@@ -906,13 +906,19 @@ class CodeGen:
                     elif isinstance(deco, ast.Call):
                         # Step 1: call deco(args) → get the actual decorator
                         actual_deco = self._emit_expr_value(deco)
-                        # actual_deco is a closure/function pointer
                         if isinstance(actual_deco.type, ir.IntType):
                             actual_deco = self.builder.inttoptr(actual_deco, i8_ptr)
                         # Step 2: call actual_deco(f) → get the wrapped function
+                        # If f uses FpyValue ABI, create a thin i64-ABI wrapper
+                        # so call_ptr0/1/2 can call it correctly.
+                        if info.uses_fv_abi:
+                            wrapper = self._get_or_emit_i64_wrapper(info)
+                            wrapper_ptr = self.builder.ptrtoint(wrapper, i64)
+                        else:
+                            wrapper_ptr = func_ptr
                         result = self.builder.call(
                             self.runtime["closure_call1"],
-                            [actual_deco, func_ptr])
+                            [actual_deco, wrapper_ptr])
                         self._store_variable(node.name,
                             self.builder.inttoptr(result, i8_ptr), "closure")
 
@@ -967,15 +973,18 @@ class CodeGen:
                         nonlocal_vars.update(n.names)
 
                 # Collect all names defined locally inside this function
-                # (assignments, for targets, nested defs, comprehension vars)
+                # (assignments, for targets, nested defs) BUT exclude
+                # names declared as nonlocal (those are captures, not locals)
                 inner_locals = set(inner_params)
                 for n in ast.walk(node):
                     if isinstance(n, ast.Assign):
                         for tgt in n.targets:
                             if isinstance(tgt, ast.Name):
-                                inner_locals.add(tgt.id)
+                                if tgt.id not in nonlocal_vars:
+                                    inner_locals.add(tgt.id)
                     if isinstance(n, ast.For) and isinstance(n.target, ast.Name):
-                        inner_locals.add(n.target.id)
+                        if n.target.id not in nonlocal_vars:
+                            inner_locals.add(n.target.id)
                     if isinstance(n, ast.FunctionDef) and n is not node:
                         inner_locals.add(n.name)
 
@@ -1048,6 +1057,43 @@ class CodeGen:
 
                     # Generate body (may reference nested closures)
                     self._emit_closure_body(func, node, free_vars)
+
+    def _get_or_emit_i64_wrapper(self, info: "FuncInfo") -> ir.Function:
+        """Create a thin i64-ABI wrapper for a FpyValue-ABI function.
+        Needed when the function is passed as a raw function pointer
+        (e.g., to decorators) and called via call_ptr0/1/2.
+        The wrapper receives i64 args, wraps them as FpyValues, calls
+        the real function, and returns the result data as i64."""
+        wrapper_name = f"{info.func.name}.__i64_wrap"
+        # Check if already created
+        try:
+            return self.module.get_global(wrapper_name)
+        except KeyError:
+            pass
+        # Create wrapper: i64 params → FpyValue call → i64 return
+        n_params = info.param_count
+        param_types = [i64] * n_params
+        wrapper_type = ir.FunctionType(i64, param_types)
+        wrapper = ir.Function(self.module, wrapper_type, name=wrapper_name)
+        block = wrapper.append_basic_block("entry")
+        b = ir.IRBuilder(block)
+        # Wrap each i64 arg as FpyValue(INT)
+        fv_args = []
+        for param in wrapper.args:
+            tag = ir.Constant(i32, FPY_TAG_INT)
+            fv = b.insert_value(ir.Constant(fpy_val, ir.Undefined), tag, 0)
+            fv = b.insert_value(fv, param, 1)
+            fv_args.append(fv)
+        # Call the real function
+        if info.func.return_value.type == void:
+            b.call(info.func, fv_args)
+            b.ret(ir.Constant(i64, 0))
+        else:
+            result = b.call(info.func, fv_args)
+            # Extract data from FpyValue result
+            data = b.extract_value(result, 1)
+            b.ret(data)
+        return wrapper
 
     def _emit_nested_funcdef(self, node: ast.FunctionDef) -> None:
         """Handle a nested function definition — either a closure or a simple inner def."""
