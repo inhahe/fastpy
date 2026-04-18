@@ -14,4 +14,9 @@ if errorlevel 1 (
     echo COMPILE_FAILED objects.c
     exit /b 1
 )
+cl.exe /c /O2 /nologo /I "D:\python314\include" cpython_bridge.c /Focpython_bridge.obj
+if errorlevel 1 (
+    echo COMPILE_FAILED cpython_bridge.c
+    exit /b 1
+)
 echo COMPILE_OK

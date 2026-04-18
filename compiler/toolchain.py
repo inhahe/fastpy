@@ -21,7 +21,12 @@ llvm.initialize_native_asmprinter()
 # Path to the pre-compiled runtime object files
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 RUNTIME_DIR = _PROJECT_ROOT / "runtime"
-RUNTIME_OBJS = [RUNTIME_DIR / "runtime.obj", RUNTIME_DIR / "objects.obj"]
+RUNTIME_OBJS = [RUNTIME_DIR / "runtime.obj", RUNTIME_DIR / "objects.obj",
+                RUNTIME_DIR / "cpython_bridge.obj"]
+
+# CPython library for linking (needed for .pyd import support)
+PYTHON_LIB_DIR = Path(r"D:\python314\libs")
+PYTHON_LIB = "python314.lib"
 RUNTIME_BUILD_BAT = RUNTIME_DIR / "build_runtime.bat"
 
 
@@ -117,6 +122,7 @@ def link_executable(
         '\\VC\\Auxiliary\\Build\\vcvars64.bat" 1>NUL 2>NUL\r\n'
         ')\r\n'
         f'link.exe /NOLOGO /OUT:"{out_str}" {obj_list} '
+        f'/LIBPATH:"{PYTHON_LIB_DIR}" {PYTHON_LIB} '
         '/DEFAULTLIB:ucrt /DEFAULTLIB:msvcrt '
         '/DEFAULTLIB:legacy_stdio_definitions '
         '/SUBSYSTEM:CONSOLE\r\n'

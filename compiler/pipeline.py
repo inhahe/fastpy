@@ -160,6 +160,9 @@ _SUPPORTED_STMT_NODES = (
     ast.Assert,      # assert
     ast.Delete,      # del
     ast.With,        # with expr as var: ...
+    ast.Import,      # import module
+    ast.ImportFrom,  # from module import name
+    ast.Match,       # match/case (Python 3.10+)
 )
 
 # Built-in functions we can handle
@@ -168,6 +171,11 @@ _SUPPORTED_BUILTINS = {"print", "range", "len", "sorted", "int", "abs", "sum",
                        "isinstance", "str", "type", "any", "all", "bool", "float",
                        "chr", "ord", "hex", "oct", "bin", "round", "repr", "pow",
                        "divmod", "dict", "tuple", "map", "filter",
+                       "hash", "next", "iter",
+                       "bytearray", "frozenset", "complex", "slice",
+                       "getattr", "setattr", "hasattr", "delattr",
+                       "vars", "dir", "id", "callable", "input",
+                       "open", "print", "eval", "exec",
                        "ZeroDivisionError", "ValueError", "TypeError",
                        "IndexError", "KeyError", "RuntimeError", "StopIteration",
                        "Exception", "AssertionError", "super"}
@@ -204,7 +212,14 @@ def _check_unsupported(tree: ast.Module) -> list[str]:
                         user_functions.add(arg.arg)
                         break
 
-    allowed_calls = _SUPPORTED_BUILTINS | user_functions
+    # Collect names imported via `from module import name`
+    imported_names = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.names:
+            for alias in node.names:
+                imported_names.add(alias.asname if alias.asname else alias.name)
+
+    allowed_calls = _SUPPORTED_BUILTINS | user_functions | imported_names
 
     for node in ast.walk(tree):
         # Check statements
@@ -218,6 +233,8 @@ def _check_unsupported(tree: ast.Module) -> list[str]:
                     found.append(f"function call: {node.func.id}()")
             elif isinstance(node.func, ast.Attribute):
                 pass  # method calls like s.lower() — handled by codegen
+            elif isinstance(node.func, (ast.Call, ast.Subscript)):
+                pass  # C()(args) or d[key](args) — handled by codegen
             else:
                 found.append(f"complex call expression")
 
