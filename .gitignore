@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.obj
+*.exe
+*.pdb
+*.ilk
+*.exp
+*.lib
+.pytest_cache/
+.hypothesis/
+*.egg-info/

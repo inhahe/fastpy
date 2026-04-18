@@ -1,0 +1,31 @@
+[project]
+name = "fastpy"
+version = "0.1.0"
+description = "A fast AOT Python compiler targeting LLVM"
+requires-python = ">=3.12"
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "hypothesis>=6.0",
+    "mypy>=1.10",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]
+markers = [
+    "regression: marks a test as a regression test",
+    "generated: marks a test as using generated programs",
+    "slow: marks a test as slow-running",
+]
+# Show short test summary for failures, errors, and skips
+addopts = "-ra --tb=short"
+
+[tool.mypy]
+python_version = "3.12"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
