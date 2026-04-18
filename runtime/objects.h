@@ -166,4 +166,7 @@ typedef struct {
     int64_t table_size;    /* size of indices array (power of 2) */
 } FpyDict;
 
+/* Variadic closure call: takes a list of args, unpacks and dispatches. */
+int64_t fastpy_closure_call_list(void *closure, void *args_list);
+
 #endif /* FASTPY_OBJECTS_H */

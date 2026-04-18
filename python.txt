@@ -10,8 +10,6 @@ For good error reporting, we could just copy CPython's code
 
 Option to treat all regular integers as checked Int64 instead of checked Int64 with fallback to BigInt, to speed up already-existing programs. command-line option or in-program option. needs a way to override it and actually use a BigInt-fallback Int64 for specific variable initializations?
 
-
-
 Would be nice if we included a capability to create an analysis report for the user of what particular parts/aspects of the program/project being compiled make the execable slower and by roughly how much, as determined by which parts/aspects disallow which fast paths as detected by our various optimization analysis functions.
 
 For exec, eval, and that third one, maybe should embed CPython or PyPy.

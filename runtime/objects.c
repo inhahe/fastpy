@@ -1023,6 +1023,46 @@ int64_t fastpy_closure_call2(FpyClosure *c, int64_t a, int64_t b) {
     return 0;
 }
 
+/* Call closure with args passed as a list (for *args unpacking).
+ * Extracts elements from the list, combines with captures, and
+ * dispatches to the underlying function pointer. Supports up to
+ * 4 total args (explicit + captures). */
+int64_t fastpy_closure_call_list(FpyClosure *c, FpyList *args) {
+    int64_t n_args = args ? args->length : 0;
+    int64_t n_caps = c->n_captures;
+    int64_t total = n_args + n_caps;
+
+    /* Extract list elements as i64 */
+    int64_t a[4] = {0, 0, 0, 0};
+    for (int64_t i = 0; i < n_args && i < 4; i++) {
+        a[i] = args->items[i].data.i;
+    }
+
+    /* Build combined args: [list_elems..., captures...] */
+    int64_t all[8];
+    for (int64_t i = 0; i < n_args && i < 4; i++) all[i] = a[i];
+    for (int64_t i = 0; i < n_caps && (n_args + i) < 8; i++)
+        all[n_args + i] = c->captures[i];
+
+    /* Dispatch by total arg count */
+    typedef int64_t (*fn0_t)(void);
+    typedef int64_t (*fn1_t)(int64_t);
+    typedef int64_t (*fn2_t)(int64_t, int64_t);
+    typedef int64_t (*fn3_t)(int64_t, int64_t, int64_t);
+    typedef int64_t (*fn4_t)(int64_t, int64_t, int64_t, int64_t);
+    typedef int64_t (*fn5_t)(int64_t, int64_t, int64_t, int64_t, int64_t);
+
+    switch (total) {
+        case 0: return ((fn0_t)c->func)();
+        case 1: return ((fn1_t)c->func)(all[0]);
+        case 2: return ((fn2_t)c->func)(all[0], all[1]);
+        case 3: return ((fn3_t)c->func)(all[0], all[1], all[2]);
+        case 4: return ((fn4_t)c->func)(all[0], all[1], all[2], all[3]);
+        case 5: return ((fn5_t)c->func)(all[0], all[1], all[2], all[3], all[4]);
+        default: return 0;
+    }
+}
+
 /* --- enumerate and zip --- */
 
 /* enumerate(list) -> list of [index, element] pairs */

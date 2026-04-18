@@ -468,6 +468,8 @@ class CodeGen:
         self.runtime["closure_call1"] = ir.Function(self.module, ft, name="fastpy_closure_call1")
         ft = ir.FunctionType(i64, [i8_ptr, i64, i64])
         self.runtime["closure_call2"] = ir.Function(self.module, ft, name="fastpy_closure_call2")
+        ft = ir.FunctionType(i64, [i8_ptr, i8_ptr])  # closure_call_list(closure, args_list)
+        self.runtime["closure_call_list"] = ir.Function(self.module, ft, name="fastpy_closure_call_list")
         # Raw function pointer calls (for higher-order without closures)
         ft = ir.FunctionType(i64, [i8_ptr, i64])
         self.runtime["call_ptr1"] = ir.Function(self.module, ft, name="fastpy_call_ptr1")
@@ -869,6 +871,49 @@ class CodeGen:
         self._prescan_list_append_types(module_stmts)
         self._current_scope_stmts = module_stmts
 
+        # Apply decorators to top-level functions: @deco def f(...) → f = deco(f)
+        # For @deco(args), this is f = deco(args)(f) — two-step application.
+        for node in tree.body:
+            if (isinstance(node, ast.FunctionDef)
+                    and node.decorator_list
+                    and node.name in self._user_functions):
+                for deco in node.decorator_list:
+                    # Skip built-in decorators (handled at class level)
+                    if isinstance(deco, ast.Name) and deco.id in (
+                            "staticmethod", "classmethod", "property"):
+                        continue
+                    if isinstance(deco, ast.Attribute):
+                        continue  # @x.setter etc — handled by class
+
+                    info = self._user_functions[node.name]
+                    func_ptr = self.builder.ptrtoint(info.func, i64)
+
+                    # @deco — simple decorator: f = deco(f)
+                    if isinstance(deco, ast.Name) and deco.id in self._user_functions:
+                        deco_info = self._user_functions[deco.id]
+                        if deco_info.uses_fv_abi:
+                            fv = self._fv_from_int(func_ptr)
+                            result = self.builder.call(deco_info.func, [fv])
+                            self._store_variable(node.name, result, "closure")
+                        else:
+                            result = self.builder.call(deco_info.func, [func_ptr])
+                            self._store_variable(node.name,
+                                self.builder.inttoptr(result, i8_ptr), "closure")
+
+                    # @deco(args) — decorator with args: f = deco(args)(f)
+                    elif isinstance(deco, ast.Call):
+                        # Step 1: call deco(args) → get the actual decorator
+                        actual_deco = self._emit_expr_value(deco)
+                        # actual_deco is a closure/function pointer
+                        if isinstance(actual_deco.type, ir.IntType):
+                            actual_deco = self.builder.inttoptr(actual_deco, i8_ptr)
+                        # Step 2: call actual_deco(f) → get the wrapped function
+                        result = self.builder.call(
+                            self.runtime["closure_call1"],
+                            [actual_deco, func_ptr])
+                        self._store_variable(node.name,
+                            self.builder.inttoptr(result, i8_ptr), "closure")
+
         for node in tree.body:
             if not isinstance(node, (ast.FunctionDef, ast.ClassDef)):
                 self._emit_stmt(node)
@@ -927,8 +972,15 @@ class CodeGen:
 
                     # Declare inner function: explicit params + capture params
                     # Mutable captures are i8* (cell pointers), immutable are i64
-                    all_params = [arg.arg for arg in node.args.args] + free_vars
+                    # If the inner function uses *args, include it as a single
+                    # i8* parameter (pointer to the args list).
+                    explicit_params = [arg.arg for arg in node.args.args]
+                    if node.args.vararg:
+                        explicit_params.append(node.args.vararg.arg)
+                    all_params = explicit_params + free_vars
                     param_types = [i64] * len(node.args.args)
+                    if node.args.vararg:
+                        param_types.append(i8_ptr)  # args list pointer
                     for v in free_vars:
                         param_types.append(i8_ptr if v in nonlocal_vars else i64)
 
@@ -1025,13 +1077,19 @@ class CodeGen:
             if isinstance(n, ast.Nonlocal):
                 nonlocal_vars.update(n.names)
 
-        all_params = [arg.arg for arg in node.args.args] + captures
+        explicit_params = [arg.arg for arg in node.args.args]
+        if node.args.vararg:
+            explicit_params.append(node.args.vararg.arg)
+        all_params = explicit_params + captures
         for param, pname in zip(func.args, all_params):
             alloca = self.builder.alloca(param.type, name=pname)
             self.builder.store(param, alloca)
             if pname in nonlocal_vars:
                 # Mutable capture — param is a cell pointer (i8*)
                 self.variables[pname] = (alloca, "cell")
+            elif node.args.vararg and pname == node.args.vararg.arg:
+                # *args parameter — it's a list pointer (i8*)
+                self.variables[pname] = (alloca, "list:int")
             else:
                 self.variables[pname] = (alloca, "int")
 
@@ -3439,10 +3497,9 @@ class CodeGen:
                 if is_property:
                     properties.add(method_name)
                 if is_setter:
-                    # Don't re-declare the method — use the property name
-                    # The setter is a second method with the same name;
-                    # we'll register it as <name>.__set__ in the methods dict
-                    pass
+                    # @x.setter: compile as a separate function named x__set
+                    # so it doesn't collide with the getter
+                    method_name = f"{method_name}__set"
                 params = [arg.arg for arg in item.args.args]
 
                 if is_static:
@@ -4281,8 +4338,15 @@ class CodeGen:
 
         for item in node.body:
             if isinstance(item, ast.FunctionDef):
-                if item.name in cls_info.methods:
-                    func = cls_info.methods[item.name]
+                method_key = item.name
+                # @x.setter methods are stored as x__set
+                is_setter = any(
+                    isinstance(d, ast.Attribute) and d.attr == "setter"
+                    for d in item.decorator_list)
+                if is_setter:
+                    method_key = f"{item.name}__set"
+                if method_key in cls_info.methods:
+                    func = cls_info.methods[method_key]
                     self._emit_method_body(func, item)
             elif isinstance(item, ast.Pass):
                 pass
@@ -5249,6 +5313,38 @@ class CodeGen:
                         value = self.builder.inttoptr(value, gtype)
                 self.builder.store(value, gvar)
                 return
+
+        # @property setter dispatch: obj.prop = val → call prop__set(self, val)
+        obj_cls = self._infer_object_class(target.value)
+        if obj_cls:
+            cls_info = self._user_classes.get(obj_cls)
+            if cls_info and cls_info.properties and target.attr in cls_info.properties:
+                setter_name = f"{target.attr}__set"
+                setter_func = cls_info.methods.get(setter_name)
+                if setter_func:
+                    obj = self._emit_expr_value(target.value)
+                    if isinstance(obj.type, ir.IntType):
+                        obj = self.builder.inttoptr(obj, i8_ptr)
+                    # Coerce value to match setter param type
+                    if isinstance(value.type, ir.PointerType):
+                        val_i64 = self.builder.ptrtoint(value, i64)
+                    elif isinstance(value.type, ir.IntType) and value.type.width != 64:
+                        val_i64 = self.builder.zext(value, i64)
+                    elif isinstance(value.type, ir.DoubleType):
+                        val_i64 = self.builder.bitcast(value, i64)
+                    else:
+                        val_i64 = value
+                    args = [obj, val_i64]
+                    coerced = []
+                    for a, p in zip(args, setter_func.args):
+                        if a.type != p.type:
+                            if isinstance(p.type, ir.IntType) and isinstance(a.type, ir.PointerType):
+                                a = self.builder.ptrtoint(a, p.type)
+                            elif isinstance(p.type, ir.PointerType) and isinstance(a.type, ir.IntType):
+                                a = self.builder.inttoptr(a, p.type)
+                        coerced.append(a)
+                    self.builder.call(setter_func, coerced)
+                    return
 
         obj = self._emit_expr_value(target.value)
         if isinstance(obj.type, ir.IntType) and obj.type.width == 64:
@@ -8035,6 +8131,19 @@ class CodeGen:
         _, tag = self.variables.get(name, (None, "int"))
         is_closure = (tag == "closure")
 
+        # Handle f(*args) — Starred arg in closure/function-pointer call.
+        # Common in decorator wrappers: def wrapper(*args): return f(*args)
+        # Uses closure_call_list which unpacks the args list at runtime
+        # and dispatches to the function pointer with the right arity.
+        has_starred = any(isinstance(a, ast.Starred) for a in node.args)
+        if has_starred and n_args == 1 and isinstance(node.args[0], ast.Starred):
+            args_list = self._emit_expr_value(node.args[0].value)
+            if isinstance(args_list.type, ir.IntType):
+                args_list = self.builder.inttoptr(args_list, i8_ptr)
+            ptr = self.builder.inttoptr(val, i8_ptr) if isinstance(val.type, ir.IntType) else val
+            return self.builder.call(
+                self.runtime["closure_call_list"], [ptr, args_list])
+
         if is_closure:
             ptr = self.builder.inttoptr(val, i8_ptr) if isinstance(val.type, ir.IntType) else val
             if n_args == 0:
@@ -10114,6 +10223,52 @@ class CodeGen:
                         result = self.builder.select(is_better, other, result)
                     return result
                 raise CodeGenError(f"{name}() requires a list argument or multiple arguments", node)
+        # Unknown builtins: route through CPython bridge
+        # This handles bytearray(), frozenset(), slice(), complex(), etc.
+        # Only for names that aren't local variables, user functions, or classes.
+        if isinstance(node.func, ast.Name):
+            name = node.func.id
+            if (name not in self._user_functions
+                    and name not in self._user_classes
+                    and name not in self.variables):
+                # Not a user function or class — try CPython bridge
+                builtin_name = self._make_string_constant("builtins")
+                builtins_mod = self.builder.call(
+                    self.runtime["cpython_import"], [builtin_name])
+                func_name = self._make_string_constant(name)
+                callable_ptr = self.builder.call(
+                    self.runtime["cpython_getattr"],
+                    [builtins_mod, func_name])
+                out_tag = self._create_entry_alloca(i32, "pyblt.tag")
+                out_data = self._create_entry_alloca(i64, "pyblt.data")
+                n_args = len(node.args)
+                if n_args == 0:
+                    self.builder.call(self.runtime["cpython_call0"],
+                                      [callable_ptr, out_tag, out_data])
+                elif n_args == 1:
+                    arg = self._emit_expr_value(node.args[0])
+                    tag, data = self._bare_to_tag_data(arg, node.args[0])
+                    self.builder.call(self.runtime["cpython_call1"],
+                                      [callable_ptr,
+                                       ir.Constant(i32, tag), data,
+                                       out_tag, out_data])
+                elif n_args == 2:
+                    a1 = self._emit_expr_value(node.args[0])
+                    t1, d1 = self._bare_to_tag_data(a1, node.args[0])
+                    a2 = self._emit_expr_value(node.args[1])
+                    t2, d2 = self._bare_to_tag_data(a2, node.args[1])
+                    self.builder.call(self.runtime["cpython_call2"],
+                                      [callable_ptr,
+                                       ir.Constant(i32, t1), d1,
+                                       ir.Constant(i32, t2), d2,
+                                       out_tag, out_data])
+                else:
+                    raise CodeGenError(
+                        f"CPython bridge call with {n_args} args not supported",
+                        node)
+                data = self.builder.load(out_data)
+                return data
+
         # Method calls like s.lower(), obj.speak()
         if isinstance(node.func, ast.Attribute):
             # CPython module method call: math.sqrt(x) etc.
