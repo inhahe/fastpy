@@ -499,6 +499,11 @@ class CodeGen:
         # to_fv(pyobj, &out_tag, &out_data) — convert PyObject* to FpyValue
         ft = ir.FunctionType(void, [i8_ptr, ir.PointerType(i32), ir.PointerType(i64)])
         self.runtime["cpython_to_fv"] = ir.Function(self.module, ft, name="fpy_cpython_to_fv")
+        # Direct len/bool on PyObject*
+        ft = ir.FunctionType(i64, [i8_ptr])
+        self.runtime["cpython_len"] = ir.Function(self.module, ft, name="fpy_cpython_len")
+        ft = ir.FunctionType(i64, [i8_ptr])
+        self.runtime["cpython_bool"] = ir.Function(self.module, ft, name="fpy_cpython_bool")
 
         # enumerate and zip
         ft = ir.FunctionType(i8_ptr, [i8_ptr, i64])
@@ -2089,6 +2094,27 @@ class CodeGen:
                                     # Genuine conflict → "mixed" (will be
                                     # handled by monomorphization pass).
                                     existing[i] = "mixed"
+
+        # Register __setitem__ call-site types from `obj[key] = val` patterns.
+        # This lets the method body know the param types (str key, int val, etc.)
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Assign)
+                    and len(node.targets) == 1
+                    and isinstance(node.targets[0], ast.Subscript)
+                    and isinstance(node.targets[0].value, ast.Name)):
+                obj_name = node.targets[0].value.id
+                if obj_name in obj_classes:
+                    cls_name = obj_classes[obj_name]
+                    key_type = self._infer_call_arg_type(node.targets[0].slice)
+                    val_type = self._infer_call_arg_type(node.value)
+                    qkey = f"{cls_name}.__setitem__"
+                    existing = self._call_site_param_types.get(qkey)
+                    types = [key_type, val_type]
+                    if existing is None:
+                        self._call_site_param_types[qkey] = types
+                    # Also register under bare name for fallback
+                    if "__setitem__" not in self._call_site_param_types:
+                        self._call_site_param_types["__setitem__"] = types
 
     def _declare_lambda(self, var_name: str, lam: ast.Lambda) -> None:
         """Create a hidden function for a lambda assigned to a variable."""
@@ -4967,6 +4993,28 @@ class CodeGen:
         value = self._emit_expr_value(node.value)
         type_tag = self._infer_type_tag(node.value, value)
 
+        # CPython bridge builtin result: tag as "pyobj" so downstream
+        # ops (len, in, for) route through the bridge.
+        if (isinstance(node.value, ast.Call)
+                and isinstance(node.value.func, ast.Name)
+                and node.value.func.id not in self._user_functions
+                and node.value.func.id not in self._user_classes
+                and node.value.func.id not in self.variables
+                and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)):
+            builtin_name = node.value.func.id
+            # Known fastpy builtins that return native types — don't tag as pyobj
+            native_builtins = {
+                "len", "int", "float", "str", "bool", "abs", "sum",
+                "min", "max", "range", "sorted", "reversed", "list",
+                "set", "enumerate", "zip", "isinstance", "type",
+                "any", "all", "chr", "ord", "hex", "oct", "bin",
+                "round", "repr", "pow", "divmod", "dict", "tuple",
+                "map", "filter", "hash", "print",
+            }
+            if builtin_name not in native_builtins:
+                type_tag = "pyobj"
+
         # If assigning an empty list and pre-scan detected the actual element type,
         # override the default "list:int" tag
         if (type_tag == "list:int" and len(node.targets) == 1
@@ -6249,6 +6297,10 @@ class CodeGen:
                 return self._fv_from_bool(value)
             if type_tag == "none":
                 return self._fv_none()
+            if type_tag == "pyobj":
+                # i64 holding a PyObject* pointer — wrap as OBJ
+                ptr = self.builder.inttoptr(value, i8_ptr)
+                return self._fv_from_obj(ptr)
             return self._fv_from_int(value)
         # Double
         if isinstance(value.type, ir.DoubleType):
@@ -8035,6 +8087,30 @@ class CodeGen:
                 if isinstance(op, ast.NotIn):
                     result_i1 = self.builder.not_(result_i1)
                 return result_i1
+
+        # pyobj-tagged container: route through CPython bridge
+        if (isinstance(container_node, ast.Name)
+                and container_node.id in self.variables
+                and self.variables[container_node.id][1] == "pyobj"):
+            container = self._load_variable(container_node.id, container_node)
+            if isinstance(container.type, ir.IntType):
+                container = self.builder.inttoptr(container, i8_ptr)
+            # Use CPython's __contains__ via bridge
+            contains_name = self._make_string_constant("__contains__")
+            method = self.builder.call(
+                self.runtime["cpython_getattr"], [container, contains_name])
+            tag, data = self._bare_to_tag_data(left_val, None)
+            out_tag = self._create_entry_alloca(i32, "pyin.tag")
+            out_data = self._create_entry_alloca(i64, "pyin.data")
+            self.builder.call(self.runtime["cpython_call1"],
+                              [method, ir.Constant(i32, tag), data,
+                               out_tag, out_data])
+            result = self.builder.load(out_data)
+            result_i1 = self.builder.icmp_signed(
+                "!=", result, ir.Constant(i64, 0))
+            if isinstance(op, ast.NotIn):
+                result_i1 = self.builder.not_(result_i1)
+            return result_i1
 
         raise CodeGenError("'in' operator not supported for this type", node)
 
@@ -10545,6 +10621,14 @@ class CodeGen:
                 name_ptr = self._make_string_constant("__len__")
                 return self.builder.call(
                     self.runtime["obj_call_method0"], [obj, name_ptr])
+        # pyobj-tagged variable (from CPython bridge): call len() directly
+        if (isinstance(arg_node, ast.Name)
+                and arg_node.id in self.variables
+                and self.variables[arg_node.id][1] == "pyobj"):
+            obj = self._load_variable(arg_node.id, arg_node)
+            if isinstance(obj.type, ir.IntType):
+                obj = self.builder.inttoptr(obj, i8_ptr)
+            return self.builder.call(self.runtime["cpython_len"], [obj])
         arg = self._emit_expr_value(arg_node)
         if isinstance(arg.type, ir.PointerType):
             return self.builder.call(self.runtime["str_len"], [arg])

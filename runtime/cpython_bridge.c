@@ -199,6 +199,18 @@ void fpy_cpython_to_fv(void *obj, int32_t *out_tag, int64_t *out_data) {
     Py_DECREF((PyObject*)obj);  /* getattr returns a new reference */
 }
 
+/* Direct len() on a PyObject*. Returns the length as int64. */
+int64_t fpy_cpython_len(void *obj) {
+    Py_ssize_t n = PyObject_Length((PyObject*)obj);
+    if (n < 0) { PyErr_Print(); return 0; }
+    return (int64_t)n;
+}
+
+/* Direct bool() on a PyObject*. Returns 0 or 1. */
+int64_t fpy_cpython_bool(void *obj) {
+    return PyObject_IsTrue((PyObject*)obj) ? 1 : 0;
+}
+
 /* Simplified call for 0-arg functions (common: module.func()) */
 void fpy_cpython_call0(void *callable,
                         int32_t *out_tag, int64_t *out_data) {
