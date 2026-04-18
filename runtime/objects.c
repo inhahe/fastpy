@@ -2405,6 +2405,11 @@ int64_t fastpy_str_compare(const char *a, const char *b) {
 }
 
 /* Call a raw function pointer (for higher-order functions without closures) */
+int64_t fastpy_call_ptr0(void *func) {
+    typedef int64_t (*fn_t)(void);
+    return ((fn_t)func)();
+}
+
 int64_t fastpy_call_ptr1(void *func, int64_t a) {
     typedef int64_t (*fn_t)(int64_t);
     return ((fn_t)func)(a);

@@ -471,6 +471,8 @@ class CodeGen:
         ft = ir.FunctionType(i64, [i8_ptr, i8_ptr])  # closure_call_list(closure, args_list)
         self.runtime["closure_call_list"] = ir.Function(self.module, ft, name="fastpy_closure_call_list")
         # Raw function pointer calls (for higher-order without closures)
+        ft = ir.FunctionType(i64, [i8_ptr])
+        self.runtime["call_ptr0"] = ir.Function(self.module, ft, name="fastpy_call_ptr0")
         ft = ir.FunctionType(i64, [i8_ptr, i64])
         self.runtime["call_ptr1"] = ir.Function(self.module, ft, name="fastpy_call_ptr1")
         ft = ir.FunctionType(i64, [i8_ptr, i64, i64])
@@ -923,21 +925,40 @@ class CodeGen:
 
         return str(self.module)
 
-    def _scan_for_closures(self, outer_func: ast.FunctionDef) -> None:
-        """Find nested function defs and identify captured variables."""
+    def _scan_for_closures(self, outer_func: ast.FunctionDef,
+                            _name_prefix: str | None = None,
+                            _all_outer_locals: set | None = None) -> None:
+        """Find nested function defs and identify captured variables.
+        Recurses into nested functions to support arbitrary nesting depth.
+        """
         outer_params = {arg.arg for arg in outer_func.args.args}
-        # Also collect variables assigned in the outer function body
+        if outer_func.args.vararg:
+            outer_params.add(outer_func.args.vararg.arg)
+        # Collect variables assigned in the outer function body
         outer_locals = set(outer_params)
         for stmt in outer_func.body:
-            if isinstance(stmt, ast.Assign):
-                for tgt in stmt.targets:
-                    if isinstance(tgt, ast.Name):
-                        outer_locals.add(tgt.id)
+            for n in ast.walk(stmt):
+                if isinstance(n, ast.Assign):
+                    for tgt in n.targets:
+                        if isinstance(tgt, ast.Name):
+                            outer_locals.add(tgt.id)
+                # Inner function names are also locals
+                if isinstance(n, ast.FunctionDef):
+                    outer_locals.add(n.name)
+
+        # Merge with all enclosing scope locals (for multi-level capture)
+        all_locals = set(outer_locals)
+        if _all_outer_locals:
+            all_locals |= _all_outer_locals
+
+        prefix = _name_prefix if _name_prefix else outer_func.name
 
         for node in outer_func.body:
             if isinstance(node, ast.FunctionDef):
                 inner_name = node.name
                 inner_params = {arg.arg for arg in node.args.args}
+                if node.args.vararg:
+                    inner_params.add(node.args.vararg.arg)
 
                 # Detect nonlocal declarations
                 nonlocal_vars = set()
@@ -945,25 +966,39 @@ class CodeGen:
                     if isinstance(n, ast.Nonlocal):
                         nonlocal_vars.update(n.names)
 
-                # Find free variables: names used in inner but defined in outer
+                # Collect all names defined locally inside this function
+                # (assignments, for targets, nested defs, comprehension vars)
+                inner_locals = set(inner_params)
+                for n in ast.walk(node):
+                    if isinstance(n, ast.Assign):
+                        for tgt in n.targets:
+                            if isinstance(tgt, ast.Name):
+                                inner_locals.add(tgt.id)
+                    if isinstance(n, ast.For) and isinstance(n.target, ast.Name):
+                        inner_locals.add(n.target.id)
+                    if isinstance(n, ast.FunctionDef) and n is not node:
+                        inner_locals.add(n.name)
+
+                # Find free variables: names used in inner but defined in
+                # any enclosing scope, NOT defined locally
                 free_vars = []
                 for n in ast.walk(node):
-                    if isinstance(n, ast.Name) and n.id not in inner_params:
-                        if n.id in outer_locals and n.id not in free_vars:
+                    if isinstance(n, ast.Name) and n.id not in inner_locals:
+                        if n.id in all_locals and n.id not in free_vars:
                             free_vars.append(n.id)
 
                 if not free_vars:
-                    # Simple nested def with no captures — queue it for
-                    # hoisting to module level. The actual declaration +
-                    # emission happens in later passes (after call-site
-                    # analysis has set up `_function_signatures`).
                     if not hasattr(self, "_hoist_inner_funcs"):
                         self._hoist_inner_funcs = []
                     self._hoist_inner_funcs.append(node)
+                    # Still recurse into no-capture functions for their
+                    # own inner defs
+                    self._scan_for_closures(
+                        node, f"{prefix}.{inner_name}", all_locals)
                     continue
 
                 if free_vars:
-                    full_name = f"{outer_func.name}.{inner_name}"
+                    full_name = f"{prefix}.{inner_name}"
                     self._closure_info[full_name] = free_vars
                     # Track which captures are mutable (nonlocal)
                     if not hasattr(self, '_closure_nonlocals'):
@@ -1005,7 +1040,13 @@ class CodeGen:
                         min_args=len(node.args.args) - len(node.args.defaults),
                     )
 
-                    # Generate body
+                    # Recurse BEFORE emitting body: scan this inner function
+                    # for its own inner functions so they're registered in
+                    # _closure_info before the body tries to use them.
+                    self._scan_for_closures(
+                        node, full_name, all_locals)
+
+                    # Generate body (may reference nested closures)
                     self._emit_closure_body(func, node, free_vars)
 
     def _emit_nested_funcdef(self, node: ast.FunctionDef) -> None:
@@ -8158,7 +8199,9 @@ class CodeGen:
         else:
             # Raw function pointer (from lambda or passed as argument)
             ptr = self.builder.inttoptr(val, i8_ptr) if isinstance(val.type, ir.IntType) else val
-            if n_args == 1:
+            if n_args == 0:
+                return self.builder.call(self.runtime["call_ptr0"], [ptr])
+            elif n_args == 1:
                 a = self._emit_expr_value(node.args[0])
                 return self.builder.call(self.runtime["call_ptr1"], [ptr, a])
             elif n_args == 2:
