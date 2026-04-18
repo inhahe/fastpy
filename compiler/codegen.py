@@ -139,6 +139,9 @@ class CodeGen:
         # bodies in LIFO order before actually returning.
         self._finally_stack: list[list[ast.stmt]] = []
 
+        # Generator functions: set of function names that contain yield
+        self._generator_funcs: set[str] = set()
+
         # CPython module imports: module_name -> LLVM global (i8* PyObject*)
         self._cpython_modules: dict[str, ir.GlobalVariable] = {}
 
@@ -2775,6 +2778,18 @@ class CodeGen:
                         ret_type = i32
                         break
 
+        # Detect generator functions (contain yield/yield from)
+        is_generator = any(
+            isinstance(n, (ast.Yield, ast.YieldFrom))
+            for n in ast.walk(node)
+        )
+        if is_generator:
+            self._generator_funcs.add(
+                _name_override if _name_override else node.name)
+            # Generators return a list (of yielded values)
+            ret_type = i8_ptr
+            ret_tag = "ptr:list"
+
         # Remember the statically-inferred bare types — the body expects
         # these, and we'll unwrap FpyValue params at entry to match.
         static_param_types = list(param_types)
@@ -3300,19 +3315,36 @@ class CodeGen:
                 tag = "int"
             self.variables[param.name] = (alloca, tag)
 
+        # Generator setup: create a list to collect yielded values
+        is_gen = effective_name in self._generator_funcs
+        if is_gen:
+            gen_list = self.builder.call(self.runtime["list_new"], [])
+            self._gen_list = gen_list  # store for yield emission
+
         # Emit function body
         self._emit_stmts(node.body)
 
         # Add implicit return if needed
         if not self.builder.block.is_terminated:
-            ret_ty = info.func.return_value.type
-            if isinstance(ret_ty, ir.VoidType):
-                self.builder.ret_void()
-            elif isinstance(ret_ty, ir.LiteralStructType):
-                # FpyValue return: implicit return is None
-                self.builder.ret(self._fv_none())
+            if is_gen:
+                # Generator: return the collected list
+                ret_ty = info.func.return_value.type
+                if isinstance(ret_ty, ir.LiteralStructType):
+                    self.builder.ret(self._fv_from_list(gen_list))
+                else:
+                    self.builder.ret(gen_list)
             else:
-                self.builder.ret(ir.Constant(ret_ty, 0))
+                ret_ty = info.func.return_value.type
+                if isinstance(ret_ty, ir.VoidType):
+                    self.builder.ret_void()
+                elif isinstance(ret_ty, ir.LiteralStructType):
+                    # FpyValue return: implicit return is None
+                    self.builder.ret(self._fv_none())
+                else:
+                    self.builder.ret(ir.Constant(ret_ty, 0))
+
+        if is_gen:
+            self._gen_list = None
 
         # Restore outer state
         (self.function, self.builder, self.variables, self._loop_stack,
@@ -4694,6 +4726,15 @@ class CodeGen:
 
     def _emit_stmt(self, node: ast.stmt) -> None:
         """Emit LLVM IR for a statement."""
+        # Yield statements: must come before generic Expr handler
+        if (isinstance(node, ast.Expr)
+                and isinstance(node.value, ast.Yield)):
+            self._emit_yield(node.value)
+            return
+        if (isinstance(node, ast.Expr)
+                and isinstance(node.value, ast.YieldFrom)):
+            self._emit_yield_from(node.value)
+            return
         if isinstance(node, ast.Expr):
             self._emit_expr_stmt(node)
         elif isinstance(node, ast.Assign):
@@ -5585,7 +5626,7 @@ class CodeGen:
                 return var_tag
             if var_tag.startswith("dict:"):
                 return "dict"
-        if isinstance(node, (ast.List, ast.ListComp)):
+        if isinstance(node, (ast.List, ast.ListComp, ast.GeneratorExp)):
             elem_type = self._infer_list_elem_type(node)
             return f"list:{elem_type}"
         if isinstance(node, ast.Tuple):
@@ -6721,6 +6762,34 @@ class CodeGen:
         # Fallback: unsupported pattern
         raise CodeGenError(
             f"Unsupported match pattern: {type(pattern).__name__}", node)
+
+    def _emit_yield(self, node: ast.Yield) -> None:
+        """Emit `yield val` — appends to the generator's result list.
+        Simple generator implementation: collects all yielded values
+        into a list. Does NOT support send/close/throw or lazy evaluation.
+        """
+        gen_list = getattr(self, '_gen_list', None)
+        if gen_list is None:
+            raise CodeGenError("yield outside generator function", node)
+        if node.value is not None:
+            self._emit_list_append_expr(gen_list, node.value)
+        else:
+            # yield with no value → append None
+            none_tag = ir.Constant(i32, FPY_TAG_NONE)
+            none_data = ir.Constant(i64, 0)
+            self.builder.call(self.runtime["list_append_fv"],
+                              [gen_list, none_tag, none_data])
+
+    def _emit_yield_from(self, node: ast.YieldFrom) -> None:
+        """Emit `yield from iterable` — extends the generator's result list."""
+        gen_list = getattr(self, '_gen_list', None)
+        if gen_list is None:
+            raise CodeGenError("yield from outside generator function", node)
+        source = self._emit_expr_value(node.value)
+        if isinstance(source.type, ir.PointerType):
+            self.builder.call(self.runtime["list_extend"], [gen_list, source])
+        else:
+            raise CodeGenError("yield from requires an iterable", node)
 
     def _emit_import(self, node: ast.Import) -> None:
         """Emit `import module` — loads a CPython module (.pyd or .py)
@@ -9805,6 +9874,14 @@ class CodeGen:
             return self._emit_generator_as_list(node)
         elif isinstance(node, ast.Set):
             return self._emit_set_literal(node)
+        elif isinstance(node, ast.Yield):
+            # yield as expression (x = yield val) — emit the yield and
+            # return None (send() not supported in simple generators)
+            self._emit_yield(node)
+            return ir.Constant(i64, 0)
+        elif isinstance(node, ast.YieldFrom):
+            self._emit_yield_from(node)
+            return ir.Constant(i64, 0)
         elif isinstance(node, ast.SetComp):
             # Set comprehension = list comprehension + dedup
             fake = ast.ListComp(elt=node.elt, generators=node.generators)
