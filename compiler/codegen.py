@@ -6600,6 +6600,10 @@ class CodeGen:
                 return self._fv_from_obj(value)
             if type_tag == "dict":
                 return self._fv_from_dict(value)
+            if type_tag == "set":
+                tag = ir.Constant(i32, FPY_TAG_SET)
+                data = self.builder.ptrtoint(value, i64)
+                return self._fv_build_from_slots(tag, data)
             if type_tag == "tuple" or type_tag.startswith("list"):
                 return self._fv_from_list(value)
             if type_tag == "closure":
@@ -6640,6 +6644,8 @@ class CodeGen:
         if type_tag == "obj":
             return self._fv_as_ptr(fv)
         if type_tag == "dict":
+            return self._fv_as_ptr(fv)
+        if type_tag == "set":
             return self._fv_as_ptr(fv)
         if type_tag == "tuple" or type_tag.startswith("list"):
             return self._fv_as_ptr(fv)
