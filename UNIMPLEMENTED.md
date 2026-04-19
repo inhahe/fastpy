@@ -90,50 +90,35 @@ These are patterns that work partially or through fallback paths:
 3. **Metaclass support** is simplified — `type(C).__name__` is resolved at
    compile time. Full metaclass instantiation protocol not implemented.
 
-4. **filter()** still uses the old int-int function pointer ABI (Hack 21
-   in CLAUDE.md). Works for int predicates and lambdas but not for
-   string-typed elements.
-
-5. **map()** with closures that capture variables works for variable-backed
+4. **map()** with closures that capture variables works for variable-backed
    function pointers but not for magic-number closures.
 
-6. **Complex numbers** route through CPython bridge — no native complex
+5. **Complex numbers** route through CPython bridge — no native complex
    arithmetic.
 
-7. **eval()/exec()** not supported natively (would need embedded interpreter).
+6. **eval()/exec()** — `eval("literal")` pre-compiles via CPython bridge.
+   Dynamic eval (non-literal strings) routes through `builtins.eval`.
+   `exec()` with literal strings works similarly. Neither has access to
+   the compiled program's local variables.
 
-8. **Multiple dispatch / singledispatch** not supported.
+7. **Multiple dispatch / singledispatch** not supported.
 
-9. **Dataclasses, NamedTuple** not supported (would need decorator processing).
+8. **Dataclasses, NamedTuple** not supported (would need decorator processing).
 
-10. **Context manager protocol** (`__enter__`/`__exit__`) — `with` statement
-    works for file-like patterns but custom context managers may not dispatch
-    correctly.
+9. **CPython bridge result arithmetic with `np.mean` style** — printing a
+   numpy float64 scalar directly shows the result via CPython's `str()`, but
+   using it in float arithmetic or `float()` conversion doesn't detect it
+   as a float (treated as OBJ tag → pointer garbage).
 
-11. **CPython bridge `int()`/`float()` on inline expressions** — `int(np.sum(a))`
-    works when `np.sum(a)` is a 1-arg call on a pyobj module, but fails for
-    2+ arg calls like `int(np.dot(a,b))`. The raw-call path only detects
-    1-arg CPython method calls.
-
-12. **CPython bridge result arithmetic with `np.mean` style** — printing a
-    numpy float64 scalar directly shows the result via CPython's `str()`, but
-    using it in float arithmetic or `float()` conversion doesn't detect it
-    as a float (treated as OBJ tag → pointer garbage).
-
-13. **Sorting with user-function keys on string params** — `sorted(lst, key=func)`
-    where func takes a string parameter fails because call-site analysis
-    doesn't trace through sorted() to infer parameter types.
-
-14. **Threading: compiled functions with args** — `threading.Thread(target=func)`
+10. **Threading: compiled functions with args** — `threading.Thread(target=func)`
     works for zero-arg functions. Functions with parameters need the native
     wrapper to handle argument passing (currently only `void(*)(void)` ABI).
 
-15. **Threading: shared mutable state** — module-level variables (lists, dicts)
-    aren't accessible from within thread worker functions due to the existing
-    global variable scope limitation. Use CPython bridge functions instead.
+### Recently resolved (2026-04-19)
 
-16. **Threading: per-object locking coverage** — `FPY_LOCK/FPY_UNLOCK` is
-    added to `fpy_list_append`, `fpy_list_set`, `fpy_dict_set` but not yet
-    to all mutating operations (pop, remove, insert, extend, clear, sort,
-    reverse, dict_delete, obj_set_fv, etc.). These need to be added for
-    full free-threaded safety.
+- **#4 filter()** — now uses inline loop like map(), handles all element types
+- **#10 Context managers** — `__enter__`/`__exit__` dispatch works
+- **#11 int() on 2+ arg bridge calls** — `int(np.dot(a,b))` now works
+- **#13 sorted(key=user_func) on strings** — call-site analysis traces through sorted/min/max
+- **#15 Shared mutable state** — global lists/dicts/strings work across functions
+- **#16 Per-object locking** — complete coverage on all mutating list/dict operations
