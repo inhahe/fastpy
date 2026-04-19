@@ -50,7 +50,8 @@ class CompileResult:
         return "Compilation failed:\n" + "\n".join(f"  {e}" for e in self.errors)
 
 
-def compile_source(source: str, output: Path | None = None) -> CompileResult:
+def compile_source(source: str, output: Path | None = None,
+                   threading_mode: int = 0) -> CompileResult:
     """
     Compile a Python source string to a native executable.
 
@@ -85,7 +86,7 @@ def compile_source(source: str, output: Path | None = None) -> CompileResult:
 
     # Stage 3: Generate LLVM IR
     try:
-        codegen = CodeGen()
+        codegen = CodeGen(threading_mode=threading_mode)
         ir_string = codegen.generate(tree)
     except CodeGenError as e:
         return CompileResult(
@@ -117,10 +118,11 @@ def compile_source(source: str, output: Path | None = None) -> CompileResult:
         )
 
 
-def compile_file(path: Path, output: Path | None = None) -> CompileResult:
+def compile_file(path: Path, output: Path | None = None,
+                 threading_mode: int = 0) -> CompileResult:
     """Compile a Python source file to a native executable."""
     source = path.read_text(encoding="utf-8")
-    return compile_source(source, output)
+    return compile_source(source, output, threading_mode=threading_mode)
 
 
 # ---------------------------------------------------------------------------

@@ -111,7 +111,7 @@ TAG_NONE = 4
 class CodeGen:
     """Generates LLVM IR from a Python AST."""
 
-    def __init__(self) -> None:
+    def __init__(self, threading_mode: int = 0) -> None:
         self.module = ir.Module(name="fastpy_module")
         self.module.triple = "x86_64-pc-windows-msvc"
         # Explicit data layout for x86_64 Windows MSVC. Matters for correct
@@ -121,9 +121,16 @@ class CodeGen:
             "e-m:w-p270:32:32-p271:32:32-p272:64:64"
             "-i64:64-f80:128-n8:16:32:64-S128"
         )
+        self._threading_mode = threading_mode
 
         # Declare runtime functions
         self._declare_runtime_functions()
+
+        # Emit threading mode global — overrides the weak default in threading.c.
+        # Use no explicit linkage (default = external definition with init).
+        gvar = ir.GlobalVariable(self.module, i32,
+                                 name="fpy_threading_mode")
+        gvar.initializer = ir.Constant(i32, threading_mode)
 
         # String constant counter
         self._str_counter = 0

@@ -7,9 +7,8 @@
 
 /* ── Global threading mode ───────────────────────────────────────── */
 
-/* Default: single-threaded. Overridden by codegen-emitted global or
- * runtime initialization. */
-int fpy_threading_mode = FPY_THREADING_NONE;
+/* Threading mode is defined by the LLVM codegen (in the compiled output.obj).
+ * The C runtime only has the extern declaration (in threading.h). */
 
 /* ── GIL state ───────────────────────────────────────────────────── */
 

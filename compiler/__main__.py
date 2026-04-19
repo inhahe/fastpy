@@ -21,6 +21,11 @@ def main() -> int:
                         help="Output executable path")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="Show detailed compilation info")
+    parser.add_argument("-t", "--free-threaded", action="store_true",
+                        help="Enable free-threaded mode (no GIL, per-object locks)")
+    parser.add_argument("--threading", choices=["none", "gil", "free"],
+                        default=None,
+                        help="Threading mode: none (default), gil, or free")
 
     args = parser.parse_args()
 
@@ -28,7 +33,15 @@ def main() -> int:
         print(f"Error: {args.source} not found", file=sys.stderr)
         return 1
 
-    result = compile_file(args.source, args.output)
+    # Determine threading mode
+    threading_mode = 0  # default: single-threaded
+    if args.free_threaded:
+        threading_mode = 2
+    elif args.threading:
+        threading_mode = {"none": 0, "gil": 1, "free": 2}[args.threading]
+
+    result = compile_file(args.source, args.output,
+                          threading_mode=threading_mode)
 
     if result.success:
         print(f"Compiled: {result.executable}")

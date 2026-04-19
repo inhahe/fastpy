@@ -29,6 +29,7 @@ FpyList* fpy_list_new(int64_t capacity) {
     list->length = 0;
     list->capacity = capacity;
     list->is_tuple = 0;
+    if (fpy_threading_mode == FPY_THREADING_FREE) fpy_mutex_init(&list->lock);
     return list;
 }
 
@@ -40,11 +41,13 @@ FpyList* fastpy_tuple_new(void) {
 }
 
 void fpy_list_append(FpyList *list, FpyValue value) {
+    FPY_LOCK(list);
     if (list->length >= list->capacity) {
         list->capacity *= 2;
         list->items = (FpyValue*)realloc(list->items, sizeof(FpyValue) * list->capacity);
     }
     list->items[list->length++] = value;
+    FPY_UNLOCK(list);
 }
 
 FpyValue fpy_list_get(FpyList *list, int64_t index) {
@@ -57,12 +60,15 @@ FpyValue fpy_list_get(FpyList *list, int64_t index) {
 }
 
 void fpy_list_set(FpyList *list, int64_t index, FpyValue value) {
+    FPY_LOCK(list);
     if (index < 0) index += list->length;
     if (index < 0 || index >= list->length) {
+        FPY_UNLOCK(list);
         fprintf(stderr, "IndexError: list assignment index out of range\n");
         exit(1);
     }
     list->items[index] = value;
+    FPY_UNLOCK(list);
 }
 
 int64_t fpy_list_len(FpyList *list) {
@@ -635,10 +641,12 @@ FpyDict* fpy_dict_new(int64_t capacity) {
         dict->table_size *= 2;
     dict->indices = (int64_t*)malloc(sizeof(int64_t) * dict->table_size);
     fpy_dict_init_indices(dict);
+    if (fpy_threading_mode == FPY_THREADING_FREE) fpy_mutex_init(&dict->lock);
     return dict;
 }
 
 void fpy_dict_set(FpyDict *dict, FpyValue key, FpyValue value) {
+    FPY_LOCK(dict);
     uint64_t h = fpy_hash_value(key);
     int64_t mask = dict->table_size - 1;
     int64_t slot = (int64_t)(h & (uint64_t)mask);
@@ -655,6 +663,7 @@ void fpy_dict_set(FpyDict *dict, FpyValue key, FpyValue value) {
         } else if (fpy_key_equal(dict->keys[idx], key)) {
             /* Key exists — update value in place */
             dict->values[idx] = value;
+            FPY_UNLOCK(dict);
             return;
         }
         slot = (slot + 1) & mask;
@@ -686,6 +695,7 @@ void fpy_dict_set(FpyDict *dict, FpyValue key, FpyValue value) {
                                            sizeof(int64_t) * dict->table_size);
         fpy_dict_rebuild_indices(dict);
     }
+    FPY_UNLOCK(dict);
 }
 
 FpyValue fpy_dict_get(FpyDict *dict, FpyValue key) {
@@ -2867,6 +2877,7 @@ FpyObj* fastpy_obj_new(int class_id) {
     FpyObj *obj = (FpyObj*)fpy_arena_alloc(total);
     obj->magic = FPY_OBJ_MAGIC;
     obj->class_id = class_id;
+    if (fpy_threading_mode == FPY_THREADING_FREE) fpy_mutex_init(&obj->lock);
     obj->dynamic_attrs = NULL;
     if (sc > 0) {
         obj->slots = (FpyValue*)(obj + 1);

@@ -13,6 +13,7 @@
 #define FASTPY_OBJECTS_H
 
 #include <stdint.h>
+#include "threading.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -99,6 +100,7 @@ struct FpyObj {
     int class_id;
     FpyValue *slots;                 /* size = class's slot_count, NULL if 0 */
     FpyObjAttrs *dynamic_attrs;      /* NULL unless used */
+    fpy_mutex_t lock;                /* per-object lock (free-threaded mode) */
 };
 
 /* List: growable array of FpyValue. `is_tuple` distinguishes tuple-
@@ -108,6 +110,7 @@ struct FpyList {
     int64_t length;
     int64_t capacity;
     int is_tuple;
+    fpy_mutex_t lock;                /* per-object lock (free-threaded mode) */
 };
 
 /* --- Value constructors --- */
@@ -169,6 +172,7 @@ typedef struct {
     int64_t length;        /* number of active entries */
     int64_t capacity;      /* allocated size of keys/values arrays */
     int64_t table_size;    /* size of indices array (power of 2) */
+    fpy_mutex_t lock;      /* per-object lock (free-threaded mode) */
 } FpyDict;
 
 /* Variadic closure call: takes a list of args, unpacks and dispatches. */
