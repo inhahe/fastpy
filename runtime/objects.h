@@ -26,6 +26,8 @@
 #define FPY_TAG_LIST   5
 #define FPY_TAG_OBJ    6
 #define FPY_TAG_DICT   7
+#define FPY_TAG_BYTES  8
+#define FPY_TAG_SET    9
 
 /* Forward declarations */
 typedef struct FpyList FpyList;
@@ -90,7 +92,10 @@ typedef struct FpyObjAttrs {
  * O(1) access. Dynamic attrs (from getattr/setattr or attrs the compiler
  * didn't pre-declare) fall back to the lazily-allocated `dynamic_attrs`
  * side table — NULL unless any dynamic attr has ever been written. */
+#define FPY_OBJ_MAGIC 0x4F424A53  /* "OBJS" — distinguishes FpyObj from PyObject* */
+
 struct FpyObj {
+    int magic;                           /* FPY_OBJ_MAGIC for native objects */
     int class_id;
     FpyValue *slots;                 /* size = class's slot_count, NULL if 0 */
     FpyObjAttrs *dynamic_attrs;      /* NULL unless used */

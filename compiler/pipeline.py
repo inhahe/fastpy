@@ -163,6 +163,8 @@ _SUPPORTED_STMT_NODES = (
     ast.Import,      # import module
     ast.ImportFrom,  # from module import name
     ast.Match,       # match/case (Python 3.10+)
+    ast.AsyncFunctionDef,  # async def (routed through CPython bridge)
+    ast.TryStar,     # except* (exception groups, Python 3.11+)
 )
 
 # Built-in functions we can handle
@@ -178,7 +180,7 @@ _SUPPORTED_BUILTINS = {"print", "range", "len", "sorted", "int", "abs", "sum",
                        "open", "print", "eval", "exec",
                        "ZeroDivisionError", "ValueError", "TypeError",
                        "IndexError", "KeyError", "RuntimeError", "StopIteration",
-                       "Exception", "AssertionError", "super"}
+                       "Exception", "AssertionError", "ExceptionGroup", "super"}
 
 
 def _check_unsupported(tree: ast.Module) -> list[str]:
@@ -191,7 +193,7 @@ def _check_unsupported(tree: ast.Module) -> list[str]:
     # Collect user-defined function, class, and lambda-assigned names
     user_functions = set()
     for node in ast.walk(tree):
-        if isinstance(node, ast.FunctionDef):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             user_functions.add(node.name)
         if isinstance(node, ast.ClassDef):
             user_functions.add(node.name)

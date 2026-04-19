@@ -277,11 +277,13 @@ double fastpy_pow_float(double base, double exp) {
 #define FPY_EXC_KEYERROR       5
 #define FPY_EXC_RUNTIMEERROR   6
 #define FPY_EXC_STOPITERATION  7
+#define FPY_EXC_EXCEPTIONGROUP 8
 #define FPY_EXC_GENERIC        99
 
 /* Global exception state */
 int fpy_exc_type = FPY_EXC_NONE;
 const char *fpy_exc_msg = "";
+int fpy_exc_group_inner = FPY_EXC_NONE;  /* inner type for ExceptionGroup */
 
 /* Raise an exception — sets the flag. Caller must check and propagate. */
 void fastpy_raise(int exc_type, const char *msg) {
@@ -308,6 +310,17 @@ const char* fastpy_exc_get_msg(void) {
 void fastpy_exc_clear(void) {
     fpy_exc_type = FPY_EXC_NONE;
     fpy_exc_msg = "";
+    fpy_exc_group_inner = FPY_EXC_NONE;
+}
+
+/* Set the inner exception type for ExceptionGroup */
+void fastpy_exc_set_group_inner(int inner_type) {
+    fpy_exc_group_inner = inner_type;
+}
+
+/* Get the inner exception type for ExceptionGroup */
+int fastpy_exc_get_group_inner(void) {
+    return fpy_exc_group_inner;
 }
 
 /* Map exception name to type id */
@@ -319,6 +332,7 @@ int fastpy_exc_name_to_id(const char *name) {
     if (strcmp(name, "KeyError") == 0) return FPY_EXC_KEYERROR;
     if (strcmp(name, "RuntimeError") == 0) return FPY_EXC_RUNTIMEERROR;
     if (strcmp(name, "StopIteration") == 0) return FPY_EXC_STOPITERATION;
+    if (strcmp(name, "ExceptionGroup") == 0) return FPY_EXC_EXCEPTIONGROUP;
     return FPY_EXC_GENERIC;
 }
 
@@ -327,9 +341,10 @@ void fastpy_exc_unhandled(void) {
     if (fpy_exc_type == FPY_EXC_NONE) return;
     const char *names[] = {
         "Exception", "ZeroDivisionError", "ValueError", "TypeError",
-        "IndexError", "KeyError", "RuntimeError", "StopIteration"
+        "IndexError", "KeyError", "RuntimeError", "StopIteration",
+        "ExceptionGroup"
     };
-    const char *name = (fpy_exc_type >= 1 && fpy_exc_type <= 7)
+    const char *name = (fpy_exc_type >= 1 && fpy_exc_type <= 8)
         ? names[fpy_exc_type] : "Exception";
     fprintf(stderr, "Traceback (most recent call last):\n  %s: %s\n", name, fpy_exc_msg);
     exit(1);

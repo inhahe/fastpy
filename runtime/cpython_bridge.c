@@ -75,8 +75,16 @@ static PyObject* fpy_to_pyobject(int32_t tag, int64_t data) {
             return PyUnicode_FromString((const char*)(intptr_t)data);
         case FPY_TAG_BOOL:
             return PyBool_FromLong((long)data);
+        case FPY_TAG_BYTES:
+            return PyBytes_FromString((const char*)(intptr_t)data);
         case FPY_TAG_NONE:
             Py_RETURN_NONE;
+        case FPY_TAG_OBJ: {
+            /* Opaque PyObject* — pass through unchanged */
+            PyObject *obj = (PyObject*)(intptr_t)data;
+            Py_INCREF(obj);
+            return obj;
+        }
         case FPY_TAG_LIST: {
             /* Convert FpyList to PyList */
             FpyList *lst = (FpyList*)(intptr_t)data;
@@ -268,4 +276,115 @@ void fpy_cpython_call2(void *callable,
     }
     pyobject_to_fpy(result, out_tag, out_data);
     Py_DECREF(result);
+}
+
+/* Raw call variants: return PyObject* directly without conversion.
+ * Used when the result will be stored as pyobj for downstream method
+ * calls, subscript access, etc. The caller owns the reference. */
+void* fpy_cpython_call0_raw(void *callable) {
+    PyObject *result = PyObject_CallNoArgs((PyObject*)callable);
+    if (!result) { PyErr_Print(); return NULL; }
+    return (void*)result;
+}
+
+void* fpy_cpython_call1_raw(void *callable,
+                             int32_t arg_tag, int64_t arg_data) {
+    PyObject *arg = fpy_to_pyobject(arg_tag, arg_data);
+    PyObject *args = PyTuple_Pack(1, arg);
+    Py_DECREF(arg);
+    PyObject *result = PyObject_CallObject((PyObject*)callable, args);
+    Py_DECREF(args);
+    if (!result) { PyErr_Print(); return NULL; }
+    return (void*)result;
+}
+
+void* fpy_cpython_call2_raw(void *callable,
+                             int32_t t1, int64_t d1,
+                             int32_t t2, int64_t d2) {
+    PyObject *a1 = fpy_to_pyobject(t1, d1);
+    PyObject *a2 = fpy_to_pyobject(t2, d2);
+    PyObject *args = PyTuple_Pack(2, a1, a2);
+    Py_DECREF(a1);
+    Py_DECREF(a2);
+    PyObject *result = PyObject_CallObject((PyObject*)callable, args);
+    Py_DECREF(args);
+    if (!result) { PyErr_Print(); return NULL; }
+    return (void*)result;
+}
+
+/* Simplified call for 3-arg functions */
+void fpy_cpython_call3(void *callable,
+                        int32_t tag1, int64_t data1,
+                        int32_t tag2, int64_t data2,
+                        int32_t tag3, int64_t data3,
+                        int32_t *out_tag, int64_t *out_data) {
+    PyObject *a1 = fpy_to_pyobject(tag1, data1);
+    PyObject *a2 = fpy_to_pyobject(tag2, data2);
+    PyObject *a3 = fpy_to_pyobject(tag3, data3);
+    PyObject *args = PyTuple_Pack(3, a1, a2, a3);
+    Py_DECREF(a1);
+    Py_DECREF(a2);
+    Py_DECREF(a3);
+
+    PyObject *result = PyObject_CallObject((PyObject*)callable, args);
+    Py_DECREF(args);
+
+    if (!result) {
+        PyErr_Print();
+        *out_tag = FPY_TAG_NONE;
+        *out_data = 0;
+        return;
+    }
+    pyobject_to_fpy(result, out_tag, out_data);
+    Py_DECREF(result);
+}
+
+/* ── Print a PyObject* via CPython's str() ─────────────────────── */
+
+void fpy_cpython_print_obj(void *pyobj) {
+    fpy_cpython_init();
+    PyObject *s = PyObject_Str((PyObject*)pyobj);
+    if (s) {
+        const char *utf8 = PyUnicode_AsUTF8(s);
+        if (utf8) printf("%s", utf8);
+        Py_DECREF(s);
+    } else {
+        PyErr_Clear();
+        printf("<object at %p>", pyobj);
+    }
+}
+
+/* ── Exec+Get ──────────────────────────────────────────────────── */
+
+/* Execute Python source code in a temporary namespace, then extract
+ * a named object (typically a function) and return it as a PyObject*.
+ * Used for async def, generators needing send/close, etc. that must
+ * run as real CPython functions. */
+void* fpy_cpython_exec_get(const char *code, const char *name) {
+    fpy_cpython_init();  /* lazy init */
+
+    PyObject *globals = PyDict_New();
+    /* builtins must be present for the exec'd code to access print, etc. */
+    PyObject *builtins = PyImport_ImportModule("builtins");
+    PyDict_SetItemString(globals, "__builtins__", builtins);
+    Py_DECREF(builtins);
+
+    PyObject *result = PyRun_String(code, Py_file_input, globals, globals);
+    if (!result) {
+        PyErr_Print();
+        fprintf(stderr, "fpy_cpython_exec_get: failed to exec code\n");
+        Py_DECREF(globals);
+        exit(1);
+    }
+    Py_DECREF(result);  /* Py_None from exec */
+
+    PyObject *value = PyDict_GetItemString(globals, name);
+    if (!value) {
+        fprintf(stderr, "fpy_cpython_exec_get: name '%s' not found after exec\n", name);
+        Py_DECREF(globals);
+        exit(1);
+    }
+    Py_INCREF(value);  /* we own a reference */
+    Py_DECREF(globals);
+    return (void*)value;
 }

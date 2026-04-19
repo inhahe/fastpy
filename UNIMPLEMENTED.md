@@ -1,119 +1,115 @@
 # Unimplemented Python 3.14 Patterns
 
-Status: **43/66** tested patterns working (65% coverage).
+Status: **66/66** audit features working + **62/62** extended pattern tests (100% coverage).
 
-Last updated after Phase 28 (dunder methods, match/case, print(*list),
-dict comp filter, bare raise, bytes).
+Last updated 2026-04-19 after implementing all 6 remaining audit features
+(async/await, send-to-gen, except*, bytearray, metaclass) and refactoring
+sets to use O(1) hash tables.
 
-## Currently working (43 features)
+## Currently working
 
-Loops, functions (def, lambda, recursion, defaults, *args, closures),
-classes (init, methods, inheritance, super, multiple inheritance),
-operator overloading (__add__, __sub__, __mul__, __neg__, __eq__, __lt__,
-__str__, __repr__, __getitem__, __len__, __bool__, __contains__, __call__,
-__hash__, __delitem__),
-containers (list, dict, tuple, set, comprehensions with filters),
-strings (f-strings, methods, slicing, %, .format),
-exceptions (try/except/finally, raise, bare raise, multiple except types),
-imports (import module, from module import name — .pyd support),
-control flow (if/elif/else, break, continue, ternary, walrus, match/case),
-with statement, chained comparisons, augmented assign, global,
-type hints (ignored at runtime), print(*list), bytes (basic len).
+### Core language
+Loops (for/while/break/continue/else), functions (def, lambda, recursion,
+defaults, *args, **kwargs, closures, nonlocal, global), classes (init,
+methods, inheritance, super, multiple inheritance, nested classes,
+metaclass, __slots__, staticmethod, classmethod, @property get/set),
+decorators (user decorators, decorators with args).
 
-## Still missing (23 features)
+### Operator overloading (dunders)
+__add__, __sub__, __mul__, __neg__, __eq__, __lt__, __str__, __repr__,
+__getitem__, __setitem__, __delitem__, __len__, __bool__, __contains__,
+__iter__/__next__, __call__, __hash__.
 
-### 1. Generators & Iterators (4 features)
+### Containers
+list (literals, comprehensions, all methods: append, pop, remove, insert,
+index, count, sort, reverse, extend, copy, clear),
+dict (literals, comprehensions, get, pop, setdefault, keys, values, items,
+update, | merge, {**a, **b} unpacking),
+tuple (literals, unpacking, *mid unpack, swap),
+set (literals, comprehensions, add, discard, remove, |, &, -, ^, in —
+all backed by O(1) hash table),
+frozenset (via CPython bridge).
 
-**yield / yield from / generator expressions / send+next**
-```python
-def gen():
-    yield 1
-    yield 2
-for x in gen():
-    print(x)
-```
-Requires transforming generator functions into resumable state machines.
-This is the largest single missing feature. Generator expressions as
-standalone iterables also don't work (they do work inside sum/any/all).
+### Strings
+f-strings (with =, !r, format specs), methods (split, join, replace,
+strip, startswith, endswith, find, upper, lower, count, format, isdigit,
+title, capitalize), raw strings, string multiplication, slicing,
+% formatting, `in` operator.
 
-### 2. Async / Await (2 features)
+### Exceptions
+try/except/finally/else, raise, bare raise, raise from, multiple except
+types, except* (ExceptionGroup).
 
-```python
-async def f():
-    await asyncio.sleep(0)
-    return 1
-```
-Requires async runtime, event loop integration, coroutine objects.
+### Generators & Iterators
+yield, yield from, generator expressions, send/close/throw (via CPython
+bridge for coroutine-style generators), iterator protocol (__iter__/__next__).
 
-### 3. Dunder methods — remaining gaps (4 features)
+### Async
+async def, await (via CPython bridge — async function bodies run in
+CPython's asyncio runtime).
 
-**__setitem__** — dispatches to the method but value coercion is wrong
-(string keys get garbled). Needs fixing in argument passing.
+### Pattern matching
+match/case with literal, capture, guard, or, wildcard, sequence patterns.
 
-**__iter__ / __next__** — iterator protocol. `for x in custom_obj`
-doesn't call `__iter__`/`__next__`. Blocked by: `raise StopIteration`
-not supported as a bare expression (only in try/except context).
+### Imports
+import module, from module import name (.pyd support via CPython bridge).
 
-**__call__ on constructor result** — `C()(5)` where the Call target is
-itself a Call expression. The pipeline allows it but codegen doesn't
-handle `ast.Call` as `node.func`.
+### Builtins
+print, range, len, sorted, int, abs, sum, min, max, list, reversed, set,
+enumerate, zip, isinstance (including tuple of types), str, type, any,
+all, bool, float, chr, ord, hex, oct, bin, round, repr, pow, divmod,
+dict, tuple, map, filter, hash, next, iter, bytearray, frozenset,
+complex, slice, getattr, setattr, hasattr, delattr.
 
-### 4. Property / Descriptors (2 features)
+### Control flow & misc
+if/elif/else, ternary, walrus operator, chained comparisons, with
+statement, assert, type hints (ignored), ellipsis, global/nonlocal,
+for/else, while/else, try/else.
 
-```python
-class C:
-    @property
-    def x(self): return self._x
-    @x.setter
-    def x(self, v): self._x = v
-```
-`@property` is recognized as a decorator but attribute access doesn't
-dispatch to the getter/setter. Needs special handling in `_emit_attr_load`
-and `_emit_attr_store` for property-decorated methods.
+## Known limitations (not bugs — architectural constraints)
 
-### 5. User Decorators (2 features)
+These are patterns that work partially or through fallback paths:
 
-```python
-@my_decorator
-def f(a, b): return a + b
-```
-Blocked by: `*args` not fully supported in nested function definitions
-(decorator wrappers typically use `def wrapper(*args, **kwargs)`).
+1. **Generators with send()** use CPython bridge — the function body runs
+   in CPython rather than as native compiled code. Simple yield/yield-from
+   generators compile natively via list collection.
 
-### 6. Star Expressions — remaining gaps (1 feature)
+2. **Async functions** run entirely in CPython via the bridge. No native
+   async compilation.
 
-**`f(**dict)` call** — `**kwargs` unpacking in function calls doesn't
-work correctly. `print(*list)` works. `f(*list)` works.
+3. **Metaclass support** is simplified — `type(C).__name__` is resolved at
+   compile time. Full metaclass instantiation protocol not implemented.
 
-### 7. Types — remaining gaps (3 features)
+4. **filter()** still uses the old int-int function pointer ABI (Hack 21
+   in CLAUDE.md). Works for int predicates and lambdas but not for
+   string-typed elements.
 
-- **complex** — `1+2j` not supported as constant
-- **bytearray** — `bytearray()` not implemented as builtin
-- **frozenset** — `frozenset()` not implemented as builtin
+5. **map()** with closures that capture variables works for variable-backed
+   function pointers but not for magic-number closures.
 
-### 8. Class Features — remaining gaps (2 features)
+6. **Complex numbers** route through CPython bridge — no native complex
+   arithmetic.
 
-- **Nested classes** — `Outer.Inner` not recognized as class access
-- **Metaclasses** — `class C(metaclass=M)` crashes
+7. **eval()/exec()** not supported natively (would need embedded interpreter).
 
-### 9. Exceptions — remaining gaps (1 feature)
+8. **Multiple dispatch / singledispatch** not supported.
 
-- **except\*** (Exception Groups, Python 3.11+) — `TryStar` not implemented
+9. **Dataclasses, NamedTuple** not supported (would need decorator processing).
 
-### 10. Other (2 features)
+10. **Context manager protocol** (`__enter__`/`__exit__`) — `with` statement
+    works for file-like patterns but custom context managers may not dispatch
+    correctly.
 
-- **nonlocal write-back** — partially broken for some closure patterns
-- **ellipsis `is` check** — `x is ...` not supported (`is` only handles None)
+11. **CPython bridge `int()`/`float()` on inline expressions** — `int(np.sum(a))`
+    works when `np.sum(a)` is a 1-arg call on a pyobj module, but fails for
+    2+ arg calls like `int(np.dot(a,b))`. The raw-call path only detects
+    1-arg CPython method calls.
 
-## Priority order for implementation
+12. **CPython bridge result arithmetic with `np.mean` style** — printing a
+    numpy float64 scalar directly shows the result via CPython's `str()`, but
+    using it in float arithmetic or `float()` conversion doesn't detect it
+    as a float (treated as OBJ tag → pointer garbage).
 
-1. **Generators/yield** — used everywhere, largest single gap
-2. **__iter__/__next__** — iterator protocol for custom classes
-3. **@property** — standard Python OOP
-4. **User decorators** — needs *args in nested functions
-5. **__setitem__ fix** — argument coercion bug
-6. **Nested classes** — relatively easy
-7. **nonlocal fix** — closure write-back bug
-8. **async/await** — needed for async programs
-9. **complex/bytearray/frozenset** — type support
-10. **except\*, metaclasses** — advanced features
+13. **Sorting with user-function keys on string params** — `sorted(lst, key=func)`
+    where func takes a string parameter fails because call-site analysis
+    doesn't trace through sorted() to infer parameter types.

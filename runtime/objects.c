@@ -72,6 +72,10 @@ int64_t fpy_list_len(FpyList *list) {
 extern void fastpy_format_float(double value, char *buf, int bufsize);
 #define format_float fastpy_format_float
 
+/* Forward declarations for set print (used by fpy_value_write) */
+void fastpy_set_print(FpyDict *set);
+void fastpy_set_write(FpyDict *set);
+
 /* --- Value repr (for list elements: strings get quotes) --- */
 
 void fpy_value_repr(FpyValue val, char *buf, int bufsize) {
@@ -122,6 +126,20 @@ void fpy_value_repr(FpyValue val, char *buf, int bufsize) {
             extern const char* fastpy_obj_to_str(FpyObj*);
             const char *s = fastpy_obj_to_str(val.data.obj);
             snprintf(buf, bufsize, "%s", s);
+            break;
+        }
+        case FPY_TAG_SET: {
+            FpyDict *set = (FpyDict*)val.data.list;
+            int pos = 0;
+            pos += snprintf(buf + pos, bufsize - pos, "{");
+            for (int64_t i = 0; i < set->length; i++) {
+                if (i > 0) pos += snprintf(buf + pos, bufsize - pos, ", ");
+                char elem[256];
+                fpy_value_repr(set->keys[i], elem, sizeof(elem));
+                pos += snprintf(buf + pos, bufsize - pos, "%s", elem);
+                if (pos >= bufsize - 1) break;
+            }
+            snprintf(buf + pos, bufsize - pos, "}");
             break;
         }
     }
@@ -195,6 +213,10 @@ int32_t fastpy_fv_truthy(int32_t tag, int64_t data) {
             return d && d->length != 0;
         }
         case FPY_TAG_OBJ: return data != 0;
+        case FPY_TAG_SET: {
+            FpyDict *s = (FpyDict*)data;
+            return s && s->length != 0;
+        }
     }
     return 0;
 }
@@ -226,6 +248,9 @@ void fpy_value_write(FpyValue val) {
             break;
         case FPY_TAG_DICT:
             fastpy_dict_write((FpyDict*)val.data.list);
+            break;
+        case FPY_TAG_SET:
+            fastpy_set_write((FpyDict*)val.data.list);
             break;
     }
 }
@@ -927,52 +952,140 @@ int64_t fastpy_dict_length(FpyDict *dict) {
     return dict->length;
 }
 
-/* --- Set operations (on FpyList) --- */
+/* --- Set operations (dict-backed, O(1) membership via hash table) ---
+ *
+ * Sets are FpyDict where keys = elements, values = fpy_none().
+ * This gives O(1) add/remove/contains vs O(n) with the old list approach.
+ * The codegen tags set-typed values with FPY_TAG_SET.
+ */
 
-FpyList* fastpy_set_union(FpyList *a, FpyList *b) {
-    FpyList *result = fpy_list_new(a->length + b->length);
-    for (int64_t i = 0; i < a->length; i++) fpy_list_append(result, a->items[i]);
-    for (int64_t i = 0; i < b->length; i++) {
-        int found = 0;
-        for (int64_t j = 0; j < a->length; j++) {
-            if (a->items[j].tag == b->items[i].tag && a->items[j].tag == FPY_TAG_INT
-                && a->items[j].data.i == b->items[i].data.i) { found = 1; break; }
-        }
-        if (!found) fpy_list_append(result, b->items[i]);
+/* Check if a set (FpyDict) contains a key. O(1) via hash lookup. */
+int fastpy_set_contains(FpyDict *set, FpyValue key) {
+    uint64_t h = fpy_hash_value(key);
+    int64_t mask = set->table_size - 1;
+    int64_t slot = (int64_t)(h & (uint64_t)mask);
+    while (1) {
+        int64_t idx = set->indices[slot];
+        if (idx == FPY_DICT_EMPTY) return 0;
+        if (idx != FPY_DICT_DELETED && fpy_key_equal(set->keys[idx], key))
+            return 1;
+        slot = (slot + 1) & mask;
     }
-    return result;
 }
 
-FpyList* fastpy_set_intersection(FpyList *a, FpyList *b) {
-    FpyList *result = fpy_list_new(a->length);
-    for (int64_t i = 0; i < a->length; i++) {
-        for (int64_t j = 0; j < b->length; j++) {
-            if (a->items[i].tag == b->items[j].tag && a->items[i].tag == FPY_TAG_INT
-                && a->items[i].data.i == b->items[j].data.i) {
-                fpy_list_append(result, a->items[i]); break;
+/* Check if a set contains an element (FV ABI). O(1) hash lookup. */
+int32_t fastpy_set_contains_fv(FpyDict *set, int32_t tag, int64_t data) {
+    FpyValue key; key.tag = tag; key.data.i = data;
+    return fastpy_set_contains(set, key);
+}
+
+/* Add an element to a set. */
+void fastpy_set_add_fv(FpyDict *set, int32_t tag, int64_t data) {
+    FpyValue key; key.tag = tag; key.data.i = data;
+    FpyValue val = fpy_none();
+    fpy_dict_set(set, key, val);
+}
+
+/* Remove an element from a set (no error if absent). */
+void fastpy_set_discard_fv(FpyDict *set, int32_t tag, int64_t data) {
+    FpyValue key; key.tag = tag; key.data.i = data;
+    uint64_t h = fpy_hash_value(key);
+    int64_t mask = set->table_size - 1;
+    int64_t slot = (int64_t)(h & (uint64_t)mask);
+    while (1) {
+        int64_t idx = set->indices[slot];
+        if (idx == FPY_DICT_EMPTY) return;  /* not found — no error */
+        if (idx != FPY_DICT_DELETED && fpy_key_equal(set->keys[idx], key)) {
+            /* Mark slot as deleted, compact entries, and rebuild indices. */
+            set->indices[slot] = FPY_DICT_DELETED;
+            for (int64_t j = idx; j < set->length - 1; j++) {
+                set->keys[j] = set->keys[j + 1];
+                set->values[j] = set->values[j + 1];
             }
+            set->length--;
+            fpy_dict_rebuild_indices(set);
+            return;
         }
+        slot = (slot + 1) & mask;
     }
+}
+
+/* Convert a list to a set (dict with keys from list, values = None). */
+FpyDict* fastpy_set_from_list(FpyList *list) {
+    FpyDict *set = fpy_dict_new(list->length > 4 ? list->length : 4);
+    FpyValue none_val = fpy_none();
+    for (int64_t i = 0; i < list->length; i++) {
+        fpy_dict_set(set, list->items[i], none_val);
+    }
+    return set;
+}
+
+/* Extract set keys as a list (for sorted(), iteration, etc.). */
+FpyList* fastpy_set_to_list(FpyDict *set) {
+    return fastpy_dict_keys(set);
+}
+
+/* Set union: a | b → new set containing elements from both. */
+FpyDict* fastpy_set_union(FpyDict *a, FpyDict *b) {
+    FpyDict *result = fpy_dict_new(a->length + b->length);
+    FpyValue none_val = fpy_none();
+    for (int64_t i = 0; i < a->length; i++)
+        fpy_dict_set(result, a->keys[i], none_val);
+    for (int64_t i = 0; i < b->length; i++)
+        fpy_dict_set(result, b->keys[i], none_val);
     return result;
 }
 
-FpyList* fastpy_set_difference(FpyList *a, FpyList *b) {
-    FpyList *result = fpy_list_new(a->length);
+/* Set intersection: a & b → elements in both. */
+FpyDict* fastpy_set_intersection(FpyDict *a, FpyDict *b) {
+    FpyDict *result = fpy_dict_new(a->length < b->length ? a->length : b->length);
+    FpyValue none_val = fpy_none();
     for (int64_t i = 0; i < a->length; i++) {
-        int found = 0;
-        for (int64_t j = 0; j < b->length; j++) {
-            if (a->items[i].tag == b->items[j].tag && a->items[i].tag == FPY_TAG_INT
-                && a->items[i].data.i == b->items[j].data.i) { found = 1; break; }
-        }
-        if (!found) fpy_list_append(result, a->items[i]);
+        if (fastpy_set_contains(b, a->keys[i]))
+            fpy_dict_set(result, a->keys[i], none_val);
     }
     return result;
 }
 
-FpyList* fastpy_set_symmetric_diff(FpyList *a, FpyList *b) {
-    FpyList *diff_ab = fastpy_set_difference(a, b);
-    FpyList *diff_ba = fastpy_set_difference(b, a);
-    return fastpy_set_union(diff_ab, diff_ba);
+/* Set difference: a - b → elements in a but not in b. */
+FpyDict* fastpy_set_difference(FpyDict *a, FpyDict *b) {
+    FpyDict *result = fpy_dict_new(a->length);
+    FpyValue none_val = fpy_none();
+    for (int64_t i = 0; i < a->length; i++) {
+        if (!fastpy_set_contains(b, a->keys[i]))
+            fpy_dict_set(result, a->keys[i], none_val);
+    }
+    return result;
+}
+
+/* Set symmetric difference: a ^ b → elements in either but not both. */
+FpyDict* fastpy_set_symmetric_diff(FpyDict *a, FpyDict *b) {
+    FpyDict *result = fpy_dict_new(a->length + b->length);
+    FpyValue none_val = fpy_none();
+    for (int64_t i = 0; i < a->length; i++) {
+        if (!fastpy_set_contains(b, a->keys[i]))
+            fpy_dict_set(result, a->keys[i], none_val);
+    }
+    for (int64_t i = 0; i < b->length; i++) {
+        if (!fastpy_set_contains(a, b->keys[i]))
+            fpy_dict_set(result, b->keys[i], none_val);
+    }
+    return result;
+}
+
+/* Print a set in {a, b, c} format. */
+void fastpy_set_print(FpyDict *set) {
+    printf("{");
+    for (int64_t i = 0; i < set->length; i++) {
+        if (i > 0) printf(", ");
+        char buf[256];
+        fpy_value_repr(set->keys[i], buf, sizeof(buf));
+        printf("%s", buf);
+    }
+    printf("}");}
+
+void fastpy_set_write(FpyDict *set) {
+    fastpy_set_print(set);
 }
 
 /* --- Closure support --- */
@@ -2080,6 +2193,79 @@ int64_t fastpy_str_count(const char *s, const char *sub) {
     return count;
 }
 
+/* List copy — shallow copy of the list */
+FpyList* fastpy_list_copy(FpyList *list) {
+    FpyList *result = fpy_list_new(list->length);
+    for (int64_t i = 0; i < list->length; i++)
+        fpy_list_append(result, list->items[i]);
+    result->is_tuple = list->is_tuple;
+    return result;
+}
+
+/* List clear — remove all items */
+void fastpy_list_clear(FpyList *list) {
+    list->length = 0;
+}
+
+/* Slice assignment: a[start:stop] = new_values
+ * Replaces elements a[start..stop) with elements from new_values.
+ * The replacement list can be a different length than the slice. */
+void fastpy_list_slice_assign(FpyList *list, int64_t start, int64_t stop,
+                               FpyList *new_values) {
+    /* Clamp indices */
+    if (start < 0) start += list->length;
+    if (stop < 0) stop += list->length;
+    if (start < 0) start = 0;
+    if (stop > list->length) stop = list->length;
+    if (start > stop) start = stop;
+
+    int64_t old_len = stop - start;
+    int64_t new_len = new_values->length;
+    int64_t diff = new_len - old_len;
+    int64_t final_len = list->length + diff;
+
+    /* Grow capacity if needed */
+    while (list->capacity < final_len) {
+        list->capacity = list->capacity * 2;
+        list->items = (FpyValue*)realloc(list->items,
+            sizeof(FpyValue) * list->capacity);
+    }
+
+    /* Shift tail elements */
+    if (diff != 0) {
+        memmove(&list->items[stop + diff], &list->items[stop],
+                sizeof(FpyValue) * (list->length - stop));
+    }
+
+    /* Copy new values into the gap */
+    for (int64_t i = 0; i < new_len; i++) {
+        list->items[start + i] = new_values->items[i];
+    }
+    list->length = final_len;
+}
+
+/* Set discard — remove element if present, no error if absent */
+void fastpy_set_discard(FpyList *set, int64_t value) {
+    for (int64_t i = 0; i < set->length; i++) {
+        if (set->items[i].tag == FPY_TAG_INT && set->items[i].data.i == value) {
+            for (int64_t j = i; j < set->length - 1; j++)
+                set->items[j] = set->items[j + 1];
+            set->length--;
+            return;
+        }
+    }
+}
+
+/* Dict merge — create new dict from two dicts (a | b) */
+FpyDict* fastpy_dict_merge(FpyDict *a, FpyDict *b) {
+    FpyDict *result = fpy_dict_new(a->length + b->length);
+    for (int64_t i = 0; i < a->length; i++)
+        fpy_dict_set(result, a->keys[i], a->values[i]);
+    for (int64_t i = 0; i < b->length; i++)
+        fpy_dict_set(result, b->keys[i], b->values[i]);
+    return result;
+}
+
 /* List concatenation */
 FpyList* fastpy_list_concat(FpyList *a, FpyList *b) {
     FpyList *result = fpy_list_new(a->length + b->length);
@@ -2299,9 +2485,8 @@ FpyList* fastpy_list_sorted_by_key_int(FpyList *lst, void *key_fn) {
     int64_t *order = (int64_t*)malloc(sizeof(int64_t) * n);
     for (int64_t i = 0; i < n; i++) {
         order[i] = i;
-        /* Compute key for each element */
-        int64_t v = (lst->items[i].tag == FPY_TAG_INT) ? lst->items[i].data.i : 0;
-        keys[i] = fn(v);
+        /* Pass element data (int value or pointer-as-int) to key function */
+        keys[i] = fn(lst->items[i].data.i);
     }
     /* Simple insertion sort on order by keys (stable) */
     for (int64_t i = 1; i < n; i++) {
@@ -2315,6 +2500,38 @@ FpyList* fastpy_list_sorted_by_key_int(FpyList *lst, void *key_fn) {
         order[j + 1] = cur;
     }
     /* Build result list in sorted order */
+    for (int64_t i = 0; i < n; i++) {
+        fpy_list_append(result, lst->items[order[i]]);
+    }
+    free(keys);
+    free(order);
+    return result;
+}
+
+/* List sorted by key function returning string: key values are compared
+   with strcmp. The key_fn returns a char* (as int64_t). */
+FpyList* fastpy_list_sorted_by_key_str(FpyList *lst, void *key_fn) {
+    typedef int64_t (*keyfn_t)(int64_t);
+    keyfn_t fn = (keyfn_t)key_fn;
+    int64_t n = lst->length;
+    FpyList *result = fpy_list_new(n);
+    const char **keys = (const char**)malloc(sizeof(const char*) * n);
+    int64_t *order = (int64_t*)malloc(sizeof(int64_t) * n);
+    for (int64_t i = 0; i < n; i++) {
+        order[i] = i;
+        keys[i] = (const char*)(intptr_t)fn(lst->items[i].data.i);
+    }
+    /* Stable insertion sort by strcmp */
+    for (int64_t i = 1; i < n; i++) {
+        int64_t cur = order[i];
+        const char *cur_key = keys[cur];
+        int64_t j = i - 1;
+        while (j >= 0 && strcmp(keys[order[j]], cur_key) > 0) {
+            order[j + 1] = order[j];
+            j--;
+        }
+        order[j + 1] = cur;
+    }
     for (int64_t i = 0; i < n; i++) {
         fpy_list_append(result, lst->items[order[i]]);
     }
@@ -2644,6 +2861,7 @@ FpyObj* fastpy_obj_new(int class_id) {
     int sc = fpy_classes[class_id].slot_count;
     size_t total = sizeof(FpyObj) + sizeof(FpyValue) * sc;
     FpyObj *obj = (FpyObj*)fpy_arena_alloc(total);
+    obj->magic = FPY_OBJ_MAGIC;
     obj->class_id = class_id;
     obj->dynamic_attrs = NULL;
     if (sc > 0) {
@@ -2859,7 +3077,18 @@ const char* fastpy_obj_to_str(FpyObj *obj) {
     return buf;
 }
 
+/* Defined in cpython_bridge.c — prints a PyObject* via CPython's str() */
+extern void fpy_cpython_print_obj(void *pyobj);
+
 void fastpy_obj_write(FpyObj *obj) {
+    if (obj == NULL) { printf("None"); return; }
+    /* Check the magic number to distinguish native FpyObj from CPython
+     * PyObject* (e.g. numpy arrays returned via the bridge). Without this,
+     * accessing class_id on a PyObject* would read ob_refcnt and crash. */
+    if (obj->magic != FPY_OBJ_MAGIC) {
+        fpy_cpython_print_obj((void*)obj);
+        return;
+    }
     const char *s = fastpy_obj_to_str(obj);
     printf("%s", s);
 }

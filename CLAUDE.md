@@ -1005,6 +1005,14 @@ what's correct. Without this record, a future session can't distinguish
 "this code is wrong but intentional" from "this code is wrong and should
 be fixed."
 
+**Never silently defer a known bug.** If you discover a bug or incorrect
+behavior but choose not to fix it immediately (e.g., because you're in
+the middle of a different task), you MUST document it before moving on.
+Add it to §17, to UNIMPLEMENTED.md, or as a code comment at the site —
+whichever is most appropriate. The rule is: if you say "I'll fix this
+later" or "this is less important," the next line of work must be writing
+down what's broken and where. Undocumented deferred bugs are lost bugs.
+
 ### 17. Known hacks and architectural debt
 
 These are correctness issues in the current compiler that need to be
@@ -1353,17 +1361,21 @@ patterns like `isinstance(obj, type(other))` also won't work.
 **Proper fix:** Runtime type representation (needed for proper
 `isinstance`, `type()`, and class comparison semantics).
 
-#### Hack 16: `sorted(key=fn)` assumes int→int key function
+#### Hack 16: `sorted(key=fn)` assumes int→int key function (PARTIALLY FIXED)
 
-**What:** `list_sorted_by_key_int` in the runtime calls the key function
-as `int64_t (*)(int64_t)` — forced to int/int even when the element or
-key isn't an int. The codegen only accepts a named user function as the
-key argument (not a lambda or builtin).
+Updated 2026-04-19: `sorted(key=len)`, `sorted(key=abs)`, `sorted(key=lambda)`
+with int-returning lambdas, and `min/max(key=abs/len)` all work now. Builtin
+key functions (`abs`, `len`, `str`, `int`) are emitted as i64(i64) shim
+functions. Lambda params are typed based on the list's element type.
 
-**Why it exists:** We have no generic callable runtime type. The key
-function pointer is passed directly to C code, which needs a fixed ABI.
+**What still breaks:** User functions used as key= that take string
+parameters (e.g. `def last(s): return s[-1]`) fail because the FV-ABI
+param isn't recognized as a string — the call-site analysis doesn't
+trace through `sorted(key=func)` to infer parameter types.
 
-**What it breaks:** Sort by string key, sort of strings, lambda keys.
+**Proper fix:** Extend call-site analysis to trace key= arguments in
+sorted/min/max and populate `_call_site_param_types` for the key
+function, or carry type info in tagged values.
 Any non-int element goes through with data.i = 0 (see `list_sorted_by_key_int`
 in the runtime).
 
@@ -1432,17 +1444,23 @@ classes behave as immutable namespaces.
 **Proper fix:** Emit class objects at runtime and dispatch attribute
 access through them.
 
-#### Hack 21: `map()` and `filter()` assume int-int function signatures
+#### Hack 21: `map()` and `filter()` assume int-int function signatures (PARTIALLY FIXED)
 
-**What:** `list_map_int` / `list_filter_int` cast the function pointer
-to `int64_t (*)(int64_t)`. The codegen only accepts a named user
-function as the callable (same limitation as `sorted(key=…)`).
+Updated 2026-04-19: `map()` now uses an inline codegen loop instead of
+`list_map_int`. Each element is loaded via `list_get_fv` and the mapped
+function is called with proper type handling: builtin converters (`str`,
+`int`, `float`) are special-cased to emit correct tags; user functions
+and lambdas are called as `i64(*)(i64)` with tag inference from the
+function's return type. `map(str, [1,2,3])` now returns `['1','2','3']`
+correctly. `filter()` still uses the old `list_filter_int` path and
+has the same int-int limitation.
 
-**Why it exists:** No generic callable runtime. See Hack 16.
+**What still breaks:** `filter()` with string-returning predicates or
+non-int elements. `map()` with multi-arg functions. `map()` with closures
+that capture variables (closures work as variable-backed func pointers
+but not as magic-number closures).
 
-**What it breaks:** map/filter over non-int elements; lambdas; builtins.
-
-**Proper fix:** Tagged values + dynamic callable dispatch.
+**Proper fix:** Tagged values + dynamic callable dispatch for filter too.
 
 #### Hack 22: Dict-with-int-values detection (SCAFFOLDING — print path uses runtime tag)
 
