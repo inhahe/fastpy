@@ -66,6 +66,16 @@ if/elif/else, ternary, walrus operator, chained comparisons, with
 statement, assert, type hints (ignored), ellipsis, global/nonlocal,
 for/else, while/else, try/else.
 
+### Threading
+Three modes via CLI flags:
+- `--threading none` (default): single-threaded, no overhead
+- `--threading gil`: GIL mode, one thread runs compiled code at a time
+- `--threading free` or `-t`: free-threaded, per-object locks, true parallelism
+
+`threading.Thread(target=compiled_func)` works — compiled functions are
+auto-wrapped as CPython callables via `fpy_cpython_wrap_native`.
+Thread-local exception state and per-thread bump allocators.
+
 ## Known limitations (not bugs — architectural constraints)
 
 These are patterns that work partially or through fallback paths:
@@ -113,3 +123,17 @@ These are patterns that work partially or through fallback paths:
 13. **Sorting with user-function keys on string params** — `sorted(lst, key=func)`
     where func takes a string parameter fails because call-site analysis
     doesn't trace through sorted() to infer parameter types.
+
+14. **Threading: compiled functions with args** — `threading.Thread(target=func)`
+    works for zero-arg functions. Functions with parameters need the native
+    wrapper to handle argument passing (currently only `void(*)(void)` ABI).
+
+15. **Threading: shared mutable state** — module-level variables (lists, dicts)
+    aren't accessible from within thread worker functions due to the existing
+    global variable scope limitation. Use CPython bridge functions instead.
+
+16. **Threading: per-object locking coverage** — `FPY_LOCK/FPY_UNLOCK` is
+    added to `fpy_list_append`, `fpy_list_set`, `fpy_dict_set` but not yet
+    to all mutating operations (pop, remove, insert, extend, clear, sort,
+    reverse, dict_delete, obj_set_fv, etc.). These need to be added for
+    full free-threaded safety.

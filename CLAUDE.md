@@ -20,10 +20,12 @@ compiler exists to make Python fast enough for OS-level userspace work.
 |----------|------|
 | `compiler/` | The compiler itself (Python) |
 | `compiler/pipeline.py` | Main compilation pipeline: source -> parse -> analyze -> codegen -> link |
-| `compiler/__main__.py` | CLI entry point: `python -m compiler source.py -o output` |
+| `compiler/__main__.py` | CLI entry point: `python -m compiler source.py -o output [-t] [--threading {none,gil,free}]` |
 | `fastpy/` | CPython shim package — provides opt-in types that work under both CPython and the compiler |
 | `fastpy/ints.py` | Fixed-width integer types: Int32, UInt32, Int64, UInt64 |
-| `runtime/` | C runtime (GC, BigInt, containers) — linked into compiled binaries |
+| `runtime/` | C runtime (GC, BigInt, containers, threading) — linked into compiled binaries |
+| `runtime/threading.h` | Threading primitives: mutex, condvar, atomics, GIL, TLS macros |
+| `runtime/threading.c` | GIL implementation, print mutex |
 | `tests/harness.py` | Differential test engine: runs programs under CPython and compiler, compares output |
 | `tests/conftest.py` | Pytest fixtures and auto-collection of test program files |
 | `tests/test_differential.py` | Inline differential tests covering language features |
@@ -85,6 +87,33 @@ python -m pytest tests/ -v          # full suite
 python -m pytest tests/ -v -x       # stop on first failure
 python -m pytest tests/test_shim.py # just the shim tests
 ```
+
+### Threading
+
+Three compile-time modes, selected via CLI flag:
+
+| Mode | Flag | Runtime behavior |
+|------|------|-----------------|
+| Single-threaded | `--threading none` (default) | No locks, no TLS overhead |
+| GIL | `--threading gil` | Global lock, one thread at a time (matches CPython) |
+| Free-threaded | `--threading free` or `-t` | Per-object locks, true parallelism (matches CPython 3.13t) |
+
+**Architecture:**
+- `fpy_threading_mode` global (0/1/2) emitted by codegen, read by runtime
+- Exception state is always thread-local (`__declspec(thread)` / `__thread`)
+- Bump allocator is always per-thread (each thread gets its own arena chain)
+- GIL: mutex + condvar in `threading.c`, acquired by main thread at startup,
+  released around CPython bridge calls (`FPY_BRIDGE_ENTER/LEAVE`)
+- Free-threaded: `fpy_mutex_t lock` field on FpyObj, FpyList, FpyDict;
+  `FPY_LOCK/FPY_UNLOCK` macros wrap mutations (no-op in other modes)
+- Native function wrapper: `fpy_cpython_wrap_native` creates a CPython
+  callable from a compiled function pointer, enabling
+  `threading.Thread(target=compiled_func)`
+- Keyword argument support in CPython bridge: `fpy_cpython_call_kw` /
+  `fpy_cpython_call_kw_raw` handle `target=func` style calls
+
+**Key files:** `runtime/threading.h` (primitives), `runtime/threading.c`
+(GIL impl), `compiler/__main__.py` (CLI flags).
 
 ---
 
