@@ -11407,7 +11407,29 @@ class CodeGen:
                 raise CodeGenError("bool() takes exactly one argument", node)
             if name == "float":
                 if len(node.args) == 1:
-                    val = self._emit_expr_value(node.args[0])
+                    arg_node = node.args[0]
+                    # pyobj: call Python's float() via bridge
+                    if self._is_pyobj_var(arg_node):
+                        ptr = self._load_variable(arg_node.id, arg_node)
+                        if isinstance(ptr.type, ir.IntType):
+                            ptr = self.builder.inttoptr(ptr, i8_ptr)
+                        blt = self._make_string_constant("builtins")
+                        blt_mod = self.builder.call(
+                            self.runtime["cpython_import"], [blt])
+                        float_name = self._make_string_constant("float")
+                        float_fn = self.builder.call(
+                            self.runtime["cpython_getattr"],
+                            [blt_mod, float_name])
+                        out_tag = self._create_entry_alloca(i32, "float.tag")
+                        out_data = self._create_entry_alloca(i64, "float.data")
+                        self.builder.call(self.runtime["cpython_call1"],
+                                          [float_fn,
+                                           ir.Constant(i32, FPY_TAG_OBJ),
+                                           self.builder.ptrtoint(ptr, i64),
+                                           out_tag, out_data])
+                        data = self.builder.load(out_data)
+                        return self.builder.bitcast(data, double)
+                    val = self._emit_expr_value(arg_node)
                     if isinstance(val.type, ir.IntType):
                         return self.builder.sitofp(val, double)
                     if isinstance(val.type, ir.PointerType):
@@ -11908,11 +11930,11 @@ class CodeGen:
             self.builder.call(self.runtime["list_append_fv"],
                               [result, ir.Constant(i32, FPY_TAG_FLOAT), elem_data])
         else:
-            # General case: get function pointer and call as i64(i64)
+            # General case: get function pointer and call via call_ptr1
+            # (which auto-detects closures via magic number)
             fn_ptr = self._get_unary_func_ptr(fn_node, node)
-            fn_typed = self.builder.bitcast(fn_ptr,
-                ir.PointerType(ir.FunctionType(i64, [i64])))
-            mapped = self.builder.call(fn_typed, [elem_data])
+            mapped = self.builder.call(
+                self.runtime["call_ptr1"], [fn_ptr, elem_data])
             # Infer result tag from the function
             if isinstance(fn_node, ast.Lambda):
                 # Lambda body type determines the tag
@@ -12000,8 +12022,6 @@ class CodeGen:
         fn_node = node.args[0]
         seq = self._emit_expr_value(node.args[1])
         fn_ptr = self._get_unary_func_ptr(fn_node, node)
-        fn_typed = self.builder.bitcast(fn_ptr,
-            ir.PointerType(ir.FunctionType(i64, [i64])))
         result = self.builder.call(self.runtime["list_new"], [])
         length = self.builder.call(self.runtime["list_length"], [seq])
 
@@ -12028,8 +12048,9 @@ class CodeGen:
         elem_data = self.builder.load(elem_data_a)
         elem_tag = self.builder.load(elem_tag_a)
 
-        # Call predicate with the element data
-        pred_result = self.builder.call(fn_typed, [elem_data])
+        # Call predicate via call_ptr1 (handles closures via magic number)
+        pred_result = self.builder.call(
+            self.runtime["call_ptr1"], [fn_ptr, elem_data])
         # Check truthiness — non-zero means keep
         is_truthy = self.builder.icmp_signed(
             "!=", pred_result, ir.Constant(i64, 0))

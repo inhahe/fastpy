@@ -441,10 +441,31 @@ typedef struct {
 
 static PyObject* fpy_native_call(FpyNativeCallable *self,
                                   PyObject *args, PyObject *kwargs) {
-    if (self->func) {
+    if (!self->func) Py_RETURN_NONE;
+
+    Py_ssize_t n = args ? PyTuple_GET_SIZE(args) : 0;
+    if (n == 0) {
+        /* void(*)(void) */
         self->func();
-        fflush(stdout);
+    } else {
+        /* Convert Python args to i64 and call with appropriate arity */
+        typedef int64_t (*fn1_t)(int64_t);
+        typedef int64_t (*fn2_t)(int64_t, int64_t);
+        typedef int64_t (*fn3_t)(int64_t, int64_t, int64_t);
+        int64_t a[4];
+        for (Py_ssize_t i = 0; i < n && i < 4; i++) {
+            int32_t tag; int64_t data;
+            pyobject_to_fpy(PyTuple_GET_ITEM(args, i), &tag, &data);
+            a[i] = data;
+        }
+        switch (n) {
+            case 1: ((fn1_t)self->func)(a[0]); break;
+            case 2: ((fn2_t)self->func)(a[0], a[1]); break;
+            case 3: ((fn3_t)self->func)(a[0], a[1], a[2]); break;
+            default: self->func(); break;
+        }
     }
+    fflush(stdout);
     Py_RETURN_NONE;
 }
 
