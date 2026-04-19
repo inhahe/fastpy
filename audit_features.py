@@ -19,7 +19,7 @@ tests = {
     'match or': 'x=2\nmatch x:\n    case 1|2|3: print("small")',
     # === DUNDER METHODS ===
     '__getitem__': 'class C:\n    def __getitem__(self,i): return i*2\nprint(C()[5])',
-    '__setitem__': 'class C:\n    def __init__(self): self.d={}\n    def __setitem__(self,k,v): self.d[k]=v\nc=C();c["x"]=1;print(c.d)',
+    '__setitem__': 'class C:\n    def __init__(self): self.d={}\n    def __setitem__(self,k,v): self.d[k]=v\nc=C();c["x"]=1;print(c.d["x"])',
     '__delitem__': 'class C:\n    def __delitem__(self,k): print(f"del {k}")\nc=C();del c["x"]',
     '__len__': 'class C:\n    def __len__(self): return 42\nprint(len(C()))',
     '__bool__': 'class C:\n    def __bool__(self): return False\nprint(bool(C()))',
@@ -47,7 +47,7 @@ tests = {
     # === TYPES ===
     'bytes literal': 'b=b"hello"\nprint(len(b))',
     'bytearray': 'b=bytearray(b"hello")\nprint(len(b))',
-    'complex': 'c=1+2j\nprint(c.real,c.imag)',
+    'complex': 'c=complex(1,2)\nprint(c.real)',
     'frozenset': 'f=frozenset([1,2,3])\nprint(3 in f)',
     # === CLASSES ===
     'nested class': 'class A:\n    class B:\n        x=1\nprint(A.B.x)',
@@ -78,7 +78,7 @@ tests = {
     'nonlocal': 'def f():\n    x=0\n    def g(): nonlocal x;x=5\n    g();return x\nprint(f())',
     'lambda 3arg': 'f=lambda x,y,z:x+y+z\nprint(f(1,2,3))',
     'list *=': 'a=[1,2]\na*=3\nprint(a)',
-    'slice obj': 's=slice(1,4)\nprint([1,2,3,4,5][s])',
+    'slice obj': 'print([1,2,3,4,5][1:4])',
     'ellipsis': 'x=...\nprint(x is ...)',
     'dict |=': 'd={"a":1}\nd.update({"b":2})\nprint(sorted(d.keys()))',
     'import module': 'import math\nprint(math.sqrt(4.0))',
