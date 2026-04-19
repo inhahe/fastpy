@@ -406,6 +406,18 @@ class CodeGen:
         # Wrap a native function pointer as a CPython callable
         ft = ir.FunctionType(i8_ptr, [i8_ptr])
         self.runtime["cpython_wrap_native"] = ir.Function(self.module, ft, name="fpy_cpython_wrap_native")
+
+        # Native math functions (C's libm) — avoids CPython bridge for math
+        ft_dd = ir.FunctionType(double, [double])
+        ft_dd2 = ir.FunctionType(double, [double, double])
+        for name in ("sqrt", "sin", "cos", "tan", "asin", "acos", "atan",
+                      "exp", "log", "log10", "ceil", "floor", "fabs",
+                      "sinh", "cosh", "tanh"):
+            self.runtime[f"math_{name}"] = ir.Function(self.module, ft_dd, name=name)
+        self.runtime["math_atan2"] = ir.Function(self.module, ft_dd2, name="atan2")
+        self.runtime["math_pow"] = ir.Function(self.module, ft_dd2, name="pow")
+        self.runtime["math_fmod"] = ir.Function(self.module, ft_dd2, name="fmod")
+        self.runtime["math_log2"] = ir.Function(self.module, ft_dd, name="log2")
         # General call with kwargs: call_kw(callable, n_args, *tags, *data,
         #     n_kwargs, *names, *kw_tags, *kw_data, &out_tag, &out_data)
         ft = ir.FunctionType(void, [
@@ -7200,12 +7212,47 @@ class CodeGen:
         else:
             raise CodeGenError("yield from requires an iterable", node)
 
+    # Modules with native implementations (no CPython bridge needed)
+    _NATIVE_MODULES = {"math"}
+
+    # Native math constants
+    _MATH_CONSTANTS = {
+        "pi": 3.141592653589793,
+        "e": 2.718281828459045,
+        "tau": 6.283185307179586,
+        "inf": float("inf"),
+    }
+
+    # Native math functions: maps Python name → (runtime key, n_args)
+    _MATH_FUNCTIONS = {
+        "sqrt": ("math_sqrt", 1), "sin": ("math_sin", 1),
+        "cos": ("math_cos", 1), "tan": ("math_tan", 1),
+        "asin": ("math_asin", 1), "acos": ("math_acos", 1),
+        "atan": ("math_atan", 1), "atan2": ("math_atan2", 2),
+        "exp": ("math_exp", 1), "log": ("math_log", 1),
+        "log2": ("math_log2", 1), "log10": ("math_log10", 1),
+        "ceil": ("math_ceil", 1), "floor": ("math_floor", 1),
+        "fabs": ("math_fabs", 1), "pow": ("math_pow", 2),
+        "fmod": ("math_fmod", 2),
+        "sinh": ("math_sinh", 1), "cosh": ("math_cosh", 1),
+        "tanh": ("math_tanh", 1),
+    }
+
     def _emit_import(self, node: ast.Import) -> None:
         """Emit `import module` — loads a CPython module (.pyd or .py)
         via the CPython C API and stores the PyObject* as a variable."""
         for alias in node.names:
             mod_name = alias.name
             var_name = alias.asname if alias.asname else mod_name
+
+            # Native module: mark as native, no CPython bridge needed
+            if mod_name in self._NATIVE_MODULES:
+                if not hasattr(self, '_native_modules'):
+                    self._native_modules = set()
+                self._native_modules.add(var_name)
+                # Store a dummy value — attribute access is intercepted
+                self._store_variable(var_name, ir.Constant(i64, 0), "native_mod")
+                continue
 
             # Create a global to hold the module PyObject*
             if mod_name not in self._cpython_modules:
@@ -7246,6 +7293,19 @@ class CodeGen:
     def _emit_import_from(self, node: ast.ImportFrom) -> None:
         """Emit `from module import name1, name2`."""
         mod_name = node.module
+
+        # Native module: store function markers instead of pyobj
+        if mod_name in self._NATIVE_MODULES:
+            if not hasattr(self, '_native_imports'):
+                self._native_imports = {}
+            for alias in node.names:
+                attr_name = alias.name
+                var_name = alias.asname if alias.asname else attr_name
+                self._native_imports[var_name] = (mod_name, attr_name)
+                # Store dummy — calls are intercepted in _emit_call_expr
+                self._store_variable(var_name, ir.Constant(i64, 0), "native_func")
+            return
+
         if mod_name not in self._cpython_modules:
             gvar = ir.GlobalVariable(
                 self.module, i8_ptr,
@@ -9854,6 +9914,24 @@ class CodeGen:
             return self._fv_build_from_slots(tag, data)
         # CPython module attribute (e.g. math.pi) — must come BEFORE the
         # generic Attribute handler which calls obj_get_fv.
+        # Native module attribute (math.pi): return constant as FpyValue
+        if (isinstance(node, ast.Attribute)
+                and isinstance(node.value, ast.Name)
+                and node.value.id in self.variables
+                and self.variables[node.value.id][1] == "native_mod"):
+            val = self._emit_native_module_attr(node.value.id, node.attr)
+            if val is not None:
+                return self._wrap_for_print(val, node)
+        # Native module call in print context (print(math.sqrt(x)))
+        if (isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id in self.variables
+                and self.variables[node.func.value.id][1] == "native_mod"):
+            val = self._emit_native_module_call(
+                node.func.value.id, node.func.attr, node)
+            if val is not None:
+                return self._wrap_for_print(val, node)
         if (isinstance(node, ast.Attribute)
                 and isinstance(node.value, ast.Name)
                 and node.value.id in self.variables
@@ -10913,7 +10991,15 @@ class CodeGen:
                 else:
                     display = self._static_type_of(node.value.args[0])
                     return self._make_string_constant(display)
-            # CPython module attribute (e.g. math.pi): return as i8*
+            # Native module attribute (e.g. math.pi): return constant
+            if (isinstance(node.value, ast.Name)
+                    and node.value.id in self.variables
+                    and self.variables[node.value.id][1] == "native_mod"):
+                result = self._emit_native_module_attr(
+                    node.value.id, node.attr)
+                if result is not None:
+                    return result
+            # CPython module attribute (e.g. os.sep): return as i8*
             # (PyObject*). Callers that need the FpyValue should use
             # _load_or_wrap_fv which does proper bridge conversion.
             if (isinstance(node.value, ast.Name)
@@ -10958,11 +11044,20 @@ class CodeGen:
         """Emit a function call as an expression (return value is used)."""
         if isinstance(node.func, ast.Name):
             name = node.func.id
+            # Native module function (from math import sqrt → sqrt(x))
+            if name in getattr(self, '_native_imports', {}):
+                mod, attr = self._native_imports[name]
+                result = self._emit_native_module_call(mod, attr, node)
+                if result is not None:
+                    return result
             # Check for closure variable
             if name in self.variables:
                 _, tag = self.variables[name]
                 if tag == "closure":
                     return self._emit_closure_call(node)
+                if tag == "native_func":
+                    # Native function via from-import — already handled above
+                    pass
             if name in self._user_functions:
                 result = self._emit_user_call(node)
                 if result is None:
@@ -11649,7 +11744,16 @@ class CodeGen:
 
         # Method calls like s.lower(), obj.speak()
         if isinstance(node.func, ast.Attribute):
-            # CPython module method call: math.sqrt(x), os.path.exists(x), etc.
+            # Native module call: math.sqrt(x) → direct C libm call
+            if (isinstance(node.func.value, ast.Name)
+                    and node.func.value.id in self.variables
+                    and self.variables[node.func.value.id][1] == "native_mod"):
+                result = self._emit_native_module_call(
+                    node.func.value.id, node.func.attr, node)
+                if result is not None:
+                    return result
+
+            # CPython module method call: os.getcwd(), json.dumps(x), etc.
             # Check if the receiver is a pyobj variable or a chained
             # attribute access on a pyobj (e.g. os.path → Attribute on os).
             receiver_is_pyobj = False
@@ -11831,6 +11935,52 @@ class CodeGen:
 
         self.builder.position_at_end(end_block)
         return result
+
+    def _emit_native_module_call(self, mod_name: str, func_name: str,
+                                  node: ast.Call) -> ir.Value | None:
+        """Emit a native module function call (e.g. math.sqrt(x)).
+        Returns the result value, or None if the function isn't natively supported."""
+        if mod_name in self._NATIVE_MODULES:
+            # math module
+            if func_name in self._MATH_FUNCTIONS:
+                rt_key, n_expected = self._MATH_FUNCTIONS[func_name]
+                if len(node.args) == n_expected:
+                    args = []
+                    for arg_node in node.args:
+                        val = self._emit_expr_value(arg_node)
+                        # Convert to double if needed
+                        if isinstance(val.type, ir.IntType):
+                            val = self.builder.sitofp(val, double)
+                        elif isinstance(val.type, ir.PointerType):
+                            # pyobj — convert through bridge
+                            val = self._convert_pyobj_to_numeric(val, arg_node)
+                            if val is None:
+                                return None
+                        args.append(val)
+                    result = self.builder.call(self.runtime[rt_key], args)
+                    # floor() and ceil() return int in Python (not float)
+                    if func_name in ("floor", "ceil"):
+                        return self.builder.fptosi(result, i64)
+                    return result
+                # Special case: math.log(x, base) — 2-arg log
+                if func_name == "log" and len(node.args) == 2:
+                    x = self._emit_expr_value(node.args[0])
+                    base = self._emit_expr_value(node.args[1])
+                    if isinstance(x.type, ir.IntType):
+                        x = self.builder.sitofp(x, double)
+                    if isinstance(base.type, ir.IntType):
+                        base = self.builder.sitofp(base, double)
+                    log_x = self.builder.call(self.runtime["math_log"], [x])
+                    log_base = self.builder.call(self.runtime["math_log"], [base])
+                    return self.builder.fdiv(log_x, log_base)
+        return None
+
+    def _emit_native_module_attr(self, mod_name: str, attr_name: str) -> ir.Value | None:
+        """Emit a native module attribute access (e.g. math.pi).
+        Returns the constant value, or None if not natively supported."""
+        if attr_name in self._MATH_CONSTANTS:
+            return ir.Constant(double, self._MATH_CONSTANTS[attr_name])
+        return None
 
     def _emit_builtin_filter(self, node: ast.Call) -> ir.Value:
         """Emit filter(func, iterable) as an inline loop.
