@@ -165,6 +165,7 @@ _SUPPORTED_STMT_NODES = (
     ast.Import,      # import module
     ast.ImportFrom,  # from module import name
     ast.Match,       # match/case (Python 3.10+)
+    ast.AnnAssign,   # x: int = expr (type-annotated assignment)
     ast.AsyncFunctionDef,  # async def (routed through CPython bridge)
     ast.TryStar,     # except* (exception groups, Python 3.11+)
 )

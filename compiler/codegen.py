@@ -5042,6 +5042,14 @@ class CodeGen:
             self._emit_async_funcdef(node)
         elif isinstance(node, ast.TryStar):
             self._emit_try_star(node)
+        elif isinstance(node, ast.AnnAssign):
+            # Type-annotated assignment: x: int = expr → ignore annotation
+            if node.value is not None and node.target is not None:
+                # Treat as regular assignment
+                fake = ast.Assign(targets=[node.target], value=node.value)
+                ast.copy_location(fake, node)
+                self._emit_assign(fake)
+            # Bare annotation (x: int) with no value — skip
         else:
             raise CodeGenError(f"Unsupported statement: {type(node).__name__}", node)
 
