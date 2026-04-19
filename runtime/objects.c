@@ -40,13 +40,18 @@ FpyList* fastpy_tuple_new(void) {
     return t;
 }
 
-void fpy_list_append(FpyList *list, FpyValue value) {
-    FPY_LOCK(list);
+/* Unlocked append — caller must hold list->lock if needed */
+static void fpy_list_append_unlocked(FpyList *list, FpyValue value) {
     if (list->length >= list->capacity) {
         list->capacity *= 2;
         list->items = (FpyValue*)realloc(list->items, sizeof(FpyValue) * list->capacity);
     }
     list->items[list->length++] = value;
+}
+
+void fpy_list_append(FpyList *list, FpyValue value) {
+    FPY_LOCK(list);
+    fpy_list_append_unlocked(list, value);
     FPY_UNLOCK(list);
 }
 
@@ -645,8 +650,8 @@ FpyDict* fpy_dict_new(int64_t capacity) {
     return dict;
 }
 
-void fpy_dict_set(FpyDict *dict, FpyValue key, FpyValue value) {
-    FPY_LOCK(dict);
+/* Unlocked dict set — caller must hold dict->lock if needed */
+static void fpy_dict_set_unlocked(FpyDict *dict, FpyValue key, FpyValue value) {
     uint64_t h = fpy_hash_value(key);
     int64_t mask = dict->table_size - 1;
     int64_t slot = (int64_t)(h & (uint64_t)mask);
@@ -663,7 +668,6 @@ void fpy_dict_set(FpyDict *dict, FpyValue key, FpyValue value) {
         } else if (fpy_key_equal(dict->keys[idx], key)) {
             /* Key exists — update value in place */
             dict->values[idx] = value;
-            FPY_UNLOCK(dict);
             return;
         }
         slot = (slot + 1) & mask;
@@ -695,6 +699,11 @@ void fpy_dict_set(FpyDict *dict, FpyValue key, FpyValue value) {
                                            sizeof(int64_t) * dict->table_size);
         fpy_dict_rebuild_indices(dict);
     }
+}
+
+void fpy_dict_set(FpyDict *dict, FpyValue key, FpyValue value) {
+    FPY_LOCK(dict);
+    fpy_dict_set_unlocked(dict, key, value);
     FPY_UNLOCK(dict);
 }
 
@@ -927,9 +936,11 @@ int32_t fastpy_dict_has_int_key(FpyDict *dict, int64_t key) {
 }
 
 void fastpy_dict_update(FpyDict *dst, FpyDict *src) {
+    FPY_LOCK(dst);
     for (int64_t i = 0; i < src->length; i++) {
-        fpy_dict_set(dst, src->keys[i], src->values[i]);
+        fpy_dict_set_unlocked(dst, src->keys[i], src->values[i]);
     }
+    FPY_UNLOCK(dst);
 }
 
 /* Dict methods returning lists */
@@ -1286,17 +1297,23 @@ int64_t fastpy_cell_get(FpyCell *cell) {
 
 /* List pop — remove and return last element */
 int64_t fastpy_list_pop_int(FpyList *list) {
+    FPY_LOCK(list);
     if (list->length == 0) {
+        FPY_UNLOCK(list);
         fprintf(stderr, "IndexError: pop from empty list\n");
         exit(1);
     }
     list->length--;
-    return list->items[list->length].data.i;
+    int64_t result = list->items[list->length].data.i;
+    FPY_UNLOCK(list);
+    return result;
 }
 
 void fastpy_list_delete_at(FpyList *list, int64_t index) {
+    FPY_LOCK(list);
     if (index < 0) index += list->length;
     if (index < 0 || index >= list->length) {
+        FPY_UNLOCK(list);
         fprintf(stderr, "IndexError: list index out of range\n");
         exit(1);
     }
@@ -1304,9 +1321,11 @@ void fastpy_list_delete_at(FpyList *list, int64_t index) {
         list->items[i] = list->items[i + 1];
     }
     list->length--;
+    FPY_UNLOCK(list);
 }
 
 void fastpy_dict_delete(FpyDict *dict, const char *key) {
+    FPY_LOCK(dict);
     FpyValue k = fpy_str(key);
     uint64_t h = fpy_hash_value(k);
     int64_t mask = dict->table_size - 1;
@@ -1326,72 +1345,85 @@ void fastpy_dict_delete(FpyDict *dict, const char *key) {
             dict->length--;
             /* Rebuild indices since entry indices shifted. */
             fpy_dict_rebuild_indices(dict);
+            FPY_UNLOCK(dict);
             return;
         }
         slot = (slot + 1) & mask;
     }
+    FPY_UNLOCK(dict);
     fprintf(stderr, "KeyError: '%s'\n", key);
     exit(1);
 }
 
 void fastpy_list_remove(FpyList *list, int64_t value) {
     /* Remove first occurrence of value; if not found, raise ValueError (for int tag) */
+    FPY_LOCK(list);
     for (int64_t i = 0; i < list->length; i++) {
         if (list->items[i].tag == FPY_TAG_INT && list->items[i].data.i == value) {
             for (int64_t j = i; j < list->length - 1; j++) {
                 list->items[j] = list->items[j + 1];
             }
             list->length--;
+            FPY_UNLOCK(list);
             return;
         }
     }
+    FPY_UNLOCK(list);
     fprintf(stderr, "ValueError: list.remove(x): x not in list\n");
     exit(1);
 }
 
 void fastpy_list_remove_str(FpyList *list, const char *value) {
+    FPY_LOCK(list);
     for (int64_t i = 0; i < list->length; i++) {
         if (list->items[i].tag == FPY_TAG_STR && strcmp(list->items[i].data.s, value) == 0) {
             for (int64_t j = i; j < list->length - 1; j++) {
                 list->items[j] = list->items[j + 1];
             }
             list->length--;
+            FPY_UNLOCK(list);
             return;
         }
     }
+    FPY_UNLOCK(list);
     fprintf(stderr, "ValueError: list.remove(x): x not in list\n");
     exit(1);
 }
 
 void fastpy_list_insert_int(FpyList *list, int64_t index, int64_t value) {
+    FPY_LOCK(list);
     int64_t len = list->length;
     if (index < 0) index += len;
     if (index < 0) index = 0;
     if (index > len) index = len;
-    /* Ensure capacity — use append for growth */
+    /* Ensure capacity — use unlocked append for growth (we hold the lock) */
     FpyValue v = { .tag = FPY_TAG_INT, .data.i = value };
-    fpy_list_append(list, v);
+    fpy_list_append_unlocked(list, v);
     /* Shift elements right from index onward */
     for (int64_t i = list->length - 1; i > index; i--) {
         list->items[i] = list->items[i - 1];
     }
     list->items[index] = v;
+    FPY_UNLOCK(list);
 }
 
 void fastpy_list_insert_str(FpyList *list, int64_t index, const char *value) {
+    FPY_LOCK(list);
     int64_t len = list->length;
     if (index < 0) index += len;
     if (index < 0) index = 0;
     if (index > len) index = len;
     FpyValue v = { .tag = FPY_TAG_STR, .data.s = value };
-    fpy_list_append(list, v);
+    fpy_list_append_unlocked(list, v);
     for (int64_t i = list->length - 1; i > index; i--) {
         list->items[i] = list->items[i - 1];
     }
     list->items[index] = v;
+    FPY_UNLOCK(list);
 }
 
 const char* fastpy_dict_pop(FpyDict *dict, const char *key) {
+    FPY_LOCK(dict);
     FpyValue k = fpy_str(key);
     uint64_t h = fpy_hash_value(k);
     int64_t mask = dict->table_size - 1;
@@ -1417,15 +1449,18 @@ const char* fastpy_dict_pop(FpyDict *dict, const char *key) {
             }
             dict->length--;
             fpy_dict_rebuild_indices(dict);
+            FPY_UNLOCK(dict);
             return result;
         }
         slot = (slot + 1) & mask;
     }
+    FPY_UNLOCK(dict);
     fprintf(stderr, "KeyError: '%s'\n", key);
     exit(1);
 }
 
 int64_t fastpy_dict_pop_int(FpyDict *dict, const char *key) {
+    FPY_LOCK(dict);
     FpyValue k = fpy_str(key);
     uint64_t h = fpy_hash_value(k);
     int64_t mask = dict->table_size - 1;
@@ -1443,10 +1478,12 @@ int64_t fastpy_dict_pop_int(FpyDict *dict, const char *key) {
             }
             dict->length--;
             fpy_dict_rebuild_indices(dict);
+            FPY_UNLOCK(dict);
             return result;
         }
         slot = (slot + 1) & mask;
     }
+    FPY_UNLOCK(dict);
     fprintf(stderr, "KeyError: '%s'\n", key);
     exit(1);
 }
@@ -2153,23 +2190,29 @@ const char* fastpy_str_repr(const char *s) {
 
 /* List extend — append all elements from another list */
 void fastpy_list_extend(FpyList *list, FpyList *other) {
+    FPY_LOCK(list);
     for (int64_t i = 0; i < other->length; i++) {
-        fpy_list_append(list, other->items[i]);
+        fpy_list_append_unlocked(list, other->items[i]);
     }
+    FPY_UNLOCK(list);
 }
 
 /* List sort in place */
 void fastpy_list_sort(FpyList *list) {
+    FPY_LOCK(list);
     qsort(list->items, list->length, sizeof(FpyValue), fpy_value_compare);
+    FPY_UNLOCK(list);
 }
 
 /* List reverse in place */
 void fastpy_list_reverse(FpyList *list) {
+    FPY_LOCK(list);
     for (int64_t i = 0; i < list->length / 2; i++) {
         FpyValue tmp = list->items[i];
         list->items[i] = list->items[list->length - 1 - i];
         list->items[list->length - 1 - i] = tmp;
     }
+    FPY_UNLOCK(list);
 }
 
 /* String find — return index of substring, -1 if not found */
@@ -2216,7 +2259,9 @@ FpyList* fastpy_list_copy(FpyList *list) {
 
 /* List clear — remove all items */
 void fastpy_list_clear(FpyList *list) {
+    FPY_LOCK(list);
     list->length = 0;
+    FPY_UNLOCK(list);
 }
 
 /* Slice assignment: a[start:stop] = new_values
@@ -2224,6 +2269,7 @@ void fastpy_list_clear(FpyList *list) {
  * The replacement list can be a different length than the slice. */
 void fastpy_list_slice_assign(FpyList *list, int64_t start, int64_t stop,
                                FpyList *new_values) {
+    FPY_LOCK(list);
     /* Clamp indices */
     if (start < 0) start += list->length;
     if (stop < 0) stop += list->length;
@@ -2254,6 +2300,7 @@ void fastpy_list_slice_assign(FpyList *list, int64_t start, int64_t stop,
         list->items[start + i] = new_values->items[i];
     }
     list->length = final_len;
+    FPY_UNLOCK(list);
 }
 
 /* Set discard — remove element if present, no error if absent */

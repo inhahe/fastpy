@@ -1,12 +1,7 @@
-Currently implementing the remaining Python 3.14 features. Then tell it to finish support for .pyd modules (test Numpy).
-
-Tell Claude to make a note somewhere of all limitations - such as attempts at optimizations that he couldn't make work. If he doesn't remember them all, he can check the full history of commit messages.
-
-There is the question of how our compiler will handle thread safety - default should behave just like CPython without free threading (except that it may allow threads to execute concurrently - purely an implementation detail, but will make them go faster) - one option is, i forgot the name of it, an advanced algorithm for ensuring database consistency, another (yucky) option is a GIL
-maybe allow a mode that works just like Python's free-threaded variety
-Or is thread safety a thing that will be determined by LLVM? Would that behave just like Python's thread interaction?
+currently working on several threading and other limitations, limitations are documented
 
 For good syntax error reporting, we could just copy CPython's code
+how is runtime error reporting? do we get a stack trace?
 
 Option to treat all regular integers as checked Int64 instead of checked Int64 with fallback to BigInt, to speed up already-existing programs. command-line option or in-program option. needs a way to override it and actually use a BigInt-fallback Int64 for specific variable initializations?
 
@@ -14,8 +9,7 @@ Would be nice if we included a capability to create an analysis report for the u
 
 For exec, eval, and that third one, maybe should embed CPython or PyPy.
 
-make support for python pyd modules
-rewrite the compiler in a compiled/faster language
+rewrite the compiler in a compiled/faster language - maybe not necessary since Python itself will be fast now..
 
 0.8037]
 (c) Microsoft Corporation. All rights reserved.

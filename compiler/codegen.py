@@ -856,16 +856,47 @@ class CodeGen:
             if isinstance(node, ast.FunctionDef):
                 self._scan_for_closures(node)
 
-        # Pass 0.7: scan for global variable declarations and create LLVM globals
+        # Pass 0.7: scan for global variable declarations and create LLVM globals.
+        # Infer the type from module-level assignments to the global name.
+        global_types: dict[str, str] = {}
+        for node in tree.body:
+            if isinstance(node, ast.Assign) and len(node.targets) == 1:
+                if isinstance(node.targets[0], ast.Name):
+                    name = node.targets[0].id
+                    if isinstance(node.value, (ast.List, ast.ListComp)):
+                        global_types[name] = "list"
+                    elif isinstance(node.value, (ast.Dict, ast.DictComp)):
+                        global_types[name] = "dict"
+                    elif isinstance(node.value, ast.Constant):
+                        if isinstance(node.value.value, str):
+                            global_types[name] = "str"
+                        elif isinstance(node.value.value, float):
+                            global_types[name] = "float"
+
         for node in ast.walk(tree):
             if isinstance(node, ast.Global):
                 for name in node.names:
                     if name not in self._global_vars:
-                        gvar = ir.GlobalVariable(self.module, i64,
-                                                 name=f"fastpy.global.{name}")
-                        gvar.initializer = ir.Constant(i64, 0)
-                        gvar.linkage = "private"
-                        self._global_vars[name] = (gvar, "int")
+                        gtype = global_types.get(name)
+                        if gtype in ("list", "dict", "str"):
+                            gvar = ir.GlobalVariable(self.module, i8_ptr,
+                                                     name=f"fastpy.global.{name}")
+                            gvar.initializer = ir.Constant(i8_ptr, None)
+                            gvar.linkage = "private"
+                            tag = gtype if gtype != "list" else "list:int"
+                            self._global_vars[name] = (gvar, tag)
+                        elif gtype == "float":
+                            gvar = ir.GlobalVariable(self.module, double,
+                                                     name=f"fastpy.global.{name}")
+                            gvar.initializer = ir.Constant(double, 0.0)
+                            gvar.linkage = "private"
+                            self._global_vars[name] = (gvar, "float")
+                        else:
+                            gvar = ir.GlobalVariable(self.module, i64,
+                                                     name=f"fastpy.global.{name}")
+                            gvar.initializer = ir.Constant(i64, 0)
+                            gvar.linkage = "private"
+                            self._global_vars[name] = (gvar, "int")
 
         # Pass 0.75: analyze call sites to determine parameter types
         self._call_site_param_types: dict[str, list[str | None]] = {}
@@ -936,6 +967,11 @@ class CodeGen:
         self.function = main_fn
         self.builder = ir.IRBuilder(entry)
         self.variables = {}
+        # Pre-populate module-level variables with globals so that
+        # assignments like `data = []` at module level store to the
+        # global variable (which functions access via `global data`).
+        for gname, (gvar, gtag) in self._global_vars.items():
+            self.variables[gname] = (gvar, gtag)
         self._loop_stack = []
 
         # Register classes with the runtime
@@ -2206,6 +2242,41 @@ class CodeGen:
                     # Also register under bare name for fallback
                     if "__setitem__" not in self._call_site_param_types:
                         self._call_site_param_types["__setitem__"] = types
+
+        # Trace sorted(list, key=func) / min/max(list, key=func) to populate
+        # call-site types for the key function. The key function receives
+        # elements of the list, so its param type matches the list's elem type.
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            if not (isinstance(node.func, ast.Name)
+                    and node.func.id in ("sorted", "min", "max")):
+                continue
+            key_func_name = None
+            for kw in node.keywords:
+                if kw.arg == "key" and isinstance(kw.value, ast.Name):
+                    key_func_name = kw.value.id
+            if key_func_name is None or key_func_name not in func_asts:
+                continue
+            # Determine the list's element type
+            if node.args:
+                list_node = node.args[0]
+                elem_type = None
+                if isinstance(list_node, ast.List) and list_node.elts:
+                    if all(isinstance(e, ast.Constant) and isinstance(e.value, str)
+                           for e in list_node.elts):
+                        elem_type = "str"
+                elif isinstance(list_node, ast.Name) and list_node.id in var_types:
+                    vt = var_types[list_node.id]
+                    if vt == "list:str":
+                        elem_type = "str"
+                if elem_type is not None:
+                    existing = self._call_site_param_types.setdefault(
+                        key_func_name, [])
+                    if not existing:
+                        existing.append(elem_type)
+                    elif existing[0] is None:
+                        existing[0] = elem_type
 
     def _declare_lambda(self, var_name: str, lam: ast.Lambda) -> None:
         """Create a hidden function for a lambda assigned to a variable."""
@@ -5539,6 +5610,15 @@ class CodeGen:
                     wrapped = self.builder.call(
                         self.runtime["cpython_wrap_native"], [func_ptr])
                     return FPY_TAG_OBJ, self.builder.ptrtoint(wrapped, i64)
+                # CPython method call result (e.g. np.array([1,2]) as arg):
+                # tag as OBJ so the bridge passes the PyObject* through.
+                if (value_node is not None
+                        and isinstance(value_node, ast.Call)
+                        and isinstance(value_node.func, ast.Attribute)
+                        and isinstance(value_node.func.value, ast.Name)
+                        and value_node.func.value.id in self.variables
+                        and self.variables[value_node.func.value.id][1] == "pyobj"):
+                    return FPY_TAG_OBJ, value
                 # Check value_node for bool constants (emitted as i64, not
                 # i32) and bool-typed variables so the BOOL tag is preserved.
                 if value_node is not None:
@@ -6416,12 +6496,29 @@ class CodeGen:
         # stored as i64 directly into the LLVM global, same as before.
         if name in self._global_vars:
             gvar, _ = self._global_vars[name]
-            if isinstance(value.type, ir.PointerType):
-                value = self.builder.ptrtoint(value, i64)
-            elif isinstance(value.type, ir.DoubleType):
-                value = self.builder.bitcast(value, i64)
-            elif isinstance(value.type, ir.IntType) and value.type.width != 64:
-                value = self.builder.zext(value, i64)
+            gvar_type = gvar.type.pointee  # the type the global holds
+            if gvar_type == i8_ptr:
+                # Pointer global (list, dict, str)
+                if isinstance(value.type, ir.IntType):
+                    value = self.builder.inttoptr(value, i8_ptr)
+                elif isinstance(value.type, ir.LiteralStructType):
+                    # FpyValue — extract data and convert to pointer
+                    data = self.builder.extract_value(value, 1)
+                    value = self.builder.inttoptr(data, i8_ptr)
+            elif gvar_type == double:
+                # Float global
+                if isinstance(value.type, ir.IntType):
+                    value = self.builder.bitcast(value, double)
+            else:
+                # i64 global (default)
+                if isinstance(value.type, ir.PointerType):
+                    value = self.builder.ptrtoint(value, i64)
+                elif isinstance(value.type, ir.DoubleType):
+                    value = self.builder.bitcast(value, i64)
+                elif isinstance(value.type, ir.IntType) and value.type.width != 64:
+                    value = self.builder.zext(value, i64)
+                elif isinstance(value.type, ir.LiteralStructType):
+                    value = self.builder.extract_value(value, 1)
             self.builder.store(value, gvar)
             self.variables[name] = (gvar, type_tag)
             return
@@ -11070,11 +11167,42 @@ class CodeGen:
                 raise CodeGenError("map() takes 2 arguments (function, iterable)", node)
             if name == "filter":
                 if len(node.args) == 2:
-                    fn_node = node.args[0]
-                    seq = self._emit_expr_value(node.args[1])
-                    fn_ptr = self._get_unary_func_ptr(fn_node, node)
-                    return self.builder.call(self.runtime["list_filter_int"], [seq, fn_ptr])
+                    return self._emit_builtin_filter(node)
                 raise CodeGenError("filter() takes 2 arguments (function, iterable)", node)
+            if name == "eval":
+                if len(node.args) >= 1 and isinstance(node.args[0], ast.Constant):
+                    # Literal string eval: compile via exec_get at runtime
+                    expr_str = node.args[0].value
+                    code = f"__eval_result__ = {expr_str}"
+                    code_ptr = self._make_string_constant(code)
+                    name_ptr = self._make_string_constant("__eval_result__")
+                    result = self.builder.call(
+                        self.runtime["cpython_exec_get"], [code_ptr, name_ptr])
+                    # Convert the PyObject* result to native via bridge
+                    out_tag = self._create_entry_alloca(i32, "eval.tag")
+                    out_data = self._create_entry_alloca(i64, "eval.data")
+                    self.builder.call(self.runtime["cpython_to_fv"],
+                                      [result, out_tag, out_data])
+                    return self.builder.load(out_data)
+                if len(node.args) >= 1:
+                    # Dynamic eval: route expression through CPython bridge
+                    # Build code: __eval_result__ = eval(expr)
+                    blt = self._make_string_constant("builtins")
+                    blt_mod = self.builder.call(
+                        self.runtime["cpython_import"], [blt])
+                    eval_name = self._make_string_constant("eval")
+                    eval_fn = self.builder.call(
+                        self.runtime["cpython_getattr"], [blt_mod, eval_name])
+                    arg = self._emit_expr_value(node.args[0])
+                    tag, data = self._bare_to_tag_data(arg, node.args[0])
+                    out_tag = self._create_entry_alloca(i32, "eval.tag")
+                    out_data = self._create_entry_alloca(i64, "eval.data")
+                    self.builder.call(self.runtime["cpython_call1"],
+                                      [eval_fn,
+                                       ir.Constant(i32, tag), data,
+                                       out_tag, out_data])
+                    return self.builder.load(out_data)
+                raise CodeGenError("eval() requires at least 1 argument", node)
             if name == "enumerate":
                 if len(node.args) >= 1:
                     lst = self._emit_expr_value(node.args[0])
@@ -11698,6 +11826,69 @@ class CodeGen:
         self.builder.position_at_end(end_block)
         return result
 
+    def _emit_builtin_filter(self, node: ast.Call) -> ir.Value:
+        """Emit filter(func, iterable) as an inline loop.
+
+        For each element, calls the predicate and appends to the result
+        list only if the predicate returns truthy. Handles all element
+        types (int, str, etc.) by passing the raw data to the predicate.
+        """
+        fn_node = node.args[0]
+        seq = self._emit_expr_value(node.args[1])
+        fn_ptr = self._get_unary_func_ptr(fn_node, node)
+        fn_typed = self.builder.bitcast(fn_ptr,
+            ir.PointerType(ir.FunctionType(i64, [i64])))
+        result = self.builder.call(self.runtime["list_new"], [])
+        length = self.builder.call(self.runtime["list_length"], [seq])
+
+        idx_alloca = self._create_entry_alloca(i64, "filt.idx")
+        self.builder.store(ir.Constant(i64, 0), idx_alloca)
+
+        cond_block = self._new_block("filt.cond")
+        body_block = self._new_block("filt.body")
+        end_block = self._new_block("filt.end")
+
+        self.builder.branch(cond_block)
+        self.builder.position_at_end(cond_block)
+        idx = self.builder.load(idx_alloca)
+        cond = self.builder.icmp_signed("<", idx, length)
+        self.builder.cbranch(cond, body_block, end_block)
+
+        self.builder.position_at_end(body_block)
+        idx = self.builder.load(idx_alloca)
+        # Get element as FpyValue (preserves tag)
+        elem_tag_a = self._create_entry_alloca(i32, "filt.etag")
+        elem_data_a = self._create_entry_alloca(i64, "filt.edata")
+        self.builder.call(self.runtime["list_get_fv"],
+                          [seq, idx, elem_tag_a, elem_data_a])
+        elem_data = self.builder.load(elem_data_a)
+        elem_tag = self.builder.load(elem_tag_a)
+
+        # Call predicate with the element data
+        pred_result = self.builder.call(fn_typed, [elem_data])
+        # Check truthiness — non-zero means keep
+        is_truthy = self.builder.icmp_signed(
+            "!=", pred_result, ir.Constant(i64, 0))
+
+        keep_block = self._new_block("filt.keep")
+        skip_block = self._new_block("filt.skip")
+        self.builder.cbranch(is_truthy, keep_block, skip_block)
+
+        self.builder.position_at_end(keep_block)
+        # Append with original tag preserved
+        self.builder.call(self.runtime["list_append_fv"],
+                          [result, elem_tag, elem_data])
+        self.builder.branch(skip_block)
+
+        self.builder.position_at_end(skip_block)
+        next_idx = self.builder.add(
+            self.builder.load(idx_alloca), ir.Constant(i64, 1))
+        self.builder.store(next_idx, idx_alloca)
+        self.builder.branch(cond_block)
+
+        self.builder.position_at_end(end_block)
+        return result
+
     def _emit_builtin_len(self, node: ast.Call) -> ir.Value:
         """Emit len() builtin."""
         if len(node.args) != 1:
@@ -11933,14 +12124,23 @@ class CodeGen:
         # the param type matches the list's element type.
         param_tag = "int"
         if isinstance(node, ast.Call) and len(node.args) >= 1:
-            list_node = node.args[0]
-            if isinstance(list_node, ast.Call):
-                list_node = node.args[-1]  # map(fn, list) → list is args[1]
-            elem_type = self._get_list_elem_type(list_node)
-            if elem_type == "str":
-                param_tag = "str"
-            elif elem_type in ("list", "tuple"):
-                param_tag = "list"
+            # Find the list argument (not the function argument).
+            # sorted(list, key=lambda) → args[0] is the list
+            # map(lambda, list) → args[1] is the list
+            # filter(lambda, list) → args[1] is the list
+            list_node = None
+            for arg in node.args:
+                if not isinstance(arg, ast.Lambda):
+                    list_node = arg
+                    break
+            if list_node is None and len(node.args) >= 2:
+                list_node = node.args[-1]
+            if list_node is not None:
+                elem_type = self._get_list_elem_type(list_node)
+                if elem_type == "str":
+                    param_tag = "str"
+                elif elem_type in ("list", "tuple"):
+                    param_tag = "list"
 
         # Save current emission state
         saved = (self.function, self.builder, self.variables, self._loop_stack,
