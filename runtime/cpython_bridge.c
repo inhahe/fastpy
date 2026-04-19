@@ -9,8 +9,15 @@
 
 #include <Python.h>
 #include "objects.h"
+#include "threading.h"
 #include <stdio.h>
 #include <string.h>
+
+/* GIL release/acquire macros for CPython bridge calls.
+ * Release fastpy's GIL before calling CPython (which has its own GIL).
+ * Reacquire after returning. No-op in single-threaded mode. */
+#define FPY_BRIDGE_ENTER() do { if (fpy_threading_mode == FPY_THREADING_GIL) fpy_gil_release(); } while(0)
+#define FPY_BRIDGE_LEAVE() do { if (fpy_threading_mode == FPY_THREADING_GIL) fpy_gil_acquire(); } while(0)
 
 /* ── Initialization ─────────────────────────────────────────────── */
 
@@ -37,7 +44,9 @@ void fpy_cpython_fini(void) {
  * The reference is owned — caller must eventually decref. */
 void* fpy_cpython_import(const char *module_name) {
     fpy_cpython_init();  /* lazy init on first import */
+    FPY_BRIDGE_ENTER();
     PyObject *mod = PyImport_ImportModule(module_name);
+    FPY_BRIDGE_LEAVE();
     if (!mod) {
         PyErr_Print();
         fprintf(stderr, "ImportError: cannot import '%s'\n", module_name);
@@ -339,6 +348,71 @@ void fpy_cpython_call3(void *callable,
     Py_DECREF(result);
 }
 
+/* ── General call with keyword arguments ──────────────────────────
+ * Calls a callable with positional args (tag/data arrays) and
+ * keyword args (name/tag/data arrays). Returns result via out ptrs. */
+void fpy_cpython_call_kw(void *callable,
+                          int32_t n_args, int32_t *arg_tags, int64_t *arg_data,
+                          int32_t n_kwargs, const char **kw_names,
+                          int32_t *kw_tags, int64_t *kw_data,
+                          int32_t *out_tag, int64_t *out_data) {
+    PyObject *args = PyTuple_New(n_args);
+    for (int i = 0; i < n_args; i++) {
+        PyObject *a = fpy_to_pyobject(arg_tags[i], arg_data[i]);
+        PyTuple_SET_ITEM(args, i, a);
+    }
+    PyObject *kwargs = NULL;
+    if (n_kwargs > 0) {
+        kwargs = PyDict_New();
+        for (int i = 0; i < n_kwargs; i++) {
+            PyObject *v = fpy_to_pyobject(kw_tags[i], kw_data[i]);
+            PyDict_SetItemString(kwargs, kw_names[i], v);
+            Py_DECREF(v);
+        }
+    }
+    FPY_BRIDGE_ENTER();
+    PyObject *result = PyObject_Call((PyObject*)callable, args, kwargs);
+    FPY_BRIDGE_LEAVE();
+    Py_DECREF(args);
+    if (kwargs) Py_DECREF(kwargs);
+    if (!result) {
+        PyErr_Print();
+        *out_tag = FPY_TAG_NONE;
+        *out_data = 0;
+        return;
+    }
+    pyobject_to_fpy(result, out_tag, out_data);
+    Py_DECREF(result);
+}
+
+/* Same but returns raw PyObject* */
+void* fpy_cpython_call_kw_raw(void *callable,
+                               int32_t n_args, int32_t *arg_tags, int64_t *arg_data,
+                               int32_t n_kwargs, const char **kw_names,
+                               int32_t *kw_tags, int64_t *kw_data) {
+    PyObject *args = PyTuple_New(n_args);
+    for (int i = 0; i < n_args; i++) {
+        PyObject *a = fpy_to_pyobject(arg_tags[i], arg_data[i]);
+        PyTuple_SET_ITEM(args, i, a);
+    }
+    PyObject *kwargs = NULL;
+    if (n_kwargs > 0) {
+        kwargs = PyDict_New();
+        for (int i = 0; i < n_kwargs; i++) {
+            PyObject *v = fpy_to_pyobject(kw_tags[i], kw_data[i]);
+            PyDict_SetItemString(kwargs, kw_names[i], v);
+            Py_DECREF(v);
+        }
+    }
+    FPY_BRIDGE_ENTER();
+    PyObject *result = PyObject_Call((PyObject*)callable, args, kwargs);
+    FPY_BRIDGE_LEAVE();
+    Py_DECREF(args);
+    if (kwargs) Py_DECREF(kwargs);
+    if (!result) { PyErr_Print(); return NULL; }
+    return (void*)result;
+}
+
 /* ── Print a PyObject* via CPython's str() ─────────────────────── */
 
 void fpy_cpython_print_obj(void *pyobj) {
@@ -352,6 +426,50 @@ void fpy_cpython_print_obj(void *pyobj) {
         PyErr_Clear();
         printf("<object at %p>", pyobj);
     }
+}
+
+/* ── Native function wrapper ─────────────────────────────────────
+ * Wraps a compiled function pointer as a CPython callable so it can
+ * be passed to threading.Thread(target=...), map(), etc. through
+ * the CPython bridge. The wrapper calls back into the native code. */
+
+/* Stored function pointer for the wrapper callback */
+typedef struct {
+    PyObject_HEAD
+    void (*func)(void);  /* native function pointer (void→void for workers) */
+} FpyNativeCallable;
+
+static PyObject* fpy_native_call(FpyNativeCallable *self,
+                                  PyObject *args, PyObject *kwargs) {
+    if (self->func) {
+        self->func();
+        fflush(stdout);
+    }
+    Py_RETURN_NONE;
+}
+
+static PyTypeObject FpyNativeCallableType = {
+    PyVarObject_HEAD_INIT(NULL, 0)
+    .tp_name = "fastpy.NativeCallable",
+    .tp_basicsize = sizeof(FpyNativeCallable),
+    .tp_call = (ternaryfunc)fpy_native_call,
+    .tp_flags = Py_TPFLAGS_DEFAULT,
+    .tp_new = PyType_GenericNew,
+};
+
+static int fpy_native_type_ready = 0;
+
+/* Create a CPython callable that wraps a native void(*)(void) function. */
+void* fpy_cpython_wrap_native(void *func_ptr) {
+    fpy_cpython_init();
+    if (!fpy_native_type_ready) {
+        PyType_Ready(&FpyNativeCallableType);
+        fpy_native_type_ready = 1;
+    }
+    FpyNativeCallable *obj = PyObject_New(FpyNativeCallable,
+                                           &FpyNativeCallableType);
+    obj->func = (void (*)(void))func_ptr;
+    return (void*)obj;
 }
 
 /* ── Exec+Get ──────────────────────────────────────────────────── */

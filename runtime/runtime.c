@@ -13,6 +13,7 @@
 #include <math.h>
 #include <setjmp.h>
 #include <stdlib.h>
+#include "threading.h"
 
 /* Forward declaration: the compiled Python module provides this */
 extern void fastpy_main(void);
@@ -108,6 +109,7 @@ void fastpy_write_space(void) {
 /* Newline-only print (for print() with no args) */
 void fastpy_print_newline(void) {
     printf("\n");
+    fflush(stdout);
 }
 
 /* --- String operations --- */
@@ -280,10 +282,11 @@ double fastpy_pow_float(double base, double exp) {
 #define FPY_EXC_EXCEPTIONGROUP 8
 #define FPY_EXC_GENERIC        99
 
-/* Global exception state */
-int fpy_exc_type = FPY_EXC_NONE;
-const char *fpy_exc_msg = "";
-int fpy_exc_group_inner = FPY_EXC_NONE;  /* inner type for ExceptionGroup */
+/* Per-thread exception state. Each thread has its own exception,
+ * so raising in one thread doesn't corrupt another's state. */
+FPY_THREAD_LOCAL int fpy_exc_type = FPY_EXC_NONE;
+FPY_THREAD_LOCAL const char *fpy_exc_msg = "";
+FPY_THREAD_LOCAL int fpy_exc_group_inner = FPY_EXC_NONE;
 
 /* Raise an exception — sets the flag. Caller must check and propagate. */
 void fastpy_raise(int exc_type, const char *msg) {
@@ -385,6 +388,12 @@ double fastpy_safe_int_fdiv(int64_t a, int64_t b) {
  * fastpy_raise), print a traceback-style message to stderr and exit
  * non-zero to match CPython's behavior. */
 int main(void) {
+    /* Initialize threading if enabled (mode set by codegen global) */
+    if (fpy_threading_mode >= FPY_THREADING_GIL) {
+        fpy_gil_init();
+        fpy_print_mutex_init();
+        fpy_gil_acquire();  /* main thread holds GIL initially */
+    }
     fastpy_main();
     if (fastpy_exc_pending()) {
         const char *name = "Exception";

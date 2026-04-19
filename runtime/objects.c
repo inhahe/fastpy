@@ -3,6 +3,7 @@
  */
 
 #include "objects.h"
+#include "threading.h"
 #include <math.h>
 
 /* Forward declarations */
@@ -150,6 +151,7 @@ void fpy_value_repr(FpyValue val, char *buf, int bufsize) {
 void fpy_value_print(FpyValue val) {
     fpy_value_write(val);
     printf("\n");
+    fflush(stdout);  /* ensure output is visible immediately (threaded context) */
 }
 
 /* --- FpyValue ABI wrappers (Phase 1 of tagged-value refactor) ---
@@ -2829,7 +2831,9 @@ typedef struct FpyArenaBlock {
     char data[];   /* flexible array member */
 } FpyArenaBlock;
 
-static FpyArenaBlock *fpy_arena_current = NULL;
+/* Per-thread arena: each thread gets its own bump allocator chain.
+ * No locking needed — threads never share arenas. */
+static FPY_THREAD_LOCAL FpyArenaBlock *fpy_arena_current = NULL;
 
 static FpyArenaBlock* fpy_arena_new_block(size_t min_size) {
     size_t cap = min_size > FPY_ARENA_BLOCK_SIZE ? min_size : FPY_ARENA_BLOCK_SIZE;

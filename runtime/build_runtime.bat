@@ -19,4 +19,9 @@ if errorlevel 1 (
     echo COMPILE_FAILED cpython_bridge.c
     exit /b 1
 )
+cl.exe /c /O2 /nologo threading.c /Fothreading.obj
+if errorlevel 1 (
+    echo COMPILE_FAILED threading.c
+    exit /b 1
+)
 echo COMPILE_OK

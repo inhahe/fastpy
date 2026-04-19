@@ -396,6 +396,20 @@ class CodeGen:
         self.runtime["cpython_call1_raw"] = ir.Function(self.module, ft, name="fpy_cpython_call1_raw")
         ft = ir.FunctionType(i8_ptr, [i8_ptr, i32, i64, i32, i64])
         self.runtime["cpython_call2_raw"] = ir.Function(self.module, ft, name="fpy_cpython_call2_raw")
+        # Wrap a native function pointer as a CPython callable
+        ft = ir.FunctionType(i8_ptr, [i8_ptr])
+        self.runtime["cpython_wrap_native"] = ir.Function(self.module, ft, name="fpy_cpython_wrap_native")
+        # General call with kwargs: call_kw(callable, n_args, *tags, *data,
+        #     n_kwargs, *names, *kw_tags, *kw_data, &out_tag, &out_data)
+        ft = ir.FunctionType(void, [
+            i8_ptr, i32, ir.PointerType(i32), ir.PointerType(i64),
+            i32, ir.PointerType(i8_ptr), ir.PointerType(i32), ir.PointerType(i64),
+            ir.PointerType(i32), ir.PointerType(i64)])
+        self.runtime["cpython_call_kw"] = ir.Function(self.module, ft, name="fpy_cpython_call_kw")
+        ft = ir.FunctionType(i8_ptr, [
+            i8_ptr, i32, ir.PointerType(i32), ir.PointerType(i64),
+            i32, ir.PointerType(i8_ptr), ir.PointerType(i32), ir.PointerType(i64)])
+        self.runtime["cpython_call_kw_raw"] = ir.Function(self.module, ft, name="fpy_cpython_call_kw_raw")
         # dict merge: dict_a | dict_b -> new dict
         ft = ir.FunctionType(i8_ptr, [i8_ptr, i8_ptr])
         self.runtime["dict_merge"] = ir.Function(self.module, ft, name="fastpy_dict_merge")
@@ -5508,6 +5522,16 @@ class CodeGen:
                         and value_node.func.id in self.variables
                         and self.variables[value_node.func.id][1] == "pyobj"):
                     return FPY_TAG_OBJ, value
+                # User function used as a value (e.g. threading.Thread(target=worker)):
+                # wrap as CPython callable so the bridge can call it back.
+                if (value_node is not None
+                        and isinstance(value_node, ast.Name)
+                        and value_node.id in self._user_functions
+                        and value_node.id not in self.variables):
+                    func_ptr = self.builder.inttoptr(value, i8_ptr)
+                    wrapped = self.builder.call(
+                        self.runtime["cpython_wrap_native"], [func_ptr])
+                    return FPY_TAG_OBJ, self.builder.ptrtoint(wrapped, i64)
                 # Check value_node for bool constants (emitted as i64, not
                 # i32) and bool-typed variables so the BOOL tag is preserved.
                 if value_node is not None:
@@ -7293,6 +7317,64 @@ class CodeGen:
         out_tag = self._create_entry_alloca(i32, "pycall.tag")
         out_data = self._create_entry_alloca(i64, "pycall.data")
 
+        # If there are keyword arguments, use the general call_kw path
+        if node.keywords:
+            n_pos = len(node.args)
+            n_kw = len(node.keywords)
+            # Build positional arg arrays
+            tags_alloca = self.builder.alloca(
+                ir.ArrayType(i32, max(n_pos, 1)), name="kw.tags")
+            data_alloca = self.builder.alloca(
+                ir.ArrayType(i64, max(n_pos, 1)), name="kw.data")
+            for i, arg_node in enumerate(node.args):
+                val = self._emit_expr_value(arg_node)
+                tag, data = self._bare_to_tag_data(val, arg_node)
+                tag_ptr = self.builder.gep(tags_alloca,
+                    [ir.Constant(i32, 0), ir.Constant(i32, i)])
+                data_ptr = self.builder.gep(data_alloca,
+                    [ir.Constant(i32, 0), ir.Constant(i32, i)])
+                self.builder.store(ir.Constant(i32, tag), tag_ptr)
+                self.builder.store(data, data_ptr)
+            # Build keyword arg arrays
+            names_alloca = self.builder.alloca(
+                ir.ArrayType(i8_ptr, n_kw), name="kw.names")
+            kw_tags_alloca = self.builder.alloca(
+                ir.ArrayType(i32, n_kw), name="kw.ktags")
+            kw_data_alloca = self.builder.alloca(
+                ir.ArrayType(i64, n_kw), name="kw.kdata")
+            for i, kw in enumerate(node.keywords):
+                name_ptr = self._make_string_constant(kw.arg)
+                val = self._emit_expr_value(kw.value)
+                tag, data = self._bare_to_tag_data(val, kw.value)
+                n_ptr = self.builder.gep(names_alloca,
+                    [ir.Constant(i32, 0), ir.Constant(i32, i)])
+                t_ptr = self.builder.gep(kw_tags_alloca,
+                    [ir.Constant(i32, 0), ir.Constant(i32, i)])
+                d_ptr = self.builder.gep(kw_data_alloca,
+                    [ir.Constant(i32, 0), ir.Constant(i32, i)])
+                self.builder.store(name_ptr, n_ptr)
+                self.builder.store(ir.Constant(i32, tag), t_ptr)
+                self.builder.store(data, d_ptr)
+            # Call
+            tags_base = self.builder.gep(tags_alloca,
+                [ir.Constant(i32, 0), ir.Constant(i32, 0)])
+            data_base = self.builder.gep(data_alloca,
+                [ir.Constant(i32, 0), ir.Constant(i32, 0)])
+            names_base = self.builder.gep(names_alloca,
+                [ir.Constant(i32, 0), ir.Constant(i32, 0)])
+            kt_base = self.builder.gep(kw_tags_alloca,
+                [ir.Constant(i32, 0), ir.Constant(i32, 0)])
+            kd_base = self.builder.gep(kw_data_alloca,
+                [ir.Constant(i32, 0), ir.Constant(i32, 0)])
+            self.builder.call(self.runtime["cpython_call_kw"],
+                              [callable_ptr,
+                               ir.Constant(i32, n_pos), tags_base, data_base,
+                               ir.Constant(i32, n_kw), names_base, kt_base, kd_base,
+                               out_tag, out_data])
+            tag_val = self.builder.load(out_tag)
+            data_val = self.builder.load(out_data)
+            return self._fv_build_from_slots(tag_val, data_val)
+
         n_args = len(node.args)
         if n_args == 0:
             self.builder.call(self.runtime["cpython_call0"],
@@ -7349,6 +7431,52 @@ class CodeGen:
         attr_name = self._make_string_constant(attr.attr)
         callable_ptr = self.builder.call(
             self.runtime["cpython_getattr"], [obj, attr_name])
+
+        # If there are keyword arguments, use the general call_kw_raw path
+        if node.keywords:
+            n_pos = len(node.args)
+            n_kw = len(node.keywords)
+            tags_alloca = self.builder.alloca(
+                ir.ArrayType(i32, max(n_pos, 1)), name="raw.tags")
+            data_alloca = self.builder.alloca(
+                ir.ArrayType(i64, max(n_pos, 1)), name="raw.data")
+            for i, arg_node in enumerate(node.args):
+                val = self._emit_expr_value(arg_node)
+                tag, data = self._bare_to_tag_data(val, arg_node)
+                self.builder.store(ir.Constant(i32, tag),
+                    self.builder.gep(tags_alloca,
+                        [ir.Constant(i32, 0), ir.Constant(i32, i)]))
+                self.builder.store(data,
+                    self.builder.gep(data_alloca,
+                        [ir.Constant(i32, 0), ir.Constant(i32, i)]))
+            names_alloca = self.builder.alloca(
+                ir.ArrayType(i8_ptr, n_kw), name="raw.knames")
+            kt_alloca = self.builder.alloca(
+                ir.ArrayType(i32, n_kw), name="raw.ktags")
+            kd_alloca = self.builder.alloca(
+                ir.ArrayType(i64, n_kw), name="raw.kdata")
+            for i, kw in enumerate(node.keywords):
+                name_ptr = self._make_string_constant(kw.arg)
+                val = self._emit_expr_value(kw.value)
+                tag, data = self._bare_to_tag_data(val, kw.value)
+                self.builder.store(name_ptr,
+                    self.builder.gep(names_alloca,
+                        [ir.Constant(i32, 0), ir.Constant(i32, i)]))
+                self.builder.store(ir.Constant(i32, tag),
+                    self.builder.gep(kt_alloca,
+                        [ir.Constant(i32, 0), ir.Constant(i32, i)]))
+                self.builder.store(data,
+                    self.builder.gep(kd_alloca,
+                        [ir.Constant(i32, 0), ir.Constant(i32, i)]))
+            return self.builder.call(self.runtime["cpython_call_kw_raw"],
+                [callable_ptr,
+                 ir.Constant(i32, n_pos),
+                 self.builder.gep(tags_alloca, [ir.Constant(i32, 0), ir.Constant(i32, 0)]),
+                 self.builder.gep(data_alloca, [ir.Constant(i32, 0), ir.Constant(i32, 0)]),
+                 ir.Constant(i32, n_kw),
+                 self.builder.gep(names_alloca, [ir.Constant(i32, 0), ir.Constant(i32, 0)]),
+                 self.builder.gep(kt_alloca, [ir.Constant(i32, 0), ir.Constant(i32, 0)]),
+                 self.builder.gep(kd_alloca, [ir.Constant(i32, 0), ir.Constant(i32, 0)])])
 
         n_args = len(node.args)
         if n_args == 0:

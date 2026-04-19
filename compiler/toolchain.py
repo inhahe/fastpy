@@ -22,7 +22,7 @@ llvm.initialize_native_asmprinter()
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 RUNTIME_DIR = _PROJECT_ROOT / "runtime"
 RUNTIME_OBJS = [RUNTIME_DIR / "runtime.obj", RUNTIME_DIR / "objects.obj",
-                RUNTIME_DIR / "cpython_bridge.obj"]
+                RUNTIME_DIR / "cpython_bridge.obj", RUNTIME_DIR / "threading.obj"]
 
 # CPython library for linking (needed for .pyd import support)
 PYTHON_LIB_DIR = Path(r"D:\python314\libs")
