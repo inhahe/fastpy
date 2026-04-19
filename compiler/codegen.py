@@ -1152,8 +1152,26 @@ class CodeGen:
                 return
 
         # Not a closure — just a regular nested def (no captures)
-        # For now, skip it (already compiled at top level if it's top-level)
-        pass
+        # Not a closure — just a regular nested def (no captures).
+        # Already compiled at top level via hoisting. Store an i64-ABI
+        # wrapper as the variable so it's safe to call through call_ptr
+        # (hoisted functions use FpyValue ABI which is incompatible with
+        # the i64 calling convention used by call_ptr0/1/2).
+        if node.name in self._user_functions:
+            info = self._user_functions[node.name]
+            if info.uses_fv_abi:
+                wrapper = self._get_or_emit_i64_wrapper(info)
+                wrapper_ptr = self.builder.bitcast(wrapper, i8_ptr)
+                # Wrap in a zero-capture closure so closure_call works too
+                closure = self.builder.call(self.runtime["closure_new"], [
+                    wrapper_ptr,
+                    ir.Constant(i32, info.param_count),
+                    ir.Constant(i32, 0),
+                ])
+                self._store_variable(node.name, closure, "closure")
+            else:
+                func_ptr = self.builder.ptrtoint(info.func, i64)
+                self._store_variable(node.name, func_ptr, "int")
 
     def _emit_closure_body(self, func: ir.Function, node: ast.FunctionDef,
                            captures: list[str]) -> None:
@@ -5014,6 +5032,12 @@ class CodeGen:
             }
             if builtin_name not in native_builtins:
                 type_tag = "pyobj"
+
+        # When a closure returns a value that will be called later,
+        # we need to detect whether it's a closure or raw function pointer.
+        # For now, closures that capture variables (from _emit_nested_funcdef)
+        # are tagged "closure". Hoisted functions (no captures) remain as
+        # "int" (raw function pointer) and are called via call_ptr0.
 
         # If assigning an empty list and pre-scan detected the actual element type,
         # override the default "list:int" tag

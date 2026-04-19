@@ -6,7 +6,7 @@ There is the question of how our compiler will handle thread safety - default sh
 maybe allow a mode that works just like Python's free-threaded variety
 Or is thread safety a thing that will be determined by LLVM? Would that behave just like Python's thread interaction?
 
-For good error reporting, we could just copy CPython's code
+For good syntax error reporting, we could just copy CPython's code
 
 Option to treat all regular integers as checked Int64 instead of checked Int64 with fallback to BigInt, to speed up already-existing programs. command-line option or in-program option. needs a way to override it and actually use a BigInt-fallback Int64 for specific variable initializations?
 

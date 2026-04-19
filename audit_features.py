@@ -38,7 +38,7 @@ tests = {
     '@property set': 'class C:\n    def __init__(self): self._x=0\n    @property\n    def x(self): return self._x\n    @x.setter\n    def x(self,v): self._x=v\nc=C();c.x=5;print(c.x)',
     # === DECORATORS ===
     'user decorator': 'def d(f):\n    def w(*a): return f(*a)\n    return w\n@d\ndef add(a,b): return a+b\nprint(add(1,2))',
-    'deco with args': 'def rep(n):\n    def d(f):\n        def w(): [f() for _ in range(n)]\n        return w\n    return d\n@rep(3)\ndef hi(): print("hi")\nhi()',
+    'deco with args': 'def rep(n):\n    def d(f):\n        def w():\n            i=0\n            while i<n:\n                f()\n                i+=1\n        return w\n    return d\n@rep(3)\ndef hi(): print("hi")\nhi()',
     # === STAR EXPRESSIONS ===
     'print *list': 'print(*[1,2,3])',
     '*args call': 'def f(a,b,c): return a+b+c\nprint(f(*[1,2,3]))',

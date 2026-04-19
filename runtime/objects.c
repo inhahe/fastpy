@@ -977,15 +977,27 @@ FpyList* fastpy_set_symmetric_diff(FpyList *a, FpyList *b) {
 
 /* --- Closure support --- */
 
+#define FPY_CLOSURE_MAGIC 0x434C4F53  /* "CLOS" */
+
 typedef struct {
-    void *func;           /* function pointer */
-    int64_t captures[8];  /* captured values (up to 8) */
+    int32_t magic;        /* FPY_CLOSURE_MAGIC — distinguishes from raw func ptrs */
     int n_captures;
     int n_params;         /* number of explicit params (excluding captures) */
+    void *func;           /* function pointer */
+    int64_t captures[8];  /* captured values (up to 8) */
 } FpyClosure;
+
+/* Check if a pointer is a closure (vs raw function pointer) */
+static int fpy_is_closure(void *ptr) {
+    /* Closures start with the magic number. Raw function pointers
+     * point to executable code which won't start with "CLOS". */
+    FpyClosure *c = (FpyClosure*)ptr;
+    return c->magic == FPY_CLOSURE_MAGIC;
+}
 
 FpyClosure* fastpy_closure_new(void *func, int n_params, int n_captures) {
     FpyClosure *c = (FpyClosure*)malloc(sizeof(FpyClosure));
+    c->magic = FPY_CLOSURE_MAGIC;
     c->func = func;
     c->n_params = n_params;
     c->n_captures = n_captures;
@@ -1000,27 +1012,45 @@ void fastpy_closure_set_capture(FpyClosure *c, int index, int64_t value) {
 int64_t fastpy_closure_call0(FpyClosure *c) {
     typedef int64_t (*fn0_t)(void);
     typedef int64_t (*fn1c_t)(int64_t);
-    if (c->n_captures == 0) return ((fn0_t)c->func)();
-    if (c->n_captures == 1) return ((fn1c_t)c->func)(c->captures[0]);
-    return 0;
+    typedef int64_t (*fn2c_t)(int64_t, int64_t);
+    typedef int64_t (*fn3c_t)(int64_t, int64_t, int64_t);
+    switch (c->n_captures) {
+        case 0: return ((fn0_t)c->func)();
+        case 1: return ((fn1c_t)c->func)(c->captures[0]);
+        case 2: return ((fn2c_t)c->func)(c->captures[0], c->captures[1]);
+        case 3: return ((fn3c_t)c->func)(c->captures[0], c->captures[1], c->captures[2]);
+        default: return 0;
+    }
 }
 
 /* Call closure with 1 explicit arg + captures */
 int64_t fastpy_closure_call1(FpyClosure *c, int64_t a) {
     typedef int64_t (*fn1_t)(int64_t);
     typedef int64_t (*fn2c_t)(int64_t, int64_t);
-    if (c->n_captures == 0) return ((fn1_t)c->func)(a);
-    if (c->n_captures == 1) return ((fn2c_t)c->func)(a, c->captures[0]);
-    return 0;
+    typedef int64_t (*fn3c_t)(int64_t, int64_t, int64_t);
+    typedef int64_t (*fn4c_t)(int64_t, int64_t, int64_t, int64_t);
+    switch (c->n_captures) {
+        case 0: return ((fn1_t)c->func)(a);
+        case 1: return ((fn2c_t)c->func)(a, c->captures[0]);
+        case 2: return ((fn3c_t)c->func)(a, c->captures[0], c->captures[1]);
+        case 3: return ((fn4c_t)c->func)(a, c->captures[0], c->captures[1], c->captures[2]);
+        default: return 0;
+    }
 }
 
 /* Call closure with 2 explicit args + captures */
 int64_t fastpy_closure_call2(FpyClosure *c, int64_t a, int64_t b) {
     typedef int64_t (*fn2_t)(int64_t, int64_t);
     typedef int64_t (*fn3c_t)(int64_t, int64_t, int64_t);
-    if (c->n_captures == 0) return ((fn2_t)c->func)(a, b);
-    if (c->n_captures == 1) return ((fn3c_t)c->func)(a, b, c->captures[0]);
-    return 0;
+    typedef int64_t (*fn4c_t)(int64_t, int64_t, int64_t, int64_t);
+    typedef int64_t (*fn5c_t)(int64_t, int64_t, int64_t, int64_t, int64_t);
+    switch (c->n_captures) {
+        case 0: return ((fn2_t)c->func)(a, b);
+        case 1: return ((fn3c_t)c->func)(a, b, c->captures[0]);
+        case 2: return ((fn4c_t)c->func)(a, b, c->captures[0], c->captures[1]);
+        case 3: return ((fn5c_t)c->func)(a, b, c->captures[0], c->captures[1], c->captures[2]);
+        default: return 0;
+    }
 }
 
 /* Call closure with args passed as a list (for *args unpacking).
@@ -2405,17 +2435,28 @@ int64_t fastpy_str_compare(const char *a, const char *b) {
 }
 
 /* Call a raw function pointer (for higher-order functions without closures) */
+/* Smart function-pointer calls: auto-detect closures via magic number.
+ * If the pointer is a closure struct, delegate to closure_callN.
+ * If it's a raw function pointer, call directly. This lets closures
+ * and raw function pointers be used interchangeably when passed
+ * through capture chains (the 3-level closure problem). */
 int64_t fastpy_call_ptr0(void *func) {
+    if (fpy_is_closure(func))
+        return fastpy_closure_call0((FpyClosure*)func);
     typedef int64_t (*fn_t)(void);
     return ((fn_t)func)();
 }
 
 int64_t fastpy_call_ptr1(void *func, int64_t a) {
+    if (fpy_is_closure(func))
+        return fastpy_closure_call1((FpyClosure*)func, a);
     typedef int64_t (*fn_t)(int64_t);
     return ((fn_t)func)(a);
 }
 
 int64_t fastpy_call_ptr2(void *func, int64_t a, int64_t b) {
+    if (fpy_is_closure(func))
+        return fastpy_closure_call2((FpyClosure*)func, a, b);
     typedef int64_t (*fn_t)(int64_t, int64_t);
     return ((fn_t)func)(a, b);
 }
