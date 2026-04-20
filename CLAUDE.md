@@ -1610,6 +1610,45 @@ and dynamic dispatch. It's the natural prerequisite for Milestone 11
 (optimization passes), because the optimizer needs to know value types
 to specialize them.
 
+#### Hack 28: Closures returning booleans crash via call_ptr
+
+**What:** Closures whose body returns a comparison (`return x > n`)
+crash at runtime when called via `call_ptr1`. The crash is an access
+violation (rc=3221225477 on Windows).
+
+**Root cause:** Closures are declared with legacy i64 ABI
+(`_scan_for_closures` at line ~1164 sets `ret_type = i64`). But when
+`_USE_FV_LOCALS` is True, the closure body's `_emit_return` wraps the
+comparison result as an FpyValue `{i32, i64}` and tries to `ret` it.
+The LLVM function signature says `i64` return but the `ret` instruction
+returns `{i32, i64}` — this is invalid IR that causes UB at runtime.
+
+**What it breaks:** Any closure that returns a comparison, boolean
+expression, or any value that gets FV-wrapped in the body. This blocks
+`filter(closure, list)` with boolean predicates.
+
+**Attempted fix (reverted):** Setting `_USE_FV_LOCALS = False` in
+`_emit_closure_body` fixed the boolean return but caused regressions
+in other closure patterns — nested closures and decorator chains broke
+because the outer function's FV state was corrupted by the flag change.
+
+**Recommended fix approach (per user):** Selectively disable FV
+wrapping in the *return path only* for closure bodies, rather than
+globally disabling `_USE_FV_LOCALS`. Specifically:
+1. In `_emit_return`, detect when `self.function` is a closure
+   (i64 return type, not FpyValue struct return).
+2. When the return value is an FpyValue, extract just the data (i64)
+   before returning — this is the unwrap that `_unwrap_fv_for_tag`
+   does. For booleans: `extract_value(fv, 1)` then zext to i64.
+3. This should be safe because the closure's callers (call_ptr1,
+   closure_call1) expect i64 returns, and the closure's internal
+   variables can still use FV locals — only the final `ret` needs
+   to strip the FpyValue wrapper.
+
+The key insight: FV locals should stay ON inside closures (variables,
+comparisons, intermediate expressions all benefit from runtime tags).
+Only the return instruction needs to convert from FpyValue back to i64.
+
 ### 18. OS design
 
 The OS architecture, language choices, driver model, hardware support
