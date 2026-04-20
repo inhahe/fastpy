@@ -26,8 +26,12 @@ static int cpython_initialized = 0;
 void fpy_cpython_init(void) {
     if (cpython_initialized) return;
     /* Set PYTHONHOME so CPython finds its stdlib. Without this,
-     * Py_Initialize fails when the exe is in a temp directory. */
+     * Py_Initialize fails when the exe is in a temp directory.
+     * On POSIX, the linked libpython usually self-discovers its prefix,
+     * so we only override on Windows where the exe runs from a temp dir. */
+#ifdef _WIN32
     Py_SetPythonHome(L"D:\\python314");
+#endif
     Py_Initialize();
     cpython_initialized = 1;
 }
@@ -145,7 +149,7 @@ static void pyobject_to_fpy(PyObject *obj, int32_t *out_tag, int64_t *out_data) 
         *out_tag = FPY_TAG_STR;
         /* Get UTF-8 string — we strdup because the PyObject may be freed */
         const char *s = PyUnicode_AsUTF8(obj);
-        char *copy = _strdup(s ? s : "");
+        char *copy = fpy_strdup(s ? s : "");
         *out_data = (int64_t)(intptr_t)copy;
     } else if (PyList_Check(obj)) {
         *out_tag = FPY_TAG_LIST;
@@ -615,4 +619,105 @@ void fpy_cpython_exec_locals(const char *code, FpyDict *locals_dict) {
     /* Flush CPython stdout immediately so exec'd print output
      * appears in the correct order relative to native printf. */
     fpy_cpython_flush();
+}
+
+/* ============================================================
+ * Extended bridge: type(), iteration, arithmetic
+ * ============================================================ */
+
+/* type(pyobj) → returns the type name as a string (e.g., "int", "list") */
+const char* fpy_cpython_typeof(void *obj) {
+    if (!obj) return "NoneType";
+    PyObject *type = PyObject_Type((PyObject*)obj);
+    if (!type) return "unknown";
+    PyObject *name = PyObject_GetAttrString(type, "__name__");
+    Py_DECREF(type);
+    if (!name) return "unknown";
+    const char *s = PyUnicode_AsUTF8(name);
+    /* Copy since the PyObject may be freed */
+    const char *result = s ? fpy_strdup(s) : "unknown";
+    Py_DECREF(name);
+    return result;
+}
+
+/* iter(pyobj) → returns a PyObject* iterator */
+void* fpy_cpython_iter(void *obj) {
+    PyObject *iter = PyObject_GetIter((PyObject*)obj);
+    if (!iter) { PyErr_Clear(); return NULL; }
+    return (void*)iter;
+}
+
+/* next(iterator) → returns 1 if got value (stored in out_tag/out_data),
+ *                   0 if StopIteration (iterator exhausted).
+ * Does NOT print errors for StopIteration. */
+int32_t fpy_cpython_iter_next(void *iter,
+                               int32_t *out_tag, int64_t *out_data) {
+    PyObject *item = PyIter_Next((PyObject*)iter);
+    if (!item) {
+        /* StopIteration or error */
+        if (PyErr_Occurred()) PyErr_Clear();
+        *out_tag = FPY_TAG_NONE;
+        *out_data = 0;
+        return 0;  /* exhausted */
+    }
+    pyobject_to_fpy(item, out_tag, out_data);
+    Py_DECREF(item);
+    return 1;  /* got value */
+}
+
+/* Arithmetic on pyobj: call a binary operator via Python C API.
+ * op: 0=add, 1=sub, 2=mul, 3=truediv, 4=floordiv, 5=mod, 6=pow
+ * Returns result as FpyValue. */
+void fpy_cpython_binop(void *left, int32_t right_tag, int64_t right_data,
+                        int32_t op,
+                        int32_t *out_tag, int64_t *out_data) {
+    PyObject *r = fpy_to_pyobject(right_tag, right_data);
+    PyObject *result = NULL;
+    switch (op) {
+        case 0: result = PyNumber_Add((PyObject*)left, r); break;
+        case 1: result = PyNumber_Subtract((PyObject*)left, r); break;
+        case 2: result = PyNumber_Multiply((PyObject*)left, r); break;
+        case 3: result = PyNumber_TrueDivide((PyObject*)left, r); break;
+        case 4: result = PyNumber_FloorDivide((PyObject*)left, r); break;
+        case 5: result = PyNumber_Remainder((PyObject*)left, r); break;
+        case 6: result = PyNumber_Power((PyObject*)left, r, Py_None); break;
+        default: break;
+    }
+    Py_DECREF(r);
+    if (!result) {
+        PyErr_Print();
+        *out_tag = FPY_TAG_NONE;
+        *out_data = 0;
+        return;
+    }
+    pyobject_to_fpy(result, out_tag, out_data);
+    Py_DECREF(result);
+}
+
+/* Reverse arithmetic: native_value op pyobj.
+ * Converts native to PyObject*, performs op, converts back. */
+void fpy_cpython_rbinop(int32_t left_tag, int64_t left_data,
+                         void *right, int32_t op,
+                         int32_t *out_tag, int64_t *out_data) {
+    PyObject *l = fpy_to_pyobject(left_tag, left_data);
+    PyObject *result = NULL;
+    switch (op) {
+        case 0: result = PyNumber_Add(l, (PyObject*)right); break;
+        case 1: result = PyNumber_Subtract(l, (PyObject*)right); break;
+        case 2: result = PyNumber_Multiply(l, (PyObject*)right); break;
+        case 3: result = PyNumber_TrueDivide(l, (PyObject*)right); break;
+        case 4: result = PyNumber_FloorDivide(l, (PyObject*)right); break;
+        case 5: result = PyNumber_Remainder(l, (PyObject*)right); break;
+        case 6: result = PyNumber_Power(l, (PyObject*)right, Py_None); break;
+        default: break;
+    }
+    Py_DECREF(l);
+    if (!result) {
+        PyErr_Print();
+        *out_tag = FPY_TAG_NONE;
+        *out_data = 0;
+        return;
+    }
+    pyobject_to_fpy(result, out_tag, out_data);
+    Py_DECREF(result);
 }

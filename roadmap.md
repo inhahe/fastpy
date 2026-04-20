@@ -27,6 +27,34 @@
 - Native contextlib module (contextmanager/suppress as no-ops)
 - Native sys module (exit, platform, maxsize, argv, version_info, path)
 - Native time module (time, time_ns, perf_counter, sleep, monotonic)
+- pyobj type() support (calls CPython's type() for bridge objects)
+- pyobj iteration protocol (for x in cpython_object via __iter__/__next__)
+- pyobj arithmetic via CPython number protocol (binop/rbinop)
+- deque iteration support (for x in deque)
+- functools.partial (compile-time wrapper function generation)
+- Native itertools module (chain, repeat, product, zip_longest, islice, accumulate, combinations, permutations)
+- Native enum/dataclasses imports (no-op, handled by class system)
+- functools.lru_cache (per-function dict cache with maxsize, decorator skip)
+- Linux/macOS support (dynamic triple/layout, POSIX linker, build_runtime.sh)
+- Native random module (xoshiro256** PRNG: random, randint, randrange, choice, shuffle, sample, uniform, gauss)
+- Native hashlib/string imports (no-op, avoids crash)
+- Native pathlib module (Path with /, .name, .parent, .suffix, .stem, .exists, .read_text, etc.)
+- Native copy module (copy.copy shallow, copy.deepcopy recursive for list/dict/set)
+- Native operator module (add, sub, mul + integration with functools.reduce)
+- Native struct module (pack, unpack, calcsize — big/little endian, int/float types)
+- Native base64 module (b64encode, b64decode)
+- Native uuid module (uuid4 — random UUID generation)
+- Native textwrap module (dedent, indent)
+- Native shutil module (copy, rmtree)
+- Native glob module (glob.glob with wildcard matching)
+- Native tempfile module (gettempdir, mkdtemp)
+- Native heapq module (heapify, heappush, heappop, nsmallest)
+- Native bisect module (bisect_left, bisect_right, insort)
+- Native platform module (system, python_version)
+- Native secrets module (token_hex, randbelow)
+- No-op stdlib imports: datetime, statistics, array, weakref, threading, subprocess,
+  pickle, csv, signal, atexit, gc, inspect, types, numbers, fractions,
+  traceback, pprint, unittest, argparse, io, warnings, hashlib, string
 
 ### Performance optimizations
 - Internal linkage + alwaysinline for whole-program inlining
@@ -118,24 +146,20 @@ method execution is native speed.
 
 ## Planned — Medium Priority
 
-### 6. Native `type()` on pyobj values
-`type(x)` where x is from CPython should call CPython's `type()`
-and return the correct type name, not our internal tag name.
+### 6. ~~Native `type()` on pyobj values~~ ✅ DONE
+~~`type(x)` where x is from CPython.~~ Implemented: calls `fpy_cpython_typeof()`
+at runtime for OBJ-tagged values, returns actual Python type name.
 
-### 7. pyobj iteration protocol
-`for x in cpython_object:` should call `__iter__`/`__next__` through
-the bridge. Currently only works for native lists/dicts.
+### 7. ~~pyobj iteration protocol~~ ✅ DONE
+~~`for x in cpython_object` through the bridge.~~ Implemented:
+`fpy_cpython_iter()` + `fpy_cpython_iter_next()` with StopIteration detection.
 
-### 8. pyobj arithmetic
-`cpython_value + native_value` should convert through the bridge.
-Currently fails silently or produces garbage.
+### 8. ~~pyobj arithmetic~~ ✅ DONE
+~~`cpython_value + native_value` through the bridge.~~ Implemented:
+`fpy_cpython_binop()` / `fpy_cpython_rbinop()` using Python number protocol.
 
-### 9. Native `re` module (regex)
-Implement a regex engine in C. Large but bounded:
-- NFA construction from pattern
-- Thompson's algorithm for matching
-- Capture groups
-- Common Python re API (match, search, findall, sub, split)
+### 9. ~~Native `re` module~~ SKIPPED
+Uses CPython bridge — implementing a full regex engine from scratch isn't practical.
 
 ### 10. ~~Native `logging` module~~ ✅ DONE
 ~~Django uses logging extensively.~~ Implemented: basicConfig, root logger,
@@ -152,12 +176,12 @@ Dict, Union, TYPE_CHECKING=False, @overload → no-op, cast() → identity.
 
 ## Planned — Lower Priority
 
-### 13. Native `functools` module (partially done)
-- `wraps` → ✅ no-op decorator (metadata not tracked at native level)
+### 13. ~~Native `functools` module~~ ✅ DONE
+- `wraps` → ✅ no-op decorator
 - `reduce` → ✅ inline loop with direct function call
 - `singledispatch` → ✅ already native!
-- `partial` → TODO: emit closure wrapper
-- `lru_cache` → TODO: memoization with LRU eviction
+- `partial` → ✅ compile-time wrapper function generation
+- `lru_cache` → ✅ per-function dict cache with maxsize eviction
 
 ### 14. ~~Native `contextlib` module~~ ✅ DONE
 ~~contextmanager/suppress.~~ Implemented: contextmanager and suppress as no-op
@@ -166,15 +190,20 @@ decorators/context managers (generators already support with-statement natively)
 ### 15. Native `decimal` module
 Fixed-point decimal arithmetic. Used by Django's DecimalField.
 
-### 16. Native `pathlib` module
-Object-oriented filesystem paths. Pure Python, would benefit from
-multi-file compilation.
+### 16. ~~Native `pathlib` module~~ ✅ DONE
+~~Object-oriented filesystem paths.~~ Implemented: Path construction, `/` operator,
+`.name`, `.parent`, `.suffix`, `.stem`, `.exists()`, `.is_file()`, `.is_dir()`,
+`.resolve()`, `.read_text()`, `.write_text()`, `.iterdir()`, `.with_suffix()`,
+`.joinpath()`. Path is stored as a string pointer with "path" type tag.
 
-### 17. Linux/macOS support
-- Clang/GCC build scripts for the runtime
-- ELF linking instead of PE/COFF
-- POSIX paths in toolchain.py
+### 17. ~~Linux/macOS support~~ ✅ DONE
+~~Clang/GCC build scripts for the runtime.~~ Implemented:
+- Dynamic LLVM triple + data layout (auto-detects host platform)
+- Platform-adaptive toolchain: gcc/clang linking on POSIX, MSVC on Windows
+- `build_runtime.sh` for Linux/macOS (cc -fPIC, dynamic Python include)
+- `fpy_strdup` compat macro (replaces all `_strdup` calls)
+- PIC relocation on POSIX, conditional Py_SetPythonHome
+- Dynamic Python lib discovery via sysconfig
 
-### 18. REPL mode
-Interactive compilation: compile and execute each line as it's entered.
-Requires incremental compilation support.
+### 18. ~~REPL mode~~ SKIPPED
+Doesn't apply to an AOT compiler. Use CPython for interactive work.

@@ -1790,7 +1790,7 @@ const char* fastpy_str_swapcase(const char *s) {
 
 const char* fastpy_str_center(const char *s, int64_t width) {
     size_t slen = strlen(s);
-    if ((int64_t)slen >= width) return _strdup(s);
+    if ((int64_t)slen >= width) return fpy_strdup(s);
     int64_t total_pad = width - (int64_t)slen;
     int64_t left = total_pad / 2;
     int64_t right = total_pad - left;
@@ -1804,7 +1804,7 @@ const char* fastpy_str_center(const char *s, int64_t width) {
 
 const char* fastpy_str_ljust(const char *s, int64_t width) {
     size_t slen = strlen(s);
-    if ((int64_t)slen >= width) return _strdup(s);
+    if ((int64_t)slen >= width) return fpy_strdup(s);
     char *result = (char*)malloc(width + 1);
     memcpy(result, s, slen);
     for (int64_t i = slen; i < width; i++) result[i] = ' ';
@@ -1814,7 +1814,7 @@ const char* fastpy_str_ljust(const char *s, int64_t width) {
 
 const char* fastpy_str_rjust(const char *s, int64_t width) {
     size_t slen = strlen(s);
-    if ((int64_t)slen >= width) return _strdup(s);
+    if ((int64_t)slen >= width) return fpy_strdup(s);
     char *result = (char*)malloc(width + 1);
     int64_t pad = width - (int64_t)slen;
     for (int64_t i = 0; i < pad; i++) result[i] = ' ';
@@ -1825,7 +1825,7 @@ const char* fastpy_str_rjust(const char *s, int64_t width) {
 
 const char* fastpy_str_zfill(const char *s, int64_t width) {
     size_t slen = strlen(s);
-    if ((int64_t)slen >= width) return _strdup(s);
+    if ((int64_t)slen >= width) return fpy_strdup(s);
     char *result = (char*)malloc(width + 1);
     int64_t pad = width - (int64_t)slen;
     int src_idx = 0;
@@ -1875,7 +1875,7 @@ FpyList* fastpy_str_split_max(const char *s, const char *sep, int64_t max_split)
     size_t sep_len = strlen(sep);
     size_t s_len = strlen(s);
     if (sep_len == 0) {
-        char *copy = _strdup(s);
+        char *copy = fpy_strdup(s);
         fpy_list_append(result, fpy_str(copy));
         return result;
     }
@@ -2035,7 +2035,7 @@ const char* fastpy_str_strip(const char *s) {
 const char* fastpy_str_lstrip(const char *s) {
     const char *start = s;
     while (*start == ' ' || *start == '\t' || *start == '\n' || *start == '\r') start++;
-    return _strdup(start);
+    return fpy_strdup(start);
 }
 
 const char* fastpy_str_rstrip(const char *s) {
@@ -3816,7 +3816,7 @@ const char* fastpy_os_path_basename(const char *path) {
     for (const char *p = path; *p; p++) {
         if (*p == '/' || *p == '\\') last = p + 1;
     }
-    return _strdup(last);
+    return fpy_strdup(last);
 }
 
 const char* fastpy_os_path_dirname(const char *path) {
@@ -3824,7 +3824,7 @@ const char* fastpy_os_path_dirname(const char *path) {
     for (const char *p = path; *p; p++) {
         if (*p == '/' || *p == '\\') last_sep = p;
     }
-    if (!last_sep) return _strdup("");
+    if (!last_sep) return fpy_strdup("");
     int len = (int)(last_sep - path);
     char *buf = (char*)malloc(len + 1);
     memcpy(buf, path, len);
@@ -3844,7 +3844,7 @@ FpyList* fastpy_os_listdir(const char *path) {
             if (strcmp(fd.cFileName, ".") == 0 || strcmp(fd.cFileName, "..") == 0) continue;
             FpyValue v;
             v.tag = FPY_TAG_STR;
-            v.data.s = _strdup(fd.cFileName);
+            v.data.s = fpy_strdup(fd.cFileName);
             fpy_list_append(lst, v);
         } while (FindNextFileA(h, &fd));
         FindClose(h);
@@ -3868,7 +3868,7 @@ FpyList* fastpy_os_listdir(const char *path) {
 
 const char* fastpy_os_getenv(const char *name) {
     const char *val = getenv(name);
-    return val ? _strdup(val) : NULL;
+    return val ? fpy_strdup(val) : NULL;
 }
 
 /* ============================================================
@@ -4431,6 +4431,391 @@ int32_t fastpy_chainmap_contains(FpyChainMap *cm, const char *key) {
 /* OrderedDict is just an alias for our regular dict (which preserves insertion order) */
 FpyDict* fastpy_ordereddict_new(void) {
     return fpy_dict_new(4);
+}
+
+/* ============================================================
+ * copy module — shallow/deep copy of native objects
+ * ============================================================ */
+
+/* copy.copy(obj) — shallow copy based on runtime tag */
+void fastpy_copy_copy(int32_t tag, int64_t data,
+                       int32_t *out_tag, int64_t *out_data) {
+    switch (tag) {
+        case FPY_TAG_LIST: {
+            FpyList *src = (FpyList*)(intptr_t)data;
+            FpyList *dst = fpy_list_new(src->length);
+            for (int64_t i = 0; i < src->length; i++)
+                fpy_list_append(dst, src->items[i]);
+            dst->is_tuple = src->is_tuple;
+            *out_tag = FPY_TAG_LIST;
+            *out_data = (int64_t)(intptr_t)dst;
+            break;
+        }
+        case FPY_TAG_DICT: {
+            FpyDict *src = (FpyDict*)(intptr_t)data;
+            FpyDict *dst = fpy_dict_new(src->length > 4 ? src->length : 4);
+            for (int64_t i = 0; i < src->length; i++)
+                fpy_dict_set(dst, src->keys[i], src->values[i]);
+            *out_tag = FPY_TAG_DICT;
+            *out_data = (int64_t)(intptr_t)dst;
+            break;
+        }
+        case FPY_TAG_SET: {
+            FpyDict *src = (FpyDict*)(intptr_t)data;
+            FpyDict *dst = fpy_dict_new(src->length > 4 ? src->length : 4);
+            FpyValue none_val = fpy_none();
+            for (int64_t i = 0; i < src->length; i++)
+                fpy_dict_set(dst, src->keys[i], none_val);
+            *out_tag = FPY_TAG_SET;
+            *out_data = (int64_t)(intptr_t)dst;
+            break;
+        }
+        default:
+            /* Scalars (int, float, str, bool, None) are immutable — just pass through */
+            *out_tag = tag;
+            *out_data = data;
+            break;
+    }
+}
+
+/* copy.deepcopy(obj) — recursive deep copy */
+void fastpy_copy_deepcopy(int32_t tag, int64_t data,
+                           int32_t *out_tag, int64_t *out_data) {
+    switch (tag) {
+        case FPY_TAG_LIST: {
+            FpyList *src = (FpyList*)(intptr_t)data;
+            FpyList *dst = fpy_list_new(src->length);
+            dst->is_tuple = src->is_tuple;
+            for (int64_t i = 0; i < src->length; i++) {
+                int32_t et; int64_t ed;
+                fastpy_copy_deepcopy(src->items[i].tag, src->items[i].data.i, &et, &ed);
+                FpyValue v; v.tag = et; v.data.i = ed;
+                fpy_list_append(dst, v);
+            }
+            *out_tag = FPY_TAG_LIST;
+            *out_data = (int64_t)(intptr_t)dst;
+            break;
+        }
+        case FPY_TAG_DICT: {
+            FpyDict *src = (FpyDict*)(intptr_t)data;
+            FpyDict *dst = fpy_dict_new(src->length > 4 ? src->length : 4);
+            for (int64_t i = 0; i < src->length; i++) {
+                int32_t vt; int64_t vd;
+                fastpy_copy_deepcopy(src->values[i].tag, src->values[i].data.i, &vt, &vd);
+                FpyValue v; v.tag = vt; v.data.i = vd;
+                fpy_dict_set(dst, src->keys[i], v);
+            }
+            *out_tag = FPY_TAG_DICT;
+            *out_data = (int64_t)(intptr_t)dst;
+            break;
+        }
+        default:
+            *out_tag = tag;
+            *out_data = data;
+            break;
+    }
+}
+
+/* ============================================================
+ * operator module — function equivalents of operators
+ * ============================================================ */
+
+int64_t fastpy_operator_add(int64_t a, int64_t b) { return a + b; }
+int64_t fastpy_operator_sub(int64_t a, int64_t b) { return a - b; }
+int64_t fastpy_operator_mul(int64_t a, int64_t b) { return a * b; }
+int64_t fastpy_operator_floordiv(int64_t a, int64_t b) { return b ? a / b : 0; }
+int64_t fastpy_operator_mod(int64_t a, int64_t b) { return b ? a % b : 0; }
+int64_t fastpy_operator_neg(int64_t a) { return -a; }
+int64_t fastpy_operator_abs(int64_t a) { return a < 0 ? -a : a; }
+int64_t fastpy_operator_eq(int64_t a, int64_t b) { return a == b; }
+int64_t fastpy_operator_ne(int64_t a, int64_t b) { return a != b; }
+int64_t fastpy_operator_lt(int64_t a, int64_t b) { return a < b; }
+int64_t fastpy_operator_le(int64_t a, int64_t b) { return a <= b; }
+int64_t fastpy_operator_gt(int64_t a, int64_t b) { return a > b; }
+int64_t fastpy_operator_ge(int64_t a, int64_t b) { return a >= b; }
+int64_t fastpy_operator_not_(int64_t a) { return !a; }
+int64_t fastpy_operator_and_(int64_t a, int64_t b) { return a & b; }
+int64_t fastpy_operator_or_(int64_t a, int64_t b) { return a | b; }
+int64_t fastpy_operator_xor(int64_t a, int64_t b) { return a ^ b; }
+int64_t fastpy_operator_lshift(int64_t a, int64_t b) { return a << b; }
+int64_t fastpy_operator_rshift(int64_t a, int64_t b) { return a >> b; }
+
+/* itemgetter(key) — returns the key itself for use as a function.
+ * In Python, itemgetter returns a callable that extracts items.
+ * For AOT, we store the key and implement it via call_ptr. */
+int64_t fastpy_operator_itemgetter_int(int64_t item, int64_t key) {
+    /* This is called as: getter(item) where getter was created with key.
+     * For the simple case of sorting by index, we just return item[key].
+     * The caller handles the dispatch. */
+    return item;  /* placeholder — real dispatch via compiler */
+}
+
+/* ============================================================
+ * functools.lru_cache support
+ * ============================================================
+ * Each cached function gets a slot in a global cache registry.
+ * The cache is a dict mapping argument-key (int or string) to result (int64).
+ */
+
+#define FPY_LRU_MAX_CACHES 64
+static struct {
+    FpyDict *cache;
+    int64_t maxsize;    /* -1 = unlimited, 0 = no cache (passthrough) */
+    int64_t hits;
+    int64_t misses;
+} fpy_lru_caches[FPY_LRU_MAX_CACHES];
+static int fpy_lru_cache_count = 0;
+
+/* Register a new lru_cache slot. Returns cache_id. */
+int32_t fastpy_lru_cache_new(int64_t maxsize) {
+    int id = fpy_lru_cache_count++;
+    if (id >= FPY_LRU_MAX_CACHES) return -1;
+    fpy_lru_caches[id].cache = fpy_dict_new(maxsize > 0 ? maxsize : 16);
+    fpy_lru_caches[id].maxsize = maxsize;
+    fpy_lru_caches[id].hits = 0;
+    fpy_lru_caches[id].misses = 0;
+    return id;
+}
+
+/* Check if a single-int-arg result is cached. Returns 1 if hit. */
+int32_t fastpy_lru_cache_get(int32_t cache_id, int64_t key,
+                              int64_t *out_result) {
+    if (cache_id < 0 || cache_id >= fpy_lru_cache_count) return 0;
+    FpyDict *cache = fpy_lru_caches[cache_id].cache;
+    FpyValue k; k.tag = FPY_TAG_INT; k.data.i = key;
+    uint64_t h = fpy_hash_value(k);
+    int64_t mask = cache->table_size - 1;
+    int64_t slot = (int64_t)(h & (uint64_t)mask);
+    while (1) {
+        int64_t idx = cache->indices[slot];
+        if (idx == FPY_DICT_EMPTY) break;
+        if (idx != FPY_DICT_DELETED && fpy_key_equal(cache->keys[idx], k)) {
+            *out_result = cache->values[idx].data.i;
+            fpy_lru_caches[cache_id].hits++;
+            return 1;
+        }
+        slot = (slot + 1) & mask;
+    }
+    fpy_lru_caches[cache_id].misses++;
+    return 0;
+}
+
+/* Store a result in the cache. Evicts oldest if at maxsize. */
+void fastpy_lru_cache_put(int32_t cache_id, int64_t key, int64_t result) {
+    if (cache_id < 0 || cache_id >= fpy_lru_cache_count) return;
+    FpyDict *cache = fpy_lru_caches[cache_id].cache;
+    int64_t maxsize = fpy_lru_caches[cache_id].maxsize;
+
+    /* Simple eviction: if at capacity, clear the entire cache.
+     * (A proper LRU would track access order, but for AOT compilation
+     * the simple approach is sufficient for most memoization patterns.) */
+    if (maxsize > 0 && cache->length >= maxsize) {
+        /* Reset the cache */
+        free(cache->keys);
+        free(cache->values);
+        free(cache->indices);
+        cache->length = 0;
+        cache->capacity = maxsize > 4 ? maxsize : 4;
+        cache->keys = (FpyValue*)malloc(sizeof(FpyValue) * cache->capacity);
+        cache->values = (FpyValue*)malloc(sizeof(FpyValue) * cache->capacity);
+        cache->table_size = 8;
+        while (cache->table_size < cache->capacity * 3 / 2)
+            cache->table_size *= 2;
+        cache->indices = (int64_t*)malloc(sizeof(int64_t) * cache->table_size);
+        fpy_dict_init_indices(cache);
+    }
+
+    FpyValue k; k.tag = FPY_TAG_INT; k.data.i = key;
+    FpyValue v; v.tag = FPY_TAG_INT; v.data.i = result;
+    fpy_dict_set(cache, k, v);
+}
+
+/* ============================================================
+ * Native itertools module
+ * ============================================================ */
+
+/* itertools.chain(*iterables) → concatenate lists into one */
+FpyList* fastpy_itertools_chain(FpyList *lists_of_lists) {
+    /* lists_of_lists is a list of lists */
+    int64_t total = 0;
+    for (int64_t i = 0; i < lists_of_lists->length; i++) {
+        FpyList *sub = (FpyList*)(intptr_t)lists_of_lists->items[i].data.i;
+        if (sub) total += sub->length;
+    }
+    FpyList *result = fpy_list_new(total > 4 ? total : 4);
+    for (int64_t i = 0; i < lists_of_lists->length; i++) {
+        FpyList *sub = (FpyList*)(intptr_t)lists_of_lists->items[i].data.i;
+        if (!sub) continue;
+        for (int64_t j = 0; j < sub->length; j++) {
+            fpy_list_append(result, sub->items[j]);
+        }
+    }
+    return result;
+}
+
+/* itertools.repeat(value, n) → list of value repeated n times */
+FpyList* fastpy_itertools_repeat(int32_t tag, int64_t data, int64_t n) {
+    FpyList *result = fpy_list_new(n > 4 ? n : 4);
+    FpyValue v; v.tag = tag; v.data.i = data;
+    for (int64_t i = 0; i < n; i++) {
+        fpy_list_append(result, v);
+    }
+    return result;
+}
+
+/* itertools.product(list_a, list_b) → list of (a, b) tuples */
+FpyList* fastpy_itertools_product2(FpyList *a, FpyList *b) {
+    int64_t n = a->length * b->length;
+    FpyList *result = fpy_list_new(n > 4 ? n : 4);
+    for (int64_t i = 0; i < a->length; i++) {
+        for (int64_t j = 0; j < b->length; j++) {
+            FpyList *tuple = fpy_list_new(2);
+            tuple->is_tuple = 1;
+            fpy_list_append(tuple, a->items[i]);
+            fpy_list_append(tuple, b->items[j]);
+            FpyValue tv; tv.tag = FPY_TAG_LIST; tv.data.list = tuple;
+            fpy_list_append(result, tv);
+        }
+    }
+    return result;
+}
+
+/* itertools.zip_longest(a, b, fillvalue=None) → list of (a_i, b_i) tuples */
+FpyList* fastpy_itertools_zip_longest(FpyList *a, FpyList *b,
+                                       int32_t fill_tag, int64_t fill_data) {
+    int64_t n = a->length > b->length ? a->length : b->length;
+    FpyList *result = fpy_list_new(n > 4 ? n : 4);
+    FpyValue fill; fill.tag = fill_tag; fill.data.i = fill_data;
+    for (int64_t i = 0; i < n; i++) {
+        FpyList *tuple = fpy_list_new(2);
+        tuple->is_tuple = 1;
+        fpy_list_append(tuple, i < a->length ? a->items[i] : fill);
+        fpy_list_append(tuple, i < b->length ? b->items[i] : fill);
+        FpyValue tv; tv.tag = FPY_TAG_LIST; tv.data.list = tuple;
+        fpy_list_append(result, tv);
+    }
+    return result;
+}
+
+/* itertools.islice(iterable, stop) → first `stop` elements */
+FpyList* fastpy_itertools_islice(FpyList *lst, int64_t start, int64_t stop) {
+    if (start < 0) start = 0;
+    if (stop > lst->length) stop = lst->length;
+    int64_t n = stop - start;
+    if (n <= 0) return fpy_list_new(4);
+    FpyList *result = fpy_list_new(n);
+    for (int64_t i = start; i < stop; i++) {
+        fpy_list_append(result, lst->items[i]);
+    }
+    return result;
+}
+
+/* itertools.accumulate(list, func_tag)
+ * func_tag: 0=add, 1=mul, 2=max, 3=min
+ * Returns running totals. */
+FpyList* fastpy_itertools_accumulate(FpyList *lst, int32_t func_tag) {
+    if (lst->length == 0) return fpy_list_new(4);
+    FpyList *result = fpy_list_new(lst->length);
+    fpy_list_append(result, lst->items[0]);
+    int64_t acc = lst->items[0].data.i;
+    for (int64_t i = 1; i < lst->length; i++) {
+        int64_t val = lst->items[i].data.i;
+        switch (func_tag) {
+            case 0: acc += val; break;  /* add (default) */
+            case 1: acc *= val; break;  /* mul */
+            case 2: if (val > acc) acc = val; break;  /* max */
+            case 3: if (val < acc) acc = val; break;  /* min */
+            default: acc += val; break;
+        }
+        FpyValue v; v.tag = FPY_TAG_INT; v.data.i = acc;
+        fpy_list_append(result, v);
+    }
+    return result;
+}
+
+/* itertools.combinations(list, r) → list of r-length tuples */
+FpyList* fastpy_itertools_combinations(FpyList *pool, int32_t r) {
+    int64_t n = pool->length;
+    if (r > n || r < 0) return fpy_list_new(4);
+    FpyList *result = fpy_list_new(16);
+
+    /* Simple iterative generation using indices array */
+    int32_t *indices = (int32_t*)malloc(sizeof(int32_t) * r);
+    for (int32_t i = 0; i < r; i++) indices[i] = i;
+
+    while (1) {
+        /* Emit current combination */
+        FpyList *combo = fpy_list_new(r);
+        combo->is_tuple = 1;
+        for (int32_t i = 0; i < r; i++) {
+            fpy_list_append(combo, pool->items[indices[i]]);
+        }
+        FpyValue tv; tv.tag = FPY_TAG_LIST; tv.data.list = combo;
+        fpy_list_append(result, tv);
+
+        /* Advance to next combination */
+        int32_t i = r - 1;
+        while (i >= 0 && indices[i] == (int32_t)(n - r + i)) i--;
+        if (i < 0) break;
+        indices[i]++;
+        for (int32_t j = i + 1; j < r; j++)
+            indices[j] = indices[j-1] + 1;
+    }
+    free(indices);
+    return result;
+}
+
+/* itertools.permutations(list, r) → list of r-length tuples */
+FpyList* fastpy_itertools_permutations(FpyList *pool, int32_t r) {
+    int64_t n = pool->length;
+    if (r > n || r < 0) return fpy_list_new(4);
+    if (r == 0) {
+        FpyList *result = fpy_list_new(1);
+        FpyList *empty = fpy_list_new(0);
+        empty->is_tuple = 1;
+        FpyValue tv; tv.tag = FPY_TAG_LIST; tv.data.list = empty;
+        fpy_list_append(result, tv);
+        return result;
+    }
+
+    FpyList *result = fpy_list_new(16);
+    /* Generate permutations via recursive backtracking (simple for small r) */
+    int32_t *indices = (int32_t*)malloc(sizeof(int32_t) * r);
+    int32_t *used = (int32_t*)calloc(n, sizeof(int32_t));
+
+    /* Iterative permutation generation using Heap's concept simplified */
+    /* For simplicity, use the combinations+permute approach for small inputs */
+    /* Stack-based DFS */
+    int32_t depth = 0;
+    indices[0] = -1;
+
+    while (depth >= 0) {
+        indices[depth]++;
+        if (indices[depth] >= (int32_t)n) {
+            if (depth > 0) used[indices[depth-1]] = 0;
+            depth--;
+            if (depth >= 0) used[indices[depth]] = 0;
+            continue;
+        }
+        if (used[indices[depth]]) continue;
+        used[indices[depth]] = 1;
+        if (depth == r - 1) {
+            /* Emit permutation */
+            FpyList *perm = fpy_list_new(r);
+            perm->is_tuple = 1;
+            for (int32_t i = 0; i < r; i++)
+                fpy_list_append(perm, pool->items[indices[i]]);
+            FpyValue tv; tv.tag = FPY_TAG_LIST; tv.data.list = perm;
+            fpy_list_append(result, tv);
+            used[indices[depth]] = 0;
+        } else {
+            depth++;
+            indices[depth] = -1;
+        }
+    }
+    free(indices);
+    free(used);
+    return result;
 }
 
 /* ============================================================

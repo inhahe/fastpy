@@ -19,6 +19,13 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* Cross-platform strdup: MSVC uses _strdup, POSIX uses strdup */
+#ifdef _MSC_VER
+#define fpy_strdup _strdup
+#else
+#define fpy_strdup strdup
+#endif
+
 /* Type tags */
 #define FPY_TAG_INT    0
 #define FPY_TAG_FLOAT  1

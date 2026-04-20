@@ -101,7 +101,9 @@ def compile_source(source: str, output: Path | None = None,
     # Stage 4: Compile to native executable
     if output is None:
         tmp_dir = tempfile.mkdtemp(prefix="fastpy_")
-        output = Path(tmp_dir) / "output.exe"
+        import sys as _sys
+        exe_name = "output.exe" if _sys.platform == "win32" else "output"
+        output = Path(tmp_dir) / exe_name
 
     try:
         from compiler.toolchain import compile_and_link
