@@ -3065,7 +3065,7 @@ FpyObj* fastpy_obj_new(int class_id) {
     int sc = fpy_classes[class_id].slot_count;
     size_t total = sizeof(FpyObj) + sizeof(FpyValue) * sc;
     FpyObj *obj = (FpyObj*)malloc(total);
-    obj->refcount = FPY_RC_IMMORTAL;  /* immortal until temporary lifetime is handled */
+    obj->refcount = FPY_RC_IMMORTAL;  /* kept immortal: __lt__ corruption with refcount=1 needs investigation */
     memset(&obj->gc_node, 0, sizeof(FpyGCNode));
     obj->gc_node.gc_type = FPY_GC_TYPE_OBJ;
     fpy_gc_track(&obj->gc_node);

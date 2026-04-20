@@ -3518,6 +3518,17 @@ class CodeGen:
                     and isinstance(d.value, bool)):
                 bool_default_params.add(name)
 
+        # Track parameter names so _emit_scope_decref skips them
+        # (parameters are borrowed references from the caller)
+        self._current_func_params = set(
+            a.arg for a in node.args.args)
+        if node.args.kwonlyargs:
+            self._current_func_params.update(a.arg for a in node.args.kwonlyargs)
+        if node.args.vararg:
+            self._current_func_params.add(node.args.vararg.arg)
+        if node.args.kwarg:
+            self._current_func_params.add(node.args.kwarg.arg)
+
         # Store parameters as local variables
         has_vararg = node.args.vararg is not None
         has_kwarg = node.args.kwarg is not None
@@ -8152,12 +8163,17 @@ class CodeGen:
         """Emit decref for all FV-local variables in the current scope.
         Called before every function exit (return/implicit return).
         The `exclude_var` is the variable being returned (don't decref it —
-        ownership transfers to the caller)."""
+        ownership transfers to the caller).
+        Function parameters are BORROWED references — the caller owns them,
+        so we must NOT decref them here."""
         if not self._USE_REFCOUNT:
             return
+        param_names = getattr(self, '_current_func_params', set())
         for var_name, (alloca, tag) in self.variables.items():
             if var_name == exclude_var:
                 continue
+            if var_name in param_names:
+                continue  # borrowed reference from caller
             if tag == "cell":
                 continue  # cells are managed separately
             if var_name in self._global_vars:
