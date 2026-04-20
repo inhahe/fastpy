@@ -4810,6 +4810,10 @@ class CodeGen:
         self.variables = {}
         self._loop_stack = []
 
+        # Track parameter names so _emit_scope_decref skips them
+        # (parameters are borrowed references from the caller)
+        self._current_func_params = set(a.arg for a in node.args.args)
+
         # Detect string params, float-default params, and object params
         string_params = self._detect_string_params(node)
         # Detect params with float/bool defaults (e.g. def __init__(self, x=0.0))
