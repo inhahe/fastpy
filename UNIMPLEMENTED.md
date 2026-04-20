@@ -104,6 +104,20 @@ These are patterns that work partially or through fallback paths:
 7. **Dataclasses** — class compiles but decorator-generated methods (like
    `__repr__`) don't override native class methods. NamedTuple works.
 
+8. **BigInt** — all integers are i64 (64-bit signed). `2**100` silently
+   overflows instead of producing a big integer. Any program that uses
+   integers larger than ~9.2×10¹⁸ produces wrong results. This is the
+   largest Python compatibility gap. Fix: speculative unboxing on fast
+   path with BigInt fallback on overflow (Milestone 10 in CLAUDE.md).
+
+9. **Native os/json/re modules** — route through CPython bridge. Could be
+   implemented natively for standalone executables without Python runtime.
+   math module is already native.
+
+10. **Linux/macOS support** — currently Windows x64 only (MSVC toolchain).
+    The runtime C code is portable; needs Clang/GCC build scripts and
+    ELF linking instead of PE/COFF.
+
 11. **GC: temporary value lifetime** — expressions like `print(str(x) + str(y))`
     create temporary strings that aren't decrefd after the statement.
     Temporaries accumulate until the cycle collector runs (every 700

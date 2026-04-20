@@ -150,12 +150,11 @@ python -m compiler myprogram.py -o myprogram.exe
 
 ## Known limitations
 
+- **Integers are 64-bit** — `2**100` silently overflows instead of producing a big integer. This is the largest Python compatibility gap. Programs using integers > ~9.2×10¹⁸ produce wrong results. BigInt support (speculative unboxing with overflow fallback) is planned.
 - **Generators with send()** and **async/await** run through the CPython bridge (correct but not native-speed)
 - **eval()/exec()** route through CPython (no access to compiled locals)
 - **Complex numbers** use the CPython bridge (no native complex arithmetic)
-- **Dataclasses** compile but decorator-generated methods don't override native class methods
-- **Call-on-call** `f(3)(5)` hangs — use `x = f(3); x(5)` as workaround
-- No garbage collection (arena allocator, objects never freed — suitable for batch programs)
+- **Windows x64 only** — needs MSVC Build Tools. Linux/macOS support planned.
 
 See [UNIMPLEMENTED.md](UNIMPLEMENTED.md) for the full list.
 
