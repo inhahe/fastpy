@@ -114,6 +114,17 @@ These are patterns that work partially or through fallback paths:
     works for zero-arg functions. Functions with parameters need the native
     wrapper to handle argument passing (currently only `void(*)(void)` ABI).
 
+11. **GC: temporary value lifetime** — expressions like `print(str(x) + str(y))`
+    create temporary strings that aren't decrefd after the statement.
+    Temporaries accumulate until the cycle collector runs (every 700
+    allocations). Not a correctness issue, but causes higher memory usage
+    for string-heavy code without variable assignments.
+
+12. **GC: audit LLVM non-determinism** — the in-process audit (66 tests
+    in one Python process) shows 65/66 due to LLVM pass manager producing
+    different code on repeated compilations. Each test passes individually
+    in a fresh process. Not a fastpy bug.
+
 ### Recently resolved (2026-04-19)
 
 - **#4 filter()** — now uses inline loop like map(), handles all element types
