@@ -25,6 +25,7 @@ extern void fastpy_raise(int exc_type, const char *msg);
 FpyList* fpy_list_new(int64_t capacity) {
     if (capacity < 4) capacity = 4;
     FpyList *list = (FpyList*)malloc(sizeof(FpyList));
+    list->refcount = 1;
     list->items = (FpyValue*)malloc(sizeof(FpyValue) * capacity);
     list->length = 0;
     list->capacity = capacity;
@@ -646,6 +647,7 @@ FpyDict* fpy_dict_new(int64_t capacity) {
         dict->table_size *= 2;
     dict->indices = (int64_t*)malloc(sizeof(int64_t) * dict->table_size);
     fpy_dict_init_indices(dict);
+    dict->refcount = 1;
     if (fpy_threading_mode == FPY_THREADING_FREE) fpy_mutex_init(&dict->lock);
     return dict;
 }
@@ -2922,6 +2924,7 @@ FpyObj* fastpy_obj_new(int class_id) {
     int sc = fpy_classes[class_id].slot_count;
     size_t total = sizeof(FpyObj) + sizeof(FpyValue) * sc;
     FpyObj *obj = (FpyObj*)fpy_arena_alloc(total);
+    obj->refcount = FPY_RC_IMMORTAL;  /* arena-allocated: can't be individually freed */
     obj->magic = FPY_OBJ_MAGIC;
     obj->class_id = class_id;
     if (fpy_threading_mode == FPY_THREADING_FREE) fpy_mutex_init(&obj->lock);

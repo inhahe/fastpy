@@ -42,6 +42,7 @@ fpy_val_ptr = ir.PointerType(fpy_val)
 # IR access to obj->slots[idx] (skips the fastpy_obj_get_slot /
 # fastpy_obj_set_slot function call overhead).
 fpy_obj_type = ir.LiteralStructType([
+    i32,                             # refcount
     i32,                             # magic (FPY_OBJ_MAGIC)
     i32,                             # class_id
     fpy_val_ptr,                     # slots
@@ -5739,7 +5740,7 @@ class CodeGen:
     # Constants for direct slot offset computation (must match C layout).
     # FpyObj: { i32 class_id, 4 pad, i8* slots, i8* dynamic_attrs } = 24 bytes
     # FpyValue: { i32 tag, 4 pad, i64 data } = 16 bytes
-    _FPYOBJ_SIZE = 32    # sizeof(FpyObj) on x64: magic(4) + class_id(4) + slots(8) + dynamic_attrs(8) + padding(8)
+    _FPYOBJ_SIZE = 32    # sizeof(FpyObj) on x64 (excl lock): refcount(4) + magic(4) + class_id(4) + pad(4) + slots(8) + dynamic_attrs(8)
     _FPYVAL_SIZE = 16    # sizeof(FpyValue) on x64
     _FPYVAL_DATA_OFF = 8 # offsetof(FpyValue, data) = 4 (tag) + 4 (pad)
 
@@ -5753,7 +5754,7 @@ class CodeGen:
         obj_typed = self.builder.bitcast(obj, fpy_obj_ptr)
         slots_pp = self.builder.gep(
             obj_typed,
-            [ir.Constant(i32, 0), ir.Constant(i32, 2)],  # index 2: slots (after magic, class_id)
+            [ir.Constant(i32, 0), ir.Constant(i32, 3)],  # index 3: slots (after refcount, magic, class_id)
             inbounds=True)
         slots_ptr = self.builder.load(slots_pp)
         if not hasattr(self, "_invariant_md"):
@@ -5803,7 +5804,7 @@ class CodeGen:
         obj_typed = self.builder.bitcast(obj, fpy_obj_ptr)
         slots_pp = self.builder.gep(
             obj_typed,
-            [ir.Constant(i32, 0), ir.Constant(i32, 2)],  # index 2: slots (after magic, class_id)
+            [ir.Constant(i32, 0), ir.Constant(i32, 3)],  # index 3: slots (after refcount, magic, class_id)
             inbounds=True)
         slots_ptr = self.builder.load(slots_pp)
         slot_addr = self.builder.gep(

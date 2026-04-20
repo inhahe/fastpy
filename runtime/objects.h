@@ -93,9 +93,25 @@ typedef struct FpyObjAttrs {
  * O(1) access. Dynamic attrs (from getattr/setattr or attrs the compiler
  * didn't pre-declare) fall back to the lazily-allocated `dynamic_attrs`
  * side table — NULL unless any dynamic attr has ever been written. */
+/* ── Reference counting ──────────────────────────────────────────
+ * Every heap-allocated object starts with a refcount field.
+ * INT32_MAX = immortal (never freed: arena-allocated, constants).
+ * Refcount is manipulated by fpy_incref/fpy_decref. When it hits
+ * zero, the type-specific destructor frees the object. */
+#define FPY_RC_IMMORTAL INT32_MAX
+
+static inline void fpy_incref(int32_t *rc) {
+    if (*rc != FPY_RC_IMMORTAL) (*rc)++;
+}
+static inline int fpy_decref(int32_t *rc) {
+    if (*rc == FPY_RC_IMMORTAL) return 0;
+    return (--(*rc) == 0);  /* returns 1 if object should be freed */
+}
+
 #define FPY_OBJ_MAGIC 0x4F424A53  /* "OBJS" — distinguishes FpyObj from PyObject* */
 
 struct FpyObj {
+    int32_t refcount;                    /* reference count (first field for all GC'd objects) */
     int magic;                           /* FPY_OBJ_MAGIC for native objects */
     int class_id;
     FpyValue *slots;                 /* size = class's slot_count, NULL if 0 */
@@ -106,6 +122,7 @@ struct FpyObj {
 /* List: growable array of FpyValue. `is_tuple` distinguishes tuple-
    typed lists for display purposes (they print with parens). */
 struct FpyList {
+    int32_t refcount;
     FpyValue *items;
     int64_t length;
     int64_t capacity;
@@ -166,6 +183,7 @@ void fpy_list_write(FpyList *list);  /* no newline */
 #define FPY_DICT_DELETED (-2)
 
 typedef struct {
+    int32_t refcount;
     int64_t *indices;      /* hash table → entry index (size = table_size) */
     FpyValue *keys;        /* compact entries: keys[0..length-1] */
     FpyValue *values;      /* compact entries: values[0..length-1] */
