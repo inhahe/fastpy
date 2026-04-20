@@ -41,10 +41,21 @@ fpy_val_ptr = ir.PointerType(fpy_val)
 # side-table so FpyObj is ~24 bytes (was ~1560). Used for direct-struct
 # IR access to obj->slots[idx] (skips the fastpy_obj_get_slot /
 # fastpy_obj_set_slot function call overhead).
+# FpyObj layout on x64:
+#   offset  0: i32 refcount
+#   offset  4: (padding)
+#   offset  8: FpyGCNode (24 bytes: 2 ptrs + 2 i32s)
+#   offset 32: i32 magic
+#   offset 36: i32 class_id
+#   offset 40: ptr slots
+#   offset 48: ptr dynamic_attrs
+# Represent GC node as 3 opaque i64s to match alignment:
 fpy_obj_type = ir.LiteralStructType([
-    i32,                             # refcount
-    i32,                             # magic (FPY_OBJ_MAGIC)
-    i32,                             # class_id
+    i64,                             # refcount (i32) + padding (4 bytes) = 8
+    i64,                             # gc_node.gc_prev
+    i64,                             # gc_node.gc_next
+    i64,                             # gc_node.gc_refs (i32) + gc_node.gc_flags (i32)
+    i64,                             # magic (i32) + class_id (i32)
     fpy_val_ptr,                     # slots
     i8_ptr,                          # dynamic_attrs (opaque to codegen)
 ])
@@ -5763,7 +5774,7 @@ class CodeGen:
         obj_typed = self.builder.bitcast(obj, fpy_obj_ptr)
         slots_pp = self.builder.gep(
             obj_typed,
-            [ir.Constant(i32, 0), ir.Constant(i32, 3)],  # index 3: slots (after refcount, magic, class_id)
+            [ir.Constant(i32, 0), ir.Constant(i32, 5)],  # index 5: slots (after refcount+pad, gc_node[3], magic+class_id)
             inbounds=True)
         slots_ptr = self.builder.load(slots_pp)
         if not hasattr(self, "_invariant_md"):
@@ -5813,7 +5824,7 @@ class CodeGen:
         obj_typed = self.builder.bitcast(obj, fpy_obj_ptr)
         slots_pp = self.builder.gep(
             obj_typed,
-            [ir.Constant(i32, 0), ir.Constant(i32, 3)],  # index 3: slots (after refcount, magic, class_id)
+            [ir.Constant(i32, 0), ir.Constant(i32, 5)],  # index 5: slots (after refcount+pad, gc_node[3], magic+class_id)
             inbounds=True)
         slots_ptr = self.builder.load(slots_pp)
         slot_addr = self.builder.gep(

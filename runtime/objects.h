@@ -14,6 +14,7 @@
 
 #include <stdint.h>
 #include "threading.h"
+#include "gc.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -105,13 +106,17 @@ static inline void fpy_incref(int32_t *rc) {
 }
 static inline int fpy_decref(int32_t *rc) {
     if (*rc == FPY_RC_IMMORTAL) return 0;
-    return (--(*rc) == 0);  /* returns 1 if object should be freed */
+    return (--(*rc) == 0);
 }
+/* Thread-safe variants — used in free-threaded mode. Defined in gc.c. */
+void fpy_incref_atomic(int32_t *rc);
+int fpy_decref_atomic(int32_t *rc);
 
 #define FPY_OBJ_MAGIC 0x4F424A53  /* "OBJS" — distinguishes FpyObj from PyObject* */
 
 struct FpyObj {
     int32_t refcount;                    /* reference count (first field for all GC'd objects) */
+    FpyGCNode gc_node;                   /* cycle collector tracking */
     int magic;                           /* FPY_OBJ_MAGIC for native objects */
     int class_id;
     FpyValue *slots;                 /* size = class's slot_count, NULL if 0 */
@@ -123,6 +128,7 @@ struct FpyObj {
    typed lists for display purposes (they print with parens). */
 struct FpyList {
     int32_t refcount;
+    FpyGCNode gc_node;                   /* cycle collector tracking */
     FpyValue *items;
     int64_t length;
     int64_t capacity;
@@ -216,6 +222,7 @@ void fpy_list_write(FpyList *list);  /* no newline */
 
 typedef struct {
     int32_t refcount;
+    FpyGCNode gc_node;                   /* cycle collector tracking */
     int64_t *indices;      /* hash table → entry index (size = table_size) */
     FpyValue *keys;        /* compact entries: keys[0..length-1] */
     FpyValue *values;      /* compact entries: values[0..length-1] */

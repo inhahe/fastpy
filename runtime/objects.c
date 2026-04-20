@@ -4,6 +4,7 @@
 
 #include "objects.h"
 #include "threading.h"
+#include "gc.h"
 #include <math.h>
 
 /* Forward declarations */
@@ -45,7 +46,7 @@ extern FpyClassDef fpy_classes[];  /* defined later in this file */
 /* --- Destructors for refcounted objects --- */
 
 static void fpy_list_destroy(FpyList *list) {
-    /* Decref each element, then free the array and the list itself */
+    fpy_gc_untrack(&list->gc_node);
     for (int64_t i = 0; i < list->length; i++) {
         fpy_rc_decref(list->items[i].tag, list->items[i].data.i);
     }
@@ -54,6 +55,7 @@ static void fpy_list_destroy(FpyList *list) {
 }
 
 static void fpy_dict_destroy(FpyDict *dict) {
+    fpy_gc_untrack(&dict->gc_node);
     for (int64_t i = 0; i < dict->length; i++) {
         fpy_rc_decref(dict->keys[i].tag, dict->keys[i].data.i);
         fpy_rc_decref(dict->values[i].tag, dict->values[i].data.i);
@@ -131,11 +133,13 @@ FpyList* fpy_list_new(int64_t capacity) {
     if (capacity < 4) capacity = 4;
     FpyList *list = (FpyList*)malloc(sizeof(FpyList));
     list->refcount = 1;
+    memset(&list->gc_node, 0, sizeof(FpyGCNode));
     list->items = (FpyValue*)malloc(sizeof(FpyValue) * capacity);
     list->length = 0;
     list->capacity = capacity;
     list->is_tuple = 0;
     if (fpy_threading_mode == FPY_THREADING_FREE) fpy_mutex_init(&list->lock);
+    fpy_gc_track(&list->gc_node);
     return list;
 }
 
@@ -756,6 +760,8 @@ FpyDict* fpy_dict_new(int64_t capacity) {
     dict->indices = (int64_t*)malloc(sizeof(int64_t) * dict->table_size);
     fpy_dict_init_indices(dict);
     dict->refcount = 1;
+    memset(&dict->gc_node, 0, sizeof(FpyGCNode));
+    fpy_gc_track(&dict->gc_node);
     if (fpy_threading_mode == FPY_THREADING_FREE) fpy_mutex_init(&dict->lock);
     return dict;
 }
@@ -3037,6 +3043,8 @@ FpyObj* fastpy_obj_new(int class_id) {
     size_t total = sizeof(FpyObj) + sizeof(FpyValue) * sc;
     FpyObj *obj = (FpyObj*)malloc(total);
     obj->refcount = FPY_RC_IMMORTAL;  /* TODO: use refcount=1 once scope cleanup is robust */
+    memset(&obj->gc_node, 0, sizeof(FpyGCNode));
+    fpy_gc_track(&obj->gc_node);
     obj->magic = FPY_OBJ_MAGIC;
     obj->class_id = class_id;
     if (fpy_threading_mode == FPY_THREADING_FREE) fpy_mutex_init(&obj->lock);

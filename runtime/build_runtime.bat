@@ -24,4 +24,9 @@ if errorlevel 1 (
     echo COMPILE_FAILED threading.c
     exit /b 1
 )
+cl.exe /c /O2 /nologo gc.c /Fogc.obj
+if errorlevel 1 (
+    echo COMPILE_FAILED gc.c
+    exit /b 1
+)
 echo COMPILE_OK
