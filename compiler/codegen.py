@@ -148,8 +148,12 @@ class CodeGen:
         self._str_counter = 0
 
         # Reference counting: emit incref/decref at variable stores and scope exits.
-        # Disabled by default until the full GC is ready; enable for testing.
         self._USE_REFCOUNT = True
+
+        # Temporary value tracking for GC: expressions that create heap
+        # objects (string concat, list literal, etc.) push FpyValue pairs
+        # here. Statement boundaries flush with decref.
+        self._rc_temps: list[tuple] = []  # list of (tag_val, data_val) LLVM values
 
         # Counter for unique block names
         self._block_counter = 0
@@ -8198,6 +8202,16 @@ class CodeGen:
                     self.builder.call(self.runtime["set_ret_tag"],
                                       [ir.Constant(i32, tag)])
                 self.builder.ret(value)
+
+    def _flush_rc_temps(self) -> None:
+        """Decref any temporary values created during expression evaluation.
+        Called at statement boundaries to free temporaries that weren't
+        stored in variables (e.g., intermediate strings from concat)."""
+        if not self._USE_REFCOUNT or not self._rc_temps:
+            return
+        for tag_val, data_val in self._rc_temps:
+            self.builder.call(self.runtime["rc_decref"], [tag_val, data_val])
+        self._rc_temps.clear()
 
     def _emit_scope_decref(self, exclude_var: str | None = None) -> None:
         """Emit decref for all FV-local variables in the current scope.

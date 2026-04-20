@@ -1444,7 +1444,7 @@ typedef struct {
 
 FpyCell* fastpy_cell_new(int64_t initial) {
     FpyCell *cell = (FpyCell*)malloc(sizeof(FpyCell));
-    cell->refcount = 1;
+    cell->refcount = FPY_RC_IMMORTAL;  /* cells are tiny, shared between closure and caller */
     cell->value = initial;
     return cell;
 }
