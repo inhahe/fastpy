@@ -1169,7 +1169,32 @@ class CodeGen:
                     for param, pname in zip(func.args, all_params):
                         param.name = pname
 
-                    ret_tag = "int" if ret_type == i64 else "void"
+                    # Detect if the closure returns a boolean.
+                    # Traces through variable assignments so that
+                    # `result = x > n; return result` is also detected.
+                    ret_tag = "void"
+                    if ret_type == i64:
+                        ret_tag = "int"
+                        _cvar_exprs: dict[str, ast.expr] = {}
+                        for _s in node.body:
+                            if (isinstance(_s, ast.Assign)
+                                    and len(_s.targets) == 1
+                                    and isinstance(_s.targets[0], ast.Name)):
+                                _cvar_exprs[_s.targets[0].id] = _s.value
+                        for rn in node.body:
+                            if isinstance(rn, ast.Return) and rn.value is not None:
+                                v = rn.value
+                                if isinstance(v, ast.Name) and v.id in _cvar_exprs:
+                                    v = _cvar_exprs[v.id]
+                                if isinstance(v, ast.Compare):
+                                    ret_tag = "bool"
+                                elif (isinstance(v, ast.UnaryOp)
+                                        and isinstance(v.op, ast.Not)):
+                                    ret_tag = "bool"
+                                elif (isinstance(v, ast.Call)
+                                        and isinstance(v.func, ast.Name)
+                                        and v.func.id in ("bool", "isinstance")):
+                                    ret_tag = "bool"
                     # Register as a special closure function
                     self._user_functions[full_name] = FuncInfo(
                         func=func, ret_tag=ret_tag,
