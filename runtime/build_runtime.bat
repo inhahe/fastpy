@@ -29,4 +29,9 @@ if errorlevel 1 (
     echo COMPILE_FAILED gc.c
     exit /b 1
 )
+cl.exe /c /O2 /nologo bigint.c /Fobigint.obj
+if errorlevel 1 (
+    echo COMPILE_FAILED bigint.c
+    exit /b 1
+)
 echo COMPILE_OK

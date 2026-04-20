@@ -26,6 +26,8 @@ def main() -> int:
     parser.add_argument("--threading", choices=["none", "gil", "free"],
                         default=None,
                         help="Threading mode: none (default), gil, or free")
+    parser.add_argument("--int64", action="store_true",
+                        help="Use i64 integers with overflow detection (no BigInt fallback, raises OverflowError)")
 
     args = parser.parse_args()
 
@@ -41,7 +43,8 @@ def main() -> int:
         threading_mode = {"none": 0, "gil": 1, "free": 2}[args.threading]
 
     result = compile_file(args.source, args.output,
-                          threading_mode=threading_mode)
+                          threading_mode=threading_mode,
+                          int64_mode=args.int64)
 
     if result.success:
         print(f"Compiled: {result.executable}")

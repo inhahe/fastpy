@@ -30,6 +30,7 @@
 #define FPY_TAG_DICT   7
 #define FPY_TAG_BYTES  8
 #define FPY_TAG_SET    9
+#define FPY_TAG_BIGINT 10
 
 /* Forward declarations */
 typedef struct FpyList FpyList;

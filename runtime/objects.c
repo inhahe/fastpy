@@ -5,6 +5,7 @@
 #include "objects.h"
 #include "threading.h"
 #include "gc.h"
+#include "bigint.h"
 #include <math.h>
 
 /* Forward declarations */
@@ -173,6 +174,12 @@ void fpy_rc_decref(int32_t tag, int64_t data) {
             }
             break;
         }
+        case FPY_TAG_BIGINT: {
+            FpyBigInt *bi = (FpyBigInt*)(intptr_t)data;
+            if (bi && fpy_decref(&bi->refcount))
+                fpy_bigint_free(bi);
+            break;
+        }
         default: break;
     }
 }
@@ -305,6 +312,12 @@ void fpy_value_repr(FpyValue val, char *buf, int bufsize) {
             snprintf(buf, bufsize, "%s", s);
             break;
         }
+        case FPY_TAG_BIGINT: {
+            const char *s = fpy_bigint_to_str((FpyBigInt*)(intptr_t)val.data.i);
+            snprintf(buf, bufsize, "%s", s);
+            free((void*)s);
+            break;
+        }
         case FPY_TAG_SET: {
             FpyDict *set = (FpyDict*)val.data.list;
             int pos = 0;
@@ -430,6 +443,12 @@ void fpy_value_write(FpyValue val) {
         case FPY_TAG_SET:
             fastpy_set_write((FpyDict*)val.data.list);
             break;
+        case FPY_TAG_BIGINT: {
+            const char *s = fpy_bigint_to_str((FpyBigInt*)(intptr_t)val.data.i);
+            printf("%s", s);
+            free((void*)s);
+            break;
+        }
     }
 }
 
