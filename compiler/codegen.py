@@ -5705,7 +5705,14 @@ class CodeGen:
                         and isinstance(value_node, ast.Name)
                         and value_node.id in self._user_functions
                         and value_node.id not in self.variables):
-                    func_ptr = self.builder.inttoptr(value, i8_ptr)
+                    info = self._user_functions[value_node.id]
+                    if info.uses_fv_abi:
+                        # FV-ABI function: wrap with i64 shim first so the
+                        # native wrapper can call it as int64_t(*)(int64_t...)
+                        wrapper = self._get_or_emit_i64_wrapper(info)
+                        func_ptr = self.builder.bitcast(wrapper, i8_ptr)
+                    else:
+                        func_ptr = self.builder.inttoptr(value, i8_ptr)
                     wrapped = self.builder.call(
                         self.runtime["cpython_wrap_native"], [func_ptr])
                     return FPY_TAG_OBJ, self.builder.ptrtoint(wrapped, i64)
@@ -12446,6 +12453,14 @@ class CodeGen:
                 raise CodeGenError("Inline lambda must take exactly one argument", node)
             fn = self._emit_inline_unary_lambda(fn_node, node)
             return self.builder.bitcast(fn, i8_ptr)
+        # Call expression returning a callable: e.g. map(f(5), list)
+        # where f(5) returns a closure. Evaluate the call and return
+        # the result as a function pointer.
+        if isinstance(fn_node, ast.Call):
+            val = self._emit_expr_value(fn_node)
+            if isinstance(val.type, ir.IntType):
+                val = self.builder.inttoptr(val, i8_ptr)
+            return val
         raise CodeGenError("key/map/filter function must be a named function or lambda", node)
 
     def _get_or_emit_builtin_shim(self, name: str) -> ir.Value:
