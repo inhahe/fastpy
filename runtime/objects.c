@@ -141,6 +141,7 @@ FpyList* fpy_list_new(int64_t capacity) {
     if (fpy_threading_mode == FPY_THREADING_FREE) fpy_mutex_init(&list->lock);
     list->gc_node.gc_type = FPY_GC_TYPE_LIST;
     fpy_gc_track(&list->gc_node);
+    fpy_gc_maybe_collect();
     return list;
 }
 
@@ -541,6 +542,9 @@ FpyList* fastpy_list_sorted(FpyList *list) {
     FpyList *result = fpy_list_new(list->length);
     memcpy(result->items, list->items, sizeof(FpyValue) * list->length);
     result->length = list->length;
+    /* Incref each copied element (now referenced from both lists) */
+    for (int64_t i = 0; i < result->length; i++)
+        FPY_VAL_INCREF(result->items[i]);
     qsort(result->items, result->length, sizeof(FpyValue), fpy_value_compare);
     return result;
 }
@@ -549,6 +553,7 @@ FpyList* fastpy_list_sorted(FpyList *list) {
 FpyList* fastpy_list_reversed(FpyList *list) {
     FpyList *result = fpy_list_new(list->length);
     for (int64_t i = 0; i < list->length; i++) {
+        FPY_VAL_INCREF(list->items[list->length - 1 - i]);
         result->items[i] = list->items[list->length - 1 - i];
     }
     result->length = list->length;
@@ -764,6 +769,7 @@ FpyDict* fpy_dict_new(int64_t capacity) {
     memset(&dict->gc_node, 0, sizeof(FpyGCNode));
     dict->gc_node.gc_type = FPY_GC_TYPE_DICT;
     fpy_gc_track(&dict->gc_node);
+    fpy_gc_maybe_collect();
     if (fpy_threading_mode == FPY_THREADING_FREE) fpy_mutex_init(&dict->lock);
     return dict;
 }
@@ -1241,6 +1247,7 @@ void fastpy_set_write(FpyDict *set) {
 
 typedef struct {
     int32_t magic;        /* FPY_CLOSURE_MAGIC — distinguishes from raw func ptrs */
+    int32_t refcount;     /* reference count */
     int n_captures;
     int n_params;         /* number of explicit params (excluding captures) */
     void *func;           /* function pointer */
@@ -1258,6 +1265,7 @@ static int fpy_is_closure(void *ptr) {
 FpyClosure* fastpy_closure_new(void *func, int n_params, int n_captures) {
     FpyClosure *c = (FpyClosure*)malloc(sizeof(FpyClosure));
     c->magic = FPY_CLOSURE_MAGIC;
+    c->refcount = 1;
     c->func = func;
     c->n_params = n_params;
     c->n_captures = n_captures;
@@ -1402,11 +1410,13 @@ FpyList* fastpy_zip3(FpyList *a, FpyList *b, FpyList *c) {
 
 /* A cell holds a mutable int64 value on the heap */
 typedef struct {
+    int32_t refcount;
     int64_t value;
 } FpyCell;
 
 FpyCell* fastpy_cell_new(int64_t initial) {
     FpyCell *cell = (FpyCell*)malloc(sizeof(FpyCell));
+    cell->refcount = 1;
     cell->value = initial;
     return cell;
 }
@@ -3069,6 +3079,7 @@ FpyObj* fastpy_obj_new(int class_id) {
     memset(&obj->gc_node, 0, sizeof(FpyGCNode));
     obj->gc_node.gc_type = FPY_GC_TYPE_OBJ;
     fpy_gc_track(&obj->gc_node);
+    fpy_gc_maybe_collect();
     obj->magic = FPY_OBJ_MAGIC;
     obj->class_id = class_id;
     if (fpy_threading_mode == FPY_THREADING_FREE) fpy_mutex_init(&obj->lock);
