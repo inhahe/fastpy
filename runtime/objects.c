@@ -32,10 +32,42 @@ FpyString* fpy_str_alloc(int64_t len) {
     return s;
 }
 
+/* Incref/decref an FpyValue (convenience for container mutations) */
+#define FPY_VAL_INCREF(v) fpy_rc_incref((v).tag, (v).data.i)
+#define FPY_VAL_DECREF(v) fpy_rc_decref((v).tag, (v).data.i)
+
+/* Forward declarations for recursive destroy */
+static void fpy_list_destroy(FpyList *list);
+static void fpy_dict_destroy(FpyDict *dict);
+void fpy_rc_decref(int32_t tag, int64_t data);
+
+/* --- Destructors for refcounted objects --- */
+
+static void fpy_list_destroy(FpyList *list) {
+    /* Decref each element, then free the array and the list itself */
+    for (int64_t i = 0; i < list->length; i++) {
+        fpy_rc_decref(list->items[i].tag, list->items[i].data.i);
+    }
+    free(list->items);
+    free(list);
+}
+
+static void fpy_dict_destroy(FpyDict *dict) {
+    for (int64_t i = 0; i < dict->length; i++) {
+        fpy_rc_decref(dict->keys[i].tag, dict->keys[i].data.i);
+        fpy_rc_decref(dict->values[i].tag, dict->values[i].data.i);
+    }
+    free(dict->indices);
+    free(dict->keys);
+    free(dict->values);
+    free(dict);
+}
+
 /* Tag-dispatching incref/decref for FpyValue. Checks the tag to
  * determine the object type, then increfs/decrefs accordingly.
  * No-op for scalars (INT, FLOAT, BOOL, NONE). */
 void fpy_rc_incref(int32_t tag, int64_t data) {
+    if (data == 0) return;  /* NULL pointer guard */
     switch (tag) {
         case FPY_TAG_LIST: case FPY_TAG_SET:
             fpy_incref(&((FpyList*)(intptr_t)data)->refcount); break;
@@ -50,6 +82,7 @@ void fpy_rc_incref(int32_t tag, int64_t data) {
 }
 
 void fpy_rc_decref(int32_t tag, int64_t data) {
+    if (data == 0) return;  /* NULL pointer guard */
     switch (tag) {
         case FPY_TAG_STR:
             if (fpy_str_decref((const char*)(intptr_t)data)) {
@@ -57,15 +90,18 @@ void fpy_rc_decref(int32_t tag, int64_t data) {
                 if (h) free(h);
             }
             break;
-        /* LIST, DICT, OBJ destructors will be added in Phase 2-3 */
         case FPY_TAG_LIST: case FPY_TAG_SET:
-            fpy_decref(&((FpyList*)(intptr_t)data)->refcount);
-            /* TODO: free list when refcount hits 0 */
+            if (fpy_decref(&((FpyList*)(intptr_t)data)->refcount))
+                fpy_list_destroy((FpyList*)(intptr_t)data);
             break;
         case FPY_TAG_DICT:
-            fpy_decref(&((FpyDict*)(intptr_t)data)->refcount);
+            if (fpy_decref(&((FpyDict*)(intptr_t)data)->refcount))
+                fpy_dict_destroy((FpyDict*)(intptr_t)data);
             break;
         case FPY_TAG_OBJ:
+            /* FpyObj: only decref, don't free yet (arena-allocated
+             * objects have FPY_RC_IMMORTAL, malloc'd ones will be
+             * freed when we migrate off the arena in a future phase) */
             fpy_decref(&((FpyObj*)(intptr_t)data)->refcount);
             break;
         default: break;
@@ -99,6 +135,7 @@ static void fpy_list_append_unlocked(FpyList *list, FpyValue value) {
         list->capacity *= 2;
         list->items = (FpyValue*)realloc(list->items, sizeof(FpyValue) * list->capacity);
     }
+    FPY_VAL_INCREF(value);
     list->items[list->length++] = value;
 }
 
@@ -125,6 +162,8 @@ void fpy_list_set(FpyList *list, int64_t index, FpyValue value) {
         fprintf(stderr, "IndexError: list assignment index out of range\n");
         exit(1);
     }
+    FPY_VAL_DECREF(list->items[index]);  /* decref old element */
+    FPY_VAL_INCREF(value);               /* incref new element */
     list->items[index] = value;
     FPY_UNLOCK(list);
 }
@@ -721,6 +760,8 @@ static void fpy_dict_set_unlocked(FpyDict *dict, FpyValue key, FpyValue value) {
             if (first_deleted < 0) first_deleted = slot;
         } else if (fpy_key_equal(dict->keys[idx], key)) {
             /* Key exists — update value in place */
+            FPY_VAL_DECREF(dict->values[idx]);  /* decref old value */
+            FPY_VAL_INCREF(value);
             dict->values[idx] = value;
             return;
         }
@@ -741,6 +782,8 @@ static void fpy_dict_set_unlocked(FpyDict *dict, FpyValue key, FpyValue value) {
     }
 
     int64_t entry_idx = dict->length;
+    FPY_VAL_INCREF(key);
+    FPY_VAL_INCREF(value);
     dict->keys[entry_idx] = key;
     dict->values[entry_idx] = value;
     dict->indices[insert_slot] = entry_idx;
