@@ -22,11 +22,17 @@
 /* GC tracking header — prepended to every tracked object.
  * The object's own struct follows immediately after this header.
  * Uses a doubly-linked list for O(1) insert/remove. */
+/* Object type tags for the GC (tells the collector what struct this node is in) */
+#define FPY_GC_TYPE_LIST  1
+#define FPY_GC_TYPE_DICT  2
+#define FPY_GC_TYPE_OBJ   3
+
 typedef struct FpyGCNode {
     struct FpyGCNode *gc_prev;
     struct FpyGCNode *gc_next;
     int32_t gc_refs;      /* temporary refcount during collection */
-    uint32_t gc_flags;    /* GC state flags */
+    uint16_t gc_flags;    /* GC state flags */
+    uint16_t gc_type;     /* FPY_GC_TYPE_LIST/DICT/OBJ */
 } FpyGCNode;
 
 #define FPY_GC_TRACKED    0x01

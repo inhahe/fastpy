@@ -139,6 +139,7 @@ FpyList* fpy_list_new(int64_t capacity) {
     list->capacity = capacity;
     list->is_tuple = 0;
     if (fpy_threading_mode == FPY_THREADING_FREE) fpy_mutex_init(&list->lock);
+    list->gc_node.gc_type = FPY_GC_TYPE_LIST;
     fpy_gc_track(&list->gc_node);
     return list;
 }
@@ -761,6 +762,7 @@ FpyDict* fpy_dict_new(int64_t capacity) {
     fpy_dict_init_indices(dict);
     dict->refcount = 1;
     memset(&dict->gc_node, 0, sizeof(FpyGCNode));
+    dict->gc_node.gc_type = FPY_GC_TYPE_DICT;
     fpy_gc_track(&dict->gc_node);
     if (fpy_threading_mode == FPY_THREADING_FREE) fpy_mutex_init(&dict->lock);
     return dict;
@@ -1139,6 +1141,8 @@ void fastpy_set_discard_fv(FpyDict *set, int32_t tag, int64_t data) {
         int64_t idx = set->indices[slot];
         if (idx == FPY_DICT_EMPTY) return;  /* not found — no error */
         if (idx != FPY_DICT_DELETED && fpy_key_equal(set->keys[idx], key)) {
+            /* Decref the removed key */
+            FPY_VAL_DECREF(set->keys[idx]);
             /* Mark slot as deleted, compact entries, and rebuild indices. */
             set->indices[slot] = FPY_DICT_DELETED;
             for (int64_t j = idx; j < set->length - 1; j++) {
@@ -1437,6 +1441,7 @@ void fastpy_list_delete_at(FpyList *list, int64_t index) {
         fprintf(stderr, "IndexError: list index out of range\n");
         exit(1);
     }
+    FPY_VAL_DECREF(list->items[index]);
     for (int64_t i = index; i < list->length - 1; i++) {
         list->items[i] = list->items[i + 1];
     }
@@ -1455,6 +1460,9 @@ void fastpy_dict_delete(FpyDict *dict, const char *key) {
         int64_t idx = dict->indices[slot];
         if (idx == FPY_DICT_EMPTY) break;
         if (idx != FPY_DICT_DELETED && fpy_key_equal(dict->keys[idx], k)) {
+            /* Decref the removed key and value */
+            FPY_VAL_DECREF(dict->keys[idx]);
+            FPY_VAL_DECREF(dict->values[idx]);
             /* Mark slot as deleted and compact the entries array. */
             dict->indices[slot] = FPY_DICT_DELETED;
             /* Shift entries down to keep compact order. */
@@ -1480,6 +1488,7 @@ void fastpy_list_remove(FpyList *list, int64_t value) {
     FPY_LOCK(list);
     for (int64_t i = 0; i < list->length; i++) {
         if (list->items[i].tag == FPY_TAG_INT && list->items[i].data.i == value) {
+            FPY_VAL_DECREF(list->items[i]);
             for (int64_t j = i; j < list->length - 1; j++) {
                 list->items[j] = list->items[j + 1];
             }
@@ -1497,6 +1506,7 @@ void fastpy_list_remove_str(FpyList *list, const char *value) {
     FPY_LOCK(list);
     for (int64_t i = 0; i < list->length; i++) {
         if (list->items[i].tag == FPY_TAG_STR && strcmp(list->items[i].data.s, value) == 0) {
+            FPY_VAL_DECREF(list->items[i]);
             for (int64_t j = i; j < list->length - 1; j++) {
                 list->items[j] = list->items[j + 1];
             }
@@ -1562,6 +1572,8 @@ const char* fastpy_dict_pop(FpyDict *dict, const char *key) {
             } else {
                 result = "";
             }
+            /* Decref the key; value ownership transfers to caller */
+            FPY_VAL_DECREF(dict->keys[idx]);
             dict->indices[slot] = FPY_DICT_DELETED;
             for (int64_t j = idx; j < dict->length - 1; j++) {
                 dict->keys[j] = dict->keys[j + 1];
@@ -1591,6 +1603,8 @@ int64_t fastpy_dict_pop_int(FpyDict *dict, const char *key) {
         if (idx != FPY_DICT_DELETED && fpy_key_equal(dict->keys[idx], k)) {
             FpyValue v = dict->values[idx];
             int64_t result = (v.tag == FPY_TAG_INT) ? v.data.i : 0;
+            /* Decref the key; value ownership transfers to caller */
+            FPY_VAL_DECREF(dict->keys[idx]);
             dict->indices[slot] = FPY_DICT_DELETED;
             for (int64_t j = idx; j < dict->length - 1; j++) {
                 dict->keys[j] = dict->keys[j + 1];
@@ -2380,6 +2394,9 @@ FpyList* fastpy_list_copy(FpyList *list) {
 /* List clear — remove all items */
 void fastpy_list_clear(FpyList *list) {
     FPY_LOCK(list);
+    for (int64_t i = 0; i < list->length; i++) {
+        FPY_VAL_DECREF(list->items[i]);
+    }
     list->length = 0;
     FPY_UNLOCK(list);
 }
@@ -2402,6 +2419,11 @@ void fastpy_list_slice_assign(FpyList *list, int64_t start, int64_t stop,
     int64_t diff = new_len - old_len;
     int64_t final_len = list->length + diff;
 
+    /* Decref elements being removed from the old slice region */
+    for (int64_t i = start; i < stop; i++) {
+        FPY_VAL_DECREF(list->items[i]);
+    }
+
     /* Grow capacity if needed */
     while (list->capacity < final_len) {
         list->capacity = list->capacity * 2;
@@ -2415,8 +2437,9 @@ void fastpy_list_slice_assign(FpyList *list, int64_t start, int64_t stop,
                 sizeof(FpyValue) * (list->length - stop));
     }
 
-    /* Copy new values into the gap */
+    /* Copy new values into the gap and incref each */
     for (int64_t i = 0; i < new_len; i++) {
+        FPY_VAL_INCREF(new_values->items[i]);
         list->items[start + i] = new_values->items[i];
     }
     list->length = final_len;
@@ -3042,8 +3065,9 @@ FpyObj* fastpy_obj_new(int class_id) {
     int sc = fpy_classes[class_id].slot_count;
     size_t total = sizeof(FpyObj) + sizeof(FpyValue) * sc;
     FpyObj *obj = (FpyObj*)malloc(total);
-    obj->refcount = FPY_RC_IMMORTAL;  /* TODO: use refcount=1 once scope cleanup is robust */
+    obj->refcount = FPY_RC_IMMORTAL;  /* immortal until temporary lifetime is handled */
     memset(&obj->gc_node, 0, sizeof(FpyGCNode));
+    obj->gc_node.gc_type = FPY_GC_TYPE_OBJ;
     fpy_gc_track(&obj->gc_node);
     obj->magic = FPY_OBJ_MAGIC;
     obj->class_id = class_id;

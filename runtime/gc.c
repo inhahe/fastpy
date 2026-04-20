@@ -43,46 +43,204 @@ int64_t fpy_gc_tracked_count(void) {
     return gc_tracked;
 }
 
-/* ── Internal reference subtraction ──────────────────────────────── */
+/* ── Container ↔ GC node conversion ──────────────────────────────── */
 
-/* Subtract 1 from the gc_refs of a referenced tracked object.
- * Called for each outgoing reference from a tracked container. */
-static void gc_subtract_ref(FpyValue val) {
-    void *ptr = NULL;
+/* Get the container pointer from a GC node, based on gc_type */
+static void* gc_node_to_container(FpyGCNode *node) {
+    switch (node->gc_type) {
+        case FPY_GC_TYPE_LIST:
+            return (char*)node - offsetof(FpyList, gc_node);
+        case FPY_GC_TYPE_DICT:
+            return (char*)node - offsetof(FpyDict, gc_node);
+        case FPY_GC_TYPE_OBJ:
+            return (char*)node - offsetof(FpyObj, gc_node);
+        default: return NULL;
+    }
+}
+
+/* Get refcount from a GC node */
+static int32_t gc_get_refcount(FpyGCNode *node) {
+    switch (node->gc_type) {
+        case FPY_GC_TYPE_LIST: {
+            FpyList *l = (FpyList*)gc_node_to_container(node);
+            return l->refcount;
+        }
+        case FPY_GC_TYPE_DICT: {
+            FpyDict *d = (FpyDict*)gc_node_to_container(node);
+            return d->refcount;
+        }
+        case FPY_GC_TYPE_OBJ: {
+            FpyObj *o = (FpyObj*)gc_node_to_container(node);
+            return o->refcount;
+        }
+        default: return FPY_RC_IMMORTAL;
+    }
+}
+
+/* Get a GC node from an FpyValue (if the value is a tracked container) */
+static FpyGCNode* gc_node_from_value(FpyValue val) {
     switch (val.tag) {
         case FPY_TAG_LIST: case FPY_TAG_SET:
-            ptr = val.data.list; break;
+            if (val.data.list) return &val.data.list->gc_node;
+            break;
         case FPY_TAG_DICT:
-            ptr = val.data.list; break;  /* dict stored in list union member */
+            if (val.data.list) return &((FpyDict*)(val.data.list))->gc_node;
+            break;
         case FPY_TAG_OBJ:
             if (val.data.obj && val.data.obj->magic == FPY_OBJ_MAGIC)
-                ptr = val.data.obj;
+                return &val.data.obj->gc_node;
             break;
-        default: return;  /* scalars/strings don't participate in cycles */
+        default: break;
     }
-    if (!ptr) return;
-    /* The GC node is stored in the gc_node field — but we don't have
-     * that field yet. For now, we skip cycle collection on objects
-     * that don't have GC nodes. This will be connected in a future pass
-     * when GC nodes are added to FpyList/FpyDict/FpyObj structs. */
+    return NULL;
+}
+
+/* ── Visit outgoing references ───────────────────────────────────── */
+
+/* For each outgoing reference in a container that points to a tracked
+ * object, call the visitor function. Used for both subtract and mark. */
+typedef void (*gc_visitor_fn)(FpyGCNode *referent);
+
+static void gc_visit_refs(FpyGCNode *node, gc_visitor_fn visitor) {
+    void *container = gc_node_to_container(node);
+    if (!container) return;
+
+    switch (node->gc_type) {
+        case FPY_GC_TYPE_LIST: {
+            FpyList *list = (FpyList*)container;
+            for (int64_t i = 0; i < list->length; i++) {
+                FpyGCNode *ref = gc_node_from_value(list->items[i]);
+                if (ref && (ref->gc_flags & FPY_GC_TRACKED))
+                    visitor(ref);
+            }
+            break;
+        }
+        case FPY_GC_TYPE_DICT: {
+            FpyDict *dict = (FpyDict*)container;
+            for (int64_t i = 0; i < dict->length; i++) {
+                FpyGCNode *ref;
+                ref = gc_node_from_value(dict->keys[i]);
+                if (ref && (ref->gc_flags & FPY_GC_TRACKED))
+                    visitor(ref);
+                ref = gc_node_from_value(dict->values[i]);
+                if (ref && (ref->gc_flags & FPY_GC_TRACKED))
+                    visitor(ref);
+            }
+            break;
+        }
+        case FPY_GC_TYPE_OBJ: {
+            FpyObj *obj = (FpyObj*)container;
+            if (obj->slots) {
+                extern FpyClassDef fpy_classes[];
+                int sc = fpy_classes[obj->class_id].slot_count;
+                for (int i = 0; i < sc; i++) {
+                    FpyGCNode *ref = gc_node_from_value(obj->slots[i]);
+                    if (ref && (ref->gc_flags & FPY_GC_TRACKED))
+                        visitor(ref);
+                }
+            }
+            break;
+        }
+    }
+}
+
+/* ── Visitor callbacks ───────────────────────────────────────────── */
+
+static void gc_subtract_one(FpyGCNode *ref) {
+    ref->gc_refs--;
+}
+
+static void gc_mark_reachable(FpyGCNode *ref) {
+    if (ref->gc_flags & FPY_GC_REACHABLE) return;  /* already visited */
+    ref->gc_flags |= FPY_GC_REACHABLE;
+    /* Recursively mark all objects reachable from this one */
+    gc_visit_refs(ref, gc_mark_reachable);
 }
 
 /* ── Collection ──────────────────────────────────────────────────── */
 
 int64_t fpy_gc_collect(void) {
-    /* Phase 1: Copy refcounts to gc_refs */
-    FpyGCNode *node;
+    if (gc_tracked == 0) return 0;
+
+    FpyGCNode *node, *next;
+
+    /* Phase 1: Copy refcounts to gc_refs, clear reachable flag */
     for (node = gc_sentinel.gc_next; node != &gc_sentinel; node = node->gc_next) {
-        node->gc_refs = 0;  /* will be set from the object's refcount */
-        node->gc_flags &= ~FPY_GC_REACHABLE;
+        int32_t rc = gc_get_refcount(node);
+        if (rc == FPY_RC_IMMORTAL) {
+            node->gc_refs = FPY_RC_IMMORTAL;
+            node->gc_flags |= FPY_GC_REACHABLE;  /* immortals are always roots */
+        } else {
+            node->gc_refs = rc;
+            node->gc_flags &= ~FPY_GC_REACHABLE;
+        }
     }
 
-    /* TODO: Phase 2-5 — subtract internal refs, find roots, mark, sweep.
-     * For now this is a skeleton that tracks objects but doesn't collect.
-     * The full algorithm requires adding FpyGCNode to FpyList/FpyDict/FpyObj
-     * and connecting the subtract/mark/sweep logic. */
+    /* Phase 2: Subtract internal references.
+     * For each tracked object, for each outgoing reference to another
+     * tracked object, decrement the referent's gc_refs. After this,
+     * gc_refs reflects only EXTERNAL references. */
+    for (node = gc_sentinel.gc_next; node != &gc_sentinel; node = node->gc_next) {
+        gc_visit_refs(node, gc_subtract_one);
+    }
 
-    return 0;  /* nothing collected yet */
+    /* Phase 3: Find roots — objects with gc_refs > 0 are reachable
+     * from outside the tracked set. Mark them and their transitive
+     * references as reachable. */
+    for (node = gc_sentinel.gc_next; node != &gc_sentinel; node = node->gc_next) {
+        if (node->gc_refs > 0 && !(node->gc_flags & FPY_GC_REACHABLE)) {
+            node->gc_flags |= FPY_GC_REACHABLE;
+            gc_visit_refs(node, gc_mark_reachable);
+        }
+    }
+
+    /* Phase 4: Sweep — destroy unreachable objects.
+     * We must be careful: destroying an object may untrack it (modifying
+     * the list), so we collect pointers first, then destroy. */
+    int64_t freed = 0;
+
+    /* Count unreachable objects */
+    int64_t unreachable_count = 0;
+    for (node = gc_sentinel.gc_next; node != &gc_sentinel; node = node->gc_next) {
+        if (!(node->gc_flags & FPY_GC_REACHABLE))
+            unreachable_count++;
+    }
+
+    if (unreachable_count == 0) return 0;
+
+    /* Collect unreachable nodes into an array */
+    FpyGCNode **to_free = (FpyGCNode**)malloc(sizeof(FpyGCNode*) * unreachable_count);
+    int64_t idx = 0;
+    for (node = gc_sentinel.gc_next; node != &gc_sentinel; node = node->gc_next) {
+        if (!(node->gc_flags & FPY_GC_REACHABLE))
+            to_free[idx++] = node;
+    }
+
+    /* Destroy each unreachable object */
+    for (int64_t i = 0; i < idx; i++) {
+        node = to_free[i];
+        /* Set refcount to 0 so fpy_rc_decref triggers destruction */
+        void *container = gc_node_to_container(node);
+        if (!container) continue;
+        switch (node->gc_type) {
+            case FPY_GC_TYPE_LIST:
+                ((FpyList*)container)->refcount = 1;
+                fpy_rc_decref(FPY_TAG_LIST, (int64_t)(intptr_t)container);
+                break;
+            case FPY_GC_TYPE_DICT:
+                ((FpyDict*)container)->refcount = 1;
+                fpy_rc_decref(FPY_TAG_DICT, (int64_t)(intptr_t)container);
+                break;
+            case FPY_GC_TYPE_OBJ:
+                ((FpyObj*)container)->refcount = 1;
+                fpy_rc_decref(FPY_TAG_OBJ, (int64_t)(intptr_t)container);
+                break;
+        }
+        freed++;
+    }
+
+    free(to_free);
+    return freed;
 }
 
 /* ── Atomic refcount operations (free-threaded mode) ────────────── */
