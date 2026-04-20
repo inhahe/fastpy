@@ -45,8 +45,14 @@ typedef struct {
     int n_captures;
     int n_params;
     void *func;
+    uint8_t capture_is_cell;  /* bitmask: bit i set = captures[i] is a cell pointer */
     int64_t captures[8];
 } FpyClosure;
+
+typedef struct {
+    int32_t refcount;
+    int64_t value;
+} FpyCell;
 
 /* Forward declarations for recursive destroy and class registry */
 static void fpy_list_destroy(FpyList *list);
@@ -132,9 +138,16 @@ void fpy_rc_decref(int32_t tag, int64_t data) {
             if (*(int32_t*)ptr == FPY_CLOSURE_MAGIC) {
                 FpyClosure *c = (FpyClosure*)ptr;
                 if (fpy_decref(&c->refcount)) {
-                    /* Decref captured values, then free closure */
-                    for (int i = 0; i < c->n_captures; i++)
-                        fpy_rc_decref(FPY_TAG_INT, c->captures[i]);
+                    /* Free captured values: cells get freed, others decrefd */
+                    for (int i = 0; i < c->n_captures; i++) {
+                        if (c->capture_is_cell & (1 << i)) {
+                            /* Cell pointer — free the cell */
+                            FpyCell *cell = (FpyCell*)(intptr_t)c->captures[i];
+                            if (cell) free(cell);
+                        }
+                        /* Regular captures: the value was borrowed from the
+                         * outer scope; don't decref (the scope owns it) */
+                    }
                     free(c);
                 }
                 break;
@@ -1297,7 +1310,13 @@ FpyClosure* fastpy_closure_new(void *func, int n_params, int n_captures) {
     c->func = func;
     c->n_params = n_params;
     c->n_captures = n_captures;
+    c->capture_is_cell = 0;  /* caller sets bits for cell captures */
     return c;
+}
+
+/* Mark a capture as a cell pointer (for proper cleanup) */
+void fastpy_closure_mark_cell(FpyClosure *c, int index) {
+    c->capture_is_cell |= (1 << index);
 }
 
 void fastpy_closure_set_capture(FpyClosure *c, int index, int64_t value) {
@@ -1434,17 +1453,12 @@ FpyList* fastpy_zip3(FpyList *a, FpyList *b, FpyList *c) {
     return result;
 }
 
-/* --- Mutable closure cells --- */
-
-/* A cell holds a mutable int64 value on the heap */
-typedef struct {
-    int32_t refcount;
-    int64_t value;
-} FpyCell;
+/* --- Mutable closure cells ---
+ * FpyCell is forward-declared at the top of this file. */
 
 FpyCell* fastpy_cell_new(int64_t initial) {
     FpyCell *cell = (FpyCell*)malloc(sizeof(FpyCell));
-    cell->refcount = FPY_RC_IMMORTAL;  /* cells are tiny, shared between closure and caller */
+    cell->refcount = 1;
     cell->value = initial;
     return cell;
 }

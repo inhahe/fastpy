@@ -712,6 +712,10 @@ class CodeGen:
         self.runtime["rc_incref"] = ir.Function(self.module, ft, name="fpy_rc_incref")
         self.runtime["rc_decref"] = ir.Function(self.module, ft, name="fpy_rc_decref")
 
+        # Mark a closure capture as a cell pointer (for GC cleanup)
+        ft = ir.FunctionType(void, [i8_ptr, i32])
+        self.runtime["closure_mark_cell"] = ir.Function(self.module, ft, name="fastpy_closure_mark_cell")
+
         # Closure return tag: set before ret, read after call
         ft = ir.FunctionType(void, [i32])
         self.runtime["set_ret_tag"] = ir.Function(self.module, ft, name="fastpy_set_ret_tag")
@@ -1328,6 +1332,10 @@ class CodeGen:
                         cell_as_i64 = self.builder.ptrtoint(cell, i64)
                         self.builder.call(self.runtime["closure_set_capture"], [
                             closure, ir.Constant(i32, i), cell_as_i64])
+                        # Mark this capture as a cell so the closure destructor
+                        # can free it properly
+                        self.builder.call(self.runtime["closure_mark_cell"], [
+                            closure, ir.Constant(i32, i)])
                         # Save cell pointer for read-back after closure call
                         cell_alloca = self._create_entry_alloca(i8_ptr,
                                                                 f"cell.{var_name}")
