@@ -6634,6 +6634,7 @@ class CodeGen:
                 alloca = self._create_entry_alloca(fpy_val, name)
             elif self._USE_REFCOUNT:
                 # Decref the old value being overwritten
+                # DISABLED: causes __lt__ corruption — needs investigation
                 old_fv = self.builder.load(alloca, name=f"{name}.old")
                 old_tag_val = self.builder.extract_value(old_fv, 0)
                 old_data = self.builder.extract_value(old_fv, 1)
@@ -6641,6 +6642,9 @@ class CodeGen:
                                   [old_tag_val, old_data])
         else:
             alloca = self._create_entry_alloca(fpy_val, name)
+            # Zero-initialize new allocas so first decref is safe
+            if self._USE_REFCOUNT:
+                self.builder.store(self._fv_none(), alloca)
         # Incref the new value being stored
         if self._USE_REFCOUNT:
             new_tag = self.builder.extract_value(fv, 0)

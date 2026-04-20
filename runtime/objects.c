@@ -36,10 +36,11 @@ FpyString* fpy_str_alloc(int64_t len) {
 #define FPY_VAL_INCREF(v) fpy_rc_incref((v).tag, (v).data.i)
 #define FPY_VAL_DECREF(v) fpy_rc_decref((v).tag, (v).data.i)
 
-/* Forward declarations for recursive destroy */
+/* Forward declarations for recursive destroy and class registry */
 static void fpy_list_destroy(FpyList *list);
 static void fpy_dict_destroy(FpyDict *dict);
 void fpy_rc_decref(int32_t tag, int64_t data);
+extern FpyClassDef fpy_classes[];  /* defined later in this file */
 
 /* --- Destructors for refcounted objects --- */
 
@@ -98,12 +99,28 @@ void fpy_rc_decref(int32_t tag, int64_t data) {
             if (fpy_decref(&((FpyDict*)(intptr_t)data)->refcount))
                 fpy_dict_destroy((FpyDict*)(intptr_t)data);
             break;
-        case FPY_TAG_OBJ:
-            /* FpyObj: only decref, don't free yet (arena-allocated
-             * objects have FPY_RC_IMMORTAL, malloc'd ones will be
-             * freed when we migrate off the arena in a future phase) */
-            fpy_decref(&((FpyObj*)(intptr_t)data)->refcount);
+        case FPY_TAG_OBJ: {
+            FpyObj *obj = (FpyObj*)(intptr_t)data;
+            if (obj->magic != FPY_OBJ_MAGIC) break;  /* CPython PyObject*, don't touch */
+            if (fpy_decref(&obj->refcount)) {
+                /* Free slots (decref each), dynamic_attrs, and the obj */
+                if (obj->slots) {
+                    int sc = fpy_classes[obj->class_id].slot_count;
+                    for (int i = 0; i < sc; i++)
+                        FPY_VAL_DECREF(obj->slots[i]);
+                    /* slots are contiguous with obj (malloc'd together), don't free separately */
+                }
+                if (obj->dynamic_attrs) {
+                    for (int i = 0; i < obj->dynamic_attrs->count; i++)
+                        FPY_VAL_DECREF(obj->dynamic_attrs->values[i]);
+                    free(obj->dynamic_attrs->names);
+                    free(obj->dynamic_attrs->values);
+                    free(obj->dynamic_attrs);
+                }
+                free(obj);
+            }
             break;
+        }
         default: break;
     }
 }
@@ -162,8 +179,8 @@ void fpy_list_set(FpyList *list, int64_t index, FpyValue value) {
         fprintf(stderr, "IndexError: list assignment index out of range\n");
         exit(1);
     }
-    FPY_VAL_DECREF(list->items[index]);  /* decref old element */
-    FPY_VAL_INCREF(value);               /* incref new element */
+    FPY_VAL_DECREF(list->items[index]);
+    FPY_VAL_INCREF(value);
     list->items[index] = value;
     FPY_UNLOCK(list);
 }
@@ -760,7 +777,7 @@ static void fpy_dict_set_unlocked(FpyDict *dict, FpyValue key, FpyValue value) {
             if (first_deleted < 0) first_deleted = slot;
         } else if (fpy_key_equal(dict->keys[idx], key)) {
             /* Key exists — update value in place */
-            FPY_VAL_DECREF(dict->values[idx]);  /* decref old value */
+            FPY_VAL_DECREF(dict->values[idx]);
             FPY_VAL_INCREF(value);
             dict->values[idx] = value;
             return;
@@ -2872,7 +2889,7 @@ void fastpy_dict_write(FpyDict *dict) {
  * ================================================================ */
 
 /* Global class registry */
-static FpyClassDef fpy_classes[FPY_MAX_CLASSES];
+FpyClassDef fpy_classes[FPY_MAX_CLASSES];
 static int fpy_class_count = 0;
 
 int fastpy_register_class(const char *name, int parent_id) {
@@ -3018,8 +3035,8 @@ static void* fpy_arena_alloc(size_t size) {
 FpyObj* fastpy_obj_new(int class_id) {
     int sc = fpy_classes[class_id].slot_count;
     size_t total = sizeof(FpyObj) + sizeof(FpyValue) * sc;
-    FpyObj *obj = (FpyObj*)fpy_arena_alloc(total);
-    obj->refcount = FPY_RC_IMMORTAL;  /* arena-allocated: can't be individually freed */
+    FpyObj *obj = (FpyObj*)malloc(total);
+    obj->refcount = FPY_RC_IMMORTAL;  /* TODO: use refcount=1 once scope cleanup is robust */
     obj->magic = FPY_OBJ_MAGIC;
     obj->class_id = class_id;
     if (fpy_threading_mode == FPY_THREADING_FREE) fpy_mutex_init(&obj->lock);
