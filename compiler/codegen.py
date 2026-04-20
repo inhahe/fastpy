@@ -988,7 +988,8 @@ class CodeGen:
             if isinstance(node, ast.FunctionDef):
                 self._emit_function_def(node)
             elif isinstance(node, ast.ClassDef):
-                self._emit_class_methods(node)
+                if node.name not in getattr(self, '_cpython_classes', set()):
+                    self._emit_class_methods(node)
 
         # Pass 2.1: emit bodies of hoisted inner functions
         for inner in getattr(self, "_hoist_inner_funcs", []):
@@ -1076,6 +1077,23 @@ class CodeGen:
             if (isinstance(node, ast.FunctionDef)
                     and node.name in getattr(self, '_cpython_generators', set())):
                 self._emit_cpython_generator(node, node.name)
+
+        # Compile CPython classes (dataclasses etc.) via exec_get
+        for node in tree.body:
+            if (isinstance(node, ast.ClassDef)
+                    and node.name in getattr(self, '_cpython_classes', set())):
+                # Collect all imports + the class definition as source
+                imports = []
+                for imp in tree.body:
+                    if isinstance(imp, (ast.Import, ast.ImportFrom)):
+                        imports.append(ast.unparse(imp))
+                class_src = ast.unparse(ast.Module(body=[node], type_ignores=[]))
+                full_src = "\n".join(imports) + "\n" + class_src
+                source_ptr = self._make_string_constant(full_src)
+                name_ptr = self._make_string_constant(node.name)
+                cls_ptr = self.builder.call(
+                    self.runtime["cpython_exec_get"], [source_ptr, name_ptr])
+                self._store_variable(node.name, cls_ptr, "pyobj")
 
         for node in tree.body:
             if not isinstance(node, (ast.FunctionDef, ast.ClassDef)):
@@ -3705,6 +3723,17 @@ class CodeGen:
         self._monomorphized_classes, then also keep the original name as
         an alias pointing to the first variant's ClassInfo.
         """
+        # Dataclass: route through CPython bridge — the @dataclass decorator
+        # generates __init__, __repr__, __eq__, etc. which our native class
+        # compilation can't replicate. Compile the class via exec_get.
+        if _sig_override is None and _name_override is None:
+            for deco in node.decorator_list:
+                if isinstance(deco, ast.Name) and deco.id == "dataclass":
+                    if not hasattr(self, '_cpython_classes'):
+                        self._cpython_classes = set()
+                    self._cpython_classes.add(node.name)
+                    return  # skip native declaration
+
         # Top-level entry: check for monomorphization
         if _sig_override is None and _name_override is None:
             if node.name in self._user_classes:

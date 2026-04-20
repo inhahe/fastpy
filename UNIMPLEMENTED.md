@@ -90,29 +90,19 @@ These are patterns that work partially or through fallback paths:
 3. **Metaclass support** is simplified — `type(C).__name__` is resolved at
    compile time. Full metaclass instantiation protocol not implemented.
 
-4. **map()** with closures that capture variables works for variable-backed
-   function pointers but not for magic-number closures.
-
-5. **Complex numbers** route through CPython bridge — no native complex
+4. **Complex numbers** route through CPython bridge — no native complex
    arithmetic.
 
-6. **eval()/exec()** — `eval("literal")` pre-compiles via CPython bridge.
+5. **eval()/exec()** — `eval("literal")` pre-compiles via CPython bridge.
    Dynamic eval (non-literal strings) routes through `builtins.eval`.
    `exec()` with literal strings works similarly. Neither has access to
    the compiled program's local variables.
 
-7. **Multiple dispatch / singledispatch** not supported.
+6. **singledispatch** — `@proc.register(int)` decorator pattern not supported
+   (method call on decorated variable).
 
-8. **Dataclasses, NamedTuple** not supported (would need decorator processing).
-
-9. **CPython bridge result arithmetic with `np.mean` style** — printing a
-   numpy float64 scalar directly shows the result via CPython's `str()`, but
-   using it in float arithmetic or `float()` conversion doesn't detect it
-   as a float (treated as OBJ tag → pointer garbage).
-
-10. **Threading: compiled functions with args** — `threading.Thread(target=func)`
-    works for zero-arg functions. Functions with parameters need the native
-    wrapper to handle argument passing (currently only `void(*)(void)` ABI).
+7. **Dataclasses** — class compiles but decorator-generated methods (like
+   `__repr__`) don't override native class methods. NamedTuple works.
 
 11. **GC: temporary value lifetime** — expressions like `print(str(x) + str(y))`
     create temporary strings that aren't decrefd after the statement.
