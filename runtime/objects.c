@@ -37,6 +37,17 @@ FpyString* fpy_str_alloc(int64_t len) {
 #define FPY_VAL_INCREF(v) fpy_rc_incref((v).tag, (v).data.i)
 #define FPY_VAL_DECREF(v) fpy_rc_decref((v).tag, (v).data.i)
 
+/* Forward declarations */
+#define FPY_CLOSURE_MAGIC 0x434C4F53  /* "CLOS" — also defined below */
+typedef struct {
+    int32_t magic;
+    int32_t refcount;
+    int n_captures;
+    int n_params;
+    void *func;
+    int64_t captures[8];
+} FpyClosure;
+
 /* Forward declarations for recursive destroy and class registry */
 static void fpy_list_destroy(FpyList *list);
 static void fpy_dict_destroy(FpyDict *dict);
@@ -76,8 +87,22 @@ void fpy_rc_incref(int32_t tag, int64_t data) {
             fpy_incref(&((FpyList*)(intptr_t)data)->refcount); break;
         case FPY_TAG_DICT:
             fpy_incref(&((FpyDict*)(intptr_t)data)->refcount); break;
-        case FPY_TAG_OBJ:
-            fpy_incref(&((FpyObj*)(intptr_t)data)->refcount); break;
+        case FPY_TAG_OBJ: {
+            /* Could be FpyObj, FpyClosure, or CPython PyObject*.
+             * FpyClosure starts with magic 0x434C4F53 at offset 0.
+             * FpyObj has its magic (0x4F424A53) deep in the struct.
+             * Check closure magic first (most common in OBJ-tagged values). */
+            void *ptr = (void*)(intptr_t)data;
+            if (*(int32_t*)ptr == FPY_CLOSURE_MAGIC) {
+                fpy_incref(&((FpyClosure*)ptr)->refcount);
+            } else {
+                FpyObj *obj = (FpyObj*)ptr;
+                if (obj->magic == FPY_OBJ_MAGIC)
+                    fpy_incref(&obj->refcount);
+                /* else: CPython PyObject* — don't touch */
+            }
+            break;
+        }
         case FPY_TAG_STR:
             fpy_str_incref((const char*)(intptr_t)data); break;
         default: break;  /* INT, FLOAT, BOOL, NONE — not heap-allocated */
@@ -102,7 +127,19 @@ void fpy_rc_decref(int32_t tag, int64_t data) {
                 fpy_dict_destroy((FpyDict*)(intptr_t)data);
             break;
         case FPY_TAG_OBJ: {
-            FpyObj *obj = (FpyObj*)(intptr_t)data;
+            void *ptr = (void*)(intptr_t)data;
+            /* Check if this is a closure (not an FpyObj) */
+            if (*(int32_t*)ptr == FPY_CLOSURE_MAGIC) {
+                FpyClosure *c = (FpyClosure*)ptr;
+                if (fpy_decref(&c->refcount)) {
+                    /* Decref captured values, then free closure */
+                    for (int i = 0; i < c->n_captures; i++)
+                        fpy_rc_decref(FPY_TAG_INT, c->captures[i]);
+                    free(c);
+                }
+                break;
+            }
+            FpyObj *obj = (FpyObj*)ptr;
             if (obj->magic != FPY_OBJ_MAGIC) break;  /* CPython PyObject*, don't touch */
             if (fpy_decref(&obj->refcount)) {
                 /* Free slots (decref each), dynamic_attrs, and the obj */
@@ -1241,18 +1278,9 @@ void fastpy_set_write(FpyDict *set) {
     fastpy_set_print(set);
 }
 
-/* --- Closure support --- */
-
-#define FPY_CLOSURE_MAGIC 0x434C4F53  /* "CLOS" */
-
-typedef struct {
-    int32_t magic;        /* FPY_CLOSURE_MAGIC — distinguishes from raw func ptrs */
-    int32_t refcount;     /* reference count */
-    int n_captures;
-    int n_params;         /* number of explicit params (excluding captures) */
-    void *func;           /* function pointer */
-    int64_t captures[8];  /* captured values (up to 8) */
-} FpyClosure;
+/* --- Closure support ---
+ * FpyClosure and FPY_CLOSURE_MAGIC are forward-declared at the top of
+ * this file for use in fpy_rc_incref/decref. */
 
 /* Check if a pointer is a closure (vs raw function pointer) */
 static int fpy_is_closure(void *ptr) {

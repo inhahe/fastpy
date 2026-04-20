@@ -12038,26 +12038,68 @@ class CodeGen:
                         return self.builder.call(
                             self.runtime["obj_call_method2"],
                             [obj, name_ptr, a1, a2])
-        # Call-on-Call: C()(5) — the result of C() is an object with __call__
+        # Call-on-Call: f(3)(5), C()(5), etc.
+        # The inner call might return a closure or an object with __call__.
+        # Use call_ptr dispatch (auto-detects closures via magic number)
+        # for the common case; fall back to obj_call_method for __call__.
         if isinstance(node.func, ast.Call):
             callee = self._emit_expr_value(node.func)
             if isinstance(callee.type, ir.IntType):
                 callee = self.builder.inttoptr(callee, i8_ptr)
             if isinstance(callee.type, ir.PointerType):
-                name_ptr = self._make_string_constant("__call__")
-                if len(node.args) == 0:
-                    return self.builder.call(
-                        self.runtime["obj_call_method0"],
-                        [callee, name_ptr])
-                elif len(node.args) == 1:
-                    a = self._emit_expr_value(node.args[0])
-                    if isinstance(a.type, ir.PointerType):
-                        a = self.builder.ptrtoint(a, i64)
-                    elif isinstance(a.type, ir.IntType) and a.type.width != 64:
-                        a = self.builder.zext(a, i64)
-                    return self.builder.call(
-                        self.runtime["obj_call_method1"],
-                        [callee, name_ptr, a])
+                # Check if the inner call returns a closure
+                inner_returns_closure = False
+                if isinstance(node.func.func, ast.Name):
+                    inner_name = node.func.func.id
+                    # Function that contains closures returns a closure
+                    for full_name in self._closure_info:
+                        if full_name.startswith(f"{inner_name}."):
+                            inner_returns_closure = True
+                            break
+                    # Variable tagged as closure
+                    if (inner_name in self.variables
+                            and self.variables[inner_name][1] == "closure"):
+                        inner_returns_closure = True
+
+                if inner_returns_closure:
+                    # Use call_ptr dispatch (handles closures and raw func ptrs)
+                    n_args = len(node.args)
+                    if n_args == 0:
+                        return self.builder.call(
+                            self.runtime["call_ptr0"], [callee])
+                    elif n_args == 1:
+                        a = self._emit_expr_value(node.args[0])
+                        if isinstance(a.type, ir.PointerType):
+                            a = self.builder.ptrtoint(a, i64)
+                        elif isinstance(a.type, ir.IntType) and a.type.width != 64:
+                            a = self.builder.zext(a, i64)
+                        return self.builder.call(
+                            self.runtime["call_ptr1"], [callee, a])
+                    elif n_args == 2:
+                        a1 = self._emit_expr_value(node.args[0])
+                        a2 = self._emit_expr_value(node.args[1])
+                        if isinstance(a1.type, ir.PointerType):
+                            a1 = self.builder.ptrtoint(a1, i64)
+                        if isinstance(a2.type, ir.PointerType):
+                            a2 = self.builder.ptrtoint(a2, i64)
+                        return self.builder.call(
+                            self.runtime["call_ptr2"], [callee, a1, a2])
+                else:
+                    # Object with __call__
+                    name_ptr = self._make_string_constant("__call__")
+                    if len(node.args) == 0:
+                        return self.builder.call(
+                            self.runtime["obj_call_method0"],
+                            [callee, name_ptr])
+                    elif len(node.args) == 1:
+                        a = self._emit_expr_value(node.args[0])
+                        if isinstance(a.type, ir.PointerType):
+                            a = self.builder.ptrtoint(a, i64)
+                        elif isinstance(a.type, ir.IntType) and a.type.width != 64:
+                            a = self.builder.zext(a, i64)
+                        return self.builder.call(
+                            self.runtime["obj_call_method1"],
+                            [callee, name_ptr, a])
         # Last resort: try calling as a closure (for higher-order function params)
         if isinstance(node.func, ast.Name) and node.func.id in self.variables:
             return self._emit_closure_call(node)
