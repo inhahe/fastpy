@@ -14,6 +14,7 @@
 #include <setjmp.h>
 #include <stdlib.h>
 #include "threading.h"
+#include "objects.h"
 
 /* Forward declaration: the compiled Python module provides this */
 extern void fastpy_main(void);
@@ -118,10 +119,10 @@ void fastpy_print_newline(void) {
 
 const char* fastpy_str_concat(const char *a, const char *b) {
     size_t la = strlen(a), lb = strlen(b);
-    char *result = (char*)malloc(la + lb + 1);
-    memcpy(result, a, la);
-    memcpy(result + la, b, lb + 1);
-    return result;
+    FpyString *s = fpy_str_alloc(la + lb);
+    memcpy(s->data, a, la);
+    memcpy(s->data + la, b, lb + 1);
+    return s->data;
 }
 
 int64_t fastpy_str_len(const char *s) {
@@ -135,10 +136,10 @@ const char* fastpy_str_index(const char *s, int64_t index) {
         fprintf(stderr, "IndexError: string index out of range\n");
         exit(1);
     }
-    char *result = (char*)malloc(2);
-    result[0] = s[index];
-    result[1] = '\0';
-    return result;
+    FpyString *r = fpy_str_alloc(1);
+    r->data[0] = s[index];
+    r->data[1] = '\0';
+    return r->data;
 }
 
 const char* fastpy_str_slice(const char *s, int64_t start, int64_t stop, int64_t has_start, int64_t has_stop) {
@@ -223,18 +224,19 @@ const char* fastpy_str_lower(const char *s) {
 
 /* Convert int to string (for f-string formatting) */
 const char* fastpy_int_to_str(int64_t value) {
-    char *result = (char*)malloc(32);
-    snprintf(result, 32, "%lld", (long long)value);
-    return result;
+    FpyString *s = fpy_str_alloc(32);
+    snprintf(s->data, 32, "%lld", (long long)value);
+    return s->data;
 }
 
 /* Convert float to string (for f-string formatting) */
 const char* fastpy_float_to_str(double value) {
     char buf[64];
     fastpy_format_float(value, buf, sizeof(buf));
-    char *result = (char*)malloc(strlen(buf) + 1);
-    strcpy(result, buf);
-    return result;
+    size_t len = strlen(buf);
+    FpyString *s = fpy_str_alloc(len);
+    memcpy(s->data, buf, len + 1);
+    return s->data;
 }
 
 /* --- Arithmetic helpers --- */

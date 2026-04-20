@@ -22,6 +22,58 @@ extern void fastpy_raise(int exc_type, const char *msg);
 
 /* --- List operations --- */
 
+/* --- Refcounted string allocation --- */
+
+FpyString* fpy_str_alloc(int64_t len) {
+    FpyString *s = (FpyString*)malloc(sizeof(FpyString) + len + 1);
+    s->magic = FPY_STR_MAGIC;
+    s->refcount = 1;
+    s->data[len] = '\0';
+    return s;
+}
+
+/* Tag-dispatching incref/decref for FpyValue. Checks the tag to
+ * determine the object type, then increfs/decrefs accordingly.
+ * No-op for scalars (INT, FLOAT, BOOL, NONE). */
+void fpy_rc_incref(int32_t tag, int64_t data) {
+    switch (tag) {
+        case FPY_TAG_LIST: case FPY_TAG_SET:
+            fpy_incref(&((FpyList*)(intptr_t)data)->refcount); break;
+        case FPY_TAG_DICT:
+            fpy_incref(&((FpyDict*)(intptr_t)data)->refcount); break;
+        case FPY_TAG_OBJ:
+            fpy_incref(&((FpyObj*)(intptr_t)data)->refcount); break;
+        case FPY_TAG_STR:
+            fpy_str_incref((const char*)(intptr_t)data); break;
+        default: break;  /* INT, FLOAT, BOOL, NONE — not heap-allocated */
+    }
+}
+
+void fpy_rc_decref(int32_t tag, int64_t data) {
+    switch (tag) {
+        case FPY_TAG_STR:
+            if (fpy_str_decref((const char*)(intptr_t)data)) {
+                FpyString *h = fpy_str_header((const char*)(intptr_t)data);
+                if (h) free(h);
+            }
+            break;
+        /* LIST, DICT, OBJ destructors will be added in Phase 2-3 */
+        case FPY_TAG_LIST: case FPY_TAG_SET:
+            fpy_decref(&((FpyList*)(intptr_t)data)->refcount);
+            /* TODO: free list when refcount hits 0 */
+            break;
+        case FPY_TAG_DICT:
+            fpy_decref(&((FpyDict*)(intptr_t)data)->refcount);
+            break;
+        case FPY_TAG_OBJ:
+            fpy_decref(&((FpyObj*)(intptr_t)data)->refcount);
+            break;
+        default: break;
+    }
+}
+
+/* --- List operations --- */
+
 FpyList* fpy_list_new(int64_t capacity) {
     if (capacity < 4) capacity = 4;
     FpyList *list = (FpyList*)malloc(sizeof(FpyList));

@@ -130,6 +130,38 @@ struct FpyList {
     fpy_mutex_t lock;                /* per-object lock (free-threaded mode) */
 };
 
+/* --- Refcounted strings ---
+ * String constants (from .rodata) are NOT refcounted — they live
+ * forever. Dynamically allocated strings (concat, format, slice, etc.)
+ * are wrapped in FpyString with a magic number and refcount.
+ * The FpyValue data pointer points to str->data (the chars), so
+ * existing code sees a normal const char*. To check if a string is
+ * owned, look for the magic 8 bytes before the char data. */
+#define FPY_STR_MAGIC 0x53545243  /* "STRC" */
+
+typedef struct {
+    int32_t magic;      /* FPY_STR_MAGIC */
+    int32_t refcount;
+    char data[];        /* flexible array member — null-terminated UTF-8 */
+} FpyString;
+
+/* Allocate a refcounted string of `len` chars (+ null terminator). */
+FpyString* fpy_str_alloc(int64_t len);
+/* Get the FpyString header from a char* data pointer. Returns NULL if not owned. */
+static inline FpyString* fpy_str_header(const char *s) {
+    FpyString *h = (FpyString*)((char*)s - offsetof(FpyString, data));
+    return (h->magic == FPY_STR_MAGIC) ? h : NULL;
+}
+static inline void fpy_str_incref(const char *s) {
+    FpyString *h = fpy_str_header(s);
+    if (h && h->refcount != FPY_RC_IMMORTAL) h->refcount++;
+}
+static inline int fpy_str_decref(const char *s) {
+    FpyString *h = fpy_str_header(s);
+    if (!h || h->refcount == FPY_RC_IMMORTAL) return 0;
+    return (--h->refcount == 0);  /* returns 1 if should be freed */
+}
+
 /* --- Value constructors --- */
 
 static inline FpyValue fpy_int(int64_t v) {

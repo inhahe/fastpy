@@ -136,6 +136,10 @@ class CodeGen:
         # String constant counter
         self._str_counter = 0
 
+        # Reference counting: emit incref/decref at variable stores and scope exits.
+        # Disabled by default until the full GC is ready; enable for testing.
+        self._USE_REFCOUNT = True
+
         # Counter for unique block names
         self._block_counter = 0
 
@@ -688,6 +692,11 @@ class CodeGen:
         self.runtime["exc_set_group_inner"] = ir.Function(self.module, ft, name="fastpy_exc_set_group_inner")
         ft = ir.FunctionType(i32, [])
         self.runtime["exc_get_group_inner"] = ir.Function(self.module, ft, name="fastpy_exc_get_group_inner")
+        # Reference counting: tag-dispatching incref/decref
+        ft = ir.FunctionType(void, [i32, i64])
+        self.runtime["rc_incref"] = ir.Function(self.module, ft, name="fpy_rc_incref")
+        self.runtime["rc_decref"] = ir.Function(self.module, ft, name="fpy_rc_decref")
+
         # Closure return tag: set before ret, read after call
         ft = ir.FunctionType(void, [i32])
         self.runtime["set_ret_tag"] = ir.Function(self.module, ft, name="fastpy_set_ret_tag")
@@ -6617,14 +6626,27 @@ class CodeGen:
         else:
             fv = self._wrap_bare_to_fv(value, type_tag)
         if name in self.variables:
-            alloca, _ = self.variables[name]
+            alloca, old_tag = self.variables[name]
             # If the existing alloca is not fpy_val (e.g., a cell or a
             # pre-existing bare alloca), create a new one.
             if not (isinstance(alloca.type, ir.PointerType)
                     and alloca.type.pointee is fpy_val):
                 alloca = self._create_entry_alloca(fpy_val, name)
+            elif self._USE_REFCOUNT:
+                # Decref the old value being overwritten
+                old_fv = self.builder.load(alloca, name=f"{name}.old")
+                old_tag_val = self.builder.extract_value(old_fv, 0)
+                old_data = self.builder.extract_value(old_fv, 1)
+                self.builder.call(self.runtime["rc_decref"],
+                                  [old_tag_val, old_data])
         else:
             alloca = self._create_entry_alloca(fpy_val, name)
+        # Incref the new value being stored
+        if self._USE_REFCOUNT:
+            new_tag = self.builder.extract_value(fv, 0)
+            new_data = self.builder.extract_value(fv, 1)
+            self.builder.call(self.runtime["rc_incref"],
+                              [new_tag, new_data])
         self.variables[name] = (alloca, type_tag)
         self.builder.store(fv, alloca)
 
@@ -8055,6 +8077,12 @@ class CodeGen:
                 if self.builder.block.is_terminated:
                     return  # finally block unconditionally terminated
 
+        # Scope cleanup: decref all locals except the return value
+        ret_var_name = None
+        if node.value is not None and isinstance(node.value, ast.Name):
+            ret_var_name = node.value.id
+        self._emit_scope_decref(exclude_var=ret_var_name)
+
         if node.value is None:
             self.builder.ret_void()
         else:
@@ -8104,6 +8132,28 @@ class CodeGen:
                     self.builder.call(self.runtime["set_ret_tag"],
                                       [ir.Constant(i32, tag)])
                 self.builder.ret(value)
+
+    def _emit_scope_decref(self, exclude_var: str | None = None) -> None:
+        """Emit decref for all FV-local variables in the current scope.
+        Called before every function exit (return/implicit return).
+        The `exclude_var` is the variable being returned (don't decref it —
+        ownership transfers to the caller)."""
+        if not self._USE_REFCOUNT:
+            return
+        for var_name, (alloca, tag) in self.variables.items():
+            if var_name == exclude_var:
+                continue
+            if tag == "cell":
+                continue  # cells are managed separately
+            if var_name in self._global_vars:
+                continue  # globals outlive the function
+            if not (isinstance(alloca.type, ir.PointerType)
+                    and alloca.type.pointee is fpy_val):
+                continue  # not an FV local
+            fv = self.builder.load(alloca, name=f"{var_name}.cleanup")
+            fv_tag = self.builder.extract_value(fv, 0)
+            fv_data = self.builder.extract_value(fv, 1)
+            self.builder.call(self.runtime["rc_decref"], [fv_tag, fv_data])
 
     def _infer_ret_tag_for_value(self, value: ir.Value,
                                   node: ast.expr) -> int:
