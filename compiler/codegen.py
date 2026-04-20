@@ -8021,6 +8021,13 @@ class CodeGen:
                 # value is already an FpyValue from _load_or_wrap_fv above.
                 self.builder.ret(value)
             elif value.type != expected:
+                # FpyValue → i64 conversion: closures use i64 ABI externally
+                # but FV locals internally. Extract the data field.
+                if (isinstance(expected, ir.IntType)
+                        and isinstance(value.type, ir.LiteralStructType)):
+                    value = self.builder.extract_value(value, 1)
+                    self.builder.ret(value)
+                    return
                 # Type mismatch — try conversion
                 if isinstance(expected, ir.IntType) and isinstance(value.type, ir.IntType):
                     if expected.width > value.type.width:
