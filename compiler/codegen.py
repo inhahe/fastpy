@@ -980,10 +980,31 @@ class CodeGen:
         # Pass 0.8: discover static attribute slots per class
         self._assign_attribute_slots(tree)
 
+        # Pre-scan: detect singledispatch functions and their .register variants.
+        # These are compiled through CPython bridge (like dataclasses).
+        if not hasattr(self, '_cpython_functions'):
+            self._cpython_functions = set()
+        _singledispatch_names = set()
+        for node in tree.body:
+            if isinstance(node, ast.FunctionDef):
+                for deco in node.decorator_list:
+                    if isinstance(deco, ast.Name) and deco.id == "singledispatch":
+                        self._cpython_functions.add(node.name)
+                        _singledispatch_names.add(node.name)
+                    # @func.register(type) — register variant
+                    if (isinstance(deco, ast.Call)
+                            and isinstance(deco.func, ast.Attribute)
+                            and deco.func.attr == "register"
+                            and isinstance(deco.func.value, ast.Name)
+                            and deco.func.value.id in _singledispatch_names):
+                        self._cpython_functions.add(node.name)
+
         # Pass 1: forward-declare all user functions and class methods
         # Also scan for nested classes (class B inside class A)
         for node in tree.body:
             if isinstance(node, ast.FunctionDef):
+                if node.name in self._cpython_functions:
+                    continue  # compiled through CPython bridge
                 self._declare_user_function(node)
             elif isinstance(node, ast.ClassDef):
                 self._declare_class(node)
@@ -1013,7 +1034,8 @@ class CodeGen:
         # Pass 2: generate code for user functions and class methods
         for node in tree.body:
             if isinstance(node, ast.FunctionDef):
-                self._emit_function_def(node)
+                if node.name not in self._cpython_functions:
+                    self._emit_function_def(node)
             elif isinstance(node, ast.ClassDef):
                 if node.name not in getattr(self, '_cpython_classes', set()):
                     self._emit_class_methods(node)
@@ -1121,6 +1143,38 @@ class CodeGen:
                 cls_ptr = self.builder.call(
                     self.runtime["cpython_exec_get"], [source_ptr, name_ptr])
                 self._store_variable(node.name, cls_ptr, "pyobj")
+
+        # Compile singledispatch function groups via exec_get.
+        # Collect the @singledispatch function and all @func.register variants
+        # into a single code block and exec it in CPython.
+        if self._cpython_functions:
+            sd_blocks: dict[str, list[ast.stmt]] = {}
+            for node in tree.body:
+                if isinstance(node, ast.FunctionDef) and node.name in self._cpython_functions:
+                    # Find which singledispatch group this belongs to
+                    for deco in node.decorator_list:
+                        if isinstance(deco, ast.Name) and deco.id == "singledispatch":
+                            sd_blocks.setdefault(node.name, []).append(node)
+                        elif (isinstance(deco, ast.Call)
+                                and isinstance(deco.func, ast.Attribute)
+                                and deco.func.attr == "register"
+                                and isinstance(deco.func.value, ast.Name)):
+                            sd_blocks.setdefault(deco.func.value.id, []).append(node)
+
+            for base_name, func_nodes in sd_blocks.items():
+                imports = []
+                for imp in tree.body:
+                    if isinstance(imp, (ast.Import, ast.ImportFrom)):
+                        imports.append(ast.unparse(imp))
+                funcs_src = "\n".join(
+                    ast.unparse(ast.Module(body=[fn], type_ignores=[]))
+                    for fn in func_nodes)
+                full_src = "\n".join(imports) + "\n" + funcs_src
+                source_ptr = self._make_string_constant(full_src)
+                name_ptr = self._make_string_constant(base_name)
+                func_ptr = self.builder.call(
+                    self.runtime["cpython_exec_get"], [source_ptr, name_ptr])
+                self._store_variable(base_name, func_ptr, "pyobj")
 
         for node in tree.body:
             if not isinstance(node, (ast.FunctionDef, ast.ClassDef)):

@@ -413,6 +413,23 @@ void* fpy_cpython_call_kw_raw(void *callable,
     return (void*)result;
 }
 
+/* ── Flush Python's stdout (important for subprocess capture) ──── */
+
+void fpy_cpython_flush(void) {
+    if (!cpython_initialized) return;
+    PyObject *sys = PyImport_ImportModule("sys");
+    if (sys) {
+        PyObject *out = PyObject_GetAttrString(sys, "stdout");
+        if (out) {
+            PyObject *r = PyObject_CallMethod(out, "flush", NULL);
+            if (r) Py_DECREF(r);
+            Py_DECREF(out);
+        }
+        Py_DECREF(sys);
+    }
+    PyErr_Clear();
+}
+
 /* ── Print a PyObject* via CPython's str() ─────────────────────── */
 
 void fpy_cpython_print_obj(void *pyobj) {

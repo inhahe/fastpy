@@ -406,6 +406,10 @@ int main(void) {
         fpy_gil_acquire();  /* main thread holds GIL initially */
     }
     fastpy_main();
+    /* Flush Python's stdout in case CPython bridge functions called print() */
+    extern void fpy_cpython_flush(void);
+    fpy_cpython_flush();
+    fflush(stdout);
     if (fastpy_exc_pending()) {
         const char *name = "Exception";
         switch (fpy_exc_type) {
