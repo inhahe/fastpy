@@ -687,6 +687,11 @@ class CodeGen:
         self.runtime["exc_set_group_inner"] = ir.Function(self.module, ft, name="fastpy_exc_set_group_inner")
         ft = ir.FunctionType(i32, [])
         self.runtime["exc_get_group_inner"] = ir.Function(self.module, ft, name="fastpy_exc_get_group_inner")
+        # Closure return tag: set before ret, read after call
+        ft = ir.FunctionType(void, [i32])
+        self.runtime["set_ret_tag"] = ir.Function(self.module, ft, name="fastpy_set_ret_tag")
+        ft = ir.FunctionType(i32, [])
+        self.runtime["get_ret_tag"] = ir.Function(self.module, ft, name="fastpy_get_ret_tag")
 
         # Write functions — only write_str and write_space remain
         # (used for print(sep=, end=) handling). Typed write_int/float/bool/none
@@ -1290,6 +1295,10 @@ class CodeGen:
                         self.variables[var_name] = (cell_alloca, "cell")
                     else:
                         val = self._load_variable(var_name, node)
+                        if isinstance(val.type, ir.PointerType):
+                            val = self.builder.ptrtoint(val, i64)
+                        elif isinstance(val.type, ir.IntType) and val.type.width != 64:
+                            val = self.builder.zext(val, i64)
                         self.builder.call(self.runtime["closure_set_capture"], [
                             closure, ir.Constant(i32, i), val])
 
@@ -2721,9 +2730,16 @@ class CodeGen:
 
         ret_type = i8_ptr if returns_param else i64
 
+        # Only scan returns in THIS function, not nested defs.
+        _nested_ids = set()
+        for _item in ast.walk(node):
+            if _item is not node and isinstance(_item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                for _sub in ast.walk(_item):
+                    _nested_ids.add(id(_sub))
         has_return_value = any(
             isinstance(n, ast.Return) and n.value is not None
             for n in ast.walk(node)
+            if id(n) not in _nested_ids
         )
         # Pre-collect string variables for return type detection
         str_vars = set()
@@ -2787,8 +2803,10 @@ class CodeGen:
                                         float_vars.add(tgt.id)
                                         break
 
-            # Check return expression type
+            # Check return expression type (skip nested function returns)
             for n in ast.walk(node):
+                if id(n) in _nested_ids:
+                    continue
                 if isinstance(n, ast.Return) and n.value is not None:
                     if isinstance(n.value, ast.Tuple):
                         ret_type = i8_ptr
@@ -8047,11 +8065,14 @@ class CodeGen:
                 self.builder.ret(value)
             elif value.type != expected:
                 # FpyValue → i64 conversion: closures use i64 ABI externally
-                # but FV locals internally. Extract the data field.
+                # but FV locals internally. Extract the data field and
+                # store the tag in fpy_ret_tag so the caller can recover it.
                 if (isinstance(expected, ir.IntType)
                         and isinstance(value.type, ir.LiteralStructType)):
-                    value = self.builder.extract_value(value, 1)
-                    self.builder.ret(value)
+                    tag = self.builder.extract_value(value, 0)
+                    data = self.builder.extract_value(value, 1)
+                    self.builder.call(self.runtime["set_ret_tag"], [tag])
+                    self.builder.ret(data)
                     return
                 # Type mismatch — try conversion
                 if isinstance(expected, ir.IntType) and isinstance(value.type, ir.IntType):
@@ -8067,9 +8088,44 @@ class CodeGen:
                     value = self.builder.ptrtoint(value, expected)
                 elif isinstance(expected, ir.PointerType) and isinstance(value.type, ir.IntType):
                     value = self.builder.inttoptr(value, expected)
+                # For closure functions, store the tag before ret
+                if (isinstance(expected, ir.IntType)
+                        and self.function.name.startswith("fastpy.closure.")):
+                    tag = self._infer_ret_tag_for_value(value, node.value)
+                    self.builder.call(self.runtime["set_ret_tag"],
+                                      [ir.Constant(i32, tag)])
                 self.builder.ret(value)
             else:
+                # For closure functions, store the tag before ret
+                if (isinstance(expected, ir.IntType)
+                        and self.function.name.startswith("fastpy.closure.")):
+                    tag = self._infer_ret_tag_for_value(value, node.value)
+                    self.builder.call(self.runtime["set_ret_tag"],
+                                      [ir.Constant(i32, tag)])
                 self.builder.ret(value)
+
+    def _infer_ret_tag_for_value(self, value: ir.Value,
+                                  node: ast.expr) -> int:
+        """Infer the FpyValue tag for a bare LLVM value being returned.
+        Used by closures to store the runtime tag in fpy_ret_tag."""
+        if isinstance(value.type, ir.IntType):
+            if value.type.width == 1 or value.type.width == 32:
+                return FPY_TAG_BOOL  # comparisons, bool ops
+            # Check AST for bool-typed expressions
+            if self._is_bool_typed(node):
+                return FPY_TAG_BOOL
+            return FPY_TAG_INT
+        if isinstance(value.type, ir.DoubleType):
+            return FPY_TAG_FLOAT
+        if isinstance(value.type, ir.PointerType):
+            if self._is_list_expr(node):
+                return FPY_TAG_LIST
+            if self._is_dict_expr(node):
+                return FPY_TAG_DICT
+            if self._is_obj_expr(node):
+                return FPY_TAG_OBJ
+            return FPY_TAG_STR
+        return FPY_TAG_INT
 
     def _wrap_return_value(self, value: ir.Value, node: ast.AST) -> ir.Value:
         """Wrap a bare return value into an FpyValue, choosing the tag from
@@ -10055,6 +10111,18 @@ class CodeGen:
             info = self._user_functions[node.func.id]
             if info.uses_fv_abi and info.ret_tag != "void":
                 return self._emit_user_call_fv(node)
+        # Closure call: read fpy_ret_tag to get the runtime tag
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id in self.variables
+                and self.variables[node.func.id][1] == "closure"):
+            data = self._emit_expr_value(node)
+            # Read the tag stored by the closure body's ret instruction
+            tag = self.builder.call(self.runtime["get_ret_tag"], [])
+            if isinstance(data.type, ir.PointerType):
+                data = self.builder.ptrtoint(data, i64)
+            elif isinstance(data.type, ir.IntType) and data.type.width != 64:
+                data = self.builder.zext(data, i64)
+            return self._fv_build_from_slots(tag, data)
         # CPython module method call (e.g. math.sqrt(x)) — returns FpyValue
         # with the runtime tag set by the bridge's type conversion.
         # Also handles chained attrs: os.path.exists(x) where os is pyobj.

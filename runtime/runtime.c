@@ -288,6 +288,15 @@ FPY_THREAD_LOCAL int fpy_exc_type = FPY_EXC_NONE;
 FPY_THREAD_LOCAL const char *fpy_exc_msg = "";
 FPY_THREAD_LOCAL int fpy_exc_group_inner = FPY_EXC_NONE;
 
+/* Per-thread return tag for closure calls. The closure body stores
+ * the value's runtime tag here before returning the i64 data. The
+ * caller reads it after the call to reconstruct the full FpyValue.
+ * Default INT so non-closure paths produce correct results. */
+FPY_THREAD_LOCAL int32_t fpy_ret_tag = 0;  /* FPY_TAG_INT */
+
+void fastpy_set_ret_tag(int32_t tag) { fpy_ret_tag = tag; }
+int32_t fastpy_get_ret_tag(void) { return fpy_ret_tag; }
+
 /* Raise an exception — sets the flag. Caller must check and propagate. */
 void fastpy_raise(int exc_type, const char *msg) {
     fpy_exc_type = exc_type;
