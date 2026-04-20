@@ -357,6 +357,8 @@ class CodeGen:
         ft = ir.FunctionType(i64, [i8_ptr])
         self.runtime["ord"] = ir.Function(self.module, ft, name="fastpy_ord")
         self.runtime["str_to_int"] = ir.Function(self.module, ft, name="fastpy_str_to_int")
+        ft = ir.FunctionType(i64, [i8_ptr, i64])
+        self.runtime["str_to_int_base"] = ir.Function(self.module, ft, name="fastpy_str_to_int_base")
         ft = ir.FunctionType(double, [i8_ptr])
         self.runtime["str_to_float"] = ir.Function(self.module, ft, name="fastpy_str_to_float")
         ft = ir.FunctionType(i8_ptr, [i64])
@@ -723,9 +725,11 @@ class CodeGen:
         self.runtime["checked_sub"] = ir.Function(self.module, ft, name="fpy_checked_sub")
         self.runtime["checked_mul"] = ir.Function(self.module, ft, name="fpy_checked_mul")
         self.runtime["checked_pow"] = ir.Function(self.module, ft, name="fpy_checked_pow")
-        # BigInt to string for printing
+        # BigInt operations
         ft = ir.FunctionType(i8_ptr, [i8_ptr])
         self.runtime["bigint_to_str"] = ir.Function(self.module, ft, name="fpy_bigint_to_str")
+        self.runtime["bigint_from_str"] = ir.Function(self.module, ft, name="fpy_bigint_from_str")
+        self.runtime["bigint_neg"] = ir.Function(self.module, ft, name="fpy_bigint_neg")
 
         # Mark a closure capture as a cell pointer (for GC cleanup)
         ft = ir.FunctionType(void, [i8_ptr, i32])
@@ -5755,6 +5759,13 @@ class CodeGen:
                         and value_node.func.id in self.variables
                         and self.variables[value_node.func.id][1] == "pyobj"):
                     return FPY_TAG_OBJ, value
+                # BigInt constant: large int that was folded at compile time
+                if (value_node is not None
+                        and isinstance(value_node, ast.Constant)
+                        and isinstance(value_node.value, int)
+                        and (value_node.value > 2**63 - 1
+                             or value_node.value < -(2**63))):
+                    return FPY_TAG_BIGINT, value
                 # User function used as a value (e.g. threading.Thread(target=worker)):
                 # wrap as CPython callable so the bridge can call it back.
                 if (value_node is not None
@@ -10318,6 +10329,27 @@ class CodeGen:
                 return self._fv_none()
             if isinstance(node.value, bool):
                 return self._fv_from_bool(value)
+            if (isinstance(node.value, int)
+                    and (node.value > 2**63 - 1 or node.value < -(2**63))):
+                return self._fv_build_from_slots(
+                    ir.Constant(i32, FPY_TAG_BIGINT), value)
+
+        # Constant-folded BigInt: BinOp that evaluated to a big int at compile time
+        if isinstance(node, ast.BinOp):
+            folded = self._try_constant_fold(node)
+            if (folded is not None and isinstance(folded, int)
+                    and (folded > 2**63 - 1 or folded < -(2**63))):
+                return self._fv_build_from_slots(
+                    ir.Constant(i32, FPY_TAG_BIGINT), value)
+        # Negation of BigInt expression
+        if (isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub)):
+            inner = node.operand
+            if isinstance(inner, ast.BinOp):
+                folded = self._try_constant_fold(inner)
+                if (folded is not None and isinstance(folded, int)
+                        and (folded > 2**63 - 1 or folded < -(2**63))):
+                    return self._fv_build_from_slots(
+                        ir.Constant(i32, FPY_TAG_BIGINT), value)
 
         # Named variables: use the variable's stored type_tag (survives load/unwrap)
         if isinstance(node, ast.Name) and node.id in self.variables:
@@ -11190,8 +11222,8 @@ class CodeGen:
 
     def _emit_expr_value(self, node: ast.expr) -> ir.Value:
         """Emit an expression and return its LLVM value."""
-        # Try compile-time constant folding (handles BigInt like 2**100)
-        if isinstance(node, ast.BinOp):
+        # Try compile-time constant folding (handles BigInt like 2**100, -(2**100))
+        if isinstance(node, (ast.BinOp, ast.UnaryOp)):
             folded = self._try_constant_fold(node)
             if folded is not None:
                 return self._emit_constant_value(folded)
@@ -11579,6 +11611,14 @@ class CodeGen:
                             return self.builder.load(data_a)
                         return self.builder.call(self.runtime["str_to_int"], [val])
                     return val
+                if len(node.args) == 2:
+                    # int(str, base) — convert string with base
+                    val = self._emit_expr_value(node.args[0])
+                    base = self._emit_expr_value(node.args[1])
+                    if isinstance(val.type, ir.IntType):
+                        val = self.builder.inttoptr(val, i8_ptr)
+                    return self.builder.call(
+                        self.runtime["str_to_int_base"], [val, base])
                 raise CodeGenError("int() with wrong number of args", node)
             if name == "map":
                 if len(node.args) == 2:
@@ -14695,8 +14735,18 @@ class CodeGen:
             return ir.Constant(i64, 1 if value else 0)
         elif isinstance(value, int):
             if value > 2**63 - 1 or value < -(2**63):
-                # BigInt — represent as string
-                return self._make_string_constant(str(value))
+                # BigInt constant — create at runtime from string.
+                # The result is an i64 (pointer to FpyBigInt), which
+                # _bare_to_tag_data will tag as BIGINT when it sees the
+                # AST node is a big int constant.
+                str_ptr = self._make_string_constant(str(abs(value)))
+                bigint = self.builder.call(
+                    self.runtime["bigint_from_str"], [str_ptr])
+                if value < 0:
+                    neg = self.builder.call(
+                        self.runtime["bigint_neg"], [bigint])
+                    bigint = neg
+                return self.builder.ptrtoint(bigint, i64)
             return ir.Constant(i64, value)
         elif isinstance(value, float):
             return ir.Constant(double, value)

@@ -2131,6 +2131,27 @@ int64_t fastpy_str_to_int(const char *s) {
     return result;
 }
 
+int64_t fastpy_str_to_int_base(const char *s, int64_t base) {
+    if (!s || base < 2 || base > 36) {
+        fastpy_raise(FPY_EXC_VALUEERROR, "invalid literal for int()");
+        return 0;
+    }
+    const char *p = s;
+    while (*p == ' ' || *p == '\t') p++;
+    char *end;
+    int64_t result = (int64_t)strtoll(p, &end, (int)base);
+    while (*end == ' ' || *end == '\t') end++;
+    if (*end != '\0') {
+        char *msg = (char*)malloc(64 + strlen(s));
+        snprintf(msg, 64 + strlen(s),
+                 "invalid literal for int() with base %lld: '%s'",
+                 (long long)base, s);
+        fastpy_raise(FPY_EXC_VALUEERROR, msg);
+        return 0;
+    }
+    return result;
+}
+
 double fastpy_str_to_float(const char *s) {
     if (!s) {
         fastpy_raise(FPY_EXC_VALUEERROR,

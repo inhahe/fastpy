@@ -128,6 +128,30 @@ FpyBigInt* fpy_bigint_from_i64(int64_t value) {
     return b;
 }
 
+FpyBigInt* fpy_bigint_from_str(const char *s) {
+    if (!s || *s == '\0') return fpy_bigint_from_i64(0);
+    int sign = 1;
+    if (*s == '-') { sign = -1; s++; }
+    else if (*s == '+') { s++; }
+
+    FpyBigInt *result = fpy_bigint_from_i64(0);
+    FpyBigInt *ten = fpy_bigint_from_i64(10);
+
+    while (*s >= '0' && *s <= '9') {
+        FpyBigInt *tmp = fpy_bigint_mul(result, ten);
+        fpy_bigint_free(result);
+        FpyBigInt *digit = fpy_bigint_from_i64(*s - '0');
+        result = fpy_bigint_add(tmp, digit);
+        fpy_bigint_free(tmp);
+        fpy_bigint_free(digit);
+        s++;
+    }
+    fpy_bigint_free(ten);
+    result->sign = sign;
+    bigint_normalize(result);
+    return result;
+}
+
 FpyBigInt* fpy_bigint_copy(FpyBigInt *a) {
     FpyBigInt *r = bigint_alloc(a->length);
     r->sign = a->sign;
@@ -379,6 +403,19 @@ void fpy_bigint_free(FpyBigInt *a) {
 }
 
 /* ── Overflow-checked i64 arithmetic ─────────────────────────────── */
+
+/* Negate: if the value is a BigInt pointer, negate the BigInt.
+ * Otherwise negate as i64 with overflow check. */
+int64_t fpy_checked_neg(int64_t a, FpyBigInt **big) {
+    *big = NULL;
+    if (a == INT64_MIN) {
+        /* -INT64_MIN overflows i64 */
+        *big = fpy_bigint_from_i64(a);
+        *big = fpy_bigint_neg(*big);
+        return 0;
+    }
+    return -a;
+}
 
 int64_t fpy_checked_add(int64_t a, int64_t b, FpyBigInt **big) {
     *big = NULL;
