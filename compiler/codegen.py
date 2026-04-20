@@ -2696,9 +2696,18 @@ class CodeGen:
 
         ret_type = i8_ptr if returns_param else i64
 
+        # Check for return statements in THIS function only (not nested defs).
+        # Without this, `def outer(): def inner(): return x>n; return inner`
+        # would detect the nested Compare return and wrongly set ret_type=i32.
+        _nested_node_ids = set()
+        for _item in ast.walk(node):
+            if _item is not node and isinstance(_item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                for _sub in ast.walk(_item):
+                    _nested_node_ids.add(id(_sub))
         has_return_value = any(
             isinstance(n, ast.Return) and n.value is not None
             for n in ast.walk(node)
+            if id(n) not in _nested_node_ids
         )
         # Pre-collect string variables for return type detection
         str_vars = set()
@@ -2762,8 +2771,29 @@ class CodeGen:
                                         float_vars.add(tgt.id)
                                         break
 
-            # Check return expression type
+            # Check return expression type.
+            # IMPORTANT: only scan returns in THIS function's body, not in
+            # nested function definitions. Otherwise `def outer(): def inner():
+            # return x > y; return inner` would wrongly infer outer's return
+            # as bool instead of closure.
+            def _direct_returns(func_node):
+                """Yield Return nodes in func_node's body, skipping nested defs."""
+                for child in ast.walk(func_node):
+                    if child is not func_node and isinstance(child, ast.FunctionDef):
+                        continue  # ast.walk still descends; filter below
+                    if isinstance(child, ast.Return) and child.value is not None:
+                        # Check if this Return is inside a nested FunctionDef
+                        # by walking the body without recursion
+                        yield child
+            # Build list of nested function line ranges to exclude
+            nested_ranges = set()
+            for item in ast.walk(node):
+                if item is not node and isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    for sub in ast.walk(item):
+                        nested_ranges.add(id(sub))
             for n in ast.walk(node):
+                if id(n) in nested_ranges:
+                    continue
                 if isinstance(n, ast.Return) and n.value is not None:
                     if isinstance(n.value, ast.Tuple):
                         ret_type = i8_ptr
@@ -8021,6 +8051,13 @@ class CodeGen:
                 # value is already an FpyValue from _load_or_wrap_fv above.
                 self.builder.ret(value)
             elif value.type != expected:
+                # FpyValue → i64 conversion: closures use i64 ABI externally
+                # but FV locals internally. Extract the data field.
+                if (isinstance(expected, ir.IntType)
+                        and isinstance(value.type, ir.LiteralStructType)):
+                    value = self.builder.extract_value(value, 1)
+                    self.builder.ret(value)
+                    return
                 # Type mismatch — try conversion
                 if isinstance(expected, ir.IntType) and isinstance(value.type, ir.IntType):
                     if expected.width > value.type.width:
