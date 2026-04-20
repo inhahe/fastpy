@@ -1169,18 +1169,7 @@ class CodeGen:
                     for param, pname in zip(func.args, all_params):
                         param.name = pname
 
-                    # Detect if the closure returns a boolean (comparison).
-                    # Only check THIS function's direct returns, not nested.
-                    ret_tag = "void"
-                    if ret_type == i64:
-                        ret_tag = "int"
-                        for rn in node.body:
-                            if isinstance(rn, ast.Return) and rn.value is not None:
-                                if isinstance(rn.value, ast.Compare):
-                                    ret_tag = "bool"
-                                elif (isinstance(rn.value, ast.UnaryOp)
-                                        and isinstance(rn.value.op, ast.Not)):
-                                    ret_tag = "bool"
+                    ret_tag = "int" if ret_type == i64 else "void"
                     # Register as a special closure function
                     self._user_functions[full_name] = FuncInfo(
                         func=func, ret_tag=ret_tag,
@@ -1281,13 +1270,6 @@ class CodeGen:
 
                 # Store closure as a variable with the inner function's name
                 self._store_variable(node.name, closure, "closure")
-                # Track which closure function this variable holds, so
-                # _is_bool_typed can detect bool-returning closures.
-                closure_info = self._user_functions.get(full_name)
-                if closure_info:
-                    if not hasattr(self, '_closure_var_info'):
-                        self._closure_var_info = {}
-                    self._closure_var_info[node.name] = closure_info
                 return
 
         # Not a closure — just a regular nested def (no captures)
@@ -2714,18 +2696,9 @@ class CodeGen:
 
         ret_type = i8_ptr if returns_param else i64
 
-        # Check for return statements in THIS function only (not nested defs).
-        # Without this, `def outer(): def inner(): return x>n; return inner`
-        # would detect the nested Compare return and wrongly set ret_type=i32.
-        _nested_node_ids = set()
-        for _item in ast.walk(node):
-            if _item is not node and isinstance(_item, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                for _sub in ast.walk(_item):
-                    _nested_node_ids.add(id(_sub))
         has_return_value = any(
             isinstance(n, ast.Return) and n.value is not None
             for n in ast.walk(node)
-            if id(n) not in _nested_node_ids
         )
         # Pre-collect string variables for return type detection
         str_vars = set()
@@ -2789,29 +2762,8 @@ class CodeGen:
                                         float_vars.add(tgt.id)
                                         break
 
-            # Check return expression type.
-            # IMPORTANT: only scan returns in THIS function's body, not in
-            # nested function definitions. Otherwise `def outer(): def inner():
-            # return x > y; return inner` would wrongly infer outer's return
-            # as bool instead of closure.
-            def _direct_returns(func_node):
-                """Yield Return nodes in func_node's body, skipping nested defs."""
-                for child in ast.walk(func_node):
-                    if child is not func_node and isinstance(child, ast.FunctionDef):
-                        continue  # ast.walk still descends; filter below
-                    if isinstance(child, ast.Return) and child.value is not None:
-                        # Check if this Return is inside a nested FunctionDef
-                        # by walking the body without recursion
-                        yield child
-            # Build list of nested function line ranges to exclude
-            nested_ranges = set()
-            for item in ast.walk(node):
-                if item is not node and isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    for sub in ast.walk(item):
-                        nested_ranges.add(id(sub))
+            # Check return expression type
             for n in ast.walk(node):
-                if id(n) in nested_ranges:
-                    continue
                 if isinstance(n, ast.Return) and n.value is not None:
                     if isinstance(n.value, ast.Tuple):
                         ret_type = i8_ptr
@@ -5297,16 +5249,6 @@ class CodeGen:
         value = self._emit_expr_value(node.value)
         type_tag = self._infer_type_tag(node.value, value)
 
-        # Track variables holding bool-returning closures
-        if (type_tag == "closure"
-                and getattr(self, '_pending_closure_bool', False)
-                and len(node.targets) == 1
-                and isinstance(node.targets[0], ast.Name)):
-            if not hasattr(self, '_closure_ret_bool_vars'):
-                self._closure_ret_bool_vars = set()
-            self._closure_ret_bool_vars.add(node.targets[0].id)
-            self._pending_closure_bool = False
-
         # CPython bridge builtin result: tag as "pyobj" so downstream
         # ops (len, in, for) route through the bridge.
         if (isinstance(node.value, ast.Call)
@@ -6074,13 +6016,6 @@ class CodeGen:
             # Check if the called function contains closures (returns a closure)
             for full_name in self._closure_info:
                 if full_name.startswith(f"{node.func.id}."):
-                    # Track bool-returning closures for _is_bool_typed
-                    cinfo = self._user_functions.get(full_name)
-                    if cinfo and cinfo.ret_tag == "bool":
-                        if not hasattr(self, '_closure_ret_bool_vars'):
-                            self._closure_ret_bool_vars = set()
-                        # The variable being assigned will be added by caller
-                        self._pending_closure_bool = True
                     return "closure"
             # Check if function returns a pointer (tuple, list, or dict)
             if node.func.id in self._user_functions:
@@ -13260,13 +13195,6 @@ class CodeGen:
                 return True
             if node.func.id in self._user_functions:
                 return self._user_functions[node.func.id].ret_tag == "bool"
-            # Closure variable call: check if the closure returns bool.
-            # Works for direct closures (check = inner func in same scope)
-            # and for closures returned by factory functions (gt3 = make_gt(3)).
-            if node.func.id in getattr(self, '_closure_var_info', {}):
-                return self._closure_var_info[node.func.id].ret_tag == "bool"
-            if node.func.id in getattr(self, '_closure_ret_bool_vars', set()):
-                return True
         return False
 
     def _class_has_method(self, class_name: str, method_name: str) -> bool:
