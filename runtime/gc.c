@@ -243,6 +243,31 @@ int64_t fpy_gc_collect(void) {
     return freed;
 }
 
+/* Final sweep: destroy ALL tracked objects regardless of refcount.
+ * Called at program exit to ensure destructors run (e.g., generator
+ * finally blocks). Only objects with destructors are actually called —
+ * others are left for the OS to reclaim with process memory. */
+void fpy_gc_finalize(void) {
+    extern FpyClassDef fpy_classes[];
+    extern int fpy_class_count;
+    FpyGCNode *node = gc_sentinel.gc_next;
+    while (node != &gc_sentinel) {
+        FpyGCNode *next = node->gc_next;
+        if (node->gc_type == FPY_GC_TYPE_OBJ) {
+            /* Recover the FpyObj and check for destructor */
+            FpyObj *obj = (FpyObj*)((char*)node - offsetof(FpyObj, gc_node));
+            if (obj->magic == FPY_OBJ_MAGIC &&
+                obj->class_id >= 0 && obj->class_id < fpy_class_count) {
+                void (*dtor)(FpyObj*) = fpy_classes[obj->class_id].destructor;
+                if (dtor) {
+                    dtor(obj);
+                }
+            }
+        }
+        node = next;
+    }
+}
+
 /* ── Atomic refcount operations (free-threaded mode) ────────────── */
 
 void fpy_incref_atomic(int32_t *rc) {

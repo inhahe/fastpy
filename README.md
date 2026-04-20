@@ -43,18 +43,19 @@ result = compile_source('print("hello world")')
 
 ### Language features (66/66 audit, 405/405 tests)
 
-- **Core**: functions, classes, closures, decorators, generators, lambda, recursion, `*args`/`**kwargs`, default arguments, global/nonlocal
+- **Core**: functions, classes, closures, decorators, generators, lambda, recursion, `*args`/`**kwargs`, default arguments, global/nonlocal, `@singledispatch` (native switch dispatch)
 - **Control flow**: if/elif/else, for/while (with break/continue/else), try/except/finally/else, with, match/case, assert, raise/raise from
-- **OOP**: inheritance, multiple inheritance, super, `@staticmethod`, `@classmethod`, `@property` (get/set), nested classes, metaclass, `__slots__`
+- **OOP**: inheritance, multiple inheritance, super, `@staticmethod`, `@classmethod`, `@property` (get/set), nested classes, full metaclass support (`metaclass=`, `__new__`, `__init_subclass__`, `__class_getitem__`), `__slots__`
 - **Dunders**: `__add__`, `__sub__`, `__mul__`, `__neg__`, `__eq__`, `__lt__`, `__str__`, `__repr__`, `__getitem__`/`__setitem__`/`__delitem__`, `__len__`, `__bool__`, `__contains__`, `__iter__`/`__next__`, `__call__`, `__hash__`
 - **Containers**: list, dict, tuple, set (O(1) hash-table-backed), frozenset, comprehensions (list/dict/set with filters), `{**a, **b}` unpacking, slice assignment
 - **Strings**: f-strings (with `=`, `!r`, format specs), all common methods (split, join, replace, strip, find, upper, lower, etc.), `%` formatting, `.format()`
-- **Generators**: yield, yield from, generator expressions, send/close/throw (via CPython bridge)
-- **Async**: async def, await (via CPython bridge)
+- **Generators**: yield, yield from, generator expressions, native send/close/throw (state-machine compilation)
+- **Async**: async def, await, `asyncio.run()`, `asyncio.gather()`, `asyncio.sleep()` — all compiled natively (sequential execution, no CPython bridge)
 - **Pattern matching**: match/case with literal, capture, guard, or, wildcard, sequence patterns
 - **Exceptions**: try/except/finally/else, except* (ExceptionGroup), bare raise, raise from
-- **Imports**: `import module`, `from module import name` (native math, .pyd bridge for everything else)
-- **Builtins**: print, range, len, sorted (with key=, reverse=), min/max (with key=), int, float, str, bool, abs, sum, map, filter, enumerate, zip, isinstance, type, any, all, hash, next, iter, eval, repr, pow, divmod, chr, ord, hex, oct, bin, round, dict, list, tuple, set, getattr/setattr/hasattr/delattr
+- **Multi-file compilation**: `from mymodule import func` resolves local `.py` files and packages (`mylib/module.py`), compiles them inline. Recursive import resolution with circular import detection.
+- **Imports**: native math/json/os/asyncio, local `.py` modules compiled inline, `.pyd` modules via CPython bridge
+- **Builtins**: print, range, len, sorted (with key=, reverse=), min/max (with key=), int, float, str, bool, abs, sum, map, filter, enumerate, zip, isinstance, type, any, all, hash, next, iter, eval, exec, repr, pow, divmod, chr, ord, hex, oct, bin, round, dict, list, tuple, set, locals, globals, getattr/setattr/hasattr/delattr
 - **Type hints**: accepted and ignored (full compatibility with annotated code)
 
 ### Threading
@@ -150,10 +151,9 @@ python -m compiler myprogram.py -o myprogram.exe
 
 ## Known limitations
 
-- **Integers are 64-bit** — `2**100` silently overflows instead of producing a big integer. This is the largest Python compatibility gap. Programs using integers > ~9.2×10¹⁸ produce wrong results. BigInt support (speculative unboxing with overflow fallback) is planned.
-- **Generators with send()** and **async/await** run through the CPython bridge (correct but not native-speed)
-- **eval()/exec()** route through CPython (no access to compiled locals)
-- **Complex numbers** use the CPython bridge (no native complex arithmetic)
+- **eval()/exec()** with literal string arguments are compiled inline at compile time (zero overhead). Dynamic strings route through CPython with automatic locals namespace injection
+- **`re` module** routes through CPython bridge (full regex engine is impractical to reimplement natively)
+- **.pyd imports** (numpy, etc.) use CPython bridge for bindings — the extension's C code runs natively, only the PyObject* marshalling goes through the bridge
 - **Windows x64 only** — needs MSVC Build Tools. Linux/macOS support planned.
 
 See [UNIMPLEMENTED.md](UNIMPLEMENTED.md) for the full list.

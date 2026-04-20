@@ -73,6 +73,7 @@ FPY_TAG_DICT = 7
 FPY_TAG_BYTES = 8
 FPY_TAG_SET = 9
 FPY_TAG_BIGINT = 10
+FPY_TAG_COMPLEX = 11
 
 
 @dataclass
@@ -119,6 +120,54 @@ TAG_FLOAT = 1
 TAG_STR = 2
 TAG_BOOL = 3
 TAG_NONE = 4
+
+
+class _GenVarRewriter(ast.NodeTransformer):
+    """AST transformer that rewrites local variable references into
+    self._<var> attribute accesses for generator state-machine classes.
+
+    Only names in the `local_vars` set are rewritten. Everything else
+    (builtins, class names, global functions) is left unchanged.
+    """
+
+    def __init__(self, local_vars: set[str]):
+        self._local_vars = local_vars
+
+    def visit_Name(self, node: ast.Name) -> ast.AST:
+        # Only rewrite names that are known local variables
+        if node.id not in self._local_vars:
+            return node
+        # Don't rewrite 'self' — it's the method parameter
+        if node.id == "self":
+            return node
+        # Don't rewrite '_sent' — it's the send() parameter
+        if node.id == "_sent":
+            return node
+
+        attr_name = f"_{node.id}"
+        if isinstance(node.ctx, ast.Store):
+            # x = ... -> self._x = ...
+            new_node = ast.Attribute(
+                value=ast.Name(id="self", ctx=ast.Load()),
+                attr=attr_name,
+                ctx=ast.Store())
+        elif isinstance(node.ctx, ast.Del):
+            new_node = ast.Attribute(
+                value=ast.Name(id="self", ctx=ast.Load()),
+                attr=attr_name,
+                ctx=ast.Del())
+        else:
+            # ... = x -> ... = self._x
+            new_node = ast.Attribute(
+                value=ast.Name(id="self", ctx=ast.Load()),
+                attr=attr_name,
+                ctx=ast.Load())
+        return ast.copy_location(new_node, node)
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.AST:
+        # Don't recurse into nested function definitions — their
+        # local variables are their own scope
+        return node
 
 
 class CodeGen:
@@ -552,6 +601,118 @@ class CodeGen:
         ft = ir.FunctionType(i8_ptr, [i8_ptr])
         self.runtime["dict_to_str"] = ir.Function(self.module, ft, name="fastpy_dict_to_str")
 
+        # --- Collections module ---
+        # Counter
+        ft = ir.FunctionType(i8_ptr, [])
+        self.runtime["counter_new"] = ir.Function(self.module, ft, name="fastpy_counter_new")
+        ft = ir.FunctionType(i8_ptr, [i8_ptr])  # counter_from_list(list) -> dict
+        self.runtime["counter_from_list"] = ir.Function(self.module, ft, name="fastpy_counter_from_list")
+        ft = ir.FunctionType(void, [i8_ptr, i32, i64])  # counter_increment(counter, tag, data)
+        self.runtime["counter_increment"] = ir.Function(self.module, ft, name="fastpy_counter_increment")
+        ft = ir.FunctionType(void, [i8_ptr, i8_ptr])  # counter_update_list(counter, list)
+        self.runtime["counter_update_list"] = ir.Function(self.module, ft, name="fastpy_counter_update_list")
+        ft = ir.FunctionType(i8_ptr, [i8_ptr, i64])  # counter_most_common(counter, n) -> list
+        self.runtime["counter_most_common"] = ir.Function(self.module, ft, name="fastpy_counter_most_common")
+        ft = ir.FunctionType(i8_ptr, [i8_ptr])  # counter_elements(counter) -> list
+        self.runtime["counter_elements"] = ir.Function(self.module, ft, name="fastpy_counter_elements")
+        # defaultdict
+        ft = ir.FunctionType(i8_ptr, [i32])  # defaultdict_new(factory_tag) -> dict
+        self.runtime["defaultdict_new"] = ir.Function(self.module, ft, name="fastpy_defaultdict_new")
+        ft = ir.FunctionType(void, [i8_ptr, i8_ptr, ir.PointerType(i32), ir.PointerType(i64)])
+        self.runtime["defaultdict_get"] = ir.Function(self.module, ft, name="fastpy_defaultdict_get")
+        ft = ir.FunctionType(void, [i8_ptr, i32, i64, ir.PointerType(i32), ir.PointerType(i64)])
+        self.runtime["defaultdict_get_fv"] = ir.Function(self.module, ft, name="fastpy_defaultdict_get_fv")
+        # deque
+        ft = ir.FunctionType(i8_ptr, [i64])  # deque_new(maxlen) -> deque
+        self.runtime["deque_new"] = ir.Function(self.module, ft, name="fastpy_deque_new")
+        ft = ir.FunctionType(i8_ptr, [i8_ptr, i64])  # deque_from_list(list, maxlen) -> deque
+        self.runtime["deque_from_list"] = ir.Function(self.module, ft, name="fastpy_deque_from_list")
+        ft = ir.FunctionType(void, [i8_ptr, i32, i64])  # deque_append(dq, tag, data)
+        self.runtime["deque_append"] = ir.Function(self.module, ft, name="fastpy_deque_append")
+        ft = ir.FunctionType(void, [i8_ptr, i32, i64])  # deque_appendleft(dq, tag, data)
+        self.runtime["deque_appendleft"] = ir.Function(self.module, ft, name="fastpy_deque_appendleft")
+        ft = ir.FunctionType(void, [i8_ptr, ir.PointerType(i32), ir.PointerType(i64)])
+        self.runtime["deque_pop"] = ir.Function(self.module, ft, name="fastpy_deque_pop")
+        ft = ir.FunctionType(void, [i8_ptr, ir.PointerType(i32), ir.PointerType(i64)])
+        self.runtime["deque_popleft"] = ir.Function(self.module, ft, name="fastpy_deque_popleft")
+        ft = ir.FunctionType(i64, [i8_ptr])  # deque_length(dq) -> int
+        self.runtime["deque_length"] = ir.Function(self.module, ft, name="fastpy_deque_length")
+        ft = ir.FunctionType(void, [i8_ptr, i64, ir.PointerType(i32), ir.PointerType(i64)])
+        self.runtime["deque_get"] = ir.Function(self.module, ft, name="fastpy_deque_get")
+        ft = ir.FunctionType(void, [i8_ptr, i64])  # deque_rotate(dq, n)
+        self.runtime["deque_rotate"] = ir.Function(self.module, ft, name="fastpy_deque_rotate")
+        ft = ir.FunctionType(void, [i8_ptr])  # deque_clear(dq)
+        self.runtime["deque_clear"] = ir.Function(self.module, ft, name="fastpy_deque_clear")
+        ft = ir.FunctionType(i8_ptr, [i8_ptr])  # deque_to_list(dq) -> list
+        self.runtime["deque_to_list"] = ir.Function(self.module, ft, name="fastpy_deque_to_list")
+        ft = ir.FunctionType(void, [i8_ptr, i8_ptr])  # deque_extend(dq, list)
+        self.runtime["deque_extend"] = ir.Function(self.module, ft, name="fastpy_deque_extend")
+        ft = ir.FunctionType(void, [i8_ptr, i8_ptr])  # deque_extendleft(dq, list)
+        self.runtime["deque_extendleft"] = ir.Function(self.module, ft, name="fastpy_deque_extendleft")
+        # namedtuple
+        ft = ir.FunctionType(i32, [i8_ptr, ir.PointerType(i8_ptr), i32])  # namedtuple_register(name, fields, n)
+        self.runtime["namedtuple_register"] = ir.Function(self.module, ft, name="fastpy_namedtuple_register")
+        ft = ir.FunctionType(i8_ptr, [i32, i32])  # namedtuple_new(type_id, n_fields) -> tuple
+        self.runtime["namedtuple_new"] = ir.Function(self.module, ft, name="fastpy_namedtuple_new")
+        # ChainMap
+        ft = ir.FunctionType(i8_ptr, [])  # chainmap_new() -> chainmap
+        self.runtime["chainmap_new"] = ir.Function(self.module, ft, name="fastpy_chainmap_new")
+        ft = ir.FunctionType(void, [i8_ptr, i8_ptr, ir.PointerType(i32), ir.PointerType(i64)])
+        self.runtime["chainmap_get"] = ir.Function(self.module, ft, name="fastpy_chainmap_get")
+        ft = ir.FunctionType(void, [i8_ptr, i8_ptr, i32, i64])  # chainmap_set(cm, key, tag, data)
+        self.runtime["chainmap_set"] = ir.Function(self.module, ft, name="fastpy_chainmap_set")
+        ft = ir.FunctionType(i8_ptr, [i8_ptr])  # chainmap_new_child(cm) -> chainmap
+        self.runtime["chainmap_new_child"] = ir.Function(self.module, ft, name="fastpy_chainmap_new_child")
+        ft = ir.FunctionType(i32, [i8_ptr, i8_ptr])  # chainmap_contains(cm, key) -> bool
+        self.runtime["chainmap_contains"] = ir.Function(self.module, ft, name="fastpy_chainmap_contains")
+        # OrderedDict (alias for regular dict)
+        ft = ir.FunctionType(i8_ptr, [])
+        self.runtime["ordereddict_new"] = ir.Function(self.module, ft, name="fastpy_ordereddict_new")
+
+        # --- sys module ---
+        ft = ir.FunctionType(void, [i64])  # sys_exit(code)
+        self.runtime["sys_exit"] = ir.Function(self.module, ft, name="fastpy_sys_exit")
+        ft = ir.FunctionType(i8_ptr, [])  # sys_argv() -> list
+        self.runtime["sys_argv"] = ir.Function(self.module, ft, name="fastpy_sys_argv")
+        ft = ir.FunctionType(i8_ptr, [])  # sys_platform() -> str
+        self.runtime["sys_platform"] = ir.Function(self.module, ft, name="fastpy_sys_platform")
+        ft = ir.FunctionType(i64, [])  # sys_maxsize() -> int
+        self.runtime["sys_maxsize"] = ir.Function(self.module, ft, name="fastpy_sys_maxsize")
+        ft = ir.FunctionType(i8_ptr, [])  # sys_version_info() -> tuple
+        self.runtime["sys_version_info"] = ir.Function(self.module, ft, name="fastpy_sys_version_info")
+
+        # --- time module ---
+        ft = ir.FunctionType(double, [])  # time_time() -> float
+        self.runtime["time_time"] = ir.Function(self.module, ft, name="fastpy_time_time")
+        ft = ir.FunctionType(i64, [])  # time_time_ns() -> int
+        self.runtime["time_time_ns"] = ir.Function(self.module, ft, name="fastpy_time_time_ns")
+        ft = ir.FunctionType(double, [])  # time_perf_counter() -> float
+        self.runtime["time_perf_counter"] = ir.Function(self.module, ft, name="fastpy_time_perf_counter")
+        ft = ir.FunctionType(void, [double])  # time_sleep(seconds)
+        self.runtime["time_sleep"] = ir.Function(self.module, ft, name="fastpy_time_sleep")
+        ft = ir.FunctionType(double, [])  # time_monotonic() -> float
+        self.runtime["time_monotonic"] = ir.Function(self.module, ft, name="fastpy_time_monotonic")
+
+        # --- Logging module ---
+        ft = ir.FunctionType(void, [i32, i8_ptr, i8_ptr])  # basicConfig(level, fmt, filename)
+        self.runtime["logging_basicConfig"] = ir.Function(self.module, ft, name="fastpy_logging_basicConfig")
+        ft = ir.FunctionType(void, [i32, i8_ptr, i8_ptr])  # log(level, name, msg)
+        self.runtime["logging_log"] = ir.Function(self.module, ft, name="fastpy_logging_log")
+        ft = ir.FunctionType(void, [i8_ptr])  # debug/info/warning/error/critical(msg)
+        self.runtime["logging_debug"] = ir.Function(self.module, ft, name="fastpy_logging_debug")
+        self.runtime["logging_info"] = ir.Function(self.module, ft, name="fastpy_logging_info")
+        self.runtime["logging_warning"] = ir.Function(self.module, ft, name="fastpy_logging_warning")
+        self.runtime["logging_error"] = ir.Function(self.module, ft, name="fastpy_logging_error")
+        self.runtime["logging_critical"] = ir.Function(self.module, ft, name="fastpy_logging_critical")
+        ft = ir.FunctionType(i32, [i8_ptr])  # getLogger(name) -> logger_id
+        self.runtime["logging_getLogger"] = ir.Function(self.module, ft, name="fastpy_logging_getLogger")
+        ft = ir.FunctionType(void, [i32, i32])  # setLevel(logger_id, level)
+        self.runtime["logging_setLevel"] = ir.Function(self.module, ft, name="fastpy_logging_setLevel")
+        ft = ir.FunctionType(void, [i32, i32, i8_ptr])  # logger_log(id, level, msg)
+        self.runtime["logging_logger_log"] = ir.Function(self.module, ft, name="fastpy_logging_logger_log")
+        ft = ir.FunctionType(i8_ptr, [i8_ptr, i8_ptr])  # format_msg(fmt, args_list) -> str
+        self.runtime["logging_format_msg"] = ir.Function(self.module, ft, name="fastpy_logging_format_msg")
+
         # Closure support
         ft = ir.FunctionType(i8_ptr, [i8_ptr, i32, i32])  # closure_new(func, n_params, n_captures)
         self.runtime["closure_new"] = ir.Function(self.module, ft, name="fastpy_closure_new")
@@ -603,6 +764,12 @@ class CodeGen:
         # exec_get(code, name) -> PyObject*: exec Python code, return named object
         ft = ir.FunctionType(i8_ptr, [i8_ptr, i8_ptr])
         self.runtime["cpython_exec_get"] = ir.Function(self.module, ft, name="fpy_cpython_exec_get")
+        # eval_locals(expr, locals_dict, &out_tag, &out_data): eval with local namespace
+        ft = ir.FunctionType(void, [i8_ptr, i8_ptr, ir.PointerType(i32), ir.PointerType(i64)])
+        self.runtime["cpython_eval_locals"] = ir.Function(self.module, ft, name="fpy_cpython_eval_locals")
+        # exec_locals(code, locals_dict): exec with local namespace
+        ft = ir.FunctionType(void, [i8_ptr, i8_ptr])
+        self.runtime["cpython_exec_locals"] = ir.Function(self.module, ft, name="fpy_cpython_exec_locals")
 
         # enumerate and zip
         ft = ir.FunctionType(i8_ptr, [i8_ptr, i64])
@@ -644,6 +811,10 @@ class CodeGen:
         ft = ir.FunctionType(void, [i32, i32])
         self.runtime["set_class_slot_count"] = ir.Function(
             self.module, ft, name="fastpy_set_class_slot_count")
+        # Per-class destructor callback (for generator finally cleanup)
+        ft = ir.FunctionType(void, [i32, i8_ptr])
+        self.runtime["set_class_destructor"] = ir.Function(
+            self.module, ft, name="fastpy_set_class_destructor")
         # Per-slot name registration (lets obj_get_fv/obj_set_fv find the
         # slot when the compiler couldn't determine it statically)
         ft = ir.FunctionType(void, [i32, i32, i8_ptr])
@@ -730,6 +901,49 @@ class CodeGen:
         self.runtime["bigint_to_str"] = ir.Function(self.module, ft, name="fpy_bigint_to_str")
         self.runtime["bigint_from_str"] = ir.Function(self.module, ft, name="fpy_bigint_from_str")
         self.runtime["bigint_neg"] = ir.Function(self.module, ft, name="fpy_bigint_neg")
+
+        # Complex number operations
+        ft = ir.FunctionType(i8_ptr, [double, double])
+        self.runtime["complex_new"] = ir.Function(self.module, ft, name="fpy_complex_new")
+        ft = ir.FunctionType(i8_ptr, [i8_ptr, i8_ptr])
+        self.runtime["complex_add"] = ir.Function(self.module, ft, name="fpy_complex_add")
+        self.runtime["complex_sub"] = ir.Function(self.module, ft, name="fpy_complex_sub")
+        self.runtime["complex_mul"] = ir.Function(self.module, ft, name="fpy_complex_mul")
+        self.runtime["complex_div"] = ir.Function(self.module, ft, name="fpy_complex_div")
+        ft = ir.FunctionType(i8_ptr, [i8_ptr])
+        self.runtime["complex_neg"] = ir.Function(self.module, ft, name="fpy_complex_neg")
+        ft = ir.FunctionType(double, [i8_ptr])
+        self.runtime["complex_abs"] = ir.Function(self.module, ft, name="fpy_complex_abs")
+
+        # Native JSON functions
+        ft = ir.FunctionType(i8_ptr, [i32, i64])
+        self.runtime["json_dumps"] = ir.Function(self.module, ft, name="fastpy_json_dumps_fv")
+        ft = ir.FunctionType(void, [i8_ptr, ir.PointerType(i32), ir.PointerType(i64)])
+        self.runtime["json_loads"] = ir.Function(self.module, ft, name="fastpy_json_loads")
+        # Native OS functions
+        ft = ir.FunctionType(i8_ptr, [])
+        self.runtime["os_getcwd"] = ir.Function(self.module, ft, name="fastpy_os_getcwd")
+        ft = ir.FunctionType(i64, [i8_ptr])
+        self.runtime["os_path_exists"] = ir.Function(self.module, ft, name="fastpy_os_path_exists")
+        self.runtime["os_path_isfile"] = ir.Function(self.module, ft, name="fastpy_os_path_isfile")
+        self.runtime["os_path_isdir"] = ir.Function(self.module, ft, name="fastpy_os_path_isdir")
+        ft = ir.FunctionType(i8_ptr, [i8_ptr, i8_ptr])
+        self.runtime["os_path_join"] = ir.Function(self.module, ft, name="fastpy_os_path_join")
+        ft = ir.FunctionType(i8_ptr, [i8_ptr])
+        self.runtime["os_path_basename"] = ir.Function(self.module, ft, name="fastpy_os_path_basename")
+        self.runtime["os_path_dirname"] = ir.Function(self.module, ft, name="fastpy_os_path_dirname")
+        self.runtime["os_getenv"] = ir.Function(self.module, ft, name="fastpy_os_getenv")
+        ft = ir.FunctionType(i8_ptr, [i8_ptr])
+        self.runtime["os_listdir"] = ir.Function(self.module, ft, name="fastpy_os_listdir")
+        # Vtable dispatch
+        ft = ir.FunctionType(void, [i32, i32, i8_ptr])
+        self.runtime["set_vtable_entry"] = ir.Function(self.module, ft, name="fastpy_set_vtable_entry")
+        ft = ir.FunctionType(i8_ptr, [i8_ptr, i32])
+        self.runtime["vtable_lookup"] = ir.Function(self.module, ft, name="fastpy_vtable_lookup")
+        # Native type.__new__: create class from namespace dict
+        ft = ir.FunctionType(i32, [i8_ptr, i32, i8_ptr])
+        self.runtime["type_new_from_dict"] = ir.Function(
+            self.module, ft, name="fastpy_type_new_from_dict")
 
         # Mark a closure capture as a cell pointer (for GC cleanup)
         ft = ir.FunctionType(void, [i8_ptr, i32])
@@ -937,6 +1151,18 @@ class CodeGen:
                             global_types[name] = "str"
                         elif isinstance(node.value.value, float):
                             global_types[name] = "float"
+                    # Detect computed float expressions: X = expr * float_var
+                    elif isinstance(node.value, ast.BinOp):
+                        def _has_float(n):
+                            if isinstance(n, ast.Constant) and isinstance(n.value, float):
+                                return True
+                            if isinstance(n, ast.Name) and global_types.get(n.id) == "float":
+                                return True
+                            if isinstance(n, ast.BinOp):
+                                return _has_float(n.left) or _has_float(n.right)
+                            return False
+                        if _has_float(node.value):
+                            global_types[name] = "float"
 
         for node in ast.walk(tree):
             if isinstance(node, ast.Global):
@@ -963,6 +1189,50 @@ class CodeGen:
                             gvar.linkage = "private"
                             self._global_vars[name] = (gvar, "int")
 
+        # Pass 0.72: auto-create globals for module-level variables read from
+        # functions. Python allows reading module-level vars without `global`.
+        module_level_names = set()
+        for node in tree.body:
+            if isinstance(node, ast.Assign) and len(node.targets) == 1:
+                if isinstance(node.targets[0], ast.Name):
+                    module_level_names.add(node.targets[0].id)
+        # Find names referenced in function bodies that aren't local params
+        # or locally-assigned variables
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                local_params = {a.arg for a in node.args.args}
+                # Collect names assigned inside this function (local vars)
+                local_assigns = set()
+                for child in ast.walk(node):
+                    if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Store):
+                        local_assigns.add(child.id)
+                for child in ast.walk(node):
+                    if (isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load)
+                            and child.id in module_level_names
+                            and child.id not in local_params
+                            and child.id not in local_assigns
+                            and child.id not in self._global_vars):
+                        gtype = global_types.get(child.id)
+                        if gtype in ("list", "dict", "str"):
+                            gvar = ir.GlobalVariable(self.module, i8_ptr,
+                                                     name=f"fastpy.global.{child.id}")
+                            gvar.initializer = ir.Constant(i8_ptr, None)
+                            gvar.linkage = "private"
+                            tag = gtype if gtype != "list" else "list:int"
+                            self._global_vars[child.id] = (gvar, tag)
+                        elif gtype == "float":
+                            gvar = ir.GlobalVariable(self.module, double,
+                                                     name=f"fastpy.global.{child.id}")
+                            gvar.initializer = ir.Constant(double, 0.0)
+                            gvar.linkage = "private"
+                            self._global_vars[child.id] = (gvar, "float")
+                        else:
+                            gvar = ir.GlobalVariable(self.module, i64,
+                                                     name=f"fastpy.global.{child.id}")
+                            gvar.initializer = ir.Constant(i64, 0)
+                            gvar.linkage = "private"
+                            self._global_vars[child.id] = (gvar, "int")
+
         # Pass 0.75: analyze call sites to determine parameter types
         self._call_site_param_types: dict[str, list[str | None]] = {}
         # Distinct call signatures per function (for monomorphization).
@@ -977,19 +1247,55 @@ class CodeGen:
         self._monomorphized_classes: dict[str, list[tuple]] = {}
         self._analyze_call_sites(tree)
 
+        # Pass 0.76: expand @dataclass classes into vanilla classes with
+        # synthesized __init__, __repr__, __eq__, __hash__. Must run before
+        # Pass 0.8 so slot allocation sees self.attr in the synthesized __init__.
+        self._expand_dataclasses(tree)
+
+        # Pass 0.77: expand generators that use yield-as-expression (send
+        # pattern) into state-machine classes. Must run before Pass 0.8 so
+        # slot allocation sees self._attr in the generated __init__/send
+        # methods. Must run after _expand_dataclasses since it uses the same
+        # pattern of injecting classes into tree.body.
+        self._expand_generators(tree)
+
         # Pass 0.8: discover static attribute slots per class
         self._assign_attribute_slots(tree)
 
         # Pre-scan: detect singledispatch functions and their .register variants.
-        # These are compiled through CPython bridge (like dataclasses).
+        # Compiled natively — each variant becomes a separate function, and
+        # Pre-scan native module imports so they're known during function
+        # compilation (before _emit_import runs at module level).
+        if not hasattr(self, '_native_modules'):
+            self._native_modules = set()
+        if not hasattr(self, '_native_imports'):
+            self._native_imports = {}
+        for node in tree.body:
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.name in self._NATIVE_MODULES:
+                        var = alias.asname if alias.asname else alias.name
+                        self._native_modules.add(var)
+            elif isinstance(node, ast.ImportFrom):
+                mod = node.module or ""
+                if mod in self._NATIVE_MODULES:
+                    for alias in node.names:
+                        var = alias.asname if alias.asname else alias.name
+                        self._native_imports[var] = (mod, alias.name)
+
+        # the call site emits a switch on the first argument's runtime tag.
         if not hasattr(self, '_cpython_functions'):
             self._cpython_functions = set()
+        # Maps base_name -> {type_name: mangled_variant_name}
+        self._singledispatch: dict[str, dict[str, str]] = {}
+        # Maps mangled_variant_name -> ast.FunctionDef (for declaration/emit)
+        self._singledispatch_variants: dict[str, ast.FunctionDef] = {}
         _singledispatch_names = set()
         for node in tree.body:
             if isinstance(node, ast.FunctionDef):
                 for deco in node.decorator_list:
                     if isinstance(deco, ast.Name) and deco.id == "singledispatch":
-                        self._cpython_functions.add(node.name)
+                        self._singledispatch[node.name] = {}
                         _singledispatch_names.add(node.name)
                     # @func.register(type) — register variant
                     if (isinstance(deco, ast.Call)
@@ -997,7 +1303,12 @@ class CodeGen:
                             and deco.func.attr == "register"
                             and isinstance(deco.func.value, ast.Name)
                             and deco.func.value.id in _singledispatch_names):
-                        self._cpython_functions.add(node.name)
+                        base_name = deco.func.value.id
+                        if deco.args and isinstance(deco.args[0], ast.Name):
+                            type_name = deco.args[0].id
+                            mangled = f"{base_name}__{type_name}"
+                            self._singledispatch[base_name][type_name] = mangled
+                            self._singledispatch_variants[mangled] = node
 
         # Pass 1: forward-declare all user functions and class methods
         # Also scan for nested classes (class B inside class A)
@@ -1005,6 +1316,15 @@ class CodeGen:
             if isinstance(node, ast.FunctionDef):
                 if node.name in self._cpython_functions:
                     continue  # compiled through CPython bridge
+                # Skip singledispatch variant functions (compiled under mangled names)
+                is_sd_variant = False
+                for deco in node.decorator_list:
+                    if (isinstance(deco, ast.Call)
+                            and isinstance(deco.func, ast.Attribute)
+                            and deco.func.attr == "register"):
+                        is_sd_variant = True
+                if is_sd_variant:
+                    continue
                 self._declare_user_function(node)
             elif isinstance(node, ast.ClassDef):
                 self._declare_class(node)
@@ -1012,6 +1332,15 @@ class CodeGen:
                 for item in node.body:
                     if isinstance(item, ast.ClassDef):
                         self._declare_class(item)
+        # Declare singledispatch variant functions under their mangled names
+        for mangled, variant_node in self._singledispatch_variants.items():
+            orig_name = variant_node.name
+            variant_node.name = mangled
+            orig_decos = variant_node.decorator_list
+            variant_node.decorator_list = []
+            self._declare_user_function(variant_node)
+            variant_node.name = orig_name
+            variant_node.decorator_list = orig_decos
 
         # Pass 1.1: hoist simple inner functions (no captures) to module
         # level so call sites inside their outer function can find them.
@@ -1034,11 +1363,28 @@ class CodeGen:
         # Pass 2: generate code for user functions and class methods
         for node in tree.body:
             if isinstance(node, ast.FunctionDef):
-                if node.name not in self._cpython_functions:
-                    self._emit_function_def(node)
+                if node.name in self._cpython_functions:
+                    continue
+                # Skip singledispatch variants (emitted separately below)
+                is_sd_variant = any(
+                    isinstance(d, ast.Call) and isinstance(d.func, ast.Attribute)
+                    and d.func.attr == "register"
+                    for d in node.decorator_list)
+                if is_sd_variant:
+                    continue
+                self._emit_function_def(node)
             elif isinstance(node, ast.ClassDef):
                 if node.name not in getattr(self, '_cpython_classes', set()):
                     self._emit_class_methods(node)
+        # Emit singledispatch variant bodies
+        for mangled, variant_node in self._singledispatch_variants.items():
+            orig_name = variant_node.name
+            orig_decos = variant_node.decorator_list
+            variant_node.name = mangled
+            variant_node.decorator_list = []
+            self._emit_function_def(variant_node)
+            variant_node.name = orig_name
+            variant_node.decorator_list = orig_decos
 
         # Pass 2.1: emit bodies of hoisted inner functions
         for inner in getattr(self, "_hoist_inner_funcs", []):
@@ -1144,16 +1490,13 @@ class CodeGen:
                     self.runtime["cpython_exec_get"], [source_ptr, name_ptr])
                 self._store_variable(node.name, cls_ptr, "pyobj")
 
-        # Compile singledispatch function groups via exec_get.
-        # Collect the @singledispatch function and all @func.register variants
-        # into a single code block and exec it in CPython.
+        # Compile CPython-bridge function groups (e.g. dataclasses) via exec_get.
         if self._cpython_functions:
             sd_blocks: dict[str, list[ast.stmt]] = {}
             for node in tree.body:
                 if isinstance(node, ast.FunctionDef) and node.name in self._cpython_functions:
-                    # Find which singledispatch group this belongs to
                     for deco in node.decorator_list:
-                        if isinstance(deco, ast.Name) and deco.id == "singledispatch":
+                        if isinstance(deco, ast.Name) and deco.id not in ("singledispatch",):
                             sd_blocks.setdefault(node.name, []).append(node)
                         elif (isinstance(deco, ast.Call)
                                 and isinstance(deco.func, ast.Attribute)
@@ -1291,6 +1634,8 @@ class CodeGen:
                     func_type = ir.FunctionType(ret_type, param_types)
                     fn_name = f"fastpy.closure.{full_name}"
                     func = ir.Function(self.module, func_type, name=fn_name)
+                    func.linkage = "internal"
+                    func.attributes.add('inlinehint')
                     for param, pname in zip(func.args, all_params):
                         param.name = pname
 
@@ -1818,6 +2163,92 @@ class CodeGen:
                         elif isinstance(node.value.value, float):
                             var_types[tgt.id] = "float"
 
+        # Propagate function return types: data = make_list() → data is "list"
+        # This catches the pattern where a function returns a list/dict/str
+        # and the result is passed to another function.
+        _func_ret_types: dict[str, str] = {}
+        self._func_ret_types = _func_ret_types  # expose for _infer_type_tag
+        for fname, fnode in func_asts.items():
+            # Collect function-local variable types
+            local_types: dict[str, str] = {}
+            for n in ast.walk(fnode):
+                if isinstance(n, ast.Assign) and len(n.targets) == 1:
+                    if isinstance(n.targets[0], ast.Name):
+                        tgt = n.targets[0].id
+                        if isinstance(n.value, (ast.List, ast.ListComp)):
+                            local_types[tgt] = "list"
+                        elif isinstance(n.value, (ast.Dict, ast.DictComp)):
+                            local_types[tgt] = "dict"
+                        elif isinstance(n.value, ast.Constant) and isinstance(n.value.value, str):
+                            local_types[tgt] = "str"
+            # Detect list element types from append patterns
+            for n in ast.walk(fnode):
+                if (isinstance(n, ast.Expr) and isinstance(n.value, ast.Call)
+                        and isinstance(n.value.func, ast.Attribute)
+                        and n.value.func.attr == "append"
+                        and isinstance(n.value.func.value, ast.Name)
+                        and n.value.func.value.id in local_types
+                        and local_types[n.value.func.value.id].startswith("list")
+                        and len(n.value.args) == 1):
+                    arg = n.value.args[0]
+                    var = n.value.func.value.id
+                    if isinstance(arg, (ast.List, ast.ListComp)):
+                        # Detect inner list element types.
+                        # Accept Constant(float), Constant(int), UnaryOp(-, Constant),
+                        # BinOp with float operands — all produce numeric values.
+                        def _is_numeric_elt(e):
+                            if isinstance(e, ast.Constant) and isinstance(e.value, (int, float)):
+                                return True
+                            if (isinstance(e, ast.UnaryOp)
+                                    and isinstance(e.operand, ast.Constant)
+                                    and isinstance(e.operand.value, (int, float))):
+                                return True
+                            if isinstance(e, ast.BinOp):
+                                return True  # computed expression
+                            return False
+                        def _has_float_elt(e):
+                            if isinstance(e, ast.Constant) and isinstance(e.value, float):
+                                return True
+                            if (isinstance(e, ast.UnaryOp)
+                                    and isinstance(e.operand, ast.Constant)
+                                    and isinstance(e.operand.value, float)):
+                                return True
+                            if isinstance(e, ast.BinOp):
+                                return True  # computed → likely float
+                            return False
+                        if (isinstance(arg, ast.List) and arg.elts
+                                and all(_is_numeric_elt(e) for e in arg.elts)
+                                and any(_has_float_elt(e) for e in arg.elts)):
+                            local_types[var] = "list:list:float"
+                        else:
+                            local_types[var] = "list:list"
+                    elif isinstance(arg, (ast.Dict, ast.DictComp)):
+                        local_types[var] = "list:dict"
+                    elif isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+                        local_types[var] = "list:str"
+                    elif isinstance(arg, ast.Constant) and isinstance(arg.value, float):
+                        local_types[var] = "list:float"
+            for n in ast.walk(fnode):
+                if isinstance(n, ast.Return) and n.value is not None:
+                    if isinstance(n.value, (ast.List, ast.ListComp)):
+                        _func_ret_types[fname] = "list"
+                    elif isinstance(n.value, (ast.Dict, ast.DictComp)):
+                        _func_ret_types[fname] = "dict"
+                    elif isinstance(n.value, ast.Name):
+                        if n.value.id in local_types:
+                            _func_ret_types[fname] = local_types[n.value.id]
+                        elif n.value.id in var_types:
+                            _func_ret_types[fname] = var_types[n.value.id]
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Assign) and len(node.targets) == 1
+                    and isinstance(node.targets[0], ast.Name)
+                    and isinstance(node.value, ast.Call)
+                    and isinstance(node.value.func, ast.Name)
+                    and node.value.func.id in _func_ret_types):
+                rt = _func_ret_types[node.value.func.id]
+                if rt.startswith("list") or rt == "dict" or rt == "str":
+                    var_types[node.targets[0].id] = rt
+
         # Track variable → class name from assignments like `x = MyClass(...)`
         obj_classes: dict[str, str] = {}
         for node in ast.walk(tree):
@@ -1933,6 +2364,32 @@ class CodeGen:
                 if arg_cls:
                     self._csa_func_param_classes.setdefault(
                         fn_name, {})[arg_idx] = arg_cls
+
+        # Build (class, attr) -> class_name map from `self.attr = ClassName(...)`
+        # in class methods.  Also detects `self.attr = self.other_obj_attr`
+        # chains.  Used below so `self.attr` as an arg to a constructor
+        # propagates the correct "obj" type for the parameter, enabling the
+        # runtime null-check that preserves NONE tags (linked list etc.).
+        self_attr_classes: dict[tuple[str, str], str] = {}
+        for cls_node in ast.walk(tree):
+            if not isinstance(cls_node, ast.ClassDef):
+                continue
+            for method in cls_node.body:
+                if not isinstance(method, ast.FunctionDef):
+                    continue
+                for n in ast.walk(method):
+                    if not (isinstance(n, ast.Assign)
+                            and len(n.targets) == 1
+                            and isinstance(n.targets[0], ast.Attribute)
+                            and isinstance(n.targets[0].value, ast.Name)
+                            and n.targets[0].value.id == "self"):
+                        continue
+                    attr = n.targets[0].attr
+                    # self.attr = ClassName(...)
+                    if (isinstance(n.value, ast.Call)
+                            and isinstance(n.value.func, ast.Name)
+                            and n.value.func.id in class_parents):
+                        self_attr_classes[(cls_node.name, attr)] = n.value.func.id
 
         # Track loop variable types from for-in iterables
         for node in ast.walk(tree):
@@ -2083,6 +2540,29 @@ class CodeGen:
                     attr_type = self._infer_attr_type_from_init(
                         cls, arg.attr, class_parents)
                     arg_types.append(attr_type)
+                elif (isinstance(arg, ast.Attribute)
+                      and isinstance(arg.value, ast.Name)
+                      and arg.value.id == "self"):
+                    # self.attr inside a method — check if we detected
+                    # this attr as holding a class instance in any class.
+                    found_cls = None
+                    for (cn, an), acls in self_attr_classes.items():
+                        if an == arg.attr:
+                            found_cls = acls
+                            break
+                    if found_cls is not None:
+                        arg_types.append("obj")
+                    else:
+                        attr_type = None
+                        # Also try _infer_attr_type_from_init for each
+                        # class that has this attr.
+                        for cn in class_parents:
+                            at = self._infer_attr_type_from_init(
+                                cn, arg.attr, class_parents)
+                            if at is not None:
+                                attr_type = at
+                                break
+                        arg_types.append(attr_type)
                 elif (isinstance(arg, ast.Call)
                       and isinstance(arg.func, ast.Name)
                       and arg.func.id in class_parents):
@@ -2466,6 +2946,8 @@ class CodeGen:
         func_type = ir.FunctionType(ret_type, param_types)
         fn_name = f"fastpy.lambda.{var_name}"
         func = ir.Function(self.module, func_type, name=fn_name)
+        func.linkage = "internal"
+        func.attributes.add('alwaysinline')  # lambdas are always small
 
         for param, pname in zip(func.args, param_names):
             param.name = pname
@@ -3188,11 +3670,18 @@ class CodeGen:
         fn_name = f"fastpy.user.{effective_name}"
         func = ir.Function(self.module, func_type, name=fn_name)
 
-        # Inline hint: tell LLVM to prefer inlining user functions.
-        # LLVM's -O2 inliner already handles most cases, but the hint
-        # helps with FpyValue wrap/unwrap elimination via SROA when
-        # functions are small enough to inline.
-        func.attributes.add('inlinehint')
+        # Internal linkage: since all code compiles into one module, user
+        # functions are never called from outside. Internal linkage lets
+        # LLVM's optimizer inline aggressively and eliminate dead code.
+        func.linkage = "internal"
+
+        # Size-based inline strategy: small functions get alwaysinline,
+        # medium get inlinehint, large get nothing (LLVM decides).
+        body_size = sum(1 for _ in ast.walk(node))
+        if body_size <= 25:
+            func.attributes.add('alwaysinline')
+        elif body_size <= 80:
+            func.attributes.add('inlinehint')
 
         for param, name in zip(func.args, param_names):
             param.name = name
@@ -3777,24 +4266,1372 @@ class CodeGen:
 
     def _class_var_is_mutated(self, class_node: ast.ClassDef,
                                 attr_name: str) -> bool:
-        """Check if `ClassName.attr` is ever assigned in the program,
+        """Check if `ClassName.attr` or `cls.attr` is ever assigned in the program,
         other than its initial class-level definition.
         """
         cls_name = class_node.name
         tree = getattr(self, "_csa_root_tree", None)
         if tree is None:
             return False
+        # Collect cls parameter names from classmethods (including __new__)
+        cls_params = set()
+        for item in class_node.body:
+            if isinstance(item, ast.FunctionDef):
+                dec_names = [d.id for d in item.decorator_list if isinstance(d, ast.Name)]
+                if "classmethod" in dec_names or item.name == "__new__":
+                    if item.args.args:
+                        cls_params.add(item.args.args[0].arg)
         for n in ast.walk(tree):
             if not (isinstance(n, ast.Assign) and len(n.targets) == 1):
                 continue
             tgt = n.targets[0]
             if (isinstance(tgt, ast.Attribute)
                     and isinstance(tgt.value, ast.Name)
-                    and tgt.value.id == cls_name
                     and tgt.attr == attr_name):
-                return True
-            # AugAssign-like pattern after walking; we accept plain Assign only
+                # ClassName.attr = ... or cls.attr = ...
+                if tgt.value.id == cls_name or tgt.value.id in cls_params:
+                    return True
         return False
+
+    # ── @dataclass expansion ──────────────────────────────────────────
+
+    def _expand_dataclasses(self, tree: ast.Module) -> None:
+        """Expand @dataclass classes into vanilla classes with synthesized
+        __init__, __repr__, __eq__, and optionally __hash__ methods.
+        Runs before slot allocation so the generated self.attr assignments
+        are discovered for slot assignment."""
+        for node in tree.body:
+            if not isinstance(node, ast.ClassDef):
+                continue
+            # Detect @dataclass (bare Name or Call with kwargs)
+            dc_deco = None
+            dc_opts = {"init": True, "repr": True, "eq": True, "frozen": False}
+            for deco in node.decorator_list:
+                if isinstance(deco, ast.Name) and deco.id == "dataclass":
+                    dc_deco = deco
+                    break
+                if (isinstance(deco, ast.Call)
+                        and isinstance(deco.func, ast.Name)
+                        and deco.func.id == "dataclass"):
+                    dc_deco = deco
+                    for kw in deco.keywords:
+                        if kw.arg in dc_opts and isinstance(kw.value, ast.Constant):
+                            dc_opts[kw.arg] = kw.value.value
+                    break
+            if dc_deco is None:
+                continue
+
+            # Remove @dataclass decorator so downstream passes don't see it
+            node.decorator_list.remove(dc_deco)
+
+            # Extract fields from AnnAssign nodes
+            fields: list[tuple[str, ast.expr | None]] = []  # (name, default_or_None)
+            new_body: list[ast.stmt] = []
+            existing_methods = {item.name for item in node.body
+                                if isinstance(item, ast.FunctionDef)}
+
+            for item in node.body:
+                if isinstance(item, ast.AnnAssign) and isinstance(item.target, ast.Name):
+                    fname = item.target.id
+                    default = item.value  # None if no default
+                    fields.append((fname, default))
+                    # Don't keep AnnAssign in body
+                else:
+                    new_body.append(item)
+
+            # Synthesize methods
+            synth: list[ast.FunctionDef] = []
+            if dc_opts["init"] and "__init__" not in existing_methods:
+                synth.append(self._synth_dc_init(node.name, fields, node))
+            if dc_opts["repr"] and "__repr__" not in existing_methods:
+                synth.append(self._synth_dc_repr(node.name, fields, node))
+            if dc_opts["eq"] and "__eq__" not in existing_methods:
+                synth.append(self._synth_dc_eq(node.name, fields, node))
+            if dc_opts["frozen"] and "__hash__" not in existing_methods:
+                synth.append(self._synth_dc_hash(node.name, fields, node))
+
+            node.body = synth + new_body
+            if not node.body:
+                node.body = [ast.Pass()]
+
+    def _synth_dc_init(self, cls_name: str,
+                        fields: list[tuple[str, ast.expr | None]],
+                        loc: ast.AST) -> ast.FunctionDef:
+        """Synthesize __init__ for a dataclass."""
+        args = [ast.arg(arg="self")]
+        defaults = []
+        body: list[ast.stmt] = []
+        for fname, default in fields:
+            args.append(ast.arg(arg=fname))
+            if default is not None:
+                defaults.append(default)
+            body.append(ast.Assign(
+                targets=[ast.Attribute(
+                    value=ast.Name(id="self", ctx=ast.Load()),
+                    attr=fname, ctx=ast.Store())],
+                value=ast.Name(id=fname, ctx=ast.Load())))
+        if not body:
+            body = [ast.Pass()]
+        func = ast.FunctionDef(
+            name="__init__",
+            args=ast.arguments(posonlyargs=[], args=args, vararg=None,
+                               kwonlyargs=[], kw_defaults=[], kwargs=None,
+                               defaults=defaults),
+            body=body, decorator_list=[], returns=None)
+        ast.copy_location(func, loc)
+        ast.fix_missing_locations(func)
+        return func
+
+    def _synth_dc_repr(self, cls_name: str,
+                        fields: list[tuple[str, ast.expr | None]],
+                        loc: ast.AST) -> ast.FunctionDef:
+        """Synthesize __repr__ for a dataclass."""
+        parts: list[ast.expr] = [ast.Constant(value=f"{cls_name}(")]
+        for i, (fname, _) in enumerate(fields):
+            if i > 0:
+                parts.append(ast.Constant(value=", "))
+            parts.append(ast.Constant(value=f"{fname}="))
+            parts.append(ast.FormattedValue(
+                value=ast.Attribute(
+                    value=ast.Name(id="self", ctx=ast.Load()),
+                    attr=fname, ctx=ast.Load()),
+                conversion=-1, format_spec=None))
+        parts.append(ast.Constant(value=")"))
+        func = ast.FunctionDef(
+            name="__repr__",
+            args=ast.arguments(posonlyargs=[], args=[ast.arg(arg="self")],
+                               vararg=None, kwonlyargs=[], kw_defaults=[],
+                               kwargs=None, defaults=[]),
+            body=[ast.Return(value=ast.JoinedStr(values=parts))],
+            decorator_list=[], returns=None)
+        ast.copy_location(func, loc)
+        ast.fix_missing_locations(func)
+        return func
+
+    def _synth_dc_eq(self, cls_name: str,
+                      fields: list[tuple[str, ast.expr | None]],
+                      loc: ast.AST) -> ast.FunctionDef:
+        """Synthesize __eq__ for a dataclass."""
+        if not fields:
+            ret_val = ast.Constant(value=True)
+        elif len(fields) == 1:
+            fname = fields[0][0]
+            ret_val = ast.Compare(
+                left=ast.Attribute(
+                    value=ast.Name(id="self", ctx=ast.Load()),
+                    attr=fname, ctx=ast.Load()),
+                ops=[ast.Eq()],
+                comparators=[ast.Attribute(
+                    value=ast.Name(id="other", ctx=ast.Load()),
+                    attr=fname, ctx=ast.Load())])
+        else:
+            cmps = []
+            for fname, _ in fields:
+                cmps.append(ast.Compare(
+                    left=ast.Attribute(
+                        value=ast.Name(id="self", ctx=ast.Load()),
+                        attr=fname, ctx=ast.Load()),
+                    ops=[ast.Eq()],
+                    comparators=[ast.Attribute(
+                        value=ast.Name(id="other", ctx=ast.Load()),
+                        attr=fname, ctx=ast.Load())]))
+            ret_val = ast.BoolOp(op=ast.And(), values=cmps)
+        func = ast.FunctionDef(
+            name="__eq__",
+            args=ast.arguments(
+                posonlyargs=[],
+                args=[ast.arg(arg="self"), ast.arg(arg="other")],
+                vararg=None, kwonlyargs=[], kw_defaults=[],
+                kwargs=None, defaults=[]),
+            body=[ast.Return(value=ret_val)],
+            decorator_list=[], returns=None)
+        ast.copy_location(func, loc)
+        ast.fix_missing_locations(func)
+        return func
+
+    def _synth_dc_hash(self, cls_name: str,
+                        fields: list[tuple[str, ast.expr | None]],
+                        loc: ast.AST) -> ast.FunctionDef:
+        """Synthesize __hash__ for a frozen dataclass."""
+        if not fields:
+            ret_val: ast.expr = ast.Constant(value=0)
+        else:
+            ret_val = ast.Call(
+                func=ast.Name(id="hash", ctx=ast.Load()),
+                args=[ast.Attribute(
+                    value=ast.Name(id="self", ctx=ast.Load()),
+                    attr=fields[0][0], ctx=ast.Load())],
+                keywords=[])
+            for fname, _ in fields[1:]:
+                ret_val = ast.BinOp(
+                    left=ret_val, op=ast.BitXor(),
+                    right=ast.Call(
+                        func=ast.Name(id="hash", ctx=ast.Load()),
+                        args=[ast.Attribute(
+                            value=ast.Name(id="self", ctx=ast.Load()),
+                            attr=fname, ctx=ast.Load())],
+                        keywords=[]))
+        func = ast.FunctionDef(
+            name="__hash__",
+            args=ast.arguments(posonlyargs=[], args=[ast.arg(arg="self")],
+                               vararg=None, kwonlyargs=[], kw_defaults=[],
+                               kwargs=None, defaults=[]),
+            body=[ast.Return(value=ret_val)],
+            decorator_list=[], returns=None)
+        ast.copy_location(func, loc)
+        ast.fix_missing_locations(func)
+        return func
+
+    # ── Native generator expansion ───────────────────────────────────
+
+    def _generator_can_expand(self, node: ast.FunctionDef) -> bool:
+        """Return True if this generator function can be expanded into a
+        native state-machine class (as opposed to needing the CPython bridge).
+
+        We handle:
+          - yield <expr>  (statement form)
+          - var = yield <expr>  (send pattern)
+          - yield inside while True loops
+          - yield inside for loops
+          - yield from (delegated generators — preprocessed into while+send)
+          - yield inside try/finally and with blocks
+
+        We bail to CPython bridge for:
+          - nested generator functions (yield in inner def)
+        """
+        # Must actually be a generator
+        has_yield = False
+        for child in ast.walk(node):
+            if isinstance(child, (ast.Yield, ast.YieldFrom)):
+                has_yield = True
+                break
+        if not has_yield:
+            return False
+
+        # Bail: nested function containing yield (inner generator)
+        for child in ast.walk(node):
+            if isinstance(child, ast.FunctionDef) and child is not node:
+                for inner in ast.walk(child):
+                    if isinstance(inner, (ast.Yield, ast.YieldFrom)):
+                        return False
+
+        return True
+
+    def _yield_inside_try_or_with(self, node: ast.FunctionDef) -> bool:
+        """Check if any yield sits inside a try/except/finally or with block.
+        Walk manually to track nesting (ast.walk doesn't provide parent info)."""
+        def _check_stmts(stmts: list[ast.stmt], in_try: bool) -> bool:
+            for stmt in stmts:
+                if isinstance(stmt, (ast.Try, ast.TryStar)):
+                    # Everything inside is "in_try"
+                    for body_list in [stmt.body, stmt.orelse, stmt.finalbody]:
+                        if _check_stmts(body_list, True):
+                            return True
+                    for handler in stmt.handlers:
+                        if _check_stmts(handler.body, True):
+                            return True
+                    continue
+                if isinstance(stmt, (ast.With, ast.AsyncWith)):
+                    if _check_stmts(stmt.body, True):
+                        return True
+                    continue
+                if isinstance(stmt, ast.FunctionDef):
+                    # Don't recurse into nested functions
+                    continue
+                if in_try:
+                    # Check if this statement or its subtree has a yield
+                    for child in ast.walk(stmt):
+                        if isinstance(child, (ast.Yield, ast.YieldFrom)):
+                            return True
+                # Recurse into if/while/for bodies
+                if isinstance(stmt, ast.If):
+                    if _check_stmts(stmt.body, in_try):
+                        return True
+                    if _check_stmts(stmt.orelse, in_try):
+                        return True
+                elif isinstance(stmt, ast.While):
+                    if _check_stmts(stmt.body, in_try):
+                        return True
+                    if _check_stmts(stmt.orelse, in_try):
+                        return True
+                elif isinstance(stmt, ast.For):
+                    if _check_stmts(stmt.body, in_try):
+                        return True
+                    if _check_stmts(stmt.orelse, in_try):
+                        return True
+            return False
+        return _check_stmts(node.body, False)
+
+    def _expand_generators(self, tree: ast.Module) -> None:
+        """Expand generator functions that use yield-as-expression (send pattern)
+        into state-machine classes, so they compile natively without CPython bridge.
+
+        For each expandable generator function, produces:
+          1. A class _Gen_<name> with __init__, __iter__, __next__, send, close, throw
+          2. A wrapper function <name>(...) that returns _Gen_<name>(...)
+
+        The class uses a _state attribute to track which yield point to
+        resume from, and instance attributes _<var> for all local variables.
+
+        Must run after _expand_dataclasses and before _assign_attribute_slots
+        so the generated classes go through the normal class pipeline.
+        """
+        to_expand: list[tuple[int, ast.FunctionDef]] = []
+        for i, node in enumerate(tree.body):
+            if not isinstance(node, ast.FunctionDef):
+                continue
+            # Only target generators that _generator_needs_cpython would flag
+            # (i.e., those with yield-as-expression / send pattern).
+            # Simple yield-only generators already compile natively via the
+            # list-collection approach.
+            has_yield = any(isinstance(n, (ast.Yield, ast.YieldFrom))
+                           for n in ast.walk(node))
+            if not has_yield:
+                continue
+            if not self._generator_needs_cpython(node):
+                continue
+            if self._generator_can_expand(node):
+                to_expand.append((i, node))
+
+        if not to_expand:
+            return
+
+        # Process in reverse order so index-based removal doesn't shift
+        new_nodes: list[ast.stmt] = []
+        removed_indices: set[int] = set()
+        for idx, func_node in reversed(to_expand):
+            cls_node, _wrapper = self._gen_expand_one(func_node)
+            new_nodes.append(cls_node)
+            removed_indices.add(idx)
+            # Remove from _cpython_generators if it was already added
+            cpygen = getattr(self, '_cpython_generators', set())
+            cpygen.discard(func_node.name)
+
+        # Build new tree.body: insert generated classes+wrappers at the
+        # position of the first removed generator, then skip removed nodes
+        first_idx = min(removed_indices)
+        result: list[ast.stmt] = []
+        for i, node in enumerate(tree.body):
+            if i == first_idx:
+                # Insert all generated nodes here (before slot allocation sees them)
+                result.extend(reversed(new_nodes))
+            if i not in removed_indices:
+                result.append(node)
+        tree.body = result
+
+    def _gen_expand_one(self, node: ast.FunctionDef) -> tuple[ast.ClassDef, ast.FunctionDef]:
+        """Transform a single generator function into (class_node, wrapper_node).
+
+        The generator body is split at yield points into state blocks.
+        Each state corresponds to the code between two consecutive yields.
+        """
+        func_name = node.name
+        # Use the original function name as the class name so that
+        # g = func_name(...) is a constructor call and g.send() works
+        # through normal method dispatch.
+        cls_name = func_name
+
+        # Collect parameter info
+        params = node.args.args  # list of ast.arg
+        defaults = node.args.defaults
+        param_names = [p.arg for p in params]
+
+        # Pre-process: convert for-loops with yields into while-loops.
+        # Also collects finally blocks for destructor cleanup.
+        self._gen_finally_blocks: list[list[ast.stmt]] = []
+        preprocessed_body = self._gen_preprocess_body(node.body)
+        finally_blocks = self._gen_finally_blocks
+
+        # Collect all local variables assigned in the function body
+        # (use the preprocessed body which may have introduced new vars)
+        local_vars = self._gen_collect_locals_from_body(preprocessed_body)
+        # Add parameter names too (they become instance attrs)
+        all_vars = set(param_names) | local_vars
+        self._gen_current_locals = all_vars  # used by _gen_rewrite_vars
+
+        # Split the body into state segments at yield points
+        segments = self._gen_split_body(preprocessed_body)
+
+        # Build __init__
+        init_method = self._gen_build_init(
+            cls_name, params, defaults, all_vars, node)
+
+        # Build send() method — the core state machine
+        send_method = self._gen_build_send(cls_name, segments, node)
+
+        # Build __next__() -> calls self.send(None)
+        next_method = self._gen_build_next(node)
+
+        # Build __iter__() -> return self
+        iter_method = self._gen_build_iter(node)
+
+        # Build close() with finally cleanup
+        close_method = self._gen_build_close(node, finally_blocks)
+
+        # Build throw(exc_type) -> raise exc
+        throw_method = self._gen_build_throw(node)
+
+        # Assemble class
+        cls_node = ast.ClassDef(
+            name=cls_name,
+            bases=[],
+            keywords=[],
+            body=[init_method, iter_method, next_method,
+                  send_method, close_method, throw_method],
+            decorator_list=[])
+        ast.copy_location(cls_node, node)
+        ast.fix_missing_locations(cls_node)
+
+        # Mark as needing a destructor if there are finally blocks
+        if finally_blocks:
+            if not hasattr(self, '_gen_classes_with_destructor'):
+                self._gen_classes_with_destructor = set()
+            self._gen_classes_with_destructor.add(cls_name)
+
+        return cls_node, None
+
+    def _gen_preprocess_body(self, body: list[ast.stmt]) -> list[ast.stmt]:
+        """Pre-process the generator body: convert for-loops containing yield
+        into equivalent while-loops so the state splitter only needs to handle
+        while-loops.
+
+        Transform:
+            for <target> in range(n):
+                <body with yield>
+
+        Into:
+            _idx_<target> = 0
+            while _idx_<target> < n:
+                <target> = _idx_<target>
+                <body with yield>
+                _idx_<target> = _idx_<target> + 1
+
+        Transform:
+            for <target> in <iterable>:
+                <body with yield>
+
+        Into:
+            _items_<target> = <iterable>
+            _idx_<target> = 0
+            _len_<target> = len(_items_<target>)
+            while _idx_<target> < _len_<target>:
+                <target> = _items_<target>[_idx_<target>]
+                <body with yield>
+                _idx_<target> = _idx_<target> + 1
+        """
+        result: list[ast.stmt] = []
+        for stmt in body:
+            if (isinstance(stmt, ast.For)
+                    and isinstance(stmt.target, ast.Name)
+                    and self._gen_body_has_yield(stmt.body)):
+                result.extend(self._gen_for_to_while(stmt))
+            elif isinstance(stmt, ast.While) and self._gen_body_has_yield(stmt.body):
+                # Recurse into while body to preprocess nested for loops
+                new_body = self._gen_preprocess_body(stmt.body)
+                new_while = ast.While(
+                    test=stmt.test,
+                    body=new_body,
+                    orelse=stmt.orelse)
+                ast.copy_location(new_while, stmt)
+                result.append(new_while)
+            elif isinstance(stmt, ast.If):
+                # Recurse into if/else bodies
+                new_body = self._gen_preprocess_body(stmt.body)
+                new_orelse = self._gen_preprocess_body(stmt.orelse)
+                new_if = ast.If(test=stmt.test, body=new_body, orelse=new_orelse)
+                ast.copy_location(new_if, stmt)
+                result.append(new_if)
+            elif isinstance(stmt, ast.With) and self._gen_body_has_yield(stmt.body):
+                # Transform: with expr as var: <body with yield>
+                # Into: _ctx = expr; var = _ctx.__enter__(); try: <body>; finally: _ctx.__exit__(None, None, None)
+                result.extend(self._gen_with_to_try(stmt))
+            elif isinstance(stmt, (ast.Try, ast.TryStar)) and self._gen_body_has_yield(stmt.body):
+                # try/finally with yield: keep the try structure but preprocess inner body
+                new_body = self._gen_preprocess_body(stmt.body)
+                new_finally = stmt.finalbody if hasattr(stmt, 'finalbody') else []
+                new_orelse = self._gen_preprocess_body(stmt.orelse) if stmt.orelse else []
+                # For try/except/finally with yield, we flatten: the except/finally
+                # blocks become cleanup code attached to the yield's state
+                if new_finally and self._gen_body_has_yield(new_body):
+                    # Flatten: execute body stmts (which include yield), then finally
+                    result.extend(new_body)
+                    result.extend(new_finally)
+                    # Record the finally block for destructor cleanup
+                    self._gen_finally_blocks.append(new_finally)
+                else:
+                    result.append(stmt)
+            else:
+                # Check for yield-from in expression statements or assignments
+                expanded = self._gen_maybe_expand_yield_from(stmt)
+                if expanded is not None:
+                    result.extend(self._gen_preprocess_body(expanded))
+                else:
+                    result.append(stmt)
+        return result
+
+    def _gen_with_to_try(self, node: ast.With) -> list[ast.stmt]:
+        """Transform 'with expr as var: body' into try/finally for the state machine."""
+        loc = node
+        stmts: list[ast.stmt] = []
+        # For each context item (handles nested with)
+        ctx_name = "_ctx_mgr"
+        item = node.items[0]  # Handle first item
+
+        # _ctx = expr
+        stmts.append(ast.Assign(
+            targets=[ast.Name(id=ctx_name, ctx=ast.Store())],
+            value=item.context_expr))
+        # var = _ctx.__enter__()
+        if item.optional_vars:
+            enter_call = ast.Call(
+                func=ast.Attribute(
+                    value=ast.Name(id=ctx_name, ctx=ast.Load()),
+                    attr="__enter__", ctx=ast.Load()),
+                args=[], keywords=[])
+            stmts.append(ast.Assign(
+                targets=[item.optional_vars],
+                value=enter_call))
+        # body (preprocessed)
+        stmts.extend(self._gen_preprocess_body(node.body))
+        # __exit__
+        exit_call = ast.Expr(value=ast.Call(
+            func=ast.Attribute(
+                value=ast.Name(id=ctx_name, ctx=ast.Load()),
+                attr="__exit__", ctx=ast.Load()),
+            args=[ast.Constant(value=None), ast.Constant(value=None),
+                  ast.Constant(value=None)],
+            keywords=[]))
+        stmts.append(exit_call)
+        for s in stmts:
+            ast.copy_location(s, loc)
+        ast.fix_missing_locations(ast.Module(body=stmts, type_ignores=[]))
+        return stmts
+
+    def _gen_maybe_expand_yield_from(self, stmt: ast.stmt) -> list[ast.stmt] | None:
+        """If stmt contains 'yield from', expand into a while+send loop.
+        Returns None if no yield-from found.
+
+        Transform:
+            result = yield from sub_gen
+        Into:
+            _sub = iter(sub_gen)
+            try:
+                _sub_val = next(_sub)
+            except StopIteration:
+                _sub_val = None
+            while True:
+                _yf_sent = yield _sub_val
+                try:
+                    _sub_val = _sub.send(_yf_sent)
+                except StopIteration:
+                    break
+        """
+        # Check: Expr(YieldFrom) or Assign(targets, YieldFrom)
+        yield_from_node = None
+        assign_target = None
+        if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.YieldFrom):
+            yield_from_node = stmt.value
+        elif (isinstance(stmt, ast.Assign) and len(stmt.targets) == 1
+              and isinstance(stmt.value, ast.YieldFrom)):
+            yield_from_node = stmt.value
+            assign_target = stmt.targets[0]
+
+        if yield_from_node is None:
+            return None
+
+        loc = stmt
+        stmts: list[ast.stmt] = []
+
+        # _sub = iter(sub_gen)
+        stmts.append(ast.Assign(
+            targets=[ast.Name(id="_yf_sub", ctx=ast.Store())],
+            value=yield_from_node.value))
+
+        # _sub_val = next(_sub)
+        stmts.append(ast.Assign(
+            targets=[ast.Name(id="_yf_val", ctx=ast.Store())],
+            value=ast.Call(
+                func=ast.Name(id="next", ctx=ast.Load()),
+                args=[ast.Name(id="_yf_sub", ctx=ast.Load())],
+                keywords=[])))
+
+        # while True: _yf_sent = yield _sub_val; _sub_val = _sub.send(_yf_sent)
+        # (simplified — doesn't handle StopIteration from sub, relies on
+        # the sub-generator yielding until done then the send() raises)
+        yield_expr = ast.Yield(value=ast.Name(id="_yf_val", ctx=ast.Load()))
+        sent_assign = ast.Assign(
+            targets=[ast.Name(id="_yf_sent", ctx=ast.Store())],
+            value=yield_expr)
+
+        # Use a flag-based while loop (not break) so the state machine
+        # correctly continues to the next statement after yield-from ends.
+        # _yf_done = False
+        stmts.append(ast.Assign(
+            targets=[ast.Name(id="_yf_done", ctx=ast.Store())],
+            value=ast.Constant(value=False)))
+
+        send_call = ast.Call(
+            func=ast.Attribute(
+                value=ast.Name(id="_yf_sub", ctx=ast.Load()),
+                attr="send", ctx=ast.Load()),
+            args=[ast.Name(id="_yf_sent", ctx=ast.Load())],
+            keywords=[])
+
+        # try: _yf_val = _sub.send(_yf_sent)
+        # except StopIteration: _yf_done = True
+        try_send = ast.Try(
+            body=[ast.Assign(
+                targets=[ast.Name(id="_yf_val", ctx=ast.Store())],
+                value=send_call)],
+            handlers=[ast.ExceptHandler(
+                type=ast.Name(id="StopIteration", ctx=ast.Load()),
+                name=None,
+                body=[ast.Assign(
+                    targets=[ast.Name(id="_yf_done", ctx=ast.Store())],
+                    value=ast.Constant(value=True))])],
+            orelse=[],
+            finalbody=[])
+
+        loop_body = [sent_assign, try_send]
+        while_loop = ast.While(
+            test=ast.UnaryOp(
+                op=ast.Not(),
+                operand=ast.Name(id="_yf_done", ctx=ast.Load())),
+            body=loop_body,
+            orelse=[])
+
+        stmts.append(while_loop)
+
+        for s in stmts:
+            ast.copy_location(s, loc)
+        ast.fix_missing_locations(ast.Module(body=stmts, type_ignores=[]))
+        return stmts
+
+    def _gen_for_to_while(self, node: ast.For) -> list[ast.stmt]:
+        """Convert a for-loop with yield into equivalent while-loop statements."""
+        target_name = node.target.id
+        idx_name = f"_idx_{target_name}"
+        loc = node  # for copy_location
+
+        # Check if iterating over range(...)
+        if (isinstance(node.iter, ast.Call)
+                and isinstance(node.iter.func, ast.Name)
+                and node.iter.func.id == "range"):
+            return self._gen_for_range_to_while(node, target_name, idx_name, loc)
+
+        # General iterable: store as list, iterate by index
+        items_name = f"_items_{target_name}"
+        len_name = f"_len_{target_name}"
+        stmts: list[ast.stmt] = []
+
+        # _items_<target> = <iterable>
+        stmts.append(ast.Assign(
+            targets=[ast.Name(id=items_name, ctx=ast.Store())],
+            value=node.iter))
+        # _len_<target> = len(_items_<target>)
+        stmts.append(ast.Assign(
+            targets=[ast.Name(id=len_name, ctx=ast.Store())],
+            value=ast.Call(
+                func=ast.Name(id="len", ctx=ast.Load()),
+                args=[ast.Name(id=items_name, ctx=ast.Load())],
+                keywords=[])))
+        # _idx_<target> = 0
+        stmts.append(ast.Assign(
+            targets=[ast.Name(id=idx_name, ctx=ast.Store())],
+            value=ast.Constant(value=0)))
+
+        # while _idx < _len:
+        #     <target> = _items[_idx]
+        #     <body>
+        #     _idx = _idx + 1
+        get_elem = ast.Assign(
+            targets=[ast.Name(id=target_name, ctx=ast.Store())],
+            value=ast.Subscript(
+                value=ast.Name(id=items_name, ctx=ast.Load()),
+                slice=ast.Name(id=idx_name, ctx=ast.Load()),
+                ctx=ast.Load()))
+
+        inc_idx = ast.Assign(
+            targets=[ast.Name(id=idx_name, ctx=ast.Store())],
+            value=ast.BinOp(
+                left=ast.Name(id=idx_name, ctx=ast.Load()),
+                op=ast.Add(),
+                right=ast.Constant(value=1)))
+
+        while_body = [get_elem] + self._gen_preprocess_body(node.body) + [inc_idx]
+        while_node = ast.While(
+            test=ast.Compare(
+                left=ast.Name(id=idx_name, ctx=ast.Load()),
+                ops=[ast.Lt()],
+                comparators=[ast.Name(id=len_name, ctx=ast.Load())]),
+            body=while_body,
+            orelse=[])
+        ast.copy_location(while_node, loc)
+        stmts.append(while_node)
+
+        for s in stmts:
+            ast.copy_location(s, loc)
+        ast.fix_missing_locations(stmts[0])  # propagate to all
+        return stmts
+
+    def _gen_for_range_to_while(
+        self,
+        node: ast.For,
+        target_name: str,
+        idx_name: str,
+        loc: ast.AST,
+    ) -> list[ast.stmt]:
+        """Convert `for x in range(...)` with yield to while loop."""
+        range_args = node.iter.args
+        stmts: list[ast.stmt] = []
+
+        if len(range_args) == 1:
+            # range(stop): idx starts at 0, goes to stop
+            start_val = ast.Constant(value=0)
+            stop_expr = range_args[0]
+            step_val = ast.Constant(value=1)
+        elif len(range_args) == 2:
+            start_val = range_args[0]
+            stop_expr = range_args[1]
+            step_val = ast.Constant(value=1)
+        elif len(range_args) == 3:
+            start_val = range_args[0]
+            stop_expr = range_args[1]
+            step_val = range_args[2]
+        else:
+            # Unexpected range() call — treat as general iterable
+            return self._gen_for_to_while.__wrapped__(self, node)  # won't happen
+
+        stop_name = f"_stop_{target_name}"
+
+        # _idx = start
+        stmts.append(ast.Assign(
+            targets=[ast.Name(id=idx_name, ctx=ast.Store())],
+            value=start_val))
+        # _stop = stop  (evaluate once)
+        stmts.append(ast.Assign(
+            targets=[ast.Name(id=stop_name, ctx=ast.Store())],
+            value=stop_expr))
+
+        # while _idx < _stop:
+        #     <target> = _idx
+        #     <body>
+        #     _idx = _idx + step
+        assign_target = ast.Assign(
+            targets=[ast.Name(id=target_name, ctx=ast.Store())],
+            value=ast.Name(id=idx_name, ctx=ast.Load()))
+
+        inc_idx = ast.Assign(
+            targets=[ast.Name(id=idx_name, ctx=ast.Store())],
+            value=ast.BinOp(
+                left=ast.Name(id=idx_name, ctx=ast.Load()),
+                op=ast.Add(),
+                right=step_val))
+
+        while_body = [assign_target] + self._gen_preprocess_body(node.body) + [inc_idx]
+        while_node = ast.While(
+            test=ast.Compare(
+                left=ast.Name(id=idx_name, ctx=ast.Load()),
+                ops=[ast.Lt()],
+                comparators=[ast.Name(id=stop_name, ctx=ast.Load())]),
+            body=while_body,
+            orelse=[])
+        ast.copy_location(while_node, loc)
+        stmts.append(while_node)
+
+        for s in stmts:
+            ast.copy_location(s, loc)
+        ast.fix_missing_locations(stmts[0])
+        return stmts
+
+    def _gen_collect_locals(self, node: ast.FunctionDef) -> set[str]:
+        """Collect all variable names assigned in the generator body.
+        These become instance attributes on the state-machine class.
+        Does not recurse into nested function definitions."""
+        return self._gen_collect_locals_from_body(node.body)
+
+    def _gen_collect_locals_from_body(self, body: list[ast.stmt]) -> set[str]:
+        """Collect all variable names assigned in a statement list.
+        Used on the preprocessed body (after for-to-while conversion)."""
+        names: set[str] = set()
+        def _scan(stmts: list[ast.stmt]) -> None:
+            for stmt in stmts:
+                if isinstance(stmt, ast.FunctionDef):
+                    continue  # skip nested functions
+                if isinstance(stmt, ast.Assign):
+                    for target in stmt.targets:
+                        if isinstance(target, ast.Name):
+                            names.add(target.id)
+                        elif isinstance(target, ast.Tuple):
+                            for elt in target.elts:
+                                if isinstance(elt, ast.Name):
+                                    names.add(elt.id)
+                elif isinstance(stmt, ast.AugAssign):
+                    if isinstance(stmt.target, ast.Name):
+                        names.add(stmt.target.id)
+                elif isinstance(stmt, ast.For):
+                    if isinstance(stmt.target, ast.Name):
+                        names.add(stmt.target.id)
+                    elif isinstance(stmt.target, ast.Tuple):
+                        for elt in stmt.target.elts:
+                            if isinstance(elt, ast.Name):
+                                names.add(elt.id)
+                    _scan(stmt.body)
+                    _scan(stmt.orelse)
+                elif isinstance(stmt, ast.While):
+                    _scan(stmt.body)
+                    _scan(stmt.orelse)
+                elif isinstance(stmt, ast.If):
+                    _scan(stmt.body)
+                    _scan(stmt.orelse)
+        _scan(body)
+        return names
+
+    # -- Segment data structure for state splitting --
+
+    class _GenSegment:
+        """A segment of generator code between two yield points.
+
+        Three kinds of segment:
+          1. **Yield segment**: has yield_expr. Executes pre_stmts, then
+             returns the yield value. On resume, _sent is assigned to
+             assign_var (if any) by the NEXT segment's state body.
+          2. **Pass-through segment**: no yield, not terminal. Executes
+             pre_stmts and falls through to the next state by setting
+             self._state. Used for init code before a loop.
+          3. **Terminal segment**: no yield, is_terminal=True. Executes
+             pre_stmts, marks finished, raises StopIteration.
+
+        For while-cond loops, the loop-entry segment has `loop_cond` set
+        to the condition expression. On each iteration, the condition is
+        checked first; if False, the segment transitions to `break_state`
+        (the state after the loop) instead of executing the loop body.
+        """
+        __slots__ = ('pre_stmts', 'yield_expr', 'assign_var',
+                     'is_loop_body', 'loop_back_state', 'is_terminal',
+                     'loop_cond', 'break_state')
+
+        def __init__(self) -> None:
+            self.pre_stmts: list[ast.stmt] = []
+            self.yield_expr: ast.Yield | None = None
+            self.assign_var: str | None = None
+            self.is_loop_body = False
+            self.loop_back_state: int | None = None
+            self.is_terminal = False
+            self.loop_cond: ast.expr | None = None  # while-cond condition
+            self.break_state: int | None = None  # state to go to when cond is False
+
+    def _gen_split_body(self, body: list[ast.stmt]) -> list['CodeGen._GenSegment']:
+        """Split a (preprocessed) generator function body into segments at
+        yield points.
+
+        The algorithm walks the statement list and accumulates statements
+        into the current segment. When a yield is encountered (either as
+        a standalone expression or as the RHS of an assignment), the current
+        segment is finalized and a new one starts.
+
+        For-loops have already been converted to while-loops by
+        _gen_preprocess_body, so only while-loop handling is needed here.
+        """
+        segments: list[CodeGen._GenSegment] = []
+        current = CodeGen._GenSegment()
+
+        current = self._gen_split_stmts(body, segments, current, loop_back=None)
+
+        # If the current segment has no yield (trailing code after the last
+        # yield, or the entire body if no yields), it becomes the terminal
+        # segment that raises StopIteration.
+        if current.yield_expr is None and (current.pre_stmts or not segments):
+            current.is_terminal = True
+            segments.append(current)
+
+        # Ensure we always have a terminal segment. If the last segment is
+        # a yield (e.g., generator ends with `yield x` and no trailing code),
+        # add an empty terminal segment so the next send() raises StopIteration.
+        if segments and segments[-1].yield_expr is not None:
+            terminal = CodeGen._GenSegment()
+            terminal.is_terminal = True
+            segments.append(terminal)
+
+        return segments
+
+    def _gen_split_stmts(
+        self,
+        stmts: list[ast.stmt],
+        segments: list['CodeGen._GenSegment'],
+        current: 'CodeGen._GenSegment',
+        loop_back: int | None,
+    ) -> 'CodeGen._GenSegment':
+        """Recursively split statements, accumulating into `current` segment.
+        Returns the current (possibly new) segment after processing.
+
+        `loop_back` is the segment index to jump back to when a yield inside
+        a loop body completes (i.e., the loop re-entry point).
+        """
+
+        for stmt in stmts:
+            # --- yield as standalone expression: `yield expr` ---
+            if (isinstance(stmt, ast.Expr)
+                    and isinstance(stmt.value, ast.Yield)):
+                current.yield_expr = stmt.value
+                if loop_back is not None:
+                    current.is_loop_body = True
+                    current.loop_back_state = loop_back
+                segments.append(current)
+                current = CodeGen._GenSegment()
+                continue
+
+            # --- yield as RHS of assignment: `var = yield expr` ---
+            if (isinstance(stmt, ast.Assign)
+                    and len(stmt.targets) == 1
+                    and isinstance(stmt.targets[0], ast.Name)
+                    and isinstance(stmt.value, ast.Yield)):
+                current.yield_expr = stmt.value
+                current.assign_var = stmt.targets[0].id
+                if loop_back is not None:
+                    current.is_loop_body = True
+                    current.loop_back_state = loop_back
+                segments.append(current)
+                current = CodeGen._GenSegment()
+                continue
+
+            # --- while True: ... with yield inside ---
+            if (isinstance(stmt, ast.While)
+                    and self._gen_is_while_true(stmt)
+                    and self._gen_body_has_yield(stmt.body)):
+                # If current has accumulated pre-stmts, finalize it as a
+                # pass-through segment (no yield, just falls through to loop).
+                loop_start = len(segments)
+                if current.pre_stmts:
+                    segments.append(current)
+                    current = CodeGen._GenSegment()
+                    loop_start = len(segments)
+
+                current = self._gen_split_stmts(
+                    stmt.body, segments, current, loop_back=loop_start)
+
+                # After processing the loop body, `current` holds the
+                # post-yield statements (code after the last yield in the
+                # loop body, possibly empty). Always create a loop-continue
+                # segment so the state machine loops back. Without this,
+                # a simple `while True: yield n` would terminate after one
+                # yield because the yield segment always advances to the
+                # next sequential state.
+                current.is_loop_body = True
+                current.loop_back_state = loop_start
+                segments.append(current)
+                current = CodeGen._GenSegment()
+                continue
+
+            # --- while <cond>: ... with yield inside ---
+            if (isinstance(stmt, ast.While)
+                    and not self._gen_is_while_true(stmt)
+                    and self._gen_body_has_yield(stmt.body)):
+                # Record the condition on a "cond-check" segment. The
+                # condition is checked at the start of each iteration;
+                # if False, transitions to break_state (filled in below).
+                loop_start = len(segments)
+                if current.pre_stmts:
+                    segments.append(current)
+                    current = CodeGen._GenSegment()
+                    loop_start = len(segments)
+
+                # Store the condition on the current segment (which will
+                # become the first segment of the loop). The break_state
+                # is determined after all loop segments are created.
+                current.loop_cond = stmt.test
+
+                current = self._gen_split_stmts(
+                    stmt.body, segments, current, loop_back=loop_start)
+
+                # Finalize loop-continue segment
+                current.is_loop_body = True
+                current.loop_back_state = loop_start
+                segments.append(current)
+                current = CodeGen._GenSegment()
+
+                # Now we know the post-loop state: it's whatever comes next
+                # (the current segment index). Patch break_state on the
+                # loop-entry segment.
+                post_loop_state = len(segments)
+                segments[loop_start].break_state = post_loop_state
+                continue
+
+            # --- Regular statement (no yield) ---
+            # This includes if/else statements. Yields inside if/else
+            # branches stay as-is in pre_stmts; the _GenVarRewriter will
+            # rewrite the variable references, and the compiler will handle
+            # the yield inside if/else as a return in the send() method
+            # context (since yields in pre_stmts of a segment are not
+            # split — they only appear if yields are inside conditional
+            # branches, which is an advanced pattern handled by keeping
+            # the entire if/else as a pre_stmt).
+            current.pre_stmts.append(stmt)
+
+        return current
+
+    def _gen_is_while_true(self, node: ast.While) -> bool:
+        """Check if a while loop is `while True:`."""
+        return (isinstance(node.test, ast.Constant)
+                and node.test.value is True)
+
+    def _gen_body_has_yield(self, stmts: list[ast.stmt]) -> bool:
+        """Check if any statement in the list (recursively) contains a yield."""
+        for stmt in stmts:
+            for child in ast.walk(stmt):
+                if isinstance(child, ast.Yield):
+                    return True
+        return False
+
+    def _gen_build_init(
+        self,
+        cls_name: str,
+        params: list[ast.arg],
+        defaults: list[ast.expr],
+        all_vars: set[str],
+        loc: ast.AST,
+    ) -> ast.FunctionDef:
+        """Build the __init__ method for the generator class.
+
+        __init__ stores all parameters as self._<name> attributes and
+        initializes self._state = 0 and self._finished = False.
+        """
+        param_names = [p.arg for p in params]
+
+        # Build argument list: self + same params as original function
+        init_args = [ast.arg(arg="self")]
+        for p in params:
+            init_args.append(ast.arg(arg=p.arg))
+
+        body: list[ast.stmt] = []
+
+        # self._state = 0
+        body.append(self._gen_self_assign("_state", ast.Constant(value=0)))
+        # self._finished = False
+        body.append(self._gen_self_assign("_finished", ast.Constant(value=False)))
+
+        # Store parameters: self._<param> = <param>
+        for name in param_names:
+            body.append(self._gen_self_assign(
+                f"_{name}",
+                ast.Name(id=name, ctx=ast.Load())))
+
+        # Initialize all local variables to None: self._<var> = None
+        for var in sorted(all_vars - set(param_names)):
+            body.append(self._gen_self_assign(
+                f"_{var}",
+                ast.Constant(value=None)))
+
+        func = ast.FunctionDef(
+            name="__init__",
+            args=ast.arguments(
+                posonlyargs=[], args=init_args, vararg=None,
+                kwonlyargs=[], kw_defaults=[], kwargs=None,
+                defaults=list(defaults)),
+            body=body, decorator_list=[], returns=None)
+        ast.copy_location(func, loc)
+        ast.fix_missing_locations(func)
+        return func
+
+    def _gen_build_iter(self, loc: ast.AST) -> ast.FunctionDef:
+        """Build __iter__(self): return self"""
+        func = ast.FunctionDef(
+            name="__iter__",
+            args=ast.arguments(
+                posonlyargs=[], args=[ast.arg(arg="self")], vararg=None,
+                kwonlyargs=[], kw_defaults=[], kwargs=None, defaults=[]),
+            body=[ast.Return(value=ast.Name(id="self", ctx=ast.Load()))],
+            decorator_list=[], returns=None)
+        ast.copy_location(func, loc)
+        ast.fix_missing_locations(func)
+        return func
+
+    def _gen_build_next(self, loc: ast.AST) -> ast.FunctionDef:
+        """Build __next__(self): return self.send(None)"""
+        call = ast.Call(
+            func=ast.Attribute(
+                value=ast.Name(id="self", ctx=ast.Load()),
+                attr="send", ctx=ast.Load()),
+            args=[ast.Constant(value=None)],
+            keywords=[])
+        func = ast.FunctionDef(
+            name="__next__",
+            args=ast.arguments(
+                posonlyargs=[], args=[ast.arg(arg="self")], vararg=None,
+                kwonlyargs=[], kw_defaults=[], kwargs=None, defaults=[]),
+            body=[ast.Return(value=call)],
+            decorator_list=[], returns=None)
+        ast.copy_location(func, loc)
+        ast.fix_missing_locations(func)
+        return func
+
+    def _gen_build_send(
+        self,
+        cls_name: str,
+        segments: list['CodeGen._GenSegment'],
+        loc: ast.AST,
+    ) -> ast.FunctionDef:
+        """Build the send(_sent) method — the core state machine.
+
+        Structure:
+            def send(self, _sent):
+                if self._finished:
+                    raise StopIteration
+                while True:
+                    if self._state == 0:
+                        <segment 0 code>
+                    if self._state == 1:
+                        <segment 1 code>
+                    ...
+                    raise StopIteration
+
+        The while-True loop allows pass-through and loop-continue segments
+        (which set self._state but don't return) to naturally re-dispatch
+        to the correct state on the next iteration.
+        """
+        body: list[ast.stmt] = []
+
+        # if self._finished: raise StopIteration
+        body.append(ast.If(
+            test=ast.Attribute(
+                value=ast.Name(id="self", ctx=ast.Load()),
+                attr="_finished", ctx=ast.Load()),
+            body=[ast.Raise(exc=ast.Name(id="StopIteration", ctx=ast.Load()))],
+            orelse=[]))
+
+        # Build the while-True loop body with state dispatch
+        loop_body: list[ast.stmt] = []
+
+        for i, seg in enumerate(segments):
+            state_body = self._gen_build_state_body(i, seg, segments, cls_name)
+            state_check = ast.If(
+                test=ast.Compare(
+                    left=ast.Attribute(
+                        value=ast.Name(id="self", ctx=ast.Load()),
+                        attr="_state", ctx=ast.Load()),
+                    ops=[ast.Eq()],
+                    comparators=[ast.Constant(value=i)]),
+                body=state_body,
+                orelse=[])
+            loop_body.append(state_check)
+
+        # Fallback: if no state matched, raise StopIteration
+        loop_body.append(self._gen_make_finish())
+
+        # Wrap in while True:
+        while_loop = ast.While(
+            test=ast.Constant(value=True),
+            body=loop_body,
+            orelse=[])
+        body.append(while_loop)
+
+        func = ast.FunctionDef(
+            name="send",
+            args=ast.arguments(
+                posonlyargs=[],
+                args=[ast.arg(arg="self"), ast.arg(arg="_sent")],
+                vararg=None, kwonlyargs=[], kw_defaults=[],
+                kwargs=None, defaults=[]),
+            body=body, decorator_list=[], returns=None)
+        ast.copy_location(func, loc)
+        ast.fix_missing_locations(func)
+        return func
+
+    def _gen_build_state_body(
+        self,
+        state_idx: int,
+        seg: 'CodeGen._GenSegment',
+        all_segments: list['CodeGen._GenSegment'],
+        cls_name: str,
+    ) -> list[ast.stmt]:
+        """Build the body of one state block inside the send() method.
+
+        When entering state i (i > 0), we are resuming after the yield in
+        segment i-1. If that yield had an assign_var (e.g. `val = yield x`),
+        we assign _sent to the corresponding instance attribute first.
+
+        Three segment kinds:
+          1. Yield segment: execute pre_stmts, set next state, return yield value.
+          2. Pass-through / loop-continue: execute pre_stmts, set next state,
+             then `continue` to re-dispatch.
+          3. Terminal: execute pre_stmts, mark finished, raise StopIteration.
+        """
+        body: list[ast.stmt] = []
+
+        # Assign _sent to the variable from the previous segment's yield
+        if state_idx > 0:
+            prev_seg = all_segments[state_idx - 1]
+            if prev_seg.assign_var:
+                body.append(self._gen_self_assign(
+                    f"_{prev_seg.assign_var}",
+                    ast.Name(id="_sent", ctx=ast.Load())))
+
+        # While-cond loop: check the condition at the start of each iteration.
+        # If the condition is False, transition to break_state (post-loop code).
+        if seg.loop_cond is not None and seg.break_state is not None:
+            # if not <cond>: self._state = break_state; continue
+            break_body: list[ast.stmt] = [
+                self._gen_self_assign(
+                    "_state", ast.Constant(value=seg.break_state)),
+                ast.Continue(),
+            ]
+            cond_check = ast.If(
+                test=ast.UnaryOp(
+                    op=ast.Not(),
+                    operand=self._gen_rewrite_vars_expr(seg.loop_cond)),
+                body=break_body,
+                orelse=[])
+            body.append(cond_check)
+
+        # Emit pre_stmts with variable rewriting (local vars -> self._var)
+        for stmt in seg.pre_stmts:
+            body.append(self._gen_rewrite_vars(stmt))
+
+        if seg.yield_expr is not None:
+            # --- Yield segment ---
+            # Always advance to the next sequential state. Even inside loops,
+            # the next state handles _sent assignment and post-yield code.
+            # The loop-back is handled by the post-yield (loop-continue)
+            # segment, not by the yield segment itself.
+            next_state = state_idx + 1
+
+            body.append(self._gen_self_assign(
+                "_state", ast.Constant(value=next_state)))
+
+            # return <yield value>
+            yield_val = seg.yield_expr.value
+            if yield_val is not None:
+                ret_val = self._gen_rewrite_vars_expr(yield_val)
+            else:
+                ret_val = ast.Constant(value=None)
+            body.append(ast.Return(value=ret_val))
+
+        elif seg.is_terminal:
+            # --- Terminal segment ---
+            body.append(self._gen_self_assign(
+                "_finished", ast.Constant(value=True)))
+            body.append(ast.Raise(
+                exc=ast.Name(id="StopIteration", ctx=ast.Load())))
+
+        else:
+            # --- Pass-through / loop-continue segment ---
+            # Set state, then `continue` to re-dispatch from the top of the
+            # while-True loop. This handles both forward transitions (state
+            # N -> N+1) and backward loop-backs (state N -> loop_start).
+            if seg.is_loop_body and seg.loop_back_state is not None:
+                next_state = seg.loop_back_state
+            else:
+                next_state = state_idx + 1
+            body.append(self._gen_self_assign(
+                "_state", ast.Constant(value=next_state)))
+            body.append(ast.Continue())
+
+        return body
+
+    def _gen_build_close(self, loc: ast.AST,
+                          finally_blocks: list[list[ast.stmt]] | None = None
+                          ) -> ast.FunctionDef:
+        """Build close(self): run finally cleanup, then mark finished."""
+        body: list[ast.stmt] = []
+        # Execute finally blocks if generator hasn't finished yet
+        if finally_blocks:
+            # if not self._finished: <finally stmts>
+            cleanup_stmts: list[ast.stmt] = []
+            for block in finally_blocks:
+                for stmt in block:
+                    cleanup_stmts.append(self._gen_rewrite_vars(stmt))
+            guard = ast.If(
+                test=ast.UnaryOp(
+                    op=ast.Not(),
+                    operand=ast.Attribute(
+                        value=ast.Name(id="self", ctx=ast.Load()),
+                        attr="_finished", ctx=ast.Load())),
+                body=cleanup_stmts,
+                orelse=[])
+            body.append(guard)
+        body.append(self._gen_self_assign("_finished", ast.Constant(value=True)))
+        func = ast.FunctionDef(
+            name="close",
+            args=ast.arguments(
+                posonlyargs=[], args=[ast.arg(arg="self")], vararg=None,
+                kwonlyargs=[], kw_defaults=[], kwargs=None, defaults=[]),
+            body=body, decorator_list=[], returns=None)
+        ast.copy_location(func, loc)
+        ast.fix_missing_locations(func)
+        return func
+
+    def _gen_build_throw(self, loc: ast.AST) -> ast.FunctionDef:
+        """Build throw(self, exc_type): mark finished and raise."""
+        body: list[ast.stmt] = [
+            self._gen_self_assign("_finished", ast.Constant(value=True)),
+            ast.Raise(exc=ast.Name(id="exc_type", ctx=ast.Load())),
+        ]
+        func = ast.FunctionDef(
+            name="throw",
+            args=ast.arguments(
+                posonlyargs=[],
+                args=[ast.arg(arg="self"), ast.arg(arg="exc_type")],
+                vararg=None, kwonlyargs=[], kw_defaults=[],
+                kwargs=None, defaults=[]),
+            body=body, decorator_list=[], returns=None)
+        ast.copy_location(func, loc)
+        ast.fix_missing_locations(func)
+        return func
+
+    def _gen_build_wrapper(
+        self,
+        func_name: str,
+        cls_name: str,
+        params: list[ast.arg],
+        defaults: list[ast.expr],
+        loc: ast.AST,
+    ) -> ast.FunctionDef:
+        """Build the wrapper function: def func_name(...): return _Gen_xxx(...)"""
+        wrapper_args = [ast.arg(arg=p.arg) for p in params]
+        call_args = [ast.Name(id=p.arg, ctx=ast.Load()) for p in params]
+
+        body = [ast.Return(value=ast.Call(
+            func=ast.Name(id=cls_name, ctx=ast.Load()),
+            args=call_args,
+            keywords=[]))]
+
+        func = ast.FunctionDef(
+            name=func_name,
+            args=ast.arguments(
+                posonlyargs=[], args=wrapper_args, vararg=None,
+                kwonlyargs=[], kw_defaults=[], kwargs=None,
+                defaults=list(defaults)),
+            body=body, decorator_list=[], returns=None)
+        ast.copy_location(func, loc)
+        ast.fix_missing_locations(func)
+        return func
+
+    # -- AST rewriting helpers for variable references --
+
+    def _gen_self_assign(self, attr: str, value: ast.expr) -> ast.Assign:
+        """Create: self.<attr> = <value>"""
+        return ast.Assign(
+            targets=[ast.Attribute(
+                value=ast.Name(id="self", ctx=ast.Load()),
+                attr=attr, ctx=ast.Store())],
+            value=value)
+
+    def _gen_make_finish(self) -> ast.stmt:
+        """Create: self._finished = True; raise StopIteration"""
+        # We return just the raise; the caller should prepend the assign
+        return ast.Raise(exc=ast.Name(id="StopIteration", ctx=ast.Load()))
+
+    def _gen_rewrite_vars(self, node: ast.stmt) -> ast.stmt:
+        """Deep-copy a statement, rewriting local variable references to
+        self._<var> attribute accesses. This is the core of the variable
+        hoisting from function locals to instance attributes."""
+        local_vars = getattr(self, '_gen_current_locals', set())
+        return _GenVarRewriter(local_vars).visit(node)
+
+    def _gen_rewrite_vars_expr(self, node: ast.expr) -> ast.expr:
+        """Deep-copy an expression, rewriting variable references."""
+        local_vars = getattr(self, '_gen_current_locals', set())
+        return _GenVarRewriter(local_vars).visit(node)
 
     def _declare_class(self, node: ast.ClassDef,
                        _sig_override: list | None = None,
@@ -3808,16 +5645,9 @@ class CodeGen:
         self._monomorphized_classes, then also keep the original name as
         an alias pointing to the first variant's ClassInfo.
         """
-        # Dataclass: route through CPython bridge — the @dataclass decorator
-        # generates __init__, __repr__, __eq__, etc. which our native class
-        # compilation can't replicate. Compile the class via exec_get.
-        if _sig_override is None and _name_override is None:
-            for deco in node.decorator_list:
-                if isinstance(deco, ast.Name) and deco.id == "dataclass":
-                    if not hasattr(self, '_cpython_classes'):
-                        self._cpython_classes = set()
-                    self._cpython_classes.add(node.name)
-                    return  # skip native declaration
+        # Dataclasses are expanded by _expand_dataclasses() before this
+        # point — the @dataclass decorator is already stripped and
+        # synthetic __init__/__repr__/__eq__ injected into the body.
 
         # Top-level entry: check for monomorphization
         if _sig_override is None and _name_override is None:
@@ -3876,10 +5706,36 @@ class CodeGen:
             if not hasattr(self, '_class_metaclasses'):
                 self._class_metaclasses = {}
             self._class_metaclasses[class_name] = metaclass_name
+            # Complex metaclass (not a user class): compile method bodies
+            # natively but use the native metaclass protocol for class
+            # creation. Methods are fast; only class creation overhead.
+            if (metaclass_name not in self._user_classes
+                    and metaclass_name != "type"
+                    and _sig_override is None):
+                if not hasattr(self, '_metaclass_classes'):
+                    self._metaclass_classes = set()
+                self._metaclass_classes.add(class_name)
+                # Don't return — continue declaring the class and its
+                # methods normally. The metaclass protocol runs in
+                # _emit_class_registration using the native dict path.
 
         if node.bases:
             if isinstance(node.bases[0], ast.Name):
                 parent_name = node.bases[0].id
+                # If the base class is imported (pyobj) and not a user class,
+                # route the entire class through CPython bridge so the
+                # inheritance protocol works correctly.
+                if (parent_name not in self._user_classes
+                        and parent_name != "type"
+                        and parent_name not in ("object",)
+                        and _sig_override is None):
+                    # Check if the base is a known imported name
+                    if (parent_name in getattr(self, 'variables', {})
+                            and self.variables.get(parent_name, (None, None))[1] == "pyobj"):
+                        if not hasattr(self, '_cpython_classes'):
+                            self._cpython_classes = set()
+                        self._cpython_classes.add(node.name)
+                        return
                 # `type` as a base class — metaclass definition (class M(type))
                 # Treat as having no runtime parent since `type` is not a
                 # user class. The class itself is registered normally.
@@ -3956,8 +5812,10 @@ class CodeGen:
                     self._class_var_globals[(class_name, attr_name)] = (gvar, "str")
                     continue
                 elif v is None:
-                    gtype = i64
-                    init = ir.Constant(i64, 0)
+                    # None-initialized class vars use i8* so they can hold
+                    # object pointers later and null → is-None check works.
+                    gtype = i8_ptr
+                    init = ir.Constant(i8_ptr, None)
                 else:
                     continue
                 gvar = ir.GlobalVariable(
@@ -4053,6 +5911,10 @@ class CodeGen:
                 is_setter = any(
                     isinstance(d, ast.Attribute) and d.attr == "setter"
                     for d in item.decorator_list)
+                # __new__ and __init_subclass__ are always classmethods
+                if method_name in ("__new__", "__init_subclass__",
+                                    "__class_getitem__"):
+                    is_classmethod = True
                 if is_classmethod:
                     classmethods.add(method_name)
                 if is_static:
@@ -4160,18 +6022,28 @@ class CodeGen:
                                     if (isinstance(s, ast.Assign)
                                             and len(s.targets) == 1
                                             and isinstance(s.targets[0], ast.Name)
-                                            and s.targets[0].id == var_name
-                                            and isinstance(s.value, ast.Attribute)
-                                            and isinstance(s.value.value, ast.Name)
-                                            and s.value.value.id == "self"):
-                                        a = s.value.attr
-                                        if a in float_attrs:
-                                            ret_type = double
-                                        elif a in string_attrs:
+                                            and s.targets[0].id == var_name):
+                                        # self.attr source
+                                        if (isinstance(s.value, ast.Attribute)
+                                                and isinstance(s.value.value, ast.Name)
+                                                and s.value.value.id == "self"):
+                                            a = s.value.attr
+                                            if a in float_attrs:
+                                                ret_type = double
+                                            elif a in string_attrs:
+                                                ret_type = i8_ptr
+                                            elif a in bool_attrs:
+                                                ret_type = i32
+                                            break
+                                        # list/dict/tuple/set literal or
+                                        # comprehension source
+                                        if isinstance(s.value, (
+                                                ast.List, ast.ListComp,
+                                                ast.Tuple, ast.Dict,
+                                                ast.DictComp, ast.Set,
+                                                ast.SetComp)):
                                             ret_type = i8_ptr
-                                        elif a in bool_attrs:
-                                            ret_type = i32
-                                        break
+                                            break
                                 if ret_type != i64:
                                     break
                             # return local_var[index] where local was assigned
@@ -4411,8 +6283,14 @@ class CodeGen:
                 fn_name = f"fastpy.class.{class_name}.{method_name}"
                 func = ir.Function(self.module, func_type, name=fn_name)
 
-                # Inline hint for methods
-                func.attributes.add('inlinehint')
+                # Internal linkage: methods are only called within this
+                # module. Allows aggressive inlining by LLVM.
+                func.linkage = "internal"
+                method_size = sum(1 for _ in ast.walk(item))
+                if method_size <= 25:
+                    func.attributes.add('alwaysinline')
+                elif method_size <= 80:
+                    func.attributes.add('inlinehint')
 
                 # Name parameters
                 for param, pname in zip(func.args, params):
@@ -4949,11 +6827,29 @@ class CodeGen:
         # null-check in _emit_method_body to preserve the NONE tag.
         nullable_params: set[str] = set()
         param_names_set = {arg.arg for arg in node.args.args}
+        # Obj-typed attrs for the current class — params stored into these
+        # slots must be tagged "obj" so the runtime null-check preserves
+        # the NONE tag for sentinel-terminated structures (linked lists etc.).
+        cur_class_obj_attrs = getattr(self, '_class_obj_attrs', {}).get(
+            self._current_class, set()) if self._current_class else set()
         for n in ast.walk(node):
             if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name):
                 pname = n.value.id
                 if pname in param_names_set and pname != "self":
                     obj_params.add(pname)
+            # `self.obj_attr = param` where obj_attr is a known obj-typed
+            # slot — param carries an object-or-None value and needs "obj"
+            # tag so the runtime null-check emits NONE when the value is 0.
+            if (isinstance(n, ast.Assign)
+                    and len(n.targets) == 1
+                    and isinstance(n.targets[0], ast.Attribute)
+                    and isinstance(n.targets[0].value, ast.Name)
+                    and n.targets[0].value.id == "self"
+                    and n.targets[0].attr in cur_class_obj_attrs
+                    and isinstance(n.value, ast.Name)
+                    and n.value.id in param_names_set
+                    and n.value.id != "self"):
+                obj_params.add(n.value.id)
             # `param is None` or `param is not None` → nullable
             if isinstance(n, ast.Compare):
                 for comparator, op in zip(
@@ -5006,10 +6902,11 @@ class CodeGen:
                 isinstance(param.type, ir.IntType) and param.type.width == 32
             )
             if is_classmethod_cls:
-                # cls (classmethod) stays as i32 — no FV wrapping
+                # cls (classmethod) stays as i32 — no FV wrapping.
+                # Tagged "cls" so cls.attr access routes through class variable globals.
                 alloca = self.builder.alloca(param.type, name=pname)
                 self.builder.store(param, alloca)
-                self.variables[pname] = (alloca, "int")
+                self.variables[pname] = (alloca, "cls")
                 llvm_arg_idx += 1
                 continue
 
@@ -5158,19 +7055,169 @@ class CodeGen:
                         class_id, ir.Constant(i32, slot_idx), name_ptr
                     ])
 
-        # Register each method
+        # Register each method and assign vtable slot
+        if not hasattr(self, '_vtable_indices'):
+            self._vtable_indices: dict[str, int] = {}
+            self._vtable_next_slot = 0
         for method_name, method_func in cls_info.methods.items():
             mname_ptr = self._make_string_constant(method_name)
-            # Cast function pointer to i8*
             func_ptr = self.builder.bitcast(method_func, i8_ptr)
-            # Argument count (excluding self)
-            n_args = len(method_func.args) - 1  # minus self
+            n_args = len(method_func.args) - 1
             returns = 0 if method_func.return_value.type == void else 1
             self.builder.call(self.runtime["register_method"], [
                 class_id, mname_ptr, func_ptr,
                 ir.Constant(i32, n_args),
                 ir.Constant(i32, returns),
             ])
+            # Assign a vtable slot for O(1) polymorphic dispatch.
+            # Same method name across classes shares the same slot index.
+            if method_name not in self._vtable_indices:
+                self._vtable_indices[method_name] = self._vtable_next_slot
+                self._vtable_next_slot += 1
+            slot = self._vtable_indices[method_name]
+            self.builder.call(self.runtime["set_vtable_entry"],
+                              [class_id, ir.Constant(i32, slot), func_ptr])
+
+        # Generator destructor: if this class was generated from a generator
+        # with try/finally blocks, register the close() method as a destructor.
+        # The GC calls this when the object is collected, ensuring finally blocks run.
+        gen_dtor_classes = getattr(self, '_gen_classes_with_destructor', set())
+        if cls_info.name in gen_dtor_classes:
+            close_fn = cls_info.methods.get("close")
+            if close_fn is not None:
+                # The close() method takes (self) → build a C-compatible
+                # destructor wrapper: void dtor(FpyObj* obj) { close(obj); }
+                func_ptr = self.builder.bitcast(close_fn, i8_ptr)
+                self.builder.call(self.runtime["set_class_destructor"],
+                                  [class_id, func_ptr])
+
+        # __init_subclass__ hook: if the parent class defines __init_subclass__,
+        # call it after registering the child class.
+        if cls_info.parent_name and cls_info.parent_name in self._user_classes:
+            parent_info = self._user_classes[cls_info.parent_name]
+            init_sub = (parent_info.methods.get("__init_subclass__")
+                        if parent_info.methods else None)
+            if init_sub is not None:
+                self.builder.call(init_sub, [class_id])
+
+        # Metaclass hooks: if the class has metaclass=Meta, call Meta's
+        # __new__ and __init__ after registration. This is zero-cost for
+        # classes without metaclass= — only the if-check is paid.
+        #
+        # For imported/pyobj metaclasses, build the namespace dict with
+        # native method function pointers wrapped as CPython callables,
+        # then call the metaclass through the bridge. Method bodies stay native.
+        metaclass_classes = getattr(self, '_metaclass_classes', set())
+        metaclasses = getattr(self, '_class_metaclasses', {})
+        meta_name = metaclasses.get(cls_info.name)
+        if meta_name and cls_info.name in metaclass_classes:
+            # Complex (non-user) metaclass — build namespace dict with
+            # native methods wrapped as CPython callables, then call
+            # the metaclass through the bridge.
+            ns_dict = self.builder.call(self.runtime["dict_new"], [])
+            # Add native methods as CPython-callable wrappers
+            for method_name, method_func in (cls_info.methods or {}).items():
+                key = self._make_string_constant(method_name)
+                func_ptr = self.builder.bitcast(method_func, i8_ptr)
+                wrapped = self.builder.call(
+                    self.runtime["cpython_wrap_native"], [func_ptr])
+                data = self.builder.ptrtoint(wrapped, i64)
+                self.builder.call(self.runtime["dict_set_fv"],
+                                  [ns_dict, key,
+                                   ir.Constant(i32, FPY_TAG_OBJ), data])
+            # Add class-level constants
+            const_attrs = self._class_const_attrs.get(cls_info.name, {})
+            for attr_name, val_node in const_attrs.items():
+                key = self._make_string_constant(attr_name)
+                val = self._emit_expr_value(val_node)
+                t, d = self._bare_to_tag_data(val, val_node)
+                self.builder.call(self.runtime["dict_set_fv"],
+                                  [ns_dict, key, ir.Constant(i32, t), d])
+            # Call the metaclass through our native type_new_from_dict
+            # which reads the namespace dict and registers the class.
+            # The metaclass object itself (if it needs to do custom work)
+            # can be called through the bridge after registration.
+            name_ptr = self._make_string_constant(cls_info.name)
+            if meta_name in self.variables:
+                # Metaclass is a pyobj variable — call it through bridge
+                meta_obj = self._load_variable(meta_name, None)
+                if isinstance(meta_obj.type, ir.IntType):
+                    meta_obj = self.builder.inttoptr(meta_obj, i8_ptr)
+                # Call Meta(name, bases, namespace) through bridge
+                name_tag, name_data = self._bare_to_tag_data(
+                    name_ptr, None)
+                ns_tag = FPY_TAG_DICT
+                ns_data = self.builder.ptrtoint(ns_dict, i64)
+                out_tag = self._create_entry_alloca(i32, "mc.tag")
+                out_data = self._create_entry_alloca(i64, "mc.data")
+                # Call with 3 args: name, (), namespace
+                # (bases as empty tuple for simplicity)
+                bases = self.builder.call(self.runtime["list_new"], [])
+                bases_data = self.builder.ptrtoint(bases, i64)
+                self.builder.call(self.runtime["cpython_call3"],
+                                  [meta_obj,
+                                   ir.Constant(i32, name_tag), name_data,
+                                   ir.Constant(i32, FPY_TAG_LIST), bases_data,
+                                   ir.Constant(i32, ns_tag), ns_data,
+                                   out_tag, out_data])
+                # Store the resulting class object as a pyobj variable
+                cls_pyobj = self.builder.load(out_data)
+                cls_ptr = self.builder.inttoptr(cls_pyobj, i8_ptr)
+                self._store_variable(cls_info.name, cls_ptr, "pyobj")
+
+        elif meta_name and meta_name in self._user_classes:
+            meta_info = self._user_classes[meta_name]
+            # Build a namespace dict with class attributes for Meta.__new__/init
+            ns_dict = self.builder.call(self.runtime["dict_new"], [])
+            # Add class-level constants to the namespace
+            const_attrs = self._class_const_attrs.get(cls_info.name, {})
+            for attr_name, val_node in const_attrs.items():
+                key = self._make_string_constant(attr_name)
+                val = self._emit_expr_value(val_node)
+                t, d = self._bare_to_tag_data(val, val_node)
+                self.builder.call(self.runtime["dict_set_fv"],
+                                  [ns_dict, key, ir.Constant(i32, t), d])
+            # Add method names
+            for method_name in (cls_info.methods or {}):
+                key = self._make_string_constant(method_name)
+                self.builder.call(self.runtime["dict_set_fv"],
+                                  [ns_dict, key,
+                                   ir.Constant(i32, FPY_TAG_INT),
+                                   ir.Constant(i64, 1)])
+            name_str = self._make_string_constant(cls_info.name)
+            # Call Meta.__new__(meta_cls, name, bases, namespace)
+            meta_new = meta_info.methods.get("__new__")
+            if meta_new is not None:
+                meta_cls_id = self.builder.load(meta_info.class_id_global)
+                # Build args: meta_cls, name_str, None (bases), ns_dict
+                args = [meta_cls_id]
+                # Coerce remaining args to match Meta.__new__ params
+                for param in list(meta_new.args)[1:]:
+                    if param.type == i8_ptr:
+                        args.append(name_str if len(args) == 1 else
+                                    self.builder.inttoptr(ir.Constant(i64, 0), i8_ptr)
+                                    if len(args) == 2 else ns_dict)
+                    else:
+                        args.append(self.builder.ptrtoint(
+                            name_str if len(args) == 1 else ns_dict, i64))
+                if len(args) == len(meta_new.args):
+                    self.builder.call(meta_new, args)
+            # Call Meta.__init__(cls, name, bases, namespace)
+            meta_init = meta_info.methods.get("__init__")
+            if meta_init is not None:
+                obj = self.builder.call(self.runtime["obj_new"],
+                                        [class_id])
+                args = [obj]
+                for param in list(meta_init.args)[1:]:
+                    if param.type == i8_ptr:
+                        args.append(name_str if len(args) == 1 else
+                                    self.builder.inttoptr(ir.Constant(i64, 0), i8_ptr)
+                                    if len(args) == 2 else ns_dict)
+                    else:
+                        args.append(self.builder.ptrtoint(
+                            name_str if len(args) == 1 else ns_dict, i64))
+                if len(args) == len(meta_init.args):
+                    self.builder.call(meta_init, args)
 
     def _emit_stmt(self, node: ast.stmt) -> None:
         """Emit LLVM IR for a statement."""
@@ -5460,6 +7507,8 @@ class CodeGen:
                 "any", "all", "chr", "ord", "hex", "oct", "bin",
                 "round", "repr", "pow", "divmod", "dict", "tuple",
                 "map", "filter", "hash", "print",
+                "locals", "globals", "eval", "exec", "complex",
+                "frozenset",
             }
             if builtin_name not in native_builtins:
                 type_tag = "pyobj"
@@ -5631,10 +7680,18 @@ class CodeGen:
                 f"Nested class {inner_class} has no attribute {node.attr}",
                 node)
 
-        # Class-level constant access: ClassName.ATTR
+        # Class-level constant access: ClassName.ATTR or cls.ATTR
+        attr_class_name = None
         if (isinstance(node.value, ast.Name)
                 and node.value.id in self._user_classes):
-            class_name = node.value.id
+            attr_class_name = node.value.id
+        elif (isinstance(node.value, ast.Name)
+              and self._current_class is not None
+              and node.value.id in self.variables
+              and self.variables[node.value.id][1] == "cls"):
+            attr_class_name = self._current_class
+        if attr_class_name is not None:
+            class_name = attr_class_name
             # Mutable class var — load from the LLVM global
             key = (class_name, node.attr)
             if key in getattr(self, "_class_var_globals", {}):
@@ -5733,6 +7790,27 @@ class CodeGen:
                               node: ast.AST,
                               value_node: ast.expr | None = None) -> None:
         """Emit list[idx] = value or dict[key] = value via FV-ABI setters."""
+        # pyobj-tagged variable: route through CPython __setitem__
+        if (isinstance(target.value, ast.Name)
+                and target.value.id in self.variables
+                and self.variables[target.value.id][1] == "pyobj"):
+            obj = self._load_variable(target.value.id, target)
+            if isinstance(obj.type, ir.IntType):
+                obj = self.builder.inttoptr(obj, i8_ptr)
+            key = self._emit_expr_value(target.slice)
+            key_tag, key_data = self._bare_to_tag_data(key, target.slice)
+            val_tag, val_data = self._bare_to_tag_data(value, value_node)
+            setitem = self._make_string_constant("__setitem__")
+            callable_ptr = self.builder.call(
+                self.runtime["cpython_getattr"], [obj, setitem])
+            out_tag = self._create_entry_alloca(i32, "si.tag")
+            out_data = self._create_entry_alloca(i64, "si.data")
+            self.builder.call(self.runtime["cpython_call2"],
+                              [callable_ptr,
+                               ir.Constant(i32, key_tag), key_data,
+                               ir.Constant(i32, val_tag), val_data,
+                               out_tag, out_data])
+            return
         # Slice assignment: a[start:stop] = new_values
         if isinstance(target.slice, ast.Slice):
             obj = self._emit_expr_value(target.value)
@@ -5774,9 +7852,13 @@ class CodeGen:
                                   [obj, name_ptr, key, value])
                 return
         obj = self._emit_expr_value(target.value)
+        if isinstance(obj.type, ir.IntType):
+            obj = self.builder.inttoptr(obj, i8_ptr)
         index = self._emit_expr_value(target.slice)
         tag, data = self._bare_to_tag_data(value, value_node=value_node)
-        if self._is_dict_expr(target.value):
+        if (self._is_dict_expr(target.value)
+                or self._is_defaultdict_expr(target.value)
+                or self._is_counter_expr(target.value)):
             # Int keys use the int-keyed setter so the dict stores them
             # natively (vs converting to strings, which would affect
             # printed representation).
@@ -5792,6 +7874,85 @@ class CodeGen:
             # List set: index must be int
             self.builder.call(self.runtime["list_set_fv"],
                               [obj, index, ir.Constant(i32, tag), data])
+
+    def _compile_eval_literal(self, source: str,
+                                node: ast.AST) -> ir.Value:
+        """Compile-time eval: parse a literal string as a Python expression
+        and compile it inline. Supports nested eval/exec within literals.
+        Falls back to CPython bridge on parse failure.
+        """
+        try:
+            expr_tree = ast.parse(source, mode="eval")
+        except SyntaxError:
+            # Can't parse — fall back to CPython bridge
+            locals_dict = self._emit_locals_dict()
+            expr_ptr = self._make_string_constant(source)
+            out_tag = self._create_entry_alloca(i32, "eval.tag")
+            out_data = self._create_entry_alloca(i64, "eval.data")
+            self.builder.call(self.runtime["cpython_eval_locals"],
+                              [expr_ptr, locals_dict, out_tag, out_data])
+            tag_val = self.builder.load(out_tag)
+            data_val = self.builder.load(out_data)
+            fv = ir.Constant(fpy_val, ir.Undefined)
+            fv = self.builder.insert_value(fv, tag_val, 0)
+            fv = self.builder.insert_value(fv, data_val, 1)
+            return fv
+        # Compile the parsed expression inline — it sees all local variables.
+        # Return a bare value (not FpyValue) so it composes correctly
+        # inside larger expressions like eval("eval('1+2') + eval('3+4')").
+        value = self._emit_expr_value(expr_tree.body)
+        # If nested eval returned an FpyValue, unwrap to bare value
+        if (isinstance(value.type, ir.LiteralStructType)
+                and value.type == fpy_val):
+            return self.builder.extract_value(value, 1)  # i64 data
+        return value
+
+    def _compile_exec_literal(self, source: str,
+                                node: ast.AST) -> None:
+        """Compile-time exec: parse a literal string as Python statements
+        and compile them inline. Supports nested eval/exec within literals.
+        Falls back to CPython bridge on parse failure.
+        """
+        try:
+            stmt_tree = ast.parse(source, mode="exec")
+        except SyntaxError:
+            # Can't parse — fall back to CPython bridge
+            locals_dict = self._emit_locals_dict()
+            code_ptr = self._make_string_constant(source)
+            self.builder.call(self.runtime["cpython_exec_locals"],
+                              [code_ptr, locals_dict])
+            return
+        # Compile each statement inline — they see and modify local variables
+        for stmt in stmt_tree.body:
+            self._emit_stmt(stmt)
+
+    def _emit_locals_dict(self) -> ir.Value:
+        """Build an FpyDict from all current local variables.
+
+        Used by locals(), eval(), and exec() to expose the compiled
+        function's local variables to CPython.
+        """
+        d = self.builder.call(self.runtime["dict_new"], [])
+        for var_name, (alloca, tag) in self.variables.items():
+            if var_name in self._global_vars:
+                continue
+            if tag == "cell":
+                continue
+            key = self._make_string_constant(var_name)
+            if (self._USE_FV_LOCALS
+                    and isinstance(alloca.type, ir.PointerType)
+                    and alloca.type.pointee is fpy_val):
+                fv = self.builder.load(alloca)
+                fv_tag = self.builder.extract_value(fv, 0)
+                fv_data = self.builder.extract_value(fv, 1)
+                self.builder.call(self.runtime["dict_set_fv"],
+                                  [d, key, fv_tag, fv_data])
+            else:
+                val = self.builder.load(alloca)
+                t, data = self._bare_to_tag_data(val, None)
+                self.builder.call(self.runtime["dict_set_fv"],
+                                  [d, key, ir.Constant(i32, t), data])
+        return d
 
     def _bare_to_tag_data(self, value: ir.Value,
                             value_node: ast.expr | None = None) -> tuple[int, ir.Value]:
@@ -5992,10 +8153,19 @@ class CodeGen:
         The `value_node` is optional — when provided, it disambiguates pointer
         values between STR/LIST/DICT/OBJ tags.
         """
-        # Class-level variable store: ClassName.attr = value → store to global
+        # Class-level variable store: ClassName.attr = value or cls.attr = value
+        # In classmethods, `cls` parameter maps to the current class.
+        attr_class_name = None
         if (isinstance(target.value, ast.Name)
                 and target.value.id in self._user_classes):
-            class_name = target.value.id
+            attr_class_name = target.value.id
+        elif (isinstance(target.value, ast.Name)
+              and self._current_class is not None
+              and target.value.id in self.variables
+              and self.variables[target.value.id][1] == "cls"):
+            attr_class_name = self._current_class
+        if attr_class_name is not None:
+            class_name = attr_class_name
             key = (class_name, target.attr)
             if key in getattr(self, "_class_var_globals", {}):
                 gvar, tag = self._class_var_globals[key]
@@ -6013,6 +8183,8 @@ class CodeGen:
                         value = self.builder.fptosi(value, gtype)
                     elif isinstance(gtype, ir.PointerType) and isinstance(value.type, ir.IntType):
                         value = self.builder.inttoptr(value, gtype)
+                    elif isinstance(gtype, ir.IntType) and isinstance(value.type, ir.PointerType):
+                        value = self.builder.ptrtoint(value, gtype)
                 self.builder.store(value, gvar)
                 return
 
@@ -6171,6 +8343,23 @@ class CodeGen:
                 return "none"
             if isinstance(node.value, bool):
                 return "bool"
+            if isinstance(node.value, complex):
+                return "complex"
+            if (isinstance(node.value, int)
+                    and (node.value > 2**63 - 1 or node.value < -(2**63))):
+                return "bigint"
+        # Constant-folded BigInt/Complex: BinOp/UnaryOp that evaluated at compile time
+        if isinstance(node, (ast.BinOp, ast.UnaryOp)):
+            folded = self._try_constant_fold(node)
+            if folded is not None and isinstance(folded, complex):
+                return "complex"
+            if (folded is not None and isinstance(folded, int)
+                    and (folded > 2**63 - 1 or folded < -(2**63))):
+                return "bigint"
+        # BinOp with a complex operand produces complex
+        if isinstance(node, ast.BinOp):
+            if self._is_complex_expr(node.left) or self._is_complex_expr(node.right):
+                return "complex"
         # Compare / not / isinstance / bool() produce booleans
         if isinstance(node, ast.Compare):
             return "bool"
@@ -6194,7 +8383,8 @@ class CodeGen:
         if isinstance(node, ast.Name) and node.id in self.variables:
             _, var_tag = self.variables[node.id]
             if var_tag in ("obj", "bool", "float", "str", "dict", "tuple",
-                            "none"):
+                            "none", "complex", "counter", "defaultdict",
+                            "deque", "chainmap", "namedtuple_type", "logger"):
                 return var_tag
             if var_tag.startswith("list"):
                 return var_tag
@@ -6209,14 +8399,73 @@ class CodeGen:
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
             if node.func.id == "divmod":
                 return "tuple"
-            if node.func.id == "dict":
+            if node.func.id in ("dict", "locals", "globals"):
                 return "dict"
             if node.func.id == "tuple":
                 return "tuple"
             if node.func.id == "set":
                 return "set"
+            if node.func.id == "complex":
+                return "complex"
+            if node.func.id == "frozenset":
+                return "set"
             if node.func.id in ("list", "sorted", "reversed"):
                 return "list:int"
+            # User function with known return type (from return-type propagation)
+            frt = getattr(self, '_func_ret_types', {})
+            if node.func.id in frt:
+                return frt[node.func.id]
+            # Native module functions with known return types
+            native_imports = getattr(self, '_native_imports', {})
+            if node.func.id in native_imports:
+                mod, fn = native_imports[node.func.id]
+                if fn == "loads" and "json" in mod:
+                    return "dict"
+                if fn in ("getcwd", "path_join", "path_basename",
+                           "path_dirname", "join", "basename", "dirname"):
+                    return "str"
+                if fn in ("listdir",):
+                    return "list:str"
+                if fn in ("exists", "isfile", "isdir",
+                           "path_exists", "path_isfile", "path_isdir"):
+                    return "bool"
+        # Native module method calls: json.loads(...), os.getcwd(), etc.
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)):
+            mod = node.func.value.id
+            fn = node.func.attr
+            if mod == "json" and fn == "loads":
+                return "dict"
+            if mod == "json" and fn == "dumps":
+                return "str"
+            if mod == "os" and fn in ("getcwd",):
+                return "str"
+            if mod == "os" and fn == "listdir":
+                return "list:str"
+            if mod == "asyncio" and fn == "gather":
+                return "list:int"
+            if mod == "logging" and fn == "getLogger":
+                return "logger"
+        # Collections module — from-import calls: Counter(), defaultdict(), deque()
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            native_imports = getattr(self, '_native_imports', {})
+            if node.func.id in native_imports:
+                mod, fn = native_imports[node.func.id]
+                if mod == "collections":
+                    if fn == "Counter":
+                        return "counter"
+                    if fn == "defaultdict":
+                        return "defaultdict"
+                    if fn == "deque":
+                        return "deque"
+                    if fn == "OrderedDict":
+                        return "dict"
+                    if fn == "namedtuple":
+                        return "namedtuple_type"
+                    if fn == "ChainMap":
+                        return "chainmap"
+                if mod == "logging" and fn == "getLogger":
+                    return "logger"
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
             if node.func.id in self._user_classes:
                 return "obj"
@@ -6250,6 +8499,10 @@ class CodeGen:
                 return "list:str"
             if method == "copy" and self._is_list_expr(node.func.value):
                 return "list:int"
+            # Collections module methods that return lists
+            if method in ("most_common", "elements"):
+                if self._is_counter_expr(node.func.value):
+                    return "list:list"
             # User class method return: check method return type
             ret_type = self._find_method_return_type(node.func.value, method)
             if ret_type is not None and isinstance(ret_type, ir.PointerType):
@@ -6305,6 +8558,26 @@ class CodeGen:
                 return "list:int"
         if isinstance(node, (ast.Set, ast.SetComp)):
             return "set"
+        # Subscript on a list: infer element type
+        if isinstance(node, ast.Subscript) and not isinstance(node.slice, ast.Slice):
+            if isinstance(node.value, ast.Name) and node.value.id in self.variables:
+                _, vtype = self.variables[node.value.id]
+                if vtype.startswith("list:"):
+                    elem = vtype.split(":", 1)[1]
+                    if elem.startswith("list"):
+                        return elem  # "list:float" from "list:list:float"
+                    if elem == "str":
+                        return "str"
+                    if elem == "float":
+                        return "float"
+                    if elem == "dict":
+                        return "dict"
+                    if elem == "obj":
+                        return "obj"
+        # Set operations (|, &, -, ^) produce sets
+        if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.BitOr, ast.BitAnd, ast.BitXor, ast.Sub)):
+            if self._is_set_expr(node.left) or self._is_set_expr(node.right):
+                return "set"
         return self._llvm_type_tag(value)
 
     def _prescan_list_append_types(self, stmts: list[ast.stmt],
@@ -6434,7 +8707,20 @@ class CodeGen:
                 arg = call.args[0]
                 # Infer what type is being appended
                 if isinstance(arg, (ast.List, ast.ListComp)):
-                    self._list_append_types[var_name] = "list"
+                    # Detect inner list element type for list-of-lists
+                    def _has_any_float(elts):
+                        for e in elts:
+                            if isinstance(e, ast.Constant) and isinstance(e.value, float):
+                                return True
+                            if isinstance(e, ast.UnaryOp) and isinstance(e.operand, ast.Constant) and isinstance(e.operand.value, float):
+                                return True
+                            if isinstance(e, ast.BinOp):
+                                return True
+                        return False
+                    if isinstance(arg, ast.List) and arg.elts and _has_any_float(arg.elts):
+                        self._list_append_types[var_name] = "list:float"
+                    else:
+                        self._list_append_types[var_name] = "list"
                 elif isinstance(arg, ast.Tuple):
                     # Appending a tuple literal — tuple elements
                     self._list_append_types[var_name] = "tuple"
@@ -6812,7 +9098,12 @@ class CodeGen:
         """Load a variable's value. Returns a bare LLVM value (not FpyValue)
         of the type dictated by the variable's current type_tag."""
         if name not in self.variables:
-            raise CodeGenError(f"Undefined variable: {name}", node)
+            # Fallback: check module-level globals (Python allows reading
+            # globals without explicit `global` declaration).
+            if name in self._global_vars:
+                self.variables[name] = self._global_vars[name]
+            else:
+                raise CodeGenError(f"Undefined variable: {name}", node)
         alloca, type_tag = self.variables[name]
         if type_tag == "cell":
             # Mutable closure variable — load cell pointer, then get value
@@ -6875,6 +9166,12 @@ class CodeGen:
                 # i64 holding a PyObject* pointer — wrap as OBJ
                 ptr = self.builder.inttoptr(value, i8_ptr)
                 return self._fv_from_obj(ptr)
+            if type_tag == "bigint":
+                return self._fv_build_from_slots(
+                    ir.Constant(i32, FPY_TAG_BIGINT), value)
+            if type_tag == "complex":
+                return self._fv_build_from_slots(
+                    ir.Constant(i32, FPY_TAG_COMPLEX), value)
             return self._fv_from_int(value)
         # Double
         if isinstance(value.type, ir.DoubleType):
@@ -6905,6 +9202,9 @@ class CodeGen:
             return self.builder.trunc(data, i32)
         if type_tag == "none":
             return ir.Constant(i64, 0)
+        if type_tag == "bigint":
+            # BigInt data is a pointer (as i64) — return as-is
+            return self._fv_as_int(fv)
         # Default: int
         return self._fv_as_int(fv)
 
@@ -7392,10 +9692,9 @@ class CodeGen:
             f"Unsupported match pattern: {type(pattern).__name__}", node)
 
     def _generator_needs_cpython(self, node: ast.FunctionDef) -> bool:
-        """Check if a generator function needs CPython's coroutine support.
-        Generators that use `yield` as an expression (x = yield),
-        or are called with .send()/.throw()/.close(), need true
-        coroutine semantics that our list-collection approach can't provide."""
+        """Check if a generator function needs the state-machine expansion
+        (as opposed to the simple list-collection approach).
+        Returns True for: yield-as-expression, yield from, yield inside try/with."""
         for child in ast.walk(node):
             # yield used as an expression in an assignment
             if isinstance(child, ast.Assign) and isinstance(child.value, ast.Yield):
@@ -7403,6 +9702,12 @@ class CodeGen:
             # yield used as expression in augmented assignment
             if isinstance(child, ast.AugAssign) and isinstance(child.value, ast.Yield):
                 return True
+            # yield from (delegation protocol)
+            if isinstance(child, ast.YieldFrom):
+                return True
+        # yield inside try/with also needs state machine
+        if self._yield_inside_try_or_with(node):
+            return True
         return False
 
     def _emit_cpython_generator(self, node: ast.FunctionDef, effective_name: str) -> None:
@@ -7445,7 +9750,9 @@ class CodeGen:
             raise CodeGenError("yield from requires an iterable", node)
 
     # Modules with native implementations (no CPython bridge needed)
-    _NATIVE_MODULES = {"math"}
+    _NATIVE_MODULES = {"math", "json", "os", "os.path", "asyncio", "collections",
+                        "typing", "abc", "functools", "logging", "contextlib",
+                        "sys", "time"}
 
     # Native math constants
     _MATH_CONSTANTS = {
@@ -7566,29 +9873,63 @@ class CodeGen:
             self._store_variable(var_name, pyobj, "pyobj")
 
     def _emit_async_funcdef(self, node: ast.AsyncFunctionDef) -> None:
-        """Emit `async def f(): ...` by compiling through CPython bridge.
-        Async functions require CPython's asyncio runtime, so we serialize
-        the source code and exec it in CPython, retrieving the callable."""
-        # Collect module references the async body needs
-        imports = set()
-        for child in ast.walk(node):
-            if isinstance(child, ast.Attribute) and isinstance(child.value, ast.Name):
-                name = child.value.id
-                if name in self._cpython_modules or name in ("asyncio",):
-                    imports.add(name)
-            if isinstance(child, ast.Name) and child.id in self._cpython_modules:
-                imports.add(child.id)
+        """Emit `async def f(): ...` by compiling as a regular function.
 
-        # Build source code from AST
-        import_stmts = "\n".join(f"import {m}" for m in sorted(imports))
-        func_source = ast.unparse(ast.Module(body=[node], type_ignores=[]))
-        full_source = f"{import_stmts}\n{func_source}" if imports else func_source
+        In an AOT binary, there's no event loop to yield to, so async
+        functions are compiled synchronously: `await expr` becomes just
+        `expr` (the awaited call is executed immediately).
 
-        source_ptr = self._make_string_constant(full_source)
-        name_ptr = self._make_string_constant(node.name)
-        func_ptr = self.builder.call(
-            self.runtime["cpython_exec_get"], [source_ptr, name_ptr])
-        self._store_variable(node.name, func_ptr, "pyobj")
+        For programs that use asyncio.run() or asyncio.gather(), those
+        still route through the CPython bridge via import. But standalone
+        async functions (the common case in compiled code) become native.
+
+        Since asyncio is now a native module (run/gather/sleep handled natively),
+        async functions that use asyncio are also compiled natively.
+        """
+        # Transform async def into regular def by stripping await.
+        # Create a regular FunctionDef with the same body, where:
+        # - `await expr` → just `expr` (synchronous call)
+        # - `async for` → regular `for`
+        # - `async with` → regular `with`
+        sync_node = self._async_to_sync(node)
+        # Declare and emit as a regular function
+        if sync_node.name not in self._user_functions:
+            self._declare_user_function(sync_node)
+        self._emit_function_def(sync_node)
+
+    def _async_to_sync(self, node: ast.AsyncFunctionDef) -> ast.FunctionDef:
+        """Transform an async function definition into a synchronous one.
+        Strips await, async for, async with into their sync equivalents."""
+        import copy
+
+        class AsyncStripper(ast.NodeTransformer):
+            def visit_Await(self, node):
+                # await expr → just expr
+                self.generic_visit(node)
+                return node.value
+
+            def visit_AsyncFor(self, node):
+                self.generic_visit(node)
+                return ast.For(
+                    target=node.target, iter=node.iter,
+                    body=node.body, orelse=node.orelse)
+
+            def visit_AsyncWith(self, node):
+                self.generic_visit(node)
+                return ast.With(items=node.items, body=node.body)
+
+        # Create FunctionDef from AsyncFunctionDef
+        sync = ast.FunctionDef(
+            name=node.name,
+            args=copy.deepcopy(node.args),
+            body=copy.deepcopy(node.body),
+            decorator_list=[],
+            returns=node.returns)
+        ast.copy_location(sync, node)
+        # Strip async constructs
+        sync = AsyncStripper().visit(sync)
+        ast.fix_missing_locations(sync)
+        return sync
 
     def _emit_try_star(self, node: ast.TryStar) -> None:
         """Emit try/except* (exception groups).
@@ -9047,6 +11388,33 @@ class CodeGen:
                 return self.builder.icmp_signed(
                     "==", tag, ir.Constant(i32, FPY_TAG_NONE))
 
+        # Class variable attribute access: cls.attr is None / ClassName.attr is None
+        # Load the pointer from the class var global and compare to null.
+        if isinstance(other, ast.Attribute):
+            attr_class = None
+            if (isinstance(other.value, ast.Name)
+                    and other.value.id in self._user_classes):
+                attr_class = other.value.id
+            elif (isinstance(other.value, ast.Name)
+                  and self._current_class is not None
+                  and other.value.id in self.variables
+                  and self.variables[other.value.id][1] == "cls"):
+                attr_class = self._current_class
+            if attr_class:
+                key = (attr_class, other.attr)
+                if key in getattr(self, "_class_var_globals", {}):
+                    gvar, gtag = self._class_var_globals[key]
+                    val = self.builder.load(gvar)
+                    if isinstance(val.type, ir.PointerType):
+                        cmp = self.builder.icmp_unsigned(
+                            "==", val, ir.Constant(val.type, None))
+                    else:
+                        cmp = self.builder.icmp_signed(
+                            "==", val, ir.Constant(val.type, 0))
+                    if isinstance(op, ast.IsNot):
+                        return self.builder.not_(cmp)
+                    return cmp
+
         is_other_none = False
         if isinstance(other, ast.Constant) and other.value is None:
             is_other_none = True
@@ -9395,6 +11763,10 @@ class CodeGen:
                 if tag == "closure":
                     self._emit_closure_call(node)
                     return
+            # Singledispatch: emit the dispatch switch
+            if name in self._singledispatch and node.args:
+                self._emit_singledispatch_call(node, name)
+                return
             if name in self._user_functions:
                 self._emit_user_call(node)
                 return
@@ -9402,6 +11774,17 @@ class CodeGen:
                 self._emit_constructor(node)
                 return
         if isinstance(node.func, ast.Attribute):
+            # Native module call (asyncio.run, json.dumps, etc.)
+            if isinstance(node.func.value, ast.Name):
+                _nm = node.func.value.id
+                _is_native = ((_nm in self.variables
+                              and self.variables[_nm][1] == "native_mod")
+                             or _nm in getattr(self, '_native_modules', set()))
+                if _is_native:
+                    result = self._emit_native_module_call(
+                        _nm, node.func.attr, node)
+                    if result is not None:
+                        return
             # Check if receiver is a CPython module/object (pyobj-tagged)
             # Also handle chained attrs: os.path.exists() → os is pyobj
             receiver_is_pyobj = False
@@ -9428,6 +11811,31 @@ class CodeGen:
         # Last resort: try as closure call
         if isinstance(node.func, ast.Name) and node.func.id in self.variables:
             self._emit_closure_call(node)
+            return
+        # exec/eval as statements — route through our locals-aware handlers
+        if isinstance(node.func, ast.Name) and node.func.id == "exec":
+            if len(node.args) >= 1:
+                # Compile-time exec: literal string → parse and compile inline
+                if (isinstance(node.args[0], ast.Constant)
+                        and isinstance(node.args[0].value, str)):
+                    self._compile_exec_literal(node.args[0].value, node)
+                    return
+                # Dynamic exec: route through CPython bridge
+                locals_dict = self._emit_locals_dict()
+                arg = self._emit_expr_value(node.args[0])
+                if isinstance(arg.type, ir.PointerType):
+                    code_ptr = arg
+                elif isinstance(arg.type, ir.IntType):
+                    code_ptr = self.builder.inttoptr(arg, i8_ptr)
+                else:
+                    code_ptr = self.builder.inttoptr(
+                        self.builder.bitcast(arg, i64), i8_ptr)
+                self.builder.call(self.runtime["cpython_exec_locals"],
+                                  [code_ptr, locals_dict])
+                return
+        if isinstance(node.func, ast.Name) and node.func.id == "eval":
+            # eval() used as a statement (return value discarded)
+            self._emit_call_expr(node)
             return
         # CPython bridge fallback for builtin calls used as statements
         # (e.g. next(gen), iter(x), etc.)
@@ -9468,6 +11876,128 @@ class CodeGen:
                                        out_tag, out_data])
                 return
         raise CodeGenError(f"Unsupported function call: {ast.dump(node.func)}", node)
+
+    # ── Singledispatch native dispatch ───────────────────────────────
+
+    # Maps Python type names to FPY_TAG values for singledispatch switches
+    _TYPE_TO_TAG = {
+        "int": FPY_TAG_INT, "float": FPY_TAG_FLOAT, "str": FPY_TAG_STR,
+        "bool": FPY_TAG_BOOL, "list": FPY_TAG_LIST, "dict": FPY_TAG_DICT,
+        "set": FPY_TAG_SET, "bytes": FPY_TAG_BYTES,
+    }
+
+    def _emit_singledispatch_call(self, node: ast.Call,
+                                   base_name: str) -> ir.Value:
+        """Emit a native singledispatch call with a switch on the first
+        argument's runtime FV tag. Returns i64 (or void sentinel for
+        statement context).
+        """
+        dispatch = self._singledispatch[base_name]
+
+        # Get the first argument's FV tag at runtime
+        first_arg_node = node.args[0]
+        first_fv = self._load_or_wrap_fv(first_arg_node)
+        first_tag = self.builder.extract_value(first_fv, 0, name="sd.tag")
+        first_data = self.builder.extract_value(first_fv, 1, name="sd.data")
+
+        # Prepare remaining args (emit once, shared across branches)
+        extra_args = [self._emit_expr_value(a) for a in node.args[1:]]
+
+        # Build the switch: one branch per registered type, default → base
+        default_b = self._new_block(f"sd.{base_name}.default")
+        merge_b = self._new_block(f"sd.{base_name}.merge")
+
+        # Result alloca (for expression context — stores the return value)
+        result_alloca = self._create_entry_alloca(i64, f"sd.{base_name}.result")
+        self.builder.store(ir.Constant(i64, 0), result_alloca)
+
+        # Build switch cases
+        switch = self.builder.switch(first_tag, default_b)
+        for type_name, mangled in dispatch.items():
+            tag_val = self._TYPE_TO_TAG.get(type_name)
+            if tag_val is None:
+                # User class: match by class_id via OBJ tag + runtime check.
+                # For simplicity, fall through to default for unknown types.
+                continue
+            case_b = self._new_block(f"sd.{base_name}.{type_name}")
+            switch.add_case(ir.Constant(i32, tag_val), case_b)
+
+            # Emit the variant call in this block
+            self.builder.position_at_end(case_b)
+            variant_info = self._user_functions.get(mangled)
+            if variant_info is not None:
+                if variant_info.uses_fv_abi:
+                    # FV ABI: pass FpyValue struct directly
+                    call_args = [first_fv] + [
+                        self._load_or_wrap_fv(a) for a in node.args[1:]]
+                else:
+                    call_args = [first_data] + [
+                        self._coerce_to_type(a, p.type)
+                        for a, p in zip(extra_args,
+                                        list(variant_info.func.args)[1:])]
+                    fp = variant_info.func.args[0]
+                    if fp.type != first_data.type:
+                        call_args[0] = self._coerce_to_type(first_data, fp.type)
+                ret = self.builder.call(variant_info.func, call_args)
+                if ret.type != void:
+                    stored = ret
+                    if isinstance(stored.type, ir.PointerType):
+                        stored = self.builder.ptrtoint(stored, i64)
+                    elif isinstance(stored.type, ir.DoubleType):
+                        stored = self.builder.bitcast(stored, i64)
+                    elif isinstance(stored.type, ir.IntType) and stored.type.width != 64:
+                        stored = self.builder.zext(stored, i64)
+                    self.builder.store(stored, result_alloca)
+            self.builder.branch(merge_b)
+
+        # Default block: call the base function
+        self.builder.position_at_end(default_b)
+        base_info = self._user_functions.get(base_name)
+        if base_info is not None:
+            if base_info.uses_fv_abi:
+                base_args = [first_fv] + [
+                    self._load_or_wrap_fv(a) for a in node.args[1:]]
+            else:
+                base_args = [first_data] + [
+                    self._coerce_to_type(a, p.type)
+                    for a, p in zip(extra_args,
+                                    list(base_info.func.args)[1:])]
+                fp = base_info.func.args[0]
+                if fp.type != first_data.type:
+                    base_args[0] = self._coerce_to_type(first_data, fp.type)
+            ret = self.builder.call(base_info.func, base_args)
+            if ret.type != void:
+                stored = ret
+                if isinstance(stored.type, ir.PointerType):
+                    stored = self.builder.ptrtoint(stored, i64)
+                elif isinstance(stored.type, ir.DoubleType):
+                    stored = self.builder.bitcast(stored, i64)
+                elif isinstance(stored.type, ir.IntType) and stored.type.width != 64:
+                    stored = self.builder.zext(stored, i64)
+                self.builder.store(stored, result_alloca)
+        self.builder.branch(merge_b)
+
+        # Merge
+        self.builder.position_at_end(merge_b)
+        return self.builder.load(result_alloca)
+
+    def _coerce_to_type(self, value: ir.Value, target_type: ir.Type) -> ir.Value:
+        """Coerce an LLVM value to the target type."""
+        if value.type == target_type:
+            return value
+        if isinstance(target_type, ir.PointerType) and isinstance(value.type, ir.IntType):
+            return self.builder.inttoptr(value, target_type)
+        if isinstance(target_type, ir.IntType) and isinstance(value.type, ir.PointerType):
+            return self.builder.ptrtoint(value, target_type)
+        if isinstance(target_type, ir.DoubleType) and isinstance(value.type, ir.IntType):
+            return self.builder.bitcast(value, target_type)
+        if isinstance(target_type, ir.IntType) and isinstance(value.type, ir.DoubleType):
+            return self.builder.bitcast(value, target_type)
+        if isinstance(target_type, ir.IntType) and isinstance(value.type, ir.IntType):
+            if target_type.width > value.type.width:
+                return self.builder.zext(value, target_type)
+            return self.builder.trunc(value, target_type)
+        return value
 
     def _emit_closure_call(self, node: ast.Call) -> ir.Value:
         """Call a closure or function-pointer variable."""
@@ -9557,9 +12087,42 @@ class CodeGen:
                 class_name, node.args, node.keywords)
         cls_info = self._user_classes[class_name]
 
-        # Create new object
+        # Create new object — call __new__ if the class defines one,
+        # otherwise use the default obj_new allocator.
         class_id = self.builder.load(cls_info.class_id_global)
-        obj = self.builder.call(self.runtime["obj_new"], [class_id])
+        new_fn = cls_info.methods.get("__new__") if cls_info.methods else None
+        if new_fn is not None:
+            # __new__(cls, *args) — pass class_id + constructor args
+            new_args = [class_id]
+            for arg_node in node.args:
+                v = self._emit_expr_value(arg_node)
+                if isinstance(v.type, ir.PointerType):
+                    v = self.builder.ptrtoint(v, i64)
+                elif isinstance(v.type, ir.DoubleType):
+                    v = self.builder.bitcast(v, i64)
+                elif isinstance(v.type, ir.IntType) and v.type.width != 64:
+                    v = self.builder.zext(v, i64)
+                new_args.append(v)
+            # Coerce to match __new__'s parameter types
+            coerced_new = []
+            for val, param in zip(new_args, new_fn.args):
+                if val.type != param.type:
+                    if isinstance(param.type, ir.IntType) and isinstance(val.type, ir.IntType):
+                        if param.type.width < val.type.width:
+                            val = self.builder.trunc(val, param.type)
+                        else:
+                            val = self.builder.zext(val, param.type)
+                    elif isinstance(param.type, ir.PointerType) and isinstance(val.type, ir.IntType):
+                        val = self.builder.inttoptr(val, param.type)
+                    elif isinstance(param.type, ir.IntType) and isinstance(val.type, ir.PointerType):
+                        val = self.builder.ptrtoint(val, param.type)
+                coerced_new.append(val)
+            obj = self.builder.call(new_fn, coerced_new)
+            # __new__ returns an i8* object pointer
+            if isinstance(obj.type, ir.IntType):
+                obj = self.builder.inttoptr(obj, i8_ptr)
+        else:
+            obj = self.builder.call(self.runtime["obj_new"], [class_id])
 
         def coerce_to_i64(v):
             if isinstance(v.type, ir.PointerType):
@@ -10205,12 +12768,37 @@ class CodeGen:
                     and isinstance(alloca.type, ir.PointerType)
                     and alloca.type.pointee is fpy_val):
                 return self.builder.load(alloca, name=f"{node.id}.fv")
-        # Dict subscript: load the FV directly to preserve the runtime tag
-        # (avoids the dict-with-int / dict-with-list heuristic for printing).
+        # defaultdict subscript: must use defaultdict_get for auto-default
         if (isinstance(node, ast.Subscript)
-                and self._is_dict_expr(node.value)
+                and self._is_defaultdict_expr(node.value)
                 and not isinstance(node.slice, ast.Slice)):
             obj = self._emit_expr_value(node.value)
+            if isinstance(obj.type, ir.IntType):
+                obj = self.builder.inttoptr(obj, i8_ptr)
+            key = self._emit_expr_value(node.slice)
+            tag_slot = self._create_entry_alloca(i32, "dd.fv.tag")
+            data_slot = self._create_entry_alloca(i64, "dd.fv.data")
+            if isinstance(key.type, ir.PointerType):
+                self.builder.call(self.runtime["defaultdict_get"],
+                                  [obj, key, tag_slot, data_slot])
+            else:
+                tag_c, data_c = self._bare_to_tag_data(key, node.slice)
+                self.builder.call(self.runtime["defaultdict_get_fv"],
+                                  [obj, ir.Constant(i32, tag_c), data_c,
+                                   tag_slot, data_slot])
+            return self._fv_build_from_slots(
+                self.builder.load(tag_slot),
+                self.builder.load(data_slot))
+        # Dict subscript: load the FV directly to preserve the runtime tag
+        # (avoids the dict-with-int / dict-with-list heuristic for printing).
+        # Also handles Counter (which is dict-backed).
+        if (isinstance(node, ast.Subscript)
+                and (self._is_dict_expr(node.value)
+                     or self._is_counter_expr(node.value))
+                and not isinstance(node.slice, ast.Slice)):
+            obj = self._emit_expr_value(node.value)
+            if isinstance(obj.type, ir.IntType):
+                obj = self.builder.inttoptr(obj, i8_ptr)
             key = self._emit_expr_value(node.slice)
             if isinstance(key.type, ir.PointerType):
                 tag_slot = self._create_entry_alloca(i32, "dget.tag")
@@ -10236,22 +12824,28 @@ class CodeGen:
         # generic Attribute handler which calls obj_get_fv.
         # Native module attribute (math.pi): return constant as FpyValue
         if (isinstance(node, ast.Attribute)
-                and isinstance(node.value, ast.Name)
-                and node.value.id in self.variables
-                and self.variables[node.value.id][1] == "native_mod"):
-            val = self._emit_native_module_attr(node.value.id, node.attr)
-            if val is not None:
-                return self._wrap_for_print(val, node)
+                and isinstance(node.value, ast.Name)):
+            _nm = node.value.id
+            _is_native = ((_nm in self.variables
+                          and self.variables[_nm][1] == "native_mod")
+                         or _nm in getattr(self, '_native_modules', set()))
+            if _is_native:
+                val = self._emit_native_module_attr(_nm, node.attr)
+                if val is not None:
+                    return self._wrap_for_print(val, node)
         # Native module call in print context (print(math.sqrt(x)))
         if (isinstance(node, ast.Call)
                 and isinstance(node.func, ast.Attribute)
-                and isinstance(node.func.value, ast.Name)
-                and node.func.value.id in self.variables
-                and self.variables[node.func.value.id][1] == "native_mod"):
-            val = self._emit_native_module_call(
-                node.func.value.id, node.func.attr, node)
-            if val is not None:
-                return self._wrap_for_print(val, node)
+                and isinstance(node.func.value, ast.Name)):
+            _nm = node.func.value.id
+            _is_native = ((_nm in self.variables
+                          and self.variables[_nm][1] == "native_mod")
+                         or _nm in getattr(self, '_native_modules', set()))
+            if _is_native:
+                val = self._emit_native_module_call(
+                    _nm, node.func.attr, node)
+                if val is not None:
+                    return self._wrap_for_print(val, node)
         if (isinstance(node, ast.Attribute)
                 and isinstance(node.value, ast.Name)
                 and node.value.id in self.variables
@@ -10369,6 +12963,11 @@ class CodeGen:
                 and self.variables[node.func.id][1] == "pyobj"):
             return self._emit_cpython_direct_call_expr(node)
         value = self._emit_expr_value(node)
+        # If the value is already an FpyValue struct (e.g., from eval()),
+        # return it directly — no wrapping needed.
+        if (isinstance(value.type, ir.LiteralStructType)
+                and value.type == fpy_val):
+            return value
         return self._wrap_for_print(value, node)
 
     def _wrap_for_print(self, value: ir.Value, node: ast.expr) -> ir.Value:
@@ -10387,6 +12986,9 @@ class CodeGen:
                     and (node.value > 2**63 - 1 or node.value < -(2**63))):
                 return self._fv_build_from_slots(
                     ir.Constant(i32, FPY_TAG_BIGINT), value)
+            if isinstance(node.value, complex):
+                return self._fv_build_from_slots(
+                    ir.Constant(i32, FPY_TAG_COMPLEX), value)
 
         # Constant-folded BigInt: BinOp that evaluated to a big int at compile time
         if isinstance(node, ast.BinOp):
@@ -10424,6 +13026,12 @@ class CodeGen:
                 return self._fv_from_float(value)
             if var_tag == "int":
                 return self._fv_from_int(value)
+            if var_tag == "bigint":
+                return self._fv_build_from_slots(
+                    ir.Constant(i32, FPY_TAG_BIGINT), value)
+            if var_tag == "complex":
+                return self._fv_build_from_slots(
+                    ir.Constant(i32, FPY_TAG_COMPLEX), value)
 
         # Containers: tag from AST
         if isinstance(value.type, ir.PointerType):
@@ -10605,6 +13213,56 @@ class CodeGen:
             if isinstance(node.op, ast.Sub):
                 if self._is_set_expr(node.left):
                     return True
+        return False
+
+    def _is_deque_expr(self, node: ast.expr) -> bool:
+        """Check if an AST expression evaluates to a deque."""
+        if isinstance(node, ast.Name) and node.id in self.variables:
+            _, type_tag = self.variables[node.id]
+            return type_tag == "deque"
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            native_imports = getattr(self, '_native_imports', {})
+            if node.func.id in native_imports:
+                mod, fn = native_imports[node.func.id]
+                return mod == "collections" and fn == "deque"
+        return False
+
+    def _is_counter_expr(self, node: ast.expr) -> bool:
+        """Check if an AST expression evaluates to a Counter."""
+        if isinstance(node, ast.Name) and node.id in self.variables:
+            _, type_tag = self.variables[node.id]
+            return type_tag == "counter"
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            native_imports = getattr(self, '_native_imports', {})
+            if node.func.id in native_imports:
+                mod, fn = native_imports[node.func.id]
+                return mod == "collections" and fn == "Counter"
+        return False
+
+    def _is_defaultdict_expr(self, node: ast.expr) -> bool:
+        """Check if an AST expression evaluates to a defaultdict."""
+        if isinstance(node, ast.Name) and node.id in self.variables:
+            _, type_tag = self.variables[node.id]
+            return type_tag == "defaultdict"
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            native_imports = getattr(self, '_native_imports', {})
+            if node.func.id in native_imports:
+                mod, fn = native_imports[node.func.id]
+                return mod == "collections" and fn == "defaultdict"
+        return False
+
+    def _is_chainmap_expr(self, node: ast.expr) -> bool:
+        """Check if an AST expression evaluates to a ChainMap."""
+        if isinstance(node, ast.Name) and node.id in self.variables:
+            _, type_tag = self.variables[node.id]
+            return type_tag == "chainmap"
+        return False
+
+    def _is_logger_expr(self, node: ast.expr) -> bool:
+        """Check if an AST expression evaluates to a logging.Logger."""
+        if isinstance(node, ast.Name) and node.id in self.variables:
+            _, type_tag = self.variables[node.id]
+            return type_tag == "logger"
         return False
 
     def _is_list_expr(self, node: ast.expr) -> bool:
@@ -10933,8 +13591,70 @@ class CodeGen:
             return self.builder.select(is_float, float_val, int_as_float)
         return None  # not a pyobj
 
+    def _is_complex_expr(self, node: ast.expr) -> bool:
+        """Check if an expression evaluates to a complex number."""
+        if isinstance(node, ast.Constant) and isinstance(node.value, complex):
+            return True
+        if isinstance(node, ast.Name) and node.id in self.variables:
+            return self.variables[node.id][1] == "complex"
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id == "complex"):
+            return True
+        return False
+
+    def _emit_complex_binop(self, node: ast.BinOp,
+                              left_is_complex: bool,
+                              right_is_complex: bool) -> ir.Value:
+        """Emit binary operation with complex operands."""
+        # Get both operands as complex pointers
+        if left_is_complex:
+            left_val = self._emit_expr_value(node.left)
+            left_ptr = self.builder.inttoptr(left_val, i8_ptr)
+        else:
+            # Convert scalar to complex(val, 0)
+            left_val = self._emit_expr_value(node.left)
+            if isinstance(left_val.type, ir.IntType):
+                left_val = self.builder.sitofp(left_val, double)
+            left_ptr = self.builder.call(
+                self.runtime["complex_new"],
+                [left_val, ir.Constant(double, 0.0)])
+        if right_is_complex:
+            right_val = self._emit_expr_value(node.right)
+            right_ptr = self.builder.inttoptr(right_val, i8_ptr)
+        else:
+            right_val = self._emit_expr_value(node.right)
+            if isinstance(right_val.type, ir.IntType):
+                right_val = self.builder.sitofp(right_val, double)
+            right_ptr = self.builder.call(
+                self.runtime["complex_new"],
+                [right_val, ir.Constant(double, 0.0)])
+
+        op = node.op
+        if isinstance(op, ast.Add):
+            result = self.builder.call(self.runtime["complex_add"],
+                                       [left_ptr, right_ptr])
+        elif isinstance(op, ast.Sub):
+            result = self.builder.call(self.runtime["complex_sub"],
+                                       [left_ptr, right_ptr])
+        elif isinstance(op, ast.Mult):
+            result = self.builder.call(self.runtime["complex_mul"],
+                                       [left_ptr, right_ptr])
+        elif isinstance(op, ast.Div):
+            result = self.builder.call(self.runtime["complex_div"],
+                                       [left_ptr, right_ptr])
+        else:
+            raise CodeGenError(
+                f"Unsupported complex operation: {type(op).__name__}", node)
+        return self.builder.ptrtoint(result, i64)
+
     def _emit_binop(self, node: ast.BinOp) -> ir.Value:
         """Emit a binary operation and return the LLVM value."""
+        # Complex arithmetic: if either operand is complex, use complex ops
+        left_is_complex = self._is_complex_expr(node.left)
+        right_is_complex = self._is_complex_expr(node.right)
+        if left_is_complex or right_is_complex:
+            return self._emit_complex_binop(node, left_is_complex, right_is_complex)
+
         left = self._emit_expr_value(node.left)
         right = self._emit_expr_value(node.right)
 
@@ -11288,6 +14008,13 @@ class CodeGen:
             # Built-in constants
             if node.id == "NotImplemented":
                 return ir.Constant(i64, 0)  # sentinel
+            # Native module constants (e.g., logging.DEBUG, logging.INFO)
+            native_imports = getattr(self, '_native_imports', {})
+            if node.id in native_imports:
+                mod, attr = native_imports[node.id]
+                val = self._emit_native_module_attr(mod, attr)
+                if val is not None:
+                    return val
             # Check if this is a lambda-assigned function name used as a value
             if node.id in self._user_functions and node.id not in self.variables:
                 info = self._user_functions[node.id]
@@ -11305,6 +14032,20 @@ class CodeGen:
                     result = self.builder.call(
                         self.runtime["obj_call_method0"], [obj, name_ptr])
                     return self.builder.inttoptr(result, i8_ptr)
+            # BigInt negation: if the operand is a bigint variable, call bigint_neg
+            # and return the result tagged as BIGINT so print/assignment handle it correctly.
+            if (isinstance(node.operand, ast.Name)
+                    and node.operand.id in self.variables
+                    and self.variables[node.operand.id][1] == "bigint"):
+                operand = self._emit_expr_value(node.operand)
+                ptr = self.builder.inttoptr(operand, i8_ptr)
+                result = self.builder.call(self.runtime["bigint_neg"], [ptr])
+                result_i64 = self.builder.ptrtoint(result, i64)
+                # Return as FpyValue with BIGINT tag
+                fv = ir.Constant(fpy_val, ir.Undefined)
+                fv = self.builder.insert_value(fv, ir.Constant(i32, FPY_TAG_BIGINT), 0)
+                fv = self.builder.insert_value(fv, result_i64, 1)
+                return fv
             operand = self._emit_expr_value(node.operand)
             if isinstance(operand.type, ir.IntType):
                 return self.builder.neg(operand)
@@ -11396,13 +14137,15 @@ class CodeGen:
                     display = self._static_type_of(node.value.args[0])
                     return self._make_string_constant(display)
             # Native module attribute (e.g. math.pi): return constant
-            if (isinstance(node.value, ast.Name)
-                    and node.value.id in self.variables
-                    and self.variables[node.value.id][1] == "native_mod"):
-                result = self._emit_native_module_attr(
-                    node.value.id, node.attr)
-                if result is not None:
-                    return result
+            if isinstance(node.value, ast.Name):
+                _nm = node.value.id
+                _is_native = ((_nm in self.variables
+                              and self.variables[_nm][1] == "native_mod")
+                             or _nm in getattr(self, '_native_modules', set()))
+                if _is_native:
+                    result = self._emit_native_module_attr(_nm, node.attr)
+                    if result is not None:
+                        return result
             # CPython module attribute (e.g. os.sep): return as i8*
             # (PyObject*). Callers that need the FpyValue should use
             # _load_or_wrap_fv which does proper bridge conversion.
@@ -11446,6 +14189,18 @@ class CodeGen:
 
     def _emit_call_expr(self, node: ast.Call) -> ir.Value:
         """Emit a function call as an expression (return value is used)."""
+        # Native module method call: asyncio.run(), json.loads(), etc.
+        if (isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)):
+            _nm = node.func.value.id
+            _is_native = ((_nm in self.variables
+                          and self.variables[_nm][1] == "native_mod")
+                         or _nm in getattr(self, '_native_modules', set()))
+            if _is_native:
+                result = self._emit_native_module_call(
+                    _nm, node.func.attr, node)
+                if result is not None:
+                    return result
         if isinstance(node.func, ast.Name):
             name = node.func.id
             # Native module function (from math import sqrt → sqrt(x))
@@ -11462,6 +14217,9 @@ class CodeGen:
                 if tag == "native_func":
                     # Native function via from-import — already handled above
                     pass
+            # Singledispatch: emit a switch on the first arg's runtime tag
+            if name in self._singledispatch and node.args:
+                return self._emit_singledispatch_call(node, name)
             if name in self._user_functions:
                 result = self._emit_user_call(node)
                 if result is None:
@@ -11590,6 +14348,28 @@ class CodeGen:
                 if len(node.args) == 0:
                     return self.builder.call(self.runtime["list_new"], [])
                 raise CodeGenError("tuple() with wrong number of args", node)
+            if name == "complex":
+                # complex(real, imag) or complex(real)
+                if len(node.args) == 0:
+                    real = ir.Constant(double, 0.0)
+                    imag = ir.Constant(double, 0.0)
+                elif len(node.args) == 1:
+                    real = self._emit_expr_value(node.args[0])
+                    if isinstance(real.type, ir.IntType):
+                        real = self.builder.sitofp(real, double)
+                    imag = ir.Constant(double, 0.0)
+                elif len(node.args) == 2:
+                    real = self._emit_expr_value(node.args[0])
+                    imag = self._emit_expr_value(node.args[1])
+                    if isinstance(real.type, ir.IntType):
+                        real = self.builder.sitofp(real, double)
+                    if isinstance(imag.type, ir.IntType):
+                        imag = self.builder.sitofp(imag, double)
+                else:
+                    raise CodeGenError("complex() takes 0-2 args", node)
+                ptr = self.builder.call(self.runtime["complex_new"],
+                                        [real, imag])
+                return self.builder.ptrtoint(ptr, i64)
             if name == "reversed":
                 if len(node.args) == 1:
                     arg = self._emit_expr_value(node.args[0])
@@ -11674,6 +14454,18 @@ class CodeGen:
                     return self.builder.call(
                         self.runtime["str_to_int_base"], [val, base])
                 raise CodeGenError("int() with wrong number of args", node)
+            if name == "locals":
+                return self._emit_locals_dict()
+            if name == "globals":
+                # Build a dict from all global variables
+                d = self.builder.call(self.runtime["dict_new"], [])
+                for gname, (gvar, gtag) in self._global_vars.items():
+                    key = self._make_string_constant(gname)
+                    val = self.builder.load(gvar, name=f"g.{gname}")
+                    t, data = self._bare_to_tag_data(val, None)
+                    self.builder.call(self.runtime["dict_set_fv"],
+                                      [d, key, ir.Constant(i32, t), data])
+                return d
             if name == "map":
                 if len(node.args) == 2:
                     return self._emit_builtin_map(node)
@@ -11683,39 +14475,51 @@ class CodeGen:
                     return self._emit_builtin_filter(node)
                 raise CodeGenError("filter() takes 2 arguments (function, iterable)", node)
             if name == "eval":
-                if len(node.args) >= 1 and isinstance(node.args[0], ast.Constant):
-                    # Literal string eval: compile via exec_get at runtime
-                    expr_str = node.args[0].value
-                    code = f"__eval_result__ = {expr_str}"
-                    code_ptr = self._make_string_constant(code)
-                    name_ptr = self._make_string_constant("__eval_result__")
-                    result = self.builder.call(
-                        self.runtime["cpython_exec_get"], [code_ptr, name_ptr])
-                    # Convert the PyObject* result to native via bridge
-                    out_tag = self._create_entry_alloca(i32, "eval.tag")
-                    out_data = self._create_entry_alloca(i64, "eval.data")
-                    self.builder.call(self.runtime["cpython_to_fv"],
-                                      [result, out_tag, out_data])
-                    return self.builder.load(out_data)
-                if len(node.args) >= 1:
-                    # Dynamic eval: route expression through CPython bridge
-                    # Build code: __eval_result__ = eval(expr)
-                    blt = self._make_string_constant("builtins")
-                    blt_mod = self.builder.call(
-                        self.runtime["cpython_import"], [blt])
-                    eval_name = self._make_string_constant("eval")
-                    eval_fn = self.builder.call(
-                        self.runtime["cpython_getattr"], [blt_mod, eval_name])
-                    arg = self._emit_expr_value(node.args[0])
-                    tag, data = self._bare_to_tag_data(arg, node.args[0])
-                    out_tag = self._create_entry_alloca(i32, "eval.tag")
-                    out_data = self._create_entry_alloca(i64, "eval.data")
-                    self.builder.call(self.runtime["cpython_call1"],
-                                      [eval_fn,
-                                       ir.Constant(i32, tag), data,
-                                       out_tag, out_data])
-                    return self.builder.load(out_data)
-                raise CodeGenError("eval() requires at least 1 argument", node)
+                if len(node.args) < 1:
+                    raise CodeGenError("eval() requires at least 1 argument", node)
+                # Compile-time eval: literal string → parse and compile inline
+                if isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str):
+                    return self._compile_eval_literal(node.args[0].value, node)
+                # Dynamic eval: route through CPython bridge with locals dict
+                locals_dict = self._emit_locals_dict()
+                arg = self._emit_expr_value(node.args[0])
+                if isinstance(arg.type, ir.PointerType):
+                    expr_ptr = arg
+                elif isinstance(arg.type, ir.IntType):
+                    expr_ptr = self.builder.inttoptr(arg, i8_ptr)
+                else:
+                    expr_ptr = self.builder.inttoptr(
+                        self.builder.bitcast(arg, i64), i8_ptr)
+                out_tag = self._create_entry_alloca(i32, "eval.tag")
+                out_data = self._create_entry_alloca(i64, "eval.data")
+                self.builder.call(self.runtime["cpython_eval_locals"],
+                                  [expr_ptr, locals_dict, out_tag, out_data])
+                tag_val = self.builder.load(out_tag)
+                data_val = self.builder.load(out_data)
+                fv = ir.Constant(fpy_val, ir.Undefined)
+                fv = self.builder.insert_value(fv, tag_val, 0)
+                fv = self.builder.insert_value(fv, data_val, 1)
+                return fv
+            if name == "exec":
+                if len(node.args) < 1:
+                    raise CodeGenError("exec() requires at least 1 argument", node)
+                # Compile-time exec: literal string → parse and compile inline
+                if isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str):
+                    self._compile_exec_literal(node.args[0].value, node)
+                    return ir.Constant(i64, 0)
+                # Dynamic exec: route through CPython bridge with locals dict
+                locals_dict = self._emit_locals_dict()
+                arg = self._emit_expr_value(node.args[0])
+                if isinstance(arg.type, ir.PointerType):
+                    code_ptr = arg
+                elif isinstance(arg.type, ir.IntType):
+                    code_ptr = self.builder.inttoptr(arg, i8_ptr)
+                else:
+                    code_ptr = self.builder.inttoptr(
+                        self.builder.bitcast(arg, i64), i8_ptr)
+                self.builder.call(self.runtime["cpython_exec_locals"],
+                                  [code_ptr, locals_dict])
+                return ir.Constant(i64, 0)
             if name == "enumerate":
                 if len(node.args) >= 1:
                     lst = self._emit_expr_value(node.args[0])
@@ -11864,9 +14668,49 @@ class CodeGen:
                     val = self._emit_expr_value(arg_node)
                     return val
                 raise CodeGenError("hash() takes exactly one argument", node)
+            if name == "next":
+                if len(node.args) >= 1:
+                    arg_node = node.args[0]
+                    obj = self._emit_expr_value(arg_node)
+                    if isinstance(obj.type, ir.IntType):
+                        obj = self.builder.inttoptr(obj, i8_ptr)
+                    name_ptr = self._make_string_constant("__next__")
+                    return self.builder.call(
+                        self.runtime["obj_call_method0"],
+                        [obj, name_ptr])
+                raise CodeGenError("next() takes exactly one argument", node)
+            if name == "iter":
+                if len(node.args) == 1:
+                    arg_node = node.args[0]
+                    if self._is_obj_expr(arg_node):
+                        obj = self._emit_expr_value(arg_node)
+                        if isinstance(obj.type, ir.IntType):
+                            obj = self.builder.inttoptr(obj, i8_ptr)
+                        name_ptr = self._make_string_constant("__iter__")
+                        return self.builder.call(
+                            self.runtime["obj_call_method0"],
+                            [obj, name_ptr])
+                    return self._emit_expr_value(arg_node)
+                raise CodeGenError("iter() takes exactly one argument", node)
             if name == "abs":
                 if len(node.args) == 1:
-                    val = self._emit_expr_value(node.args[0])
+                    # Complex abs: |a+bi| = sqrt(a^2 + b^2)
+                    arg_node = node.args[0]
+                    if (isinstance(arg_node, ast.Name)
+                            and arg_node.id in self.variables
+                            and self.variables[arg_node.id][1] == "complex"):
+                        val = self._emit_expr_value(arg_node)
+                        ptr = self.builder.inttoptr(val, i8_ptr)
+                        return self.builder.call(
+                            self.runtime["complex_abs"], [ptr])
+                    if (isinstance(arg_node, ast.Call)
+                            and isinstance(arg_node.func, ast.Name)
+                            and arg_node.func.id == "complex"):
+                        val = self._emit_expr_value(arg_node)
+                        ptr = self.builder.inttoptr(val, i8_ptr)
+                        return self.builder.call(
+                            self.runtime["complex_abs"], [ptr])
+                    val = self._emit_expr_value(arg_node)
                     if isinstance(val.type, ir.IntType):
                         neg = self.builder.neg(val)
                         is_neg = self.builder.icmp_signed("<", val, ir.Constant(i64, 0))
@@ -11989,15 +14833,13 @@ class CodeGen:
                     self.builder.position_at_end(end_block)
                     return self.builder.load(sum_alloca)
                 raise CodeGenError("sum() requires a list argument", node)
-            if name == "set":
+            if name in ("set", "frozenset"):
                 if len(node.args) == 1:
                     arg = self._emit_expr_value(node.args[0])
-                    # Convert list to dict-backed set
                     return self.builder.call(self.runtime["set_from_list"], [arg])
                 if len(node.args) == 0:
-                    # Empty set: empty dict (dict-backed set)
                     return self.builder.call(self.runtime["dict_new"], [])
-                raise CodeGenError("set() takes 0 or 1 arguments", node)
+                raise CodeGenError(f"{name}() takes 0 or 1 arguments", node)
             if name == "min" or name == "max":
                 # Extract key= kwarg if provided. Supports `key=len` (for
                 # strings) and `key=<user_function>` that returns int.
@@ -12169,9 +15011,22 @@ class CodeGen:
                                        ir.Constant(i32, t1), d1,
                                        ir.Constant(i32, t2), d2,
                                        out_tag, out_data])
+                elif n_args == 3:
+                    a1 = self._emit_expr_value(node.args[0])
+                    t1, d1 = self._bare_to_tag_data(a1, node.args[0])
+                    a2 = self._emit_expr_value(node.args[1])
+                    t2, d2 = self._bare_to_tag_data(a2, node.args[1])
+                    a3 = self._emit_expr_value(node.args[2])
+                    t3, d3 = self._bare_to_tag_data(a3, node.args[2])
+                    self.builder.call(self.runtime["cpython_call3"],
+                                      [callable_ptr,
+                                       ir.Constant(i32, t1), d1,
+                                       ir.Constant(i32, t2), d2,
+                                       ir.Constant(i32, t3), d3,
+                                       out_tag, out_data])
                 else:
                     raise CodeGenError(
-                        f"CPython bridge call with {n_args} args not supported",
+                        f"CPython bridge call with {n_args} args not supported (max 3)",
                         node)
                 data = self.builder.load(out_data)
                 return data
@@ -12449,13 +15304,578 @@ class CodeGen:
                     log_x = self.builder.call(self.runtime["math_log"], [x])
                     log_base = self.builder.call(self.runtime["math_log"], [base])
                     return self.builder.fdiv(log_x, log_base)
+            # json module
+            if mod_name == "json":
+                if func_name == "dumps" and len(node.args) == 1:
+                    val = self._emit_expr_value(node.args[0])
+                    tag, data = self._bare_to_tag_data(val, node.args[0])
+                    return self.builder.call(self.runtime["json_dumps"],
+                                             [ir.Constant(i32, tag), data])
+                if func_name == "loads" and len(node.args) == 1:
+                    arg = self._emit_expr_value(node.args[0])
+                    if isinstance(arg.type, ir.IntType):
+                        arg = self.builder.inttoptr(arg, i8_ptr)
+                    out_tag = self._create_entry_alloca(i32, "json.tag")
+                    out_data = self._create_entry_alloca(i64, "json.data")
+                    self.builder.call(self.runtime["json_loads"],
+                                      [arg, out_tag, out_data])
+                    # Return the data as a pointer (most JSON is dict/list)
+                    data_val = self.builder.load(out_data)
+                    return self.builder.inttoptr(data_val, i8_ptr)
+            # os module
+            if mod_name in ("os", "os.path"):
+                def _str_arg(idx=0):
+                    v = self._emit_expr_value(node.args[idx])
+                    if isinstance(v.type, ir.IntType):
+                        return self.builder.inttoptr(v, i8_ptr)
+                    return v
+                if func_name == "getcwd" and len(node.args) == 0:
+                    return self.builder.call(self.runtime["os_getcwd"], [])
+                if func_name == "listdir" and len(node.args) == 1:
+                    return self.builder.call(self.runtime["os_listdir"],
+                                             [_str_arg()])
+                if func_name == "getenv" and len(node.args) == 1:
+                    result = self.builder.call(self.runtime["os_getenv"],
+                                               [_str_arg()])
+                    # Returns NULL for missing env var → None
+                    is_null = self.builder.icmp_unsigned(
+                        "==", result, ir.Constant(i8_ptr, None))
+                    return self.builder.select(
+                        is_null,
+                        ir.Constant(i8_ptr, None),
+                        result)
+            # os.path functions (accessed as os.path.func via chained attr)
+            # Also support from-import: from os.path import exists
+            _os_path_fns = {
+                "exists": ("os_path_exists", 1, "bool"),
+                "isfile": ("os_path_isfile", 1, "bool"),
+                "isdir": ("os_path_isdir", 1, "bool"),
+                "join": ("os_path_join", 2, "str"),
+                "basename": ("os_path_basename", 1, "str"),
+                "dirname": ("os_path_dirname", 1, "str"),
+            }
+            # asyncio module — since async functions compile synchronously,
+            # asyncio.run() is a no-op wrapper and asyncio.gather() collects results.
+            if mod_name == "asyncio":
+                if func_name == "run" and len(node.args) == 1:
+                    # The coroutine already executed (await → direct call).
+                    # asyncio.run(result) just returns the result.
+                    arg = node.args[0]
+                    # If the arg is a void function call, call it as statement
+                    if (isinstance(arg, ast.Call)
+                            and isinstance(arg.func, ast.Name)
+                            and arg.func.id in self._user_functions
+                            and self._user_functions[arg.func.id].ret_tag == "void"):
+                        self._emit_user_call(arg)
+                        return ir.Constant(i64, 0)
+                    return self._emit_expr_value(arg)
+                if func_name == "gather":
+                    # Each arg is an already-computed coroutine result.
+                    # Collect into a list.
+                    lst = self.builder.call(self.runtime["list_new"], [])
+                    for arg_node in node.args:
+                        val = self._emit_expr_value(arg_node)
+                        tag, data = self._bare_to_tag_data(val, arg_node)
+                        self.builder.call(self.runtime["list_append_fv"],
+                                          [lst, ir.Constant(i32, tag), data])
+                    return lst
+                if func_name == "sleep":
+                    # asyncio.sleep(n) — in AOT, just sleep for real
+                    if len(node.args) == 1:
+                        val = self._emit_expr_value(node.args[0])
+                        # Convert to milliseconds for the runtime
+                        if isinstance(val.type, ir.IntType):
+                            val = self.builder.sitofp(val, double)
+                        # For now, just return None (sleep is a no-op in AOT)
+                        return ir.Constant(i64, 0)
+                    return ir.Constant(i64, 0)
+            if func_name in _os_path_fns:
+                rt_key, n_args, _ret = _os_path_fns[func_name]
+                if len(node.args) == n_args:
+                    args = []
+                    for i in range(n_args):
+                        v = self._emit_expr_value(node.args[i])
+                        if isinstance(v.type, ir.IntType):
+                            v = self.builder.inttoptr(v, i8_ptr)
+                        args.append(v)
+                    return self.builder.call(self.runtime[rt_key], args)
+
+            # --- collections module ---
+            if mod_name == "collections":
+                return self._emit_collections_call(func_name, node)
+
+            # --- typing module ---
+            # All typing constructs are no-ops at runtime. They just pass
+            # through their arguments or return identity.
+            if mod_name == "typing":
+                # cast(Type, value) → just return the value
+                if func_name == "cast" and len(node.args) == 2:
+                    return self._emit_expr_value(node.args[1])
+                # TypeVar("T") → dummy, never used at runtime
+                if func_name == "TypeVar":
+                    return ir.Constant(i64, 0)
+                # Generic type aliases: Optional[X], List[X], etc.
+                # When called as functions, they're identity
+                return ir.Constant(i64, 0)
+
+            # --- functools module ---
+            if mod_name == "functools":
+                return self._emit_functools_call(func_name, node)
+
+            # --- logging module ---
+            if mod_name == "logging":
+                return self._emit_logging_call(func_name, node)
+
+            # --- sys module ---
+            if mod_name == "sys":
+                if func_name == "exit":
+                    code = ir.Constant(i64, 0)
+                    if len(node.args) >= 1:
+                        code = self._emit_expr_value(node.args[0])
+                        if isinstance(code.type, ir.DoubleType):
+                            code = self.builder.fptosi(code, i64)
+                    self.builder.call(self.runtime["sys_exit"], [code])
+                    return ir.Constant(i64, 0)
+                return None
+
+            # --- time module ---
+            if mod_name == "time":
+                if func_name == "time" and len(node.args) == 0:
+                    return self.builder.call(self.runtime["time_time"], [])
+                if func_name == "time_ns" and len(node.args) == 0:
+                    return self.builder.call(self.runtime["time_time_ns"], [])
+                if func_name == "perf_counter" and len(node.args) == 0:
+                    return self.builder.call(self.runtime["time_perf_counter"], [])
+                if func_name == "perf_counter_ns" and len(node.args) == 0:
+                    # Return as nanoseconds (int)
+                    t = self.builder.call(self.runtime["time_perf_counter"], [])
+                    ns = self.builder.fmul(t, ir.Constant(double, 1e9))
+                    return self.builder.fptosi(ns, i64)
+                if func_name == "monotonic" and len(node.args) == 0:
+                    return self.builder.call(self.runtime["time_monotonic"], [])
+                if func_name == "sleep" and len(node.args) == 1:
+                    val = self._emit_expr_value(node.args[0])
+                    if isinstance(val.type, ir.IntType):
+                        val = self.builder.sitofp(val, double)
+                    self.builder.call(self.runtime["time_sleep"], [val])
+                    return ir.Constant(i64, 0)
+                return None
+
+            # --- contextlib module ---
+            if mod_name == "contextlib":
+                # contextmanager is a decorator — it's a no-op at compile time.
+                # The generator function is already compiled with yield support.
+                # suppress(*exceptions) — currently a no-op (exceptions ignored)
+                if func_name == "contextmanager":
+                    # Return the decorated function unchanged
+                    if len(node.args) == 1:
+                        return self._emit_expr_value(node.args[0])
+                    return ir.Constant(i64, 0)
+                if func_name == "suppress":
+                    # Returns a dummy context manager (no-op)
+                    return ir.Constant(i64, 0)
+                if func_name == "closing":
+                    # closing(thing) → just return the thing
+                    if len(node.args) == 1:
+                        return self._emit_expr_value(node.args[0])
+                    return ir.Constant(i64, 0)
+                return ir.Constant(i64, 0)
+
         return None
+
+    # --- Factory tag mapping for defaultdict ---
+    _DEFAULTDICT_FACTORY = {
+        "list": 0, "int": 1, "str": 2, "float": 3, "dict": 4,
+    }
+
+    def _emit_collections_call(self, func_name: str, node: ast.Call) -> ir.Value | None:
+        """Emit a collections module constructor/function call."""
+        # --- Counter ---
+        if func_name == "Counter":
+            if len(node.args) == 0:
+                return self.builder.call(self.runtime["counter_new"], [])
+            if len(node.args) == 1:
+                arg = self._emit_expr_value(node.args[0])
+                if isinstance(arg.type, ir.IntType):
+                    arg = self.builder.inttoptr(arg, i8_ptr)
+                return self.builder.call(self.runtime["counter_from_list"], [arg])
+
+        # --- defaultdict ---
+        if func_name == "defaultdict":
+            factory_tag = 1  # default to int
+            if len(node.args) >= 1:
+                # First arg is the factory function: list, int, str, float, dict
+                arg0 = node.args[0]
+                if isinstance(arg0, ast.Name) and arg0.id in self._DEFAULTDICT_FACTORY:
+                    factory_tag = self._DEFAULTDICT_FACTORY[arg0.id]
+            result = self.builder.call(
+                self.runtime["defaultdict_new"],
+                [ir.Constant(i32, factory_tag)])
+            # Track this variable as a defaultdict for subscript interception
+            if not hasattr(self, '_defaultdict_vars'):
+                self._defaultdict_vars = set()
+            # Mark the result — caller will store in a variable name
+            self._last_collections_type = "defaultdict"
+            return result
+
+        # --- deque ---
+        if func_name == "deque":
+            maxlen = ir.Constant(i64, -1)  # unlimited by default
+            # Check for maxlen keyword arg
+            for kw in node.keywords:
+                if kw.arg == "maxlen":
+                    maxlen = self._emit_expr_value(kw.value)
+                    if isinstance(maxlen.type, ir.DoubleType):
+                        maxlen = self.builder.fptosi(maxlen, i64)
+
+            if len(node.args) == 0:
+                result = self.builder.call(self.runtime["deque_new"], [maxlen])
+            else:
+                arg = self._emit_expr_value(node.args[0])
+                if isinstance(arg.type, ir.IntType):
+                    arg = self.builder.inttoptr(arg, i8_ptr)
+                result = self.builder.call(
+                    self.runtime["deque_from_list"], [arg, maxlen])
+            self._last_collections_type = "deque"
+            return result
+
+        # --- OrderedDict ---
+        if func_name == "OrderedDict":
+            # Our dict already preserves insertion order, so just create a dict
+            result = self.builder.call(self.runtime["ordereddict_new"], [])
+            return result
+
+        # --- namedtuple ---
+        if func_name == "namedtuple":
+            # namedtuple('TypeName', ['field1', 'field2', ...])
+            # This returns a type ID — actual instances created at call sites
+            if len(node.args) >= 2:
+                # Get the type name
+                type_name_node = node.args[0]
+                if isinstance(type_name_node, ast.Constant) and isinstance(type_name_node.value, str):
+                    type_name = type_name_node.value
+                else:
+                    return None
+
+                # Get field names
+                fields_node = node.args[1]
+                field_names = []
+                if isinstance(fields_node, ast.List):
+                    for elt in fields_node.elts:
+                        if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
+                            field_names.append(elt.value)
+                elif isinstance(fields_node, ast.Constant) and isinstance(fields_node.value, str):
+                    # "field1 field2 field3" or "field1, field2, field3"
+                    s = fields_node.value
+                    if ',' in s:
+                        field_names = [f.strip() for f in s.split(',')]
+                    else:
+                        field_names = s.split()
+
+                if field_names:
+                    n = len(field_names)
+                    # Emit string constants for field names
+                    name_ptr = self._make_string_constant(type_name)
+                    # Build an array of string pointers for field names
+                    arr_type = ir.ArrayType(i8_ptr, n)
+                    arr_alloca = self._create_entry_alloca(arr_type, "nt.fields")
+                    for i, fname in enumerate(field_names):
+                        fp = self._make_string_constant(fname)
+                        ptr = self.builder.gep(arr_alloca,
+                                               [ir.Constant(i64, 0), ir.Constant(i32, i)])
+                        self.builder.store(fp, ptr)
+                    arr_ptr = self.builder.bitcast(arr_alloca, ir.PointerType(i8_ptr))
+                    type_id = self.builder.call(
+                        self.runtime["namedtuple_register"],
+                        [name_ptr, arr_ptr, ir.Constant(i32, n)])
+                    # Store namedtuple info for later instance creation
+                    if not hasattr(self, '_namedtuple_types'):
+                        self._namedtuple_types = {}
+                    # We'll store the type_id as a constant — the result of
+                    # namedtuple() call is conceptually a "class". When it's
+                    # called later, we intercept it.
+                    self._last_collections_type = "namedtuple"
+                    self._last_namedtuple_info = {
+                        "type_name": type_name,
+                        "fields": field_names,
+                    }
+                    return type_id
+            return None
+
+        # --- ChainMap ---
+        if func_name == "ChainMap":
+            if len(node.args) == 0:
+                result = self.builder.call(self.runtime["chainmap_new"], [])
+            else:
+                # ChainMap(dict1, dict2, ...) — build from dicts
+                result = self.builder.call(self.runtime["chainmap_new"], [])
+                # For now, use the simple new + later populate approach
+                # TODO: implement chainmap_from_dicts with varargs
+            self._last_collections_type = "chainmap"
+            return result
+
+        return None
+
+    def _emit_functools_call(self, func_name: str, node: ast.Call) -> ir.Value | None:
+        """Emit functools module function calls."""
+        # wraps(func) — decorator that copies metadata. At compile time,
+        # this is a no-op (we don't have function metadata). Returns the
+        # function unchanged.
+        if func_name == "wraps":
+            if len(node.args) == 1:
+                return self._emit_expr_value(node.args[0])
+            return ir.Constant(i64, 0)
+
+        # partial(func, *args) — partial application.
+        # For AOT compilation, we can't create true partial objects at
+        # runtime without closures. Return a dummy for now — most usage
+        # is as a callback setup, handled by the closure system.
+        if func_name == "partial":
+            # In many patterns, partial is stored and called later.
+            # For now, return a sentinel (future: emit a closure wrapper).
+            return ir.Constant(i64, 0)
+
+        # lru_cache — decorator that memoizes. At compile time, applying
+        # @lru_cache to a function is a no-op (the function runs normally).
+        # The caching would require runtime dict lookups keyed by args.
+        if func_name == "lru_cache":
+            # Returns a decorator — effectively identity at compile time
+            return ir.Constant(i64, 0)
+
+        # reduce(func, iterable[, initial])
+        if func_name == "reduce" and len(node.args) >= 2:
+            return self._emit_functools_reduce(node)
+
+        # singledispatch is already handled natively by the compiler
+        return None
+
+    def _emit_functools_reduce(self, node: ast.Call) -> ir.Value:
+        """Emit functools.reduce(func, iterable[, initial]).
+
+        Inlines the reduce loop, calling the user function directly
+        via the normal call infrastructure (respects FV-ABI).
+        """
+        fn_node = node.args[0]
+        seq = self._emit_expr_value(node.args[1])
+
+        # Get the user function (if it's a known function)
+        user_func = None
+        if isinstance(fn_node, ast.Name) and fn_node.id in self._user_functions:
+            user_func = self._user_functions[fn_node.id].func
+
+        # Get sequence length
+        length = self.builder.call(self.runtime["list_length"], [seq])
+
+        # Determine initial value
+        if len(node.args) >= 3:
+            accum_init = self._emit_expr_value(node.args[2])
+            start_idx = ir.Constant(i64, 0)
+        else:
+            tag_slot = self._create_entry_alloca(i32, "red.tag")
+            data_slot = self._create_entry_alloca(i64, "red.data")
+            self.builder.call(self.runtime["list_get_fv"],
+                              [seq, ir.Constant(i64, 0), tag_slot, data_slot])
+            accum_init = self.builder.load(data_slot)
+            start_idx = ir.Constant(i64, 1)
+
+        # Loop: accumulate
+        accum_alloca = self._create_entry_alloca(i64, "red.accum")
+        self.builder.store(accum_init, accum_alloca)
+        idx_alloca = self._create_entry_alloca(i64, "red.idx")
+        self.builder.store(start_idx, idx_alloca)
+
+        cond_block = self._new_block("red.cond")
+        body_block = self._new_block("red.body")
+        end_block = self._new_block("red.end")
+
+        self.builder.branch(cond_block)
+        self.builder.position_at_end(cond_block)
+        idx = self.builder.load(idx_alloca)
+        cmp = self.builder.icmp_signed("<", idx, length)
+        self.builder.cbranch(cmp, body_block, end_block)
+
+        self.builder.position_at_end(body_block)
+        tag_slot2 = self._create_entry_alloca(i32, "red.el.tag")
+        data_slot2 = self._create_entry_alloca(i64, "red.el.data")
+        self.builder.call(self.runtime["list_get_fv"],
+                          [seq, idx, tag_slot2, data_slot2])
+        elem = self.builder.load(data_slot2)
+        accum = self.builder.load(accum_alloca)
+
+        # Call fn(accum, elem) — use user function directly if available
+        if user_func is not None:
+            # Match function parameter types — wrap as FpyValue if needed
+            params = list(user_func.args)
+            call_args = [accum, elem]
+            coerced = []
+            for val, param in zip(call_args, params):
+                if param.type == fpy_val:
+                    # Function expects FpyValue — wrap the i64 as INT
+                    val = self._fv_from_int(val)
+                elif val.type != param.type:
+                    if isinstance(param.type, ir.PointerType) and isinstance(val.type, ir.IntType):
+                        val = self.builder.inttoptr(val, param.type)
+                    elif isinstance(param.type, ir.IntType) and isinstance(val.type, ir.PointerType):
+                        val = self.builder.ptrtoint(val, param.type)
+                    elif (isinstance(param.type, ir.IntType)
+                          and isinstance(val.type, ir.IntType)
+                          and param.type.width != val.type.width):
+                        if param.type.width > val.type.width:
+                            val = self.builder.zext(val, param.type)
+                        else:
+                            val = self.builder.trunc(val, param.type)
+                coerced.append(val)
+            result = self.builder.call(user_func, coerced)
+            # Unwrap result to i64
+            if isinstance(result.type, ir.LiteralStructType) and result.type == fpy_val:
+                result = self._fv_data_i64(result)
+            elif isinstance(result.type, ir.PointerType):
+                result = self.builder.ptrtoint(result, i64)
+            elif isinstance(result.type, ir.IntType) and result.type.width != 64:
+                result = self.builder.zext(result, i64)
+        else:
+            # Fallback: call via function pointer (closure or unknown)
+            fn_ptr = self._emit_expr_value(fn_node)
+            if isinstance(fn_ptr.type, ir.IntType):
+                fn_ptr = self.builder.inttoptr(fn_ptr, i8_ptr)
+            fn_type = ir.FunctionType(i64, [i64, i64])
+            fn_typed = self.builder.bitcast(fn_ptr, ir.PointerType(fn_type))
+            result = self.builder.call(fn_typed, [accum, elem])
+
+        self.builder.store(result, accum_alloca)
+        next_idx = self.builder.add(idx, ir.Constant(i64, 1))
+        self.builder.store(next_idx, idx_alloca)
+        self.builder.branch(cond_block)
+
+        self.builder.position_at_end(end_block)
+        return self.builder.load(accum_alloca)
+
+    # Logging level constants
+    _LOGGING_LEVELS = {
+        "DEBUG": 10, "INFO": 20, "WARNING": 30, "WARN": 30,
+        "ERROR": 40, "CRITICAL": 50, "FATAL": 50,
+        "NOTSET": 0,
+    }
+
+    def _emit_logging_call(self, func_name: str, node: ast.Call) -> ir.Value | None:
+        """Emit logging module function calls."""
+
+        # --- logging.basicConfig(...) ---
+        if func_name == "basicConfig":
+            level = ir.Constant(i32, -1)  # -1 = don't change
+            fmt = self._make_string_constant("")
+            filename = self._make_string_constant("")
+            for kw in node.keywords:
+                if kw.arg == "level":
+                    lv = self._emit_expr_value(kw.value)
+                    if isinstance(lv.type, ir.IntType) and lv.type.width != 32:
+                        lv = self.builder.trunc(lv, i32) if lv.type.width > 32 \
+                            else self.builder.zext(lv, i32)
+                    level = lv
+                elif kw.arg == "format":
+                    fmt = self._emit_expr_value(kw.value)
+                    if isinstance(fmt.type, ir.IntType):
+                        fmt = self.builder.inttoptr(fmt, i8_ptr)
+                elif kw.arg == "filename":
+                    filename = self._emit_expr_value(kw.value)
+                    if isinstance(filename.type, ir.IntType):
+                        filename = self.builder.inttoptr(filename, i8_ptr)
+            self.builder.call(self.runtime["logging_basicConfig"],
+                              [level, fmt, filename])
+            return ir.Constant(i64, 0)
+
+        # --- logging.debug/info/warning/error/critical(msg) ---
+        _level_funcs = {
+            "debug": "logging_debug",
+            "info": "logging_info",
+            "warning": "logging_warning",
+            "warn": "logging_warning",
+            "error": "logging_error",
+            "critical": "logging_critical",
+            "fatal": "logging_critical",
+        }
+        if func_name in _level_funcs and len(node.args) >= 1:
+            msg = self._emit_logging_msg(node)
+            self.builder.call(self.runtime[_level_funcs[func_name]], [msg])
+            return ir.Constant(i64, 0)
+
+        # --- logging.log(level, msg) ---
+        if func_name == "log" and len(node.args) >= 2:
+            level = self._emit_expr_value(node.args[0])
+            if isinstance(level.type, ir.IntType) and level.type.width != 32:
+                level = self.builder.trunc(level, i32) if level.type.width > 32 \
+                    else self.builder.zext(level, i32)
+            msg = self._emit_logging_msg_from(node, start_idx=1)
+            name_ptr = self._make_string_constant("root")
+            self.builder.call(self.runtime["logging_log"],
+                              [level, name_ptr, msg])
+            return ir.Constant(i64, 0)
+
+        # --- logging.getLogger(name) ---
+        if func_name == "getLogger":
+            if len(node.args) >= 1:
+                name = self._emit_expr_value(node.args[0])
+                if isinstance(name.type, ir.IntType):
+                    name = self.builder.inttoptr(name, i8_ptr)
+            else:
+                name = self._make_string_constant("root")
+            result = self.builder.call(self.runtime["logging_getLogger"], [name])
+            self._last_collections_type = "logger"
+            return result
+
+        return None
+
+    def _emit_logging_msg(self, node: ast.Call) -> ir.Value:
+        """Build the message string for a logging call.
+        Handles: logging.info("hello"), logging.info("val=%d", val)"""
+        return self._emit_logging_msg_from(node, start_idx=0)
+
+    def _emit_logging_msg_from(self, node: ast.Call, start_idx: int) -> ir.Value:
+        """Build message string starting from args[start_idx]."""
+        fmt_node = node.args[start_idx]
+        fmt = self._emit_expr_value(fmt_node)
+        if isinstance(fmt.type, ir.IntType):
+            fmt = self.builder.inttoptr(fmt, i8_ptr)
+
+        # If there are additional args, use format_msg to interpolate
+        if len(node.args) > start_idx + 1:
+            args_list = self.builder.call(self.runtime["list_new"], [])
+            for arg_node in node.args[start_idx + 1:]:
+                val = self._emit_expr_value(arg_node)
+                tag, data = self._bare_to_tag_data(val, arg_node)
+                self.builder.call(self.runtime["list_append_fv"],
+                                  [args_list, ir.Constant(i32, tag), data])
+            return self.builder.call(self.runtime["logging_format_msg"],
+                                      [fmt, args_list])
+        return fmt
 
     def _emit_native_module_attr(self, mod_name: str, attr_name: str) -> ir.Value | None:
         """Emit a native module attribute access (e.g. math.pi).
         Returns the constant value, or None if not natively supported."""
         if attr_name in self._MATH_CONSTANTS:
             return ir.Constant(double, self._MATH_CONSTANTS[attr_name])
+        # typing.TYPE_CHECKING is always False at runtime
+        if mod_name == "typing" and attr_name == "TYPE_CHECKING":
+            return ir.Constant(i64, 0)
+        # logging.DEBUG/INFO/WARNING/ERROR/CRITICAL constants
+        if mod_name == "logging" and attr_name in self._LOGGING_LEVELS:
+            return ir.Constant(i64, self._LOGGING_LEVELS[attr_name])
+        # sys module attributes
+        if mod_name == "sys":
+            if attr_name == "platform":
+                return self.builder.call(self.runtime["sys_platform"], [])
+            if attr_name == "maxsize":
+                return self.builder.call(self.runtime["sys_maxsize"], [])
+            if attr_name == "argv":
+                return self.builder.call(self.runtime["sys_argv"], [])
+            if attr_name == "version_info":
+                return self.builder.call(self.runtime["sys_version_info"], [])
+            if attr_name == "stdout":
+                return ir.Constant(i64, 1)  # sentinel for stdout
+            if attr_name == "stderr":
+                return ir.Constant(i64, 2)  # sentinel for stderr
+            if attr_name == "path":
+                return self.builder.call(self.runtime["list_new"], [])
         return None
 
     def _emit_builtin_filter(self, node: ast.Call) -> ir.Value:
@@ -12525,6 +15945,18 @@ class CodeGen:
         if len(node.args) != 1:
             raise CodeGenError("len() takes exactly one argument", node)
         arg_node = node.args[0]
+        # Collections: deque uses its own length function
+        if self._is_deque_expr(arg_node):
+            value = self._emit_expr_value(arg_node)
+            if isinstance(value.type, ir.IntType):
+                value = self.builder.inttoptr(value, i8_ptr)
+            return self.builder.call(self.runtime["deque_length"], [value])
+        # Counter and defaultdict are dict-backed, use dict_length
+        if self._is_counter_expr(arg_node) or self._is_defaultdict_expr(arg_node):
+            value = self._emit_expr_value(arg_node)
+            if isinstance(value.type, ir.IntType):
+                value = self.builder.inttoptr(value, i8_ptr)
+            return self.builder.call(self.runtime["dict_length"], [value])
         if self._is_set_expr(arg_node):
             value = self._emit_expr_value(arg_node)
             if isinstance(value.type, ir.IntType):
@@ -12961,6 +16393,19 @@ class CodeGen:
             if self._current_class is None:
                 raise CodeGenError("super() can only be used inside a class method", node)
             cls_info = self._user_classes.get(self._current_class)
+            # super().__new__(cls) with no explicit parent → object.__new__(cls) → obj_new(cls)
+            if (method == "__new__"
+                    and (cls_info is None or cls_info.parent_name is None)):
+                if node.args:
+                    cls_arg = self._emit_expr_value(node.args[0])
+                    if isinstance(cls_arg.type, ir.PointerType):
+                        cls_arg = self.builder.ptrtoint(cls_arg, i32)
+                    elif isinstance(cls_arg.type, ir.IntType) and cls_arg.type.width != 32:
+                        cls_arg = self.builder.trunc(cls_arg, i32)
+                else:
+                    # No cls arg — use current class id
+                    cls_arg = self.builder.load(cls_info.class_id_global)
+                return self.builder.call(self.runtime["obj_new"], [cls_arg])
             if cls_info is None or cls_info.parent_name is None:
                 raise CodeGenError(f"Class {self._current_class} has no parent class", node)
             parent_info = self._user_classes.get(cls_info.parent_name)
@@ -13013,6 +16458,143 @@ class CodeGen:
                             val = self.builder.bitcast(val, param.type)
                     coerced.append(val)
                 return self.builder.call(func, coerced)
+
+        # --- Logging module: logger method calls ---
+        if self._is_logger_expr(attr.value):
+            logger_id = self._emit_expr_value(attr.value)
+            if isinstance(logger_id.type, ir.PointerType):
+                logger_id = self.builder.ptrtoint(logger_id, i32)
+            elif isinstance(logger_id.type, ir.IntType) and logger_id.type.width != 32:
+                logger_id = self.builder.trunc(logger_id, i32) \
+                    if logger_id.type.width > 32 \
+                    else self.builder.zext(logger_id, i32)
+            _logger_levels = {
+                "debug": 10, "info": 20, "warning": 30, "warn": 30,
+                "error": 40, "critical": 50, "fatal": 50,
+            }
+            if method in _logger_levels and len(node.args) >= 1:
+                msg = self._emit_logging_msg(node)
+                self.builder.call(self.runtime["logging_logger_log"],
+                                  [logger_id,
+                                   ir.Constant(i32, _logger_levels[method]),
+                                   msg])
+                return ir.Constant(i64, 0)
+            if method == "setLevel" and len(node.args) == 1:
+                level = self._emit_expr_value(node.args[0])
+                if isinstance(level.type, ir.IntType) and level.type.width != 32:
+                    level = self.builder.trunc(level, i32) \
+                        if level.type.width > 32 \
+                        else self.builder.zext(level, i32)
+                self.builder.call(self.runtime["logging_setLevel"],
+                                  [logger_id, level])
+                return ir.Constant(i64, 0)
+            if method == "log" and len(node.args) >= 2:
+                level = self._emit_expr_value(node.args[0])
+                if isinstance(level.type, ir.IntType) and level.type.width != 32:
+                    level = self.builder.trunc(level, i32) \
+                        if level.type.width > 32 \
+                        else self.builder.zext(level, i32)
+                msg = self._emit_logging_msg_from(node, start_idx=1)
+                self.builder.call(self.runtime["logging_logger_log"],
+                                  [logger_id, level, msg])
+                return ir.Constant(i64, 0)
+            raise CodeGenError(f"Unsupported logger method: .{method}()", node)
+
+        # --- Collections module method calls ---
+
+        # Check if object is a deque
+        if self._is_deque_expr(attr.value):
+            obj = self._emit_expr_value(attr.value)
+            if isinstance(obj.type, ir.IntType):
+                obj = self.builder.inttoptr(obj, i8_ptr)
+            if method == "append" and len(node.args) == 1:
+                val = self._emit_expr_value(node.args[0])
+                tag, data = self._bare_to_tag_data(val, node.args[0])
+                self.builder.call(self.runtime["deque_append"],
+                                  [obj, ir.Constant(i32, tag), data])
+                return obj
+            if method == "appendleft" and len(node.args) == 1:
+                val = self._emit_expr_value(node.args[0])
+                tag, data = self._bare_to_tag_data(val, node.args[0])
+                self.builder.call(self.runtime["deque_appendleft"],
+                                  [obj, ir.Constant(i32, tag), data])
+                return obj
+            if method == "pop" and len(node.args) == 0:
+                out_tag = self._create_entry_alloca(i32, "dq.pop.tag")
+                out_data = self._create_entry_alloca(i64, "dq.pop.data")
+                self.builder.call(self.runtime["deque_pop"],
+                                  [obj, out_tag, out_data])
+                return self.builder.load(out_data)
+            if method == "popleft" and len(node.args) == 0:
+                out_tag = self._create_entry_alloca(i32, "dq.popleft.tag")
+                out_data = self._create_entry_alloca(i64, "dq.popleft.data")
+                self.builder.call(self.runtime["deque_popleft"],
+                                  [obj, out_tag, out_data])
+                return self.builder.load(out_data)
+            if method == "rotate":
+                n = ir.Constant(i64, 1)
+                if len(node.args) == 1:
+                    n = self._emit_expr_value(node.args[0])
+                self.builder.call(self.runtime["deque_rotate"], [obj, n])
+                return obj
+            if method == "clear" and len(node.args) == 0:
+                self.builder.call(self.runtime["deque_clear"], [obj])
+                return obj
+            if method == "extend" and len(node.args) == 1:
+                other = self._emit_expr_value(node.args[0])
+                if isinstance(other.type, ir.IntType):
+                    other = self.builder.inttoptr(other, i8_ptr)
+                self.builder.call(self.runtime["deque_extend"], [obj, other])
+                return obj
+            if method == "extendleft" and len(node.args) == 1:
+                other = self._emit_expr_value(node.args[0])
+                if isinstance(other.type, ir.IntType):
+                    other = self.builder.inttoptr(other, i8_ptr)
+                self.builder.call(self.runtime["deque_extendleft"], [obj, other])
+                return obj
+            raise CodeGenError(f"Unsupported deque method: .{method}()", node)
+
+        # Check if object is a Counter
+        if self._is_counter_expr(attr.value):
+            obj = self._emit_expr_value(attr.value)
+            if isinstance(obj.type, ir.IntType):
+                obj = self.builder.inttoptr(obj, i8_ptr)
+            if method == "most_common":
+                n = ir.Constant(i64, -1)  # all elements
+                if len(node.args) == 1:
+                    n = self._emit_expr_value(node.args[0])
+                return self.builder.call(self.runtime["counter_most_common"],
+                                          [obj, n])
+            if method == "elements" and len(node.args) == 0:
+                return self.builder.call(self.runtime["counter_elements"], [obj])
+            if method == "update" and len(node.args) == 1:
+                other = self._emit_expr_value(node.args[0])
+                if isinstance(other.type, ir.IntType):
+                    other = self.builder.inttoptr(other, i8_ptr)
+                self.builder.call(self.runtime["counter_update_list"],
+                                  [obj, other])
+                return obj
+            # Counter also supports dict methods (keys, values, items, get, etc.)
+            if method == "keys":
+                return self.builder.call(self.runtime["dict_keys"], [obj])
+            if method == "values":
+                return self.builder.call(self.runtime["dict_values"], [obj])
+            if method == "items":
+                return self.builder.call(self.runtime["dict_items"], [obj])
+            raise CodeGenError(f"Unsupported Counter method: .{method}()", node)
+
+        # Check if object is a defaultdict — method calls go to regular dict methods
+        if self._is_defaultdict_expr(attr.value):
+            obj = self._emit_expr_value(attr.value)
+            if isinstance(obj.type, ir.IntType):
+                obj = self.builder.inttoptr(obj, i8_ptr)
+            if method == "keys":
+                return self.builder.call(self.runtime["dict_keys"], [obj])
+            if method == "values":
+                return self.builder.call(self.runtime["dict_values"], [obj])
+            if method == "items":
+                return self.builder.call(self.runtime["dict_items"], [obj])
+            raise CodeGenError(f"Unsupported defaultdict method: .{method}()", node)
 
         # Check if object is a list
         if self._is_list_expr(attr.value):
@@ -13431,7 +17013,43 @@ class CodeGen:
                     return self.builder.call(self.runtime["str_count"], [obj, sub])
             if method == "format":
                 return self._emit_str_format(node, obj)
-        raise CodeGenError(f"Unsupported method: .{method}()", node)
+        # Fallback: runtime method dispatch for unknown objects.
+        # This handles generated code (e.g. yield-from delegation)
+        # where the receiver's class isn't statically known.
+        obj = self._emit_expr_value(node.func.value)
+        if isinstance(obj.type, ir.IntType):
+            obj = self.builder.inttoptr(obj, i8_ptr)
+        name_ptr = self._make_string_constant(method)
+        n_args = len(node.args)
+        if n_args == 0:
+            return self.builder.call(
+                self.runtime["obj_call_method0"], [obj, name_ptr])
+        elif n_args == 1:
+            arg = self._emit_expr_value(node.args[0])
+            if isinstance(arg.type, ir.PointerType):
+                arg = self.builder.ptrtoint(arg, i64)
+            elif isinstance(arg.type, ir.DoubleType):
+                arg = self.builder.bitcast(arg, i64)
+            elif isinstance(arg.type, ir.IntType) and arg.type.width != 64:
+                arg = self.builder.zext(arg, i64)
+            return self.builder.call(
+                self.runtime["obj_call_method1"], [obj, name_ptr, arg])
+        elif n_args == 2:
+            a1 = self._emit_expr_value(node.args[0])
+            a2 = self._emit_expr_value(node.args[1])
+            for v in [a1, a2]:
+                if isinstance(v.type, ir.PointerType):
+                    v = self.builder.ptrtoint(v, i64)
+            return self.builder.call(
+                self.runtime["obj_call_method2"],
+                [obj, name_ptr,
+                 a1 if isinstance(a1.type, ir.IntType) and a1.type.width == 64
+                 else self.builder.ptrtoint(a1, i64) if isinstance(a1.type, ir.PointerType)
+                 else self.builder.zext(a1, i64),
+                 a2 if isinstance(a2.type, ir.IntType) and a2.type.width == 64
+                 else self.builder.ptrtoint(a2, i64) if isinstance(a2.type, ir.PointerType)
+                 else self.builder.zext(a2, i64)])
+        raise CodeGenError(f"Unsupported method: .{method}() with {n_args} args", node)
 
     def _method_overridden_in_subclass(self, base_class: str,
                                          method_name: str) -> bool:
@@ -13856,6 +17474,24 @@ class CodeGen:
 
     def _emit_subscript(self, node: ast.Subscript) -> ir.Value:
         """Emit subscript operation: s[i], s[i:j], d['key'], lst[i]."""
+        # __class_getitem__: ClassName[type_arg] — used for generic types.
+        # If the class defines __class_getitem__, call it as a classmethod.
+        # Otherwise, return a sentinel (type hints are no-ops at runtime).
+        if (isinstance(node.value, ast.Name)
+                and node.value.id in self._user_classes):
+            cls_info = self._user_classes[node.value.id]
+            cgi = (cls_info.methods.get("__class_getitem__")
+                   if cls_info.methods else None)
+            if cgi is not None:
+                class_id = self.builder.load(cls_info.class_id_global)
+                arg = self._emit_expr_value(node.slice)
+                if isinstance(arg.type, ir.PointerType):
+                    arg = self.builder.ptrtoint(arg, i64)
+                elif isinstance(arg.type, ir.IntType) and arg.type.width != 64:
+                    arg = self.builder.zext(arg, i64)
+                return self.builder.call(cgi, [class_id, arg])
+            # No __class_getitem__ — treat as type hint (no-op), return 0
+            return ir.Constant(i64, 0)
         # pyobj subscript: route through CPython bridge __getitem__
         if (isinstance(node.value, ast.Name)
                 and node.value.id in self.variables
@@ -13876,6 +17512,79 @@ class CodeGen:
                                ir.Constant(i32, tag), data,
                                out_tag, out_data])
             return self.builder.load(out_data)
+        # Check for Counter subscript access — uses regular dict get (returns 0 for missing)
+        if self._is_counter_expr(node.value):
+            obj = self._emit_expr_value(node.value)
+            if isinstance(obj.type, ir.IntType):
+                obj = self.builder.inttoptr(obj, i8_ptr)
+            key = self._emit_expr_value(node.slice)
+            # Counter[key] → dict lookup; missing keys should return 0
+            # Use dict_has_key to check, then get or return 0
+            if isinstance(key.type, ir.PointerType):
+                has = self.builder.call(self.runtime["dict_has_key"], [obj, key])
+                has_bool = self.builder.icmp_unsigned("!=", has, ir.Constant(i32, 0))
+                tag_slot = self._create_entry_alloca(i32, "ctr.tag")
+                data_slot = self._create_entry_alloca(i64, "ctr.data")
+                with_block = self._new_block("ctr.found")
+                merge_block = self._new_block("ctr.merge")
+                self.builder.cbranch(has_bool, with_block, merge_block)
+                self.builder.position_at_end(with_block)
+                self.builder.call(self.runtime["dict_get_fv"],
+                                  [obj, key, tag_slot, data_slot])
+                found_val = self.builder.load(data_slot)
+                self.builder.branch(merge_block)
+                self.builder.position_at_end(merge_block)
+                phi = self.builder.phi(i64, "ctr.val")
+                phi.add_incoming(found_val, with_block)
+                phi.add_incoming(ir.Constant(i64, 0), has_bool.parent)
+                return phi
+            else:
+                # Int key
+                has = self.builder.call(self.runtime["dict_has_int_key"], [obj, key])
+                has_bool = self.builder.icmp_unsigned("!=", has, ir.Constant(i32, 0))
+                with_block = self._new_block("ctr.found")
+                merge_block = self._new_block("ctr.merge")
+                self.builder.cbranch(has_bool, with_block, merge_block)
+                self.builder.position_at_end(with_block)
+                found_val = self.builder.call(
+                    self.runtime["dict_get_int_val"], [obj, key])
+                self.builder.branch(merge_block)
+                self.builder.position_at_end(merge_block)
+                phi = self.builder.phi(i64, "ctr.val")
+                phi.add_incoming(found_val, with_block)
+                phi.add_incoming(ir.Constant(i64, 0), has_bool.parent)
+                return phi
+
+        # Check for defaultdict subscript access — auto-inserts default on miss
+        if self._is_defaultdict_expr(node.value):
+            obj = self._emit_expr_value(node.value)
+            if isinstance(obj.type, ir.IntType):
+                obj = self.builder.inttoptr(obj, i8_ptr)
+            key = self._emit_expr_value(node.slice)
+            out_tag = self._create_entry_alloca(i32, "dd.tag")
+            out_data = self._create_entry_alloca(i64, "dd.data")
+            if isinstance(key.type, ir.PointerType):
+                self.builder.call(self.runtime["defaultdict_get"],
+                                  [obj, key, out_tag, out_data])
+            else:
+                tag_c, data_c = self._bare_to_tag_data(key, node.slice)
+                self.builder.call(self.runtime["defaultdict_get_fv"],
+                                  [obj, ir.Constant(i32, tag_c), data_c,
+                                   out_tag, out_data])
+            return self.builder.load(out_data)
+
+        # Check for deque subscript access
+        if self._is_deque_expr(node.value):
+            obj = self._emit_expr_value(node.value)
+            if isinstance(obj.type, ir.IntType):
+                obj = self.builder.inttoptr(obj, i8_ptr)
+            idx = self._emit_expr_value(node.slice)
+            out_tag = self._create_entry_alloca(i32, "dq.get.tag")
+            out_data = self._create_entry_alloca(i64, "dq.get.data")
+            self.builder.call(self.runtime["deque_get"],
+                              [obj, idx, out_tag, out_data])
+            return self.builder.load(out_data)
+
         # Check for dict access
         if self._is_dict_expr(node.value):
             obj = self._emit_expr_value(node.value)
@@ -13946,10 +17655,10 @@ class CodeGen:
             if (base_name is not None
                     and base_name in getattr(self, "_dict_var_obj_values", set())):
                 return self.builder.inttoptr(data, i8_ptr)
-            # Unknown: use fv_str which returns the string representation for
-            # non-strings and the raw pointer for strings. Matches the old
-            # dict_get_as_str behavior.
-            return self.builder.call(self.runtime["fv_str"], [tag, data])
+            # Unknown value type: return the raw data. For dicts from
+            # json.loads or other dynamic sources, the caller uses the
+            # FV tag to determine how to handle the value.
+            return data
 
         # Check for list/tuple access
         if self._is_list_expr(node.value) or self._is_tuple_expr(node.value):
@@ -14063,6 +17772,9 @@ class CodeGen:
 
     def _emit_list_append_expr(self, list_ptr: ir.Value, node: ast.expr) -> None:
         """Append a Python expression's value to a list via FV-ABI."""
+        # Ensure list_ptr is i8* (may be i64 from FV unwrap)
+        if isinstance(list_ptr.type, ir.IntType):
+            list_ptr = self.builder.inttoptr(list_ptr, i8_ptr)
         # For string/None/bool constants, build the FpyValue directly.
         if isinstance(node, ast.Constant):
             if isinstance(node.value, str):
@@ -14086,7 +17798,12 @@ class CodeGen:
         # so we can tag the append as LIST instead of STR.
         if self._is_list_expr(node) or self._is_tuple_expr(node):
             value = self._emit_expr_value(node)
-            data = self.builder.ptrtoint(value, i64)
+            if isinstance(value.type, ir.PointerType):
+                data = self.builder.ptrtoint(value, i64)
+            elif isinstance(value.type, ir.IntType) and value.type.width == 64:
+                data = value
+            else:
+                data = self.builder.zext(value, i64) if isinstance(value.type, ir.IntType) else value
             self.builder.call(self.runtime["list_append_fv"],
                               [list_ptr, ir.Constant(i32, FPY_TAG_LIST), data])
             return
@@ -14817,9 +18534,11 @@ class CodeGen:
             # bytes literal — store as string for now (limited support)
             return self._make_string_constant(value.decode('latin-1', errors='replace'))
         elif isinstance(value, complex):
-            # complex literal — store as float (real part only for now)
-            # Full complex support would need a FPY_TAG_COMPLEX type
-            return ir.Constant(double, value.real)
+            # Complex literal — create FpyComplex at runtime
+            real = ir.Constant(double, value.real)
+            imag = ir.Constant(double, value.imag)
+            ptr = self.builder.call(self.runtime["complex_new"], [real, imag])
+            return self.builder.ptrtoint(ptr, i64)
         else:
             raise CodeGenError(f"Unsupported constant in expression: {type(value)}")
 

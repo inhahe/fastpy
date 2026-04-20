@@ -31,6 +31,23 @@
 #define FPY_TAG_BYTES  8
 #define FPY_TAG_SET    9
 #define FPY_TAG_BIGINT 10
+#define FPY_TAG_COMPLEX 11
+
+/* Complex number (heap-allocated pair of doubles) */
+typedef struct {
+    double real;
+    double imag;
+} FpyComplex;
+
+FpyComplex* fpy_complex_new(double real, double imag);
+FpyComplex* fpy_complex_add(FpyComplex *a, FpyComplex *b);
+FpyComplex* fpy_complex_sub(FpyComplex *a, FpyComplex *b);
+FpyComplex* fpy_complex_mul(FpyComplex *a, FpyComplex *b);
+FpyComplex* fpy_complex_div(FpyComplex *a, FpyComplex *b);
+FpyComplex* fpy_complex_neg(FpyComplex *a);
+double fpy_complex_abs(FpyComplex *a);
+void fpy_complex_print(FpyComplex *c);
+char* fpy_complex_to_str(FpyComplex *c);
 
 /* Forward declarations */
 typedef struct FpyList FpyList;
@@ -76,7 +93,12 @@ typedef struct {
     int method_count;
     int slot_count;         /* number of pre-declared attribute slots */
     const char **slot_names; /* slot_names[i] = attribute name for slot i */
+    void (*destructor)(FpyObj *obj); /* per-class destructor, NULL if none */
+    void **vtable;                  /* vtable[i] = method func ptr, NULL-filled */
+    int vtable_size;                /* number of vtable entries */
 } FpyClassDef;
+
+#define FPY_MAX_VTABLE 64  /* max methods per class hierarchy */
 
 #define FPY_MAX_CLASSES 256
 

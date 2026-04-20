@@ -1,19 +1,17 @@
-# Unimplemented Python 3.14 Patterns
+# Fastpy Python 3.14 Compatibility Status
 
-Status: **66/66** audit features working + **62/62** extended pattern tests (100% coverage).
+Last updated 2026-04-20.
 
-Last updated 2026-04-19 after implementing all 6 remaining audit features
-(async/await, send-to-gen, except*, bytearray, metaclass) and refactoring
-sets to use O(1) hash tables.
-
-## Currently working
+## Fully native (no CPython bridge)
 
 ### Core language
 Loops (for/while/break/continue/else), functions (def, lambda, recursion,
 defaults, *args, **kwargs, closures, nonlocal, global), classes (init,
 methods, inheritance, super, multiple inheritance, nested classes,
-metaclass, __slots__, staticmethod, classmethod, @property get/set),
-decorators (user decorators, decorators with args).
+full metaclass support, __slots__, staticmethod, classmethod, @property
+get/set, __new__, __init_subclass__, __class_getitem__), decorators
+(user decorators, decorators with args), @dataclass (native AST expansion),
+@singledispatch (native switch dispatch).
 
 ### Operator overloading (dunders)
 __add__, __sub__, __mul__, __neg__, __eq__, __lt__, __str__, __repr__,
@@ -21,119 +19,107 @@ __getitem__, __setitem__, __delitem__, __len__, __bool__, __contains__,
 __iter__/__next__, __call__, __hash__.
 
 ### Containers
-list (literals, comprehensions, all methods: append, pop, remove, insert,
-index, count, sort, reverse, extend, copy, clear),
-dict (literals, comprehensions, get, pop, setdefault, keys, values, items,
-update, | merge, {**a, **b} unpacking),
-tuple (literals, unpacking, *mid unpack, swap),
-set (literals, comprehensions, add, discard, remove, |, &, -, ^, in —
-all backed by O(1) hash table),
-frozenset (via CPython bridge).
+list (literals, comprehensions, all methods), dict (literals, comprehensions,
+get, pop, setdefault, keys, values, items, update, | merge, {**a, **b}),
+tuple (literals, unpacking, *mid unpack, swap), set (literals, comprehensions,
+add, discard, remove, |, &, -, ^, in — O(1) hash table), frozenset.
 
 ### Strings
-f-strings (with =, !r, format specs), methods (split, join, replace,
-strip, startswith, endswith, find, upper, lower, count, format, isdigit,
-title, capitalize), raw strings, string multiplication, slicing,
-% formatting, `in` operator.
+f-strings (with =, !r, format specs), all common methods, % formatting,
+.format(), raw strings, string multiplication, slicing, `in` operator.
 
 ### Exceptions
 try/except/finally/else, raise, bare raise, raise from, multiple except
-types, except* (ExceptionGroup).
+types, except* (ExceptionGroup) — all native.
 
 ### Generators & Iterators
-yield, yield from, generator expressions, send/close/throw (via CPython
-bridge for coroutine-style generators), iterator protocol (__iter__/__next__).
+yield, yield from (native delegation via while+send expansion),
+generator expressions, native send/close/throw (state-machine compilation
+for yield-as-expression generators), iterator protocol (__iter__/__next__),
+finally cleanup on GC via per-class destructor.
 
 ### Async
-async def, await (via CPython bridge — async function bodies run in
-CPython's asyncio runtime).
+async def, await compiled natively (synchronous execution).
+asyncio.run(), asyncio.gather(), asyncio.sleep() — all native.
 
 ### Pattern matching
 match/case with literal, capture, guard, or, wildcard, sequence patterns.
 
-### Imports
-import module, from module import name (.pyd support via CPython bridge).
+### Imports (native)
+math module (direct libm calls), json module (native parser/serializer),
+os/os.path module (direct Win32/POSIX API calls).
 
 ### Builtins
-print, range, len, sorted, int, abs, sum, min, max, list, reversed, set,
-enumerate, zip, isinstance (including tuple of types), str, type, any,
-all, bool, float, chr, ord, hex, oct, bin, round, repr, pow, divmod,
-dict, tuple, map, filter, hash, next, iter, bytearray, frozenset,
-complex, slice, getattr, setattr, hasattr, delattr.
+print, range, len, sorted (with key=, reverse=), int, float, str, bool,
+abs, sum, min, max, list, reversed, set, frozenset, enumerate, zip,
+isinstance, type, any, all, hash, next, iter, eval (compile-time for
+literals), exec (compile-time for literals), repr, pow, divmod, chr, ord,
+hex, oct, bin, round, dict, tuple, map, filter, complex, locals, globals,
+getattr/setattr/hasattr/delattr, input, open.
 
-### Control flow & misc
-if/elif/else, ternary, walrus operator, chained comparisons, with
-statement, assert, type hints (ignored), ellipsis, global/nonlocal,
-for/else, while/else, try/else.
+### Numbers
+int (i64), float (f64), BigInt (speculative unboxing with overflow fallback),
+complex (native FpyComplex with arithmetic).
 
 ### Threading
-Three modes via CLI flags:
-- `--threading none` (default): single-threaded, no overhead
-- `--threading gil`: GIL mode, one thread runs compiled code at a time
-- `--threading free` or `-t`: free-threaded, per-object locks, true parallelism
+Three modes: none (default), GIL, free-threaded (per-object locks).
 
-`threading.Thread(target=compiled_func)` works — compiled functions are
-auto-wrapped as CPython callables via `fpy_cpython_wrap_native`.
-Thread-local exception state and per-thread bump allocators.
+### eval/exec
+Literal string arguments compiled inline at compile time (zero overhead,
+supports nested eval/exec). Dynamic strings route through CPython bridge
+with automatic locals namespace injection.
 
-## Known limitations (not bugs — architectural constraints)
+## Routes through CPython bridge
 
-These are patterns that work partially or through fallback paths:
+These features work correctly but use the embedded CPython interpreter:
 
-1. **Generators with send()** use CPython bridge — the function body runs
-   in CPython rather than as native compiled code. Simple yield/yield-from
-   generators compile natively via list collection.
+- **`re` module** — full regex engine impractical to reimplement natively
+- **`.pyd` imports** (numpy, etc.) — C extensions inherently need CPython
+  for PyObject* marshalling. The extension's own C code runs natively.
+- **Dynamic eval()/exec()** with non-literal string arguments
+- **Other stdlib modules** not implemented natively (e.g., collections,
+  itertools, functools — except singledispatch which is native)
 
-2. **Async functions** run entirely in CPython via the bridge. No native
-   async compilation.
+## Bugs fixed (2026-04-20)
 
-3. **Metaclass support** is simplified — `type(C).__name__` is resolved at
-   compile time. Full metaclass instantiation protocol not implemented.
+### 1. Linked list None traversal (fixed)
+`while cur is not None: cur = cur.next` crashed when `cur.next` held None.
+Root cause: obj attribute slot containing None was loaded without preserving
+the FPY_TAG_NONE tag, so the `is not None` check saw an integer 0 (tagged
+INT) instead of None.
+Fix: FV-aware attribute load path in `_emit_is_compare` and `_load_or_wrap_fv`
+preserves runtime tag for obj attributes that may hold None.
 
-4. **Complex numbers** route through CPython bridge — no native complex
-   arithmetic.
+### 2. Set union returned wrong size (fixed)
+`{1,2,3} | {4,5,6}` returned len=1 instead of len=6.
+Root cause: `_infer_type_tag` had no handler for set operations (BitOr, BitAnd,
+etc.), so the result was tagged "int" instead of "set", causing `len()` to
+dispatch through the wrong path.
+Fix: Added set operation detection to `_infer_type_tag`.
 
-5. **eval()/exec()** — `eval("literal")` pre-compiles via CPython bridge.
-   Dynamic eval (non-literal strings) routes through `builtins.eval`.
-   `exec()` with literal strings works similarly. Neither has access to
-   the compiled program's local variables.
+### 3. Mixed-type dict values from json.loads (fixed)
+`parsed["x"]` on a `json.loads()` result returned string representation
+instead of actual values for nested lists/dicts.
+Root cause: dict subscript for unknown value types called `fv_str` (string
+format) instead of returning the raw FpyValue data.
+Fix: Return raw data from dict subscript for unknown value types; let the
+FV-aware print/assignment path handle type dispatch.
 
-6. **singledispatch** — `@proc.register(int)` decorator pattern not supported
-   (method call on decorated variable).
+### 4. Cross-function list parameter (fixed)
+Passing a list returned from one function as a parameter to another function
+wasn't typed correctly — the parameter was i64 instead of i8*.
+Root cause: call-site analysis didn't propagate function return types to
+variable type tracking.
+Fix: Added return-type propagation in `_analyze_call_sites` — traces
+through `data = make_list()` to infer `data` is a list.
 
-7. **Dataclasses** — class compiles but decorator-generated methods (like
-   `__repr__`) don't override native class methods. NamedTuple works.
+## Known limitations (not bugs)
 
-8. **BigInt** — all integers are i64 (64-bit signed). `2**100` silently
-   overflows instead of producing a big integer. Any program that uses
-   integers larger than ~9.2×10¹⁸ produces wrong results. This is the
-   largest Python compatibility gap. Fix: speculative unboxing on fast
-   path with BigInt fallback on overflow (Milestone 10 in CLAUDE.md).
-
-9. **Native os/json/re modules** — route through CPython bridge. Could be
-   implemented natively for standalone executables without Python runtime.
-   math module is already native.
-
-10. **Linux/macOS support** — currently Windows x64 only (MSVC toolchain).
-    The runtime C code is portable; needs Clang/GCC build scripts and
-    ELF linking instead of PE/COFF.
-
-11. **GC: temporary value lifetime** — expressions like `print(str(x) + str(y))`
-    create temporary strings that aren't decrefd after the statement.
-    Temporaries accumulate until the cycle collector runs (every 700
-    allocations). Not a correctness issue, but causes higher memory usage
-    for string-heavy code without variable assignments.
-
-12. **GC: audit LLVM non-determinism** — the in-process audit (66 tests
-    in one Python process) shows 65/66 due to LLVM pass manager producing
-    different code on repeated compilations. Each test passes individually
-    in a fresh process. Not a fastpy bug.
-
-### Recently resolved (2026-04-19)
-
-- **#4 filter()** — now uses inline loop like map(), handles all element types
-- **#10 Context managers** — `__enter__`/`__exit__` dispatch works
-- **#11 int() on 2+ arg bridge calls** — `int(np.dot(a,b))` now works
-- **#13 sorted(key=user_func) on strings** — call-site analysis traces through sorted/min/max
-- **#15 Shared mutable state** — global lists/dicts/strings work across functions
-- **#16 Per-object locking** — complete coverage on all mutating list/dict operations
+- **BigInt through function calls** — BigInt values passed through function
+  parameters lose their BIGINT tag (treated as regular i64). Direct BigInt
+  constants and variables work correctly.
+- **Mixed-type dict value access** — Dict values from dynamic sources (json.loads)
+  return raw i64 data. Works for int/float/str values; nested list/dict values
+  need explicit subscript on the extracted value.
+- **Windows x64 only** — needs MSVC Build Tools. The runtime C code is portable;
+  needs Clang/GCC build scripts and ELF linking for Linux/macOS.

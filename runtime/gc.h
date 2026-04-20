@@ -47,6 +47,10 @@ void fpy_gc_untrack(FpyGCNode *node);
 /* Run the cycle collector. Returns number of objects freed. */
 int64_t fpy_gc_collect(void);
 
+/* Final sweep: call destructors on all remaining tracked objects.
+ * Called at program exit to ensure generator finally blocks run. */
+void fpy_gc_finalize(void);
+
 /* Get the number of tracked objects. */
 int64_t fpy_gc_tracked_count(void);
 

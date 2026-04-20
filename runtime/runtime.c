@@ -406,6 +406,13 @@ int main(void) {
         fpy_gil_acquire();  /* main thread holds GIL initially */
     }
     fastpy_main();
+    /* Run final GC sweep to trigger destructors on all remaining
+     * objects (e.g., generators with pending finally blocks). This
+     * matches CPython's behavior of running __del__/close() at exit.
+     * Only objects with destructors are called — others are left for
+     * the OS to reclaim with process memory. */
+    extern void fpy_gc_finalize(void);
+    fpy_gc_finalize();
     /* Flush Python's stdout in case CPython bridge functions called print() */
     extern void fpy_cpython_flush(void);
     fpy_cpython_flush();
@@ -426,4 +433,122 @@ int main(void) {
         return 1;
     }
     return 0;
+}
+
+/* ============================================================
+ * Native sys module
+ * ============================================================ */
+
+/* sys.exit(code) */
+void fastpy_sys_exit(int64_t code) {
+    exit((int)code);
+}
+
+/* sys.argv — returns an empty list (AOT-compiled programs don't
+ * receive Python argv by default; future: link to main(argc, argv)) */
+FpyList* fastpy_sys_argv(void) {
+    return fpy_list_new(4);
+}
+
+/* sys.platform */
+const char* fastpy_sys_platform(void) {
+#ifdef _WIN32
+    return "win32";
+#elif __APPLE__
+    return "darwin";
+#else
+    return "linux";
+#endif
+}
+
+/* sys.maxsize (2^63 - 1) */
+int64_t fastpy_sys_maxsize(void) {
+    return 9223372036854775807LL;
+}
+
+/* sys.version_info — returns a tuple (major, minor, micro, ...) */
+FpyList* fastpy_sys_version_info(void) {
+    FpyList *t = fpy_list_new(5);
+    t->is_tuple = 1;
+    FpyValue v;
+    v.tag = FPY_TAG_INT; v.data.i = 3; fpy_list_append(t, v);  /* major */
+    v.tag = FPY_TAG_INT; v.data.i = 14; fpy_list_append(t, v); /* minor */
+    v.tag = FPY_TAG_INT; v.data.i = 0; fpy_list_append(t, v);  /* micro */
+    v.tag = FPY_TAG_STR; v.data.s = "final"; fpy_list_append(t, v);
+    v.tag = FPY_TAG_INT; v.data.i = 0; fpy_list_append(t, v);
+    return t;
+}
+
+/* ============================================================
+ * Native time module
+ * ============================================================ */
+
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <sys/time.h>
+#include <unistd.h>
+#endif
+
+/* time.time() → float seconds since epoch */
+double fastpy_time_time(void) {
+#ifdef _WIN32
+    FILETIME ft;
+    GetSystemTimeAsFileTime(&ft);
+    uint64_t t = ((uint64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
+    /* Convert from 100ns intervals since 1601 to seconds since 1970 */
+    return (double)(t - 116444736000000000ULL) / 10000000.0;
+#else
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (double)tv.tv_sec + (double)tv.tv_usec / 1000000.0;
+#endif
+}
+
+/* time.time_ns() → int nanoseconds since epoch */
+int64_t fastpy_time_time_ns(void) {
+#ifdef _WIN32
+    FILETIME ft;
+    GetSystemTimeAsFileTime(&ft);
+    uint64_t t = ((uint64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
+    return (int64_t)((t - 116444736000000000ULL) * 100);
+#else
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (int64_t)tv.tv_sec * 1000000000LL + (int64_t)tv.tv_usec * 1000LL;
+#endif
+}
+
+/* time.perf_counter() → float high-resolution timer */
+double fastpy_time_perf_counter(void) {
+#ifdef _WIN32
+    LARGE_INTEGER freq, count;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&count);
+    return (double)count.QuadPart / (double)freq.QuadPart;
+#else
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (double)tv.tv_sec + (double)tv.tv_usec / 1000000.0;
+#endif
+}
+
+/* time.sleep(seconds) */
+void fastpy_time_sleep(double seconds) {
+#ifdef _WIN32
+    Sleep((DWORD)(seconds * 1000));
+#else
+    usleep((useconds_t)(seconds * 1000000));
+#endif
+}
+
+/* time.monotonic() → float monotonic clock */
+double fastpy_time_monotonic(void) {
+#ifdef _WIN32
+    return fastpy_time_perf_counter();
+#else
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (double)tv.tv_sec + (double)tv.tv_usec / 1000000.0;
+#endif
 }

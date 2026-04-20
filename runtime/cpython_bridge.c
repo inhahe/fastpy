@@ -544,3 +544,75 @@ void* fpy_cpython_exec_get(const char *code, const char *name) {
     Py_DECREF(globals);
     return (void*)value;
 }
+
+/* ── eval/exec with local variable namespace ──────────────────────── */
+
+/* Convert an FpyDict to a CPython PyDict. */
+static PyObject* fpy_dict_to_pydict(FpyDict *dict) {
+    PyObject *pydict = PyDict_New();
+    for (int64_t i = 0; i < dict->length; i++) {
+        PyObject *pk = fpy_to_pyobject(dict->keys[i].tag, dict->keys[i].data.i);
+        PyObject *pv = fpy_to_pyobject(dict->values[i].tag, dict->values[i].data.i);
+        PyDict_SetItem(pydict, pk, pv);
+        Py_DECREF(pk);
+        Py_DECREF(pv);
+    }
+    return pydict;
+}
+
+/* eval(expr) with locals dict — evaluates expr in a namespace populated
+ * from the caller's local variables. Returns the result as FpyValue. */
+void fpy_cpython_eval_locals(const char *expr, FpyDict *locals_dict,
+                              int32_t *out_tag, int64_t *out_data) {
+    fpy_cpython_init();
+
+    PyObject *globals = PyDict_New();
+    PyObject *builtins = PyImport_ImportModule("builtins");
+    PyDict_SetItemString(globals, "__builtins__", builtins);
+    Py_DECREF(builtins);
+
+    PyObject *locals = locals_dict ? fpy_dict_to_pydict(locals_dict) : PyDict_New();
+
+    PyObject *result = PyRun_String(expr, Py_eval_input, globals, locals);
+    if (!result) {
+        PyErr_Print();
+        fprintf(stderr, "fpy_cpython_eval_locals: eval failed\n");
+        *out_tag = FPY_TAG_NONE;
+        *out_data = 0;
+        Py_DECREF(globals);
+        Py_DECREF(locals);
+        return;
+    }
+
+    pyobject_to_fpy(result, out_tag, out_data);
+    Py_DECREF(result);
+    Py_DECREF(globals);
+    Py_DECREF(locals);
+}
+
+/* exec(code) with locals dict — executes code in a namespace populated
+ * from the caller's local variables. Returns void (exec has no value). */
+void fpy_cpython_exec_locals(const char *code, FpyDict *locals_dict) {
+    fpy_cpython_init();
+
+    PyObject *globals = PyDict_New();
+    PyObject *builtins = PyImport_ImportModule("builtins");
+    PyDict_SetItemString(globals, "__builtins__", builtins);
+    Py_DECREF(builtins);
+
+    PyObject *locals = locals_dict ? fpy_dict_to_pydict(locals_dict) : PyDict_New();
+
+    PyObject *result = PyRun_String(code, Py_file_input, globals, locals);
+    if (!result) {
+        PyErr_Print();
+        fprintf(stderr, "fpy_cpython_exec_locals: exec failed\n");
+    } else {
+        Py_DECREF(result);
+    }
+
+    Py_DECREF(globals);
+    Py_DECREF(locals);
+    /* Flush CPython stdout immediately so exec'd print output
+     * appears in the correct order relative to native printf. */
+    fpy_cpython_flush();
+}
