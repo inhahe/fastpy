@@ -13,6 +13,10 @@
 #include <math.h>
 #include <setjmp.h>
 #include <stdlib.h>
+#ifndef _WIN32
+#include <dirent.h>
+#include <unistd.h>
+#endif
 #include "threading.h"
 #include "objects.h"
 
@@ -282,6 +286,7 @@ double fastpy_pow_float(double base, double exp) {
 #define FPY_EXC_RUNTIMEERROR   6
 #define FPY_EXC_STOPITERATION  7
 #define FPY_EXC_EXCEPTIONGROUP 8
+#define FPY_EXC_NAMEERROR      9
 #define FPY_EXC_GENERIC        99
 
 /* Per-thread exception state. Each thread has its own exception,
@@ -347,6 +352,7 @@ int fastpy_exc_name_to_id(const char *name) {
     if (strcmp(name, "RuntimeError") == 0) return FPY_EXC_RUNTIMEERROR;
     if (strcmp(name, "StopIteration") == 0) return FPY_EXC_STOPITERATION;
     if (strcmp(name, "ExceptionGroup") == 0) return FPY_EXC_EXCEPTIONGROUP;
+    if (strcmp(name, "NameError") == 0) return FPY_EXC_NAMEERROR;
     return FPY_EXC_GENERIC;
 }
 
@@ -356,9 +362,9 @@ void fastpy_exc_unhandled(void) {
     const char *names[] = {
         "Exception", "ZeroDivisionError", "ValueError", "TypeError",
         "IndexError", "KeyError", "RuntimeError", "StopIteration",
-        "ExceptionGroup"
+        "ExceptionGroup", "NameError"
     };
-    const char *name = (fpy_exc_type >= 1 && fpy_exc_type <= 8)
+    const char *name = (fpy_exc_type >= 1 && fpy_exc_type <= 9)
         ? names[fpy_exc_type] : "Exception";
     fprintf(stderr, "Traceback (most recent call last):\n  %s: %s\n", name, fpy_exc_msg);
     exit(1);
@@ -415,6 +421,7 @@ extern void fastpy_fv_write(int32_t, int64_t);
 extern const char* fastpy_fv_repr(int32_t, int64_t);
 extern const char* fastpy_fv_str(int32_t, int64_t);
 extern int32_t fastpy_fv_truthy(int32_t, int64_t);
+extern void fastpy_fv_binop(int32_t, int64_t, int32_t, int64_t, int32_t, int32_t*, int64_t*);
 extern void fastpy_raise(int, const char*);
 extern int32_t fastpy_exc_pending(void);
 extern void fastpy_exc_clear(void);
@@ -499,6 +506,7 @@ static FpySymEntry fpy_jit_symbols[] = {
     SYM(fastpy_print_newline),
     SYM(fastpy_fv_print), SYM(fastpy_fv_write),
     SYM(fastpy_fv_repr), SYM(fastpy_fv_str), SYM(fastpy_fv_truthy),
+    SYM(fastpy_fv_binop),
     SYM(fastpy_raise), SYM(fastpy_exc_pending), SYM(fastpy_exc_clear),
     SYM(fastpy_exc_get_type), SYM(fastpy_exc_get_msg), SYM(fastpy_exc_name_to_id),
     SYM(fastpy_list_new), SYM(fastpy_list_append_fv),
@@ -581,6 +589,7 @@ int main(void) {
             case FPY_EXC_INDEXERROR:   name = "IndexError"; break;
             case FPY_EXC_RUNTIMEERROR: name = "RuntimeError"; break;
             case FPY_EXC_STOPITERATION: name = "StopIteration"; break;
+            case FPY_EXC_NAMEERROR:    name = "NameError"; break;
             default: break;
         }
         fprintf(stderr, "%s: %s\n", name, fpy_exc_msg ? fpy_exc_msg : "");

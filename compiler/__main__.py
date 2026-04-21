@@ -16,7 +16,8 @@ def main() -> int:
         prog="fastpy",
         description="Compile Python source to a native executable.",
     )
-    parser.add_argument("source", type=Path, help="Python source file to compile")
+    parser.add_argument("source", type=Path, nargs="?", default=None,
+                        help="Python source file to compile")
     parser.add_argument("-o", "--output", type=Path, default=None,
                         help="Output executable path")
     parser.add_argument("-v", "--verbose", action="store_true",
@@ -28,8 +29,28 @@ def main() -> int:
                         help="Threading mode: none (default), gil, or free")
     parser.add_argument("--int64", action="store_true",
                         help="Use i64 integers with overflow detection (no BigInt fallback, raises OverflowError)")
+    parser.add_argument("--python-version", type=str, default=None,
+                        metavar="VER",
+                        help='Target Python version (e.g. "3.12", "3.14"). '
+                             'Default: current Python.')
+    parser.add_argument("--list-pythons", action="store_true",
+                        help="List discovered Python installations and exit")
 
     args = parser.parse_args()
+
+    if args.list_pythons:
+        from compiler.toolchain import discover_pythons
+        pythons = discover_pythons()
+        if not pythons:
+            print("No Python installations found.", file=sys.stderr)
+            return 1
+        for p in pythons:
+            current = " (current)" if p.executable == Path(sys.executable) else ""
+            print(f"Python {p.version_str:5s}  {p.executable}{current}")
+        return 0
+
+    if args.source is None:
+        parser.error("the following arguments are required: source")
 
     if not args.source.exists():
         print(f"Error: {args.source} not found", file=sys.stderr)
@@ -44,7 +65,8 @@ def main() -> int:
 
     result = compile_file(args.source, args.output,
                           threading_mode=threading_mode,
-                          int64_mode=args.int64)
+                          int64_mode=args.int64,
+                          python_version=args.python_version)
 
     if result.success:
         print(f"Compiled: {result.executable}")

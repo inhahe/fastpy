@@ -428,6 +428,88 @@ int32_t fastpy_fv_truthy(int32_t tag, int64_t data) {
     return 0;
 }
 
+/* FpyValue binary operation — runtime dispatch for Add/Sub/Mul/etc.
+ * op: 0=add, 1=sub, 2=mul, 3=div, 4=floordiv, 5=mod
+ * Results are written to *out_tag, *out_data. */
+extern const char* fastpy_str_concat(const char*, const char*);
+extern const char* fastpy_str_repeat(const char*, int64_t);
+extern FpyList* fastpy_list_concat(FpyList*, FpyList*);
+void fastpy_fv_binop(int32_t lt, int64_t ld, int32_t rt, int64_t rd,
+                      int32_t op, int32_t *out_tag, int64_t *out_data) {
+    /* String + String → concat */
+    if (lt == FPY_TAG_STR && rt == FPY_TAG_STR && op == 0) {
+        const char *result = fastpy_str_concat((const char*)ld, (const char*)rd);
+        *out_tag = FPY_TAG_STR;
+        *out_data = (int64_t)(intptr_t)result;
+        return;
+    }
+    /* String * Int or Int * String → repeat */
+    if (lt == FPY_TAG_STR && rt == FPY_TAG_INT && op == 2) {
+        const char *result = fastpy_str_repeat((const char*)ld, rd);
+        *out_tag = FPY_TAG_STR;
+        *out_data = (int64_t)(intptr_t)result;
+        return;
+    }
+    if (lt == FPY_TAG_INT && rt == FPY_TAG_STR && op == 2) {
+        const char *result = fastpy_str_repeat((const char*)rd, ld);
+        *out_tag = FPY_TAG_STR;
+        *out_data = (int64_t)(intptr_t)result;
+        return;
+    }
+    /* List + List → concat */
+    if (lt == FPY_TAG_LIST && rt == FPY_TAG_LIST && op == 0) {
+        FpyList *result = fastpy_list_concat((FpyList*)ld, (FpyList*)rd);
+        *out_tag = FPY_TAG_LIST;
+        *out_data = (int64_t)(intptr_t)result;
+        return;
+    }
+    /* Promote to float if either operand is float */
+    if (lt == FPY_TAG_FLOAT || rt == FPY_TAG_FLOAT) {
+        double lf, rf;
+        if (lt == FPY_TAG_FLOAT) { memcpy(&lf, &ld, sizeof(double)); }
+        else if (lt == FPY_TAG_INT) { lf = (double)ld; }
+        else if (lt == FPY_TAG_BOOL) { lf = (double)ld; }
+        else { lf = 0.0; }
+        if (rt == FPY_TAG_FLOAT) { memcpy(&rf, &rd, sizeof(double)); }
+        else if (rt == FPY_TAG_INT) { rf = (double)rd; }
+        else if (rt == FPY_TAG_BOOL) { rf = (double)rd; }
+        else { rf = 0.0; }
+        double result;
+        switch (op) {
+            case 0: result = lf + rf; break;
+            case 1: result = lf - rf; break;
+            case 2: result = lf * rf; break;
+            case 3: result = rf != 0.0 ? lf / rf : 0.0; break;
+            case 4: result = rf != 0.0 ? floor(lf / rf) : 0.0; break;
+            case 5: result = rf != 0.0 ? fmod(lf, rf) : 0.0; break;
+            default: result = 0.0; break;
+        }
+        *out_tag = FPY_TAG_FLOAT;
+        memcpy(out_data, &result, sizeof(double));
+        return;
+    }
+    /* Int/Bool arithmetic */
+    int64_t li = (lt == FPY_TAG_BOOL) ? (int64_t)(ld != 0) : ld;
+    int64_t ri = (rt == FPY_TAG_BOOL) ? (int64_t)(rd != 0) : rd;
+    int64_t result;
+    switch (op) {
+        case 0: result = li + ri; break;
+        case 1: result = li - ri; break;
+        case 2: result = li * ri; break;
+        case 3: /* truediv returns float */ {
+            double d = ri != 0 ? (double)li / (double)ri : 0.0;
+            *out_tag = FPY_TAG_FLOAT;
+            memcpy(out_data, &d, sizeof(double));
+            return;
+        }
+        case 4: result = ri != 0 ? li / ri : 0; break;
+        case 5: result = ri != 0 ? li % ri : 0; break;
+        default: result = 0; break;
+    }
+    *out_tag = FPY_TAG_INT;
+    *out_data = result;
+}
+
 void fpy_value_write(FpyValue val) {
     char buf[4096];
     switch (val.tag) {
@@ -1416,7 +1498,9 @@ int64_t fastpy_closure_call2(FpyClosure *c, int64_t a, int64_t b) {
  * Extracts elements from the list, combines with captures, and
  * dispatches to the underlying function pointer. Supports up to
  * 4 total args (explicit + captures). */
-int64_t fastpy_closure_call_list(FpyClosure *c, FpyList *args) {
+int64_t fastpy_closure_call_list(void *closure, void *args_list) {
+    FpyClosure *c = (FpyClosure *)closure;
+    FpyList *args = (FpyList *)args_list;
     int64_t n_args = args ? args->length : 0;
     int64_t n_caps = c->n_captures;
     int64_t total = n_args + n_caps;

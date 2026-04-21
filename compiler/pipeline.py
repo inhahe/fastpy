@@ -52,13 +52,18 @@ class CompileResult:
 
 def compile_source(source: str, output: Path | None = None,
                    threading_mode: int = 0,
-                   int64_mode: bool = False) -> CompileResult:
+                   int64_mode: bool = False,
+                   python_version: str | None = None) -> CompileResult:
     """
     Compile a Python source string to a native executable.
 
     Args:
         source: Python source code as a string.
         output: Path for the output executable. If None, uses a temp file.
+        threading_mode: 0=none, 1=GIL, 2=free-threaded.
+        int64_mode: Use i64 integers with overflow detection.
+        python_version: Target Python version (e.g. "3.12", "3.14").
+            If None, uses the current Python interpreter.
 
     Returns:
         CompileResult indicating success or failure.
@@ -127,7 +132,8 @@ def compile_source(source: str, output: Path | None = None,
 
     try:
         from compiler.toolchain import compile_and_link
-        exe_path = compile_and_link(ir_string, output)
+        exe_path = compile_and_link(ir_string, output,
+                                     python_version=python_version)
         return CompileResult(
             success=True,
             executable=exe_path,
@@ -143,7 +149,8 @@ def compile_source(source: str, output: Path | None = None,
 
 def compile_file(path: Path, output: Path | None = None,
                  threading_mode: int = 0,
-                 int64_mode: bool = False) -> CompileResult:
+                 int64_mode: bool = False,
+                 python_version: str | None = None) -> CompileResult:
     """Compile a Python source file to a native executable.
 
     Resolves local imports: if the source contains `import foo` or
@@ -158,7 +165,8 @@ def compile_file(path: Path, output: Path | None = None,
     merged = _resolve_and_merge(source, base_dir)
 
     return compile_source(merged, output, threading_mode=threading_mode,
-                          int64_mode=int64_mode)
+                          int64_mode=int64_mode,
+                          python_version=python_version)
 
 
 def _resolve_and_merge(source: str, base_dir: Path,

@@ -23,6 +23,11 @@
 
 static int cpython_initialized = 0;
 
+/* Python version baked in at compile time (from Python.h headers).
+ * Compared against the runtime version to detect ABI mismatches. */
+static const int fpy_compiled_python_major = PY_MAJOR_VERSION;
+static const int fpy_compiled_python_minor = PY_MINOR_VERSION;
+
 void fpy_cpython_init(void) {
     if (cpython_initialized) return;
     /* Set PYTHONHOME so CPython finds its stdlib. Without this,
@@ -30,9 +35,33 @@ void fpy_cpython_init(void) {
      * On POSIX, the linked libpython usually self-discovers its prefix,
      * so we only override on Windows where the exe runs from a temp dir. */
 #ifdef _WIN32
-    Py_SetPythonHome(L"D:\\python314");
+    {
+        static wchar_t home[512];
+        swprintf(home, 512, L"%hs", PYTHON_HOME_STR);
+        Py_SetPythonHome(home);
+    }
 #endif
     Py_Initialize();
+    /* ABI version check: compare the compile-time Python version (from
+     * headers) with the actual runtime version (from the loaded DLL/SO).
+     * Py_GetVersion() returns the runtime version string like "3.14.0".
+     * A mismatch means the wrong libpython was loaded at runtime. */
+    {
+        const char *runtime_ver = Py_GetVersion();  /* e.g. "3.14.0 ..." */
+        int rt_major = 0, rt_minor = 0;
+        sscanf(runtime_ver, "%d.%d", &rt_major, &rt_minor);
+        if (rt_major != fpy_compiled_python_major ||
+            rt_minor != fpy_compiled_python_minor) {
+            fprintf(stderr,
+                "fastpy: Python ABI mismatch! "
+                "Compiled against %d.%d, running with %d.%d.\n"
+                "Recompile with the correct Python version or install Python %d.%d.\n",
+                fpy_compiled_python_major, fpy_compiled_python_minor,
+                rt_major, rt_minor,
+                fpy_compiled_python_major, fpy_compiled_python_minor);
+            exit(1);
+        }
+    }
     cpython_initialized = 1;
 }
 

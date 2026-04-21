@@ -1014,6 +1014,9 @@ class CodeGen:
         self.runtime["fv_str"] = ir.Function(self.module, ft, name="fastpy_fv_str")
         ft = ir.FunctionType(i32, [i32, i64])
         self.runtime["fv_truthy"] = ir.Function(self.module, ft, name="fastpy_fv_truthy")
+        # void fastpy_fv_binop(i32 lt, i64 ld, i32 rt, i64 rd, i32 op, i32* out_tag, i64* out_data)
+        ft = ir.FunctionType(void, [i32, i64, i32, i64, i32, ir.PointerType(i32), ir.PointerType(i64)])
+        self.runtime["fv_binop"] = ir.Function(self.module, ft, name="fastpy_fv_binop")
 
         # int64_t fastpy_pow_int(int64_t base, int64_t exp)
         ft = ir.FunctionType(i64, [i64, i64])
@@ -8548,7 +8551,10 @@ class CodeGen:
                              and isinstance(rhs.func, ast.Attribute)
                              and isinstance(rhs.func.value, ast.Name)
                              and rhs.func.value.id in self.variables
-                             and self._var_kind(rhs.func.value.id) == VKind.PYOBJ)
+                             and self._var_kind(rhs.func.value.id) == VKind.PYOBJ
+                             # Exclude native modules — they have PYOBJ kind but
+                             # should use the native dispatch path, not bridge
+                             and rhs.func.value.id not in getattr(self, '_native_modules', set()))
             is_pyobj_direct = (isinstance(rhs, ast.Call)
                                and isinstance(rhs.func, ast.Name)
                                and rhs.func.id in self.variables
@@ -9533,6 +9539,8 @@ class CodeGen:
                 return "none"
             if isinstance(node.value, bool):
                 return "bool"
+            if isinstance(node.value, bytes):
+                return "str"  # bytes stored as str ptr, tagged BYTES at FV level
             if isinstance(node.value, complex):
                 return "complex"
             if (isinstance(node.value, int)
@@ -9561,10 +9569,16 @@ class CodeGen:
         if isinstance(node, ast.BoolOp):
             if all(self._is_bool_typed(v) for v in node.values):
                 return "bool"
-        # Attribute access returning an object (e.g. `node.next` where
-        # `next` is a Node-typed attr). Must come before the generic
-        # fall-through so the target gets an "obj" tag instead of "str".
+        # Attribute access: detect container (list/dict) and object attrs
+        # so len(), print, and binops dispatch correctly.
         if isinstance(node, ast.Attribute):
+            obj_cls = self._infer_object_class(node.value)
+            if obj_cls and obj_cls in self._class_container_attrs:
+                list_attrs, dict_attrs = self._class_container_attrs[obj_cls]
+                if node.attr in list_attrs:
+                    return "list:int"
+                if node.attr in dict_attrs:
+                    return "dict"
             if self._is_obj_expr(node):
                 return "obj"
         # Name: propagate the variable's stored tag so `cur = head` keeps
@@ -9745,10 +9759,17 @@ class CodeGen:
                 return False
             if _is_dec(node.left) or _is_dec(node.right):
                 return "decimal"
-        # Method calls on pyobj receivers return pyobj
+        # Method calls on pyobj receivers return pyobj — EXCEPT for native
+        # modules (time, os, json, etc.) whose functions return native types.
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
             if self._is_pyobj_receiver(node.func.value):
-                return "pyobj"
+                # Check if receiver is a native module — if so, use LLVM type
+                recv_name = (node.func.value.id
+                             if isinstance(node.func.value, ast.Name) else None)
+                if recv_name and recv_name in getattr(self, '_native_modules', set()):
+                    pass  # fall through to _llvm_type_tag below
+                else:
+                    return "pyobj"
         # Direct call of pyobj or native_func variable that goes through bridge
         if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
                 and node.func.id in self.variables
@@ -10310,15 +10331,8 @@ class CodeGen:
         type_tag = existing_tag or self._llvm_type_tag(result)
         self._store_variable(target_name, result, type_tag)
 
-    _alloca_counter = 0  # class-level counter for unique alloca names
-
     def _create_entry_alloca(self, llvm_type: ir.Type, name: str) -> ir.AllocaInstr:
-        """Create an alloca in the function's entry block (standard LLVM pattern).
-
-        Uses a global counter to give every alloca a unique name, avoiding
-        llvmlite's name deduplication recursion on large modules."""
-        CodeGen._alloca_counter += 1
-        unique_name = f"{name}.{CodeGen._alloca_counter}"
+        """Create an alloca in the function's entry block (standard LLVM pattern)."""
         entry_block = self.function.entry_basic_block
         # Save current position, insert at start of entry block
         saved_block = self.builder.block
@@ -10326,7 +10340,7 @@ class CodeGen:
             self.builder.position_before(entry_block.instructions[0])
         else:
             self.builder.position_at_end(entry_block)
-        alloca = self.builder.alloca(llvm_type, name=unique_name)
+        alloca = self.builder.alloca(llvm_type, name=name)
         # Restore position
         self.builder.position_at_end(saved_block)
         return alloca
@@ -10536,12 +10550,16 @@ class CodeGen:
                     self._store_variable(name, mod_ptr, "pyobj")
                     return mod_ptr
                 except (ImportError, ValueError):
-                    # Phase 4: undefined variable → return 0 (None-like)
-                    # instead of crashing. Many stdlib modules have
-                    # conditionally-defined variables (try/except imports,
-                    # platform checks) that exist at runtime via CPython.
+                    # Truly undefined variable — emit NameError at runtime.
+                    # CPython raises "NameError: name 'x' is not defined".
                     self._bridge_fallback_log.append(
                         f"line {getattr(node, 'lineno', '?')}: undefined variable: {name}")
+                    msg = f"name '{name}' is not defined"
+                    name_ptr = self._make_string_constant("NameError")
+                    exc_id = self.builder.call(self.runtime["exc_name_to_id"], [name_ptr])
+                    msg_ptr = self._make_string_constant(msg)
+                    self.builder.call(self.runtime["raise"], [exc_id, msg_ptr])
+                    self.builder.call(self.runtime["exc_unhandled"], [])
                     return ir.Constant(i64, 0)
         alloca, type_tag = self.variables[name]
         if type_tag == "cell":
@@ -10864,6 +10882,8 @@ class CodeGen:
                 return TypedValue(val, ValueType(VKind.FLOAT))
             if isinstance(node.value, str):
                 return TypedValue(val, ValueType(VKind.STR))
+            if isinstance(node.value, bytes):
+                return TypedValue(val, ValueType(VKind.STR))  # bytes stored as str ptr with BYTES tag
             if node.value is None:
                 return TypedValue(val, ValueType(VKind.NONE))
         # Fast path: container literals
@@ -11402,19 +11422,28 @@ class CodeGen:
             mod_name = alias.name
             var_name = alias.asname if alias.asname else mod_name
 
-            # Native module: mark as native, no CPython bridge needed
+            # Native module: mark as native AND import through CPython bridge.
+            # The native dispatch handles known functions (os.getcwd, math.sqrt),
+            # but non-native attributes (os.name, os.sep) need the real module
+            # object for bridge fallback. Storing NULL caused segfaults.
             if mod_name in self._NATIVE_MODULES:
                 if not hasattr(self, '_native_modules'):
                     self._native_modules = set()
                 self._native_modules.add(var_name)
-                # Store a dummy value — attribute access is intercepted
-                self._store_variable(var_name, ir.Constant(i64, 0), "native_mod")
+                # Import the REAL module through CPython so bridge fallback works
+                mod_ptr = self.builder.call(
+                    self.runtime["cpython_import"],
+                    [self._make_string_constant(mod_name)])
+                self._store_variable(var_name, mod_ptr, "native_mod")
                 # For dotted imports (import os.path), also store top-level name
                 if "." in var_name:
                     top = var_name.split(".")[0]
                     if top not in self.variables:
                         self._native_modules.add(top)
-                        self._store_variable(top, ir.Constant(i64, 0), "native_mod")
+                        top_ptr = self.builder.call(
+                            self.runtime["cpython_import"],
+                            [self._make_string_constant(top)])
+                        self._store_variable(top, top_ptr, "native_mod")
                 continue
 
             # Create a global to hold the module PyObject*
@@ -11816,7 +11845,33 @@ class CodeGen:
                                ir.Constant(i32, t3), d3,
                                out_tag, out_data])
         else:
-            return self._bridge_fallback_expr(node, f"CPython call with {n_args} args (max 3)")
+            # 4+ positional args: use call_kw with 0 keyword args
+            tags_alloca = self.builder.alloca(
+                ir.ArrayType(i32, n_args), name="call.tags")
+            data_alloca = self.builder.alloca(
+                ir.ArrayType(i64, n_args), name="call.data")
+            for i, arg_node in enumerate(node.args):
+                val = self._emit_expr_value(arg_node)
+                tag, data = self._bare_to_tag_data(val, arg_node)
+                tp = self.builder.gep(tags_alloca,
+                    [ir.Constant(i64, 0), ir.Constant(i32, i)])
+                self.builder.store(ir.Constant(i32, tag), tp)
+                dp = self.builder.gep(data_alloca,
+                    [ir.Constant(i64, 0), ir.Constant(i32, i)])
+                self.builder.store(data, dp)
+            tags_base = self.builder.gep(tags_alloca,
+                [ir.Constant(i32, 0), ir.Constant(i32, 0)])
+            data_base = self.builder.gep(data_alloca,
+                [ir.Constant(i32, 0), ir.Constant(i32, 0)])
+            # null pointers for keyword args (none)
+            null_names = ir.Constant(ir.PointerType(i8_ptr), None)
+            null_tags = ir.Constant(ir.PointerType(i32), None)
+            null_data = ir.Constant(ir.PointerType(i64), None)
+            self.builder.call(self.runtime["cpython_call_kw"],
+                              [callable_ptr,
+                               ir.Constant(i32, n_args), tags_base, data_base,
+                               ir.Constant(i32, 0), null_names, null_tags, null_data,
+                               out_tag, out_data])
 
         # Return the result — determine bare type from tag
         tag_val = self.builder.load(out_tag)
@@ -15941,6 +15996,15 @@ class CodeGen:
             return self._emit_int_binop(node.op, ltv.as_i64(self.builder),
                                          rtv.as_i64(self.builder), node)
 
+        # ── Fast path: str % ... (format) — must be checked before the
+        #    float fast path, because "%.2f" % 3.14 has rk==FLOAT and
+        #    would be misrouted to float modulo. ────────────────────────
+        if lk == VKind.STR and op == ast.Mod:
+            # fmt % args
+            args_list = rtv.as_ptr(self.builder) if rk in (VKind.LIST, VKind.TUPLE) \
+                else self._wrap_single_as_list(rtv)
+            return self._rt_call("str_format_percent", [ltv, TypedValue(args_list, ValueType(VKind.LIST))])
+
         # ── Fast path: float op float (or int+float promotion) ─────────
         if lk == VKind.FLOAT or rk == VKind.FLOAT:
             left_d = ltv.val if lk == VKind.FLOAT else self.builder.sitofp(ltv.as_i64(self.builder), double)
@@ -15954,11 +16018,6 @@ class CodeGen:
             return self._rt_call("str_repeat", [ltv, rtv])
         if lk == VKind.INT and rk == VKind.STR and op == ast.Mult:
             return self._rt_call("str_repeat", [rtv, ltv])
-        if lk == VKind.STR and op == ast.Mod:
-            # fmt % args
-            args_list = rtv.as_ptr(self.builder) if rk in (VKind.LIST, VKind.TUPLE) \
-                else self._wrap_single_as_list(rtv)
-            return self._rt_call("str_format_percent", [ltv, TypedValue(args_list, ValueType(VKind.LIST))])
         if lk == VKind.STR and rk == VKind.INT and op == ast.Add:
             r_str = self._rt_call("int_to_str", [rtv])
             return self._rt_call("str_concat", [ltv, TypedValue(r_str, ValueType(VKind.STR))])
@@ -16026,6 +16085,34 @@ class CodeGen:
         if rk == VKind.BOOL and lk == VKind.INT:
             return self._emit_int_binop(node.op, ltv.as_i64(self.builder),
                                          rtv.as_i64(self.builder), node)
+
+        # ── FpyValue runtime dispatch: when either operand is a runtime-
+        #    typed FpyValue struct, dispatch to fastpy_fv_binop so string
+        #    concat, list concat, and mixed arithmetic are handled
+        #    correctly at runtime. ──────────────────────────────────────
+        _l_is_fv = (isinstance(ltv.val.type, ir.LiteralStructType) and ltv.val.type == fpy_val)
+        _r_is_fv = (isinstance(rtv.val.type, ir.LiteralStructType) and rtv.val.type == fpy_val)
+        if _l_is_fv or _r_is_fv:
+            _fv_ops = {ast.Add: 0, ast.Sub: 1, ast.Mult: 2, ast.Div: 3,
+                       ast.FloorDiv: 4, ast.Mod: 5}
+            if op in _fv_ops:
+                lt_tag, lt_data = (self.builder.extract_value(ltv.val, 0),
+                                   self.builder.extract_value(ltv.val, 1)) \
+                    if _l_is_fv else (ir.Constant(i32, ltv.vtype.kind.fpy_tag),
+                                       ltv.as_i64(self.builder))
+                rt_tag, rt_data = (self.builder.extract_value(rtv.val, 0),
+                                   self.builder.extract_value(rtv.val, 1)) \
+                    if _r_is_fv else (ir.Constant(i32, rtv.vtype.kind.fpy_tag),
+                                       rtv.as_i64(self.builder))
+                out_tag = self._create_entry_alloca(i32, "fvbop.tag")
+                out_data = self._create_entry_alloca(i64, "fvbop.data")
+                self.builder.call(self.runtime["fv_binop"],
+                                  [lt_tag, lt_data, rt_tag, rt_data,
+                                   ir.Constant(i32, _fv_ops[op]),
+                                   out_tag, out_data])
+                return self._fv_build_from_slots(
+                    self.builder.load(out_tag),
+                    self.builder.load(out_data))
 
         # ── Fast path: int bitwise ops ─────────────────────────────────
         if lk in (VKind.INT, VKind.BOOL, VKind.UNKNOWN) and rk in (VKind.INT, VKind.BOOL, VKind.UNKNOWN):
@@ -20932,10 +21019,14 @@ class CodeGen:
             if (base_name is not None
                     and base_name in getattr(self, "_dict_var_obj_values", set())):
                 return self.builder.inttoptr(data, i8_ptr)
-            # Unknown value type: return the raw data. For dicts from
-            # json.loads or other dynamic sources, the caller uses the
-            # FV tag to determine how to handle the value.
-            return data
+            # Unknown value type: return FpyValue with the runtime tag
+            # so downstream code (print, assignment, etc.) can dispatch
+            # correctly. Without this, string values from dicts with int
+            # keys would be printed as raw pointer numbers.
+            fv = ir.Constant(fpy_val, ir.Undefined)
+            fv = self.builder.insert_value(fv, tag, 0)
+            fv = self.builder.insert_value(fv, data, 1)
+            return fv
 
         # Check for list/tuple access
         if self._is_list_expr(node.value) or self._is_tuple_expr(node.value):

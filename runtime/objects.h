@@ -13,6 +13,7 @@
 #define FASTPY_OBJECTS_H
 
 #include <stdint.h>
+#include <stddef.h>
 #include "threading.h"
 #include "gc.h"
 #include <stdio.h>
