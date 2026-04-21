@@ -509,6 +509,7 @@ static FpySymEntry fpy_jit_symbols[] = {
     SYM(fastpy_dict_new), SYM(fastpy_dict_set_fv), SYM(fastpy_dict_get_fv),
     SYM(fastpy_dict_length), SYM(fastpy_dict_keys), SYM(fastpy_dict_values),
     SYM(fastpy_dict_items), SYM(fastpy_dict_has_key), SYM(fastpy_dict_update),
+    SYM(fastpy_dict_equal), SYM(fastpy_set_equal),
     SYM(fastpy_tuple_new), SYM(fastpy_obj_new),
     SYM(fastpy_register_class), SYM(fastpy_register_method),
     SYM(fastpy_obj_set_fv), SYM(fastpy_obj_get_fv),

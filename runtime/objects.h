@@ -282,6 +282,10 @@ typedef struct {
     fpy_mutex_t lock;      /* per-object lock (free-threaded mode) */
 } FpyDict;
 
+/* Dict/set equality */
+int32_t fastpy_dict_equal(FpyDict *a, FpyDict *b);
+int32_t fastpy_set_equal(FpyDict *a, FpyDict *b);
+
 /* Variadic closure call: takes a list of args, unpacks and dispatches. */
 int64_t fastpy_closure_call_list(void *closure, void *args_list);
 

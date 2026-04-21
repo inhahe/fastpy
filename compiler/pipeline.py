@@ -86,6 +86,9 @@ def compile_source(source: str, output: Path | None = None,
         )
 
     # Stage 3: Generate LLVM IR
+    import sys as _sys
+    old_limit = _sys.getrecursionlimit()
+    _sys.setrecursionlimit(max(old_limit, 20000))  # large stdlib modules need headroom
     try:
         codegen = CodeGen(threading_mode=threading_mode, int64_mode=int64_mode)
         ir_string = codegen.generate(tree)
@@ -97,6 +100,23 @@ def compile_source(source: str, output: Path | None = None,
                 line=e.node.lineno if e.node and hasattr(e.node, "lineno") else None,
             )],
         )
+    except RecursionError:
+        return CompileResult(
+            success=False,
+            errors=[CompileError(message="Module too large for compilation (recursion limit)")],
+        )
+    except (TypeError, ValueError, AttributeError, IndexError,
+            KeyError, UnboundLocalError, AssertionError, RuntimeError) as e:
+        # Catch internal codegen errors (type mismatches from llvmlite,
+        # missing attributes, index errors) as compile failures
+        import traceback as _tb
+        msg = str(e)[:200] if str(e) else f"{type(e).__name__} in codegen"
+        return CompileResult(
+            success=False,
+            errors=[CompileError(message=msg)],
+        )
+    finally:
+        _sys.setrecursionlimit(old_limit)
 
     # Stage 4: Compile to native executable
     if output is None:
@@ -408,6 +428,8 @@ _SUPPORTED_STMT_NODES = (
     ast.Match,       # match/case (Python 3.10+)
     ast.AnnAssign,   # x: int = expr (type-annotated assignment)
     ast.AsyncFunctionDef,  # async def (routed through CPython bridge)
+    ast.AsyncWith,   # async with (desugared to regular with)
+    ast.AsyncFor,    # async for (desugared to regular for)
     ast.TryStar,     # except* (exception groups, Python 3.11+)
 )
 
@@ -477,15 +499,14 @@ def _check_unsupported(tree: ast.Module) -> list[str]:
         if isinstance(node, ast.stmt) and not isinstance(node, _SUPPORTED_STMT_NODES):
             found.append(f"{type(node).__name__} statement")
 
-        # Check that calls are only to allowed functions
+        # Phase 4: function call checks relaxed. Unknown callables are
+        # handled by the codegen via bridge fallback (closure calls,
+        # CPython bridge, or runtime dispatch). Only truly unsupported
+        # call syntax (not Name/Attribute/Call/Subscript) is blocked.
         if isinstance(node, ast.Call):
-            if isinstance(node.func, ast.Name):
-                if node.func.id not in allowed_calls:
-                    found.append(f"function call: {node.func.id}()")
-            elif isinstance(node.func, ast.Attribute):
-                pass  # method calls like s.lower() — handled by codegen
-            elif isinstance(node.func, (ast.Call, ast.Subscript)):
-                pass  # C()(args) or d[key](args) — handled by codegen
+            if isinstance(node.func, (ast.Name, ast.Attribute,
+                                       ast.Call, ast.Subscript)):
+                pass  # all handled by codegen + bridge fallback
             else:
                 found.append(f"complex call expression")
 

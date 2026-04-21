@@ -2953,6 +2953,91 @@ int64_t fastpy_list_compare(FpyList *a, FpyList *b) {
     return 0;
 }
 
+/* Dict equality: two dicts are equal if they have the same keys and values.
+ * Compares by iterating the compact key/value arrays. */
+int32_t fastpy_dict_equal(FpyDict *a, FpyDict *b) {
+    if (a == b) return 1;
+    if (!a || !b) return 0;
+    if (a->length != b->length) return 0;
+    /* For each key in a, check that b has the same key with the same value. */
+    for (int64_t i = 0; i < a->length; i++) {
+        FpyValue key = a->keys[i];
+        /* Look up key in b */
+        uint64_t h = fpy_hash_value(key);
+        int64_t mask = b->table_size - 1;
+        int64_t slot = (int64_t)(h & (uint64_t)mask);
+        int found = 0;
+        while (1) {
+            int64_t idx = b->indices[slot];
+            if (idx == FPY_DICT_EMPTY) break;
+            if (idx != FPY_DICT_DELETED && fpy_key_equal(b->keys[idx], key)) {
+                /* Key found — compare values */
+                FpyValue va = a->values[i];
+                FpyValue vb = b->values[idx];
+                if (va.tag != vb.tag) return 0;
+                switch (va.tag) {
+                    case FPY_TAG_INT:
+                    case FPY_TAG_BOOL:
+                        if (va.data.i != vb.data.i) return 0;
+                        break;
+                    case FPY_TAG_FLOAT:
+                        if (va.data.f != vb.data.f) return 0;
+                        break;
+                    case FPY_TAG_STR:
+                        if (strcmp(va.data.s, vb.data.s) != 0) return 0;
+                        break;
+                    case FPY_TAG_NONE:
+                        break;
+                    case FPY_TAG_LIST:
+                        if (!fastpy_list_equal(va.data.list, vb.data.list)) return 0;
+                        break;
+                    case FPY_TAG_DICT:
+                    case FPY_TAG_SET:
+                        if (!fastpy_dict_equal((FpyDict*)va.data.list,
+                                               (FpyDict*)vb.data.list)) return 0;
+                        break;
+                    default:
+                        /* For other types, compare raw data (pointer identity) */
+                        if (va.data.i != vb.data.i) return 0;
+                        break;
+                }
+                found = 1;
+                break;
+            }
+            slot = (slot + 1) & mask;
+        }
+        if (!found) return 0;
+    }
+    return 1;
+}
+
+/* Set equality: two sets are equal if they have the same elements.
+ * Sets are dict-backed, so this checks that every key in a is in b
+ * and the lengths are equal (values are all None — ignore them). */
+int32_t fastpy_set_equal(FpyDict *a, FpyDict *b) {
+    if (a == b) return 1;
+    if (!a || !b) return 0;
+    if (a->length != b->length) return 0;
+    for (int64_t i = 0; i < a->length; i++) {
+        FpyValue key = a->keys[i];
+        uint64_t h = fpy_hash_value(key);
+        int64_t mask = b->table_size - 1;
+        int64_t slot = (int64_t)(h & (uint64_t)mask);
+        int found = 0;
+        while (1) {
+            int64_t idx = b->indices[slot];
+            if (idx == FPY_DICT_EMPTY) break;
+            if (idx != FPY_DICT_DELETED && fpy_key_equal(b->keys[idx], key)) {
+                found = 1;
+                break;
+            }
+            slot = (slot + 1) & mask;
+        }
+        if (!found) return 0;
+    }
+    return 1;
+}
+
 /* List repetition: [1, 2] * 3 = [1, 2, 1, 2, 1, 2] */
 FpyList* fastpy_list_repeat(FpyList *lst, int64_t n) {
     if (n <= 0) return fpy_list_new(0);
