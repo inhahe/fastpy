@@ -12419,6 +12419,10 @@ class CodeGen:
             if name == "print":
                 self._emit_print(node)
                 return
+            # Builtin functions that modify state (handled in _emit_call_expr)
+            if name in ("setattr", "delattr"):
+                self._emit_call_expr(node)
+                return
             # Check if it's a closure variable
             if name in self.variables:
                 _, tag = self.variables[name]
