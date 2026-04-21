@@ -101,6 +101,11 @@ void* fpy_cpython_getattr(void *obj, const char *attr_name) {
     return (void*)result;
 }
 
+/* Check if a PyObject* has an attribute. Returns 1 (True) or 0 (False). */
+int32_t fpy_cpython_hasattr(void *obj, const char *attr_name) {
+    return PyObject_HasAttrString((PyObject*)obj, attr_name) ? 1 : 0;
+}
+
 /* ── Type conversion: FpyValue → PyObject* ──────────────────────── */
 
 static PyObject* fpy_to_pyobject(int32_t tag, int64_t data) {
@@ -203,6 +208,30 @@ static void pyobject_to_fpy(PyObject *obj, int32_t *out_tag, int64_t *out_data) 
             fpy_dict_set(dict, fk, fv);
         }
         *out_data = (int64_t)(intptr_t)dict;
+    } else if (PyBytes_Check(obj)) {
+        *out_tag = FPY_TAG_BYTES;
+        /* Extract raw bytes data — copy since the PyObject may be freed.
+         * Note: this uses strlen-based copy, so embedded nulls are truncated.
+         * For full binary fidelity, a length-prefixed buffer would be needed. */
+        const char *data = PyBytes_AS_STRING(obj);
+        Py_ssize_t len = PyBytes_GET_SIZE(obj);
+        char *copy = (char*)malloc(len + 1);
+        memcpy(copy, data, len);
+        copy[len] = '\0';
+        *out_data = (int64_t)(intptr_t)copy;
+    } else if (PyTuple_Check(obj)) {
+        /* Convert PyTuple to FpyList (with is_tuple flag) */
+        *out_tag = FPY_TAG_LIST;
+        Py_ssize_t n = PyTuple_GET_SIZE(obj);
+        FpyList *lst = fpy_list_new(n);
+        lst->is_tuple = 1;
+        for (Py_ssize_t i = 0; i < n; i++) {
+            PyObject *item = PyTuple_GET_ITEM(obj, i);
+            FpyValue v;
+            pyobject_to_fpy(item, &v.tag, &v.data.i);
+            fpy_list_append(lst, v);
+        }
+        *out_data = (int64_t)(intptr_t)lst;
     } else {
         /* Opaque PyObject* — store as a tagged pointer.
          * We increment the refcount so it stays alive. */

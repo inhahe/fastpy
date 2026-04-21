@@ -232,8 +232,9 @@ class ValueType:
             "set": VKind.SET, "tuple": VKind.TUPLE, "obj": VKind.OBJ,
             "pyobj": VKind.PYOBJ, "decimal": VKind.DECIMAL,
             "complex": VKind.COMPLEX, "bigint": VKind.BIGINT,
-            "closure": VKind.CLOSURE, "counter": VKind.DICT,
-            "defaultdict": VKind.DICT, "deque": VKind.LIST,
+            "bytes": VKind.STR, "closure": VKind.CLOSURE,
+            "counter": VKind.DICT, "defaultdict": VKind.DICT,
+            "deque": VKind.LIST,
             "chainmap": VKind.OBJ, "logger": VKind.OBJ,
             "path": VKind.STR, "native_func": VKind.UNKNOWN,
             "native_mod": VKind.PYOBJ, "cls": VKind.INT,
@@ -247,7 +248,11 @@ class ValueType:
         if tag.startswith("dict:"):
             return ValueType(VKind.DICT)
         kind = _map.get(tag, VKind.UNKNOWN)
-        return ValueType(kind)
+        vt = ValueType(kind)
+        # Preserve original tag for aliases (e.g. "bytes" -> VKind.STR)
+        # so we can distinguish bytes from str at the FV wrapping level.
+        vt._tag_cache = tag
+        return vt
 
 
 @dataclass
@@ -1043,6 +1048,9 @@ class CodeGen:
         self.runtime["str_repeat"] = ir.Function(self.module, ft, name="fastpy_str_repeat")
         ft = ir.FunctionType(i8_ptr, [i8_ptr])
         self.runtime["str_lower"] = ir.Function(self.module, ft, name="fastpy_str_lower")
+        # str.encode() → returns bytes (same content, different tag)
+        ft = ir.FunctionType(i8_ptr, [i8_ptr])
+        self.runtime["str_encode"] = ir.Function(self.module, ft, name="fastpy_str_encode")
         ft = ir.FunctionType(i8_ptr, [i64])
         self.runtime["int_to_str"] = ir.Function(self.module, ft, name="fastpy_int_to_str")
         ft = ir.FunctionType(i8_ptr, [double])
@@ -1601,6 +1609,9 @@ class CodeGen:
         self.runtime["cpython_import"] = ir.Function(self.module, ft, name="fpy_cpython_import")
         ft = ir.FunctionType(i8_ptr, [i8_ptr, i8_ptr])  # fpy_cpython_getattr(obj, name) -> PyObject*
         self.runtime["cpython_getattr"] = ir.Function(self.module, ft, name="fpy_cpython_getattr")
+        # hasattr(obj, name) -> i32 (0 or 1)
+        ft = ir.FunctionType(i32, [i8_ptr, i8_ptr])
+        self.runtime["cpython_hasattr"] = ir.Function(self.module, ft, name="fpy_cpython_hasattr")
         # call1(callable, tag, data, &out_tag, &out_data)
         ft = ir.FunctionType(void, [i8_ptr, i32, i64, ir.PointerType(i32), ir.PointerType(i64)])
         self.runtime["cpython_call1"] = ir.Function(self.module, ft, name="fpy_cpython_call1")
@@ -8657,7 +8668,9 @@ class CodeGen:
                 "set", "enumerate", "zip", "isinstance", "type",
                 "any", "all", "chr", "ord", "hex", "oct", "bin",
                 "round", "repr", "pow", "divmod", "dict", "tuple",
-                "map", "filter", "hash", "print",
+                "map", "filter", "hash", "print", "hasattr",
+                "getattr", "setattr", "delattr", "callable",
+                "issubclass", "id", "input", "open",
                 "locals", "globals", "eval", "exec", "complex",
                 "frozenset",
             }
@@ -9221,10 +9234,14 @@ class CodeGen:
                 if vn_kind in _vkind_to_tag:
                     tag = _vkind_to_tag[vn_kind]
                 elif vn_kind == VKind.STR:
-                    tag = FPY_TAG_STR
-                elif (isinstance(value_node, ast.Constant)
-                      and isinstance(value_node.value, bytes)):
-                    tag = FPY_TAG_BYTES
+                    # Check if this is actually bytes (stored as char* like str)
+                    if vn_tag == "bytes":
+                        tag = FPY_TAG_BYTES
+                    elif (isinstance(value_node, ast.Constant)
+                          and isinstance(value_node.value, bytes)):
+                        tag = FPY_TAG_BYTES
+                    else:
+                        tag = FPY_TAG_STR
                 else:
                     # Legacy fallback for unrecognized types
                     if self._is_list_expr(value_node) or self._is_tuple_expr(value_node):
@@ -9243,6 +9260,24 @@ class CodeGen:
             # Return runtime tag (can't use ir.Constant for variable tag)
             return FPY_TAG_INT, data_val
         return FPY_TAG_INT, ir.Constant(i64, 0)
+
+    def _to_tag_data_ir(self, value: ir.Value,
+                         value_node: 'ast.expr | None' = None) -> tuple:
+        """Convert an LLVM value to (tag_ir: ir.Value, data_ir: ir.Value).
+
+        Like _bare_to_tag_data, but returns IR values for both tag and data.
+        For FpyValue structs, the runtime tag is preserved (not hardcoded
+        to INT). For other types, the tag is an ir.Constant(i32, ...).
+
+        Returns a tuple (tag_ir, data_ir) where both are LLVM IR values.
+        """
+        if isinstance(value.type, ir.LiteralStructType) and value.type == fpy_val:
+            tag_ir = self.builder.extract_value(value, 0)
+            data_ir = self.builder.extract_value(value, 1)
+            return tag_ir, data_ir
+        # Fall back to compile-time tag from _bare_to_tag_data
+        tag_int, data_ir = self._bare_to_tag_data(value, value_node)
+        return ir.Constant(i32, tag_int), data_ir
 
     def _get_attr_slot(self, attr_node: ast.Attribute) -> int | None:
         """Return the static slot index for an obj.attr reference, or None
@@ -9558,10 +9593,15 @@ class CodeGen:
         if isinstance(node, ast.BinOp):
             if self._is_complex_expr(node.left) or self._is_complex_expr(node.right):
                 return "complex"
-        # Compare / not / isinstance / bool() produce booleans
+        # Compare / not / isinstance / bool() / hasattr() produce booleans
         if isinstance(node, ast.Compare):
             return "bool"
         if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+            return "bool"
+        # Builtin calls that return bool
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id in ("hasattr", "isinstance", "issubclass",
+                                     "callable", "bool", "any", "all")):
             return "bool"
         # BoolOp (and/or) with all bool-typed operands → bool result; with
         # mixed types, the result is the left/right operand's type (we
@@ -9642,6 +9682,10 @@ class CodeGen:
                 if fn in ("exists", "isfile", "isdir",
                            "path_exists", "path_isfile", "path_isdir"):
                     return "bool"
+        # str.encode() returns bytes
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "encode"):
+            return "bytes"
         # Native module method calls: json.loads(...), os.getcwd(), etc.
         if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)):
@@ -10592,6 +10636,12 @@ class CodeGen:
         if isinstance(type_tag, ValueType) and isinstance(value.type, ir.PointerType):
             kind = type_tag.kind
             if kind == VKind.STR:
+                # Check if this is actually bytes (stored as char* like str
+                # but tagged with FPY_TAG_BYTES at the FV level)
+                if type_tag._tag_cache == "bytes":
+                    tag = ir.Constant(i32, FPY_TAG_BYTES)
+                    data = self.builder.ptrtoint(value, i64)
+                    return self._fv_build_from_slots(tag, data)
                 return self._fv_from_str(value)
             if kind == VKind.OBJ:
                 return self._fv_from_obj(value)
@@ -11763,13 +11813,13 @@ class CodeGen:
                 ir.ArrayType(i64, max(n_pos, 1)), name="kw.data")
             for i, arg_node in enumerate(node.args):
                 val = self._emit_expr_value(arg_node)
-                tag, data = self._bare_to_tag_data(val, arg_node)
+                t_ir, d_ir = self._to_tag_data_ir(val, arg_node)
                 tag_ptr = self.builder.gep(tags_alloca,
                     [ir.Constant(i32, 0), ir.Constant(i32, i)])
                 data_ptr = self.builder.gep(data_alloca,
                     [ir.Constant(i32, 0), ir.Constant(i32, i)])
-                self.builder.store(ir.Constant(i32, tag), tag_ptr)
-                self.builder.store(data, data_ptr)
+                self.builder.store(t_ir, tag_ptr)
+                self.builder.store(d_ir, data_ptr)
             # Build keyword arg arrays
             names_alloca = self.builder.alloca(
                 ir.ArrayType(i8_ptr, n_kw), name="kw.names")
@@ -11780,7 +11830,7 @@ class CodeGen:
             for i, kw in enumerate(node.keywords):
                 name_ptr = self._make_string_constant(kw.arg)
                 val = self._emit_expr_value(kw.value)
-                tag, data = self._bare_to_tag_data(val, kw.value)
+                t_ir, d_ir = self._to_tag_data_ir(val, kw.value)
                 n_ptr = self.builder.gep(names_alloca,
                     [ir.Constant(i32, 0), ir.Constant(i32, i)])
                 t_ptr = self.builder.gep(kw_tags_alloca,
@@ -11788,8 +11838,8 @@ class CodeGen:
                 d_ptr = self.builder.gep(kw_data_alloca,
                     [ir.Constant(i32, 0), ir.Constant(i32, i)])
                 self.builder.store(name_ptr, n_ptr)
-                self.builder.store(ir.Constant(i32, tag), t_ptr)
-                self.builder.store(data, d_ptr)
+                self.builder.store(t_ir, t_ptr)
+                self.builder.store(d_ir, d_ptr)
             # Call
             tags_base = self.builder.gep(tags_alloca,
                 [ir.Constant(i32, 0), ir.Constant(i32, 0)])
@@ -11816,33 +11866,33 @@ class CodeGen:
                               [callable_ptr, out_tag, out_data])
         elif n_args == 1:
             arg = self._emit_expr_value(node.args[0])
-            tag, data = self._bare_to_tag_data(arg, node.args[0])
+            t_ir, d_ir = self._to_tag_data_ir(arg, node.args[0])
             self.builder.call(self.runtime["cpython_call1"],
                               [callable_ptr,
-                               ir.Constant(i32, tag), data,
+                               t_ir, d_ir,
                                out_tag, out_data])
         elif n_args == 2:
             a1 = self._emit_expr_value(node.args[0])
-            t1, d1 = self._bare_to_tag_data(a1, node.args[0])
+            t1_ir, d1_ir = self._to_tag_data_ir(a1, node.args[0])
             a2 = self._emit_expr_value(node.args[1])
-            t2, d2 = self._bare_to_tag_data(a2, node.args[1])
+            t2_ir, d2_ir = self._to_tag_data_ir(a2, node.args[1])
             self.builder.call(self.runtime["cpython_call2"],
                               [callable_ptr,
-                               ir.Constant(i32, t1), d1,
-                               ir.Constant(i32, t2), d2,
+                               t1_ir, d1_ir,
+                               t2_ir, d2_ir,
                                out_tag, out_data])
         elif n_args == 3:
             a1 = self._emit_expr_value(node.args[0])
-            t1, d1 = self._bare_to_tag_data(a1, node.args[0])
+            t1_ir, d1_ir = self._to_tag_data_ir(a1, node.args[0])
             a2 = self._emit_expr_value(node.args[1])
-            t2, d2 = self._bare_to_tag_data(a2, node.args[1])
+            t2_ir, d2_ir = self._to_tag_data_ir(a2, node.args[1])
             a3 = self._emit_expr_value(node.args[2])
-            t3, d3 = self._bare_to_tag_data(a3, node.args[2])
+            t3_ir, d3_ir = self._to_tag_data_ir(a3, node.args[2])
             self.builder.call(self.runtime["cpython_call3"],
                               [callable_ptr,
-                               ir.Constant(i32, t1), d1,
-                               ir.Constant(i32, t2), d2,
-                               ir.Constant(i32, t3), d3,
+                               t1_ir, d1_ir,
+                               t2_ir, d2_ir,
+                               t3_ir, d3_ir,
                                out_tag, out_data])
         else:
             # 4+ positional args: use call_kw with 0 keyword args
@@ -11852,13 +11902,13 @@ class CodeGen:
                 ir.ArrayType(i64, n_args), name="call.data")
             for i, arg_node in enumerate(node.args):
                 val = self._emit_expr_value(arg_node)
-                tag, data = self._bare_to_tag_data(val, arg_node)
+                t_ir, d_ir = self._to_tag_data_ir(val, arg_node)
                 tp = self.builder.gep(tags_alloca,
                     [ir.Constant(i64, 0), ir.Constant(i32, i)])
-                self.builder.store(ir.Constant(i32, tag), tp)
+                self.builder.store(t_ir, tp)
                 dp = self.builder.gep(data_alloca,
                     [ir.Constant(i64, 0), ir.Constant(i32, i)])
-                self.builder.store(data, dp)
+                self.builder.store(d_ir, dp)
             tags_base = self.builder.gep(tags_alloca,
                 [ir.Constant(i32, 0), ir.Constant(i32, 0)])
             data_base = self.builder.gep(data_alloca,
@@ -11977,11 +12027,11 @@ class CodeGen:
             data_alloca = self.builder.alloca(ir.ArrayType(i64, max(n_pos, 1)))
             for i, arg_node in enumerate(node.args):
                 val = self._emit_expr_value(arg_node)
-                tag, data = self._bare_to_tag_data(val, arg_node)
+                t_ir, d_ir = self._to_tag_data_ir(val, arg_node)
                 tp = self.builder.gep(tags_alloca, [ir.Constant(i64, 0), ir.Constant(i32, i)])
-                self.builder.store(ir.Constant(i32, tag), tp)
+                self.builder.store(t_ir, tp)
                 dp = self.builder.gep(data_alloca, [ir.Constant(i64, 0), ir.Constant(i32, i)])
-                self.builder.store(data, dp)
+                self.builder.store(d_ir, dp)
             kw_names = self.builder.alloca(ir.ArrayType(i8_ptr, max(n_kw, 1)))
             kw_tags = self.builder.alloca(ir.ArrayType(i32, max(n_kw, 1)))
             kw_data = self.builder.alloca(ir.ArrayType(i64, max(n_kw, 1)))
@@ -11989,11 +12039,11 @@ class CodeGen:
                 np = self.builder.gep(kw_names, [ir.Constant(i64, 0), ir.Constant(i32, i)])
                 self.builder.store(self._make_string_constant(kw.arg), np)
                 val = self._emit_expr_value(kw.value)
-                tag, data = self._bare_to_tag_data(val, kw.value)
+                t_ir, d_ir = self._to_tag_data_ir(val, kw.value)
                 tp = self.builder.gep(kw_tags, [ir.Constant(i64, 0), ir.Constant(i32, i)])
-                self.builder.store(ir.Constant(i32, tag), tp)
+                self.builder.store(t_ir, tp)
                 dp = self.builder.gep(kw_data, [ir.Constant(i64, 0), ir.Constant(i32, i)])
-                self.builder.store(data, dp)
+                self.builder.store(d_ir, dp)
             t_ptr = self.builder.gep(tags_alloca, [ir.Constant(i64, 0), ir.Constant(i32, 0)])
             d_ptr = self.builder.gep(data_alloca, [ir.Constant(i64, 0), ir.Constant(i32, 0)])
             kn_ptr = self.builder.gep(kw_names, [ir.Constant(i64, 0), ir.Constant(i32, 0)])
@@ -12008,40 +12058,40 @@ class CodeGen:
                               [callable_ptr, out_tag, out_data])
         elif n_args == 1:
             arg = self._emit_expr_value(node.args[0])
-            tag, data = self._bare_to_tag_data(arg, node.args[0])
+            t_ir, d_ir = self._to_tag_data_ir(arg, node.args[0])
             self.builder.call(self.runtime["cpython_call1"],
-                              [callable_ptr, ir.Constant(i32, tag), data,
+                              [callable_ptr, t_ir, d_ir,
                                out_tag, out_data])
         elif n_args == 2:
             a1 = self._emit_expr_value(node.args[0])
-            t1, d1 = self._bare_to_tag_data(a1, node.args[0])
+            t1_ir, d1_ir = self._to_tag_data_ir(a1, node.args[0])
             a2 = self._emit_expr_value(node.args[1])
-            t2, d2 = self._bare_to_tag_data(a2, node.args[1])
+            t2_ir, d2_ir = self._to_tag_data_ir(a2, node.args[1])
             self.builder.call(self.runtime["cpython_call2"],
-                              [callable_ptr, ir.Constant(i32, t1), d1,
-                               ir.Constant(i32, t2), d2, out_tag, out_data])
+                              [callable_ptr, t1_ir, d1_ir,
+                               t2_ir, d2_ir, out_tag, out_data])
         elif n_args == 3:
             a1 = self._emit_expr_value(node.args[0])
-            t1, d1 = self._bare_to_tag_data(a1, node.args[0])
+            t1_ir, d1_ir = self._to_tag_data_ir(a1, node.args[0])
             a2 = self._emit_expr_value(node.args[1])
-            t2, d2 = self._bare_to_tag_data(a2, node.args[1])
+            t2_ir, d2_ir = self._to_tag_data_ir(a2, node.args[1])
             a3 = self._emit_expr_value(node.args[2])
-            t3, d3 = self._bare_to_tag_data(a3, node.args[2])
+            t3_ir, d3_ir = self._to_tag_data_ir(a3, node.args[2])
             self.builder.call(self.runtime["cpython_call3"],
-                              [callable_ptr, ir.Constant(i32, t1), d1,
-                               ir.Constant(i32, t2), d2,
-                               ir.Constant(i32, t3), d3, out_tag, out_data])
+                              [callable_ptr, t1_ir, d1_ir,
+                               t2_ir, d2_ir,
+                               t3_ir, d3_ir, out_tag, out_data])
         else:
             # Fallback: use kwargs path with 0 kwargs
             tags_alloca = self.builder.alloca(ir.ArrayType(i32, n_args))
             data_alloca = self.builder.alloca(ir.ArrayType(i64, n_args))
             for i, arg_node in enumerate(node.args):
                 val = self._emit_expr_value(arg_node)
-                tag, data = self._bare_to_tag_data(val, arg_node)
+                t_ir, d_ir = self._to_tag_data_ir(val, arg_node)
                 tp = self.builder.gep(tags_alloca, [ir.Constant(i64, 0), ir.Constant(i32, i)])
-                self.builder.store(ir.Constant(i32, tag), tp)
+                self.builder.store(t_ir, tp)
                 dp = self.builder.gep(data_alloca, [ir.Constant(i64, 0), ir.Constant(i32, i)])
-                self.builder.store(data, dp)
+                self.builder.store(d_ir, dp)
             t_ptr = self.builder.gep(tags_alloca, [ir.Constant(i64, 0), ir.Constant(i32, 0)])
             d_ptr = self.builder.gep(data_alloca, [ir.Constant(i64, 0), ir.Constant(i32, 0)])
             kn_ptr = ir.Constant(ir.PointerType(i8_ptr), None)
@@ -16114,6 +16164,33 @@ class CodeGen:
                     self.builder.load(out_tag),
                     self.builder.load(out_data))
 
+        # ── Fast path: PYOBJ binary ops — dispatch to CPython ──────────
+        if lk == VKind.PYOBJ or rk == VKind.PYOBJ:
+            _pyobj_ops = {ast.Add: 0, ast.Sub: 1, ast.Mult: 2, ast.Div: 3,
+                          ast.FloorDiv: 4, ast.Mod: 5, ast.Pow: 6}
+            if op in _pyobj_ops:
+                out_tag = self._create_entry_alloca(i32, "pybop.tag")
+                out_data = self._create_entry_alloca(i64, "pybop.data")
+                if lk == VKind.PYOBJ:
+                    # left is PyObject*, right is tag+data
+                    self.builder.call(self.runtime["cpython_binop"],
+                                      [ltv.as_ptr(self.builder),
+                                       ir.Constant(i32, rtv.vtype.kind.fpy_tag),
+                                       rtv.as_i64(self.builder),
+                                       ir.Constant(i32, _pyobj_ops[op]),
+                                       out_tag, out_data])
+                else:
+                    # left is tag+data, right is PyObject* — use rbinop
+                    self.builder.call(self.runtime["cpython_rbinop"],
+                                      [ir.Constant(i32, ltv.vtype.kind.fpy_tag),
+                                       ltv.as_i64(self.builder),
+                                       rtv.as_ptr(self.builder),
+                                       ir.Constant(i32, _pyobj_ops[op]),
+                                       out_tag, out_data])
+                return self._fv_build_from_slots(
+                    self.builder.load(out_tag),
+                    self.builder.load(out_data))
+
         # ── Fast path: int bitwise ops ─────────────────────────────────
         if lk in (VKind.INT, VKind.BOOL, VKind.UNKNOWN) and rk in (VKind.INT, VKind.BOOL, VKind.UNKNOWN):
             return self._emit_int_binop(node.op, ltv.as_i64(self.builder),
@@ -16130,7 +16207,9 @@ class CodeGen:
                            rtv.as_i64(self.builder),
                            ir.Constant(i32, op_code),
                            out_tag, out_data])
-        return self.builder.load(out_data)
+        return self._fv_build_from_slots(
+            self.builder.load(out_tag),
+            self.builder.load(out_data))
 
     def _wrap_single_as_list(self, tv: TypedValue) -> ir.Value:
         """Wrap a single value into a list for % formatting."""
@@ -17082,17 +17161,27 @@ class CodeGen:
                 return self.builder.load(data_slot)
 
             if name == "hasattr" and len(node.args) >= 2:
-                obj = self._emit_expr_value(node.args[0])
-                if isinstance(obj.type, ir.IntType):
-                    obj = self.builder.inttoptr(obj, i8_ptr)
-                attr_name = self._emit_expr_value(node.args[1])
-                if isinstance(attr_name.type, ir.IntType):
-                    attr_name = self.builder.inttoptr(attr_name, i8_ptr)
-                # Check if obj has the attribute (slot_count > 0 and slot exists)
-                # Use obj_get_fv and check if it doesn't crash — simplification:
+                # Check if the object is a PYOBJ before evaluating args
+                obj_kind = VKind.UNKNOWN
+                if (isinstance(node.args[0], ast.Name)
+                        and node.args[0].id in self.variables):
+                    obj_kind = self._var_kind(node.args[0].id)
+                # For PYOBJ (bridge objects), call CPython's hasattr
+                if obj_kind == VKind.PYOBJ:
+                    obj = self._emit_expr_value(node.args[0])
+                    if isinstance(obj.type, ir.IntType):
+                        obj = self.builder.inttoptr(obj, i8_ptr)
+                    attr_name = self._emit_expr_value(node.args[1])
+                    if isinstance(attr_name.type, ir.IntType):
+                        attr_name = self.builder.inttoptr(attr_name, i8_ptr)
+                    result = self.builder.call(
+                        self.runtime["cpython_hasattr"], [obj, attr_name])
+                    return self.builder.zext(result, i64)
                 # For native objects with known slots, always return True
-                # (our slot system pre-allocates all used attrs)
-                return ir.Constant(i64, 1)  # True (all attrs exist by construction)
+                # (our slot system pre-allocates all used attrs).
+                # Don't evaluate args — avoids potential side effects from
+                # _emit_expr_value on non-PYOBJ objects.
+                return ir.Constant(i64, 1)  # True
 
             if name == "setattr" and len(node.args) >= 3:
                 obj = self._emit_expr_value(node.args[0])
@@ -20376,6 +20465,9 @@ class CodeGen:
                     return self._rt_call("str_count", [obj, sub])
             if method == "format":
                 return self._emit_str_format(node, obj)
+            if method == "encode":
+                # str.encode() → bytes (same UTF-8 content, tagged as BYTES)
+                return self._rt_call("str_encode", [obj])
         # Fallback: runtime method dispatch for unknown objects.
         # This handles generated code (e.g. yield-from delegation)
         # where the receiver's class isn't statically known.
@@ -20620,7 +20712,8 @@ class CodeGen:
         if isinstance(node, ast.BoolOp):
             return all(self._is_bool_typed(v) for v in node.values)
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
-            if node.func.id in ("bool", "isinstance"):
+            if node.func.id in ("bool", "isinstance", "hasattr", "callable",
+                                "issubclass", "any", "all"):
                 return True
             if node.func.id in self._user_functions:
                 return self._user_functions[node.func.id].ret_tag == "bool"

@@ -348,6 +348,24 @@ void fpy_value_repr(FpyValue val, char *buf, int bufsize) {
             snprintf(buf + pos, bufsize - pos, "}");
             break;
         }
+        case FPY_TAG_BYTES: {
+            /* bytes repr: b'...' */
+            const char *data = val.data.s;
+            int pos = 0;
+            pos += snprintf(buf + pos, bufsize - pos, "b'");
+            if (data) {
+                size_t len = strlen(data);
+                for (size_t i = 0; i < len && pos < bufsize - 6; i++) {
+                    unsigned char c = (unsigned char)data[i];
+                    if (c == '\\') pos += snprintf(buf + pos, bufsize - pos, "\\\\");
+                    else if (c == '\'') pos += snprintf(buf + pos, bufsize - pos, "\\'");
+                    else if (c >= 32 && c < 127) pos += snprintf(buf + pos, bufsize - pos, "%c", c);
+                    else pos += snprintf(buf + pos, bufsize - pos, "\\x%02x", c);
+                }
+            }
+            snprintf(buf + pos, bufsize - pos, "'");
+            break;
+        }
     }
 }
 
@@ -554,6 +572,22 @@ void fpy_value_write(FpyValue val) {
             char *s = fpy_decimal_to_str((FpyDecimal*)(intptr_t)val.data.i);
             printf("%s", s);
             free(s);
+            break;
+        }
+        case FPY_TAG_BYTES: {
+            /* Print bytes in Python b'...' repr format */
+            const char *data = val.data.s;
+            if (!data) { printf("b''"); break; }
+            printf("b'");
+            size_t len = strlen(data);
+            for (size_t i = 0; i < len; i++) {
+                unsigned char c = (unsigned char)data[i];
+                if (c == '\\') printf("\\\\");
+                else if (c == '\'') printf("\\'");
+                else if (c >= 32 && c < 127) printf("%c", c);
+                else printf("\\x%02x", c);
+            }
+            printf("'");
             break;
         }
     }

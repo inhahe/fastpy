@@ -226,6 +226,17 @@ const char* fastpy_str_lower(const char *s) {
     return result;
 }
 
+/* str.encode() — returns a copy of the string tagged as bytes.
+ * For UTF-8 strings (the default encoding), the byte content is identical
+ * to the string content, so we just strdup and let the caller tag as BYTES. */
+const char* fastpy_str_encode(const char *s) {
+    if (!s) return "";
+    size_t len = strlen(s);
+    FpyString *result = fpy_str_alloc(len);
+    memcpy(result->data, s, len + 1);
+    return result->data;
+}
+
 /* Convert int to string (for f-string formatting) */
 const char* fastpy_int_to_str(int64_t value) {
     FpyString *s = fpy_str_alloc(32);
