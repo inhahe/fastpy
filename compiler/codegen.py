@@ -11691,12 +11691,8 @@ class CodeGen:
         """Emit for (k, v) in <list> or for i, (name, score) in enumerate(zip(...))."""
         targets = node.target.elts
 
-        iter_val = self._emit_expr_value(node.iter)
-        if isinstance(iter_val.type, ir.IntType):
-            iter_val = self.builder.inttoptr(iter_val, i8_ptr)
-        elif isinstance(iter_val.type, ir.LiteralStructType) and iter_val.type == fpy_val:
-            data = self.builder.extract_value(iter_val, 1)
-            iter_val = self.builder.inttoptr(data, i8_ptr)
+        iter_tv = self._emit_expr(node.iter)
+        iter_val = iter_tv.as_ptr(self.builder)
         iter_len = self._rt_call("list_length", [iter_val])
 
         # Unique per-loop index name so nested `for a,b in ...` loops
@@ -11762,7 +11758,8 @@ class CodeGen:
     def _emit_for_string(self, node: ast.For) -> None:
         """Emit for ch in string: iterate over characters."""
         var_name = node.target.id
-        str_val = self._ensure_ptr(self._emit_expr_value(node.iter))
+        str_tv = self._emit_expr(node.iter)
+        str_val = str_tv.as_ptr(self.builder)
         str_len = self._rt_call("str_len", [str_val])
 
         idx_name = f"__idx_str_{var_name}"
@@ -11863,15 +11860,9 @@ class CodeGen:
         Works for any iterable expression (Name, Call, Attribute, etc.)."""
         var_name = node.target.id
 
-        # Evaluate the iterable expression
-        obj = self._emit_expr_value(node.iter)
-        if isinstance(obj.type, ir.IntType):
-            obj = self.builder.inttoptr(obj, i8_ptr)
-        elif (isinstance(obj.type, ir.LiteralStructType)
-              and obj.type == fpy_val):
-            # FpyValue — extract data as pointer
-            data = self.builder.extract_value(obj, 1)
-            obj = self.builder.inttoptr(data, i8_ptr)
+        # Evaluate the iterable expression (Phase 2: TypedValue)
+        iter_tv = self._emit_expr(node.iter)
+        obj = iter_tv.as_ptr(self.builder)
         iterator = self.builder.call(self.runtime["cpython_iter"], [obj])
 
         # Alloca for next() results
@@ -11910,11 +11901,9 @@ class CodeGen:
         """Emit `for x in deque` by converting to list first, then iterating."""
         var_name = node.target.id
 
-        # Convert deque to list for iteration
-        dq = self._emit_expr_value(node.iter)
-        if isinstance(dq.type, ir.IntType):
-            dq = self.builder.inttoptr(dq, i8_ptr)
-        lst = self.builder.call(self.runtime["deque_to_list"], [dq])
+        # Convert deque to list for iteration (Phase 2: TypedValue)
+        dq_tv = self._emit_expr(node.iter)
+        lst = self._rt_call("deque_to_list", [dq_tv])
 
         # Now iterate the list (reuse the standard list iteration)
         # Store the list as a temporary and emit a list for-loop
@@ -11956,8 +11945,9 @@ class CodeGen:
         """Emit for x in <list>: iterate over list elements by index."""
         var_name = node.target.id
 
-        # Evaluate the list
-        list_val = self._ensure_ptr(self._emit_expr_value(node.iter))
+        # Evaluate the list (Phase 2: use TypedValue for proper coercion)
+        iter_tv = self._emit_expr(node.iter)
+        list_val = iter_tv.as_ptr(self.builder)
         list_len = self._rt_call("list_length", [list_val])
 
         # Index variable
@@ -12033,7 +12023,8 @@ class CodeGen:
         var_name = node.target.id
 
         # Call dict_keys to get a list of keys, then iterate as a string list
-        dict_val = self._ensure_ptr(self._emit_expr_value(node.iter))
+        dict_tv = self._emit_expr(node.iter)
+        dict_val = dict_tv.as_ptr(self.builder)
         keys_list = self._rt_call("dict_keys", [dict_val])
         list_len = self._rt_call("list_length", [keys_list])
 
@@ -18139,69 +18130,40 @@ class CodeGen:
         return result
 
     def _emit_builtin_len(self, node: ast.Call) -> ir.Value:
-        """Emit len() builtin."""
+        """Emit len() builtin. Phase 2: uses TypedValue for clean dispatch."""
         if len(node.args) != 1:
             raise CodeGenError("len() takes exactly one argument", node)
-        arg_node = node.args[0]
-        # Collections: deque uses its own length function
-        if self._is_deque_expr(arg_node):
-            value = self._emit_expr_value(arg_node)
-            if isinstance(value.type, ir.IntType):
-                value = self.builder.inttoptr(value, i8_ptr)
-            return self.builder.call(self.runtime["deque_length"], [value])
-        # Counter and defaultdict are dict-backed, use dict_length
-        if self._is_counter_expr(arg_node) or self._is_defaultdict_expr(arg_node):
-            value = self._emit_expr_value(arg_node)
-            if isinstance(value.type, ir.IntType):
-                value = self.builder.inttoptr(value, i8_ptr)
-            return self._rt_call("dict_length", [value])
-        if self._is_set_expr(arg_node):
-            value = self._emit_expr_value(arg_node)
-            if isinstance(value.type, ir.IntType):
-                value = self.builder.inttoptr(value, i8_ptr)
-            return self._rt_call("dict_length", [value])
-        if self._is_list_expr(arg_node) or self._is_tuple_expr(arg_node):
-            value = self._emit_expr_value(arg_node)
-            return self._rt_call("list_length", [value])
-        if self._is_dict_expr(arg_node):
-            value = self._emit_expr_value(arg_node)
-            return self._rt_call("dict_length", [value])
-        # __len__ on user-class objects
-        if self._is_obj_expr(arg_node):
-            obj_cls = self._infer_object_class(arg_node)
-            if obj_cls and self._class_has_method(obj_cls, "__len__"):
-                obj = self._emit_expr_value(arg_node)
-                if isinstance(obj.type, ir.IntType):
-                    obj = self.builder.inttoptr(obj, i8_ptr)
+
+        tv = self._emit_expr(node.args[0])
+        kind = tv.vtype.kind
+
+        # Fast paths based on known type
+        if kind in (VKind.LIST, VKind.TUPLE):
+            return self._rt_call("list_length", [tv])
+        if kind in (VKind.DICT, VKind.SET):
+            return self._rt_call("dict_length", [tv])
+        if kind == VKind.STR:
+            return self._rt_call("str_len", [tv])
+
+        # OBJ with __len__: native dispatch
+        if kind == VKind.OBJ and tv.vtype.class_name:
+            cls_info = self._user_classes.get(tv.vtype.class_name)
+            if cls_info and self._class_has_method(cls_info.name, "__len__"):
                 name_ptr = self._make_string_constant("__len__")
                 return self.builder.call(
-                    self.runtime["obj_call_method0"], [obj, name_ptr])
-        # pyobj-tagged variable (from CPython bridge): call len() directly
-        if (isinstance(arg_node, ast.Name)
-                and arg_node.id in self.variables
-                and self.variables[arg_node.id][1] == "pyobj"):
-            obj = self._load_variable(arg_node.id, arg_node)
-            if isinstance(obj.type, ir.IntType):
-                obj = self.builder.inttoptr(obj, i8_ptr)
-            return self.builder.call(self.runtime["cpython_len"], [obj])
-        # CPython method call expression: len(module.func(...))
-        if (isinstance(arg_node, ast.Call)
-                and isinstance(arg_node.func, ast.Attribute)
-                and isinstance(arg_node.func.value, ast.Name)
-                and arg_node.func.value.id in self.variables
-                and self.variables[arg_node.func.value.id][1] == "pyobj"):
-            obj = self._emit_cpython_call_raw(arg_node)
-            return self.builder.call(self.runtime["cpython_len"], [obj])
-        arg = self._emit_expr_value(arg_node)
-        if isinstance(arg.type, ir.PointerType):
-            return self._rt_call("str_len", [arg])
-        # Fallback: try cpython_len via bridge
-        if isinstance(arg.type, ir.IntType):
-            arg = self.builder.inttoptr(arg, i8_ptr)
-        elif isinstance(arg.type, ir.LiteralStructType) and arg.type == fpy_val:
-            data = self.builder.extract_value(arg, 1)
-            arg = self.builder.inttoptr(data, i8_ptr)
-        return self.builder.call(self.runtime["cpython_len"], [arg])
+                    self.runtime["obj_call_method0"],
+                    [tv.as_ptr(self.builder), name_ptr])
+
+        # Also check old-style type detection (for variables tagged with
+        # old string tags that ValueType.from_old_tag maps to UNKNOWN/LIST)
+        arg_node = node.args[0]
+        if self._is_deque_expr(arg_node):
+            return self.builder.call(self.runtime["deque_length"],
+                                      [tv.as_ptr(self.builder)])
+
+        # Slow path: CPython bridge (works for any type)
+        return self.builder.call(self.runtime["cpython_len"],
+                                  [tv.as_ptr(self.builder)])
 
     def _emit_builtin_sorted(self, node: ast.Call) -> ir.Value:
         """Emit sorted() — returns a new sorted list. Supports reverse=/key= keywords."""
