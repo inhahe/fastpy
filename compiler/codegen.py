@@ -8157,7 +8157,7 @@ class CodeGen:
             if slc.upper is not None:
                 stop = self._emit_expr_value(slc.upper)
             else:
-                length = self.builder.call(self.runtime["list_length"], [obj])
+                length = self._rt_call("list_length", [obj])
                 stop = length
             if isinstance(value.type, ir.IntType):
                 value = self.builder.inttoptr(value, i8_ptr)
@@ -9278,7 +9278,7 @@ class CodeGen:
 
             if star_idx is not None:
                 # Starred unpacking: first, *rest = list or *init, last = list
-                list_len = self.builder.call(self.runtime["list_length"], [val])
+                list_len = self._rt_call("list_length", [val])
                 n_fixed = len(target.elts) - 1  # everything except the starred
 
                 for i, tgt in enumerate(target.elts):
@@ -9799,6 +9799,48 @@ class CodeGen:
             return "str"
         return "unknown"
 
+    def _ensure_ptr(self, val: 'ir.Value') -> 'ir.Value':
+        """Coerce a value to i8* pointer. Handles i64 (inttoptr), FpyValue (extract+inttoptr)."""
+        if isinstance(val.type, ir.PointerType):
+            return val
+        if isinstance(val.type, ir.IntType):
+            return self.builder.inttoptr(val, i8_ptr)
+        if isinstance(val.type, ir.LiteralStructType) and val.type == fpy_val:
+            data = self.builder.extract_value(val, 1)
+            return self.builder.inttoptr(data, i8_ptr)
+        return self.builder.inttoptr(self.builder.bitcast(val, i64), i8_ptr)
+
+    def _rt_call(self, name: str, args: list) -> 'ir.Value':
+        """Call a runtime function with automatic type coercion.
+        Converts args to match the function's expected parameter types."""
+        func = self.runtime[name]
+        coerced = []
+        for val, param in zip(args, func.args):
+            if val.type == param.type:
+                coerced.append(val)
+            elif isinstance(param.type, ir.PointerType):
+                coerced.append(self._ensure_ptr(val))
+            elif isinstance(param.type, ir.IntType) and isinstance(val.type, ir.PointerType):
+                coerced.append(self.builder.ptrtoint(val, param.type))
+            elif isinstance(param.type, ir.IntType) and isinstance(val.type, ir.IntType):
+                if param.type.width > val.type.width:
+                    coerced.append(self.builder.zext(val, param.type))
+                else:
+                    coerced.append(self.builder.trunc(val, param.type))
+            elif isinstance(param.type, ir.DoubleType) and isinstance(val.type, ir.IntType):
+                coerced.append(self.builder.sitofp(val, double))
+            elif isinstance(param.type, ir.IntType) and isinstance(val.type, ir.DoubleType):
+                coerced.append(self.builder.fptosi(val, param.type))
+            elif isinstance(val.type, ir.LiteralStructType) and val.type == fpy_val:
+                data = self.builder.extract_value(val, 1)
+                if isinstance(param.type, ir.PointerType):
+                    coerced.append(self.builder.inttoptr(data, i8_ptr))
+                else:
+                    coerced.append(data)
+            else:
+                coerced.append(val)
+        return self.builder.call(func, coerced)
+
     def _new_block(self, name: str) -> ir.Block:
         """Create a new basic block with a unique name."""
         self._block_counter += 1
@@ -10195,7 +10237,7 @@ class CodeGen:
         # MatchSequence: case (a, b) — tuple/list unpacking
         if isinstance(pattern, ast.MatchSequence):
             # Check length matches
-            length = self.builder.call(self.runtime["list_length"], [subject])
+            length = self._rt_call("list_length", [subject])
             len_ok = self.builder.icmp_signed(
                 "==", length, ir.Constant(i64, len(pattern.patterns)))
             # For each element, extract and match/bind
@@ -11450,7 +11492,12 @@ class CodeGen:
         targets = node.target.elts
 
         iter_val = self._emit_expr_value(node.iter)
-        iter_len = self.builder.call(self.runtime["list_length"], [iter_val])
+        if isinstance(iter_val.type, ir.IntType):
+            iter_val = self.builder.inttoptr(iter_val, i8_ptr)
+        elif isinstance(iter_val.type, ir.LiteralStructType) and iter_val.type == fpy_val:
+            data = self.builder.extract_value(iter_val, 1)
+            iter_val = self.builder.inttoptr(data, i8_ptr)
+        iter_len = self._rt_call("list_length", [iter_val])
 
         # Unique per-loop index name so nested `for a,b in ...` loops
         # don't clobber each other's counter.
@@ -11515,8 +11562,8 @@ class CodeGen:
     def _emit_for_string(self, node: ast.For) -> None:
         """Emit for ch in string: iterate over characters."""
         var_name = node.target.id
-        str_val = self._emit_expr_value(node.iter)
-        str_len = self.builder.call(self.runtime["str_len"], [str_val])
+        str_val = self._ensure_ptr(self._emit_expr_value(node.iter))
+        str_len = self._rt_call("str_len", [str_val])
 
         idx_name = f"__idx_str_{var_name}"
         self._store_variable(idx_name, ir.Constant(i64, 0), "int")
@@ -11671,7 +11718,7 @@ class CodeGen:
 
         # Now iterate the list (reuse the standard list iteration)
         # Store the list as a temporary and emit a list for-loop
-        length = self.builder.call(self.runtime["list_length"], [lst])
+        length = self._rt_call("list_length", [lst])
 
         idx_alloca = self._create_entry_alloca(i64, "dqfor.idx")
         self.builder.store(ir.Constant(i64, 0), idx_alloca)
@@ -11710,8 +11757,8 @@ class CodeGen:
         var_name = node.target.id
 
         # Evaluate the list
-        list_val = self._emit_expr_value(node.iter)
-        list_len = self.builder.call(self.runtime["list_length"], [list_val])
+        list_val = self._ensure_ptr(self._emit_expr_value(node.iter))
+        list_len = self._rt_call("list_length", [list_val])
 
         # Index variable
         idx_name = f"__idx_{var_name}"
@@ -11786,9 +11833,9 @@ class CodeGen:
         var_name = node.target.id
 
         # Call dict_keys to get a list of keys, then iterate as a string list
-        dict_val = self._emit_expr_value(node.iter)
-        keys_list = self.builder.call(self.runtime["dict_keys"], [dict_val])
-        list_len = self.builder.call(self.runtime["list_length"], [keys_list])
+        dict_val = self._ensure_ptr(self._emit_expr_value(node.iter))
+        keys_list = self._rt_call("dict_keys", [dict_val])
+        list_len = self._rt_call("list_length", [keys_list])
 
         idx_name = f"__idx_{var_name}"
         self._store_variable(idx_name, ir.Constant(i64, 0), "int")
@@ -11928,11 +11975,11 @@ class CodeGen:
                 return self._fv_call_truthy(fv)
         if self._is_list_expr(node):
             val = self._emit_expr_value(node)
-            length = self.builder.call(self.runtime["list_length"], [val])
+            length = self._rt_call("list_length", [val])
             return self.builder.icmp_signed("!=", length, ir.Constant(i64, 0))
         if self._is_dict_expr(node):
             val = self._emit_expr_value(node)
-            length = self.builder.call(self.runtime["dict_length"], [val])
+            length = self._rt_call("dict_length", [val])
             return self.builder.icmp_signed("!=", length, ir.Constant(i64, 0))
         # __bool__ on user-class objects
         if self._is_obj_expr(node):
@@ -11951,7 +11998,7 @@ class CodeGen:
             # Strings: empty string → False
             null_ptr = ir.Constant(val.type, None)
             is_non_null = self.builder.icmp_unsigned("!=", val, null_ptr)
-            length = self.builder.call(self.runtime["str_len"], [val])
+            length = self._rt_call("str_len", [val])
             has_len = self.builder.icmp_signed("!=", length, ir.Constant(i64, 0))
             return self.builder.and_(is_non_null, has_len)
         return self._truthiness(val)
@@ -12193,7 +12240,7 @@ class CodeGen:
         if (self._is_list_expr(container_node) or self._is_tuple_expr(container_node)
                 or isinstance(container_node, (ast.List, ast.Tuple))):
             container = self._emit_expr_value(container_node)
-            length = self.builder.call(self.runtime["list_length"], [container])
+            length = self._rt_call("list_length", [container])
 
             # Linear search
             result_alloca = self.builder.alloca(ir.IntType(1), name="in.result")
@@ -12493,7 +12540,7 @@ class CodeGen:
             return self.builder.fcmp_ordered("!=", value, ir.Constant(double, 0.0))
         if isinstance(value.type, ir.PointerType):
             # Empty string is falsy; also check non-null pointer
-            length = self.builder.call(self.runtime["str_len"], [value])
+            length = self._rt_call("str_len", [value])
             return self.builder.icmp_signed("!=", length, ir.Constant(i64, 0))
         return ir.Constant(ir.IntType(1), 0)
 
@@ -15201,7 +15248,7 @@ class CodeGen:
             fake = ast.ListComp(elt=node.elt, generators=node.generators)
             ast.copy_location(fake, node)
             result = self._emit_list_comprehension(fake)
-            return self.builder.call(self.runtime["set_from_list"], [result])
+            return self._rt_call("set_from_list", [result])
         else:
             raise CodeGenError(
                 f"Unsupported expression: {type(node).__name__}", node
@@ -15397,7 +15444,7 @@ class CodeGen:
                 # list(dict) → list of keys
                 if len(node.args) == 1 and self._is_dict_expr(node.args[0]):
                     d = self._emit_expr_value(node.args[0])
-                    return self.builder.call(self.runtime["dict_keys"], [d])
+                    return self._rt_call("dict_keys", [d])
                 # list(x) — for now, just return the arg (shallow copy would be better)
                 if len(node.args) == 1:
                     return self._emit_expr_value(node.args[0])
@@ -15458,7 +15505,7 @@ class CodeGen:
             if name == "reversed":
                 if len(node.args) == 1:
                     arg = self._emit_expr_value(node.args[0])
-                    return self.builder.call(self.runtime["list_reversed"], [arg])
+                    return self._rt_call("list_reversed", [arg])
                 raise CodeGenError("reversed() takes exactly one argument", node)
             if name == "int":
                 if len(node.args) == 1:
@@ -15634,7 +15681,7 @@ class CodeGen:
             if name == "any":
                 if len(node.args) == 1 and self._is_list_expr(node.args[0]):
                     lst = self._emit_expr_value(node.args[0])
-                    length = self.builder.call(self.runtime["list_length"], [lst])
+                    length = self._rt_call("list_length", [lst])
                     result_alloca = self._create_entry_alloca(ir.IntType(1), "any.result")
                     self.builder.store(ir.Constant(ir.IntType(1), 0), result_alloca)
                     idx_alloca = self._create_entry_alloca(i64, "any.idx")
@@ -15665,7 +15712,7 @@ class CodeGen:
             if name == "all":
                 if len(node.args) == 1 and self._is_list_expr(node.args[0]):
                     lst = self._emit_expr_value(node.args[0])
-                    length = self.builder.call(self.runtime["list_length"], [lst])
+                    length = self._rt_call("list_length", [lst])
                     result_alloca = self._create_entry_alloca(ir.IntType(1), "all.result")
                     self.builder.store(ir.Constant(ir.IntType(1), 1), result_alloca)
                     idx_alloca = self._create_entry_alloca(i64, "all.idx")
@@ -15924,7 +15971,7 @@ class CodeGen:
                 if len(node.args) >= 1 and self._is_list_expr(node.args[0]):
                     # Sum of a list — iterate and accumulate
                     lst = self._emit_expr_value(node.args[0])
-                    length = self.builder.call(self.runtime["list_length"], [lst])
+                    length = self._rt_call("list_length", [lst])
                     sum_alloca = self._create_entry_alloca(i64, "sum.acc")
                     # Optional start value
                     if len(node.args) >= 2:
@@ -15959,7 +16006,7 @@ class CodeGen:
             if name in ("set", "frozenset"):
                 if len(node.args) == 1:
                     arg = self._emit_expr_value(node.args[0])
-                    return self.builder.call(self.runtime["set_from_list"], [arg])
+                    return self._rt_call("set_from_list", [arg])
                 if len(node.args) == 0:
                     return self.builder.call(self.runtime["dict_new"], [])
                 raise CodeGenError(f"{name}() takes 0 or 1 arguments", node)
@@ -15978,7 +16025,7 @@ class CodeGen:
                             key_func_name = "__lambda__"
                 if len(node.args) == 1 and self._is_list_expr(node.args[0]):
                     lst = self._emit_expr_value(node.args[0])
-                    length = self.builder.call(self.runtime["list_length"], [lst])
+                    length = self._rt_call("list_length", [lst])
                     elem_type = self._get_list_elem_type(node.args[0])
                     is_str = (elem_type == "str")
                     result_type = i8_ptr if is_str else i64
@@ -16315,7 +16362,7 @@ class CodeGen:
         fn_node = node.args[0]
         seq = self._emit_expr_value(node.args[1])
         result = self.builder.call(self.runtime["list_new"], [])
-        length = self.builder.call(self.runtime["list_length"], [seq])
+        length = self._rt_call("list_length", [seq])
 
         idx_alloca = self._create_entry_alloca(i64, "map.idx")
         self.builder.store(ir.Constant(i64, 0), idx_alloca)
@@ -17298,7 +17345,7 @@ class CodeGen:
                         user_func = self.runtime[_op_rt[fn]]
 
         # Get sequence length
-        length = self.builder.call(self.runtime["list_length"], [seq])
+        length = self._rt_call("list_length", [seq])
 
         # Determine initial value
         if len(node.args) >= 3:
@@ -17624,7 +17671,7 @@ class CodeGen:
                     r = self.builder.trunc(r, i32)
             else:
                 # Default: full permutation (r = len)
-                length = self.builder.call(self.runtime["list_length"], [lst])
+                length = self._rt_call("list_length", [lst])
                 r = self.builder.trunc(length, i32)
             return self.builder.call(self.runtime["itertools_permutations"],
                                       [lst, r])
@@ -17767,7 +17814,7 @@ class CodeGen:
         seq = self._emit_expr_value(node.args[1])
         fn_ptr = self._get_unary_func_ptr(fn_node, node)
         result = self.builder.call(self.runtime["list_new"], [])
-        length = self.builder.call(self.runtime["list_length"], [seq])
+        length = self._rt_call("list_length", [seq])
 
         idx_alloca = self._create_entry_alloca(i64, "filt.idx")
         self.builder.store(ir.Constant(i64, 0), idx_alloca)
@@ -17834,18 +17881,18 @@ class CodeGen:
             value = self._emit_expr_value(arg_node)
             if isinstance(value.type, ir.IntType):
                 value = self.builder.inttoptr(value, i8_ptr)
-            return self.builder.call(self.runtime["dict_length"], [value])
+            return self._rt_call("dict_length", [value])
         if self._is_set_expr(arg_node):
             value = self._emit_expr_value(arg_node)
             if isinstance(value.type, ir.IntType):
                 value = self.builder.inttoptr(value, i8_ptr)
-            return self.builder.call(self.runtime["dict_length"], [value])
+            return self._rt_call("dict_length", [value])
         if self._is_list_expr(arg_node) or self._is_tuple_expr(arg_node):
             value = self._emit_expr_value(arg_node)
-            return self.builder.call(self.runtime["list_length"], [value])
+            return self._rt_call("list_length", [value])
         if self._is_dict_expr(arg_node):
             value = self._emit_expr_value(arg_node)
-            return self.builder.call(self.runtime["dict_length"], [value])
+            return self._rt_call("dict_length", [value])
         # __len__ on user-class objects
         if self._is_obj_expr(arg_node):
             obj_cls = self._infer_object_class(arg_node)
@@ -17874,7 +17921,7 @@ class CodeGen:
             return self.builder.call(self.runtime["cpython_len"], [obj])
         arg = self._emit_expr_value(arg_node)
         if isinstance(arg.type, ir.PointerType):
-            return self.builder.call(self.runtime["str_len"], [arg])
+            return self._rt_call("str_len", [arg])
         # Fallback: try cpython_len via bridge
         if isinstance(arg.type, ir.IntType):
             arg = self.builder.inttoptr(arg, i8_ptr)
@@ -17926,7 +17973,7 @@ class CodeGen:
             sort_fn = "list_sorted_by_key_str" if key_returns_str else "list_sorted_by_key_int"
             result = self.builder.call(self.runtime[sort_fn], [arg, fn_ptr])
             if reverse:
-                result = self.builder.call(self.runtime["list_reversed"], [result])
+                result = self._rt_call("list_reversed", [result])
             return result
 
         # If sorting a set, convert to list first (extract keys from dict)
@@ -17935,17 +17982,17 @@ class CodeGen:
             if isinstance(arg.type, ir.IntType):
                 arg = self.builder.inttoptr(arg, i8_ptr)
             keys = self.builder.call(self.runtime["set_to_list"], [arg])
-            result = self.builder.call(self.runtime["list_sorted"], [keys])
+            result = self._rt_call("list_sorted", [keys])
         # If sorting a dict, sort its keys
         elif self._is_dict_expr(node.args[0]):
             arg = self._emit_expr_value(node.args[0])
-            keys = self.builder.call(self.runtime["dict_keys"], [arg])
-            result = self.builder.call(self.runtime["list_sorted"], [keys])
+            keys = self._rt_call("dict_keys", [arg])
+            result = self._rt_call("list_sorted", [keys])
         else:
             arg = self._emit_expr_value(node.args[0])
-            result = self.builder.call(self.runtime["list_sorted"], [arg])
+            result = self._rt_call("list_sorted", [arg])
         if reverse:
-            result = self.builder.call(self.runtime["list_reversed"], [result])
+            result = self._rt_call("list_reversed", [result])
         return result
 
     def _get_unary_func_ptr(self, fn_node: ast.expr, node: ast.AST) -> ir.Value:
@@ -18555,11 +18602,11 @@ class CodeGen:
                 return obj
             # Counter also supports dict methods (keys, values, items, get, etc.)
             if method == "keys":
-                return self.builder.call(self.runtime["dict_keys"], [obj])
+                return self._rt_call("dict_keys", [obj])
             if method == "values":
-                return self.builder.call(self.runtime["dict_values"], [obj])
+                return self._rt_call("dict_values", [obj])
             if method == "items":
-                return self.builder.call(self.runtime["dict_items"], [obj])
+                return self._rt_call("dict_items", [obj])
             raise CodeGenError(f"Unsupported Counter method: .{method}()", node)
 
         # Check if object is a defaultdict — method calls go to regular dict methods
@@ -18568,11 +18615,11 @@ class CodeGen:
             if isinstance(obj.type, ir.IntType):
                 obj = self.builder.inttoptr(obj, i8_ptr)
             if method == "keys":
-                return self.builder.call(self.runtime["dict_keys"], [obj])
+                return self._rt_call("dict_keys", [obj])
             if method == "values":
-                return self.builder.call(self.runtime["dict_values"], [obj])
+                return self._rt_call("dict_values", [obj])
             if method == "items":
-                return self.builder.call(self.runtime["dict_items"], [obj])
+                return self._rt_call("dict_items", [obj])
             raise CodeGenError(f"Unsupported defaultdict method: .{method}()", node)
 
         # Check if object is a list
@@ -18663,11 +18710,11 @@ class CodeGen:
         if self._is_dict_expr(attr.value):
             obj = self._emit_expr_value(attr.value)
             if method == "keys":
-                return self.builder.call(self.runtime["dict_keys"], [obj])
+                return self._rt_call("dict_keys", [obj])
             if method == "values":
-                return self.builder.call(self.runtime["dict_values"], [obj])
+                return self._rt_call("dict_values", [obj])
             if method == "items":
-                return self.builder.call(self.runtime["dict_items"], [obj])
+                return self._rt_call("dict_items", [obj])
             if method == "get":
                 if len(node.args) >= 1:
                     key = self._emit_expr_value(node.args[0])
@@ -19003,7 +19050,7 @@ class CodeGen:
             if method == "join":
                 if len(node.args) == 1:
                     lst = self._emit_expr_value(node.args[0])
-                    return self.builder.call(self.runtime["str_join"], [obj, lst])
+                    return self._rt_call("str_join", [obj, lst])
             if method == "replace":
                 if len(node.args) == 2:
                     old = self._emit_expr_value(node.args[0])
@@ -19960,7 +20007,7 @@ class CodeGen:
         else:
             # Iterate over a list/tuple/set expression
             iter_val = self._emit_expr_value(gen.iter)
-            iter_len = self.builder.call(self.runtime["list_length"], [iter_val])
+            iter_len = self._rt_call("list_length", [iter_val])
 
             idx_name = f"__lc_idx_{var_name}"
             self._store_variable(idx_name, ir.Constant(i64, 0), "int")
@@ -20074,7 +20121,7 @@ class CodeGen:
             self._store_variable(var0, start0, "int")
         else:
             outer_list = self._emit_expr_value(gen0.iter)
-            outer_len = self.builder.call(self.runtime["list_length"], [outer_list])
+            outer_len = self._rt_call("list_length", [outer_list])
             self._store_variable(idx0_name, ir.Constant(i64, 0), "int")
 
         outer_cond = self._new_block("nlc.outer.cond")
@@ -20113,7 +20160,7 @@ class CodeGen:
         else:
             # Iterate over list/variable
             inner_list = self._emit_expr_value(gen1.iter)
-            inner_len = self.builder.call(self.runtime["list_length"], [inner_list])
+            inner_len = self._rt_call("list_length", [inner_list])
             idx1_name = f"__nlc_idx_{var1}"
             self._store_variable(idx1_name, ir.Constant(i64, 0), "int")
 
