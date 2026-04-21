@@ -690,10 +690,9 @@ void* fpy_jit_import(const char *module_name) {
         return fpy_cpython_import(module_name);
     }
 
-    /* Module was compiled and executed natively.
-     * Return a dummy non-NULL pointer to indicate success.
-     * The module's functions/classes are now registered in our runtime. */
-    return (void*)(intptr_t)1;  /* non-NULL sentinel */
+    /* Module was compiled and executed natively. Still return the CPython
+     * module object so downstream cpython_getattr calls work. */
+    return fpy_cpython_import(module_name);
 }
 
 /* Execute Python source code in a temporary namespace, then extract

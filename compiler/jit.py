@@ -56,9 +56,13 @@ def jit_compile(source: str) -> int:
         # Parse source
         tree = ast.parse(source, mode="exec")
 
-        # Compile to IR
+        # Compile to IR (suppress errors — JIT is best-effort)
         codegen = CodeGen()
-        ir_string = codegen.generate(tree)
+        try:
+            ir_string = codegen.generate(tree)
+        except Exception as gen_err:
+            print(f"[fastpy JIT] compilation failed: {gen_err}", file=sys.stderr)
+            return 0
 
         # Compile IR to object file
         jit_dir = Path(_get_jit_dir())

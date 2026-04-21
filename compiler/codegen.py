@@ -10338,7 +10338,7 @@ class CodeGen:
 
         name_ptr = self._make_string_constant(mod_name)
         mod_ptr = self.builder.call(
-            self.runtime["cpython_import"], [name_ptr])
+            self.runtime["jit_import"], [name_ptr])
         self.builder.store(mod_ptr, self._cpython_modules[mod_name])
 
         for alias in node.names:
