@@ -15158,6 +15158,30 @@ class CodeGen:
                     _nm, node.func.attr, node)
                 if result is not None:
                     return result
+        # Chained native module call: os.path.exists(...), os.path.join(...)
+        if (isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Attribute)
+                and isinstance(node.func.value.value, ast.Name)):
+            _nm = node.func.value.value.id
+            _sub = node.func.value.attr
+            _fn = node.func.attr
+            _is_native = ((_nm in self.variables
+                          and self.variables[_nm][1] == "native_mod")
+                         or _nm in getattr(self, '_native_modules', set()))
+            if _is_native:
+                # Try as "os.path" module with function "exists"
+                combined = f"{_nm}.{_sub}"
+                result = self._emit_native_module_call(combined, _fn, node)
+                if result is not None:
+                    return result
+                # Fallback: route through CPython bridge
+                mod_ptr = self.builder.call(
+                    self.runtime["cpython_import"],
+                    [self._make_string_constant(combined)])
+                func_ptr = self.builder.call(
+                    self.runtime["cpython_getattr"],
+                    [mod_ptr, self._make_string_constant(_fn)])
+                return self._emit_cpython_call_with_ptr(func_ptr, node)
         if isinstance(node.func, ast.Name):
             name = node.func.id
             # Native module function (from math import sqrt → sqrt(x))
