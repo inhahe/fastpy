@@ -76,6 +76,171 @@ FPY_TAG_BIGINT = 10
 FPY_TAG_COMPLEX = 11
 
 
+# ── Phase 1 of refactor: TypedValue foundation ───────────────────────
+# These types exist alongside the old string-tag system. New code should
+# use TypedValue; old code continues to work unchanged.
+
+from enum import Enum, auto
+
+class VKind(Enum):
+    """Value type kinds — replaces string tags like 'int', 'str', 'list:int'."""
+    INT = auto()
+    FLOAT = auto()
+    BOOL = auto()
+    STR = auto()
+    NONE = auto()
+    LIST = auto()
+    DICT = auto()
+    SET = auto()
+    TUPLE = auto()
+    OBJ = auto()       # native FpyObj (user-defined class instance)
+    PYOBJ = auto()      # CPython PyObject* (bridge object)
+    DECIMAL = auto()
+    COMPLEX = auto()
+    BIGINT = auto()
+    CLOSURE = auto()
+    FVALUE = auto()     # runtime-typed FpyValue {tag, data}
+    UNKNOWN = auto()    # compile-time type not known
+
+    @property
+    def is_ptr(self) -> bool:
+        return self in (VKind.STR, VKind.LIST, VKind.DICT, VKind.SET,
+                        VKind.TUPLE, VKind.OBJ, VKind.PYOBJ, VKind.DECIMAL,
+                        VKind.COMPLEX, VKind.BIGINT, VKind.CLOSURE)
+
+    @property
+    def fpy_tag(self) -> int:
+        """FPY_TAG_* constant for runtime dispatch."""
+        return {
+            VKind.INT: 0, VKind.FLOAT: 1, VKind.STR: 2, VKind.BOOL: 3,
+            VKind.NONE: 4, VKind.LIST: 5, VKind.OBJ: 6, VKind.DICT: 7,
+            VKind.SET: 9, VKind.BIGINT: 10, VKind.COMPLEX: 11,
+            VKind.DECIMAL: 12, VKind.TUPLE: 5, VKind.PYOBJ: 6,
+            VKind.CLOSURE: 6,
+        }.get(self, 0)
+
+    @property
+    def llvm_type(self):
+        """Expected LLVM IR type for this kind."""
+        if self == VKind.FLOAT: return double
+        if self == VKind.BOOL: return i32
+        if self == VKind.FVALUE: return fpy_val
+        if self.is_ptr: return i8_ptr
+        return i64
+
+    @property
+    def old_tag(self) -> str:
+        """Convert to old-style string tag for compatibility."""
+        return {
+            VKind.INT: "int", VKind.FLOAT: "float", VKind.BOOL: "bool",
+            VKind.STR: "str", VKind.NONE: "none", VKind.LIST: "list:int",
+            VKind.DICT: "dict", VKind.SET: "set", VKind.TUPLE: "tuple",
+            VKind.OBJ: "obj", VKind.PYOBJ: "pyobj", VKind.DECIMAL: "decimal",
+            VKind.COMPLEX: "complex", VKind.BIGINT: "bigint",
+            VKind.CLOSURE: "closure", VKind.FVALUE: "int", VKind.UNKNOWN: "int",
+        }.get(self, "int")
+
+
+@dataclass
+class ValueType:
+    """Static type information for a compiled value."""
+    kind: VKind
+    elem_type: 'ValueType | None' = None    # for LIST/DICT: element value type
+    class_name: str | None = None           # for OBJ: which user class
+
+    @staticmethod
+    def from_old_tag(tag: str) -> 'ValueType':
+        """Convert old string tag to ValueType (for migration)."""
+        _map = {
+            "int": VKind.INT, "float": VKind.FLOAT, "bool": VKind.BOOL,
+            "str": VKind.STR, "none": VKind.NONE, "dict": VKind.DICT,
+            "set": VKind.SET, "tuple": VKind.TUPLE, "obj": VKind.OBJ,
+            "pyobj": VKind.PYOBJ, "decimal": VKind.DECIMAL,
+            "complex": VKind.COMPLEX, "bigint": VKind.BIGINT,
+            "closure": VKind.CLOSURE, "counter": VKind.DICT,
+            "defaultdict": VKind.DICT, "deque": VKind.LIST,
+            "chainmap": VKind.OBJ, "logger": VKind.OBJ,
+            "path": VKind.STR, "native_func": VKind.UNKNOWN,
+            "native_mod": VKind.PYOBJ, "cls": VKind.INT,
+            "cell": VKind.UNKNOWN, "namedtuple_type": VKind.INT,
+        }
+        if tag.startswith("list"):
+            elem = tag.split(":", 1)[1] if ":" in tag else "int"
+            return ValueType(VKind.LIST, elem_type=ValueType.from_old_tag(elem))
+        if tag.startswith("dict:"):
+            return ValueType(VKind.DICT)
+        kind = _map.get(tag, VKind.UNKNOWN)
+        return ValueType(kind)
+
+
+@dataclass
+class TypedValue:
+    """An LLVM IR value paired with its compile-time type information.
+    This is the core type that all expression emitters will return
+    after the refactor is complete."""
+    val: ir.Value          # the LLVM IR value
+    vtype: ValueType       # its static type
+
+    def as_ptr(self, builder) -> ir.Value:
+        """Coerce to i8* pointer."""
+        if isinstance(self.val.type, ir.PointerType):
+            return self.val
+        if isinstance(self.val.type, ir.IntType):
+            return builder.inttoptr(self.val, i8_ptr)
+        if isinstance(self.val.type, ir.LiteralStructType) and self.val.type == fpy_val:
+            data = builder.extract_value(self.val, 1)
+            return builder.inttoptr(data, i8_ptr)
+        return builder.inttoptr(builder.bitcast(self.val, i64), i8_ptr)
+
+    def as_i64(self, builder) -> ir.Value:
+        """Coerce to i64."""
+        if isinstance(self.val.type, ir.IntType) and self.val.type.width == 64:
+            return self.val
+        if isinstance(self.val.type, ir.PointerType):
+            return builder.ptrtoint(self.val, i64)
+        if isinstance(self.val.type, ir.IntType):
+            return builder.zext(self.val, i64) if self.val.type.width < 64 \
+                else builder.trunc(self.val, i64)
+        if isinstance(self.val.type, ir.DoubleType):
+            return builder.bitcast(self.val, i64)
+        if isinstance(self.val.type, ir.LiteralStructType) and self.val.type == fpy_val:
+            return builder.extract_value(self.val, 1)
+        return self.val
+
+    def as_fv(self, builder) -> ir.Value:
+        """Coerce to FpyValue {i32, i64} struct."""
+        if (isinstance(self.val.type, ir.LiteralStructType)
+                and self.val.type == fpy_val):
+            return self.val
+        tag = ir.Constant(i32, self.vtype.kind.fpy_tag)
+        data = self.as_i64(builder)
+        fv = ir.Constant(fpy_val, ir.Undefined)
+        fv = builder.insert_value(fv, tag, 0)
+        fv = builder.insert_value(fv, data, 1)
+        return fv
+
+    def coerce_to(self, builder, target_llvm_type) -> ir.Value:
+        """Coerce to any LLVM type."""
+        if self.val.type == target_llvm_type:
+            return self.val
+        if isinstance(target_llvm_type, ir.PointerType):
+            return self.as_ptr(builder)
+        if target_llvm_type == i64:
+            return self.as_i64(builder)
+        if target_llvm_type == i32:
+            return builder.trunc(self.as_i64(builder), i32)
+        if target_llvm_type == double:
+            if isinstance(self.val.type, ir.IntType):
+                return builder.sitofp(self.val, double)
+            return self.val
+        if target_llvm_type == fpy_val:
+            return self.as_fv(builder)
+        return self.val
+
+
+# ── End Phase 1 foundation ───────────────────────────────────────────
+
+
 @dataclass
 class FuncInfo:
     """Metadata about a user-defined function."""
@@ -9832,34 +9997,48 @@ class CodeGen:
 
     def _rt_call(self, name: str, args: list) -> 'ir.Value':
         """Call a runtime function with automatic type coercion.
-        Converts args to match the function's expected parameter types."""
+        Args can be bare ir.Value or TypedValue — both are handled."""
         func = self.runtime[name]
         coerced = []
-        for val, param in zip(args, func.args):
-            if val.type == param.type:
-                coerced.append(val)
+        for arg, param in zip(args, func.args):
+            # Unwrap TypedValue if needed
+            if isinstance(arg, TypedValue):
+                coerced.append(arg.coerce_to(self.builder, param.type))
+            elif arg.type == param.type:
+                coerced.append(arg)
             elif isinstance(param.type, ir.PointerType):
-                coerced.append(self._ensure_ptr(val))
-            elif isinstance(param.type, ir.IntType) and isinstance(val.type, ir.PointerType):
-                coerced.append(self.builder.ptrtoint(val, param.type))
-            elif isinstance(param.type, ir.IntType) and isinstance(val.type, ir.IntType):
-                if param.type.width > val.type.width:
-                    coerced.append(self.builder.zext(val, param.type))
+                coerced.append(self._ensure_ptr(arg))
+            elif isinstance(param.type, ir.IntType) and isinstance(arg.type, ir.PointerType):
+                coerced.append(self.builder.ptrtoint(arg, param.type))
+            elif isinstance(param.type, ir.IntType) and isinstance(arg.type, ir.IntType):
+                if param.type.width > arg.type.width:
+                    coerced.append(self.builder.zext(arg, param.type))
                 else:
-                    coerced.append(self.builder.trunc(val, param.type))
-            elif isinstance(param.type, ir.DoubleType) and isinstance(val.type, ir.IntType):
-                coerced.append(self.builder.sitofp(val, double))
-            elif isinstance(param.type, ir.IntType) and isinstance(val.type, ir.DoubleType):
-                coerced.append(self.builder.fptosi(val, param.type))
-            elif isinstance(val.type, ir.LiteralStructType) and val.type == fpy_val:
-                data = self.builder.extract_value(val, 1)
+                    coerced.append(self.builder.trunc(arg, param.type))
+            elif isinstance(param.type, ir.DoubleType) and isinstance(arg.type, ir.IntType):
+                coerced.append(self.builder.sitofp(arg, double))
+            elif isinstance(param.type, ir.IntType) and isinstance(arg.type, ir.DoubleType):
+                coerced.append(self.builder.fptosi(arg, param.type))
+            elif isinstance(arg.type, ir.LiteralStructType) and arg.type == fpy_val:
+                data = self.builder.extract_value(arg, 1)
                 if isinstance(param.type, ir.PointerType):
                     coerced.append(self.builder.inttoptr(data, i8_ptr))
                 else:
                     coerced.append(data)
             else:
-                coerced.append(val)
+                coerced.append(arg)
         return self.builder.call(func, coerced)
+
+    # ── Phase 1: TypedValue-aware expression emission ──────────────────
+
+    def _emit_expr(self, node: ast.expr) -> TypedValue:
+        """Emit an expression and return TypedValue (value + type info).
+        This wraps _emit_expr_value with type inference. New code should
+        call this instead of _emit_expr_value."""
+        val = self._emit_expr_value(node)
+        tag = self._infer_type_tag(node, val)
+        vtype = ValueType.from_old_tag(tag)
+        return TypedValue(val, vtype)
 
     def _new_block(self, name: str) -> ir.Block:
         """Create a new basic block with a unique name."""
