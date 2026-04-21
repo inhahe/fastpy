@@ -1651,6 +1651,13 @@ class CodeGen:
         ft = ir.FunctionType(void, [i32, i64, i8_ptr, i32,
                                      ir.PointerType(i32), ir.PointerType(i64)])
         self.runtime["cpython_rbinop"] = ir.Function(self.module, ft, name="fpy_cpython_rbinop")
+        # pyobj compare: (left_pyobj, right_pyobj, op) → i32 (1=true, 0=false)
+        ft = ir.FunctionType(i32, [i8_ptr, i8_ptr, i32])
+        self.runtime["cpython_compare"] = ir.Function(self.module, ft, name="fpy_cpython_compare")
+        # pyobj concat: (left_pyobj, right_pyobj, &out_tag, &out_data) → void
+        ft = ir.FunctionType(void, [i8_ptr, i8_ptr,
+                                     ir.PointerType(i32), ir.PointerType(i64)])
+        self.runtime["cpython_concat"] = ir.Function(self.module, ft, name="fpy_cpython_concat")
         # JIT exec: tries native compilation, falls back to CPython
         ft = ir.FunctionType(void, [i8_ptr])
         self.runtime["jit_exec"] = ir.Function(self.module, ft, name="fpy_jit_exec")
@@ -13295,6 +13302,20 @@ class CodeGen:
                         cmp = self.builder.icmp_signed(">", cmp_result, ir.Constant(i64, 0))
                     else:
                         cmp = self.builder.icmp_signed(">=", cmp_result, ir.Constant(i64, 0))
+
+                # PYOBJ comparison: dispatch to CPython rich comparison
+                elif (left_kind == VKind.PYOBJ
+                        and isinstance(op, (ast.Eq, ast.NotEq, ast.Lt, ast.LtE,
+                                            ast.Gt, ast.GtE))):
+                    _cmp_ops = {ast.Eq: 0, ast.NotEq: 1, ast.Lt: 2,
+                                ast.LtE: 3, ast.Gt: 4, ast.GtE: 5}
+                    cmp_result = self.builder.call(
+                        self.runtime["cpython_compare"],
+                        [tv_left.as_ptr(self.builder),
+                         tv_right.as_ptr(self.builder),
+                         ir.Constant(i32, _cmp_ops[type(op)])])
+                    cmp = self.builder.icmp_signed("!=", cmp_result,
+                                                    ir.Constant(i32, 0))
 
                 # --- Fallback: LLVM-type-based dispatch (old code) ---
                 # Catches UNKNOWN-kind pointer comparisons that still need

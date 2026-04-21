@@ -982,3 +982,64 @@ void fpy_cpython_rbinop(int32_t left_tag, int64_t left_data,
     if (*out_tag == FPY_TAG_OBJ) Py_INCREF(result);
     Py_DECREF(result);
 }
+
+/* ── PyObject* refcount helpers for objects.c ─────────────────────
+ * objects.c cannot include Python.h, so these wrappers let
+ * fpy_rc_incref/decref handle OBJ-tagged PyObject* values safely
+ * by delegating to Py_INCREF/Py_DECREF. */
+
+void fpy_bridge_pyobj_incref(void *ptr) {
+    if (ptr) Py_INCREF((PyObject*)ptr);
+}
+
+void fpy_bridge_pyobj_decref(void *ptr) {
+    if (ptr) Py_DECREF((PyObject*)ptr);
+}
+
+/* ── PyObject* comparison ─────────────────────────────────────────
+ * Compare two PyObject* values using Python's rich comparison.
+ * op: 0=Eq, 1=NotEq, 2=Lt, 3=LtE, 4=Gt, 5=GtE
+ * Returns 1 for true, 0 for false. */
+int32_t fpy_cpython_compare(void *left, void *right, int32_t op) {
+    if (!left || !right) return (op == 0) ? (left == right) : (left != right);
+    int py_op;
+    switch (op) {
+        case 0: py_op = Py_EQ; break;
+        case 1: py_op = Py_NE; break;
+        case 2: py_op = Py_LT; break;
+        case 3: py_op = Py_LE; break;
+        case 4: py_op = Py_GT; break;
+        case 5: py_op = Py_GE; break;
+        default: return 0;
+    }
+    PyObject *result = PyObject_RichCompare((PyObject*)left, (PyObject*)right, py_op);
+    if (!result) {
+        PyErr_Clear();
+        return 0;
+    }
+    int truthy = PyObject_IsTrue(result);
+    Py_DECREF(result);
+    return truthy > 0 ? 1 : 0;
+}
+
+/* ── PyObject* sequence concatenation ─────────────────────────────
+ * Concatenate two PyObject* values (bytes, etc.) using PySequence_Concat.
+ * Returns result via tag+data output pointers. */
+void fpy_cpython_concat(void *left, void *right,
+                         int32_t *out_tag, int64_t *out_data) {
+    if (!left || !right) {
+        *out_tag = FPY_TAG_NONE;
+        *out_data = 0;
+        return;
+    }
+    PyObject *result = PySequence_Concat((PyObject*)left, (PyObject*)right);
+    if (!result) {
+        PyErr_Print();
+        *out_tag = FPY_TAG_NONE;
+        *out_data = 0;
+        return;
+    }
+    pyobject_to_fpy(result, out_tag, out_data);
+    if (*out_tag == FPY_TAG_OBJ) Py_INCREF(result);
+    Py_DECREF(result);
+}

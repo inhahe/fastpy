@@ -24,9 +24,13 @@ fastpy is typically **10-250x faster than CPython** and **within 1-2x of C++** o
 ## Quick start
 
 ```bash
-# Compile and run
+# Windows
 python -m compiler hello.py -o hello.exe
 ./hello.exe
+
+# Linux / macOS
+python -m compiler hello.py -o hello
+./hello
 
 # Or compile in Python
 from compiler.pipeline import compile_source
@@ -35,15 +39,27 @@ result = compile_source('print("hello world")')
 
 ### Requirements
 
-- Python 3.13+ with llvmlite (`pip install llvmlite`)
-- MSVC Build Tools (for linking on Windows)
-- CPython 3.14 headers/libs (for .pyd module import support)
+- Python 3.11+ with llvmlite (`pip install llvmlite`)
+- **Windows:** MSVC Build Tools (for linking)
+- **Linux/macOS:** gcc or clang (for linking), Python headers (`python3-dev`)
+- CPython headers/libs for the target Python version (for .pyd/.so module import support)
+
+### Multi-Python version targeting
+
+Compile against any installed Python version:
+
+```bash
+python -m compiler hello.py --python-version 3.12
+python -m compiler hello.py --python-version 3.14
+```
+
+An ABI version check at startup verifies the compiled-against Python version matches the runtime Python version.
 
 ## What's supported
 
-### Language features (66/66 audit, 405/405 tests)
+### Language features (66/66 audit, 405/405 tests, 94/94 regressions)
 
-- **Core**: functions, classes, closures, decorators, generators, lambda, recursion, `*args`/`**kwargs`, default arguments, global/nonlocal, `@singledispatch` (native switch dispatch)
+- **Core**: functions, classes, closures, decorators, generators, lambda, recursion, `*args`/`**kwargs`, default arguments, global/nonlocal, `@singledispatch` (native switch dispatch), first-class functions (function aliases, indirect calls, `__call__` dispatch)
 - **Control flow**: if/elif/else, for/while (with break/continue/else), try/except/finally/else, with, match/case, assert, raise/raise from
 - **OOP**: inheritance, multiple inheritance, super, `@staticmethod`, `@classmethod`, `@property` (get/set), nested classes, full metaclass support (`metaclass=`, `__new__`, `__init_subclass__`, `__class_getitem__`), `__slots__`
 - **Dunders**: `__add__`, `__sub__`, `__mul__`, `__neg__`, `__eq__`, `__lt__`, `__str__`, `__repr__`, `__getitem__`/`__setitem__`/`__delitem__`, `__len__`, `__bool__`, `__contains__`, `__iter__`/`__next__`, `__call__`, `__hash__`
@@ -85,17 +101,17 @@ print(a.shape)           # works
 print(np.zeros(5))       # works
 ```
 
-Tested with: math (native), json, os, os.path, hashlib, datetime, re, collections, random, string, numpy.
+Tested with: math (native), json, os, os.path, hashlib, datetime, re, collections, random, string, numpy. **104/104 stdlib `.py` files now compile successfully.**
 
 The `math` module is compiled natively (direct C libm calls, no Python runtime needed). All other modules route through an embedded CPython interpreter.
 
 ## Architecture
 
 ```
-source.py  -->  ast.parse()  -->  CodeGen  -->  LLVM IR  -->  .obj  -->  .exe
+source.py  -->  ast.parse()  -->  CodeGen  -->  LLVM IR  -->  .obj  -->  .exe/.elf
                                     |                          |
-                              compiler/codegen.py        MSVC linker
-                              (Python, ~14k lines)            |
+                              compiler/codegen.py     MSVC (Windows) / gcc/clang (Linux/macOS)
+                              (Python, ~21k lines)            |
                                                      runtime/*.c (linked in)
 ```
 
@@ -106,13 +122,14 @@ source.py  -->  ast.parse()  -->  CodeGen  -->  LLVM IR  -->  .obj  -->  .exe
 | `compiler/codegen.py` | LLVM IR code generation from Python AST |
 | `compiler/pipeline.py` | Compilation pipeline: parse, check, codegen, link |
 | `compiler/__main__.py` | CLI: `python -m compiler source.py [-o output] [-t]` |
-| `compiler/toolchain.py` | MSVC toolchain detection and linking |
+| `compiler/toolchain.py` | Platform toolchain detection and linking (MSVC on Windows, gcc/clang on Linux/macOS) |
 | `runtime/objects.c` | Object system: FpyValue, FpyList, FpyDict, FpyObj, sets, closures |
 | `runtime/runtime.c` | Core runtime: print, exceptions, math, string ops, entry point |
 | `runtime/cpython_bridge.c` | CPython embedding for .pyd imports and eval/exec |
 | `runtime/threading.h/c` | Threading primitives: GIL, mutexes, TLS, per-object locks |
 | `runtime/objects.h` | Type definitions, tag constants, value constructors |
-| `tests/` | Differential test suite (405 tests, compared against CPython) |
+| `runtime/build_runtime.sh` | Linux/macOS runtime build script (gcc/clang) |
+| `tests/` | Differential test suite (405 tests, compared against CPython) + 94 regression tests |
 | `audit_features.py` | Python 3.14 feature coverage audit (66 features) |
 | `benchmarks/` | Performance benchmarks vs C++ and CPython |
 
@@ -153,8 +170,7 @@ python -m compiler myprogram.py -o myprogram.exe
 
 - **eval()/exec()** with literal string arguments are compiled inline at compile time (zero overhead). Dynamic strings route through CPython with automatic locals namespace injection
 - **`re` module** routes through CPython bridge (full regex engine is impractical to reimplement natively)
-- **.pyd imports** (numpy, etc.) use CPython bridge for bindings — the extension's C code runs natively, only the PyObject* marshalling goes through the bridge
-- **Windows x64 only** — needs MSVC Build Tools. Linux/macOS support planned.
+- **.pyd/.so imports** (numpy, etc.) use CPython bridge for bindings — the extension's C code runs natively, only the PyObject* marshalling goes through the bridge
 
 See [UNIMPLEMENTED.md](UNIMPLEMENTED.md) for the full list.
 

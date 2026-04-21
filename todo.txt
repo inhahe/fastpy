@@ -1,5 +1,0 @@
-start claude in ..\qtpyrc for this project
-eventually, we may want to have claude give us a summary of all algorithms used to (a) analyze projects for fast-paths, etc., and (b) run the code, so that we can see if there are any obvious huge optimizations it can make. Claude seems to miss big optimizations when they're not already-known optimization problems.
-
-
-

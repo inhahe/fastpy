@@ -1,6 +1,6 @@
 # Fastpy Python 3.14 Compatibility Status
 
-Last updated 2026-04-20.
+Last updated 2026-04-21.
 
 ## Fully native (no CPython bridge)
 
@@ -80,7 +80,7 @@ These features work correctly but use the embedded CPython interpreter:
 - **Other stdlib modules** not implemented natively (e.g., collections,
   itertools, functools — except singledispatch which is native)
 
-## Bugs fixed (2026-04-20)
+## Bugs fixed (2026-04-21)
 
 ### 1. Linked list None traversal (fixed)
 `while cur is not None: cur = cur.next` crashed when `cur.next` held None.
@@ -113,6 +113,28 @@ variable type tracking.
 Fix: Added return-type propagation in `_analyze_call_sites` — traces
 through `data = make_list()` to infer `data` is a list.
 
+### 5. SafeIRBuilder LLVM type mismatches (fixed)
+Various LLVM type mismatches (i64 vs i8*, i32 vs i64, etc.) caused crashes
+in call, icmp, fadd, store, ret, phi, and select instructions.
+Fix: SafeIRBuilder wrapper auto-coerces all LLVM type mismatches at every
+IR instruction emission point.
+
+### 6. Exception handling noinline fix (fixed)
+Functions containing `raise` statements caused LLVM optimization issues.
+Fix: Functions that contain raise statements are now marked `noinline` to
+prevent the optimizer from mishandling exception control flow.
+
+### 7. ABI version check at startup (fixed)
+Compiled binaries would silently crash if run with a different Python version
+than they were compiled against.
+Fix: Added compile-time vs runtime Python version ABI check at startup,
+with a clear error message on mismatch.
+
+### 8. Function return type propagation (fixed)
+List-of-lists returned from functions lost their element type information.
+Fix: Added list-of-lists detection from append patterns, propagating
+nested list types through function return boundaries.
+
 ## Known limitations (not bugs)
 
 - **BigInt through function calls** — BigInt values passed through function
@@ -121,5 +143,37 @@ through `data = make_list()` to infer `data` is a list.
 - **Mixed-type dict value access** — Dict values from dynamic sources (json.loads)
   return raw i64 data. Works for int/float/str values; nested list/dict values
   need explicit subscript on the extracted value.
-- **Windows x64 only** — needs MSVC Build Tools. The runtime C code is portable;
-  needs Clang/GCC build scripts and ELF linking for Linux/macOS.
+- **Fastpy objects are not PyObjects** — CPython cannot treat fastpy-compiled
+  functions, classes, or instances as `PyObject*`. Passing fastpy callables
+  (lambdas, closures) to CPython APIs that expect Python callables fails.
+  This affects `functools.reduce(lambda ...)`, `collections.defaultdict(int)`,
+  `weakref.ref(...)`, and similar patterns. Workaround: use CPython-side
+  callables or avoid bridge calls that need fastpy values as callbacks.
+  **Planned fix (mirror object pattern):**
+  Add an optional `PyObject* py_mirror` field to FpyObj. When a native object
+  is passed to CPython, lazily create a PyObject* wrapper backed by a custom
+  PyTypeObject (`FpyWrapperType`) that delegates `tp_getattro`, `tp_setattro`,
+  `tp_call`, `tp_richcompare`, and `tp_hash` back to the FpyObj's slot system.
+  Cache the wrapper in `py_mirror` for identity preservation. For the reverse
+  direction (PyObject* → FpyObj), store the original PyObject* pointer in an
+  optional `py_origin` field so round-trips preserve identity. For functions
+  and lambdas, `cpython_wrap_native` already creates PyCFunction wrappers —
+  extend this to class instances and arbitrary objects.
+- **Bridge mutation is silently dropped** — Passing an FpyList or FpyDict to
+  a CPython function creates a copy. In-place mutations (e.g. `heapq.heapify`,
+  `struct.pack_into`) happen on the copy and are discarded. Workaround: capture
+  the return value instead of relying on in-place mutation.
+  **Planned fix (copy + sync-back):** True shared backing is impossible because
+  CPython C extensions use macros (`PyList_GET_ITEM`, `PyDict_Next`) that
+  directly access `PyListObject->ob_item[]` / `PyDictObject` internals,
+  bypassing any custom type's protocol methods. The element representations
+  are also incompatible (FpyValue is 16 bytes, PyObject* is 8 bytes).
+  Instead, after each bridge call, for each LIST/DICT argument that was
+  passed to CPython, re-read the PyList/PyDict contents back into the
+  original FpyList/FpyDict. Implementation: in `fpy_cpython_call_kw` (and
+  the call0/1/2/3 variants), after `PyObject_Call` returns, iterate the
+  mutable args: if tag==LIST, clear the FpyList and re-append from the
+  PyList; if tag==DICT, clear and re-insert from PyDict. This is O(n) per
+  mutable arg but the copy-out is already O(n), so total cost doubles but
+  order doesn't change. For bytearrays (pack_into), the same pattern
+  applies: copy the PyByteArray buffer back into the FpyValue.

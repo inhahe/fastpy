@@ -512,6 +512,10 @@ extern void fpy_jit_exec(const char*);
 extern void* fpy_jit_import(const char*);
 extern void fpy_rc_incref(int32_t, int64_t);
 extern void fpy_rc_decref(int32_t, int64_t);
+extern void fpy_cpython_binop(void*, int32_t, int64_t, int32_t, int32_t*, int64_t*);
+extern void fpy_cpython_rbinop(int32_t, int64_t, void*, int32_t, int32_t*, int64_t*);
+extern int32_t fpy_cpython_compare(void*, void*, int32_t);
+extern void fpy_cpython_concat(void*, void*, int32_t*, int64_t*);
 
 static FpySymEntry fpy_jit_symbols[] = {
     SYM(fastpy_print_newline),
@@ -550,6 +554,8 @@ static FpySymEntry fpy_jit_symbols[] = {
     SYM(fpy_cpython_flush), SYM(fpy_cpython_iter), SYM(fpy_cpython_iter_next),
     SYM(fpy_jit_exec), SYM(fpy_jit_import),
     SYM(fpy_rc_incref), SYM(fpy_rc_decref),
+    SYM(fpy_cpython_binop), SYM(fpy_cpython_rbinop),
+    SYM(fpy_cpython_compare), SYM(fpy_cpython_concat),
     {NULL, NULL}
 };
 

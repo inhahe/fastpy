@@ -1,8 +1,8 @@
 # Fastpy Roadmap — Path to Full CPython Compatibility
 
-## Completed (this session)
+## Completed
 
-### Core features
+### Core features (this session)
 - Native @dataclass (AST expansion)
 - Native @singledispatch (switch dispatch)
 - Native complex numbers (FPY_TAG_COMPLEX)
@@ -65,6 +65,34 @@
 - Vtable dispatch for O(1) polymorphic method calls
 - Per-class typed attributes (float/str/bool)
 - FV ABI for native-typed method parameters
+
+### Codegen refactor (Phases 1-4 complete)
+- Phase 1: TypedValue foundation (VKind, ValueType, TypedValue classes)
+- Phase 2: Expression emitters converted to TypedValue
+- Phase 3: Variable storage uses ValueType (replaces string tags)
+- Phase 4: Bridge fallbacks for all CodeGenError paths
+- SafeIRBuilder: auto-coerces all LLVM type mismatches (call, icmp, fadd, store, ret, phi, select)
+- Result: 104/104 stdlib .py files compile (up from 17)
+
+### First-class functions
+- Function aliases (`callback = some_func; callback(x)`)
+- Indirect calls through variables
+- `__call__` dispatch for callable objects
+- Function return type propagation (list-of-lists from append patterns)
+
+### CPython bridge improvements
+- PyBytes_Check, PyTuple_Check for correct type identification
+- PYOBJ binops/comparisons via `fpy_cpython_binop`/`fpy_cpython_compare`
+- 4+ arg bridge calls via `fpy_cpython_call_kw`
+- Safe refcounting across FpyClosure, FpyObj, and PyObject* types
+- ABI version check at startup (compile-time vs runtime Python version)
+
+### Multi-Python version targeting
+- Compile against any installed Python (3.11, 3.12, 3.13, 3.14)
+- Dynamic Python include/lib discovery via sysconfig
+
+### Exception handling
+- noinline fix for raise-containing functions (prevents LLVM optimizer issues)
 
 ### Bug fixes
 - Linked list None traversal
@@ -202,3 +230,24 @@ coefficient + exponent. Supports Decimal(str), Decimal(int), arithmetic
 
 ### 18. ~~REPL mode~~ SKIPPED
 Doesn't apply to an AOT compiler. Use CPython for interactive work.
+
+## Planned -- Remaining
+
+### Phase 5: Module registry (codegen refactor)
+Convert the if/elif module dispatch chain to a dispatch dict. Each module
+handler becomes a small function or lambda.
+
+### Phase 6: Cleanup (codegen refactor)
+Remove old `_emit_expr_value`, `_bare_to_tag_data`, `_infer_type_tag`,
+and scattered inttoptr/ptrtoint/bitcast calls.
+
+## Stats
+
+| Metric | Value |
+|--------|-------|
+| Differential tests | 405/405 passing |
+| Regression tests | 94/94 passing |
+| Stdlib .py files compiling | 104/104 |
+| Platforms | Windows x64, Linux x64 (WSL Ubuntu tested) |
+| Python versions | 3.11, 3.12, 3.13, 3.14 |
+| Codegen refactor phases | 4/6 complete |

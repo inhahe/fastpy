@@ -61,6 +61,11 @@ static void fpy_dict_destroy(FpyDict *dict);
 void fpy_rc_decref(int32_t tag, int64_t data);
 extern FpyClassDef fpy_classes[];  /* defined later in this file */
 
+/* Bridge helpers for PyObject* refcounting (defined in cpython_bridge.c).
+ * objects.c cannot include Python.h, so it delegates to these wrappers. */
+extern void fpy_bridge_pyobj_incref(void *ptr);
+extern void fpy_bridge_pyobj_decref(void *ptr);
+
 /* --- Destructors for refcounted objects --- */
 
 static void fpy_list_destroy(FpyList *list) {
@@ -97,16 +102,31 @@ void fpy_rc_incref(int32_t tag, int64_t data) {
         case FPY_TAG_OBJ: {
             /* Could be FpyObj, FpyClosure, or CPython PyObject*.
              * FpyClosure starts with magic 0x434C4F53 at offset 0.
-             * FpyObj has its magic (0x4F424A53) deep in the struct.
-             * Check closure magic first (most common in OBJ-tagged values). */
+             * FpyObj has refcount at offset 0 (small positive int) and
+             * magic 0x4F424A53 at offset 32.
+             * CPython PyObject* has ob_refcnt at offset 0.
+             *
+             * Strategy: check closure magic at offset 0 (safe — always
+             * readable for any valid heap pointer). Then check FpyObj by
+             * reading the refcount first (offset 0) — if it's a sane
+             * value (1..10000), it's likely an FpyObj or FpyClosure;
+             * read magic at offset 32 to confirm. Otherwise delegate to
+             * Py_INCREF via the bridge helper. */
             void *ptr = (void*)(intptr_t)data;
-            if (*(int32_t*)ptr == FPY_CLOSURE_MAGIC) {
+            int32_t first_word = *(int32_t*)ptr;
+            if (first_word == FPY_CLOSURE_MAGIC) {
                 fpy_incref(&((FpyClosure*)ptr)->refcount);
-            } else {
+            } else if (first_word > 0 && first_word < 100000) {
+                /* Plausible refcount — check FpyObj magic at offset 32 */
                 FpyObj *obj = (FpyObj*)ptr;
                 if (obj->magic == FPY_OBJ_MAGIC)
                     fpy_incref(&obj->refcount);
-                /* else: CPython PyObject* — don't touch */
+                else
+                    fpy_bridge_pyobj_incref(ptr);
+            } else {
+                /* Not a closure, not a plausible FpyObj refcount —
+                 * treat as CPython PyObject* */
+                fpy_bridge_pyobj_incref(ptr);
             }
             break;
         }
@@ -135,8 +155,9 @@ void fpy_rc_decref(int32_t tag, int64_t data) {
             break;
         case FPY_TAG_OBJ: {
             void *ptr = (void*)(intptr_t)data;
+            int32_t first_word = *(int32_t*)ptr;
             /* Check if this is a closure (not an FpyObj) */
-            if (*(int32_t*)ptr == FPY_CLOSURE_MAGIC) {
+            if (first_word == FPY_CLOSURE_MAGIC) {
                 FpyClosure *c = (FpyClosure*)ptr;
                 if (fpy_decref(&c->refcount)) {
                     /* Free captured values: cells get freed, others decrefd */
@@ -153,29 +174,36 @@ void fpy_rc_decref(int32_t tag, int64_t data) {
                 }
                 break;
             }
-            FpyObj *obj = (FpyObj*)ptr;
-            if (obj->magic != FPY_OBJ_MAGIC) break;  /* CPython PyObject*, don't touch */
-            if (fpy_decref(&obj->refcount)) {
-                /* Call per-class destructor if set (e.g., generator cleanup).
-                 * Runs before slots are freed so the destructor can access attrs. */
-                void (*dtor)(FpyObj*) = fpy_classes[obj->class_id].destructor;
-                if (dtor) dtor(obj);
-                /* Free slots (decref each), dynamic_attrs, and the obj */
-                if (obj->slots) {
-                    int sc = fpy_classes[obj->class_id].slot_count;
-                    for (int i = 0; i < sc; i++)
-                        FPY_VAL_DECREF(obj->slots[i]);
-                    /* slots are contiguous with obj (malloc'd together), don't free separately */
+            /* Check if plausible FpyObj (first word is refcount, small positive) */
+            if (first_word > 0 && first_word < 100000) {
+                FpyObj *obj = (FpyObj*)ptr;
+                if (obj->magic == FPY_OBJ_MAGIC) {
+                    if (fpy_decref(&obj->refcount)) {
+                        /* Call per-class destructor if set (e.g., generator cleanup).
+                         * Runs before slots are freed so the destructor can access attrs. */
+                        void (*dtor)(FpyObj*) = fpy_classes[obj->class_id].destructor;
+                        if (dtor) dtor(obj);
+                        /* Free slots (decref each), dynamic_attrs, and the obj */
+                        if (obj->slots) {
+                            int sc = fpy_classes[obj->class_id].slot_count;
+                            for (int i = 0; i < sc; i++)
+                                FPY_VAL_DECREF(obj->slots[i]);
+                            /* slots are contiguous with obj (malloc'd together), don't free separately */
+                        }
+                        if (obj->dynamic_attrs) {
+                            for (int i = 0; i < obj->dynamic_attrs->count; i++)
+                                FPY_VAL_DECREF(obj->dynamic_attrs->values[i]);
+                            free(obj->dynamic_attrs->names);
+                            free(obj->dynamic_attrs->values);
+                            free(obj->dynamic_attrs);
+                        }
+                        free(obj);
+                    }
+                    break;
                 }
-                if (obj->dynamic_attrs) {
-                    for (int i = 0; i < obj->dynamic_attrs->count; i++)
-                        FPY_VAL_DECREF(obj->dynamic_attrs->values[i]);
-                    free(obj->dynamic_attrs->names);
-                    free(obj->dynamic_attrs->values);
-                    free(obj->dynamic_attrs);
-                }
-                free(obj);
             }
+            /* Not a closure, not an FpyObj — treat as CPython PyObject* */
+            fpy_bridge_pyobj_decref(ptr);
             break;
         }
         case FPY_TAG_BIGINT: {
@@ -479,6 +507,46 @@ void fastpy_fv_binop(int32_t lt, int64_t ld, int32_t rt, int64_t rd,
         FpyList *result = fastpy_list_concat((FpyList*)ld, (FpyList*)rd);
         *out_tag = FPY_TAG_LIST;
         *out_data = (int64_t)(intptr_t)result;
+        return;
+    }
+    /* Bytes + Bytes → concat */
+    if (lt == FPY_TAG_BYTES && rt == FPY_TAG_BYTES && op == 0) {
+        const char *a = (const char*)(intptr_t)ld;
+        const char *b = (const char*)(intptr_t)rd;
+        size_t la = a ? strlen(a) : 0;
+        size_t lb = b ? strlen(b) : 0;
+        char *result = (char*)malloc(la + lb + 1);
+        if (a) memcpy(result, a, la);
+        if (b) memcpy(result + la, b, lb);
+        result[la + lb] = '\0';
+        *out_tag = FPY_TAG_BYTES;
+        *out_data = (int64_t)(intptr_t)result;
+        return;
+    }
+    /* Bytes * Int or Int * Bytes → repeat */
+    if (lt == FPY_TAG_BYTES && rt == FPY_TAG_INT && op == 2) {
+        const char *a = (const char*)(intptr_t)ld;
+        size_t la = a ? strlen(a) : 0;
+        int64_t n = rd > 0 ? rd : 0;
+        size_t total = la * (size_t)n;
+        char *result = (char*)malloc(total + 1);
+        for (int64_t i = 0; i < n; i++)
+            memcpy(result + i * la, a, la);
+        result[total] = '\0';
+        *out_tag = FPY_TAG_BYTES;
+        *out_data = (int64_t)(intptr_t)result;
+        return;
+    }
+    /* OBJ + OBJ or OBJ + any → delegate to CPython PyNumber_* */
+    if (lt == FPY_TAG_OBJ || rt == FPY_TAG_OBJ) {
+        /* Use fpy_cpython_binop/rbinop via bridge */
+        extern void fpy_cpython_binop(void*, int32_t, int64_t, int32_t, int32_t*, int64_t*);
+        extern void fpy_cpython_rbinop(int32_t, int64_t, void*, int32_t, int32_t*, int64_t*);
+        if (lt == FPY_TAG_OBJ) {
+            fpy_cpython_binop((void*)(intptr_t)ld, rt, rd, op, out_tag, out_data);
+        } else {
+            fpy_cpython_rbinop(lt, ld, (void*)(intptr_t)rd, op, out_tag, out_data);
+        }
         return;
     }
     /* Promote to float if either operand is float */

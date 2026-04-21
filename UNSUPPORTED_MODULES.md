@@ -1,10 +1,11 @@
 # Standard Library Module Support
 
-## Status: 54 native / 124 via CPython bridge
+## Status: 70+ native / 104+ via CPython bridge
 
-Fastpy recognizes 54 standard library modules natively (compiled to native code or
-no-op imports). The remaining 124 route through the embedded CPython bridge
-(`fpy_cpython_import`), which works correctly but runs at interpreter speed.
+Fastpy recognizes 70+ standard library modules natively (compiled to native code or
+no-op imports). All 104 stdlib `.py` files compile successfully. The remaining modules
+route through the embedded CPython bridge (`fpy_cpython_import`), which works
+correctly but runs at interpreter speed. Linux and Windows are both supported.
 
 ## Modules that COULD be native but aren't yet (low priority)
 
@@ -65,6 +66,13 @@ at interpreter speed. This is acceptable because:
 1. Most are used for setup/teardown, not hot loops
 2. The bridge handles type conversion automatically (PyObject* <-> FpyValue)
 3. Method calls on bridge objects use `__getattr__`/`__call__` protocol
+4. Bridge calls now support 4+ positional args (`fpy_cpython_call_kw`)
+5. PYOBJ binops/comparisons dispatch through `fpy_cpython_binop`/`fpy_cpython_compare`
+6. PyBytes_Check and PyTuple_Check correctly identify and preserve types across the bridge
+7. Safe refcounting across FpyClosure, FpyObj, and PyObject* types
+
+The compiler can target any installed Python version (3.11, 3.12, 3.13, 3.14)
+with an ABI version check at startup to prevent version mismatches.
 
 The only scenario where bridge performance matters is tight loops calling
 bridge functions millions of times. For those cases, the solution is either:
