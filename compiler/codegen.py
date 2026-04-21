@@ -7632,9 +7632,9 @@ class CodeGen:
             container = self._emit_expr_value(target.value)
             key = self._emit_expr_value(target.slice)
             if self._is_dict_expr(target.value):
-                self.builder.call(self.runtime["dict_delete"], [container, key])
+                self._rt_call("dict_delete", [container, key])
             elif self._is_list_expr(target.value):
-                self.builder.call(self.runtime["list_delete_at"], [container, key])
+                self._rt_call("list_delete_at", [container, key])
             elif self._is_obj_expr(target.value):
                 obj_cls = self._infer_object_class(target.value)
                 if obj_cls and self._class_has_method(obj_cls, "__delitem__"):
@@ -8205,7 +8205,7 @@ class CodeGen:
                                   [obj, index, ir.Constant(i32, tag), data])
         else:
             # List set: index must be int
-            self.builder.call(self.runtime["list_set_fv"],
+            self._rt_call("list_set_fv",
                               [obj, index, ir.Constant(i32, tag), data])
 
     def _compile_eval_literal(self, source: str,
@@ -9291,7 +9291,7 @@ class CodeGen:
                         # stop = list_len - (n_targets_after_star)
                         n_after = len(target.elts) - star_idx - 1
                         stop = self.builder.sub(list_len, ir.Constant(i64, n_after))
-                        rest = self.builder.call(self.runtime["list_slice"], [
+                        rest = self._rt_call("list_slice", [
                             val, start, stop, ir.Constant(i64, 1), ir.Constant(i64, 1)])
                         self._store_variable(name, rest, "list:int")
                     elif isinstance(tgt, ast.Name):
@@ -9352,7 +9352,7 @@ class CodeGen:
             elif isinstance(rhs.type, ir.PointerType) and isinstance(node.op, ast.Add):
                 # String concatenation
                 current_ptr = self.builder.inttoptr(data, i8_ptr)
-                result = self.builder.call(self.runtime["str_concat"], [current_ptr, rhs])
+                result = self._rt_call("str_concat", [current_ptr, rhs])
             else:
                 # Fall back to the original typed-subscript path
                 current = self._emit_subscript(node.target)
@@ -9378,12 +9378,12 @@ class CodeGen:
             target_name = node.target.id
             _, tag = self.variables.get(target_name, (None, ""))
             if tag.startswith("list") or self._is_list_expr(ast.Name(id=target_name)):
-                result = self.builder.call(self.runtime["list_concat"], [current, rhs])
+                result = self._rt_call("list_concat", [current, rhs])
                 self._store_variable(target_name, result, tag or "list:int")
                 return
             # String concatenation
             if isinstance(rhs.type, ir.PointerType):
-                result = self.builder.call(self.runtime["str_concat"], [current, rhs])
+                result = self._rt_call("str_concat", [current, rhs])
                 self._store_variable(target_name, result, "str")
                 return
 
@@ -9392,7 +9392,7 @@ class CodeGen:
             target_name = node.target.id
             _, tag = self.variables.get(target_name, (None, ""))
             if tag.startswith("list"):
-                result = self.builder.call(self.runtime["list_repeat"], [current, rhs])
+                result = self._rt_call("list_repeat", [current, rhs])
                 self._store_variable(target_name, result, tag)
                 return
 
@@ -9587,15 +9587,19 @@ class CodeGen:
                 if name == "__file__":
                     return self._make_string_constant("")
                 return ir.Constant(i64, 0)
-            elif name in ("sys", "os"):
-                # Implicit stdlib imports — load via bridge on first use
-                mod_ptr = self.builder.call(
-                    self.runtime["cpython_import"],
-                    [self._make_string_constant(name)])
-                self._store_variable(name, mod_ptr, "pyobj")
-                return mod_ptr
             else:
-                raise CodeGenError(f"Undefined variable: {name}", node)
+                # Try implicit module import via CPython bridge.
+                # This handles cross-module references in stdlib code
+                # (e.g., `threading` used without explicit import).
+                try:
+                    __import__(name)
+                    mod_ptr = self.builder.call(
+                        self.runtime["cpython_import"],
+                        [self._make_string_constant(name)])
+                    self._store_variable(name, mod_ptr, "pyobj")
+                    return mod_ptr
+                except (ImportError, ValueError):
+                    raise CodeGenError(f"Undefined variable: {name}", node)
         alloca, type_tag = self.variables[name]
         if type_tag == "cell":
             # Mutable closure variable — load cell pointer, then get value
@@ -9727,7 +9731,7 @@ class CodeGen:
             # (kept for safety if someone flips the flag off)
             tag_slot = self._create_entry_alloca(i32, "lget.tag")
             data_slot = self._create_entry_alloca(i64, "lget.data")
-            self.builder.call(self.runtime["list_get_fv"],
+            self._rt_call("list_get_fv",
                               [list_val, idx, tag_slot, data_slot])
             data = self.builder.load(data_slot)
             fv = self._fv_build_from_slots(
@@ -9739,7 +9743,7 @@ class CodeGen:
         # FV path: get (tag, data) and pack directly into the alloca's FV
         tag_slot = self._create_entry_alloca(i32, "lget.tag")
         data_slot = self._create_entry_alloca(i64, "lget.data")
-        self.builder.call(self.runtime["list_get_fv"],
+        self._rt_call("list_get_fv",
                           [list_val, idx, tag_slot, data_slot])
         loaded_tag = self.builder.load(tag_slot)
         loaded_data = self.builder.load(data_slot)
@@ -9770,7 +9774,7 @@ class CodeGen:
         """Call list_get_fv and return (tag, data) loaded from the output slots."""
         tag_slot = self._create_entry_alloca(i32, f"{slot_prefix}.tag")
         data_slot = self._create_entry_alloca(i64, f"{slot_prefix}.data")
-        self.builder.call(self.runtime["list_get_fv"],
+        self._rt_call("list_get_fv",
                           [lst, idx, tag_slot, data_slot])
         return self.builder.load(tag_slot), self.builder.load(data_slot)
 
@@ -10200,7 +10204,7 @@ class CodeGen:
             if isinstance(subject.type, ir.IntType) and isinstance(val.type, ir.IntType):
                 return self.builder.icmp_signed("==", subject, val)
             elif isinstance(subject.type, ir.PointerType) and isinstance(val.type, ir.PointerType):
-                cmp = self.builder.call(self.runtime["str_compare"], [subject, val])
+                cmp = self._rt_call("str_compare", [subject, val])
                 return self.builder.icmp_signed("==", cmp, ir.Constant(i64, 0))
             elif isinstance(subject.type, ir.DoubleType) and isinstance(val.type, ir.DoubleType):
                 return self.builder.fcmp_ordered("==", subject, val)
@@ -10307,7 +10311,7 @@ class CodeGen:
             raise CodeGenError("yield from outside generator function", node)
         source = self._emit_expr_value(node.value)
         if isinstance(source.type, ir.PointerType):
-            self.builder.call(self.runtime["list_extend"], [gen_list, source])
+            self._rt_call("list_extend", [gen_list, source])
         else:
             raise CodeGenError("yield from requires an iterable", node)
 
@@ -11581,7 +11585,7 @@ class CodeGen:
 
         self.builder.position_at_end(body_block)
         idx = self._load_variable(idx_name, node)
-        ch = self.builder.call(self.runtime["str_index"], [str_val, idx])
+        ch = self._rt_call("str_index", [str_val, idx])
         self._store_variable(var_name, ch, "str")
 
         self._loop_stack.append((end_block, incr_block))
@@ -11736,7 +11740,7 @@ class CodeGen:
         self.builder.position_at_end(body_block)
         tag_slot = self._create_entry_alloca(i32, "dqfor.tag")
         data_slot = self._create_entry_alloca(i64, "dqfor.data")
-        self.builder.call(self.runtime["list_get_fv"],
+        self._rt_call("list_get_fv",
                           [lst, idx, tag_slot, data_slot])
         elem = self.builder.load(data_slot)
         self._store_variable(var_name, elem, "int")
@@ -12035,7 +12039,7 @@ class CodeGen:
                         and (self._is_list_expr(node.left)
                              or self._is_tuple_expr(node.left))):
                     # List/tuple equality
-                    eq_result = self.builder.call(self.runtime["list_equal"], [cmp_left, cmp_right])
+                    eq_result = self._rt_call("list_equal", [cmp_left, cmp_right])
                     truthy = self.builder.icmp_signed("!=", eq_result, ir.Constant(i32, 0))
                     if isinstance(op, ast.NotEq):
                         truthy = self.builder.not_(truthy)
@@ -12061,7 +12065,7 @@ class CodeGen:
                         and isinstance(cmp_right.type, ir.PointerType)
                         and isinstance(op, (ast.Eq, ast.NotEq))):
                     # String comparison
-                    cmp_result = self.builder.call(self.runtime["str_compare"], [cmp_left, cmp_right])
+                    cmp_result = self._rt_call("str_compare", [cmp_left, cmp_right])
                     if isinstance(op, ast.Eq):
                         cmp = self.builder.icmp_signed("==", cmp_result, ir.Constant(i64, 0))
                     else:
@@ -12266,7 +12270,7 @@ class CodeGen:
             elem_type = self._get_list_elem_type(container_node)
             if elem_type == "str" or isinstance(left_val.type, ir.PointerType):
                 elem = self._list_get_as_bare(container, idx, "str")
-                cmp_result = self.builder.call(self.runtime["str_compare"], [left_val, elem])
+                cmp_result = self._rt_call("str_compare", [left_val, elem])
                 eq = self.builder.icmp_signed("==", cmp_result, ir.Constant(i64, 0))
             elif elem_type == "float" or isinstance(left_val.type, ir.DoubleType):
                 elem = self._list_get_as_bare(container, idx, "float")
@@ -12316,7 +12320,7 @@ class CodeGen:
         # String 'in': "x" in "hello"
         container = self._emit_expr_value(container_node)
         if isinstance(container.type, ir.PointerType) and isinstance(left_val.type, ir.PointerType):
-            result = self.builder.call(self.runtime["str_contains"], [container, left_val])
+            result = self._rt_call("str_contains", [container, left_val])
             result_i1 = self.builder.icmp_signed("!=", result, ir.Constant(i32, 0))
             if isinstance(op, ast.NotIn):
                 result_i1 = self.builder.not_(result_i1)
@@ -13647,7 +13651,7 @@ class CodeGen:
                     # Print element via FV
                     tag_s = self._create_entry_alloca(i32, "pstar.tag")
                     data_s = self._create_entry_alloca(i64, "pstar.data")
-                    self.builder.call(self.runtime["list_get_fv"],
+                    self._rt_call("list_get_fv",
                                       [lst, idx, tag_s, data_s])
                     tag = self.builder.load(tag_s)
                     data = self.builder.load(data_s)
@@ -14777,19 +14781,19 @@ class CodeGen:
                 and isinstance(left.type, ir.PointerType)
                 and isinstance(right.type, ir.PointerType)
                 and self._is_dict_expr(node.left) and self._is_dict_expr(node.right)):
-            return self.builder.call(self.runtime["dict_merge"], [left, right])
+            return self._rt_call("dict_merge", [left, right])
 
         # Set operations (dict-backed sets): O(n) with O(1) per-element lookup
         if (isinstance(left.type, ir.PointerType) and isinstance(right.type, ir.PointerType)
                 and (self._is_set_expr(node.left) or self._is_set_expr(node.right))):
             if isinstance(node.op, ast.BitOr):
-                return self.builder.call(self.runtime["set_union"], [left, right])
+                return self._rt_call("set_union", [left, right])
             elif isinstance(node.op, ast.BitAnd):
-                return self.builder.call(self.runtime["set_intersection"], [left, right])
+                return self._rt_call("set_intersection", [left, right])
             elif isinstance(node.op, ast.Sub):
-                return self.builder.call(self.runtime["set_difference"], [left, right])
+                return self._rt_call("set_difference", [left, right])
             elif isinstance(node.op, ast.BitXor):
-                return self.builder.call(self.runtime["set_symmetric_diff"], [left, right])
+                return self._rt_call("set_symmetric_diff", [left, right])
 
         # List concatenation: list + list. Detect mismatched pointer types
         # (e.g. list + str) and raise TypeError at runtime instead of
@@ -14807,22 +14811,22 @@ class CodeGen:
                 return self._emit_type_error(
                     f'unsupported operand type(s) for +: "{left_type}" and "list"',
                     node)
-            return self.builder.call(self.runtime["list_concat"], [left, right])
+            return self._rt_call("list_concat", [left, right])
 
         # List repetition: list * int or int * list
         if isinstance(node.op, ast.Mult):
             if isinstance(left.type, ir.PointerType) and self._is_list_expr(node.left) and isinstance(right.type, ir.IntType):
-                return self.builder.call(self.runtime["list_repeat"], [left, right])
+                return self._rt_call("list_repeat", [left, right])
             if isinstance(right.type, ir.PointerType) and self._is_list_expr(node.right) and isinstance(left.type, ir.IntType):
-                return self.builder.call(self.runtime["list_repeat"], [right, left])
+                return self._rt_call("list_repeat", [right, left])
 
         # String operations (only if NOT lists)
         if isinstance(left.type, ir.PointerType) and not self._is_list_expr(node.left):
             if isinstance(node.op, ast.Add) and isinstance(right.type, ir.PointerType):
-                return self.builder.call(self.runtime["str_concat"], [left, right])
+                return self._rt_call("str_concat", [left, right])
             elif isinstance(node.op, ast.Mult) and isinstance(right.type, ir.IntType):
                 # string * int = repeat
-                return self.builder.call(self.runtime["str_repeat"], [left, right])
+                return self._rt_call("str_repeat", [left, right])
             elif isinstance(node.op, ast.Mod):
                 # fmt % args — build an args list if not already a list/tuple
                 if self._is_list_expr(node.right) or self._is_tuple_expr(node.right):
@@ -14831,11 +14835,11 @@ class CodeGen:
                     # Wrap single value into a list
                     args_list = self.builder.call(self.runtime["list_new"], [])
                     self._emit_list_append_value(args_list, right)
-                return self.builder.call(self.runtime["str_format_percent"], [left, args_list])
+                return self._rt_call("str_format_percent", [left, args_list])
         if isinstance(right.type, ir.PointerType) and isinstance(node.op, ast.Mult):
             if isinstance(left.type, ir.IntType):
                 # int * string = repeat
-                return self.builder.call(self.runtime["str_repeat"], [right, left])
+                return self._rt_call("str_repeat", [right, left])
 
         # Type mismatch guard — if types don't match after all special cases
         if left.type != right.type:
@@ -15575,7 +15579,7 @@ class CodeGen:
                             self.builder.call(self.runtime["cpython_to_fv"],
                                               [val, tag_a, data_a])
                             return self.builder.load(data_a)
-                        return self.builder.call(self.runtime["str_to_int"], [val])
+                        return self._rt_call("str_to_int", [val])
                     return val
                 if len(node.args) == 2:
                     # int(str, base) — convert string with base
@@ -15665,18 +15669,18 @@ class CodeGen:
                                 break
                     if start is None:
                         start = ir.Constant(i64, 0)
-                    return self.builder.call(self.runtime["enumerate"], [lst, start])
+                    return self._rt_call("enumerate", [lst, start])
                 raise CodeGenError("enumerate() requires at least one argument", node)
             if name == "zip":
                 if len(node.args) == 2:
                     a = self._emit_expr_value(node.args[0])
                     b = self._emit_expr_value(node.args[1])
-                    return self.builder.call(self.runtime["zip"], [a, b])
+                    return self._rt_call("zip", [a, b])
                 if len(node.args) == 3:
                     a = self._emit_expr_value(node.args[0])
                     b = self._emit_expr_value(node.args[1])
                     c = self._emit_expr_value(node.args[2])
-                    return self.builder.call(self.runtime["zip3"], [a, b, c])
+                    return self._rt_call("zip3", [a, b, c])
                 raise CodeGenError("zip() with 1 or >3 args not yet supported", node)
             if name == "any":
                 if len(node.args) == 1 and self._is_list_expr(node.args[0]):
@@ -15772,7 +15776,7 @@ class CodeGen:
                     if isinstance(val.type, ir.IntType):
                         return self.builder.sitofp(val, double)
                     if isinstance(val.type, ir.PointerType):
-                        return self.builder.call(self.runtime["str_to_float"], [val])
+                        return self._rt_call("str_to_float", [val])
                     return val
                 raise CodeGenError("float() takes exactly one argument", node)
             if name == "str":
@@ -15901,8 +15905,8 @@ class CodeGen:
                     # Build a 2-tuple for the result (via FV-ABI append)
                     tup = self.builder.call(self.runtime["tuple_new"], [])
                     int_tag = ir.Constant(i32, FPY_TAG_INT)
-                    self.builder.call(self.runtime["list_append_fv"], [tup, int_tag, q_val])
-                    self.builder.call(self.runtime["list_append_fv"], [tup, int_tag, r_val])
+                    self._rt_call("list_append_fv", [tup, int_tag, q_val])
+                    self._rt_call("list_append_fv", [tup, int_tag, r_val])
                     return tup
                 raise CodeGenError("divmod() takes exactly 2 arguments", node)
             if name == "pow":
@@ -15930,7 +15934,7 @@ class CodeGen:
             if name == "ord":
                 if len(node.args) == 1:
                     val = self._emit_expr_value(node.args[0])
-                    return self.builder.call(self.runtime["ord"], [val])
+                    return self._rt_call("ord", [val])
                 raise CodeGenError("ord() takes exactly one argument", node)
             if name == "hex":
                 if len(node.args) == 1:
@@ -16116,7 +16120,7 @@ class CodeGen:
                         self.builder.store(new_elem, result_alloca)
                     elif is_str:
                         elem = self._list_get_as_bare(lst, idx, "str")
-                        cmp_result = self.builder.call(self.runtime["str_compare"], [elem, current])
+                        cmp_result = self._rt_call("str_compare", [elem, current])
                         op = "<" if name == "min" else ">"
                         is_better = self.builder.icmp_signed(op, cmp_result, ir.Constant(i64, 0))
                         new_val = self.builder.select(is_better, elem, current)
@@ -16382,7 +16386,7 @@ class CodeGen:
         # Get element as bare value (int for int lists, str for str lists)
         elem_tag_a = self._create_entry_alloca(i32, "map.etag")
         elem_data_a = self._create_entry_alloca(i64, "map.edata")
-        self.builder.call(self.runtime["list_get_fv"],
+        self._rt_call("list_get_fv",
                           [seq, idx, elem_tag_a, elem_data_a])
         elem_data = self.builder.load(elem_data_a)
 
@@ -17354,7 +17358,7 @@ class CodeGen:
         else:
             tag_slot = self._create_entry_alloca(i32, "red.tag")
             data_slot = self._create_entry_alloca(i64, "red.data")
-            self.builder.call(self.runtime["list_get_fv"],
+            self._rt_call("list_get_fv",
                               [seq, ir.Constant(i64, 0), tag_slot, data_slot])
             accum_init = self.builder.load(data_slot)
             start_idx = ir.Constant(i64, 1)
@@ -17378,7 +17382,7 @@ class CodeGen:
         self.builder.position_at_end(body_block)
         tag_slot2 = self._create_entry_alloca(i32, "red.el.tag")
         data_slot2 = self._create_entry_alloca(i64, "red.el.data")
-        self.builder.call(self.runtime["list_get_fv"],
+        self._rt_call("list_get_fv",
                           [seq, idx, tag_slot2, data_slot2])
         elem = self.builder.load(data_slot2)
         accum = self.builder.load(accum_alloca)
@@ -17834,7 +17838,7 @@ class CodeGen:
         # Get element as FpyValue (preserves tag)
         elem_tag_a = self._create_entry_alloca(i32, "filt.etag")
         elem_data_a = self._create_entry_alloca(i64, "filt.edata")
-        self.builder.call(self.runtime["list_get_fv"],
+        self._rt_call("list_get_fv",
                           [seq, idx, elem_tag_a, elem_data_a])
         elem_data = self.builder.load(elem_data_a)
         elem_tag = self.builder.load(elem_tag_a)
@@ -17981,7 +17985,7 @@ class CodeGen:
             arg = self._emit_expr_value(node.args[0])
             if isinstance(arg.type, ir.IntType):
                 arg = self.builder.inttoptr(arg, i8_ptr)
-            keys = self.builder.call(self.runtime["set_to_list"], [arg])
+            keys = self._rt_call("set_to_list", [arg])
             result = self._rt_call("list_sorted", [keys])
         # If sorting a dict, sort its keys
         elif self._is_dict_expr(node.args[0]):
@@ -18629,19 +18633,19 @@ class CodeGen:
                 self._emit_list_append_expr(obj, node.args[0])
                 return obj
             if method == "pop" and len(node.args) == 0:
-                return self.builder.call(self.runtime["list_pop_int"], [obj])
+                return self._rt_call("list_pop_int", [obj])
             if method == "index" and len(node.args) == 1:
                 val = self._emit_expr_value(node.args[0])
-                return self.builder.call(self.runtime["list_index"], [obj, val])
+                return self._rt_call("list_index", [obj, val])
             if method == "count" and len(node.args) == 1:
                 val = self._emit_expr_value(node.args[0])
-                return self.builder.call(self.runtime["list_count"], [obj, val])
+                return self._rt_call("list_count", [obj, val])
             if method == "extend" and len(node.args) == 1:
                 other = self._emit_expr_value(node.args[0])
-                self.builder.call(self.runtime["list_extend"], [obj, other])
+                self._rt_call("list_extend", [obj, other])
                 return obj
             if method == "sort" and len(node.args) == 0:
-                self.builder.call(self.runtime["list_sort"], [obj])
+                self._rt_call("list_sort", [obj])
                 # Handle reverse=True keyword
                 for kw in node.keywords:
                     if kw.arg == "reverse":
@@ -18651,27 +18655,27 @@ class CodeGen:
                                 self.runtime["list_reverse_inplace"], [obj])
                 return obj
             if method == "reverse" and len(node.args) == 0:
-                self.builder.call(self.runtime["list_reverse_inplace"], [obj])
+                self._rt_call("list_reverse_inplace", [obj])
                 return obj
             if method == "remove" and len(node.args) == 1:
                 val = self._emit_expr_value(node.args[0])
                 if isinstance(val.type, ir.PointerType):
-                    self.builder.call(self.runtime["list_remove_str"], [obj, val])
+                    self._rt_call("list_remove_str", [obj, val])
                 else:
-                    self.builder.call(self.runtime["list_remove"], [obj, val])
+                    self._rt_call("list_remove", [obj, val])
                 return obj
             if method == "insert" and len(node.args) == 2:
                 idx = self._emit_expr_value(node.args[0])
                 val = self._emit_expr_value(node.args[1])
                 if isinstance(val.type, ir.PointerType):
-                    self.builder.call(self.runtime["list_insert_str"], [obj, idx, val])
+                    self._rt_call("list_insert_str", [obj, idx, val])
                 else:
-                    self.builder.call(self.runtime["list_insert_int"], [obj, idx, val])
+                    self._rt_call("list_insert_int", [obj, idx, val])
                 return obj
             if method == "copy" and len(node.args) == 0:
-                return self.builder.call(self.runtime["list_copy"], [obj])
+                return self._rt_call("list_copy", [obj])
             if method == "clear" and len(node.args) == 0:
-                self.builder.call(self.runtime["list_clear"], [obj])
+                self._rt_call("list_clear", [obj])
                 return obj
             if method == "discard" and len(node.args) == 1:
                 val = self._emit_expr_value(node.args[0])
@@ -18721,7 +18725,7 @@ class CodeGen:
                     # Use FV-ABI: return full FpyValue so runtime tag drives dispatch.
                     # This handles mixed-type dicts (kwargs pattern) correctly.
                     if isinstance(key.type, ir.PointerType):
-                        has = self.builder.call(self.runtime["dict_has_key"], [obj, key])
+                        has = self._rt_call("dict_has_key", [obj, key])
                         has_bool = self.builder.icmp_unsigned("!=", has, ir.Constant(i32, 0))
                         tag_slot = self._create_entry_alloca(i32, "dget.tag")
                         data_slot = self._create_entry_alloca(i64, "dget.data")
@@ -18764,25 +18768,25 @@ class CodeGen:
                             default = self.builder.call(self.runtime["int_to_str"], [default])
                     else:
                         default = self._make_string_constant("None")
-                    return self.builder.call(self.runtime["dict_get_default"], [obj, key, default])
+                    return self._rt_call("dict_get_default", [obj, key, default])
             if method == "update":
                 if len(node.args) == 1:
                     other = self._emit_expr_value(node.args[0])
-                    self.builder.call(self.runtime["dict_update"], [obj, other])
+                    self._rt_call("dict_update", [obj, other])
                     return obj
             if method == "pop":
                 if len(node.args) == 1:
                     key = self._emit_expr_value(node.args[0])
                     # Heuristic: use int pop if we can't tell; returning str by default
-                    return self.builder.call(self.runtime["dict_pop_int"], [obj, key])
+                    return self._rt_call("dict_pop_int", [obj, key])
             if method == "setdefault":
                 if len(node.args) == 2:
                     key = self._emit_expr_value(node.args[0])
                     default = self._emit_expr_value(node.args[1])
                     if isinstance(default.type, ir.PointerType):
-                        self.builder.call(self.runtime["dict_setdefault_list"], [obj, key, default])
+                        self._rt_call("dict_setdefault_list", [obj, key, default])
                     else:
-                        self.builder.call(self.runtime["dict_setdefault_int"], [obj, key, default])
+                        self._rt_call("dict_setdefault_int", [obj, key, default])
                     return obj
             raise CodeGenError(f"Unsupported dict method: .{method}()", node)
 
@@ -18994,59 +18998,59 @@ class CodeGen:
         if isinstance(obj.type, ir.PointerType):
             # String methods
             if method == "lower":
-                return self.builder.call(self.runtime["str_lower"], [obj])
+                return self._rt_call("str_lower", [obj])
             if method == "upper":
-                return self.builder.call(self.runtime["str_upper"], [obj])
+                return self._rt_call("str_upper", [obj])
             if method == "strip":
                 if len(node.args) == 1:
                     chars = self._emit_expr_value(node.args[0])
-                    return self.builder.call(self.runtime["str_strip_chars"], [obj, chars])
-                return self.builder.call(self.runtime["str_strip"], [obj])
+                    return self._rt_call("str_strip_chars", [obj, chars])
+                return self._rt_call("str_strip", [obj])
             if method == "lstrip":
-                return self.builder.call(self.runtime["str_lstrip"], [obj])
+                return self._rt_call("str_lstrip", [obj])
             if method == "rstrip":
-                return self.builder.call(self.runtime["str_rstrip"], [obj])
+                return self._rt_call("str_rstrip", [obj])
             if method == "isdigit":
-                return self.builder.call(self.runtime["str_isdigit"], [obj])
+                return self._rt_call("str_isdigit", [obj])
             if method == "isalpha":
-                return self.builder.call(self.runtime["str_isalpha"], [obj])
+                return self._rt_call("str_isalpha", [obj])
             if method == "isalnum":
-                return self.builder.call(self.runtime["str_isalnum"], [obj])
+                return self._rt_call("str_isalnum", [obj])
             if method == "isspace":
-                return self.builder.call(self.runtime["str_isspace"], [obj])
+                return self._rt_call("str_isspace", [obj])
             if method == "capitalize":
-                return self.builder.call(self.runtime["str_capitalize"], [obj])
+                return self._rt_call("str_capitalize", [obj])
             if method == "title":
-                return self.builder.call(self.runtime["str_title"], [obj])
+                return self._rt_call("str_title", [obj])
             if method == "swapcase":
-                return self.builder.call(self.runtime["str_swapcase"], [obj])
+                return self._rt_call("str_swapcase", [obj])
             if method == "center":
                 if len(node.args) == 1:
                     w = self._emit_expr_value(node.args[0])
-                    return self.builder.call(self.runtime["str_center"], [obj, w])
+                    return self._rt_call("str_center", [obj, w])
             if method == "ljust":
                 if len(node.args) == 1:
                     w = self._emit_expr_value(node.args[0])
-                    return self.builder.call(self.runtime["str_ljust"], [obj, w])
+                    return self._rt_call("str_ljust", [obj, w])
             if method == "rjust":
                 if len(node.args) == 1:
                     w = self._emit_expr_value(node.args[0])
-                    return self.builder.call(self.runtime["str_rjust"], [obj, w])
+                    return self._rt_call("str_rjust", [obj, w])
             if method == "zfill":
                 if len(node.args) == 1:
                     w = self._emit_expr_value(node.args[0])
-                    return self.builder.call(self.runtime["str_zfill"], [obj, w])
+                    return self._rt_call("str_zfill", [obj, w])
             if method == "splitlines":
-                return self.builder.call(self.runtime["str_splitlines"], [obj])
+                return self._rt_call("str_splitlines", [obj])
             if method == "split":
                 if len(node.args) == 2:
                     sep = self._emit_expr_value(node.args[0])
                     maxsplit = self._emit_expr_value(node.args[1])
-                    return self.builder.call(self.runtime["str_split_max"], [obj, sep, maxsplit])
+                    return self._rt_call("str_split_max", [obj, sep, maxsplit])
                 if len(node.args) == 1:
                     sep = self._emit_expr_value(node.args[0])
-                    return self.builder.call(self.runtime["str_split_max"], [obj, sep, ir.Constant(i64, -1)])
-                return self.builder.call(self.runtime["str_split"], [obj])
+                    return self._rt_call("str_split_max", [obj, sep, ir.Constant(i64, -1)])
+                return self._rt_call("str_split", [obj])
             if method == "join":
                 if len(node.args) == 1:
                     lst = self._emit_expr_value(node.args[0])
@@ -19055,27 +19059,27 @@ class CodeGen:
                 if len(node.args) == 2:
                     old = self._emit_expr_value(node.args[0])
                     new = self._emit_expr_value(node.args[1])
-                    return self.builder.call(self.runtime["str_replace"], [obj, old, new])
+                    return self._rt_call("str_replace", [obj, old, new])
             if method == "startswith":
                 if len(node.args) == 1:
                     prefix = self._emit_expr_value(node.args[0])
-                    return self.builder.call(self.runtime["str_startswith"], [obj, prefix])
+                    return self._rt_call("str_startswith", [obj, prefix])
             if method == "endswith":
                 if len(node.args) == 1:
                     suffix = self._emit_expr_value(node.args[0])
-                    return self.builder.call(self.runtime["str_endswith"], [obj, suffix])
+                    return self._rt_call("str_endswith", [obj, suffix])
             if method == "find":
                 if len(node.args) == 1:
                     sub = self._emit_expr_value(node.args[0])
-                    return self.builder.call(self.runtime["str_find"], [obj, sub])
+                    return self._rt_call("str_find", [obj, sub])
             if method == "rfind":
                 if len(node.args) == 1:
                     sub = self._emit_expr_value(node.args[0])
-                    return self.builder.call(self.runtime["str_rfind"], [obj, sub])
+                    return self._rt_call("str_rfind", [obj, sub])
             if method == "count":
                 if len(node.args) == 1:
                     sub = self._emit_expr_value(node.args[0])
-                    return self.builder.call(self.runtime["str_count"], [obj, sub])
+                    return self._rt_call("str_count", [obj, sub])
             if method == "format":
                 return self._emit_str_format(node, obj)
         # Fallback: runtime method dispatch for unknown objects.
@@ -19586,7 +19590,7 @@ class CodeGen:
             # Counter[key] → dict lookup; missing keys should return 0
             # Use dict_has_key to check, then get or return 0
             if isinstance(key.type, ir.PointerType):
-                has = self.builder.call(self.runtime["dict_has_key"], [obj, key])
+                has = self._rt_call("dict_has_key", [obj, key])
                 has_bool = self.builder.icmp_unsigned("!=", has, ir.Constant(i32, 0))
                 tag_slot = self._create_entry_alloca(i32, "ctr.tag")
                 data_slot = self._create_entry_alloca(i64, "ctr.data")
@@ -19605,7 +19609,7 @@ class CodeGen:
                 return phi
             else:
                 # Int key
-                has = self.builder.call(self.runtime["dict_has_int_key"], [obj, key])
+                has = self._rt_call("dict_has_int_key", [obj, key])
                 has_bool = self.builder.icmp_unsigned("!=", has, ir.Constant(i32, 0))
                 with_block = self._new_block("ctr.found")
                 merge_block = self._new_block("ctr.merge")
@@ -19734,7 +19738,7 @@ class CodeGen:
             # Route through list_get_fv and unwrap based on the static elem_type
             tag_slot = self._create_entry_alloca(i32, "lget.tag")
             data_slot = self._create_entry_alloca(i64, "lget.data")
-            self.builder.call(self.runtime["list_get_fv"],
+            self._rt_call("list_get_fv",
                               [obj, index, tag_slot, data_slot])
             data = self.builder.load(data_slot)
             elem_type = self._get_list_elem_type(node.value)
@@ -19772,7 +19776,7 @@ class CodeGen:
                 return self._emit_string_slice(obj, node.slice, node)
             else:
                 index = self._emit_expr_value(node.slice)
-                return self.builder.call(self.runtime["str_index"], [obj, index])
+                return self._rt_call("str_index", [obj, index])
 
         # Fallback: treat as pyobj __getitem__ via bridge
         obj = self._emit_expr_value(node.value)
@@ -20237,7 +20241,7 @@ class CodeGen:
             if key_node is None:
                 other = self._emit_expr_value(val_node)
                 # Use dict_update to copy all entries from other into dict_ptr
-                self.builder.call(self.runtime["dict_update"], [dict_ptr, other])
+                self._rt_call("dict_update", [dict_ptr, other])
                 continue
             key = self._emit_expr_value(key_node)
             val = self._emit_expr_value(val_node)
@@ -20378,13 +20382,13 @@ class CodeGen:
                 # Check for list/obj expressions first
                 if self._is_list_expr(value.value):
                     val = self._emit_expr_value(value.value)
-                    str_val = self.builder.call(self.runtime["list_to_str"], [val])
+                    str_val = self._rt_call("list_to_str", [val])
                 elif self._is_dict_expr(value.value):
                     val = self._emit_expr_value(value.value)
-                    str_val = self.builder.call(self.runtime["dict_to_str"], [val])
+                    str_val = self._rt_call("dict_to_str", [val])
                 elif self._is_tuple_expr(value.value):
                     val = self._emit_expr_value(value.value)
-                    str_val = self.builder.call(self.runtime["tuple_to_str"], [val])
+                    str_val = self._rt_call("tuple_to_str", [val])
                 elif self._is_obj_expr(value.value):
                     val = self._emit_expr_value(value.value)
                     if isinstance(val.type, ir.IntType) and val.type.width == 64:
@@ -20437,7 +20441,7 @@ class CodeGen:
                         elif isinstance(value.value, ast.JoinedStr):
                             val_type = "str"
                         if val_type == "str":
-                            str_val = self.builder.call(self.runtime["str_repr"], [str_val])
+                            str_val = self._rt_call("str_repr", [str_val])
                 parts.append(str_val)
             else:
                 raise CodeGenError(f"Unsupported f-string part: {type(value).__name__}", node)
@@ -20448,7 +20452,7 @@ class CodeGen:
         # Concatenate all parts
         result = parts[0]
         for part in parts[1:]:
-            result = self.builder.call(self.runtime["str_concat"], [result, part])
+            result = self._rt_call("str_concat", [result, part])
         return result
 
     def _value_to_str(self, value: ir.Value, node: ast.AST) -> ir.Value:
@@ -20563,7 +20567,7 @@ class CodeGen:
 
         result = parts[0]
         for part in parts[1:]:
-            result = self.builder.call(self.runtime["str_concat"], [result, part])
+            result = self._rt_call("str_concat", [result, part])
         return result
 
     def _apply_format_spec(self, value: ir.Value, spec: str, arg_node: ast.expr, node: ast.AST) -> ir.Value:
@@ -20591,9 +20595,9 @@ class CodeGen:
     def _format_value_to_str(self, value: ir.Value, node: ast.expr) -> ir.Value:
         """Convert a value to string for str.format() — reuses f-string logic."""
         if self._is_list_expr(node):
-            return self.builder.call(self.runtime["list_to_str"], [value])
+            return self._rt_call("list_to_str", [value])
         if self._is_dict_expr(node):
-            return self.builder.call(self.runtime["dict_to_str"], [value])
+            return self._rt_call("dict_to_str", [value])
         return self._value_to_str(value, node)
 
     def _emit_constant_value(self, value: Any) -> ir.Value:
