@@ -10231,10 +10231,7 @@ class CodeGen:
                         "tempfile", "heapq", "bisect", "traceback",
                         "pprint", "unittest", "argparse",
                         # Batch: common imports that use CPython bridge or are no-ops
-                        "decimal", "datetime", "platform", "secrets", "statistics",
-                        "array", "weakref", "threading", "subprocess",
-                        "pickle", "csv", "signal", "atexit", "gc",
-                        "inspect", "types", "numbers", "fractions"}
+                        "decimal", "platform", "secrets"}
 
     # Native math constants
     _MATH_CONSTANTS = {
