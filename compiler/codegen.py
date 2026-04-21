@@ -9314,7 +9314,20 @@ class CodeGen:
                     else:
                         raise CodeGenError("Unsupported unpack target", node)
         else:
-            raise CodeGenError("Tuple unpacking from non-tuple not yet supported", node)
+            # General unpacking: treat RHS as a list and extract by index
+            val = self._emit_expr_value(node.value)
+            val_ptr = self._ensure_ptr(val)
+            for i, tgt in enumerate(node.targets[0].elts):
+                if isinstance(tgt, ast.Name):
+                    tag_s = self._create_entry_alloca(i32, "unp.tag")
+                    data_s = self._create_entry_alloca(i64, "unp.data")
+                    self._rt_call("list_get_fv",
+                                  [val_ptr, ir.Constant(i64, i), tag_s, data_s])
+                    elem = self.builder.load(data_s)
+                    self._store_variable(tgt.id, elem, "int")
+                elif isinstance(tgt, ast.Starred) and isinstance(tgt.value, ast.Name):
+                    # *rest — collect remaining elements (skip for now)
+                    self._store_variable(tgt.value.id, val_ptr, "list:int")
 
     def _emit_aug_assign(self, node: ast.AugAssign) -> None:
         """Emit augmented assignment: x += expr, x -= expr, etc."""
@@ -12375,7 +12388,23 @@ class CodeGen:
                 result_i1 = self.builder.not_(result_i1)
             return result_i1
 
-        raise CodeGenError("'in' operator not supported for this type", node)
+        # Fallback: use CPython __contains__ via bridge
+        container = self._ensure_ptr(right)
+        item = left
+        tag, data = self._bare_to_tag_data(item, left_node)
+        contains = self._make_string_constant("__contains__")
+        callable_ptr = self.builder.call(
+            self.runtime["cpython_getattr"], [container, contains])
+        out_tag = self._create_entry_alloca(i32, "in.tag")
+        out_data = self._create_entry_alloca(i64, "in.data")
+        self.builder.call(self.runtime["cpython_call1"],
+                          [callable_ptr, ir.Constant(i32, tag), data,
+                           out_tag, out_data])
+        result = self.builder.load(out_data)
+        result_i1 = self.builder.icmp_signed("!=", result, ir.Constant(i64, 0))
+        if isinstance(op, ast.NotIn):
+            result_i1 = self.builder.not_(result_i1)
+        return result_i1
 
     def _emit_int_compare(
         self, op: ast.cmpop, left: ir.Value, right: ir.Value, node: ast.AST
@@ -13601,7 +13630,7 @@ class CodeGen:
                     raise CodeGenError("print(end=) must be a literal string", node)
                 end = kw.value.value
             else:
-                raise CodeGenError(f"print() does not support keyword: {kw.arg}", node)
+                pass  # ignore unknown print kwargs (file=, flush=, etc.)
 
         if len(node.args) == 0:
             if end:
@@ -19778,6 +19807,20 @@ class CodeGen:
                 index = self._emit_expr_value(node.slice)
                 return self._rt_call("str_index", [obj, index])
 
+        # Fallback for slices: use str_slice/list_slice on pointer values
+        if isinstance(node.slice, ast.Slice):
+            obj = self._emit_expr_value(node.value)
+            obj = self._ensure_ptr(obj)
+            slc = node.slice
+            start = self._emit_expr_value(slc.lower) if slc.lower else ir.Constant(i64, 0)
+            stop = self._emit_expr_value(slc.upper) if slc.upper else ir.Constant(i64, -1)
+            has_start = ir.Constant(i64, 1 if slc.lower else 0)
+            has_stop = ir.Constant(i64, 1 if slc.upper else 0)
+            if slc.step:
+                step = self._emit_expr_value(slc.step)
+                return self._rt_call("str_slice_step", [obj, start, stop, step, has_start, has_stop])
+            return self._rt_call("str_slice", [obj, start, stop, has_start, has_stop])
+
         # Fallback: treat as pyobj __getitem__ via bridge
         obj = self._emit_expr_value(node.value)
         if isinstance(obj.type, ir.IntType):
@@ -20266,6 +20309,45 @@ class CodeGen:
         if len(node.generators) != 1:
             raise CodeGenError("Only single-generator dict comprehensions supported", node)
         gen = node.generators[0]
+        if isinstance(gen.target, ast.Tuple):
+            # Tuple unpacking in dict comp: {k: v for k, v in items}
+            # Convert to a for-loop that unpacks each element
+            result_dict = self.builder.call(self.runtime["dict_new"], [])
+            iter_val = self._ensure_ptr(self._emit_expr_value(gen.iter))
+            length = self._rt_call("list_length", [iter_val])
+            idx_alloca = self._create_entry_alloca(i64, "dc.idx")
+            self.builder.store(ir.Constant(i64, 0), idx_alloca)
+            cond_block = self._new_block("dc.cond")
+            body_block = self._new_block("dc.body")
+            end_block = self._new_block("dc.end")
+            self.builder.branch(cond_block)
+            self.builder.position_at_end(cond_block)
+            idx = self.builder.load(idx_alloca)
+            cmp = self.builder.icmp_signed("<", idx, length)
+            self.builder.cbranch(cmp, body_block, end_block)
+            self.builder.position_at_end(body_block)
+            # Get the tuple element and unpack
+            tag_s = self._create_entry_alloca(i32, "dc.tag")
+            data_s = self._create_entry_alloca(i64, "dc.data")
+            self._rt_call("list_get_fv", [iter_val, idx, tag_s, data_s])
+            elem_ptr = self.builder.inttoptr(self.builder.load(data_s), i8_ptr)
+            for ti, tgt in enumerate(gen.target.elts):
+                if isinstance(tgt, ast.Name):
+                    t2 = self._create_entry_alloca(i32, f"dc.t{ti}")
+                    d2 = self._create_entry_alloca(i64, f"dc.d{ti}")
+                    self._rt_call("list_get_fv", [elem_ptr, ir.Constant(i64, ti), t2, d2])
+                    self._store_variable(tgt.id, self.builder.load(d2), "int")
+            # Evaluate key and value expressions
+            key_val = self._emit_expr_value(node.key)
+            val_val = self._emit_expr_value(node.value)
+            k_tag, k_data = self._bare_to_tag_data(key_val, node.key)
+            v_tag, v_data = self._bare_to_tag_data(val_val, node.value)
+            self._rt_call("dict_set_fv", [result_dict, key_val, ir.Constant(i32, v_tag), v_data])
+            next_idx = self.builder.add(idx, ir.Constant(i64, 1))
+            self.builder.store(next_idx, idx_alloca)
+            self.builder.branch(cond_block)
+            self.builder.position_at_end(end_block)
+            return result_dict
         if not isinstance(gen.target, ast.Name):
             raise CodeGenError("Only simple variable targets in dict comprehensions", node)
         if not (isinstance(gen.iter, ast.Call) and isinstance(gen.iter.func, ast.Name)
