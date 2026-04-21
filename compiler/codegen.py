@@ -482,6 +482,22 @@ class _SafeIRBuilder(ir.IRBuilder):
                 elif (isinstance(ptype, ir.DoubleType)
                       and isinstance(arg.type, ir.IntType)):
                     coerced[i] = super().bitcast(arg, ptype)
+                # double → i8* (bitcast to i64, then inttoptr)
+                elif (isinstance(ptype, ir.PointerType)
+                      and isinstance(arg.type, ir.DoubleType)):
+                    tmp = super().bitcast(arg, i64)
+                    coerced[i] = super().inttoptr(tmp, ptype)
+                # i8* → double (ptrtoint, then bitcast)
+                elif (isinstance(ptype, ir.DoubleType)
+                      and isinstance(arg.type, ir.PointerType)):
+                    tmp = super().ptrtoint(arg, i64)
+                    coerced[i] = super().bitcast(tmp, ptype)
+                # {i32,i64} → i32 (extract data, trunc)
+                elif (isinstance(ptype, ir.IntType) and ptype.width == 32
+                      and isinstance(arg.type, ir.LiteralStructType)
+                      and arg.type == fpy_val):
+                    data = super().extract_value(arg, 1)
+                    coerced[i] = super().trunc(data, ptype)
             args = coerced
         # Pad missing args with zero/null defaults
         if hasattr(fn, 'function_type'):
@@ -595,6 +611,46 @@ class _SafeIRBuilder(ir.IRBuilder):
             rhs = super().sitofp(rhs, ir.DoubleType())
         return lhs, rhs
 
+    def insert_value(self, agg, value, idx, name=''):
+        """Auto-coerce value for insert_value into FpyValue struct."""
+        if (isinstance(agg.type, ir.LiteralStructType) and agg.type == fpy_val
+                and idx == 1 and isinstance(value.type, ir.PointerType)):
+            value = super().ptrtoint(value, i64)
+        elif (isinstance(agg.type, ir.LiteralStructType) and agg.type == fpy_val
+              and idx == 1 and isinstance(value.type, ir.IntType) and value.type.width == 32):
+            value = super().zext(value, i64)
+        elif (isinstance(agg.type, ir.LiteralStructType) and agg.type == fpy_val
+              and idx == 0 and isinstance(value.type, ir.IntType) and value.type.width == 64):
+            value = super().trunc(value, i32)
+        return super().insert_value(agg, value, idx, name=name)
+
+    def extract_value(self, agg, idx, name=''):
+        """Guard extract_value against non-aggregate types."""
+        if not isinstance(agg.type, (ir.LiteralStructType, ir.ArrayType)):
+            # Can't extract from a scalar — return the value itself
+            return agg
+        return super().extract_value(agg, idx, name=name)
+
+    def zext(self, value, typ, name=''):
+        """Handle zext on non-integer types (extract from FpyValue first)."""
+        if isinstance(value.type, ir.LiteralStructType) and value.type == fpy_val:
+            value = super().extract_value(value, 1)
+        if isinstance(value.type, ir.PointerType):
+            value = super().ptrtoint(value, i64)
+        if value.type == typ:
+            return value
+        return super().zext(value, typ, name=name)
+
+    def trunc(self, value, typ, name=''):
+        """Handle trunc on non-integer types."""
+        if isinstance(value.type, ir.LiteralStructType) and value.type == fpy_val:
+            value = super().extract_value(value, 1)
+        if isinstance(value.type, ir.PointerType):
+            value = super().ptrtoint(value, i64)
+        if value.type == typ:
+            return value
+        return super().trunc(value, typ, name=name)
+
     def fadd(self, lhs, rhs, name=''):
         lhs, rhs = self._coerce_float_pair(lhs, rhs)
         return super().fadd(lhs, rhs, name=name)
@@ -628,6 +684,38 @@ class _SafeIRBuilder(ir.IRBuilder):
     def mul(self, lhs, rhs, name=''):
         lhs, rhs = self._coerce_pair(lhs, rhs)
         return super().mul(lhs, rhs, name=name)
+
+    def sdiv(self, lhs, rhs, name=''):
+        lhs, rhs = self._coerce_pair(lhs, rhs)
+        return super().sdiv(lhs, rhs, name=name)
+
+    def srem(self, lhs, rhs, name=''):
+        lhs, rhs = self._coerce_pair(lhs, rhs)
+        return super().srem(lhs, rhs, name=name)
+
+    def udiv(self, lhs, rhs, name=''):
+        lhs, rhs = self._coerce_pair(lhs, rhs)
+        return super().udiv(lhs, rhs, name=name)
+
+    def urem(self, lhs, rhs, name=''):
+        lhs, rhs = self._coerce_pair(lhs, rhs)
+        return super().urem(lhs, rhs, name=name)
+
+    def xor(self, lhs, rhs, name=''):
+        lhs, rhs = self._coerce_pair(lhs, rhs)
+        return super().xor(lhs, rhs, name=name)
+
+    def shl(self, lhs, rhs, name=''):
+        lhs, rhs = self._coerce_pair(lhs, rhs)
+        return super().shl(lhs, rhs, name=name)
+
+    def lshr(self, lhs, rhs, name=''):
+        lhs, rhs = self._coerce_pair(lhs, rhs)
+        return super().lshr(lhs, rhs, name=name)
+
+    def ashr(self, lhs, rhs, name=''):
+        lhs, rhs = self._coerce_pair(lhs, rhs)
+        return super().ashr(lhs, rhs, name=name)
 
     def and_(self, lhs, rhs, name=''):
         lhs, rhs = self._coerce_pair(lhs, rhs)
@@ -680,13 +768,20 @@ class _SafeIRBuilder(ir.IRBuilder):
         if value.type != ret_type:
             if isinstance(ret_type, ir.VoidType):
                 return super().ret_void()
-            if ret_type == i64 and isinstance(value.type, ir.PointerType):
+            # int → int (widen or narrow)
+            if isinstance(ret_type, ir.IntType) and isinstance(value.type, ir.IntType):
+                if value.type.width < ret_type.width:
+                    value = super().zext(value, ret_type)
+                elif value.type.width > ret_type.width:
+                    value = super().trunc(value, ret_type)
+            elif isinstance(ret_type, ir.IntType) and isinstance(value.type, ir.PointerType):
                 value = super().ptrtoint(value, i64)
-            elif ret_type == i64 and isinstance(value.type, ir.LiteralStructType):
+                if ret_type.width != 64:
+                    value = super().trunc(value, ret_type)
+            elif isinstance(ret_type, ir.IntType) and isinstance(value.type, ir.LiteralStructType):
                 value = super().extract_value(value, 1)
-            elif ret_type == i64 and isinstance(value.type, ir.IntType):
-                value = super().zext(value, i64) if value.type.width < 64 \
-                    else super().trunc(value, i64)
+                if ret_type.width != 64:
+                    value = super().trunc(value, ret_type)
             elif isinstance(ret_type, ir.PointerType) and isinstance(value.type, ir.IntType):
                 value = super().inttoptr(value, ret_type)
             elif (isinstance(ret_type, ir.PointerType)
@@ -704,6 +799,25 @@ class _SafeIRBuilder(ir.IRBuilder):
                 fv = super().insert_value(fv, ir.Constant(i32, 2), 0)
                 fv = super().insert_value(fv, data, 1)
                 value = fv
+            # double ↔ int
+            elif isinstance(ret_type, ir.DoubleType) and isinstance(value.type, ir.IntType):
+                value = super().bitcast(value, ret_type) if value.type.width == 64 \
+                    else super().sitofp(value, ret_type)
+            elif isinstance(ret_type, ir.IntType) and isinstance(value.type, ir.DoubleType):
+                value = super().bitcast(value, i64)
+                if ret_type.width != 64:
+                    value = super().trunc(value, ret_type)
+            # double ↔ pointer
+            elif isinstance(ret_type, ir.DoubleType) and isinstance(value.type, ir.PointerType):
+                value = super().ptrtoint(value, i64)
+                value = super().bitcast(value, ret_type)
+            elif isinstance(ret_type, ir.PointerType) and isinstance(value.type, ir.DoubleType):
+                value = super().bitcast(value, i64)
+                value = super().inttoptr(value, ret_type)
+            # FpyValue → double
+            elif isinstance(ret_type, ir.DoubleType) and isinstance(value.type, ir.LiteralStructType):
+                data = super().extract_value(value, 1)
+                value = super().bitcast(data, ret_type)
         return super().ret(value)
 
     def ret_void(self):
@@ -750,6 +864,9 @@ class CodeGen:
         self._singledispatch_variants = {}
         self._cpython_functions = set()
         self._cpython_classes = set()
+        # Phase 4: function aliases — tracks `f = my_func` so `f(args)`
+        # calls the compiled my_func instead of falling back to bridge.
+        self._func_aliases: dict[str, str] = {}  # alias_name → original_func_name
 
         # Declare runtime functions
         self._declare_runtime_functions()
@@ -3298,6 +3415,22 @@ class CodeGen:
             if not isinstance(cls_node, ast.ClassDef):
                 continue
 
+        # Phase 4: pre-scan function aliases (f = func_name) so call-site
+        # analysis treats f(args) as func_name(args) for type inference.
+        _prescan_aliases: dict[str, str] = {}
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Assign) and len(node.targets) == 1
+                    and isinstance(node.targets[0], ast.Name)
+                    and isinstance(node.value, ast.Name)
+                    and (node.value.id in func_asts or node.value.id in class_parents
+                         or node.value.id in _prescan_aliases)):
+                alias = node.targets[0].id
+                target = node.value.id
+                # Resolve chains
+                while target in _prescan_aliases:
+                    target = _prescan_aliases[target]
+                _prescan_aliases[alias] = target
+
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
                 continue
@@ -3305,6 +3438,9 @@ class CodeGen:
             cls_name = None  # reset each iteration — set by attribute branch below
             if isinstance(node.func, ast.Name):
                 func_name = node.func.id
+                # Phase 4: resolve function aliases for call-site analysis
+                if func_name in _prescan_aliases:
+                    func_name = _prescan_aliases[func_name]
             # Method calls: obj.method(args) — register under "Class.method"
             # if the object's class is known, otherwise under bare "method".
             elif isinstance(node.func, ast.Attribute):
@@ -3454,6 +3590,28 @@ class CodeGen:
                                     var_types[caller_var] = refinements[pname]
                                     arg_types[pi] = refinements[pname]
                         break
+
+            # Phase 4: track function-valued arguments. When apply(add, 5, 6)
+            # is called and `add` is a user function, record that apply's
+            # param[0] should be aliased to `add` inside the function body.
+            # If multiple call sites pass different functions, clear the mapping
+            # (can't statically resolve — would need monomorphization).
+            for i, arg in enumerate(node.args):
+                if isinstance(arg, ast.Name):
+                    arg_name = arg.id
+                    if arg_name in _prescan_aliases:
+                        arg_name = _prescan_aliases[arg_name]
+                    if arg_name in func_asts:
+                        if not hasattr(self, '_param_func_map'):
+                            self._param_func_map = {}
+                            self._param_func_targets = {}  # all targets per key
+                        key = (func_name, i)
+                        self._param_func_targets.setdefault(key, set()).add(arg_name)
+                        if key in self._param_func_map:
+                            if self._param_func_map[key] != arg_name:
+                                self._param_func_map[key] = None  # ambiguous
+                        else:
+                            self._param_func_map[key] = arg_name
 
             # Register for the function/class and its parent chain
             names_to_register = [func_name]
@@ -3838,8 +3996,8 @@ class CodeGen:
         self._lambda_counter += 1
         fn_name = f"fastpy.lambda.{var_name}.{self._lambda_counter}"
         func = ir.Function(self.module, func_type, name=fn_name)
-        func.linkage = "internal"
-        func.attributes.add('alwaysinline')  # lambdas are always small
+        # Don't set internal linkage yet — it's invalid on declarations.
+        # Set it after the body is emitted (see below).
 
         for param, pname in zip(func.args, param_names):
             param.name = pname
@@ -3880,6 +4038,10 @@ class CodeGen:
             elif isinstance(expected_ret, ir.DoubleType) and isinstance(result.type, ir.IntType):
                 result = self.builder.sitofp(result, expected_ret)
         self.builder.ret(result)
+
+        # Now that body is emitted, safe to set internal linkage + inline
+        func.linkage = "internal"
+        func.attributes.add('alwaysinline')
 
         self.function, self.builder, self.variables, self._loop_stack = saved
 
@@ -4965,6 +5127,7 @@ class CodeGen:
                 return
 
         effective_name = _name_override if _name_override else node.name
+        self._current_func_name = effective_name  # Phase 4: for indirect call ABI detection
 
         # CPython generators: skip body emission. The function will be
         # compiled and stored via CPython bridge in fastpy_main.
@@ -5143,6 +5306,16 @@ class CodeGen:
             else:
                 tag = "int"
             self.variables[param.name] = (alloca, tag)
+
+        # Phase 4: set up function aliases for parameters that received
+        # function references at call sites. E.g., apply(add, 5, 6) where
+        # add is a user function → alias param[0] ("func") to "add".
+        param_func_map = getattr(self, '_param_func_map', {})
+        param_names = [a.arg for a in node.args.args]
+        for (fname, pidx), target_func in param_func_map.items():
+            if (fname == effective_name and pidx < len(param_names)
+                    and target_func is not None):  # None = ambiguous, skip
+                self._func_aliases[param_names[pidx]] = target_func
 
         # Generator setup: create a list to collect yielded values
         is_gen = effective_name in self._generator_funcs
@@ -8566,6 +8739,12 @@ class CodeGen:
 
         for target in node.targets:
             if isinstance(target, ast.Name):
+                # Phase 4: track function aliases (f = my_func → f calls my_func)
+                # Also handles chains: g = f where f is already an alias
+                if (isinstance(node.value, ast.Name)
+                        and (node.value.id in self._user_functions
+                             or node.value.id in self._func_aliases)):
+                    self._func_aliases[target.id] = node.value.id
                 # Phase 3: embed class_name in ValueType for constructor results
                 if class_name:
                     self._store_variable(target.id, value,
@@ -10108,8 +10287,15 @@ class CodeGen:
         type_tag = existing_tag or self._llvm_type_tag(result)
         self._store_variable(target_name, result, type_tag)
 
+    _alloca_counter = 0  # class-level counter for unique alloca names
+
     def _create_entry_alloca(self, llvm_type: ir.Type, name: str) -> ir.AllocaInstr:
-        """Create an alloca in the function's entry block (standard LLVM pattern)."""
+        """Create an alloca in the function's entry block (standard LLVM pattern).
+
+        Uses a global counter to give every alloca a unique name, avoiding
+        llvmlite's name deduplication recursion on large modules."""
+        CodeGen._alloca_counter += 1
+        unique_name = f"{name}.{CodeGen._alloca_counter}"
         entry_block = self.function.entry_basic_block
         # Save current position, insert at start of entry block
         saved_block = self.builder.block
@@ -10117,7 +10303,7 @@ class CodeGen:
             self.builder.position_before(entry_block.instructions[0])
         else:
             self.builder.position_at_end(entry_block)
-        alloca = self.builder.alloca(llvm_type, name=name)
+        alloca = self.builder.alloca(llvm_type, name=unique_name)
         # Restore position
         self.builder.position_at_end(saved_block)
         return alloca
@@ -10255,6 +10441,12 @@ class CodeGen:
             # globals without explicit `global` declaration).
             if name in self._global_vars:
                 self.variables[name] = self._global_vars[name]
+            elif name in self._user_functions:
+                # User function used as a value (e.g., callback = add, or
+                # passed as argument: apply(add, x, y)). Return the function
+                # pointer as i64 for indirect calling.
+                info = self._user_functions[name]
+                return self.builder.ptrtoint(info.func, i64)
             elif name in self._user_classes:
                 # Class name referenced from within a method (e.g., Counter.count)
                 # Return the class_id as an integer for use in attribute access.
@@ -11476,16 +11668,8 @@ class CodeGen:
         self._bridge_fallback_log.append(
             f"line {getattr(node, 'lineno', '?')}: {reason}")
 
-        # For Call expressions, try the direct bridge path (more efficient)
-        if isinstance(node, ast.Call):
-            if isinstance(node.func, ast.Attribute):
-                return self._emit_cpython_method_call(node)
-            if isinstance(node.func, ast.Name):
-                return self._emit_cpython_direct_call_expr(node)
-
-        # Generic fallback: return 0 (None-like) for unsupported expressions.
-        # This is safe for statement-context expressions; for value-context,
-        # the caller should handle the None return appropriately.
+        # Don't retry method/call paths — they may have called us, causing
+        # infinite recursion. Just return 0 as a safe default.
         return ir.Constant(i64, 0)
 
     def _bridge_fallback_stmt(self, node: ast.stmt, reason: str) -> None:
@@ -13520,10 +13704,100 @@ class CodeGen:
             return self.builder.icmp_signed("!=", length, ir.Constant(i64, 0))
         return ir.Constant(ir.IntType(1), 0)
 
+    def _try_indirect_func_call(self, node: ast.Call) -> ir.Value | None:
+        """Try to call a variable as a function pointer (indirect call).
+
+        When a user function is passed as an argument (e.g., apply(add, x, y)),
+        the parameter holds the function's raw pointer as i64. This method
+        loads that pointer, casts it to the function's actual calling convention,
+        and calls it. Returns None if not applicable."""
+        if not isinstance(node.func, ast.Name):
+            return None
+        name = node.func.id
+        if name not in self.variables:
+            return None
+        # Check if we know what function this might be (from _param_func_map)
+        # to determine the right calling convention
+        resolved = self._resolve_func_alias(name)
+        info = self._user_functions.get(resolved)
+        # Determine calling convention. Only proceed if we KNOW the ABI.
+        # If we can't determine it, return None to let closure call handle it.
+        if info is not None:
+            uses_fv = info.uses_fv_abi
+        else:
+            # Check _param_func_targets for this parameter's known targets
+            uses_fv = None  # unknown
+            current_fn = getattr(self, '_current_func_name', None)
+            current_fn_info = self._user_functions.get(current_fn) if current_fn else None
+            if current_fn and current_fn_info:
+                pidx = None
+                for i, arg in enumerate(current_fn_info.func.args):
+                    if arg.name == name:
+                        pidx = i
+                        break
+                if pidx is not None:
+                    targets = getattr(self, '_param_func_targets', {})
+                    key = (current_fn, pidx)
+                    if key in targets:
+                        # All targets must agree on ABI
+                        abis = set()
+                        for target in targets[key]:
+                            if target in self._user_functions:
+                                abis.add(self._user_functions[target].uses_fv_abi)
+                        if len(abis) == 1:
+                            uses_fv = abis.pop()
+            if uses_fv is None:
+                return None  # can't determine ABI — let closure call handle it
+
+        # Load the function pointer from the variable
+        func_ptr_i64 = self._load_variable(name, node)
+        if not isinstance(func_ptr_i64.type, ir.IntType):
+            return None
+
+        n_args = len(node.args)
+
+        if uses_fv:
+            # FV-ABI: {i32, i64}(({i32, i64})*)
+            fv_func_type = ir.FunctionType(fpy_val, [fpy_val] * n_args)
+            func_ptr = self.builder.inttoptr(func_ptr_i64,
+                                              ir.PointerType(fv_func_type))
+            fv_args = []
+            for arg_node in node.args:
+                tv = self._emit_expr(arg_node)
+                fv_args.append(tv.as_fv(self.builder))
+            result = self.builder.call(func_ptr, fv_args)
+            return self.builder.extract_value(result, 1)
+        else:
+            # i64-ABI (lambdas, simple functions): i64(i64, i64, ...)
+            i64_func_type = ir.FunctionType(i64, [i64] * n_args)
+            func_ptr = self.builder.inttoptr(func_ptr_i64,
+                                              ir.PointerType(i64_func_type))
+            i64_args = []
+            for arg_node in node.args:
+                val = self._emit_expr_value(arg_node)
+                if isinstance(val.type, ir.PointerType):
+                    val = self.builder.ptrtoint(val, i64)
+                elif isinstance(val.type, ir.LiteralStructType):
+                    val = self.builder.extract_value(val, 1)
+                elif isinstance(val.type, ir.IntType) and val.type.width != 64:
+                    val = self.builder.zext(val, i64)
+                i64_args.append(val)
+            return self.builder.call(func_ptr, i64_args)
+
+    def _resolve_func_alias(self, name: str) -> str:
+        """Resolve function aliases: if name is an alias for a user function,
+        return the original function name. Follows chains (g=f, f=add → add).
+        Returns name unchanged if not an alias."""
+        seen = set()
+        while name in self._func_aliases and name not in seen:
+            seen.add(name)
+            name = self._func_aliases[name]
+        return name
+
     def _emit_call(self, node: ast.Call) -> None:
         """Emit a function call (as a statement — discard return value)."""
         if isinstance(node.func, ast.Name):
-            name = node.func.id
+            name = self._resolve_func_alias(node.func.id)
             if name == "print":
                 self._emit_print(node)
                 return
@@ -13572,8 +13846,11 @@ class CodeGen:
                 and self._var_kind(node.func.id) == VKind.PYOBJ):
             self._emit_cpython_direct_call(node)
             return
-        # Last resort: try as closure call
+        # Try indirect function pointer call for function-valued variables
         if isinstance(node.func, ast.Name) and node.func.id in self.variables:
+            result = self._try_indirect_func_call(node)
+            if result is not None:
+                return
             self._emit_closure_call(node)
             return
         # exec/eval as statements — route through our locals-aware handlers
@@ -14170,13 +14447,15 @@ class CodeGen:
             if expanded != node.keywords:
                 node = ast.Call(func=node.func, args=node.args,
                                 keywords=expanded)
-        name = node.func.id
+        name = self._resolve_func_alias(node.func.id)
         # Resolve monomorphized specializations: if the function was split into
         # multiple specializations at declaration time, pick the one that
         # matches this call site's argument types.
         if name in self._monomorphized:
             name = self._resolve_specialization(
                 name, node.args, node.keywords)
+        if name not in self._user_functions:
+            return None  # alias resolved to non-existent function
         info = self._user_functions[name]
 
         # Check if this is a *args or **kwargs function
@@ -14388,7 +14667,7 @@ class CodeGen:
             if expanded != node.keywords:
                 node = ast.Call(func=node.func, args=node.args,
                                 keywords=expanded)
-        name = node.func.id
+        name = self._resolve_func_alias(node.func.id)
         if name in self._monomorphized:
             name = self._resolve_specialization(
                 name, node.args, node.keywords)
@@ -16182,7 +16461,7 @@ class CodeGen:
                     [mod_ptr, self._make_string_constant(_fn)])
                 return self._emit_cpython_call_with_ptr(func_ptr, node)
         if isinstance(node.func, ast.Name):
-            name = node.func.id
+            name = self._resolve_func_alias(node.func.id)
             # Native module function (from math import sqrt → sqrt(x))
             if name in getattr(self, '_native_imports', {}):
                 mod, attr = self._native_imports[name]
@@ -17269,8 +17548,11 @@ class CodeGen:
                         return self.builder.call(
                             self.runtime["obj_call_method1"],
                             [callee, name_ptr, a])
-        # Last resort: try calling as a closure (for higher-order function params)
+        # Try indirect function pointer call
         if isinstance(node.func, ast.Name) and node.func.id in self.variables:
+            result = self._try_indirect_func_call(node)
+            if result is not None:
+                return result
             return self._emit_closure_call(node)
         # Phase 4: unknown call expression → bridge fallback
         return self._bridge_fallback_expr(
@@ -21191,7 +21473,7 @@ class CodeGen:
     def _emit_dict_comprehension(self, node: ast.DictComp) -> ir.Value:
         """Emit {key: val for x in range(n)}."""
         if len(node.generators) != 1:
-            raise CodeGenError("Only single-generator dict comprehensions supported", node)
+            return self._bridge_fallback_expr(node, "multi-generator dict comprehension")
         gen = node.generators[0]
         if isinstance(gen.target, ast.Tuple):
             # Tuple unpacking in dict comp: {k: v for k, v in items}
@@ -21300,9 +21582,9 @@ class CodeGen:
     def _emit_ifexp(self, node: ast.IfExp) -> ir.Value:
         """Emit a ternary expression: x if condition else y.
 
-        Phase 4: auto-coerces then/else branches to the same type
-        when they produce different LLVM types (e.g., one is i64 and
-        the other is i8* from different code paths)."""
+        Phase 4: when branches produce different LLVM types, both are
+        normalized to i64 in their own blocks (avoiding cross-block
+        dominance errors). When types match, the original type is kept."""
         cond = self._emit_condition(node.test)
         then_block = self._new_block("ifexp.then")
         else_block = self._new_block("ifexp.else")
@@ -21310,40 +21592,53 @@ class CodeGen:
 
         self.builder.cbranch(cond, then_block, else_block)
 
+        # Then branch
         self.builder.position_at_end(then_block)
         then_val = self._emit_expr_value(node.body)
-        # Coerce then_val type before branching (while still in then_block)
         if isinstance(then_val.type, ir.LiteralStructType) and then_val.type == fpy_val:
             then_val = self.builder.extract_value(then_val, 1)
         then_block_end = self.builder.block
         self.builder.branch(merge_block)
 
+        # Else branch
         self.builder.position_at_end(else_block)
         else_val = self._emit_expr_value(node.orelse)
         if isinstance(else_val.type, ir.LiteralStructType) and else_val.type == fpy_val:
             else_val = self.builder.extract_value(else_val, 1)
-        # Match types: coerce to the same representation
+
+        # Only normalize to i64 when types MISMATCH. When both branches
+        # produce the same type (common case), keep the original type.
         if then_val.type != else_val.type:
-            # double ↔ int: prefer double
-            if isinstance(then_val.type, ir.DoubleType) and isinstance(else_val.type, ir.IntType):
-                else_val = self.builder.sitofp(else_val, ir.DoubleType())
-            elif isinstance(else_val.type, ir.DoubleType) and isinstance(then_val.type, ir.IntType):
-                then_val = self.builder.sitofp(then_val, ir.DoubleType())
-            # ptr ↔ int: prefer i64
-            elif isinstance(then_val.type, ir.PointerType) and isinstance(else_val.type, ir.IntType):
-                else_val = self.builder.inttoptr(else_val, then_val.type)
-            elif isinstance(else_val.type, ir.PointerType) and isinstance(then_val.type, ir.IntType):
-                else_val = self.builder.ptrtoint(else_val, then_val.type)
-            elif isinstance(then_val.type, ir.IntType) and isinstance(else_val.type, ir.IntType):
-                if then_val.type.width > else_val.type.width:
-                    else_val = self.builder.zext(else_val, then_val.type)
-                else:
-                    then_val = self.builder.zext(then_val, else_val.type)
+            # Types differ — normalize both to i64 in their own blocks.
+            # We need to go back to then_block to insert coercion there.
+            else_block_cur = self.builder.block
+
+            # Re-enter then_block_end to normalize then_val
+            # (insert before the branch terminator)
+            term = then_block_end.instructions[-1]
+            then_block_end.instructions.remove(term)
+            self.builder.position_at_end(then_block_end)
+            if isinstance(then_val.type, ir.PointerType):
+                then_val = self.builder.ptrtoint(then_val, i64)
+            elif isinstance(then_val.type, ir.DoubleType):
+                then_val = self.builder.bitcast(then_val, i64)
+            elif isinstance(then_val.type, ir.IntType) and then_val.type.width != 64:
+                then_val = self.builder.zext(then_val, i64)
+            then_block_end.instructions.append(term)
+
+            # Back to else_block to normalize else_val
+            self.builder.position_at_end(else_block_cur)
+            if isinstance(else_val.type, ir.PointerType):
+                else_val = self.builder.ptrtoint(else_val, i64)
+            elif isinstance(else_val.type, ir.DoubleType):
+                else_val = self.builder.bitcast(else_val, i64)
+            elif isinstance(else_val.type, ir.IntType) and else_val.type.width != 64:
+                else_val = self.builder.zext(else_val, i64)
+
         else_block_end = self.builder.block
         self.builder.branch(merge_block)
 
         self.builder.position_at_end(merge_block)
-        # Use then_val's type for the phi (both should match now)
         phi = self.builder.phi(then_val.type)
         phi.add_incoming(then_val, then_block_end)
         phi.add_incoming(else_val, else_block_end)
