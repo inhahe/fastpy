@@ -6,7 +6,7 @@ Most of these are not Linux-specific — they're latent codegen / runtime bugs
 that happen to surface because the bridge is used more heavily here than on
 Windows with MSVC.
 
-**Legend:** ✅ = fix already applied in working tree • ⚠️ = needs fix
+**Legend:** ✅ = fixed • ⚠️ = still open
 
 ---
 
@@ -175,7 +175,7 @@ variable storage.
 
 ## Category 4: Codegen — "partial-native" modules are broken
 
-### 4.1  ⚠️ Named-native modules store `NULL` for the module object
+### 4.1  ✅ Named-native modules store `NULL` for the module object
 
 `_NATIVE_MODULES` in `compiler/codegen.py` (line ~11380) lists `os`,
 `hashlib`, `json`, `math`, `time`, `struct`, `base64`, `random`,
@@ -215,7 +215,7 @@ print(h.hexdigest())   # works — pure bridge path
 Pure-bridge modules (not in `_NATIVE_MODULES`) call `fpy_jit_import`
 correctly and their attribute access works.
 
-### 4.2  ⚠️ `hashlib.md5(...)` doesn't actually call the bridge
+### 4.2  ✅ `hashlib.md5(...)` doesn't actually call the bridge
 
 The IR for `h = hashlib.md5(b"hello")` shows no `fpy_cpython_*` call at
 all — `h` is stored as `{tag=INT, data=0}`. The codegen recognizes
@@ -381,41 +381,36 @@ protocol doesn't call `tp_iternext` on an OBJ-tagged PyObject.
 
 ## Workarounds summary
 
-For anyone who wants to use the bridge today on Linux, the reliable
-recipe is:
+Most bridge bugs from the initial Linux port have been fixed. Remaining
+workarounds:
 
-1. **Always use underscore-prefixed C modules:** `_hashlib`, `_struct`,
-   `_socket`, `_datetime`, `_random`, etc. Avoid `hashlib`, `struct`,
-   `socket`, `datetime`, `random`.
-2. **Always pre-bind bytes:** `buf = bytes([...])` then pass `buf`.
-   Never inline `b"..."` and never inline `bytes([...])` in a call arg.
-3. **Keep bridge calls to ≤ 3 positional args.** Use keyword form or
-   split into multiple calls if possible.
-4. **Don't reassign a variable across bridge return types.**
-5. **Don't expect in-place mutation of lists/bytearrays through the
+1. **Don't expect in-place mutation of lists/bytearrays through the
    bridge.** Capture the return value of any method you'd expect to
    mutate, or work with CPython-side objects (PyListObject returned by
    another bridge call, mutated via bridge).
-6. **Don't use fastpy classes/lambdas as CPython callables.** If you
+2. **Don't use fastpy classes/lambdas as CPython callables.** If you
    need a callable into CPython, write it as a pure-Python (bridge-run)
    helper.
 
+Previously required workarounds that are NO LONGER NEEDED:
+- ~~Always use underscore-prefixed C modules~~ -- native modules now work
+- ~~Always pre-bind bytes~~ -- bytes literals and inline bytes() work
+- ~~Keep bridge calls to 3 or fewer positional args~~ -- 4+ args now supported
+- ~~Don't reassign a variable across bridge return types~~ -- safe refcounting fixed
+
 ---
 
-## Fix priority (my opinion)
+## Fix priority (remaining items)
 
 | Priority | Bug | Rationale |
 |----------|-----|-----------|
-| **P0** | 4.1 Partial-native NULL module | Breaks `os`, `hashlib`, `time`, `struct`, etc. — the most common imports |
-| **P0** | 2.1 `b"..."` passed as str | Breaks almost any hashing / compression / serialization code |
-| **P1** | 2.2 inline `bytes([...])` | Same root cause as 2.1 likely |
-| **P1** | 3.1 reassignment segfault | Silent trap, easy to hit |
-| **P1** | 3.2 `time.time()` var read segfault | Linux-only, blocks benchmarks |
-| **P2** | 5.1 bool returns as int | Cosmetic but surprising |
-| **P2** | 5.4 binary operator dispatch | Makes `_decimal`, `_datetime` arithmetic broken |
-| **P2** | 6.1/6.2 bridge mutation | Blocks `_heapq` usage, `pack_into` |
-| **P3** | 2.5 > 3 args | Not hit often; keyword form sometimes works |
-| **P3** | 7.1 object model gap | Deep architectural item |
+| **P2** | 6.1/6.2 bridge mutation | Blocks `_heapq` in-place usage, `pack_into` |
+| **P3** | 7.1 object model gap | Deep architectural item — fastpy objects are not PyObjects |
+| **P3** | 7.2 `sys.version` misparse | Edge case in import pass |
+| **P3** | 8.1 NULL after TypeError | Error propagation across bridge |
+| **P3** | 8.3 Generator bridge results | Iterator protocol for bridge generators |
+
+All P0 and P1 bugs from the initial Linux port have been fixed.
 
 ---
 
@@ -438,7 +433,5 @@ across ~60 stdlib modules:
   `_interpchannels`, `_remote_debugging` — all load and their
   attributes/functions work.
 
-The partial-native NULL-module path (Category 4) is by far the single
-biggest contributor to user-visible crashes — fixing that alone would
-make `import os; os.getpid()`, `import hashlib; hashlib.sha256(b"x")`
-etc. just work.
+The partial-native NULL-module path (Category 4) has been fixed. `import os;
+os.getpid()`, `import hashlib; hashlib.sha256(b"x")` etc. now work correctly.
