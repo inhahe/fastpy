@@ -492,6 +492,29 @@ class _SafeIRBuilder(ir.IRBuilder):
                       and isinstance(arg.type, ir.PointerType)):
                     tmp = super().ptrtoint(arg, i64)
                     coerced[i] = super().bitcast(tmp, ptype)
+                # i64 → {i32,i64} FpyValue (wrap as INT)
+                elif (isinstance(ptype, ir.LiteralStructType) and ptype == fpy_val
+                      and isinstance(arg.type, ir.IntType) and arg.type.width == 64):
+                    fv = ir.Constant(fpy_val, ir.Undefined)
+                    fv = super().insert_value(fv, ir.Constant(i32, 0), 0)
+                    fv = super().insert_value(fv, arg, 1)
+                    coerced[i] = fv
+                # i8* → {i32,i64} FpyValue (wrap as STR)
+                elif (isinstance(ptype, ir.LiteralStructType) and ptype == fpy_val
+                      and isinstance(arg.type, ir.PointerType)):
+                    data = super().ptrtoint(arg, i64)
+                    fv = ir.Constant(fpy_val, ir.Undefined)
+                    fv = super().insert_value(fv, ir.Constant(i32, 2), 0)
+                    fv = super().insert_value(fv, data, 1)
+                    coerced[i] = fv
+                # double → {i32,i64} FpyValue (wrap as FLOAT)
+                elif (isinstance(ptype, ir.LiteralStructType) and ptype == fpy_val
+                      and isinstance(arg.type, ir.DoubleType)):
+                    data = super().bitcast(arg, i64)
+                    fv = ir.Constant(fpy_val, ir.Undefined)
+                    fv = super().insert_value(fv, ir.Constant(i32, 1), 0)
+                    fv = super().insert_value(fv, data, 1)
+                    coerced[i] = fv
                 # {i32,i64} → i32 (extract data, trunc)
                 elif (isinstance(ptype, ir.IntType) and ptype.width == 32
                       and isinstance(arg.type, ir.LiteralStructType)
@@ -13784,6 +13807,12 @@ class CodeGen:
                 i64_args.append(val)
             return self.builder.call(func_ptr, i64_args)
 
+    def _iter_class_chain(self, cls_name: str):
+        """Yield class names in the inheritance chain (cls, parent, grandparent...)."""
+        while cls_name and cls_name in self._user_classes:
+            yield cls_name
+            cls_name = self._user_classes[cls_name].parent_name
+
     def _resolve_func_alias(self, name: str) -> str:
         """Resolve function aliases: if name is an alias for a user function,
         return the original function name. Follows chains (g=f, f=add → add).
@@ -17453,39 +17482,30 @@ class CodeGen:
             fv = self._emit_cpython_direct_call_expr(node)
             data = self.builder.extract_value(fv, 1)
             return data
-        # __call__ on user-class objects
+        # __call__ on user-class objects — use direct dispatch for correct types
         if isinstance(node.func, ast.Name) and node.func.id in self.variables:
             _, tag = self.variables[node.func.id]
             if tag == "obj":
                 obj_cls = self._obj_var_class.get(node.func.id)
                 if obj_cls and self._class_has_method(obj_cls, "__call__"):
+                    # Direct dispatch to __call__
                     obj = self._load_variable(node.func.id, node)
                     if isinstance(obj.type, ir.IntType):
                         obj = self.builder.inttoptr(obj, i8_ptr)
-                    name_ptr = self._make_string_constant("__call__")
-                    if len(node.args) == 0:
-                        return self.builder.call(
-                            self.runtime["obj_call_method0"],
-                            [obj, name_ptr])
-                    elif len(node.args) == 1:
-                        a = self._emit_expr_value(node.args[0])
-                        if isinstance(a.type, ir.PointerType):
-                            a = self.builder.ptrtoint(a, i64)
-                        elif isinstance(a.type, ir.IntType) and a.type.width != 64:
-                            a = self.builder.zext(a, i64)
-                        return self.builder.call(
-                            self.runtime["obj_call_method1"],
-                            [obj, name_ptr, a])
-                    elif len(node.args) == 2:
-                        a1 = self._emit_expr_value(node.args[0])
-                        a2 = self._emit_expr_value(node.args[1])
-                        if isinstance(a1.type, ir.IntType) and a1.type.width != 64:
-                            a1 = self.builder.zext(a1, i64)
-                        if isinstance(a2.type, ir.IntType) and a2.type.width != 64:
-                            a2 = self.builder.zext(a2, i64)
-                        return self.builder.call(
-                            self.runtime["obj_call_method2"],
-                            [obj, name_ptr, a1, a2])
+                    call_func = None
+                    cn = obj_cls
+                    while cn and cn in self._user_classes:
+                        ci = self._user_classes[cn]
+                        if "__call__" in ci.methods:
+                            call_func = ci.methods["__call__"]
+                            break
+                        cn = ci.parent_name
+                    if call_func is not None:
+                        # Build args: self + user args (SafeIRBuilder auto-coerces)
+                        direct_args = [obj]
+                        for arg_node in node.args:
+                            direct_args.append(self._emit_expr_value(arg_node))
+                        return self.builder.call(call_func, direct_args)
         # Call-on-Call: f(3)(5), C()(5), etc.
         # The inner call might return a closure or an object with __call__.
         # Use call_ptr dispatch (auto-detects closures via magic number)
