@@ -10270,6 +10270,12 @@ class CodeGen:
                 self._native_modules.add(var_name)
                 # Store a dummy value — attribute access is intercepted
                 self._store_variable(var_name, ir.Constant(i64, 0), "native_mod")
+                # For dotted imports (import os.path), also store top-level name
+                if "." in var_name:
+                    top = var_name.split(".")[0]
+                    if top not in self.variables:
+                        self._native_modules.add(top)
+                        self._store_variable(top, ir.Constant(i64, 0), "native_mod")
                 continue
 
             # Create a global to hold the module PyObject*
