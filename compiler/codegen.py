@@ -9535,6 +9535,17 @@ class CodeGen:
                 alloca = self._create_entry_alloca(i32, name)
                 self.builder.store(class_id, alloca)
                 self.variables[name] = (alloca, "cls")
+            elif name in ("str", "int", "float", "bool", "list", "dict",
+                         "tuple", "set", "type", "object", "bytes",
+                         "None", "True", "False", "Exception",
+                         "ValueError", "TypeError", "KeyError",
+                         "IndexError", "RuntimeError", "StopIteration",
+                         "AttributeError", "NotImplementedError",
+                         "ZeroDivisionError", "OSError", "IOError",
+                         "FileNotFoundError", "ImportError"):
+                # Built-in type/exception names used as values (isinstance, annotations)
+                # Return a sentinel constant — these are recognized at specific use sites
+                return ir.Constant(i64, hash(name) & 0x7FFFFFFFFFFFFFFF)
             else:
                 raise CodeGenError(f"Undefined variable: {name}", node)
         alloca, type_tag = self.variables[name]
@@ -9876,7 +9887,9 @@ class CodeGen:
         if not (isinstance(node.iter, ast.Call)
                 and isinstance(node.iter.func, ast.Name)
                 and node.iter.func.id == "range"):
-            raise CodeGenError("Only 'for x in range(...)' or 'for x in list/string' is supported", node)
+            # Fallback: treat as pyobj iterable (uses CPython iter protocol)
+            self._emit_for_pyobj(node)
+            return
 
         range_args = node.iter.args
         if len(range_args) == 1:
@@ -11546,15 +11559,21 @@ class CodeGen:
         self.builder.call(self.runtime["exc_clear"], [])
 
     def _emit_for_pyobj(self, node: ast.For) -> None:
-        """Emit `for x in pyobj` using CPython's iteration protocol.
+        """Emit `for x in iterable` using CPython's iteration protocol.
         Calls fpy_cpython_iter() to get the iterator, then repeatedly
-        calls fpy_cpython_iter_next() until exhausted."""
+        calls fpy_cpython_iter_next() until exhausted.
+        Works for any iterable expression (Name, Call, Attribute, etc.)."""
         var_name = node.target.id
 
-        # Get the CPython object and call iter() on it
-        obj = self._load_variable(node.iter.id, node.iter)
+        # Evaluate the iterable expression
+        obj = self._emit_expr_value(node.iter)
         if isinstance(obj.type, ir.IntType):
             obj = self.builder.inttoptr(obj, i8_ptr)
+        elif (isinstance(obj.type, ir.LiteralStructType)
+              and obj.type == fpy_val):
+            # FpyValue — extract data as pointer
+            data = self.builder.extract_value(obj, 1)
+            obj = self.builder.inttoptr(data, i8_ptr)
         iterator = self.builder.call(self.runtime["cpython_iter"], [obj])
 
         # Alloca for next() results
