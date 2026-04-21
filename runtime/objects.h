@@ -39,6 +39,7 @@
 #define FPY_TAG_SET    9
 #define FPY_TAG_BIGINT 10
 #define FPY_TAG_COMPLEX 11
+#define FPY_TAG_DECIMAL 12
 
 /* Complex number (heap-allocated pair of doubles) */
 typedef struct {
@@ -55,6 +56,25 @@ FpyComplex* fpy_complex_neg(FpyComplex *a);
 double fpy_complex_abs(FpyComplex *a);
 void fpy_complex_print(FpyComplex *c);
 char* fpy_complex_to_str(FpyComplex *c);
+
+/* Decimal number (fixed-precision: 18 digits via int64 coefficient) */
+typedef struct {
+    int64_t coefficient;  /* significand (absolute value, up to 10^18) */
+    int32_t exponent;     /* power of 10 (negative = fractional digits) */
+    int8_t sign;          /* 1 = positive, -1 = negative, 0 = zero */
+} FpyDecimal;
+
+FpyDecimal* fpy_decimal_new(int64_t coeff, int32_t exp, int8_t sign);
+FpyDecimal* fpy_decimal_from_str(const char *s);
+FpyDecimal* fpy_decimal_from_int(int64_t val);
+FpyDecimal* fpy_decimal_add(FpyDecimal *a, FpyDecimal *b);
+FpyDecimal* fpy_decimal_sub(FpyDecimal *a, FpyDecimal *b);
+FpyDecimal* fpy_decimal_mul(FpyDecimal *a, FpyDecimal *b);
+FpyDecimal* fpy_decimal_div(FpyDecimal *a, FpyDecimal *b);
+int fpy_decimal_compare(FpyDecimal *a, FpyDecimal *b);
+char* fpy_decimal_to_str(FpyDecimal *d);
+FpyDecimal* fpy_decimal_neg(FpyDecimal *a);
+FpyDecimal* fpy_decimal_abs(FpyDecimal *a);
 
 /* Forward declarations */
 typedef struct FpyList FpyList;

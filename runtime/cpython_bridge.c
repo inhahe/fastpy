@@ -209,6 +209,8 @@ void fpy_cpython_call(void *callable, int32_t argc,
     }
 
     pyobject_to_fpy(result, out_tag, out_data);
+    /* For OBJ-tagged results, incref to keep alive (caller holds raw ptr) */
+    if (*out_tag == FPY_TAG_OBJ) Py_INCREF(result);
     Py_DECREF(result);
 }
 
@@ -217,7 +219,10 @@ void fpy_cpython_call(void *callable, int32_t argc,
  * converted to FpyValue{FLOAT, bits}. */
 void fpy_cpython_to_fv(void *obj, int32_t *out_tag, int64_t *out_data) {
     pyobject_to_fpy((PyObject*)obj, out_tag, out_data);
-    Py_DECREF((PyObject*)obj);  /* getattr returns a new reference */
+    /* For OBJ-tagged results, incref to keep the reference alive
+     * (since we're giving the caller a raw pointer) */
+    if (*out_tag == FPY_TAG_OBJ) Py_INCREF((PyObject*)obj);
+    Py_DECREF((PyObject*)obj);
 }
 
 /* Direct len() on a PyObject*. Returns the length as int64. */
@@ -243,6 +248,8 @@ void fpy_cpython_call0(void *callable,
         return;
     }
     pyobject_to_fpy(result, out_tag, out_data);
+    /* For OBJ-tagged results, incref to keep alive (caller holds raw ptr) */
+    if (*out_tag == FPY_TAG_OBJ) Py_INCREF(result);
     Py_DECREF(result);
 }
 
@@ -264,6 +271,8 @@ void fpy_cpython_call1(void *callable,
         return;
     }
     pyobject_to_fpy(result, out_tag, out_data);
+    /* For OBJ-tagged results, incref to keep alive (caller holds raw ptr) */
+    if (*out_tag == FPY_TAG_OBJ) Py_INCREF(result);
     Py_DECREF(result);
 }
 
@@ -288,6 +297,8 @@ void fpy_cpython_call2(void *callable,
         return;
     }
     pyobject_to_fpy(result, out_tag, out_data);
+    /* For OBJ-tagged results, incref to keep alive (caller holds raw ptr) */
+    if (*out_tag == FPY_TAG_OBJ) Py_INCREF(result);
     Py_DECREF(result);
 }
 
@@ -349,6 +360,8 @@ void fpy_cpython_call3(void *callable,
         return;
     }
     pyobject_to_fpy(result, out_tag, out_data);
+    /* For OBJ-tagged results, incref to keep alive (caller holds raw ptr) */
+    if (*out_tag == FPY_TAG_OBJ) Py_INCREF(result);
     Py_DECREF(result);
 }
 
@@ -386,6 +399,8 @@ void fpy_cpython_call_kw(void *callable,
         return;
     }
     pyobject_to_fpy(result, out_tag, out_data);
+    /* For OBJ-tagged results, incref to keep alive (caller holds raw ptr) */
+    if (*out_tag == FPY_TAG_OBJ) Py_INCREF(result);
     Py_DECREF(result);
 }
 
@@ -516,11 +531,177 @@ void* fpy_cpython_wrap_native(void *func_ptr) {
 
 /* ── Exec+Get ──────────────────────────────────────────────────── */
 
+/* ── Compiled code cache for exec/eval ──────────────────────────── */
+/* Caches compiled PyCodeObjects keyed by source hash.
+ * Avoids re-parsing the same string on repeated exec/eval calls. */
+
+#define FPY_CODE_CACHE_SIZE 128
+static struct {
+    uint64_t hash;
+    PyObject *code;  /* compiled PyCodeObject */
+} fpy_code_cache[FPY_CODE_CACHE_SIZE];
+static int fpy_code_cache_used = 0;
+
+static uint64_t fpy_hash_str(const char *s) {
+    uint64_t h = 14695981039346656037ULL;
+    while (*s) {
+        h ^= (uint8_t)*s++;
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+static PyObject* fpy_get_cached_code(const char *source, int mode) {
+    uint64_t h = fpy_hash_str(source) ^ (uint64_t)mode;
+    /* Check cache */
+    for (int i = 0; i < fpy_code_cache_used; i++) {
+        if (fpy_code_cache[i].hash == h)
+            return fpy_code_cache[i].code;
+    }
+    /* Compile and cache */
+    PyObject *code = Py_CompileString(source,
+        "<fastpy-exec>",
+        mode == 0 ? Py_file_input : Py_eval_input);
+    if (!code) return NULL;
+    if (fpy_code_cache_used < FPY_CODE_CACHE_SIZE) {
+        fpy_code_cache[fpy_code_cache_used].hash = h;
+        fpy_code_cache[fpy_code_cache_used].code = code;
+        fpy_code_cache_used++;
+    }
+    return code;
+}
+
+/* ── Native JIT compilation ──────────────────────────────────────── */
+/* Attempts to compile source to native code via the fastpy compiler.
+ * Returns a function pointer if successful, NULL if fallback needed.
+ * The JIT module (compiler/jit.py) must be importable. */
+
+typedef void (*FpyJitFunc)(void);
+
+static FpyJitFunc fpy_jit_try_compile(const char *source) {
+    fpy_cpython_init();
+
+    /* Import the JIT module */
+    PyObject *jit_module = PyImport_ImportModule("compiler.jit");
+    if (!jit_module) {
+        PyErr_Clear();
+        return NULL;  /* JIT not available — fall back to interpreter */
+    }
+
+    /* Call jit_compile(source) → function pointer as int */
+    PyObject *compile_func = PyObject_GetAttrString(jit_module, "jit_compile");
+    Py_DECREF(jit_module);
+    if (!compile_func) {
+        PyErr_Clear();
+        return NULL;
+    }
+
+    PyObject *py_source = PyUnicode_FromString(source);
+    PyObject *result = PyObject_CallOneArg(compile_func, py_source);
+    Py_DECREF(py_source);
+    Py_DECREF(compile_func);
+
+    if (!result) {
+        PyErr_Clear();
+        return NULL;
+    }
+
+    long long func_ptr = PyLong_AsLongLong(result);
+    Py_DECREF(result);
+
+    if (func_ptr == 0 || func_ptr == -1) {
+        PyErr_Clear();
+        return NULL;
+    }
+
+    return (FpyJitFunc)(intptr_t)func_ptr;
+}
+
+/* Execute source natively if JIT succeeds, otherwise fall back to CPython.
+ * Called from the runtime when exec(dynamic_string) is encountered. */
+void fpy_jit_exec(const char *source) {
+    /* Try native JIT first */
+    FpyJitFunc func = fpy_jit_try_compile(source);
+    if (func) {
+        func();  /* Call the native compiled function */
+        return;
+    }
+
+    /* Fallback: use CPython interpreter */
+    fpy_cpython_init();
+    PyObject *globals = PyDict_New();
+    PyObject *builtins = PyImport_ImportModule("builtins");
+    PyDict_SetItemString(globals, "__builtins__", builtins);
+    Py_DECREF(builtins);
+
+    PyObject *code = fpy_get_cached_code(source, 0);
+    PyObject *result;
+    if (code) {
+        result = PyEval_EvalCode(code, globals, globals);
+    } else {
+        PyErr_Clear();
+        result = PyRun_String(source, Py_file_input, globals, globals);
+    }
+    if (!result) PyErr_Print();
+    else Py_DECREF(result);
+    Py_DECREF(globals);
+    fpy_cpython_flush();
+}
+
+/* ── Compile-on-load for dynamic imports ─────────────────────────── */
+/* When importlib.import_module(name) is called, try to find and compile
+ * the .py source natively before falling back to CPython's import. */
+
+void* fpy_jit_import(const char *module_name) {
+    fpy_cpython_init();
+
+    /* Try the JIT import path */
+    PyObject *jit_module = PyImport_ImportModule("compiler.jit");
+    if (!jit_module) {
+        PyErr_Clear();
+        /* JIT not available — fall through to CPython import */
+        return fpy_cpython_import(module_name);
+    }
+
+    PyObject *import_func = PyObject_GetAttrString(jit_module, "jit_import");
+    Py_DECREF(jit_module);
+    if (!import_func) {
+        PyErr_Clear();
+        return fpy_cpython_import(module_name);
+    }
+
+    PyObject *py_name = PyUnicode_FromString(module_name);
+    PyObject *result = PyObject_CallOneArg(import_func, py_name);
+    Py_DECREF(py_name);
+    Py_DECREF(import_func);
+
+    if (!result) {
+        PyErr_Clear();
+        return fpy_cpython_import(module_name);
+    }
+
+    long long func_ptr = PyLong_AsLongLong(result);
+    Py_DECREF(result);
+
+    if (func_ptr == 0 || func_ptr == -1) {
+        /* JIT compilation failed or module not found as .py
+         * Fall back to CPython's standard import */
+        PyErr_Clear();
+        return fpy_cpython_import(module_name);
+    }
+
+    /* Module was compiled and executed natively.
+     * Return a dummy non-NULL pointer to indicate success.
+     * The module's functions/classes are now registered in our runtime. */
+    return (void*)(intptr_t)1;  /* non-NULL sentinel */
+}
+
 /* Execute Python source code in a temporary namespace, then extract
  * a named object (typically a function) and return it as a PyObject*.
  * Used for async def, generators needing send/close, etc. that must
- * run as real CPython functions. */
-void* fpy_cpython_exec_get(const char *code, const char *name) {
+ * run as real CPython functions.
+ * Uses code cache for repeated exec of the same source. */
+void* fpy_cpython_exec_get(const char *code_str, const char *name) {
     fpy_cpython_init();  /* lazy init */
 
     PyObject *globals = PyDict_New();
@@ -529,7 +710,15 @@ void* fpy_cpython_exec_get(const char *code, const char *name) {
     PyDict_SetItemString(globals, "__builtins__", builtins);
     Py_DECREF(builtins);
 
-    PyObject *result = PyRun_String(code, Py_file_input, globals, globals);
+    /* Try cached compiled code first */
+    PyObject *code = fpy_get_cached_code(code_str, 0);
+    PyObject *result;
+    if (code) {
+        result = PyEval_EvalCode(code, globals, globals);
+    } else {
+        PyErr_Clear();
+        result = PyRun_String(code_str, Py_file_input, globals, globals);
+    }
     if (!result) {
         PyErr_Print();
         fprintf(stderr, "fpy_cpython_exec_get: failed to exec code\n");
@@ -565,7 +754,8 @@ static PyObject* fpy_dict_to_pydict(FpyDict *dict) {
 }
 
 /* eval(expr) with locals dict — evaluates expr in a namespace populated
- * from the caller's local variables. Returns the result as FpyValue. */
+ * from the caller's local variables. Returns the result as FpyValue.
+ * Uses code cache for repeated eval of the same expression. */
 void fpy_cpython_eval_locals(const char *expr, FpyDict *locals_dict,
                               int32_t *out_tag, int64_t *out_data) {
     fpy_cpython_init();
@@ -577,7 +767,15 @@ void fpy_cpython_eval_locals(const char *expr, FpyDict *locals_dict,
 
     PyObject *locals = locals_dict ? fpy_dict_to_pydict(locals_dict) : PyDict_New();
 
-    PyObject *result = PyRun_String(expr, Py_eval_input, globals, locals);
+    /* Try cached compiled code */
+    PyObject *code = fpy_get_cached_code(expr, 1);
+    PyObject *result;
+    if (code) {
+        result = PyEval_EvalCode(code, globals, locals);
+    } else {
+        PyErr_Clear();
+        result = PyRun_String(expr, Py_eval_input, globals, locals);
+    }
     if (!result) {
         PyErr_Print();
         fprintf(stderr, "fpy_cpython_eval_locals: eval failed\n");
@@ -589,6 +787,8 @@ void fpy_cpython_eval_locals(const char *expr, FpyDict *locals_dict,
     }
 
     pyobject_to_fpy(result, out_tag, out_data);
+    /* For OBJ-tagged results, incref to keep alive (caller holds raw ptr) */
+    if (*out_tag == FPY_TAG_OBJ) Py_INCREF(result);
     Py_DECREF(result);
     Py_DECREF(globals);
     Py_DECREF(locals);
@@ -691,6 +891,8 @@ void fpy_cpython_binop(void *left, int32_t right_tag, int64_t right_data,
         return;
     }
     pyobject_to_fpy(result, out_tag, out_data);
+    /* For OBJ-tagged results, incref to keep alive (caller holds raw ptr) */
+    if (*out_tag == FPY_TAG_OBJ) Py_INCREF(result);
     Py_DECREF(result);
 }
 
@@ -719,5 +921,7 @@ void fpy_cpython_rbinop(int32_t left_tag, int64_t left_data,
         return;
     }
     pyobject_to_fpy(result, out_tag, out_data);
+    /* For OBJ-tagged results, incref to keep alive (caller holds raw ptr) */
+    if (*out_tag == FPY_TAG_OBJ) Py_INCREF(result);
     Py_DECREF(result);
 }

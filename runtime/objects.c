@@ -328,6 +328,12 @@ void fpy_value_repr(FpyValue val, char *buf, int bufsize) {
             free(s);
             break;
         }
+        case FPY_TAG_DECIMAL: {
+            char *s = fpy_decimal_to_str((FpyDecimal*)(intptr_t)val.data.i);
+            snprintf(buf, bufsize, "Decimal('%s')", s);
+            free(s);
+            break;
+        }
         case FPY_TAG_SET: {
             FpyDict *set = (FpyDict*)val.data.list;
             int pos = 0;
@@ -462,6 +468,12 @@ void fpy_value_write(FpyValue val) {
         case FPY_TAG_COMPLEX:
             fpy_complex_print((FpyComplex*)(intptr_t)val.data.i);
             break;
+        case FPY_TAG_DECIMAL: {
+            char *s = fpy_decimal_to_str((FpyDecimal*)(intptr_t)val.data.i);
+            printf("%s", s);
+            free(s);
+            break;
+        }
     }
 }
 
@@ -3557,6 +3569,178 @@ char* fpy_complex_to_str(FpyComplex *c) {
     } else {
         snprintf(buf, 128, "(%g+%gj)", c->real, c->imag);
     }
+    return buf;
+}
+
+/* ── Native Decimal arithmetic ─────────────────────────────────── */
+
+FpyDecimal* fpy_decimal_new(int64_t coeff, int32_t exp, int8_t sign) {
+    FpyDecimal *d = (FpyDecimal*)malloc(sizeof(FpyDecimal));
+    d->coefficient = coeff < 0 ? -coeff : coeff;
+    d->exponent = exp;
+    d->sign = sign;
+    if (coeff == 0) d->sign = 0;
+    return d;
+}
+
+FpyDecimal* fpy_decimal_from_int(int64_t val) {
+    if (val == 0) return fpy_decimal_new(0, 0, 0);
+    if (val < 0) return fpy_decimal_new(-val, 0, -1);
+    return fpy_decimal_new(val, 0, 1);
+}
+
+FpyDecimal* fpy_decimal_from_str(const char *s) {
+    if (!s || !*s) return fpy_decimal_new(0, 0, 0);
+    int8_t sign = 1;
+    const char *p = s;
+    if (*p == '-') { sign = -1; p++; }
+    else if (*p == '+') { p++; }
+
+    int64_t coeff = 0;
+    int32_t exp = 0;
+    int saw_dot = 0, frac_digits = 0;
+
+    while (*p) {
+        if (*p == '.') { saw_dot = 1; p++; continue; }
+        if (*p >= '0' && *p <= '9') {
+            coeff = coeff * 10 + (*p - '0');
+            if (saw_dot) frac_digits++;
+        } else if (*p == 'e' || *p == 'E') {
+            /* Scientific notation */
+            p++;
+            int esign = 1;
+            if (*p == '-') { esign = -1; p++; }
+            else if (*p == '+') { p++; }
+            int eval = 0;
+            while (*p >= '0' && *p <= '9') eval = eval * 10 + (*p++ - '0');
+            exp = esign * eval - frac_digits;
+            goto done;
+        } else break;
+        p++;
+    }
+    exp = -frac_digits;
+done:
+    if (coeff == 0) sign = 0;
+    return fpy_decimal_new(coeff, exp, sign);
+}
+
+/* Normalize exponents: align a and b to the same exponent (smaller one) */
+static void fpy_decimal_align(FpyDecimal *a, FpyDecimal *b,
+                               int64_t *a_coeff, int64_t *b_coeff, int32_t *common_exp) {
+    if (a->exponent == b->exponent) {
+        *a_coeff = a->coefficient;
+        *b_coeff = b->coefficient;
+        *common_exp = a->exponent;
+    } else if (a->exponent < b->exponent) {
+        *common_exp = a->exponent;
+        *a_coeff = a->coefficient;
+        int32_t diff = b->exponent - a->exponent;
+        int64_t scale = 1;
+        for (int32_t i = 0; i < diff && i < 18; i++) scale *= 10;
+        *b_coeff = b->coefficient * scale;
+    } else {
+        *common_exp = b->exponent;
+        *b_coeff = b->coefficient;
+        int32_t diff = a->exponent - b->exponent;
+        int64_t scale = 1;
+        for (int32_t i = 0; i < diff && i < 18; i++) scale *= 10;
+        *a_coeff = a->coefficient * scale;
+    }
+}
+
+FpyDecimal* fpy_decimal_add(FpyDecimal *a, FpyDecimal *b) {
+    int64_t ac, bc; int32_t exp;
+    fpy_decimal_align(a, b, &ac, &bc, &exp);
+    int64_t a_signed = a->sign >= 0 ? ac : -ac;
+    int64_t b_signed = b->sign >= 0 ? bc : -bc;
+    int64_t result = a_signed + b_signed;
+    int8_t sign = result > 0 ? 1 : (result < 0 ? -1 : 0);
+    return fpy_decimal_new(result < 0 ? -result : result, exp, sign);
+}
+
+FpyDecimal* fpy_decimal_sub(FpyDecimal *a, FpyDecimal *b) {
+    int64_t ac, bc; int32_t exp;
+    fpy_decimal_align(a, b, &ac, &bc, &exp);
+    int64_t a_signed = a->sign >= 0 ? ac : -ac;
+    int64_t b_signed = b->sign >= 0 ? bc : -bc;
+    int64_t result = a_signed - b_signed;
+    int8_t sign = result > 0 ? 1 : (result < 0 ? -1 : 0);
+    return fpy_decimal_new(result < 0 ? -result : result, exp, sign);
+}
+
+FpyDecimal* fpy_decimal_mul(FpyDecimal *a, FpyDecimal *b) {
+    int64_t coeff = a->coefficient * b->coefficient;
+    int32_t exp = a->exponent + b->exponent;
+    int8_t sign = (int8_t)(a->sign * b->sign);
+    return fpy_decimal_new(coeff, exp, sign);
+}
+
+FpyDecimal* fpy_decimal_div(FpyDecimal *a, FpyDecimal *b) {
+    if (b->coefficient == 0) {
+        fprintf(stderr, "DivisionError: division by zero\n");
+        return fpy_decimal_new(0, 0, 0);
+    }
+    /* Scale numerator for precision (18 digits) */
+    int64_t scale = 1000000000LL;  /* 9 extra digits of precision */
+    int64_t num = a->coefficient * scale;
+    int64_t coeff = num / b->coefficient;
+    int32_t exp = a->exponent - b->exponent - 9;
+    int8_t sign = (int8_t)(a->sign * b->sign);
+    /* Remove trailing zeros */
+    while (coeff != 0 && coeff % 10 == 0) { coeff /= 10; exp++; }
+    return fpy_decimal_new(coeff, exp, sign);
+}
+
+int fpy_decimal_compare(FpyDecimal *a, FpyDecimal *b) {
+    int64_t ac, bc; int32_t exp;
+    fpy_decimal_align(a, b, &ac, &bc, &exp);
+    int64_t av = a->sign >= 0 ? ac : -ac;
+    int64_t bv = b->sign >= 0 ? bc : -bc;
+    if (av < bv) return -1;
+    if (av > bv) return 1;
+    return 0;
+}
+
+FpyDecimal* fpy_decimal_neg(FpyDecimal *a) {
+    return fpy_decimal_new(a->coefficient, a->exponent, (int8_t)(-a->sign));
+}
+
+FpyDecimal* fpy_decimal_abs(FpyDecimal *a) {
+    return fpy_decimal_new(a->coefficient, a->exponent,
+                            a->sign < 0 ? 1 : a->sign);
+}
+
+char* fpy_decimal_to_str(FpyDecimal *d) {
+    if (d->sign == 0) return fpy_strdup("0");
+
+    char coeff_buf[32];
+    sprintf(coeff_buf, "%lld", (long long)d->coefficient);
+    int clen = (int)strlen(coeff_buf);
+
+    char *buf = (char*)malloc(clen + 32);
+    char *out = buf;
+    if (d->sign < 0) *out++ = '-';
+
+    if (d->exponent >= 0) {
+        /* No decimal point needed, just append zeros */
+        memcpy(out, coeff_buf, clen); out += clen;
+        for (int32_t i = 0; i < d->exponent; i++) *out++ = '0';
+    } else {
+        int frac_digits = -d->exponent;
+        if (frac_digits >= clen) {
+            /* 0.00...digits */
+            *out++ = '0'; *out++ = '.';
+            for (int i = 0; i < frac_digits - clen; i++) *out++ = '0';
+            memcpy(out, coeff_buf, clen); out += clen;
+        } else {
+            /* digits with dot inserted */
+            int int_digits = clen - frac_digits;
+            memcpy(out, coeff_buf, int_digits); out += int_digits;
+            *out++ = '.';
+            memcpy(out, coeff_buf + int_digits, frac_digits); out += frac_digits;
+        }
+    }
+    *out = '\0';
     return buf;
 }
 

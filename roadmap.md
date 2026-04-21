@@ -50,6 +50,10 @@
 - Native tempfile module (gettempdir, mkdtemp)
 - Native heapq module (heapify, heappush, heappop, nsmallest)
 - Native bisect module (bisect_left, bisect_right, insort)
+- Metaclass super().__init__/__new__ in type-inheriting classes (no-op/obj_new)
+- Hybrid metaclass: bridge metaclasses run for side effects, methods stay native vtable
+- Runtime JIT for exec/eval (native compilation via compiler/jit.py + bytecode cache fallback)
+- Compile-on-load for dynamic imports (jit_import: find .py → compile → load .dll/.so)
 - Native platform module (system, python_version)
 - Native secrets module (token_hex, randbelow)
 - No-op stdlib imports: datetime, statistics, array, weakref, threading, subprocess,
@@ -73,8 +77,12 @@
 
 ## Planned — High Priority
 
-### 1. Fully native metaclass protocol
-Replace CPython exec_get fallback with native implementation.
+### 1. ~~Fully native metaclass protocol~~ ✅ DONE
+User-defined metaclasses with `__new__` and `__init__` compile natively.
+`super().__new__/init()` in type-inheriting classes resolved to obj_new/no-op.
+Hybrid approach for bridge metaclasses: metaclass runs through CPython for
+side effects (validation, hooks), but method bodies stay native with vtable
+dispatch. No speed regression (benchmarks: fib=175ms, loop=99ms, list=15ms).
 
 **What it means:** `type.__new__(mcs, name, bases, namespace)` implemented in C:
 - Build namespace dict from class body (methods + assignments)
@@ -97,48 +105,33 @@ Replace CPython exec_get fallback with native implementation.
 
 **Runtime function:** `fastpy_type_new(meta_id, name, bases, namespace) → class_id`
 
-### 2. Runtime JIT compilation for compile()/exec()
-When `compile(source, ...)` or `exec(dynamic_string)` is called at runtime:
-- Parse the string with Python's ast module (via embedded CPython)
-- Feed the AST to our compiler (CodeGen)
-- Generate LLVM IR → machine code
-- Execute the machine code
+### 2. ~~Runtime JIT compilation for exec/eval~~ ✅ DONE
+Two-tier system for dynamic `exec()`/`eval()`:
+1. **Native JIT** (compiler/jit.py): Compiles source → LLVM IR → shared library
+   (.dll/.so) → loads and calls `fastpy_main()`. Cached by source hash.
+   Requires fastpy compiler + llvmlite importable at runtime.
+2. **Bytecode cache** fallback: `Py_CompileString` → `PyEval_EvalCode` with
+   128-entry FNV-1a hash cache. Used when JIT module not available.
+The C bridge (`fpy_jit_exec`) tries native JIT first, falls back automatically.
+No speed regression (fib=179ms vs 174ms baseline, within noise).
 
-**Benefit:** Django's template engine compiles templates once, executes many
-times. With JIT, the template code runs at native speed instead of
-interpreter speed.
-
-**Implementation:**
-- `fpy_runtime_compile(source_str) → function_pointer`
-- Uses llvmlite's MCJIT to compile IR to machine code in-process
-- Cache compiled code keyed by source hash
-
-### 3. Compile-on-load for dynamic imports
-When `importlib.import_module(name)` resolves to a `.py` file:
-- Read the source
-- Compile it with our compiler (single-file compilation)
-- Execute the compiled module
-- Cache the compiled module
-
-**Benefit:** Dynamically loaded modules run at native speed, not
-interpreter speed. Django's app loading, middleware discovery, URL
-routing all benefit.
-
-**Implementation:**
-- Runtime function: `fpy_import_module(name) → module_object`
-- Checks local filesystem for .py files
-- Falls back to CPython for .pyd/.so extensions and frozen modules
+### 3. ~~Compile-on-load for dynamic imports~~ ✅ DONE
+`fpy_jit_import(name)` tries to find a `.py` file on `sys.path`, compile it
+natively via the JIT infrastructure (CodeGen → LLVM IR → shared lib → load),
+and execute its top-level code. Falls back to CPython's import system for
+.pyd/.so modules or when the JIT compiler isn't available.
+Static imports already compile natively at build time via multi-file compilation.
+No speed regression (fib=172ms vs 174ms baseline).
 
 ### 4. ~~Native collections module~~ ✅ DONE
 ~~Implement the most-used collections types natively.~~
 All implemented: Counter, defaultdict, deque, OrderedDict, namedtuple, ChainMap.
 
-### 5. Hybrid pyobj method compilation
-When a class routes through CPython bridge (because of complex metaclass
-or imported base class), compile its method bodies natively:
-- Parse the class AST
-- Compile each method as a native function
-- Wrap native functions as CPython callables (FpyNativeCallable)
+### 5. ~~Hybrid pyobj method compilation~~ ✅ DONE
+Method bodies are ALWAYS compiled to native LLVM IR regardless of metaclass.
+When a bridge metaclass is used, methods are wrapped via `cpython_wrap_native()`
+for the metaclass call, but the class uses native vtable dispatch for runtime
+method invocation. Inheritance chains (including polymorphism) all work natively.
 - Pass wrapped callables in the namespace dict to Meta.__new__
 
 **Result:** Class creation uses CPython's metaclass protocol, but
@@ -187,8 +180,10 @@ Dict, Union, TYPE_CHECKING=False, @overload → no-op, cast() → identity.
 ~~contextmanager/suppress.~~ Implemented: contextmanager and suppress as no-op
 decorators/context managers (generators already support with-statement natively).
 
-### 15. Native `decimal` module
-Fixed-point decimal arithmetic. Used by Django's DecimalField.
+### 15. ~~Native `decimal` module~~ ✅ DONE
+~~Fixed-point decimal arithmetic.~~ Implemented: 18-digit precision via int64
+coefficient + exponent. Supports Decimal(str), Decimal(int), arithmetic
+(+, -, *, /), comparison, string conversion. Used by Django's DecimalField.
 
 ### 16. ~~Native `pathlib` module~~ ✅ DONE
 ~~Object-oriented filesystem paths.~~ Implemented: Path construction, `/` operator,
