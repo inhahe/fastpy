@@ -2683,6 +2683,10 @@ class CodeGen:
                         func_param_dict_refinements.setdefault(
                             node.name, {})[pname] = "dict:list"
 
+        # (cls() type propagation is done after the main walk below)
+            if not isinstance(cls_node, ast.ClassDef):
+                continue
+
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
                 continue
@@ -2950,6 +2954,44 @@ class CodeGen:
                 self._dict_var_list_values.add(vname)
             elif vtype == "dict:int":
                 self._dict_var_int_values.add(vname)
+
+        # Post-scan: cls() calls inside classmethods → register types under class name
+        for cls_node in tree.body:
+            if not isinstance(cls_node, ast.ClassDef):
+                continue
+            for method_node in cls_node.body:
+                if not isinstance(method_node, ast.FunctionDef):
+                    continue
+                is_cm = any(isinstance(d, ast.Name) and d.id == "classmethod"
+                            for d in method_node.decorator_list)
+                if not is_cm:
+                    continue
+                cm_types = self._call_site_param_types.get(method_node.name, [])
+                cm_params = [a.arg for a in method_node.args.args[1:]]  # skip cls
+                for n in ast.walk(method_node):
+                    if (isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+                            and n.func.id == "cls"):
+                        cls_arg_types = []
+                        for arg in n.args:
+                            if isinstance(arg, ast.Constant):
+                                if isinstance(arg.value, str): cls_arg_types.append("str")
+                                elif isinstance(arg.value, bool): cls_arg_types.append("bool")
+                                elif isinstance(arg.value, float): cls_arg_types.append("float")
+                                else: cls_arg_types.append(None)
+                            elif isinstance(arg, ast.Name) and arg.id in cm_params:
+                                idx = cm_params.index(arg.id)
+                                cls_arg_types.append(cm_types[idx] if idx < len(cm_types) else None)
+                            else:
+                                cls_arg_types.append(None)
+                        if cls_node.name not in self._call_site_param_types:
+                            self._call_site_param_types[cls_node.name] = cls_arg_types
+                        else:
+                            existing = self._call_site_param_types[cls_node.name]
+                            for i in range(min(len(existing), len(cls_arg_types))):
+                                if existing[i] is None and cls_arg_types[i] is not None:
+                                    existing[i] = cls_arg_types[i]
+                            for i in range(len(existing), len(cls_arg_types)):
+                                existing.append(cls_arg_types[i])
 
         # Propagate signatures through the call graph: when function F is
         # called inside G's body with G's parameter as an argument, F needs a
@@ -18167,6 +18209,17 @@ class CodeGen:
                         val = self.builder.inttoptr(val, param.type)
                 coerced.append(val)
             return self.builder.call(func, coerced)
+
+        # Check for nested class construction: Outer.Inner(args)
+        if isinstance(attr.value, ast.Name) and attr.value.id in self._user_classes:
+            if method in self._user_classes:
+                # Inner is a known class — construct it
+                fake_call = ast.Call(
+                    func=ast.Name(id=method, ctx=ast.Load()),
+                    args=node.args, keywords=node.keywords)
+                ast.copy_location(fake_call, node)
+                ast.copy_location(fake_call.func, node.func)
+                return self._emit_constructor(fake_call)
 
         # Check for static/classmethod call on a class: ClassName.method(args)
         if isinstance(attr.value, ast.Name) and attr.value.id in self._user_classes:
