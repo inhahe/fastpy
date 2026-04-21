@@ -398,6 +398,159 @@ double fastpy_safe_int_fdiv(int64_t a, int64_t b) {
 /* Entry point. If fastpy_main sets an unhandled exception (via
  * fastpy_raise), print a traceback-style message to stderr and exit
  * non-zero to match CPython's behavior. */
+/* ── JIT symbol table ──────────────────────────────────────────────
+ * Returns pairs of (name, address) for all runtime functions so the
+ * in-process MCJIT can resolve them. Called from compiler/jit.py. */
+
+typedef struct { const char *name; void *addr; } FpySymEntry;
+
+/* Forward declarations for runtime functions used in symbol table.
+ * Most are declared in objects.h or defined earlier in this file.
+ * Only need to declare those not visible from the includes. */
+#define SYM(fn) { #fn, (void*)(intptr_t)fn }
+
+extern void fastpy_print_newline(void);
+extern void fastpy_fv_print(int32_t, int64_t);
+extern void fastpy_fv_write(int32_t, int64_t);
+extern const char* fastpy_fv_repr(int32_t, int64_t);
+extern const char* fastpy_fv_str(int32_t, int64_t);
+extern int32_t fastpy_fv_truthy(int32_t, int64_t);
+extern void fastpy_raise(int, const char*);
+extern int32_t fastpy_exc_pending(void);
+extern void fastpy_exc_clear(void);
+extern int32_t fastpy_exc_get_type(void);
+extern const char* fastpy_exc_get_msg(void);
+extern int32_t fastpy_exc_name_to_id(const char*);
+extern FpyList* fastpy_list_new(void);
+extern void fastpy_list_append_fv(FpyList*, int32_t, int64_t);
+extern void fastpy_list_get_fv(FpyList*, int64_t, int32_t*, int64_t*);
+extern void fastpy_list_set_fv(FpyList*, int64_t, int32_t, int64_t);
+extern int64_t fastpy_list_length(FpyList*);
+extern FpyList* fastpy_list_sorted(FpyList*);
+extern FpyList* fastpy_list_reversed(FpyList*);
+extern FpyList* fastpy_list_copy(FpyList*);
+extern void fastpy_list_clear(FpyList*);
+extern void fastpy_list_extend(FpyList*, FpyList*);
+extern void fastpy_list_sort(FpyList*);
+extern FpyList* fastpy_list_concat(FpyList*, FpyList*);
+extern FpyDict* fastpy_dict_new(void);
+extern void fastpy_dict_set_fv(FpyDict*, const char*, int32_t, int64_t);
+extern void fastpy_dict_get_fv(FpyDict*, const char*, int32_t*, int64_t*);
+extern int64_t fastpy_dict_length(FpyDict*);
+extern FpyList* fastpy_dict_keys(FpyDict*);
+extern FpyList* fastpy_dict_values(FpyDict*);
+extern FpyList* fastpy_dict_items(FpyDict*);
+extern int32_t fastpy_dict_has_key(FpyDict*, const char*);
+extern void fastpy_dict_update(FpyDict*, FpyDict*);
+extern FpyList* fastpy_tuple_new(void);
+extern void* fastpy_obj_new(int32_t);
+extern int32_t fastpy_register_class(const char*, int32_t);
+extern void fastpy_register_method(int32_t, const char*, void*, int32_t, int32_t);
+extern void fastpy_obj_set_fv(void*, const char*, int32_t, int64_t);
+extern void fastpy_obj_get_fv(void*, const char*, int32_t*, int64_t*);
+extern const char* fastpy_str_concat(const char*, const char*);
+extern int64_t fastpy_str_len(const char*);
+extern const char* fastpy_str_lower(const char*);
+extern const char* fastpy_str_upper(const char*);
+extern const char* fastpy_str_strip(const char*);
+extern const char* fastpy_str_replace(const char*, const char*, const char*);
+extern FpyList* fastpy_str_split(const char*);
+extern const char* fastpy_str_join(const char*, FpyList*);
+extern int64_t fastpy_str_compare(const char*, const char*);
+extern int64_t fastpy_str_find(const char*, const char*);
+extern const char* fastpy_int_to_str(int64_t);
+extern const char* fastpy_float_to_str(double);
+extern int64_t fastpy_pow_int(int64_t, int64_t);
+extern double fastpy_pow_float(double, double);
+extern int64_t fastpy_round(double);
+extern const char* fastpy_chr(int64_t);
+extern int64_t fastpy_ord(const char*);
+extern const char* fastpy_hex(int64_t);
+extern FpyList* fastpy_enumerate(FpyList*, int64_t);
+extern FpyList* fastpy_zip(FpyList*, FpyList*);
+extern FpyList* fastpy_range(int64_t, int64_t, int64_t);
+extern void* fastpy_closure_new(void*, int32_t, int32_t);
+extern void fastpy_closure_set_capture(void*, int32_t, int64_t);
+extern int64_t fastpy_closure_call0(void*);
+extern int64_t fastpy_closure_call1(void*, int64_t);
+extern int64_t fastpy_closure_call2(void*, int64_t, int64_t);
+extern void* fastpy_cell_new(int64_t);
+extern void fastpy_cell_set(void*, int64_t);
+extern int64_t fastpy_cell_get(void*);
+extern void* fpy_cpython_import(const char*);
+extern void* fpy_cpython_getattr(void*, const char*);
+extern void fpy_cpython_call0(void*, int32_t*, int64_t*);
+extern void fpy_cpython_call1(void*, int32_t, int64_t, int32_t*, int64_t*);
+extern void fpy_cpython_call2(void*, int32_t, int64_t, int32_t, int64_t, int32_t*, int64_t*);
+extern void fpy_cpython_call3(void*, int32_t, int64_t, int32_t, int64_t, int32_t, int64_t, int32_t*, int64_t*);
+extern void fpy_cpython_call_kw(void*, int32_t, int32_t*, int64_t*, int32_t, const char**, int32_t*, int64_t*, int32_t*, int64_t*);
+extern void fpy_cpython_to_fv(void*, int32_t*, int64_t*);
+extern int64_t fpy_cpython_len(void*);
+extern int64_t fpy_cpython_bool(void*);
+extern void fpy_cpython_flush(void);
+extern void* fpy_cpython_iter(void*);
+extern int32_t fpy_cpython_iter_next(void*, int32_t*, int64_t*);
+extern void fpy_jit_exec(const char*);
+extern void* fpy_jit_import(const char*);
+extern void fpy_rc_incref(int32_t, int64_t);
+extern void fpy_rc_decref(int32_t, int64_t);
+
+static FpySymEntry fpy_jit_symbols[] = {
+    SYM(fastpy_print_newline),
+    SYM(fastpy_fv_print), SYM(fastpy_fv_write),
+    SYM(fastpy_fv_repr), SYM(fastpy_fv_str), SYM(fastpy_fv_truthy),
+    SYM(fastpy_raise), SYM(fastpy_exc_pending), SYM(fastpy_exc_clear),
+    SYM(fastpy_exc_get_type), SYM(fastpy_exc_get_msg), SYM(fastpy_exc_name_to_id),
+    SYM(fastpy_list_new), SYM(fastpy_list_append_fv),
+    SYM(fastpy_list_get_fv), SYM(fastpy_list_set_fv),
+    SYM(fastpy_list_length), SYM(fastpy_list_sorted), SYM(fastpy_list_reversed),
+    SYM(fastpy_list_copy), SYM(fastpy_list_clear),
+    SYM(fastpy_list_extend), SYM(fastpy_list_sort), SYM(fastpy_list_concat),
+    SYM(fastpy_dict_new), SYM(fastpy_dict_set_fv), SYM(fastpy_dict_get_fv),
+    SYM(fastpy_dict_length), SYM(fastpy_dict_keys), SYM(fastpy_dict_values),
+    SYM(fastpy_dict_items), SYM(fastpy_dict_has_key), SYM(fastpy_dict_update),
+    SYM(fastpy_tuple_new), SYM(fastpy_obj_new),
+    SYM(fastpy_register_class), SYM(fastpy_register_method),
+    SYM(fastpy_obj_set_fv), SYM(fastpy_obj_get_fv),
+    SYM(fastpy_str_concat), SYM(fastpy_str_len), SYM(fastpy_str_lower),
+    SYM(fastpy_str_upper), SYM(fastpy_str_strip), SYM(fastpy_str_replace),
+    SYM(fastpy_str_split), SYM(fastpy_str_join),
+    SYM(fastpy_str_compare), SYM(fastpy_str_find),
+    SYM(fastpy_int_to_str), SYM(fastpy_float_to_str),
+    SYM(fastpy_pow_int), SYM(fastpy_pow_float), SYM(fastpy_round),
+    SYM(fastpy_chr), SYM(fastpy_ord), SYM(fastpy_hex),
+    SYM(fastpy_enumerate), SYM(fastpy_zip), SYM(fastpy_range),
+    SYM(fastpy_closure_new), SYM(fastpy_closure_set_capture),
+    SYM(fastpy_closure_call0), SYM(fastpy_closure_call1), SYM(fastpy_closure_call2),
+    SYM(fastpy_cell_new), SYM(fastpy_cell_set), SYM(fastpy_cell_get),
+    SYM(fpy_cpython_import), SYM(fpy_cpython_getattr),
+    SYM(fpy_cpython_call0), SYM(fpy_cpython_call1), SYM(fpy_cpython_call2),
+    SYM(fpy_cpython_call3), SYM(fpy_cpython_call_kw),
+    SYM(fpy_cpython_to_fv), SYM(fpy_cpython_len), SYM(fpy_cpython_bool),
+    SYM(fpy_cpython_flush), SYM(fpy_cpython_iter), SYM(fpy_cpython_iter_next),
+    SYM(fpy_jit_exec), SYM(fpy_jit_import),
+    SYM(fpy_rc_incref), SYM(fpy_rc_decref),
+    {NULL, NULL}
+};
+
+/* Returns the symbol table. Called from Python via ctypes. */
+#ifdef _WIN32
+__declspec(dllexport)
+#endif
+FpySymEntry* fastpy_get_jit_symbols(void) {
+    return fpy_jit_symbols;
+}
+
+/* Returns the number of symbols (excluding terminator). */
+#ifdef _WIN32
+__declspec(dllexport)
+#endif
+int fastpy_get_jit_symbol_count(void) {
+    int n = 0;
+    while (fpy_jit_symbols[n].name) n++;
+    return n;
+}
+
 int main(void) {
     /* Initialize threading if enabled (mode set by codegen global) */
     if (fpy_threading_mode >= FPY_THREADING_GIL) {

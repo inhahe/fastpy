@@ -1,46 +1,130 @@
 """
 Runtime JIT compilation for fastpy.
 
-When exec()/eval() is called with a dynamic string at runtime, this module
-compiles the source to a native shared library (.dll/.so), loads it, and
-calls the resulting function. Results are cached by source hash.
+Uses llvmlite's in-process MCJIT (ExecutionEngine) to compile Python source
+to native machine code in the same address space. Runtime symbols (fastpy_*
+functions) resolve automatically from the current process — no separate
+DLL/SO needed.
 
 Usage (from C bridge via embedded CPython):
-    from compiler.jit import jit_exec, jit_eval
-    jit_exec("x = 42; print(x)")
-    result = jit_eval("2 + 3")
+    from compiler.jit import jit_compile, jit_import
+    func_ptr = jit_compile("print(42)")  # returns function pointer or 0
 """
 
 import ast
 import sys
 import os
 import hashlib
-import tempfile
-import ctypes
-from pathlib import Path
 
-# Cache of compiled shared libraries: hash → (lib_handle, func_ptr)
+# Cache: source_hash → function_pointer (int)
 _jit_cache = {}
-_jit_dir = None
 
+# Cache: module_name → function_pointer (int)
+_import_cache = {}
 
-def _get_jit_dir():
-    """Get/create the JIT cache directory."""
-    global _jit_dir
-    if _jit_dir is None:
-        _jit_dir = os.path.join(tempfile.gettempdir(), "fastpy_jit")
-        os.makedirs(_jit_dir, exist_ok=True)
-    return _jit_dir
+# Persistent execution engines (prevent GC from freeing JIT'd code)
+_engines = []
 
 
 def _source_hash(source: str) -> str:
-    """Hash source code for cache lookup."""
     return hashlib.md5(source.encode()).hexdigest()[:16]
+
+
+def _init_llvm():
+    """Initialize LLVM targets (idempotent)."""
+    import llvmlite.binding as llvm
+    llvm.initialize_native_target()
+    llvm.initialize_native_asmprinter()
+    return llvm
+
+
+# Runtime symbol table cache: name → address
+_sym_table = None
+
+
+def _load_symbol_table():
+    """Load the runtime symbol table from the compiled binary.
+    Uses the exported fastpy_get_jit_symbols / fastpy_get_jit_symbol_count
+    functions which are marked __declspec(dllexport)."""
+    global _sym_table
+    if _sym_table is not None:
+        return _sym_table
+
+    import ctypes
+
+    _sym_table = {}
+
+    if sys.platform == "win32":
+        kernel32 = ctypes.WinDLL("kernel32")
+        GetProcAddress = kernel32.GetProcAddress
+        GetProcAddress.restype = ctypes.c_void_p
+        GetProcAddress.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+        hmod = kernel32.GetModuleHandleW(None)
+
+        # Get the exported symbol table function
+        get_syms_addr = GetProcAddress(hmod, b"fastpy_get_jit_symbols")
+        get_count_addr = GetProcAddress(hmod, b"fastpy_get_jit_symbol_count")
+
+        if not get_syms_addr or not get_count_addr:
+            return _sym_table  # symbols not exported (old binary)
+
+        # Call the functions via ctypes
+        class SymEntry(ctypes.Structure):
+            _fields_ = [("name", ctypes.c_char_p), ("addr", ctypes.c_void_p)]
+
+        get_count = ctypes.CFUNCTYPE(ctypes.c_int)(get_count_addr)
+        count = get_count()
+
+        get_syms = ctypes.CFUNCTYPE(ctypes.POINTER(SymEntry))(get_syms_addr)
+        syms = get_syms()
+
+        for i in range(count):
+            entry = syms[i]
+            if entry.name and entry.addr:
+                _sym_table[entry.name.decode()] = entry.addr
+    else:
+        # On Linux/macOS: dlsym with RTLD_DEFAULT
+        libc = ctypes.CDLL(None)
+        dlsym = libc.dlsym
+        dlsym.restype = ctypes.c_void_p
+        dlsym.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+        RTLD_DEFAULT = ctypes.c_void_p(0)
+
+        # Use the same exported function approach
+        get_count_addr = dlsym(RTLD_DEFAULT, b"fastpy_get_jit_symbol_count")
+        get_syms_addr = dlsym(RTLD_DEFAULT, b"fastpy_get_jit_symbols")
+        if get_count_addr and get_syms_addr:
+            class SymEntry(ctypes.Structure):
+                _fields_ = [("name", ctypes.c_char_p), ("addr", ctypes.c_void_p)]
+            get_count = ctypes.CFUNCTYPE(ctypes.c_int)(get_count_addr)
+            count = get_count()
+            get_syms = ctypes.CFUNCTYPE(ctypes.POINTER(SymEntry))(get_syms_addr)
+            syms = get_syms()
+            for i in range(count):
+                entry = syms[i]
+                if entry.name and entry.addr:
+                    _sym_table[entry.name.decode()] = entry.addr
+
+    return _sym_table
+
+
+def _register_runtime_symbols(engine, mod):
+    """Register runtime function addresses with the MCJIT engine."""
+    sym_table = _load_symbol_table()
+
+    for func in mod.functions:
+        if func.is_declaration and func.name:
+            addr = sym_table.get(func.name)
+            if addr:
+                try:
+                    engine.add_global_mapping(func, addr)
+                except (OverflowError, OSError):
+                    pass
 
 
 def jit_compile(source: str) -> int:
     """
-    JIT-compile Python source to a native function.
+    JIT-compile Python source to native code in-process via MCJIT.
     Returns a function pointer (as int) to the compiled fastpy_main(),
     or 0 if compilation fails (caller should fall back to CPython).
     """
@@ -50,133 +134,87 @@ def jit_compile(source: str) -> int:
 
     try:
         from compiler.codegen import CodeGen
-        from compiler.toolchain import compile_ir_to_obj, link_executable, \
-            ensure_runtime_built, RUNTIME_OBJS, OBJ_EXT, IS_WINDOWS
 
-        # Parse source
+        # Parse
         tree = ast.parse(source, mode="exec")
 
-        # Compile to IR (suppress errors — JIT is best-effort)
+        # Compile to LLVM IR
         codegen = CodeGen()
+        # Ensure pre-scan attributes exist (normally set by generate's pre-scan)
+        if not hasattr(codegen, '_singledispatch'):
+            codegen._singledispatch = {}
+            codegen._singledispatch_variants = {}
         try:
             ir_string = codegen.generate(tree)
         except Exception as gen_err:
             print(f"[fastpy JIT] compilation failed: {gen_err}", file=sys.stderr)
             return 0
 
-        # Compile IR to object file
-        jit_dir = Path(_get_jit_dir())
-        obj_path = jit_dir / f"jit_{h}{OBJ_EXT}"
-        compile_ir_to_obj(ir_string, obj_path)
+        # JIT via in-process ExecutionEngine
+        llvm = _init_llvm()
 
-        # Link as shared library (DLL on Windows, .so on Linux/macOS)
-        if IS_WINDOWS:
-            lib_path = jit_dir / f"jit_{h}.dll"
-        else:
-            lib_path = jit_dir / f"jit_{h}.so"
+        mod = llvm.parse_assembly(ir_string)
+        mod.verify()
 
-        # Link with runtime
-        runtime_objs = ensure_runtime_built()
-        _link_shared(obj_path, runtime_objs, lib_path)
+        # Create execution engine with MCJIT.
+        target = llvm.Target.from_default_triple()
+        tm = target.create_target_machine(opt=2)
 
-        # Load the shared library
-        if IS_WINDOWS:
-            lib = ctypes.CDLL(str(lib_path))
-        else:
-            lib = ctypes.CDLL(str(lib_path))
+        engine = llvm.create_mcjit_compiler(mod, tm)
 
-        # Get the fastpy_main function pointer
-        func = lib.fastpy_main
-        func.restype = None
-        func.argtypes = []
+        # Register runtime function addresses with MCJIT
+        try:
+            _register_runtime_symbols(engine, mod)
+        except Exception as sym_err:
+            print(f"[fastpy JIT] symbol registration failed: {sym_err}", file=sys.stderr)
+            return 0
 
-        # Cache it
-        func_ptr = ctypes.cast(func, ctypes.c_void_p).value
+        try:
+            engine.finalize_object()
+        except Exception as fin_err:
+            print(f"[fastpy JIT] finalize failed: {fin_err}", file=sys.stderr)
+            return 0
+
+        # Get function pointer to fastpy_main
+        func_ptr = engine.get_function_address("fastpy_main")
+        if func_ptr == 0:
+            print("[fastpy JIT] fastpy_main not found in compiled module", file=sys.stderr)
+            return 0
+
+        # Keep engine alive (prevent GC from freeing the machine code)
+        _engines.append(engine)
+
+        # Cache
         _jit_cache[h] = func_ptr
-
-        # Clean up object file
-        if obj_path.exists():
-            obj_path.unlink()
-
         return func_ptr
 
     except Exception as e:
-        # JIT compilation failed — caller falls back to CPython interpreter
         print(f"[fastpy JIT] compilation failed: {e}", file=sys.stderr)
         return 0
 
 
-def _link_shared(obj_path, runtime_objs, output_path):
-    """Link object file as a shared library."""
-    import subprocess
-    from compiler.toolchain import IS_WINDOWS, PYTHON_LIB_DIR, PYTHON_LIB
-
-    if IS_WINDOWS:
-        # Use MSVC to create a DLL
-        obj_list = f'"{obj_path}" ' + " ".join(f'"{p}"' for p in runtime_objs)
-        bat_content = (
-            '@echo off\r\n'
-            'call "C:\\Program Files\\Microsoft Visual Studio\\2022\\Community'
-            '\\VC\\Auxiliary\\Build\\vcvars64.bat" 1>NUL 2>NUL\r\n'
-            'if errorlevel 1 (\r\n'
-            '    call "C:\\Program Files\\Microsoft Visual Studio\\2022\\Enterprise'
-            '\\VC\\Auxiliary\\Build\\vcvars64.bat" 1>NUL 2>NUL\r\n'
-            ')\r\n'
-            f'link.exe /NOLOGO /DLL /OUT:"{output_path}" {obj_list} '
-            f'/LIBPATH:"{PYTHON_LIB_DIR}" {PYTHON_LIB} '
-            '/DEFAULTLIB:ucrt /DEFAULTLIB:msvcrt '
-            '/DEFAULTLIB:legacy_stdio_definitions '
-            '/EXPORT:fastpy_main\r\n'
-        )
-        bat_path = output_path.parent / "_jit_link.bat"
-        bat_path.write_text(bat_content, encoding="ascii")
-        result = subprocess.run(
-            ["cmd.exe", "/c", str(bat_path)],
-            capture_output=True, text=True, timeout=30)
-        bat_path.unlink(missing_ok=True)
-        if result.returncode != 0 or not output_path.exists():
-            raise RuntimeError(f"JIT link failed: {result.stderr}")
-    else:
-        import shutil
-        cc = shutil.which("cc") or shutil.which("gcc") or "cc"
-        cmd = [cc, "-shared", "-o", str(output_path), str(obj_path)]
-        cmd += [str(p) for p in runtime_objs]
-        cmd += [f"-L{PYTHON_LIB_DIR}", f"-l{PYTHON_LIB}"]
-        cmd += ["-lm", "-ldl"]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-        if result.returncode != 0:
-            raise RuntimeError(f"JIT link failed: {result.stderr}")
-
-
 def jit_exec(source: str) -> None:
     """JIT-compile and execute source code."""
+    import ctypes
     func_ptr = jit_compile(source)
     if func_ptr:
-        # Call the native function
-        cfunc = ctypes.CFUNCTYPE(None)
-        cfunc(func_ptr)()
+        cfunc = ctypes.CFUNCTYPE(None)(func_ptr)
+        cfunc()
     else:
-        # Fallback to CPython
         exec(source)
 
 
 def jit_eval(source: str):
-    """JIT-compile and evaluate an expression. Returns the result."""
-    # For eval, we wrap in a function that returns the value
-    # This is complex — for now, fall back to CPython for eval
+    """JIT-compile and evaluate an expression."""
     return eval(source)
 
 
 # ── Compile-on-load for dynamic imports ──────────────────────────────
 
-# Cache of compiled modules: module_name → func_ptr
-_import_cache = {}
-
 
 def _find_module_file(name: str) -> str | None:
     """Find a .py file for the given module name on sys.path."""
     parts = name.split(".")
-    # Try as a package (dir/__init__.py) or module (file.py)
     candidates = [
         os.path.join(*parts) + ".py",
         os.path.join(*parts, "__init__.py"),
@@ -188,7 +226,6 @@ def _find_module_file(name: str) -> str | None:
             full = os.path.join(base, candidate)
             if os.path.isfile(full):
                 return full
-    # Also check current directory
     for candidate in candidates:
         if os.path.isfile(candidate):
             return os.path.abspath(candidate)
@@ -197,33 +234,34 @@ def _find_module_file(name: str) -> str | None:
 
 def jit_import(name: str) -> int:
     """
-    Compile-on-load: find a .py module, compile it natively, execute it.
-    Returns a function pointer to the compiled module's fastpy_main,
-    or 0 if the module can't be found or compiled (caller uses CPython import).
-
-    The compiled module's top-level code runs (registering functions/classes
-    in the fastpy runtime), making them available for subsequent calls.
+    Compile-on-load: find a .py module, compile it natively in-process,
+    execute its top-level code.
+    Returns a function pointer (non-zero) on success, 0 on failure.
     """
     if name in _import_cache:
         return _import_cache[name]
 
-    # Find the .py source file
     filepath = _find_module_file(name)
     if filepath is None:
-        return 0  # Not a .py file — use CPython import (e.g., .pyd, .so, builtin)
+        return 0
+
+    # Skip installed packages (site-packages) — their complex code
+    # is better handled by CPython. Only JIT-compile local user files.
+    if "site-packages" in filepath or "Lib" + os.sep in filepath:
+        return 0
 
     try:
-        # Read source
+        import ctypes
+
         with open(filepath, "r", encoding="utf-8") as f:
             source = f.read()
 
-        # Compile using the same JIT infrastructure
         func_ptr = jit_compile(source)
         if func_ptr:
             _import_cache[name] = func_ptr
-            # Execute the module (runs top-level code, registers functions/classes)
-            cfunc = ctypes.CFUNCTYPE(None)
-            cfunc(func_ptr)()
+            # Execute the module's top-level code
+            cfunc = ctypes.CFUNCTYPE(None)(func_ptr)
+            cfunc()
             return func_ptr
         return 0
 
