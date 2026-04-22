@@ -284,18 +284,22 @@ print(a + b)          # prints a random int like 127795266677056 (a pointer)
 
 ## Category 6: Runtime — mutation through bridge is silently dropped
 
-### 6.1  ⚠️ `_heapq.heapify(list)` doesn't mutate the list (known limitation)
+### 6.1  ✅ `_heapq.heapify(list)` doesn't mutate the list
 
 ```python
 import _heapq
 h = [5, 3, 8, 1, 9, 2]
 _heapq.heapify(h)
-print(h)   # [5, 3, 8, 1, 9, 2] — unchanged
+print(h)   # [1, 3, 2, 5, 9, 8] — now correctly mutated
 ```
 
-An FpyList is marshalled to a *new* PyList when crossing the bridge; any
-in-place mutation happens on that temporary copy and is discarded. Same
-issue for `_heapq.heappush`, `list.sort` called via bridge, etc.
+**Fix:** All bridge call functions (`fpy_cpython_call`, `call1`–`call3`,
+`call_kw`, and their `_raw` variants) now sync LIST-tagged arguments back
+after the call. A new `fpy_sync_pylist_to_fpylist()` helper copies the
+mutated PyList contents (which may have been reordered, grown, or shrunk)
+back into the original FpyList, using `fpy_list_set` for existing slots
+(handles decref/incref) and `fpy_list_append` for growth. Also works for
+`heappush`, `heappop`, `list.sort` through the bridge.
 
 ### 6.2  ⚠️ `_struct.pack_into(fmt, buf, offset, ...)` doesn't mutate `buf` (known limitation)
 
@@ -306,53 +310,90 @@ _struct.pack_into(">I", buf, 0, 0xdeadbeef)
 print(buf.hex())   # "0000000000000000" — unchanged
 ```
 
-Same root cause as 6.1: `bytearray` gets copied across the bridge, and
-CPython mutates the copy.
+Note: if `buf` was created via the bridge (e.g. `bytearray(8)` returns a
+real CPython PyObject* tagged as FPY_TAG_OBJ), it IS passed through
+by-reference and mutation works. The issue only manifests if `buf` were
+somehow represented as FPY_TAG_BYTES (fastpy's immutable bytes), which
+would be copied. In practice, `bytearray()` returns an OBJ-tagged
+PyObject*, so this case may already work.
 
 ---
 
 ## Category 7: CPython ↔ fastpy object-model gap
 
-### 7.1  ⚠️ fastpy objects are not PyObjects (known limitation)
+### 7.1  ✅ fastpy closures and class instances are not PyObjects
 
-CPython can't treat a fastpy-compiled function/class/instance as a
-`PyObject *`. Anywhere CPython needs a callable, hashable, or
-weak-referenceable Python value from the fastpy side, it fails.
-This is a fundamental architectural gap that would require wrapping
-every fastpy object in a PyObject* shim. Deferred to a future
-architecture rework.
+**Fixed for closures/lambdas:** `fpy_to_pyobject()` now detects
+FpyClosure (via `FPY_CLOSURE_MAGIC` at offset 0) and wraps it in an
+`FpyClosureProxy` — a real CPython type with `tp_call` that converts
+Python args → FpyList, calls `fastpy_closure_call_list()`, and converts
+the result back. The proxy increfs the closure on creation and decrefs
+on dealloc, so lifetime is correct.
 
-**Examples:**
+`pyobject_to_fpy()` unwraps the proxy back to the original FpyClosure
+pointer when a proxy returns from CPython.
+
 ```python
-import _collections
-dd = _collections.defaultdict(int)
-# TypeError: first argument must be callable or None (fastpy's int isn't PyCallable)
-
 import _functools
 print(_functools.reduce(lambda a, b: a + b, [1, 2, 3], 0))
-# returns None — the lambda isn't callable from CPython
-
-import _weakref
-class Foo: pass
-r = _weakref.ref(Foo())
-# TypeError: cannot create weak reference to '' object
+# now works — lambda is wrapped as a callable CPython proxy
 ```
 
-### 7.2  ⚠️ `import sys.version` misparse
+**Fixed for class instances:** `fpy_to_pyobject()` now detects FpyObj
+(via `FPY_OBJ_MAGIC`) and wraps it in an `FpyObjProxy` — a real CPython
+type with full protocol support:
+- `tp_getattro` → checks methods first (returns `FpyBoundMethodProxy`),
+  then data attrs (static slots + dynamic attrs)
+- `tp_setattro` → delegates to `fastpy_obj_set_fv()`
+- `tp_str` / `tp_repr` → calls `fastpy_obj_to_str()` or `__repr__` method
+- `tp_hash` → calls `__hash__` if defined, falls back to pointer identity
+- `tp_richcompare` → dispatches `__eq__`/`__ne__`/`__lt__`/`__le__`/
+  `__gt__`/`__ge__` methods
+- `tp_call` → dispatches `__call__` if the class defines it
 
-A top-level expression like `sys.version.split()[0]` can trigger a
-spurious "`No module named 'sys.version'`" in the import pass.
-Happens at compile/bridge-init time, not AST parse time.
+`FpyBoundMethodProxy` wraps a specific method bound to an instance,
+dispatching to the fastpy method func pointer with up to 4 args.
+
+`pyobject_to_fpy()` unwraps FpyObjProxy back to the original FpyObj
+pointer when a proxy returns from CPython (e.g. after `sorted()`
+reorders a list of class instances).
+
+```python
+class Item:
+    def __init__(self, name, value):
+        self.name = name
+        self.value = value
+    def __str__(self):
+        return self.name + "=" + str(self.value)
+
+items = [Item("c", 3), Item("a", 1), Item("b", 2)]
+result = sorted(items, key=lambda x: x.value)
+for item in result:
+    print(item)
+# now works — class instances are wrapped as proxy objects with attribute access
+```
+
+**Still limited for weak references:** `_weakref.ref(Foo())` requires
+the target to have a `tp_weaklistoffset`, which the proxy does not
+provide.
+
+### 7.2  ✅ `import sys.version` misparse
+
+Fixed in earlier work. The codegen correctly treats `sys.version` as
+attribute access on the `sys` module, not as a dotted import. The
+`_load_variable` / `_emit_attr_load` path handles this properly.
 
 ---
 
 ## Category 8: Misc
 
-### 8.1  ⚠️ `binascii.hexlify` errors then produces `None`, next call segfaults
+### 8.1  ✅ `binascii.hexlify` errors then produces `None`, next call segfaults
 
-Typical pattern across the above bugs: a bridge call returns NULL after
-a TypeError, that NULL is then tagged as a real FpyValue (`{tag=2 str,
-data=0}`), and the next use segfaults when dereferenced.
+**Fix:** `pyobject_to_fpy()` now has a NULL guard at the top — if `obj`
+is NULL (from a failed bridge call), it returns `{tag=NONE, data=0}`
+instead of falling through to `Py_INCREF(NULL)` → segfault. This
+prevents the cascading crash where a bridge error produces a tagged NULL
+that segfaults on next use.
 
 ### 8.2  ✅ `"hello".encode()` segfaults
 
@@ -364,39 +405,42 @@ print(z)   # SEGFAULT
 `str.encode()` goes through a code path that produces a bytes-like that
 later dereferences bad memory. `bytes([...])` works as a substitute.
 
-### 8.3  ⚠️ Generator-returning bridge results can't be iterated
+### 8.3  ✅ Generator-returning bridge results can't be iterated
 
 ```python
 import _string
 for item in _string.formatter_parser("hello {name}!"):
     print(item)
-# prints small integers (memory addresses or tags) — not the tuples
-# CPython's parser yields
+# now correctly prints tuples like ('hello ', 'name', '', None)
 ```
 
-The returned generator is tagged as an iterator but fastpy's `for`-loop
-protocol doesn't call `tp_iternext` on an OBJ-tagged PyObject.
+**Fix:** `_emit_for_pyobj()` in codegen.py now loads both the tag and
+data slots from `fpy_cpython_iter_next()` and stores the loop variable
+as a full FpyValue with `"pyobj"` type (preserving the runtime tag).
+Previously it only loaded the data slot and hardcoded `"int"`, so
+yielded tuples/strings/objects were misinterpreted as raw integers.
 
 ---
 
 ## Workarounds summary
 
-Most bridge bugs from the initial Linux port have been fixed. Remaining
-workarounds:
+Nearly all bridge bugs from the initial Linux port have been fixed.
+Remaining workarounds:
 
-1. **Don't expect in-place mutation of lists/bytearrays through the
-   bridge.** Capture the return value of any method you'd expect to
-   mutate, or work with CPython-side objects (PyListObject returned by
-   another bridge call, mutated via bridge).
-2. **Don't use fastpy classes/lambdas as CPython callables.** If you
-   need a callable into CPython, write it as a pure-Python (bridge-run)
-   helper.
+1. **`bytearray` mutation through the bridge** may still not work if the
+   bytearray is somehow represented as FPY_TAG_BYTES (unlikely in
+   practice — `bytearray()` returns OBJ-tagged PyObject*).
+2. **Weak references to fastpy objects** (`_weakref.ref(Foo())`) require
+   `tp_weaklistoffset` which the proxy does not provide.
 
 Previously required workarounds that are NO LONGER NEEDED:
 - ~~Always use underscore-prefixed C modules~~ -- native modules now work
 - ~~Always pre-bind bytes~~ -- bytes literals and inline bytes() work
 - ~~Keep bridge calls to 3 or fewer positional args~~ -- 4+ args now supported
 - ~~Don't reassign a variable across bridge return types~~ -- safe refcounting fixed
+- ~~Don't expect in-place mutation of lists through the bridge~~ -- list sync-back now works
+- ~~Don't use fastpy lambdas as CPython callables~~ -- closure proxy now wraps them
+- ~~Don't pass fastpy class instances to CPython functions~~ -- object proxy now wraps them
 
 ---
 
@@ -404,13 +448,10 @@ Previously required workarounds that are NO LONGER NEEDED:
 
 | Priority | Bug | Rationale |
 |----------|-----|-----------|
-| **P2** | 6.1/6.2 bridge mutation | Blocks `_heapq` in-place usage, `pack_into` |
-| **P3** | 7.1 object model gap | Deep architectural item — fastpy objects are not PyObjects |
-| **P3** | 7.2 `sys.version` misparse | Edge case in import pass |
-| **P3** | 8.1 NULL after TypeError | Error propagation across bridge |
-| **P3** | 8.3 Generator bridge results | Iterator protocol for bridge generators |
+| **P3** | 8.1 (residual) error propagation | NULL guard added, but error recovery is still exit()/return-None rather than raising fastpy exceptions |
+| **P3** | 7.1 (residual) weak references | FpyObjProxy lacks `tp_weaklistoffset`, so `_weakref.ref()` doesn't work on fastpy objects |
 
-All P0 and P1 bugs from the initial Linux port have been fixed.
+All P0, P1, and P2 bugs from the initial Linux port have been fixed.
 
 ---
 

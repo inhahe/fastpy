@@ -35,6 +35,15 @@ def main() -> int:
                              'Default: current Python.')
     parser.add_argument("--list-pythons", action="store_true",
                         help="List discovered Python installations and exit")
+    parser.add_argument("-T", "--typed", action="store_true",
+                        help="Use type annotations for fast-path code generation "
+                             "(native LLVM ops for annotated int/float/bool vars)")
+    parser.add_argument("--no-stdlib-merge", action="store_true",
+                        help="Disable stdlib source merging (use CPython bridge "
+                             "for all stdlib modules)")
+    parser.add_argument("--warm-stdlib-cache", action="store_true",
+                        help="Pre-test all stdlib modules for compilability, "
+                             "populate the cache, and exit")
 
     args = parser.parse_args()
 
@@ -47,6 +56,11 @@ def main() -> int:
         for p in pythons:
             current = " (current)" if p.executable == Path(sys.executable) else ""
             print(f"Python {p.version_str:5s}  {p.executable}{current}")
+        return 0
+
+    if args.warm_stdlib_cache:
+        from compiler.stdlib_cache import warm_cache
+        warm_cache()
         return 0
 
     if args.source is None:
@@ -66,7 +80,9 @@ def main() -> int:
     result = compile_file(args.source, args.output,
                           threading_mode=threading_mode,
                           int64_mode=args.int64,
-                          python_version=args.python_version)
+                          typed_mode=args.typed,
+                          python_version=args.python_version,
+                          merge_stdlib=not args.no_stdlib_merge)
 
     if result.success:
         print(f"Compiled: {result.executable}")

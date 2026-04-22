@@ -53,6 +53,7 @@ class CompileResult:
 def compile_source(source: str, output: Path | None = None,
                    threading_mode: int = 0,
                    int64_mode: bool = False,
+                   typed_mode: bool = False,
                    python_version: str | None = None) -> CompileResult:
     """
     Compile a Python source string to a native executable.
@@ -95,7 +96,8 @@ def compile_source(source: str, output: Path | None = None,
     old_limit = _sys.getrecursionlimit()
     _sys.setrecursionlimit(max(old_limit, 20000))  # large stdlib modules need headroom
     try:
-        codegen = CodeGen(threading_mode=threading_mode, int64_mode=int64_mode)
+        codegen = CodeGen(threading_mode=threading_mode, int64_mode=int64_mode,
+                          typed_mode=typed_mode)
         ir_string = codegen.generate(tree)
     except CodeGenError as e:
         return CompileResult(
@@ -150,34 +152,60 @@ def compile_source(source: str, output: Path | None = None,
 def compile_file(path: Path, output: Path | None = None,
                  threading_mode: int = 0,
                  int64_mode: bool = False,
-                 python_version: str | None = None) -> CompileResult:
+                 typed_mode: bool = False,
+                 python_version: str | None = None,
+                 merge_stdlib: bool = True) -> CompileResult:
     """Compile a Python source file to a native executable.
 
     Resolves local imports: if the source contains `import foo` or
     `from foo import bar` and `foo.py` (or `foo/__init__.py`) exists
     relative to the source file, the imported module is compiled inline.
-    External imports (stdlib, third-party) route through CPython bridge.
+
+    When merge_stdlib=True (default), also attempts to compile and merge
+    pure-Python stdlib modules instead of routing them through CPython
+    bridge.  Modules that can't be compiled are left for the bridge.
     """
     source = path.read_text(encoding="utf-8")
     base_dir = path.resolve().parent
 
-    # Resolve local imports and merge into a single source
-    merged = _resolve_and_merge(source, base_dir)
+    # Set up stdlib resolution if enabled
+    stdlib_resolver = None
+    stdlib_cache = None
+    if merge_stdlib:
+        try:
+            from compiler.stdlib_cache import StdlibResolver, StdlibCache
+            import sys as _sys
+            pyver = (_sys.version_info.major, _sys.version_info.minor)
+            stdlib_resolver = StdlibResolver(python_version=pyver)
+            stdlib_cache = StdlibCache(python_version=pyver)
+        except Exception:
+            pass  # stdlib caching unavailable — proceed without it
+
+    # Resolve local imports (and optionally stdlib) and merge
+    merged = _resolve_and_merge(source, base_dir,
+                                _stdlib_resolver=stdlib_resolver,
+                                _stdlib_cache=stdlib_cache)
 
     return compile_source(merged, output, threading_mode=threading_mode,
-                          int64_mode=int64_mode,
+                          int64_mode=int64_mode, typed_mode=typed_mode,
                           python_version=python_version)
 
 
 def _resolve_and_merge(source: str, base_dir: Path,
                         _visited: set | None = None,
-                        _current_pkg: str = "") -> str:
+                        _current_pkg: str = "",
+                        _stdlib_resolver=None,
+                        _stdlib_cache=None) -> str:
     """Recursively resolve local imports and merge modules into one source.
 
     For each `import X` or `from X import Y` where X.py exists locally:
     1. Parse X.py, prefix its top-level names with `modname__` to avoid collisions
     2. Prepend the prefixed module code before the importing module
     3. Replace the import statement with aliasing assignments
+
+    When _stdlib_resolver and _stdlib_cache are provided, also attempts to
+    resolve pure-Python stdlib modules.  Modules that fail compilation are
+    left as regular import statements (CPython bridge fallback).
 
     Handles: `from X import Y`, `import X` (dotted access), relative imports,
     package imports (`from pkg.mod import func`), name collision avoidance.
@@ -192,6 +220,9 @@ def _resolve_and_merge(source: str, base_dir: Path,
         if isinstance(node, ast.Import):
             for alias in node.names:
                 mod_path = _find_local_module(alias.name, base_dir)
+                if mod_path is None and _stdlib_resolver is not None:
+                    mod_path = _find_compilable_stdlib(
+                        alias.name, _stdlib_resolver, _stdlib_cache)
                 if mod_path is not None:
                     imports_to_resolve.append((i, node, alias.name, mod_path))
         elif isinstance(node, ast.ImportFrom):
@@ -215,6 +246,9 @@ def _resolve_and_merge(source: str, base_dir: Path,
                     imports_to_resolve.append((i, node, mod_name, mod_path))
             elif mod_name:
                 mod_path = _find_local_module(mod_name, base_dir)
+                if mod_path is None and _stdlib_resolver is not None:
+                    mod_path = _find_compilable_stdlib(
+                        mod_name, _stdlib_resolver, _stdlib_cache)
                 if mod_path is not None:
                     imports_to_resolve.append((i, node, mod_name, mod_path))
 
@@ -234,7 +268,12 @@ def _resolve_and_merge(source: str, base_dir: Path,
             _visited.add(mod_key)
             mod_source = mod_path.read_text(encoding="utf-8")
             mod_base = mod_path.parent
-            resolved_mod = _resolve_and_merge(mod_source, mod_base, _visited)
+            # Pass stdlib resolver through so transitive stdlib imports
+            # can also be merged if they are cached as compilable.
+            resolved_mod = _resolve_and_merge(
+                mod_source, mod_base, _visited,
+                _stdlib_resolver=_stdlib_resolver,
+                _stdlib_cache=_stdlib_cache)
             resolved_mod = _strip_main_block(resolved_mod)
             prefixed_mod = _prefix_module_defs(resolved_mod, safe_prefix)
             prepended_sources.append(prefixed_mod)
@@ -392,6 +431,39 @@ def _strip_main_block(source: str) -> str:
     if len(new_body) == len(tree.body):
         return source  # No change
     return ast.unparse(ast.Module(body=new_body, type_ignores=[]))
+
+
+# ---------------------------------------------------------------------------
+# Stdlib module resolution for source merging
+# ---------------------------------------------------------------------------
+
+def _find_compilable_stdlib(module_name: str,
+                             resolver, cache) -> 'Path | None':
+    """Check if a stdlib module exists and is compilable.
+
+    Uses the cache to avoid re-testing modules.  On a cache miss,
+    performs a test-compilation and caches the result.
+
+    Returns the module's source path if compilable, None otherwise.
+    """
+    stdlib_path = resolver.find_stdlib_module(module_name)
+    if stdlib_path is None:
+        return None
+
+    if cache is None:
+        return None
+
+    # Check cache
+    compilable = cache.is_compilable(module_name, stdlib_path)
+    if compilable is not None:
+        return stdlib_path if compilable else None
+
+    # Cache miss — test-compile the module
+    from compiler.stdlib_cache import test_compilability
+    ok, prefixed, error = test_compilability(module_name, stdlib_path)
+    cache.put(module_name, stdlib_path, ok,
+              prefixed_source=prefixed, error=error)
+    return stdlib_path if ok else None
 
 
 # ---------------------------------------------------------------------------

@@ -58,6 +58,7 @@ class PythonInstall:
     include_dir: Path              # e.g. D:\python314\include
     lib_dir: Path                  # e.g. D:\python314\libs
     prefix: Path                   # e.g. D:\python314
+    stdlib_dir: Path | None = None # e.g. D:\python314\Lib
 
     @property
     def version_str(self) -> str:
@@ -186,6 +187,7 @@ def _current_python_install() -> PythonInstall:
     """Build a PythonInstall for the currently running Python (no subprocess)."""
     include = Path(sysconfig.get_path("include"))
     prefix = Path(sys.prefix)
+    stdlib_dir = Path(sysconfig.get_path("stdlib"))
     if IS_WINDOWS:
         lib_dir = prefix / "libs"
     else:
@@ -197,6 +199,7 @@ def _current_python_install() -> PythonInstall:
         include_dir=include,
         lib_dir=lib_dir,
         prefix=prefix,
+        stdlib_dir=stdlib_dir,
     )
 
 

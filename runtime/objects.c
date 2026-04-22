@@ -302,9 +302,28 @@ void fpy_value_repr(FpyValue val, char *buf, int bufsize) {
         case FPY_TAG_FLOAT:
             format_float(val.data.f, buf, bufsize);
             break;
-        case FPY_TAG_STR:
-            snprintf(buf, bufsize, "'%s'", val.data.s);
+        case FPY_TAG_STR: {
+            /* Escape special characters like CPython's repr() */
+            int pos = 0;
+            const char *s = val.data.s;
+            buf[pos++] = '\'';
+            if (s) {
+                for (; *s && pos < bufsize - 6; s++) {
+                    unsigned char c = (unsigned char)*s;
+                    if (c == '\\')      { buf[pos++] = '\\'; buf[pos++] = '\\'; }
+                    else if (c == '\'') { buf[pos++] = '\\'; buf[pos++] = '\''; }
+                    else if (c == '\n') { buf[pos++] = '\\'; buf[pos++] = 'n'; }
+                    else if (c == '\r') { buf[pos++] = '\\'; buf[pos++] = 'r'; }
+                    else if (c == '\t') { buf[pos++] = '\\'; buf[pos++] = 't'; }
+                    else if (c < 32 || c == 127)
+                        pos += snprintf(buf + pos, bufsize - pos, "\\x%02x", c);
+                    else buf[pos++] = c;
+                }
+            }
+            if (pos < bufsize - 1) buf[pos++] = '\'';
+            buf[pos] = '\0';
             break;
+        }
         case FPY_TAG_BOOL:
             snprintf(buf, bufsize, "%s", val.data.b ? "True" : "False");
             break;
@@ -339,9 +358,28 @@ void fpy_value_repr(FpyValue val, char *buf, int bufsize) {
             break;
         }
         case FPY_TAG_OBJ: {
-            extern const char* fastpy_obj_to_str(FpyObj*);
-            const char *s = fastpy_obj_to_str(val.data.obj);
-            snprintf(buf, bufsize, "%s", s);
+            /* Could be FpyObj or CPython PyObject* — detect via magic */
+            void *ptr = val.data.obj;
+            int32_t first_word = *(int32_t*)ptr;
+            if (first_word == FPY_CLOSURE_MAGIC) {
+                snprintf(buf, bufsize, "<closure>");
+            } else if (first_word > 0 && first_word < 100000) {
+                FpyObj *obj = (FpyObj*)ptr;
+                if (obj->magic == FPY_OBJ_MAGIC) {
+                    extern const char* fastpy_obj_to_str(FpyObj*);
+                    const char *s = fastpy_obj_to_str(obj);
+                    snprintf(buf, bufsize, "%s", s);
+                } else {
+                    /* CPython PyObject* — use PyObject_Str */
+                    extern const char* fpy_bridge_pyobj_str(void*);
+                    const char *s = fpy_bridge_pyobj_str(ptr);
+                    snprintf(buf, bufsize, "%s", s);
+                }
+            } else {
+                extern const char* fpy_bridge_pyobj_str(void*);
+                const char *s = fpy_bridge_pyobj_str(ptr);
+                snprintf(buf, bufsize, "%s", s);
+            }
             break;
         }
         case FPY_TAG_BIGINT: {
@@ -4340,6 +4378,37 @@ const char* fastpy_os_getenv(const char *name) {
 
 FpyDict* fastpy_counter_new(void) {
     return fpy_dict_new(4);
+}
+
+FpyDict* fastpy_counter_from_string(const char *str) {
+    if (!str) return fpy_dict_new(4);
+    int64_t len = (int64_t)strlen(str);
+    FpyDict *counter = fpy_dict_new(len > 4 ? (int32_t)len : 4);
+    for (int64_t i = 0; i < len; i++) {
+        char buf[2] = {str[i], '\0'};
+        FpyValue key;
+        key.tag = FPY_TAG_STR;
+        key.data.s = fpy_strdup(buf);
+        uint64_t h = fpy_hash_value(key);
+        int64_t mask = counter->table_size - 1;
+        int64_t slot = (int64_t)(h & (uint64_t)mask);
+        int found = 0;
+        while (1) {
+            int64_t idx = counter->indices[slot];
+            if (idx == FPY_DICT_EMPTY) break;
+            if (idx != FPY_DICT_DELETED && fpy_key_equal(counter->keys[idx], key)) {
+                counter->values[idx].data.i++;
+                found = 1;
+                free(key.data.s);
+                break;
+            }
+            slot = (slot + 1) & mask;
+        }
+        if (!found) {
+            fpy_dict_set(counter, key, fpy_int(1));
+        }
+    }
+    return counter;
 }
 
 FpyDict* fastpy_counter_from_list(FpyList *list) {

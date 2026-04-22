@@ -151,6 +151,25 @@ def run_executable(exe_path: Path, timeout: float = 10.0) -> RunResult:
         )
 
 
+def _parse_compile_flags(source: str) -> dict:
+    """Extract compile flags from a `# compile_flags: ...` comment.
+
+    Recognised flags: --typed, --int64.
+    Returns kwargs suitable for compile_source().
+    """
+    kwargs: dict = {}
+    for line in source.splitlines()[:5]:  # only check first 5 lines
+        line = line.strip()
+        if line.startswith("# compile_flags:"):
+            flags = line.split(":", 1)[1].strip().split()
+            if "--typed" in flags:
+                kwargs["typed_mode"] = True
+            if "--int64" in flags:
+                kwargs["int64_mode"] = True
+            break
+    return kwargs
+
+
 def diff_test(
     source: str,
     timeout: float = 10.0,
@@ -173,8 +192,9 @@ def diff_test(
             cpython=cpython_result,
         )
 
-    # Step 2: Try to compile
-    compile_result = compile_source(source)
+    # Step 2: Try to compile (with any per-file compile flags)
+    extra_kwargs = _parse_compile_flags(source)
+    compile_result = compile_source(source, **extra_kwargs)
 
     if not compile_result.success:
         # Compiler can't handle this yet — that's a skip, not a failure

@@ -13,6 +13,10 @@
 #include <math.h>
 #include <setjmp.h>
 #include <stdlib.h>
+#ifdef _WIN32
+#include <io.h>
+#include <fcntl.h>
+#endif
 #ifndef _WIN32
 #include <dirent.h>
 #include <unistd.h>
@@ -578,6 +582,13 @@ int fastpy_get_jit_symbol_count(void) {
 }
 
 int main(void) {
+#ifdef _WIN32
+    /* Ensure stdout/stderr are in text mode so \n → \r\n conversion
+     * matches CPython's behavior. C runtime may default to binary
+     * mode when stdout is a pipe (e.g. subprocess capture). */
+    _setmode(_fileno(stdout), _O_TEXT);
+    _setmode(_fileno(stderr), _O_TEXT);
+#endif
     /* Initialize threading if enabled (mode set by codegen global) */
     if (fpy_threading_mode >= FPY_THREADING_GIL) {
         fpy_gil_init();
