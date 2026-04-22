@@ -5482,6 +5482,35 @@ class CodeGen:
                 # Update self.variables so _emit_expr sees the correct VKind
                 self.variables[pname] = (native_alloca, ValueType(kind))
 
+        # --typed mode: container parameter annotations (list[int], dict[str, int], etc.)
+        # Don't create native allocas — just override the type tag with element info.
+        if self._typed_mode and info.uses_fv_abi:
+            ast_params = list(node.args.args)
+            for _pidx, ast_arg in enumerate(ast_params):
+                container_tag = self._parse_container_annotation(ast_arg.annotation)
+                if container_tag is None:
+                    continue
+                pname = ast_arg.arg
+                if pname not in self.variables or pname in self._native_vars:
+                    continue
+                alloca, _ = self.variables[pname]
+                self.variables[pname] = (alloca, container_tag)
+                # Dict value type tracking: extract from annotation node
+                if (container_tag == "dict"
+                        and isinstance(ast_arg.annotation, ast.Subscript)
+                        and isinstance(ast_arg.annotation.slice, ast.Tuple)
+                        and len(ast_arg.annotation.slice.elts) == 2):
+                    val_kind = self._parse_annotation(ast_arg.annotation.slice.elts[1])
+                    if val_kind == VKind.INT:
+                        self._dict_var_int_values.add(pname)
+                    val_nested = self._parse_container_annotation(
+                        ast_arg.annotation.slice.elts[1])
+                    if val_nested is not None:
+                        if val_nested.startswith("list"):
+                            self._dict_var_list_values.add(pname)
+                        elif val_nested == "dict":
+                            self._dict_var_dict_values.add(pname)
+
         # Phase 4: set up function aliases for parameters that received
         # function references at call sites. E.g., apply(add, 5, 6) where
         # add is a user function → alias param[0] ("func") to "add".
@@ -8624,6 +8653,49 @@ class CodeGen:
                         ast.copy_location(fake, node)
                         self._emit_assign(fake)
                     return
+                # Container annotations: list[int], dict[str, int], etc.
+                # No native alloca — just process the assignment normally,
+                # then override the type tag with annotated element type info.
+                container_tag = self._parse_container_annotation(node.annotation)
+                if container_tag is not None:
+                    varname = node.target.id
+                    if varname in self._unsafe_typed_vars:
+                        import sys
+                        print(f"fastpy: warning: ignoring type annotation for "
+                              f"'{varname}' (contradicted by assignment in scope)",
+                              file=sys.stderr)
+                        if node.value is not None:
+                            fake = ast.Assign(targets=[node.target], value=node.value)
+                            ast.copy_location(fake, node)
+                            self._emit_assign(fake)
+                        return
+                    if node.value is not None:
+                        fake = ast.Assign(targets=[node.target], value=node.value)
+                        ast.copy_location(fake, node)
+                        self._emit_assign(fake)
+                    # Override type tag with annotation-provided element type
+                    if varname in self.variables:
+                        alloca, _ = self.variables[varname]
+                        self.variables[varname] = (alloca, container_tag)
+                    # Dict value type tracking: extract from annotation node
+                    if (container_tag == "dict"
+                            and isinstance(node.annotation, ast.Subscript)
+                            and isinstance(node.annotation.slice, ast.Tuple)
+                            and len(node.annotation.slice.elts) == 2):
+                        val_kind = self._parse_annotation(node.annotation.slice.elts[1])
+                        _vk_map = {VKind.INT: "int", VKind.STR: "str",
+                                   VKind.FLOAT: "float"}
+                        val_tag = _vk_map.get(val_kind)
+                        if val_tag == "int":
+                            self._dict_var_int_values.add(varname)
+                        val_nested = self._parse_container_annotation(
+                            node.annotation.slice.elts[1])
+                        if val_nested is not None:
+                            if val_nested.startswith("list"):
+                                self._dict_var_list_values.add(varname)
+                            elif val_nested == "dict":
+                                self._dict_var_dict_values.add(varname)
+                    return
             # Non-typed or unrecognized annotation → treat as regular assignment
             if node.value is not None and node.target is not None:
                 fake = ast.Assign(targets=[node.target], value=node.value)
@@ -11020,6 +11092,68 @@ class CodeGen:
         # typing.Optional, Union, list[int], etc. — not handled yet
         return None
 
+    def _parse_container_annotation(self, node: ast.expr | None) -> str | None:
+        """Parse a container type annotation into a type tag string.
+
+        Handles ``list[int]``, ``List[str]``, ``dict[str, int]``, ``set[int]``,
+        ``tuple[int, ...]``, and their ``typing`` module equivalents.
+        Returns tag strings like ``'list:int'``, ``'list:str'``,
+        ``'dict'``, ``'set'``, ``'tuple'``, or None if not a container
+        annotation.
+        """
+        if node is None:
+            return None
+
+        # Bare container name without subscript: list, dict, set, tuple
+        if isinstance(node, ast.Name):
+            if node.id in ('list', 'List'):
+                return "list:int"
+            if node.id in ('dict', 'Dict'):
+                return "dict"
+            if node.id in ('set', 'Set'):
+                return "set"
+            if node.id in ('tuple', 'Tuple'):
+                return "tuple"
+            return None
+
+        # Subscripted: list[int], dict[str, int], etc.
+        if not isinstance(node, ast.Subscript):
+            return None
+        if not isinstance(node.value, ast.Name):
+            return None
+
+        container = node.value.id
+        _kind_to_tag = {
+            VKind.INT: "int", VKind.FLOAT: "float",
+            VKind.STR: "str", VKind.BOOL: "bool",
+        }
+
+        if container in ('list', 'List'):
+            # list[int], list[str], list[float], list[list[int]], ...
+            elem_kind = self._parse_annotation(node.slice)
+            if elem_kind is not None:
+                return f"list:{_kind_to_tag.get(elem_kind, 'int')}"
+            # Nested container: list[list[int]], list[dict[str, int]]
+            nested = self._parse_container_annotation(node.slice)
+            if nested is not None:
+                base = nested.split(":")[0]
+                return f"list:{base}"
+            return "list:int"
+
+        if container in ('dict', 'Dict'):
+            # dict[K, V] — value type tracked via _dict_var_* sets,
+            # NOT via the tag string (codegen checks == "dict" everywhere).
+            # Return "dict" as tag; callers populate _dict_var_* from slice.
+            return "dict"
+
+        if container in ('set', 'Set'):
+            return "set"
+
+        if container in ('tuple', 'Tuple'):
+            return "tuple"
+
+        return None
+
     @staticmethod
     def _infer_expr_kind(node: ast.expr) -> VKind | None:
         """Infer VKind from an expression's AST structure alone.
@@ -11074,6 +11208,18 @@ class CodeGen:
                 kind = self._parse_annotation(stmt.annotation)
                 if kind is not None and kind in self._VKIND_TO_LLVM:
                     annotated[stmt.target.id] = kind
+                else:
+                    # Container annotations: list[int], dict[str, int], etc.
+                    container_tag = self._parse_container_annotation(stmt.annotation)
+                    if container_tag is not None:
+                        if container_tag.startswith("list"):
+                            annotated[stmt.target.id] = VKind.LIST
+                        elif container_tag.startswith("dict"):
+                            annotated[stmt.target.id] = VKind.DICT
+                        elif container_tag.startswith("set"):
+                            annotated[stmt.target.id] = VKind.SET
+                        elif container_tag.startswith("tuple"):
+                            annotated[stmt.target.id] = VKind.TUPLE
 
         if not annotated:
             return set()
