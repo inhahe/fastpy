@@ -511,6 +511,7 @@ _SUPPORTED_STMT_NODES = (
     ast.AsyncWith,   # async with (desugared to regular with)
     ast.AsyncFor,    # async for (desugared to regular for)
     ast.TryStar,     # except* (exception groups, Python 3.11+)
+    ast.TypeAlias,   # type X = ... (PEP 695, Python 3.12+)
 )
 
 # Built-in functions we can handle

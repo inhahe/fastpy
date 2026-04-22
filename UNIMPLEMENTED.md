@@ -1,6 +1,6 @@
 # Fastpy Python 3.14 Compatibility Status
 
-Last updated 2026-04-21.
+Last updated 2026-04-22.
 
 ## Fully native (no CPython bridge)
 
@@ -43,7 +43,14 @@ async def, await compiled natively (synchronous execution).
 asyncio.run(), asyncio.gather(), asyncio.sleep() — all native.
 
 ### Pattern matching
-match/case with literal, capture, guard, or, wildcard, sequence patterns.
+match/case with literal, capture, guard, or, wildcard, sequence, singleton
+patterns. Tested: literal, string, capture, wildcard, or, guard, sequence,
+nested sequence, singleton (None/True/False), mixed singleton+literal.
+
+**Missing pattern types** (silently treated as never-match):
+- `MatchStar` — `case [first, *rest]:`
+- `MatchMapping` — `case {"key": val}:`
+- `MatchClass` — `case Point(x, y):`
 
 ### Imports (native)
 math module (direct libm calls), json module (native parser/serializer),
@@ -79,6 +86,50 @@ These features work correctly but use the embedded CPython interpreter:
 - **Dynamic eval()/exec()** with non-literal string arguments
 - **Other stdlib modules** not implemented natively (e.g., collections,
   itertools, functools — except singledispatch which is native)
+
+## Bugs fixed (2026-04-22)
+
+### 9. Complex arithmetic print showed raw pointers (fixed)
+`print(c1 + c2)` printed a raw i64 pointer instead of the complex result.
+Root cause: `_wrap_for_print` had no handler for `inferred == "complex"` after
+`_infer_type_tag` returned "complex" for BinOp with complex operands — the i64
+(ptrtoint'd FpyComplex*) fell through to the scalar default, tagged as INT.
+Fix: Added `inferred == "complex"` check in `_wrap_for_print`; extended
+`_is_complex_expr` to handle BinOp and UnaryOp recursively; fixed USub to use
+`complex_neg` instead of integer negation; fixed `abs()` to detect complex
+expressions via `_is_complex_expr`; fixed `signbit()` check in C runtime for
+`-0.0` real part (CPython prints `(-0-3j)` not `-3j`).
+
+### 10. MatchSingleton treated as wildcard (fixed)
+`case None:`, `case True:`, `case False:` matched everything.
+Root cause: No handler for `ast.MatchSingleton` — fell through to the default
+which returned None (always-match).
+Fix: Added MatchSingleton handler checking FpyValue tag (NONE for None,
+BOOL+data for True/False).
+
+### 11. Match guard clause ignored on capture patterns (fixed)
+`case n if n < 0:` always matched, ignoring the guard.
+Root cause: Capture patterns returned `matched = None` (always match), and the
+guard check only ran when `matched` was not None.
+Fix: Restructured guard evaluation to always run when present.
+
+### 12. Match sequence sub-pattern bug (fixed)
+`case (0, y):` matched any sequence regardless of the literal.
+Root cause: Sequence pattern matching only handled MatchAs (capture) sub-patterns;
+MatchValue (literal) sub-patterns were ignored.
+Fix: Recursive `_emit_match_pattern` for each element in the sequence.
+
+### 13. Ellipsis printed as 0 (fixed)
+`print(...)` and `x = ...; print(x)` both printed `0`.
+Root cause: Ellipsis stored as i64(0) with no distinguishing tag.
+Fix: Direct detection in print path (`_emit_print_single`, `_emit_write_single`)
+for Ellipsis constants and variables tracked via `_ellipsis_vars`.
+
+### 14. Positional-only params ignored (fixed)
+`def f(a, b, /):` only saw 0 parameters; `a` and `b` were inaccessible.
+Root cause: `node.args.posonlyargs` was never read — only `node.args.args`.
+Fix: AST normalization at the top of `generate()` merges `posonlyargs` into
+`args` before any codegen.
 
 ## Bugs fixed (2026-04-21)
 
@@ -134,6 +185,38 @@ with a clear error message on mismatch.
 List-of-lists returned from functions lost their element type information.
 Fix: Added list-of-lists detection from append patterns, propagating
 nested list types through function return boundaries.
+
+## Grammar gaps (Python 3.14)
+
+Systematic comparison against the Python 3.14 PEG grammar (`Grammar/python.gram`).
+
+### Silently wrong (compiles, produces incorrect results)
+- **MatchStar** — `case [first, *rest]:` treated as never-match. Should capture
+  remaining sequence elements.
+- **MatchMapping** — `case {"key": val}:` treated as never-match. Should match
+  dict structure and bind values.
+- **MatchClass** — `case Point(x, y):` treated as never-match. Should match
+  class instances and bind attributes.
+
+### Formerly blocked, now implemented
+- **`type` statement** (Python 3.12+) — `type X = int | str` silently ignored
+  (no runtime effect). Tested.
+- **`@` operator** (MatMult) — `a @ b` dispatches to `__matmul__` on user
+  classes. Correctly handles both int-returning and object-returning methods.
+  Tested with dot product and matrix multiplication.
+- **t-strings** (Python 3.14) — `t"hello {name}"` compiled as f-string
+  (string interpolation). Note: CPython 3.14 returns `Template` objects;
+  fastpy returns plain strings. This is a semantic simplification.
+
+### Tested (2026-04-22)
+- **match/case** — literal, string, capture, wildcard, or, guard, sequence,
+  nested sequence, singleton (None/True/False), mixed singleton+literal
+- **except\*** — exception groups (single/multiple handlers, plain exceptions)
+- **Complex numbers** — arithmetic (+, -, *), abs(), unary negation, repr
+- **Bytes literals** — `b"hello"` (partial: latin-1 decode)
+- **Ellipsis** — `print(...)` and `x = ...; print(x)` both print "Ellipsis"
+- **for/while ... else:** — with and without break
+- **Positional-only params** — `def f(a, /, b):` works correctly
 
 ## Known limitations (not bugs)
 

@@ -962,6 +962,14 @@ class CodeGen:
         # Module-level vars that functions can access via 'global' keyword
         self._global_vars: dict[str, tuple[ir.GlobalVariable, str]] = {}
 
+        # Variables assigned Ellipsis literal (...) — tracked for print dispatch
+        self._ellipsis_vars: set[str] = set()
+
+        # Annotated variable names whose annotations are contradicted by
+        # assignments in the same scope.  Pre-scanned before codegen so the
+        # AnnAssign handler can skip native alloca creation for them.
+        self._unsafe_typed_vars: set[str] = set()
+
         # Pre-scanned list element types from append() analysis
         # Maps variable name -> inferred element type (e.g. "list", "str", "obj")
         self._list_append_types: dict[str, str] = {}
@@ -2063,6 +2071,31 @@ class CodeGen:
 
     def generate(self, tree: ast.Module) -> str:
         """Generate LLVM IR from a Python AST. Returns IR as string."""
+        # Normalize: merge positional-only args into regular args.
+        # At the codegen level, posonly and regular args are identical;
+        # the `/` marker only constrains calling convention (no keyword passing).
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if node.args.posonlyargs:
+                    node.args.args = node.args.posonlyargs + node.args.args
+                    node.args.posonlyargs = []
+
+        # Normalize: t-strings (Python 3.14) → f-strings.
+        # TemplateStr/Interpolation are structurally identical to JoinedStr/FormattedValue;
+        # converting them lets the existing f-string codegen handle t-strings.
+        if hasattr(ast, 'TemplateStr'):
+            for node in ast.walk(tree):
+                # Rewrite TemplateStr values in-place
+                if hasattr(node, 'values') and isinstance(node, ast.TemplateStr):
+                    node.__class__ = ast.JoinedStr
+                    for i, v in enumerate(node.values):
+                        if isinstance(v, ast.Interpolation):
+                            fv = ast.FormattedValue(
+                                value=v.value, conversion=v.conversion,
+                                format_spec=None)
+                            ast.copy_location(fv, v)
+                            node.values[i] = fv
+
         # Pass 0: scan for lambda assignments and create hidden functions
         self._lambda_counter = 0
         self._lambda_map: dict[int, str] = {}  # id(Lambda node) -> func name
@@ -2397,6 +2430,9 @@ class CodeGen:
         # Pre-scan module-level list append patterns
         module_stmts = [n for n in tree.body if not isinstance(n, (ast.FunctionDef, ast.ClassDef))]
         self._prescan_list_append_types(module_stmts)
+        # Pre-scan for typed annotations contradicted by later assignments
+        if self._typed_mode:
+            self._unsafe_typed_vars = self._scan_unsafe_typed_vars(tree.body)
         self._current_scope_stmts = module_stmts
         self._module_stmts = module_stmts
 
@@ -5240,7 +5276,8 @@ class CodeGen:
                  self._dict_var_int_values, self._dict_var_list_values,
                  self._dict_var_dict_values, self._dict_var_obj_values,
                  self._dict_var_key_types,
-                 self._obj_var_class, self._native_vars)
+                 self._obj_var_class, self._native_vars,
+                 self._unsafe_typed_vars)
 
         # Set up function state
         self.function = info.func
@@ -5256,6 +5293,9 @@ class CodeGen:
         self._dict_var_obj_values = set()
         self._dict_var_key_types = {}
         self._obj_var_class = {}
+        # Pre-scan for typed annotations contradicted by later assignments
+        if self._typed_mode:
+            self._unsafe_typed_vars = self._scan_unsafe_typed_vars(node.body)
 
         # Pre-scan function body for list append patterns. Build a
         # param-name → type map from call-site analysis so `for c in s:`
@@ -5489,7 +5529,8 @@ class CodeGen:
          self._dict_var_int_values, self._dict_var_list_values,
          self._dict_var_dict_values, self._dict_var_obj_values,
          self._dict_var_key_types,
-         self._obj_var_class, self._native_vars) = saved
+         self._obj_var_class, self._native_vars,
+         self._unsafe_typed_vars) = saved
 
     # -----------------------------------------------------------------
     # Class support
@@ -8554,6 +8595,8 @@ class CodeGen:
             self._emit_async_funcdef(node)
         elif isinstance(node, ast.TryStar):
             self._emit_try_star(node)
+        elif isinstance(node, ast.TypeAlias):
+            pass  # type X = ... is a type-only construct, no runtime effect
         elif isinstance(node, ast.AnnAssign):
             # --typed mode: use annotation for native alloca
             if (self._typed_mode
@@ -8562,7 +8605,13 @@ class CodeGen:
                 kind = self._parse_annotation(node.annotation)
                 if kind is not None and kind in self._VKIND_TO_LLVM:
                     varname = node.target.id
-                    if varname not in self._native_vars:
+                    # Skip native alloca if pre-scan found contradicting assignments
+                    if varname in self._unsafe_typed_vars:
+                        import sys
+                        print(f"fastpy: warning: ignoring type annotation for "
+                              f"'{varname}' (contradicted by assignment in scope)",
+                              file=sys.stderr)
+                    elif varname not in self._native_vars:
                         native_type = self._VKIND_TO_LLVM[kind]
                         native_alloca = self._create_entry_alloca(
                             native_type, f"{varname}.typed")
@@ -8679,6 +8728,13 @@ class CodeGen:
         # Lambda assignments are handled in the declaration pass — skip
         if isinstance(node.value, ast.Lambda):
             return
+
+        # Track Ellipsis assignments for print dispatch
+        if (len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+                and isinstance(node.value, ast.Constant)
+                and node.value.value is ...):
+            self._ellipsis_vars.add(node.targets[0].id)
 
         # CPython module attribute or method result: use _load_or_wrap_fv
         # to get a proper FpyValue with the runtime tag from the bridge.
@@ -9862,6 +9918,9 @@ class CodeGen:
         if isinstance(node, ast.BinOp):
             if self._is_complex_expr(node.left) or self._is_complex_expr(node.right):
                 return "complex"
+        # UnaryOp on complex produces complex
+        if isinstance(node, ast.UnaryOp) and self._is_complex_expr(node.operand):
+            return "complex"
         # Compare / not / isinstance / bool() / hasattr() produce booleans
         if isinstance(node, ast.Compare):
             return "bool"
@@ -10202,10 +10261,25 @@ class CodeGen:
                      or self._is_tuple_expr(node.value))):
             elem = self._get_list_elem_type(node.value)
             return f"list:{elem}"
-        # BinOp on objects (operator overloading) returns an object
+        # BinOp: object operator overloading OR list concat/repeat
         if isinstance(node, ast.BinOp):
             if self._is_obj_expr(node.left):
-                return "obj"
+                _binop_dunders = {
+                    ast.Add: "__add__", ast.Sub: "__sub__", ast.Mult: "__mul__",
+                    ast.FloorDiv: "__floordiv__", ast.Div: "__truediv__",
+                    ast.Mod: "__mod__", ast.Pow: "__pow__",
+                    ast.MatMult: "__matmul__"}
+                dunder = _binop_dunders.get(type(node.op))
+                if dunder:
+                    ret_type = self._find_method_return_type(node.left, dunder)
+                    if ret_type is None:
+                        return "obj"  # unknown class/method → safe default
+                    if isinstance(ret_type, ir.PointerType):
+                        return "obj"
+                    if isinstance(ret_type, ir.DoubleType):
+                        return "float"
+                    return "int"
+                return "obj"  # fallback for unrecognized operators
             # List concat / repeat yield lists (Add / Mult only — not Mod,
             # because str % tuple is string formatting, not a list op).
             if (isinstance(node.op, (ast.Add, ast.Mult))
@@ -10946,6 +11020,119 @@ class CodeGen:
         # typing.Optional, Union, list[int], etc. — not handled yet
         return None
 
+    @staticmethod
+    def _infer_expr_kind(node: ast.expr) -> VKind | None:
+        """Infer VKind from an expression's AST structure alone.
+
+        Returns None when the type cannot be determined statically (unknown
+        function return, arbitrary variable, etc.).  Only returns a VKind
+        when the type is unambiguous from the AST — constants, container
+        literals, f-strings, etc.
+        """
+        if isinstance(node, ast.Constant):
+            v = node.value
+            if isinstance(v, bool):
+                return VKind.BOOL
+            if isinstance(v, int):
+                return VKind.INT
+            if isinstance(v, float):
+                return VKind.FLOAT
+            if isinstance(v, str):
+                return VKind.STR
+            if v is None:
+                return VKind.NONE
+            if isinstance(v, bytes):
+                return VKind.BYTES
+            if isinstance(v, complex):
+                return VKind.COMPLEX
+            return None
+        if isinstance(node, (ast.List, ast.ListComp)):
+            return VKind.LIST
+        if isinstance(node, (ast.Dict, ast.DictComp)):
+            return VKind.DICT
+        if isinstance(node, (ast.Set, ast.SetComp)):
+            return VKind.SET
+        if isinstance(node, ast.Tuple):
+            return VKind.TUPLE
+        if isinstance(node, ast.JoinedStr):
+            return VKind.STR
+        return None
+
+    def _scan_unsafe_typed_vars(self, body: list[ast.stmt]) -> set[str]:
+        """Pre-scan a scope's statements for annotated variables that are
+        later assigned to a contradicting type.
+
+        Walks into control-flow bodies (if/while/for/try/with/match) but
+        NOT into nested function/class definitions (those are separate
+        scopes).  Returns the set of variable names that should NOT get
+        native typed allocas.
+        """
+        # Step 1: collect all typed annotations in this scope
+        annotated: dict[str, VKind] = {}
+        for stmt in self._walk_scope(body):
+            if isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
+                kind = self._parse_annotation(stmt.annotation)
+                if kind is not None and kind in self._VKIND_TO_LLVM:
+                    annotated[stmt.target.id] = kind
+
+        if not annotated:
+            return set()
+
+        # Step 2: find assignments that contradict the annotation
+        unsafe: set[str] = set()
+        for stmt in self._walk_scope(body):
+            if isinstance(stmt, ast.Assign):
+                for target in stmt.targets:
+                    if isinstance(target, ast.Name) and target.id in annotated:
+                        rhs_kind = self._infer_expr_kind(stmt.value)
+                        if rhs_kind is not None and rhs_kind != annotated[target.id]:
+                            unsafe.add(target.id)
+            elif isinstance(stmt, ast.AnnAssign):
+                if (isinstance(stmt.target, ast.Name)
+                        and stmt.target.id in annotated
+                        and stmt.value is not None):
+                    rhs_kind = self._infer_expr_kind(stmt.value)
+                    if rhs_kind is not None and rhs_kind != annotated[stmt.target.id]:
+                        unsafe.add(stmt.target.id)
+            elif isinstance(stmt, ast.AugAssign):
+                if isinstance(stmt.target, ast.Name) and stmt.target.id in annotated:
+                    rhs_kind = self._infer_expr_kind(stmt.value)
+                    if rhs_kind is not None and rhs_kind != annotated[stmt.target.id]:
+                        unsafe.add(stmt.target.id)
+        return unsafe
+
+    @staticmethod
+    def _walk_scope(body: list[ast.stmt]):
+        """Yield all statements in a scope, descending into control-flow
+        bodies but NOT into nested function/class definitions."""
+        for stmt in body:
+            yield stmt
+            if isinstance(stmt, (ast.If, ast.While, ast.For)):
+                yield from CodeGen._walk_scope(stmt.body)
+                if stmt.orelse:
+                    yield from CodeGen._walk_scope(stmt.orelse)
+            elif isinstance(stmt, ast.Try):
+                yield from CodeGen._walk_scope(stmt.body)
+                for handler in stmt.handlers:
+                    yield from CodeGen._walk_scope(handler.body)
+                if stmt.orelse:
+                    yield from CodeGen._walk_scope(stmt.orelse)
+                if stmt.finalbody:
+                    yield from CodeGen._walk_scope(stmt.finalbody)
+            elif hasattr(ast, 'TryStar') and isinstance(stmt, ast.TryStar):
+                yield from CodeGen._walk_scope(stmt.body)
+                for handler in stmt.handlers:
+                    yield from CodeGen._walk_scope(handler.body)
+                if stmt.orelse:
+                    yield from CodeGen._walk_scope(stmt.orelse)
+                if stmt.finalbody:
+                    yield from CodeGen._walk_scope(stmt.finalbody)
+            elif isinstance(stmt, ast.With):
+                yield from CodeGen._walk_scope(stmt.body)
+            elif isinstance(stmt, ast.Match):
+                for case in stmt.cases:
+                    yield from CodeGen._walk_scope(case.body)
+
     def _typed_box_native(self, value: ir.Value, kind: VKind) -> ir.Value:
         """Box a native-typed value back into FpyValue for boundary crossing."""
         if kind == VKind.INT:
@@ -11398,6 +11585,13 @@ class CodeGen:
                 return TypedValue(val, ValueType(VKind.BYTES))
             if node.value is None:
                 return TypedValue(val, ValueType(VKind.NONE))
+        # Fast path: complex constant
+        if isinstance(node, ast.Constant) and isinstance(node.value, complex):
+            return TypedValue(val, ValueType(VKind.COMPLEX))
+        # Fast path: BinOp with complex operands → result is complex
+        if isinstance(node, ast.BinOp):
+            if self._is_complex_expr(node.left) or self._is_complex_expr(node.right):
+                return TypedValue(val, ValueType(VKind.COMPLEX))
         # Fast path: container literals
         if isinstance(node, ast.Set):
             return TypedValue(val, ValueType(VKind.SET))
@@ -11798,10 +11992,25 @@ class CodeGen:
     def _emit_match(self, node: ast.Match) -> None:
         """Emit match/case statement (Python 3.10+ structural pattern matching).
 
-        Supports: literal patterns, capture patterns, wildcard (_),
-        OR patterns (|), and guard clauses (if cond).
+        Supports: literal, singleton (None/True/False), capture, wildcard (_),
+        OR (|), sequence, and guard clauses.  Subject is loaded as an FpyValue
+        to preserve the runtime tag (needed for MatchSingleton and for
+        distinguishing None/0/False).
         """
-        subject = self._emit_expr_value(node.subject)
+        # Load subject as FpyValue to preserve runtime type information
+        subject_fv = self._load_or_wrap_fv(node.subject)
+        if (isinstance(subject_fv.type, ir.LiteralStructType)
+                and subject_fv.type == fpy_val):
+            subject_tag = self._fv_tag(subject_fv)
+            subject_data = self._fv_data_i64(subject_fv)
+        else:
+            # Bare value fallback — wrap into FpyValue
+            bare = subject_fv
+            tag_str = self._llvm_type_tag(bare)
+            subject_fv = self._wrap_bare_to_fv(bare, tag_str)
+            subject_tag = self._fv_tag(subject_fv)
+            subject_data = self._fv_data_i64(subject_fv)
+
         end_block = self._new_block("match.end")
 
         for case in node.cases:
@@ -11809,13 +12018,15 @@ class CodeGen:
             next_case = self._new_block("match.next")
             body_block = self._new_block("match.body")
 
-            matched = self._emit_match_pattern(subject, pattern, node)
+            matched = self._emit_match_pattern(
+                subject_fv, subject_tag, subject_data, pattern, node)
 
-            # Guard: case N if cond:
-            if case.guard is not None and matched is not None:
-                guard_block = self._new_block("match.guard")
-                self.builder.cbranch(matched, guard_block, next_case)
-                self.builder.position_at_end(guard_block)
+            # Guard clause — must be checked even when pattern always matches
+            if case.guard is not None:
+                if matched is not None:
+                    guard_block = self._new_block("match.guard")
+                    self.builder.cbranch(matched, guard_block, next_case)
+                    self.builder.position_at_end(guard_block)
                 guard_cond = self._emit_condition(case.guard)
                 self.builder.cbranch(guard_cond, body_block, next_case)
             elif matched is not None:
@@ -11836,68 +12047,142 @@ class CodeGen:
             self.builder.branch(end_block)
         self.builder.position_at_end(end_block)
 
-    def _emit_match_pattern(self, subject, pattern, node):
-        """Emit a match pattern check. Returns an i1 condition or None
-        for wildcard/capture patterns that always match."""
-        # MatchValue: case 1, case "hello", etc.
+    def _emit_match_pattern(self, subject_fv, subject_tag, subject_data,
+                             pattern, node):
+        """Emit a match pattern check.
+
+        Returns an i1 condition, or None for wildcard/capture patterns that
+        always match.
+
+        subject_fv:   FpyValue {i32 tag, i64 data}
+        subject_tag:  i32 tag extracted from subject_fv
+        subject_data: i64 data extracted from subject_fv
+        """
+        # ── MatchValue: case 1, case "hello", case Color.RED ──────────
         if isinstance(pattern, ast.MatchValue):
             val = self._emit_expr_value(pattern.value)
-            if isinstance(subject.type, ir.IntType) and isinstance(val.type, ir.IntType):
-                return self.builder.icmp_signed("==", subject, val)
-            elif isinstance(subject.type, ir.PointerType) and isinstance(val.type, ir.PointerType):
-                cmp = self._rt_call("str_compare", [subject, val])
-                return self.builder.icmp_signed("==", cmp, ir.Constant(i64, 0))
-            elif isinstance(subject.type, ir.DoubleType) and isinstance(val.type, ir.DoubleType):
-                return self.builder.fcmp_ordered("==", subject, val)
+            if isinstance(val.type, ir.IntType) and val.type.width == 64:
+                tag_ok = self.builder.icmp_signed(
+                    "==", subject_tag, ir.Constant(i32, FPY_TAG_INT))
+                val_ok = self.builder.icmp_signed("==", subject_data, val)
+                return self.builder.and_(tag_ok, val_ok)
+            elif isinstance(val.type, ir.PointerType):
+                tag_ok = self.builder.icmp_signed(
+                    "==", subject_tag, ir.Constant(i32, FPY_TAG_STR))
+                subj_ptr = self.builder.inttoptr(subject_data, i8_ptr)
+                cmp = self._rt_call("str_compare", [subj_ptr, val])
+                str_ok = self.builder.icmp_signed(
+                    "==", cmp, ir.Constant(i64, 0))
+                return self.builder.and_(tag_ok, str_ok)
+            elif isinstance(val.type, ir.DoubleType):
+                tag_ok = self.builder.icmp_signed(
+                    "==", subject_tag, ir.Constant(i32, FPY_TAG_FLOAT))
+                subj_dbl = self.builder.bitcast(subject_data, double)
+                flt_ok = self.builder.fcmp_ordered("==", subj_dbl, val)
+                return self.builder.and_(tag_ok, flt_ok)
             # Type mismatch → no match
             return ir.Constant(ir.IntType(1), 0)
 
-        # MatchStar / MatchAs with name: case n → capture
+        # ── MatchSingleton: case None, case True, case False ──────────
+        if isinstance(pattern, ast.MatchSingleton):
+            if pattern.value is None:
+                return self.builder.icmp_signed(
+                    "==", subject_tag, ir.Constant(i32, FPY_TAG_NONE))
+            if pattern.value is True:
+                tag_ok = self.builder.icmp_signed(
+                    "==", subject_tag, ir.Constant(i32, FPY_TAG_BOOL))
+                val_ok = self.builder.icmp_signed(
+                    "==", subject_data, ir.Constant(i64, 1))
+                return self.builder.and_(tag_ok, val_ok)
+            if pattern.value is False:
+                tag_ok = self.builder.icmp_signed(
+                    "==", subject_tag, ir.Constant(i32, FPY_TAG_BOOL))
+                val_ok = self.builder.icmp_signed(
+                    "==", subject_data, ir.Constant(i64, 0))
+                return self.builder.and_(tag_ok, val_ok)
+            return ir.Constant(ir.IntType(1), 0)
+
+        # ── MatchAs: capture / wildcard / alias ───────────────────────
         if isinstance(pattern, ast.MatchAs):
             if pattern.pattern is not None:
                 # case pattern as name
-                inner = self._emit_match_pattern(subject, pattern.pattern, node)
+                inner = self._emit_match_pattern(
+                    subject_fv, subject_tag, subject_data,
+                    pattern.pattern, node)
                 if pattern.name:
-                    tag = self._infer_type_tag(node.subject, subject) \
-                          if hasattr(node, 'subject') else self._llvm_type_tag(subject)
-                    self._store_variable(pattern.name, subject, tag)
+                    self._store_variable(pattern.name, subject_fv, "int")
                 return inner
             if pattern.name is None:
                 # case _ → wildcard, always matches
                 return None
-            # case name → capture, always matches
-            tag = self._infer_type_tag(node.subject, subject) \
-                  if hasattr(node, 'subject') else self._llvm_type_tag(subject)
-            self._store_variable(pattern.name, subject, tag)
+            # case name → capture, always matches, binds subject
+            self._store_variable(pattern.name, subject_fv, "int")
             return None
 
-        # MatchOr: case 1 | 2 | 3
+        # ── MatchOr: case 1 | 2 | 3 ──────────────────────────────────
         if isinstance(pattern, ast.MatchOr):
             result = ir.Constant(ir.IntType(1), 0)
             for p in pattern.patterns:
-                cond = self._emit_match_pattern(subject, p, node)
+                cond = self._emit_match_pattern(
+                    subject_fv, subject_tag, subject_data, p, node)
                 if cond is None:
                     return None  # wildcard in OR → always matches
                 result = self.builder.or_(result, cond)
             return result
 
-        # MatchSequence: case (a, b) — tuple/list unpacking
+        # ── MatchSequence: case (a, b), case [1, x, 3] ───────────────
         if isinstance(pattern, ast.MatchSequence):
-            # Check length matches
-            length = self._rt_call("list_length", [subject])
-            len_ok = self.builder.icmp_signed(
-                "==", length, ir.Constant(i64, len(pattern.patterns)))
-            # For each element, extract and match/bind
-            for i, p in enumerate(pattern.patterns):
-                if isinstance(p, ast.MatchAs) and p.name and p.pattern is None:
-                    # Capture: bind element to name
-                    elem = self._list_get_as_bare(
-                        subject, ir.Constant(i64, i), "int")
-                    self._store_variable(p.name, elem, "int")
-            return len_ok
+            # Subject must be a list/tuple (both use tag LIST=5)
+            is_seq = self.builder.icmp_signed(
+                "==", subject_tag, ir.Constant(i32, FPY_TAG_LIST))
 
-        # Fallback: unsupported pattern
-        return None  # Phase 4: unsupported match pattern → wildcard match
+            # Branch: only access list elements if subject is a sequence
+            check_block = self._new_block("mseq.check")
+            fail_block = self._new_block("mseq.fail")
+            elem_block = self._new_block("mseq.elem")
+            done_block = self._new_block("mseq.done")
+
+            self.builder.cbranch(is_seq, check_block, fail_block)
+
+            self.builder.position_at_end(check_block)
+            list_ptr = self.builder.inttoptr(subject_data, i8_ptr)
+            length = self._rt_call("list_length", [list_ptr])
+            expected_len = len(pattern.patterns)
+            len_ok = self.builder.icmp_signed(
+                "==", length, ir.Constant(i64, expected_len))
+            self.builder.cbranch(len_ok, elem_block, fail_block)
+
+            # Extract each element as FpyValue and match sub-patterns
+            self.builder.position_at_end(elem_block)
+            elem_ok = ir.Constant(ir.IntType(1), 1)
+            for i, sub_pat in enumerate(pattern.patterns):
+                tag_i, data_i = self._fv_list_get(
+                    list_ptr, ir.Constant(i64, i), f"mseq.{i}")
+                elem_fv = self._fv_build_from_slots(tag_i, data_i)
+                sub_cond = self._emit_match_pattern(
+                    elem_fv, tag_i, data_i, sub_pat, node)
+                if sub_cond is not None:
+                    elem_ok = self.builder.and_(elem_ok, sub_cond)
+
+            last_elem_block = self.builder.block
+            self.builder.branch(done_block)
+
+            self.builder.position_at_end(fail_block)
+            self.builder.branch(done_block)
+
+            self.builder.position_at_end(done_block)
+            phi = self.builder.phi(ir.IntType(1), "mseq.result")
+            phi.add_incoming(elem_ok, last_elem_block)
+            phi.add_incoming(ir.Constant(ir.IntType(1), 0), fail_block)
+            return phi
+
+        # ── Unsupported patterns ──────────────────────────────────────
+        # MatchStar, MatchMapping, MatchClass: return false (never
+        # matches) instead of the old behaviour of returning None
+        # (always matches, silently wrong).  These need proper
+        # implementation — for now, at least they won't produce
+        # incorrect positive matches.
+        return ir.Constant(ir.IntType(1), 0)
 
     def _generator_needs_cpython(self, node: ast.FunctionDef) -> bool:
         """Check if a generator function needs the state-machine expansion
@@ -15790,6 +16075,17 @@ class CodeGen:
             self.builder.call(self.runtime["cpython_print_obj"], [ptr])
             self.builder.call(self.runtime["print_newline"], [])
             return
+        # Ellipsis: print "Ellipsis" directly (no runtime tag for it)
+        if isinstance(node, ast.Constant) and node.value is ...:
+            str_ptr = self._make_string_constant("Ellipsis")
+            self.builder.call(self.runtime["write_str"], [str_ptr])
+            self.builder.call(self.runtime["print_newline"], [])
+            return
+        if isinstance(node, ast.Name) and node.id in self._ellipsis_vars:
+            str_ptr = self._make_string_constant("Ellipsis")
+            self.builder.call(self.runtime["write_str"], [str_ptr])
+            self.builder.call(self.runtime["print_newline"], [])
+            return
         fv = self._load_or_wrap_fv(node)
         tag, data = self._fv_unpack(fv)
         self.builder.call(self.runtime["fv_print"], [tag, data])
@@ -16157,6 +16453,9 @@ class CodeGen:
 
         # Expression-level type inference (e.g. print(a + b), print(glob.glob(x)))
         inferred = self._infer_type_tag(node, value)
+        if inferred == "complex":
+            return self._fv_build_from_slots(
+                ir.Constant(i32, FPY_TAG_COMPLEX), value)
         if inferred == "decimal":
             return self._fv_build_from_slots(
                 ir.Constant(i32, FPY_TAG_DECIMAL), value)
@@ -16689,6 +16988,15 @@ class CodeGen:
 
     def _emit_write_single(self, node: ast.expr) -> None:
         """Emit a write (no newline) for a single expression via FV dispatch."""
+        # Ellipsis: write "Ellipsis" directly (no runtime tag for it)
+        if isinstance(node, ast.Constant) and node.value is ...:
+            str_ptr = self._make_string_constant("Ellipsis")
+            self.builder.call(self.runtime["write_str"], [str_ptr])
+            return
+        if isinstance(node, ast.Name) and node.id in self._ellipsis_vars:
+            str_ptr = self._make_string_constant("Ellipsis")
+            self.builder.call(self.runtime["write_str"], [str_ptr])
+            return
         fv = self._load_or_wrap_fv(node)
         tag, data = self._fv_unpack(fv)
         self.builder.call(self.runtime["fv_write"], [tag, data])
@@ -16778,6 +17086,11 @@ class CodeGen:
         if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
                 and node.func.id == "complex"):
             return True
+        if isinstance(node, ast.BinOp):
+            return (self._is_complex_expr(node.left)
+                    or self._is_complex_expr(node.right))
+        if isinstance(node, ast.UnaryOp):
+            return self._is_complex_expr(node.operand)
         return False
 
     def _emit_complex_binop(self, node: ast.BinOp,
@@ -16911,14 +17224,24 @@ class CodeGen:
         if lk == VKind.OBJ:
             _obj_ops = {ast.Add: "__add__", ast.Sub: "__sub__", ast.Mult: "__mul__",
                         ast.FloorDiv: "__floordiv__", ast.Div: "__truediv__",
-                        ast.Mod: "__mod__", ast.Pow: "__pow__"}
+                        ast.Mod: "__mod__", ast.Pow: "__pow__",
+                        ast.MatMult: "__matmul__"}
             method = _obj_ops.get(op)
             if method:
                 name_ptr = self._make_string_constant(method)
                 result = self.builder.call(
                     self.runtime["obj_call_method1"],
                     [ltv.as_ptr(self.builder), name_ptr, rtv.as_i64(self.builder)])
-                return self.builder.inttoptr(result, i8_ptr)
+                # Check method return type: only inttoptr if it returns a pointer
+                ret_type = self._find_method_return_type(node.left, method)
+                if ret_type is None:
+                    # Unknown class/method → assume object (safe default)
+                    return self.builder.inttoptr(result, i8_ptr)
+                if isinstance(ret_type, ir.PointerType):
+                    return self.builder.inttoptr(result, i8_ptr)
+                if isinstance(ret_type, ir.DoubleType):
+                    return self.builder.bitcast(result, double)
+                return result  # raw i64 for known int returns
 
         # ── Fast path: bool as int ─────────────────────────────────────
         if lk == VKind.BOOL and rk in (VKind.INT, VKind.BOOL):
@@ -17083,16 +17406,21 @@ class CodeGen:
         """Emit overflow-checked integer arithmetic.
         On overflow: promotes to BigInt (default) or raises OverflowError (--int64).
         Returns i64 (for small results) or i64 (BigInt pointer cast, tagged BIGINT)."""
-        # --typed --int64: raw LLVM arithmetic, no overflow check (C-like perf)
+        # --typed --int64: use LLVM overflow intrinsics — no BigInt fallback,
+        # no runtime function calls, SIMD-vectorisable by LLVM.  Still raises
+        # OverflowError on overflow (safe), but avoids the checked_* runtime
+        # functions and their BigInt allocation paths.
         if self._typed_mode and self._int64_mode:
-            if isinstance(op, ast.Add):
-                return self.builder.add(left, right)
-            if isinstance(op, ast.Sub):
-                return self.builder.sub(left, right)
-            if isinstance(op, ast.Mult):
-                return self.builder.mul(left, right)
-            if isinstance(op, ast.Pow):
-                return self._emit_raw_ipow(left, right)
+            intrinsic = {
+                ast.Add: "llvm.sadd.with.overflow.i64",
+                ast.Sub: "llvm.ssub.with.overflow.i64",
+                ast.Mult: "llvm.smul.with.overflow.i64",
+            }.get(type(op))
+            if intrinsic is not None:
+                return self._emit_intrinsic_overflow_op(intrinsic, left, right)
+            # Pow: fall through to runtime checked_pow (intrinsic not
+            # available for exponentiation; the existing --int64 OverflowError
+            # path handles it correctly).
 
         op_map = {
             ast.Add: "checked_add",
@@ -17145,6 +17473,45 @@ class CodeGen:
             # For practical purposes: if it fits in i64, return i64.
             # If it doesn't, return the BigInt pointer.
             return self.builder.select(is_big, big_as_i64, result)
+
+    def _emit_intrinsic_overflow_op(
+        self, intrinsic_name: str,
+        left: ir.Value, right: ir.Value,
+    ) -> ir.Value:
+        """Emit an overflow-checked integer op using an LLVM intrinsic.
+
+        Uses llvm.sadd/ssub/smul.with.overflow.i64 — a single instruction
+        that returns {i64, i1} (result + overflow flag).  On overflow we
+        raise OverflowError.  No runtime function call, no BigInt allocation,
+        and the pattern is transparent to LLVM's auto-vectoriser.
+        """
+        i1 = ir.IntType(1)
+        ovf_struct = ir.LiteralStructType([i64, i1])
+        fn_ty = ir.FunctionType(ovf_struct, [i64, i64])
+
+        # Get-or-declare the intrinsic in the current module
+        try:
+            fn = self.module.globals[intrinsic_name]
+        except KeyError:
+            fn = ir.Function(self.module, fn_ty, name=intrinsic_name)
+
+        result_struct = self.builder.call(fn, [left, right])
+        value = self.builder.extract_value(result_struct, 0)
+        overflowed = self.builder.extract_value(result_struct, 1)
+
+        overflow_block = self._new_block("intrinsic_ovf.err")
+        ok_block = self._new_block("intrinsic_ovf.ok")
+        self.builder.cbranch(overflowed, overflow_block, ok_block)
+
+        self.builder.position_at_end(overflow_block)
+        exc_name = self._make_string_constant("OverflowError")
+        exc_id = self.builder.call(self.runtime["exc_name_to_id"], [exc_name])
+        msg = self._make_string_constant("integer overflow")
+        self.builder.call(self.runtime["raise"], [exc_id, msg])
+        self.builder.unreachable()
+
+        self.builder.position_at_end(ok_block)
+        return value
 
     def _emit_raw_ipow(self, base: ir.Value, exp: ir.Value) -> ir.Value:
         """Emit raw integer power via binary exponentiation (no overflow check).
@@ -17238,7 +17605,7 @@ class CodeGen:
             return node.value
         if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
             val = self._try_constant_fold(node.operand)
-            if isinstance(val, (int, float)):
+            if isinstance(val, (int, float, complex)):
                 return -val
         if isinstance(node, ast.BinOp):
             left = self._try_constant_fold(node.left)
@@ -17307,6 +17674,12 @@ class CodeGen:
                 fv = self.builder.insert_value(fv, ir.Constant(i32, FPY_TAG_BIGINT), 0)
                 fv = self.builder.insert_value(fv, result_i64, 1)
                 return fv
+            # Complex negation: -c → complex_neg(c)
+            if self._is_complex_expr(node.operand):
+                operand = self._emit_expr_value(node.operand)
+                ptr = self.builder.inttoptr(operand, i8_ptr)
+                result = self.builder.call(self.runtime["complex_neg"], [ptr])
+                return self.builder.ptrtoint(result, i64)
             operand = self._emit_expr_value(node.operand)
             if isinstance(operand.type, ir.IntType):
                 return self.builder.neg(operand)
@@ -18201,9 +18574,7 @@ class CodeGen:
                 if len(node.args) == 1:
                     # Complex abs: |a+bi| = sqrt(a^2 + b^2)
                     arg_node = node.args[0]
-                    if (isinstance(arg_node, ast.Name)
-                            and arg_node.id in self.variables
-                            and self._var_kind(arg_node.id) == VKind.COMPLEX):
+                    if self._is_complex_expr(arg_node):
                         val = self._emit_expr_value(arg_node)
                         ptr = self.builder.inttoptr(val, i8_ptr)
                         return self.builder.call(

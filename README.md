@@ -57,22 +57,22 @@ An ABI version check at startup verifies the compiled-against Python version mat
 
 ## What's supported
 
-### Language features (66/66 audit, 405/405 tests, 94/94 regressions)
+### Language features (66/66 audit, 405/405 tests, 91/91 regressions)
 
 - **Core**: functions, classes, closures, decorators, generators, lambda, recursion, `*args`/`**kwargs`, default arguments, global/nonlocal, `@singledispatch` (native switch dispatch), first-class functions (function aliases, indirect calls, `__call__` dispatch)
 - **Control flow**: if/elif/else, for/while (with break/continue/else), try/except/finally/else, with, match/case, assert, raise/raise from
 - **OOP**: inheritance, multiple inheritance, super, `@staticmethod`, `@classmethod`, `@property` (get/set), nested classes, full metaclass support (`metaclass=`, `__new__`, `__init_subclass__`, `__class_getitem__`), `__slots__`
-- **Dunders**: `__add__`, `__sub__`, `__mul__`, `__neg__`, `__eq__`, `__lt__`, `__str__`, `__repr__`, `__getitem__`/`__setitem__`/`__delitem__`, `__len__`, `__bool__`, `__contains__`, `__iter__`/`__next__`, `__call__`, `__hash__`
+- **Dunders**: `__add__`, `__sub__`, `__mul__`, `__matmul__` (`@`), `__neg__`, `__eq__`, `__lt__`, `__str__`, `__repr__`, `__getitem__`/`__setitem__`/`__delitem__`, `__len__`, `__bool__`, `__contains__`, `__iter__`/`__next__`, `__call__`, `__hash__`
 - **Containers**: list, dict, tuple, set (O(1) hash-table-backed), frozenset, comprehensions (list/dict/set with filters), `{**a, **b}` unpacking, slice assignment
 - **Strings**: f-strings (with `=`, `!r`, format specs), all common methods (split, join, replace, strip, find, upper, lower, etc.), `%` formatting, `.format()`
 - **Generators**: yield, yield from, generator expressions, native send/close/throw (state-machine compilation)
 - **Async**: async def, await, `asyncio.run()`, `asyncio.gather()`, `asyncio.sleep()` — all compiled natively (sequential execution, no CPython bridge)
-- **Pattern matching**: match/case with literal, capture, guard, or, wildcard, sequence patterns
+- **Pattern matching**: match/case with literal, capture, guard, or, wildcard, sequence, singleton (None/True/False) patterns (missing: star/mapping/class patterns — see [UNIMPLEMENTED.md](UNIMPLEMENTED.md))
 - **Exceptions**: try/except/finally/else, except* (ExceptionGroup), bare raise, raise from
 - **Multi-file compilation**: `from mymodule import func` resolves local `.py` files and packages (`mylib/module.py`), compiles them inline. Recursive import resolution with circular import detection.
 - **Imports**: native math/json/os/asyncio, local `.py` modules compiled inline, `.pyd` modules via CPython bridge
 - **Builtins**: print, range, len, sorted (with key=, reverse=), min/max (with key=), int, float, str, bool, abs, sum, map, filter, enumerate, zip, isinstance, type, any, all, hash, next, iter, eval, exec, repr, pow, divmod, chr, ord, hex, oct, bin, round, dict, list, tuple, set, locals, globals, getattr/setattr/hasattr/delattr
-- **Type hints**: accepted and ignored (full compatibility with annotated code)
+- **Type hints**: accepted and ignored (full compatibility with annotated code). With `--typed`/`-T`, type annotations drive native LLVM code generation for annotated variables (skip FpyValue overhead). Annotations are validated: if any assignment in scope contradicts the declared type, the variable silently falls back to full box (with a compile-time warning). With `--typed --int64`, annotated `int` arithmetic uses LLVM overflow intrinsics (SIMD-friendly, no runtime calls)
 
 ### Threading
 
@@ -101,7 +101,7 @@ print(a.shape)           # works
 print(np.zeros(5))       # works
 ```
 
-Tested with: math (native), json, os, os.path, hashlib, datetime, re, collections, random, string, numpy. **104/104 stdlib `.py` files now compile successfully.**
+Tested with: math (native), json, os, os.path, hashlib, datetime, re, collections, random, string, numpy. **134/134 stdlib modules now compile successfully.**
 
 The `math` module is compiled natively (direct C libm calls, no Python runtime needed). All other modules route through an embedded CPython interpreter.
 
@@ -129,7 +129,7 @@ source.py  -->  ast.parse()  -->  CodeGen  -->  LLVM IR  -->  .obj  -->  .exe/.e
 | `runtime/threading.h/c` | Threading primitives: GIL, mutexes, TLS, per-object locks |
 | `runtime/objects.h` | Type definitions, tag constants, value constructors |
 | `runtime/build_runtime.sh` | Linux/macOS runtime build script (gcc/clang) |
-| `tests/` | Differential test suite (405 tests, compared against CPython) + 94 regression tests |
+| `tests/` | Differential test suite (405 tests, compared against CPython) + 91 regression tests |
 | `audit_features.py` | Python 3.14 feature coverage audit (66 features) |
 | `benchmarks/` | Performance benchmarks vs C++ and CPython |
 

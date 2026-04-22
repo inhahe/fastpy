@@ -3864,19 +3864,23 @@ double fpy_complex_abs(FpyComplex *a) {
 }
 
 void fpy_complex_print(FpyComplex *c) {
-    if (c->real == 0.0) {
+    if (c->real == 0.0 && !signbit(c->real)) {
         printf("%gj", c->imag);
-    } else {
+    } else if (c->imag >= 0.0 || c->imag != c->imag) {
         printf("(%g+%gj)", c->real, c->imag);
+    } else {
+        printf("(%g%gj)", c->real, c->imag);
     }
 }
 
 char* fpy_complex_to_str(FpyComplex *c) {
     char *buf = (char*)malloc(128);
-    if (c->real == 0.0) {
+    if (c->real == 0.0 && !signbit(c->real)) {
         snprintf(buf, 128, "%gj", c->imag);
-    } else {
+    } else if (c->imag >= 0.0 || c->imag != c->imag) {
         snprintf(buf, 128, "(%g+%gj)", c->real, c->imag);
+    } else {
+        snprintf(buf, 128, "(%g%gj)", c->real, c->imag);
     }
     return buf;
 }
