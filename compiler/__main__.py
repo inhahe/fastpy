@@ -89,7 +89,14 @@ def main() -> int:
         return 0
     else:
         for err in result.errors:
-            print(f"Error: {err}", file=sys.stderr)
+            msg = str(err)
+            # SyntaxError messages from traceback.format_exception_only()
+            # are already nicely formatted with source line + caret.
+            # Print them directly instead of prefixing with "Error:".
+            if msg.startswith(("SyntaxError:", "  File ")):
+                print(msg, file=sys.stderr)
+            else:
+                print(f"Error: {msg}", file=sys.stderr)
         return 1
 
 

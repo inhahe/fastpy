@@ -874,7 +874,8 @@ class CodeGen:
     """Generates LLVM IR from a Python AST."""
 
     def __init__(self, threading_mode: int = 0, int64_mode: bool = False,
-                 typed_mode: bool = False) -> None:
+                 typed_mode: bool = False,
+                 source_filename: str = "<module>") -> None:
         self._current_scope_stmts = []  # Phase 4: initialize early
         self.module = ir.Module(name="fastpy_module")
         # Use the host platform's LLVM triple and data layout for correct
@@ -893,6 +894,7 @@ class CodeGen:
         # Typed mode: use type annotations (int, float, bool, str) for fast-path
         # code generation — annotated vars use native LLVM types instead of FpyValue.
         self._typed_mode = typed_mode
+        self._source_filename = source_filename
         # Per-function dict mapping variable name → (native_alloca, VKind).
         # Populated from function parameter annotations and AnnAssign statements
         # when _typed_mode is True.  Variables in this dict bypass the FpyValue
@@ -969,6 +971,13 @@ class CodeGen:
         # assignments in the same scope.  Pre-scanned before codegen so the
         # AnnAssign handler can skip native alloca creation for them.
         self._unsafe_typed_vars: set[str] = set()
+
+        # Per-variable integer overflow policy from Annotated markers or
+        # constructor calls (unchecked_int / checked_int).
+        # Maps variable name → "unchecked" | "checked".
+        # "unchecked": raw LLVM add/sub/mul, no overflow detection
+        # "checked":   LLVM overflow intrinsics, OverflowError (no BigInt)
+        self._int_mode_vars: dict[str, str] = {}
 
         # Pre-scanned list element types from append() analysis
         # Maps variable name -> inferred element type (e.g. "list", "str", "obj")
@@ -1834,6 +1843,24 @@ class CodeGen:
         self.runtime["exc_set_group_inner"] = ir.Function(self.module, ft, name="fastpy_exc_set_group_inner")
         ft = ir.FunctionType(i32, [])
         self.runtime["exc_get_group_inner"] = ir.Function(self.module, ft, name="fastpy_exc_get_group_inner")
+        # Shadow call stack for runtime tracebacks
+        # void fpy_shadow_push(const char *func, const char *file, i32 line)
+        ft = ir.FunctionType(void, [i8_ptr, i8_ptr, i32])
+        self.runtime["shadow_push"] = ir.Function(self.module, ft, name="fpy_shadow_push")
+        # void fpy_shadow_pop(void)
+        ft = ir.FunctionType(void, [])
+        self.runtime["shadow_pop"] = ir.Function(self.module, ft, name="fpy_shadow_pop")
+        # void fpy_shadow_update_line(i32 line)
+        ft = ir.FunctionType(void, [i32])
+        self.runtime["shadow_update_line"] = ir.Function(self.module, ft, name="fpy_shadow_update_line")
+        # void fpy_shadow_set_arg(i32 index, const char *name, i32 tag, i64 data)
+        ft = ir.FunctionType(void, [i32, i8_ptr, i32, i64])
+        self.runtime["shadow_set_arg"] = ir.Function(self.module, ft, name="fpy_shadow_set_arg")
+        # Global variable for current line (written by compiler, read by raise)
+        self._shadow_line_global = ir.GlobalVariable(
+            self.module, i32, name="fpy_current_line")
+        self._shadow_line_global.linkage = "external"
+
         # Reference counting: tag-dispatching incref/decref
         ft = ir.FunctionType(void, [i32, i64])
         self.runtime["rc_incref"] = ir.Function(self.module, ft, name="fpy_rc_incref")
@@ -2564,11 +2591,18 @@ class CodeGen:
                     self.runtime["cpython_exec_get"], [source_ptr, name_ptr])
                 self._store_variable(base_name, func_ptr, "pyobj")
 
+        # Push shadow frame for module-level code
+        main_name_ptr = self._make_string_constant("<module>")
+        main_file_ptr = self._make_string_constant(self._source_filename)
+        self.builder.call(self.runtime["shadow_push"],
+                          [main_name_ptr, main_file_ptr, ir.Constant(i32, 1)])
+
         for node in tree.body:
             if not isinstance(node, (ast.FunctionDef, ast.ClassDef)):
                 self._emit_stmt(node)
 
         if not self.builder.block.is_terminated:
+            self.builder.call(self.runtime["shadow_pop"], [])
             self.builder.ret_void()
 
         return str(self.module)
@@ -5277,7 +5311,7 @@ class CodeGen:
                  self._dict_var_dict_values, self._dict_var_obj_values,
                  self._dict_var_key_types,
                  self._obj_var_class, self._native_vars,
-                 self._unsafe_typed_vars)
+                 self._unsafe_typed_vars, self._int_mode_vars)
 
         # Set up function state
         self.function = info.func
@@ -5293,6 +5327,7 @@ class CodeGen:
         self._dict_var_obj_values = set()
         self._dict_var_key_types = {}
         self._obj_var_class = {}
+        self._int_mode_vars = {}
         # Pre-scan for typed annotations contradicted by later assignments
         if self._typed_mode:
             self._unsafe_typed_vars = self._scan_unsafe_typed_vars(node.body)
@@ -5456,6 +5491,17 @@ class CodeGen:
                 pname = ast_arg.arg
                 if pname not in self.variables:
                     continue
+                # Extract Annotated markers for int overflow policy
+                if ast_arg.annotation is not None and kind == VKind.INT:
+                    _, markers = self._unwrap_annotated(ast_arg.annotation)
+                    if 'Unchecked32' in markers:
+                        self._int_mode_vars[pname] = 'unchecked32'
+                    elif 'Checked32' in markers:
+                        self._int_mode_vars[pname] = 'checked32'
+                    elif 'Unchecked' in markers:
+                        self._int_mode_vars[pname] = 'unchecked'
+                    elif 'Checked' in markers:
+                        self._int_mode_vars[pname] = 'checked'
                 # The parameter is already stored as FpyValue in self.variables.
                 # Create a native-type alloca and add a guard + unbox.
                 alloca, _tag = self.variables[pname]
@@ -5482,6 +5528,35 @@ class CodeGen:
                 # Update self.variables so _emit_expr sees the correct VKind
                 self.variables[pname] = (native_alloca, ValueType(kind))
 
+        # --typed mode: container parameter annotations (list[int], dict[str, int], etc.)
+        # Don't create native allocas — just override the type tag with element info.
+        if self._typed_mode and info.uses_fv_abi:
+            ast_params = list(node.args.args)
+            for _pidx, ast_arg in enumerate(ast_params):
+                container_tag = self._parse_container_annotation(ast_arg.annotation)
+                if container_tag is None:
+                    continue
+                pname = ast_arg.arg
+                if pname not in self.variables or pname in self._native_vars:
+                    continue
+                alloca, _ = self.variables[pname]
+                self.variables[pname] = (alloca, container_tag)
+                # Dict value type tracking: extract from annotation node
+                if (container_tag == "dict"
+                        and isinstance(ast_arg.annotation, ast.Subscript)
+                        and isinstance(ast_arg.annotation.slice, ast.Tuple)
+                        and len(ast_arg.annotation.slice.elts) == 2):
+                    val_kind = self._parse_annotation(ast_arg.annotation.slice.elts[1])
+                    if val_kind == VKind.INT:
+                        self._dict_var_int_values.add(pname)
+                    val_nested = self._parse_container_annotation(
+                        ast_arg.annotation.slice.elts[1])
+                    if val_nested is not None:
+                        if val_nested.startswith("list"):
+                            self._dict_var_list_values.add(pname)
+                        elif val_nested == "dict":
+                            self._dict_var_dict_values.add(pname)
+
         # Phase 4: set up function aliases for parameters that received
         # function references at call sites. E.g., apply(add, 5, 6) where
         # add is a user function → alias param[0] ("func") to "add".
@@ -5498,11 +5573,58 @@ class CodeGen:
             gen_list = self.builder.call(self.runtime["list_new"], [])
             self._gen_list = gen_list  # store for yield emission
 
+        # Push shadow stack frame for traceback
+        func_name_ptr = self._make_string_constant(effective_name)
+        file_name_ptr = self._make_string_constant(self._source_filename)
+        start_line = ir.Constant(i32, node.lineno if hasattr(node, 'lineno') else 0)
+        self.builder.call(self.runtime["shadow_push"],
+                          [func_name_ptr, file_name_ptr, start_line])
+
+        # Register function arguments in shadow frame for traceback debugging.
+        # Only the first 8 parameters are tracked (FPY_SHADOW_MAX_ARGS).
+        ast_params = list(node.args.args)
+        for _arg_idx, _ast_arg in enumerate(ast_params):
+            if _arg_idx >= 8:
+                break
+            _arg_name = _ast_arg.arg
+            if _arg_name not in self.variables:
+                continue
+            try:
+                _alloca, _tag = self.variables[_arg_name]
+                _arg_name_ptr = self._make_string_constant(_arg_name)
+                _loaded = self.builder.load(_alloca)
+                if isinstance(_loaded.type, ir.LiteralStructType):
+                    # FpyValue struct {i32 tag, i64 data}
+                    _atag = self.builder.extract_value(_loaded, 0)
+                    _adata = self.builder.extract_value(_loaded, 1)
+                elif isinstance(_loaded.type, ir.DoubleType):
+                    _atag = ir.Constant(i32, 1)   # FPY_TAG_FLOAT
+                    _adata = self.builder.bitcast(_loaded, i64)
+                elif isinstance(_loaded.type, ir.IntType):
+                    _atag = ir.Constant(i32, 0)   # FPY_TAG_INT
+                    if _loaded.type.width < 64:
+                        _adata = self.builder.zext(_loaded, i64)
+                    elif _loaded.type.width > 64:
+                        _adata = self.builder.trunc(_loaded, i64)
+                    else:
+                        _adata = _loaded
+                elif isinstance(_loaded.type, ir.PointerType):
+                    _atag = ir.Constant(i32, 2)   # FPY_TAG_STR (guess)
+                    _adata = self.builder.ptrtoint(_loaded, i64)
+                else:
+                    continue  # skip exotic types
+                self.builder.call(self.runtime["shadow_set_arg"],
+                                  [ir.Constant(i32, _arg_idx), _arg_name_ptr,
+                                   _atag, _adata])
+            except Exception:
+                pass  # best-effort: skip if anything goes wrong
+
         # Emit function body
         self._emit_stmts(node.body)
 
-        # Add implicit return if needed
+        # Pop shadow stack before implicit return
         if not self.builder.block.is_terminated:
+            self.builder.call(self.runtime["shadow_pop"], [])
             if is_gen:
                 # Generator: return the collected list
                 ret_ty = info.func.return_value.type
@@ -5530,7 +5652,7 @@ class CodeGen:
          self._dict_var_dict_values, self._dict_var_obj_values,
          self._dict_var_key_types,
          self._obj_var_class, self._native_vars,
-         self._unsafe_typed_vars) = saved
+         self._unsafe_typed_vars, self._int_mode_vars) = saved
 
     # -----------------------------------------------------------------
     # Class support
@@ -8534,6 +8656,16 @@ class CodeGen:
 
     def _emit_stmt(self, node: ast.stmt) -> None:
         """Emit LLVM IR for a statement."""
+        # Update current line number for traceback accuracy.
+        # Uses a direct store to a non-TLS global (read by fastpy_raise
+        # to update the top shadow frame before snapshotting).
+        # NOTE: we use a store instead of calling fpy_shadow_update_line
+        # because adding a function call before every statement disrupts
+        # LLVM's optimizer in certain control flow patterns (closures +
+        # exception handling combinations).
+        if hasattr(node, 'lineno') and node.lineno:
+            self.builder.store(ir.Constant(i32, node.lineno),
+                               self._shadow_line_global)
         # Yield statements: must come before generic Expr handler
         if (isinstance(node, ast.Expr)
                 and isinstance(node.value, ast.Yield)):
@@ -8602,9 +8734,21 @@ class CodeGen:
             if (self._typed_mode
                     and node.annotation is not None
                     and isinstance(node.target, ast.Name)):
+                # Extract Annotated markers (Unchecked, Checked, etc.)
+                _, markers = self._unwrap_annotated(node.annotation)
                 kind = self._parse_annotation(node.annotation)
                 if kind is not None and kind in self._VKIND_TO_LLVM:
                     varname = node.target.id
+                    # Record int overflow policy from markers
+                    if kind == VKind.INT:
+                        if 'Unchecked32' in markers:
+                            self._int_mode_vars[varname] = 'unchecked32'
+                        elif 'Checked32' in markers:
+                            self._int_mode_vars[varname] = 'checked32'
+                        elif 'Unchecked' in markers:
+                            self._int_mode_vars[varname] = 'unchecked'
+                        elif 'Checked' in markers:
+                            self._int_mode_vars[varname] = 'checked'
                     # Skip native alloca if pre-scan found contradicting assignments
                     if varname in self._unsafe_typed_vars:
                         import sys
@@ -8623,6 +8767,49 @@ class CodeGen:
                         fake = ast.Assign(targets=[node.target], value=node.value)
                         ast.copy_location(fake, node)
                         self._emit_assign(fake)
+                    return
+                # Container annotations: list[int], dict[str, int], etc.
+                # No native alloca — just process the assignment normally,
+                # then override the type tag with annotated element type info.
+                container_tag = self._parse_container_annotation(node.annotation)
+                if container_tag is not None:
+                    varname = node.target.id
+                    if varname in self._unsafe_typed_vars:
+                        import sys
+                        print(f"fastpy: warning: ignoring type annotation for "
+                              f"'{varname}' (contradicted by assignment in scope)",
+                              file=sys.stderr)
+                        if node.value is not None:
+                            fake = ast.Assign(targets=[node.target], value=node.value)
+                            ast.copy_location(fake, node)
+                            self._emit_assign(fake)
+                        return
+                    if node.value is not None:
+                        fake = ast.Assign(targets=[node.target], value=node.value)
+                        ast.copy_location(fake, node)
+                        self._emit_assign(fake)
+                    # Override type tag with annotation-provided element type
+                    if varname in self.variables:
+                        alloca, _ = self.variables[varname]
+                        self.variables[varname] = (alloca, container_tag)
+                    # Dict value type tracking: extract from annotation node
+                    if (container_tag == "dict"
+                            and isinstance(node.annotation, ast.Subscript)
+                            and isinstance(node.annotation.slice, ast.Tuple)
+                            and len(node.annotation.slice.elts) == 2):
+                        val_kind = self._parse_annotation(node.annotation.slice.elts[1])
+                        _vk_map = {VKind.INT: "int", VKind.STR: "str",
+                                   VKind.FLOAT: "float"}
+                        val_tag = _vk_map.get(val_kind)
+                        if val_tag == "int":
+                            self._dict_var_int_values.add(varname)
+                        val_nested = self._parse_container_annotation(
+                            node.annotation.slice.elts[1])
+                        if val_nested is not None:
+                            if val_nested.startswith("list"):
+                                self._dict_var_list_values.add(varname)
+                            elif val_nested == "dict":
+                                self._dict_var_dict_values.add(varname)
                     return
             # Non-typed or unrecognized annotation → treat as regular assignment
             if node.value is not None and node.target is not None:
@@ -8735,6 +8922,37 @@ class CodeGen:
                 and isinstance(node.value, ast.Constant)
                 and node.value.value is ...):
             self._ellipsis_vars.add(node.targets[0].id)
+
+        # Track unchecked_int() / checked_int() / *_int32() constructor calls
+        _INT_CONSTRUCTORS = {
+            'unchecked_int': 'unchecked',
+            'checked_int': 'checked',
+            'unchecked_int32': 'unchecked32',
+            'checked_int32': 'checked32',
+        }
+        if (len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+                and isinstance(node.value, ast.Call)
+                and isinstance(node.value.func, ast.Name)
+                and node.value.func.id in _INT_CONSTRUCTORS):
+            varname = node.targets[0].id
+            mode = _INT_CONSTRUCTORS[node.value.func.id]
+            self._int_mode_vars[varname] = mode
+            # Evaluate the argument (or default 0) and store as int
+            if node.value.args:
+                value = self._emit_expr_value(node.value.args[0])
+            else:
+                value = ir.Constant(i64, 0)
+            if isinstance(value.type, ir.PointerType):
+                value = self.builder.ptrtoint(value, i64)
+            elif isinstance(value.type, ir.DoubleType):
+                value = self.builder.fptosi(value, i64)
+            # For i32 modes, truncate to 32-bit range and sign-extend back
+            if mode.endswith('32'):
+                value = self.builder.sext(
+                    self.builder.trunc(value, ir.IntType(32)), i64)
+            self._store_variable(varname, value, "int")
+            return
 
         # CPython module attribute or method result: use _load_or_wrap_fv
         # to get a proper FpyValue with the runtime tag from the bridge.
@@ -11004,20 +11222,107 @@ class CodeGen:
         VKind.STR: FPY_TAG_STR,
     }
 
+    @staticmethod
+    def _unwrap_annotated(node: ast.expr) -> tuple[ast.expr, set[str]]:
+        """Unwrap ``Annotated[T, Marker1, ...]`` into (T, {marker names}).
+
+        If *node* is not an ``Annotated`` subscript, returns ``(node, set())``.
+        Marker names are collected from ``ast.Name`` nodes in positions [1:].
+        """
+        if (isinstance(node, ast.Subscript)
+                and isinstance(node.value, ast.Name)
+                and node.value.id == 'Annotated'
+                and isinstance(node.slice, ast.Tuple)
+                and len(node.slice.elts) >= 2):
+            base_type = node.slice.elts[0]
+            markers = set()
+            for m in node.slice.elts[1:]:
+                if isinstance(m, ast.Name):
+                    markers.add(m.id)
+            return base_type, markers
+        return node, set()
+
     def _parse_annotation(self, node: ast.expr | None) -> VKind | None:
         """Parse a Python type annotation AST node into a VKind.
 
         Returns None for annotations we don't optimize (complex types,
         typing module constructs, user classes, etc.).  Only simple
         builtin type names are recognized: int, float, bool, str.
+        Transparently unwraps ``Annotated[T, ...]`` to T.
         """
         if node is None:
             return None
+        # Unwrap Annotated[T, ...] → T
+        node, _ = self._unwrap_annotated(node)
         if isinstance(node, ast.Name):
             return self._ANNOTATION_TO_VKIND.get(node.id)
         if isinstance(node, ast.Constant) and node.value is None:
             return VKind.NONE
-        # typing.Optional, Union, list[int], etc. — not handled yet
+        return None
+
+    def _parse_container_annotation(self, node: ast.expr | None) -> str | None:
+        """Parse a container type annotation into a type tag string.
+
+        Handles ``list[int]``, ``List[str]``, ``dict[str, int]``, ``set[int]``,
+        ``tuple[int, ...]``, and their ``typing`` module equivalents.
+        Transparently unwraps ``Annotated[list[int], ...]`` to ``list[int]``.
+        Returns tag strings like ``'list:int'``, ``'list:str'``,
+        ``'dict'``, ``'set'``, ``'tuple'``, or None if not a container
+        annotation.
+        """
+        if node is None:
+            return None
+        # Unwrap Annotated[container[T], ...] → container[T]
+        node, _ = self._unwrap_annotated(node)
+
+        # Bare container name without subscript: list, dict, set, tuple
+        if isinstance(node, ast.Name):
+            if node.id in ('list', 'List'):
+                return "list:int"
+            if node.id in ('dict', 'Dict'):
+                return "dict"
+            if node.id in ('set', 'Set'):
+                return "set"
+            if node.id in ('tuple', 'Tuple'):
+                return "tuple"
+            return None
+
+        # Subscripted: list[int], dict[str, int], etc.
+        if not isinstance(node, ast.Subscript):
+            return None
+        if not isinstance(node.value, ast.Name):
+            return None
+
+        container = node.value.id
+        _kind_to_tag = {
+            VKind.INT: "int", VKind.FLOAT: "float",
+            VKind.STR: "str", VKind.BOOL: "bool",
+        }
+
+        if container in ('list', 'List'):
+            # list[int], list[str], list[float], list[list[int]], ...
+            elem_kind = self._parse_annotation(node.slice)
+            if elem_kind is not None:
+                return f"list:{_kind_to_tag.get(elem_kind, 'int')}"
+            # Nested container: list[list[int]], list[dict[str, int]]
+            nested = self._parse_container_annotation(node.slice)
+            if nested is not None:
+                base = nested.split(":")[0]
+                return f"list:{base}"
+            return "list:int"
+
+        if container in ('dict', 'Dict'):
+            # dict[K, V] — value type tracked via _dict_var_* sets,
+            # NOT via the tag string (codegen checks == "dict" everywhere).
+            # Return "dict" as tag; callers populate _dict_var_* from slice.
+            return "dict"
+
+        if container in ('set', 'Set'):
+            return "set"
+
+        if container in ('tuple', 'Tuple'):
+            return "tuple"
+
         return None
 
     @staticmethod
@@ -11074,6 +11379,18 @@ class CodeGen:
                 kind = self._parse_annotation(stmt.annotation)
                 if kind is not None and kind in self._VKIND_TO_LLVM:
                     annotated[stmt.target.id] = kind
+                else:
+                    # Container annotations: list[int], dict[str, int], etc.
+                    container_tag = self._parse_container_annotation(stmt.annotation)
+                    if container_tag is not None:
+                        if container_tag.startswith("list"):
+                            annotated[stmt.target.id] = VKind.LIST
+                        elif container_tag.startswith("dict"):
+                            annotated[stmt.target.id] = VKind.DICT
+                        elif container_tag.startswith("set"):
+                            annotated[stmt.target.id] = VKind.SET
+                        elif container_tag.startswith("tuple"):
+                            annotated[stmt.target.id] = VKind.TUPLE
 
         if not annotated:
             return set()
@@ -12254,7 +12571,9 @@ class CodeGen:
                         "tempfile", "heapq", "bisect", "traceback",
                         "pprint", "unittest", "argparse",
                         # Batch: common imports that use CPython bridge or are no-ops
-                        "decimal", "platform", "secrets"}
+                        "decimal", "platform", "secrets",
+                        # fastpy shim package: markers are compile-time only
+                        "fastpy"}
 
     # Native math constants
     _MATH_CONSTANTS = {
@@ -13200,6 +13519,9 @@ class CodeGen:
             # statement will catch it. If not, early-return so the caller
             # can check the exception flag.
             if not self._in_try_block:
+                # Pop shadow frame before early return (traceback already
+                # snapshotted by fastpy_raise above)
+                self.builder.call(self.runtime["shadow_pop"], [])
                 ret_type = self.function.return_value.type
                 if isinstance(ret_type, ir.VoidType):
                     self.builder.ret_void()
@@ -13221,6 +13543,7 @@ class CodeGen:
             msg = self._make_string_constant("")
             self.builder.call(self.runtime["raise"], [exc_id, msg])
             if not self._in_try_block:
+                self.builder.call(self.runtime["shadow_pop"], [])
                 ret_type = self.function.return_value.type
                 if isinstance(ret_type, ir.VoidType):
                     self.builder.ret_void()
@@ -13300,6 +13623,9 @@ class CodeGen:
                 self._finally_stack = saved_stack
                 if self.builder.block.is_terminated:
                     return  # finally block unconditionally terminated
+
+        # Pop shadow stack before returning
+        self.builder.call(self.runtime["shadow_pop"], [])
 
         # Scope cleanup: decref all locals except the return value
         ret_var_name = None
@@ -17332,11 +17658,185 @@ class CodeGen:
         self._emit_list_append_value(args_list, tv.val)
         return args_list
 
+    def _get_int_mode_for_binop(self, node: ast.BinOp) -> str | None:
+        """Return per-variable int mode for a BinOp, if any operand has one.
+
+        Checks both operands of the BinOp against ``_int_mode_vars``.
+        Returns one of ``"unchecked"``, ``"checked"``, ``"unchecked32"``,
+        ``"checked32"``, or ``None`` (use default).
+
+        Priority (most specific / narrowest wins):
+        ``unchecked32`` > ``checked32`` > ``unchecked`` > ``checked``.
+        Within the same width, unchecked wins over checked (the user
+        explicitly opted into raw arithmetic).
+        """
+        modes: set[str] = set()
+        for operand in (node.left, node.right):
+            if isinstance(operand, ast.Name) and operand.id in self._int_mode_vars:
+                modes.add(self._int_mode_vars[operand.id])
+        if "unchecked32" in modes:
+            return "unchecked32"
+        if "checked32" in modes:
+            return "checked32"
+        if "unchecked" in modes:
+            return "unchecked"
+        if "checked" in modes:
+            return "checked"
+        return None
+
+    def _emit_unchecked_int_op(
+        self, op: ast.operator, left: ir.Value, right: ir.Value,
+    ) -> ir.Value:
+        """Emit raw integer arithmetic with no overflow checks.
+
+        Used for variables marked with ``Unchecked`` / ``unchecked_int()``.
+        Wraps silently on overflow (C / two's-complement semantics).
+        """
+        if isinstance(op, ast.Add):
+            return self.builder.add(left, right)
+        elif isinstance(op, ast.Sub):
+            return self.builder.sub(left, right)
+        elif isinstance(op, ast.Mult):
+            return self.builder.mul(left, right)
+        elif isinstance(op, ast.Pow):
+            return self._emit_raw_ipow(left, right)
+        # Unreachable for the ops we gate on, but be safe.
+        return self.builder.add(left, right)
+
+    # ── 32-bit integer arithmetic ────────────────────────────────────
+
+    def _emit_unchecked_int32_op(
+        self, op: ast.operator, left: ir.Value, right: ir.Value,
+    ) -> ir.Value:
+        """Emit raw 32-bit integer arithmetic with no overflow checks.
+
+        Truncates i64 operands to i32, performs the operation, and
+        sign-extends the result back to i64.  Wraps silently at the
+        32-bit boundary (two's-complement).
+        """
+        i32_ty = ir.IntType(32)
+        left32 = self.builder.trunc(left, i32_ty)
+        right32 = self.builder.trunc(right, i32_ty)
+        if isinstance(op, ast.Add):
+            result32 = self.builder.add(left32, right32)
+        elif isinstance(op, ast.Sub):
+            result32 = self.builder.sub(left32, right32)
+        elif isinstance(op, ast.Mult):
+            result32 = self.builder.mul(left32, right32)
+        elif isinstance(op, ast.Pow):
+            # Compute in i64, then truncate to i32 (wrapping)
+            result64 = self._emit_raw_ipow(left, right)
+            return self.builder.sext(self.builder.trunc(result64, i32_ty), i64)
+        else:
+            result32 = self.builder.add(left32, right32)
+        return self.builder.sext(result32, i64)
+
+    def _emit_intrinsic_overflow_op_i32(
+        self, intrinsic_name: str,
+        left32: ir.Value, right32: ir.Value,
+    ) -> ir.Value:
+        """Emit an overflow-checked i32 op using an LLVM intrinsic.
+
+        Like ``_emit_intrinsic_overflow_op`` but for 32-bit operands.
+        Returns i64 (sign-extended from the i32 result).
+        """
+        i1 = ir.IntType(1)
+        i32_ty = ir.IntType(32)
+        ovf_struct = ir.LiteralStructType([i32_ty, i1])
+        fn_ty = ir.FunctionType(ovf_struct, [i32_ty, i32_ty])
+
+        try:
+            fn = self.module.globals[intrinsic_name]
+        except KeyError:
+            fn = ir.Function(self.module, fn_ty, name=intrinsic_name)
+
+        result_struct = self.builder.call(fn, [left32, right32])
+        value32 = self.builder.extract_value(result_struct, 0)
+        overflowed = self.builder.extract_value(result_struct, 1)
+
+        overflow_block = self._new_block("intrinsic_ovf32.err")
+        ok_block = self._new_block("intrinsic_ovf32.ok")
+        self.builder.cbranch(overflowed, overflow_block, ok_block)
+
+        self.builder.position_at_end(overflow_block)
+        exc_name = self._make_string_constant("OverflowError")
+        exc_id = self.builder.call(self.runtime["exc_name_to_id"], [exc_name])
+        msg = self._make_string_constant("integer overflow (i32)")
+        self.builder.call(self.runtime["raise"], [exc_id, msg])
+        self.builder.branch(ok_block)
+
+        self.builder.position_at_end(ok_block)
+        return self.builder.sext(value32, i64)
+
+    def _emit_checked_int32_op(
+        self, op: ast.operator, left: ir.Value, right: ir.Value,
+    ) -> ir.Value:
+        """Emit checked 32-bit integer arithmetic (OverflowError on overflow).
+
+        Truncates i64 operands to i32, uses LLVM i32 overflow intrinsics
+        for add/sub/mul, and sign-extends the result back to i64.
+        """
+        i32_ty = ir.IntType(32)
+        left32 = self.builder.trunc(left, i32_ty)
+        right32 = self.builder.trunc(right, i32_ty)
+
+        intrinsic = {
+            ast.Add: "llvm.sadd.with.overflow.i32",
+            ast.Sub: "llvm.ssub.with.overflow.i32",
+            ast.Mult: "llvm.smul.with.overflow.i32",
+        }.get(type(op))
+        if intrinsic is not None:
+            return self._emit_intrinsic_overflow_op_i32(
+                intrinsic, left32, right32)
+
+        # Pow: compute in i64 and range-check to i32
+        if isinstance(op, ast.Pow):
+            result = self._emit_checked_int_op(
+                op, left, right, force_overflow_error=True)
+            i32_max = ir.Constant(i64, 2147483647)
+            i32_min = ir.Constant(i64, -2147483648)
+            too_big = self.builder.icmp_signed(">", result, i32_max)
+            too_small = self.builder.icmp_signed("<", result, i32_min)
+            out_of_range = self.builder.or_(too_big, too_small)
+            overflow_block = self._new_block("checked32_pow.err")
+            ok_block = self._new_block("checked32_pow.ok")
+            self.builder.cbranch(out_of_range, overflow_block, ok_block)
+            self.builder.position_at_end(overflow_block)
+            exc_name = self._make_string_constant("OverflowError")
+            exc_id = self.builder.call(
+                self.runtime["exc_name_to_id"], [exc_name])
+            msg = self._make_string_constant("integer overflow (i32)")
+            self.builder.call(self.runtime["raise"], [exc_id, msg])
+            self.builder.branch(ok_block)
+            self.builder.position_at_end(ok_block)
+            return result
+
+        # Fallback (shouldn't reach)
+        return self.builder.sext(self.builder.add(left32, right32), i64)
+
     def _emit_int_binop(
         self, op: ast.operator, left: ir.Value, right: ir.Value, node: ast.AST
     ) -> ir.Value:
         """Emit an integer binary operation."""
         if isinstance(op, (ast.Add, ast.Sub, ast.Mult, ast.Pow)):
+            # ── Per-variable int mode (Annotated markers / constructors) ──
+            mode = None
+            if isinstance(node, ast.BinOp):
+                mode = self._get_int_mode_for_binop(node)
+            elif isinstance(node, ast.AugAssign):
+                # x += 1 — check the target variable's mode
+                if (isinstance(node.target, ast.Name)
+                        and node.target.id in self._int_mode_vars):
+                    mode = self._int_mode_vars[node.target.id]
+            if mode == "unchecked":
+                return self._emit_unchecked_int_op(op, left, right)
+            elif mode == "checked":
+                return self._emit_checked_int_op(
+                    op, left, right, force_overflow_error=True)
+            elif mode == "unchecked32":
+                return self._emit_unchecked_int32_op(op, left, right)
+            elif mode == "checked32":
+                return self._emit_checked_int32_op(op, left, right)
             return self._emit_checked_int_op(op, left, right)
         elif isinstance(op, ast.FloorDiv):
             return self._emit_python_floordiv(left, right)
@@ -17402,15 +17902,23 @@ class CodeGen:
         return self.builder.select(needs_adjust, adjusted, r)
 
     def _emit_checked_int_op(self, op: ast.operator,
-                              left: ir.Value, right: ir.Value) -> ir.Value:
+                              left: ir.Value, right: ir.Value,
+                              force_overflow_error: bool = False) -> ir.Value:
         """Emit overflow-checked integer arithmetic.
         On overflow: promotes to BigInt (default) or raises OverflowError (--int64).
-        Returns i64 (for small results) or i64 (BigInt pointer cast, tagged BIGINT)."""
-        # --typed --int64: use LLVM overflow intrinsics — no BigInt fallback,
-        # no runtime function calls, SIMD-vectorisable by LLVM.  Still raises
-        # OverflowError on overflow (safe), but avoids the checked_* runtime
-        # functions and their BigInt allocation paths.
-        if self._typed_mode and self._int64_mode:
+        Returns i64 (for small results) or i64 (BigInt pointer cast, tagged BIGINT).
+
+        When *force_overflow_error* is True (per-variable ``Checked`` mode),
+        the intrinsic / OverflowError path is used regardless of the global
+        ``--int64`` flag — equivalent to ``--typed --int64`` for this one op.
+        """
+        # --typed --int64 (or per-variable Checked): use LLVM overflow
+        # intrinsics — no BigInt fallback, no runtime function calls,
+        # SIMD-vectorisable by LLVM.  Still raises OverflowError on
+        # overflow (safe), but avoids the checked_* runtime functions and
+        # their BigInt allocation paths.
+        use_intrinsics = (self._typed_mode and self._int64_mode) or force_overflow_error
+        if use_intrinsics:
             intrinsic = {
                 ast.Add: "llvm.sadd.with.overflow.i64",
                 ast.Sub: "llvm.ssub.with.overflow.i64",
@@ -17419,8 +17927,8 @@ class CodeGen:
             if intrinsic is not None:
                 return self._emit_intrinsic_overflow_op(intrinsic, left, right)
             # Pow: fall through to runtime checked_pow (intrinsic not
-            # available for exponentiation; the existing --int64 OverflowError
-            # path handles it correctly).
+            # available for exponentiation; the OverflowError path below
+            # handles it correctly).
 
         op_map = {
             ast.Add: "checked_add",
@@ -17447,8 +17955,8 @@ class CodeGen:
         is_big = self.builder.icmp_unsigned(
             "!=", big_ptr, ir.Constant(i8_ptr, None))
 
-        if self._int64_mode:
-            # --int64 mode: raise OverflowError instead of promoting
+        if self._int64_mode or force_overflow_error:
+            # --int64 / per-variable Checked: raise OverflowError
             overflow_block = self._new_block("overflow.err")
             ok_block = self._new_block("overflow.ok")
             self.builder.cbranch(is_big, overflow_block, ok_block)
@@ -17458,7 +17966,10 @@ class CodeGen:
             exc_id = self.builder.call(self.runtime["exc_name_to_id"], [exc_name])
             msg = self._make_string_constant("integer overflow")
             self.builder.call(self.runtime["raise"], [exc_id, msg])
-            self.builder.unreachable()
+            # fastpy_raise sets the exception flag and returns — branch
+            # to ok_block so execution continues.  The statement-level
+            # exc_pending() check will catch the flag.
+            self.builder.branch(ok_block)
 
             self.builder.position_at_end(ok_block)
             return result
@@ -17508,7 +18019,11 @@ class CodeGen:
         exc_id = self.builder.call(self.runtime["exc_name_to_id"], [exc_name])
         msg = self._make_string_constant("integer overflow")
         self.builder.call(self.runtime["raise"], [exc_id, msg])
-        self.builder.unreachable()
+        # fastpy_raise sets the exception flag and returns — branch to
+        # ok_block so execution continues with the truncated value.  The
+        # statement-level exc_pending() check will catch the flag and
+        # route to the except handler.
+        self.builder.branch(ok_block)
 
         self.builder.position_at_end(ok_block)
         return value

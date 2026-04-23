@@ -15,12 +15,19 @@ void fastpy_obj_write(FpyObj *obj);
 
 /* External exception-raising API (defined in runtime.c) */
 extern void fastpy_raise(int exc_type, const char *msg);
+extern int fastpy_exc_pending(void);
 
 /* Exception type constants (mirror runtime.c) */
+#define FPY_EXC_ZERODIVISION   1
 #define FPY_EXC_VALUEERROR     2
 #define FPY_EXC_TYPEERROR      3
 #define FPY_EXC_INDEXERROR     4
 #define FPY_EXC_KEYERROR       5
+#define FPY_EXC_ATTRIBUTEERROR 11
+
+/* Thread-local buffer for formatted error messages. Only one exception
+ * can be pending per thread, so a single buffer is safe. */
+static FPY_THREAD_LOCAL char _err_buf[256];
 
 /* --- List operations --- */
 
@@ -260,8 +267,8 @@ void fpy_list_append(FpyList *list, FpyValue value) {
 FpyValue fpy_list_get(FpyList *list, int64_t index) {
     if (index < 0) index += list->length;
     if (index < 0 || index >= list->length) {
-        fprintf(stderr, "IndexError: list index out of range\n");
-        exit(1);
+        fastpy_raise(FPY_EXC_INDEXERROR, "list index out of range");
+        FpyValue _err = {0}; return _err;
     }
     return list->items[index];
 }
@@ -271,8 +278,8 @@ void fpy_list_set(FpyList *list, int64_t index, FpyValue value) {
     if (index < 0) index += list->length;
     if (index < 0 || index >= list->length) {
         FPY_UNLOCK(list);
-        fprintf(stderr, "IndexError: list assignment index out of range\n");
-        exit(1);
+        fastpy_raise(FPY_EXC_INDEXERROR, "list assignment index out of range");
+        return;
     }
     FPY_VAL_DECREF(list->items[index]);
     FPY_VAL_INCREF(value);
@@ -791,7 +798,7 @@ FpyList* fastpy_list_slice(FpyList *list, int64_t start, int64_t stop,
 FpyList* fastpy_list_slice_step(FpyList *list, int64_t start, int64_t stop,
                                 int64_t step, int64_t has_start, int64_t has_stop) {
     int64_t len = list->length;
-    if (step == 0) { fprintf(stderr, "ValueError: slice step cannot be zero\n"); exit(1); }
+    if (step == 0) { fastpy_raise(FPY_EXC_VALUEERROR, "slice step cannot be zero"); return NULL; }
 
     if (step > 0) {
         if (!has_start) start = 0;
@@ -1163,8 +1170,8 @@ FpyValue fpy_dict_get(FpyDict *dict, FpyValue key) {
             return dict->values[idx];
         slot = (slot + 1) & mask;
     }
-    fprintf(stderr, "KeyError\n");
-    exit(1);
+    fastpy_raise(FPY_EXC_KEYERROR, "KeyError");
+    FpyValue _err = {0}; return _err;
 }
 
 /* --- Dict wrapper functions for LLVM --- */
@@ -1229,8 +1236,8 @@ void fastpy_dict_get_fv(FpyDict *dict, const char *key,
         }
         slot = (slot + 1) & mask;
     }
-    fprintf(stderr, "KeyError: '%s'\n", key);
-    exit(1);
+    fastpy_raise(FPY_EXC_KEYERROR, key);
+    *out_tag = FPY_TAG_NONE; *out_data = 0; return;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1339,8 +1346,8 @@ void fastpy_dict_get_int_fv(FpyDict *dict, int64_t key,
         }
         slot = (slot + 1) & mask;
     }
-    fprintf(stderr, "KeyError\n");
-    exit(1);
+    fastpy_raise(FPY_EXC_KEYERROR, "KeyError");
+    *out_tag = FPY_TAG_NONE; *out_data = 0; return;
 }
 
 /* Direct int-value return for int-keyed dicts with known int values.
@@ -1360,8 +1367,8 @@ int64_t fastpy_dict_get_int_val(FpyDict *dict, int64_t key) {
         }
         slot = (slot + 1) & mask;
     }
-    fprintf(stderr, "KeyError\n");
-    exit(1);
+    fastpy_raise(FPY_EXC_KEYERROR, "KeyError");
+    return 0;
 }
 
 int32_t fastpy_dict_has_int_key(FpyDict *dict, int64_t key) {
@@ -1744,8 +1751,8 @@ int64_t fastpy_list_pop_int(FpyList *list) {
     FPY_LOCK(list);
     if (list->length == 0) {
         FPY_UNLOCK(list);
-        fprintf(stderr, "IndexError: pop from empty list\n");
-        exit(1);
+        fastpy_raise(FPY_EXC_INDEXERROR, "pop from empty list");
+        return 0;
     }
     list->length--;
     int64_t result = list->items[list->length].data.i;
@@ -1758,8 +1765,8 @@ void fastpy_list_delete_at(FpyList *list, int64_t index) {
     if (index < 0) index += list->length;
     if (index < 0 || index >= list->length) {
         FPY_UNLOCK(list);
-        fprintf(stderr, "IndexError: list index out of range\n");
-        exit(1);
+        fastpy_raise(FPY_EXC_INDEXERROR, "list index out of range");
+        return;
     }
     FPY_VAL_DECREF(list->items[index]);
     for (int64_t i = index; i < list->length - 1; i++) {
@@ -1799,8 +1806,8 @@ void fastpy_dict_delete(FpyDict *dict, const char *key) {
         slot = (slot + 1) & mask;
     }
     FPY_UNLOCK(dict);
-    fprintf(stderr, "KeyError: '%s'\n", key);
-    exit(1);
+    fastpy_raise(FPY_EXC_KEYERROR, key);
+    return;
 }
 
 void fastpy_list_remove(FpyList *list, int64_t value) {
@@ -1818,8 +1825,8 @@ void fastpy_list_remove(FpyList *list, int64_t value) {
         }
     }
     FPY_UNLOCK(list);
-    fprintf(stderr, "ValueError: list.remove(x): x not in list\n");
-    exit(1);
+    fastpy_raise(FPY_EXC_VALUEERROR, "list.remove(x): x not in list");
+    return;
 }
 
 void fastpy_list_remove_str(FpyList *list, const char *value) {
@@ -1836,8 +1843,8 @@ void fastpy_list_remove_str(FpyList *list, const char *value) {
         }
     }
     FPY_UNLOCK(list);
-    fprintf(stderr, "ValueError: list.remove(x): x not in list\n");
-    exit(1);
+    fastpy_raise(FPY_EXC_VALUEERROR, "list.remove(x): x not in list");
+    return;
 }
 
 void fastpy_list_insert_int(FpyList *list, int64_t index, int64_t value) {
@@ -1907,8 +1914,8 @@ const char* fastpy_dict_pop(FpyDict *dict, const char *key) {
         slot = (slot + 1) & mask;
     }
     FPY_UNLOCK(dict);
-    fprintf(stderr, "KeyError: '%s'\n", key);
-    exit(1);
+    fastpy_raise(FPY_EXC_KEYERROR, key);
+    return NULL;
 }
 
 int64_t fastpy_dict_pop_int(FpyDict *dict, const char *key) {
@@ -1938,8 +1945,8 @@ int64_t fastpy_dict_pop_int(FpyDict *dict, const char *key) {
         slot = (slot + 1) & mask;
     }
     FPY_UNLOCK(dict);
-    fprintf(stderr, "KeyError: '%s'\n", key);
-    exit(1);
+    fastpy_raise(FPY_EXC_KEYERROR, key);
+    return 0;
 }
 
 void fastpy_dict_setdefault_list(FpyDict *dict, const char *key, FpyList *default_val) {
@@ -3675,9 +3682,10 @@ void fastpy_obj_get_fv(FpyObj *obj, const char *name, int32_t *out_tag, int64_t 
             }
         }
     }
-    fprintf(stderr, "AttributeError: '%s' object has no attribute '%s'\n",
-            fpy_classes[obj->class_id].name, name);
-    exit(1);
+    snprintf(_err_buf, sizeof(_err_buf), "'%s' object has no attribute '%s'",
+             fpy_classes[obj->class_id].name, name);
+    fastpy_raise(FPY_EXC_ATTRIBUTEERROR, _err_buf);
+    *out_tag = FPY_TAG_NONE; *out_data = 0; return;
 }
 
 /* Get attribute as string representation (works for any type).
@@ -3686,9 +3694,10 @@ void fastpy_obj_get_fv(FpyObj *obj, const char *name, int32_t *out_tag, int64_t 
 int64_t fastpy_obj_call_method0(FpyObj *obj, const char *name) {
     FpyMethodDef *m = fastpy_find_method(obj->class_id, name);
     if (!m) {
-        fprintf(stderr, "AttributeError: '%s' object has no method '%s'\n",
-                fpy_classes[obj->class_id].name, name);
-        exit(1);
+        snprintf(_err_buf, sizeof(_err_buf), "'%s' object has no method '%s'",
+                 fpy_classes[obj->class_id].name, name);
+        fastpy_raise(FPY_EXC_ATTRIBUTEERROR, _err_buf);
+        return 0;
     }
     return ((FpyMethodFunc)m->func)(obj);
 }
@@ -3696,9 +3705,10 @@ int64_t fastpy_obj_call_method0(FpyObj *obj, const char *name) {
 int64_t fastpy_obj_call_method1(FpyObj *obj, const char *name, int64_t a) {
     FpyMethodDef *m = fastpy_find_method(obj->class_id, name);
     if (!m) {
-        fprintf(stderr, "AttributeError: '%s' object has no method '%s'\n",
-                fpy_classes[obj->class_id].name, name);
-        exit(1);
+        snprintf(_err_buf, sizeof(_err_buf), "'%s' object has no method '%s'",
+                 fpy_classes[obj->class_id].name, name);
+        fastpy_raise(FPY_EXC_ATTRIBUTEERROR, _err_buf);
+        return 0;
     }
     return ((FpyMethod1Func)m->func)(obj, a);
 }
@@ -3706,9 +3716,10 @@ int64_t fastpy_obj_call_method1(FpyObj *obj, const char *name, int64_t a) {
 int64_t fastpy_obj_call_method2(FpyObj *obj, const char *name, int64_t a, int64_t b) {
     FpyMethodDef *m = fastpy_find_method(obj->class_id, name);
     if (!m) {
-        fprintf(stderr, "AttributeError: '%s' object has no method '%s'\n",
-                fpy_classes[obj->class_id].name, name);
-        exit(1);
+        snprintf(_err_buf, sizeof(_err_buf), "'%s' object has no method '%s'",
+                 fpy_classes[obj->class_id].name, name);
+        fastpy_raise(FPY_EXC_ATTRIBUTEERROR, _err_buf);
+        return 0;
     }
     return ((FpyMethod2Func)m->func)(obj, a, b);
 }
@@ -3716,9 +3727,10 @@ int64_t fastpy_obj_call_method2(FpyObj *obj, const char *name, int64_t a, int64_
 int64_t fastpy_obj_call_method3(FpyObj *obj, const char *name, int64_t a, int64_t b, int64_t c) {
     FpyMethodDef *m = fastpy_find_method(obj->class_id, name);
     if (!m) {
-        fprintf(stderr, "AttributeError: '%s' object has no method '%s'\n",
-                fpy_classes[obj->class_id].name, name);
-        exit(1);
+        snprintf(_err_buf, sizeof(_err_buf), "'%s' object has no method '%s'",
+                 fpy_classes[obj->class_id].name, name);
+        fastpy_raise(FPY_EXC_ATTRIBUTEERROR, _err_buf);
+        return 0;
     }
     return ((FpyMethod3Func)m->func)(obj, a, b, c);
 }
@@ -3726,9 +3738,10 @@ int64_t fastpy_obj_call_method3(FpyObj *obj, const char *name, int64_t a, int64_
 int64_t fastpy_obj_call_method4(FpyObj *obj, const char *name, int64_t a, int64_t b, int64_t c, int64_t d) {
     FpyMethodDef *m = fastpy_find_method(obj->class_id, name);
     if (!m) {
-        fprintf(stderr, "AttributeError: '%s' object has no method '%s'\n",
-                fpy_classes[obj->class_id].name, name);
-        exit(1);
+        snprintf(_err_buf, sizeof(_err_buf), "'%s' object has no method '%s'",
+                 fpy_classes[obj->class_id].name, name);
+        fastpy_raise(FPY_EXC_ATTRIBUTEERROR, _err_buf);
+        return 0;
     }
     return ((FpyMethod4Func)m->func)(obj, a, b, c, d);
 }
@@ -3739,13 +3752,23 @@ typedef double (*FpyMethodDouble1Func)(FpyObj *self, int64_t a);
 
 double fastpy_obj_call_method0_double(FpyObj *obj, const char *name) {
     FpyMethodDef *m = fastpy_find_method(obj->class_id, name);
-    if (!m) { fprintf(stderr, "AttributeError: no method '%s'\n", name); exit(1); }
+    if (!m) {
+        snprintf(_err_buf, sizeof(_err_buf), "'%s' object has no method '%s'",
+                 fpy_classes[obj->class_id].name, name);
+        fastpy_raise(FPY_EXC_ATTRIBUTEERROR, _err_buf);
+        return 0.0;
+    }
     return ((FpyMethodDoubleFunc)m->func)(obj);
 }
 
 double fastpy_obj_call_method1_double(FpyObj *obj, const char *name, int64_t a) {
     FpyMethodDef *m = fastpy_find_method(obj->class_id, name);
-    if (!m) { fprintf(stderr, "AttributeError: no method '%s'\n", name); exit(1); }
+    if (!m) {
+        snprintf(_err_buf, sizeof(_err_buf), "'%s' object has no method '%s'",
+                 fpy_classes[obj->class_id].name, name);
+        fastpy_raise(FPY_EXC_ATTRIBUTEERROR, _err_buf);
+        return 0.0;
+    }
     return ((FpyMethodDouble1Func)m->func)(obj, a);
 }
 
@@ -3847,8 +3870,8 @@ FpyComplex* fpy_complex_mul(FpyComplex *a, FpyComplex *b) {
 FpyComplex* fpy_complex_div(FpyComplex *a, FpyComplex *b) {
     double denom = b->real * b->real + b->imag * b->imag;
     if (denom == 0.0) {
-        fprintf(stderr, "ZeroDivisionError: complex division by zero\n");
-        exit(1);
+        fastpy_raise(FPY_EXC_ZERODIVISION, "complex division by zero");
+        return NULL;
     }
     return fpy_complex_new(
         (a->real * b->real + a->imag * b->imag) / denom,
@@ -3990,8 +4013,8 @@ FpyDecimal* fpy_decimal_mul(FpyDecimal *a, FpyDecimal *b) {
 
 FpyDecimal* fpy_decimal_div(FpyDecimal *a, FpyDecimal *b) {
     if (b->coefficient == 0) {
-        fprintf(stderr, "DivisionError: division by zero\n");
-        return fpy_decimal_new(0, 0, 0);
+        fastpy_raise(FPY_EXC_ZERODIVISION, "division by zero");
+        return NULL;
     }
     /* Scale numerator for precision (18 digits) */
     int64_t scale = 1000000000LL;  /* 9 extra digits of precision */
@@ -4731,8 +4754,8 @@ void fastpy_deque_appendleft(FpyDeque *dq, int32_t tag, int64_t data) {
 
 void fastpy_deque_pop(FpyDeque *dq, int32_t *out_tag, int64_t *out_data) {
     if (dq->length == 0) {
-        fprintf(stderr, "IndexError: pop from an empty deque\n");
-        exit(1);
+        fastpy_raise(FPY_EXC_INDEXERROR, "pop from an empty deque");
+        *out_tag = FPY_TAG_NONE; *out_data = 0; return;
     }
     dq->length--;
     int64_t tail = (dq->head + dq->length) % dq->capacity;
@@ -4742,8 +4765,8 @@ void fastpy_deque_pop(FpyDeque *dq, int32_t *out_tag, int64_t *out_data) {
 
 void fastpy_deque_popleft(FpyDeque *dq, int32_t *out_tag, int64_t *out_data) {
     if (dq->length == 0) {
-        fprintf(stderr, "IndexError: pop from an empty deque\n");
-        exit(1);
+        fastpy_raise(FPY_EXC_INDEXERROR, "pop from an empty deque");
+        *out_tag = FPY_TAG_NONE; *out_data = 0; return;
     }
     *out_tag = dq->items[dq->head].tag;
     *out_data = dq->items[dq->head].data.i;
@@ -4758,8 +4781,8 @@ int64_t fastpy_deque_length(FpyDeque *dq) {
 void fastpy_deque_get(FpyDeque *dq, int64_t index, int32_t *out_tag, int64_t *out_data) {
     if (index < 0) index += dq->length;
     if (index < 0 || index >= dq->length) {
-        fprintf(stderr, "IndexError: deque index out of range\n");
-        exit(1);
+        fastpy_raise(FPY_EXC_INDEXERROR, "deque index out of range");
+        *out_tag = FPY_TAG_NONE; *out_data = 0; return;
     }
     int64_t actual = (dq->head + index) % dq->capacity;
     *out_tag = dq->items[actual].tag;
@@ -4913,8 +4936,8 @@ void fastpy_chainmap_get(FpyChainMap *cm, const char *key,
             slot = (slot + 1) & mask;
         }
     }
-    fprintf(stderr, "KeyError: '%s'\n", key);
-    exit(1);
+    fastpy_raise(FPY_EXC_KEYERROR, key);
+    *out_tag = FPY_TAG_NONE; *out_data = 0; return;
 }
 
 void fastpy_chainmap_set(FpyChainMap *cm, const char *key,

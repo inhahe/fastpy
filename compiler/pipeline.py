@@ -26,6 +26,10 @@ class CompileError:
     col: int | None = None
 
     def __str__(self) -> str:
+        # SyntaxError messages already contain file/line/caret info from
+        # traceback.format_exception_only() — don't append redundant location.
+        if self.message.startswith(("  File ", "SyntaxError:")):
+            return self.message
         loc = ""
         if self.line is not None:
             loc = f" (line {self.line}"
@@ -54,7 +58,8 @@ def compile_source(source: str, output: Path | None = None,
                    threading_mode: int = 0,
                    int64_mode: bool = False,
                    typed_mode: bool = False,
-                   python_version: str | None = None) -> CompileResult:
+                   python_version: str | None = None,
+                   source_filename: str = "<module>") -> CompileResult:
     """
     Compile a Python source string to a native executable.
 
@@ -71,12 +76,17 @@ def compile_source(source: str, output: Path | None = None,
     """
     # Stage 1: Parse with Python's own parser
     try:
-        tree = ast.parse(source)
+        tree = ast.parse(source, filename=source_filename)
     except SyntaxError as e:
+        # Use traceback.format_exception_only() for CPython-quality error
+        # display including source line, caret, and context.
+        import traceback as _tb
+        lines = _tb.format_exception_only(type(e), e)
+        detail = "".join(lines).rstrip()
         return CompileResult(
             success=False,
             errors=[CompileError(
-                message=f"SyntaxError: {e.msg}",
+                message=detail,
                 line=e.lineno,
                 col=e.offset,
             )],
@@ -97,7 +107,8 @@ def compile_source(source: str, output: Path | None = None,
     _sys.setrecursionlimit(max(old_limit, 20000))  # large stdlib modules need headroom
     try:
         codegen = CodeGen(threading_mode=threading_mode, int64_mode=int64_mode,
-                          typed_mode=typed_mode)
+                          typed_mode=typed_mode,
+                          source_filename=source_filename)
         ir_string = codegen.generate(tree)
     except CodeGenError as e:
         return CompileResult(
@@ -188,7 +199,8 @@ def compile_file(path: Path, output: Path | None = None,
 
     return compile_source(merged, output, threading_mode=threading_mode,
                           int64_mode=int64_mode, typed_mode=typed_mode,
-                          python_version=python_version)
+                          python_version=python_version,
+                          source_filename=str(path))
 
 
 def _resolve_and_merge(source: str, base_dir: Path,
@@ -213,7 +225,10 @@ def _resolve_and_merge(source: str, base_dir: Path,
     if _visited is None:
         _visited = set()
 
-    tree = ast.parse(source)
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return source  # pass through to compile_source for proper error display
     imports_to_resolve: list[tuple[int, ast.stmt, str, Path]] = []
 
     for i, node in enumerate(tree.body):

@@ -154,7 +154,7 @@ def run_executable(exe_path: Path, timeout: float = 10.0) -> RunResult:
 def _parse_compile_flags(source: str) -> dict:
     """Extract compile flags from a `# compile_flags: ...` comment.
 
-    Recognised flags: --typed, --int64.
+    Recognised flags: --typed, --int64, --threading gil, --threading free, -t.
     Returns kwargs suitable for compile_source().
     """
     kwargs: dict = {}
@@ -166,6 +166,16 @@ def _parse_compile_flags(source: str) -> dict:
                 kwargs["typed_mode"] = True
             if "--int64" in flags:
                 kwargs["int64_mode"] = True
+            if "-t" in flags:
+                kwargs["threading_mode"] = 2
+            elif "--threading" in flags:
+                idx = flags.index("--threading")
+                if idx + 1 < len(flags):
+                    mode = flags[idx + 1]
+                    if mode == "gil":
+                        kwargs["threading_mode"] = 1
+                    elif mode == "free":
+                        kwargs["threading_mode"] = 2
             break
     return kwargs
 

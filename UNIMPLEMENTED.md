@@ -68,6 +68,23 @@ getattr/setattr/hasattr/delattr, input, open.
 int (i64), float (f64), BigInt (speculative unboxing with overflow fallback),
 complex (native FpyComplex with arithmetic).
 
+Per-variable integer overflow control via `typing.Annotated` markers and
+constructor functions, in both 64-bit and 32-bit widths:
+- `Annotated[int, Unchecked]` / `unchecked_int()` — raw LLVM i64 add/sub/mul,
+  wraps silently on overflow (C / two's-complement semantics).
+- `Annotated[int, Checked]` / `checked_int()` — LLVM i64 overflow intrinsics,
+  raises OverflowError on overflow (no BigInt fallback).
+- `Annotated[int, Unchecked32]` / `unchecked_int32()` — raw LLVM i32
+  add/sub/mul, wraps at the 32-bit boundary.  Values stored as i64
+  internally, arithmetic truncated to i32 and sign-extended back.
+- `Annotated[int, Checked32]` / `checked_int32()` — LLVM i32 overflow
+  intrinsics, raises OverflowError at the 32-bit boundary.
+- Default (no annotation) — runtime `checked_*` functions with BigInt fallback.
+
+The `fastpy` shim package provides CPython-compatible implementations
+so annotated code runs identically under CPython for development/testing.
+Augmented assignment (`x += 1`) is handled for all modes.
+
 ### Threading
 Three modes: none (default), GIL, free-threaded (per-object locks).
 
@@ -88,6 +105,26 @@ These features work correctly but use the embedded CPython interpreter:
   itertools, functools — except singledispatch which is native)
 
 ## Bugs fixed (2026-04-22)
+
+### 15. Runtime errors bypassed exception system (fixed)
+27 error paths in `objects.c` used `fprintf(stderr, "Error: ...")+exit(1)`
+instead of `fastpy_raise()`, making IndexError, KeyError, ValueError,
+AttributeError, and ZeroDivisionError from runtime operations (list subscript,
+dict lookup, method dispatch, complex/decimal division, deque ops, etc.)
+uncatchable by try/except.
+Fix: All 27 sites converted to `fastpy_raise()` with proper sentinel returns.
+Added `FPY_EXC_ZERODIVISION` and `FPY_EXC_ATTRIBUTEERROR` constants to
+`objects.c`. Formatted error messages use TLS `_err_buf[256]` for
+AttributeError messages that include class/attribute names.
+
+### 16. Traceback showed wrong line for non-top frames (fixed)
+`fpy_shadow_push` recorded the function definition line for each frame.
+When an exception propagated through nested calls, only the innermost frame
+had the correct line; outer frames showed their definition lines.
+Fix: `fpy_shadow_push` now freezes the caller frame's lineno from
+`fpy_current_line` before pushing. `fpy_shadow_pop` restores
+`fpy_current_line` from the now-current frame's saved lineno. This gives
+every frame the exact call-site line.
 
 ### 9. Complex arithmetic print showed raw pointers (fixed)
 `print(c1 + c2)` printed a raw i64 pointer instead of the complex result.
@@ -217,6 +254,30 @@ Systematic comparison against the Python 3.14 PEG grammar (`Grammar/python.gram`
 - **Ellipsis** — `print(...)` and `x = ...; print(x)` both print "Ellipsis"
 - **for/while ... else:** — with and without break
 - **Positional-only params** — `def f(a, /, b):` works correctly
+- **Per-variable overflow control** — `Annotated[int, Unchecked/Checked]` and
+  `unchecked_int()/checked_int()` for 64-bit; `Unchecked32/Checked32` and
+  `unchecked_int32()/checked_int32()` for 32-bit. Tested: happy path, wrapping
+  overflow, OverflowError, augmented assignment, functions, annotated params
+
+### Implemented (2026-04-22)
+- **Shadow call stack** — runtime tracebacks for unhandled exceptions showing
+  `File "source.py", line N, in func` for each frame. Push/pop at function
+  entry/exit; line number tracked via global store updated per-statement.
+  Per-frame line accuracy: push freezes caller's line from the compiler-updated
+  global, pop restores it — every frame shows the exact call-site line, not
+  the function definition line. Argument values displayed inline:
+  `func(name='key', index=99)` with type-aware formatting (int, float, str,
+  bool, None, list/dict/obj placeholders).
+- **Runtime exceptions are catchable** — all `fprintf+exit` error paths in
+  `objects.c` (27 sites: IndexError, KeyError, ValueError, AttributeError,
+  ZeroDivisionError) converted to `fastpy_raise()` with sentinel returns.
+  Exceptions propagate through the polling model and are catchable by
+  try/except. Tested in all three threading modes (none, GIL, free-threaded).
+- **CPython-quality syntax errors** — `traceback.format_exception_only()` for
+  source line, caret, and column position in compile-time errors.
+- **C extension for Int32/UInt32/Int64/UInt64** — `fastpy/_fastints.c` replaces
+  pure-Python `ints.py` for CPython-side fixed-width integer performance.
+  Falls back to pure Python if the extension is not compiled.
 
 ## Known limitations (not bugs)
 
