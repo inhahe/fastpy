@@ -302,6 +302,8 @@ double fastpy_pow_float(double base, double exp) {
 #define FPY_EXC_STOPITERATION  7
 #define FPY_EXC_EXCEPTIONGROUP 8
 #define FPY_EXC_NAMEERROR      9
+#define FPY_EXC_OVERFLOWERROR  10
+#define FPY_EXC_ATTRIBUTEERROR 11
 #define FPY_EXC_GENERIC        99
 
 /* Per-thread exception state. Each thread has its own exception,
@@ -319,10 +321,182 @@ FPY_THREAD_LOCAL int32_t fpy_ret_tag = 0;  /* FPY_TAG_INT */
 void fastpy_set_ret_tag(int32_t tag) { fpy_ret_tag = tag; }
 int32_t fastpy_get_ret_tag(void) { return fpy_ret_tag; }
 
-/* Raise an exception — sets the flag. Caller must check and propagate. */
+/* --- Shadow call stack (for traceback on unhandled exceptions) --- */
+
+#define FPY_SHADOW_MAX_ARGS 8
+
+typedef struct {
+    const char *name;       /* argument name (string literal from IR) */
+    int32_t tag;            /* FpyValue tag (INT, FLOAT, STR, etc.) */
+    int64_t data;           /* FpyValue data (value or pointer) */
+} FpyShadowArg;
+
+typedef struct {
+    const char *func_name;  /* function name (string literal from IR) */
+    const char *filename;   /* source filename (string literal from IR) */
+    int32_t lineno;         /* current line number (updated per statement) */
+    int32_t n_args;         /* number of tracked arguments */
+    FpyShadowArg args[FPY_SHADOW_MAX_ARGS];
+} FpyShadowFrame;
+
+#define FPY_SHADOW_STACK_MAX 256
+
+FPY_THREAD_LOCAL FpyShadowFrame fpy_shadow_stack[FPY_SHADOW_STACK_MAX];
+FPY_THREAD_LOCAL int fpy_shadow_depth = 0;
+
+/* Traceback snapshot: frozen copy of the shadow stack at raise time.
+ * The live shadow stack continues push/pop normally; the snapshot
+ * preserves the state for printing if the exception goes unhandled. */
+FPY_THREAD_LOCAL FpyShadowFrame fpy_traceback[FPY_SHADOW_STACK_MAX];
+FPY_THREAD_LOCAL int fpy_traceback_depth = 0;
+
+/* Forward declaration: the compiler-updated global line number.
+ * Defined below the shadow stack functions but needed by push/pop. */
+extern int32_t fpy_current_line;
+
+/* Push a frame onto the shadow stack. Called at function entry.
+ * Before pushing, freeze the caller frame's line number from the
+ * compiler-updated fpy_current_line global — this captures the
+ * exact call-site line, not the function definition line. */
+void fpy_shadow_push(const char *func, const char *file, int32_t line) {
+    if (fpy_shadow_depth > 0)
+        fpy_shadow_stack[fpy_shadow_depth - 1].lineno = fpy_current_line;
+    if (fpy_shadow_depth < FPY_SHADOW_STACK_MAX) {
+        FpyShadowFrame *f = &fpy_shadow_stack[fpy_shadow_depth];
+        f->func_name = func;
+        f->filename = file;
+        f->lineno = line;
+        f->n_args = 0;
+        fpy_shadow_depth++;
+    }
+}
+
+/* Pop the top frame from the shadow stack. Called before return.
+ * Restore fpy_current_line to the now-current (caller) frame's
+ * saved line number, so that subsequent pushes or raises see the
+ * correct call-site line for the caller. */
+void fpy_shadow_pop(void) {
+    if (fpy_shadow_depth > 0)
+        fpy_shadow_depth--;
+    if (fpy_shadow_depth > 0)
+        fpy_current_line = fpy_shadow_stack[fpy_shadow_depth - 1].lineno;
+}
+
+/* Update the line number of the current frame. Called before statements. */
+void fpy_shadow_update_line(int32_t line) {
+    if (fpy_shadow_depth > 0)
+        fpy_shadow_stack[fpy_shadow_depth - 1].lineno = line;
+}
+
+/* Register a function argument in the current shadow frame.
+ * Called at function entry after fpy_shadow_push, once per parameter.
+ * index: 0-based argument position
+ * name: argument name (string literal from IR)
+ * tag/data: the FpyValue representation of the argument value */
+void fpy_shadow_set_arg(int32_t index, const char *name,
+                        int32_t tag, int64_t data) {
+    if (fpy_shadow_depth > 0 && index >= 0 && index < FPY_SHADOW_MAX_ARGS) {
+        FpyShadowFrame *f = &fpy_shadow_stack[fpy_shadow_depth - 1];
+        f->args[index].name = name;
+        f->args[index].tag = tag;
+        f->args[index].data = data;
+        if (index >= f->n_args) f->n_args = index + 1;
+    }
+}
+
+/* Exported current line number — the compiler stores to this directly
+ * via LLVM global instead of calling fpy_shadow_update_line, to avoid
+ * function call overhead and register clobbering on every statement.
+ * Not thread-local: in multi-threaded mode the traceback may show a
+ * stale line, but this is acceptable since tracebacks are best-effort. */
+int32_t fpy_current_line = 0;
+
+/* Format a single FpyShadowArg value into buf (best-effort). */
+static void fpy_format_arg_value(const FpyShadowArg *arg, char *buf, int bufsz) {
+    switch (arg->tag) {
+        case 0: /* INT */
+            snprintf(buf, bufsz, "%lld", (long long)arg->data);
+            break;
+        case 1: { /* FLOAT */
+            double d;
+            memcpy(&d, &arg->data, sizeof(double));
+            snprintf(buf, bufsz, "%g", d);
+            break;
+        }
+        case 2: /* STR */
+            if (arg->data) {
+                const char *s = (const char*)(intptr_t)arg->data;
+                /* Truncate long strings */
+                if (strlen(s) > 40)
+                    snprintf(buf, bufsz, "'%.37s...'", s);
+                else
+                    snprintf(buf, bufsz, "'%s'", s);
+            } else {
+                snprintf(buf, bufsz, "''");
+            }
+            break;
+        case 3: /* BOOL */
+            snprintf(buf, bufsz, "%s", arg->data ? "True" : "False");
+            break;
+        case 4: /* NONE */
+            snprintf(buf, bufsz, "None");
+            break;
+        case 5: /* LIST */
+            snprintf(buf, bufsz, "[...]");
+            break;
+        case 6: /* OBJ */
+            snprintf(buf, bufsz, "<object>");
+            break;
+        case 7: /* DICT */
+            snprintf(buf, bufsz, "{...}");
+            break;
+        default:
+            snprintf(buf, bufsz, "<tag=%d>", (int)arg->tag);
+            break;
+    }
+}
+
+/* Print a Python-style traceback from the snapshot to stderr. */
+static void fpy_shadow_print_traceback(void) {
+    if (fpy_traceback_depth == 0) return;
+    fprintf(stderr, "Traceback (most recent call last):\n");
+    for (int i = 0; i < fpy_traceback_depth; i++) {
+        const FpyShadowFrame *f = &fpy_traceback[i];
+        fprintf(stderr, "  File \"%s\", line %d, in %s",
+                f->filename ? f->filename : "<unknown>",
+                (int)f->lineno,
+                f->func_name ? f->func_name : "<unknown>");
+        /* Print argument values inline: func(a=1, b='hello') */
+        if (f->n_args > 0) {
+            char vbuf[64];
+            fprintf(stderr, "(");
+            for (int j = 0; j < f->n_args; j++) {
+                if (j > 0) fprintf(stderr, ", ");
+                fpy_format_arg_value(&f->args[j], vbuf, sizeof(vbuf));
+                fprintf(stderr, "%s=%s",
+                        f->args[j].name ? f->args[j].name : "?", vbuf);
+            }
+            fprintf(stderr, ")");
+        }
+        fprintf(stderr, "\n");
+    }
+}
+
+/* Raise an exception — sets the flag. Caller must check and propagate.
+ * Also snapshots the shadow call stack for traceback display. */
 void fastpy_raise(int exc_type, const char *msg) {
     fpy_exc_type = exc_type;
     fpy_exc_msg = msg;
+    /* Update the current frame's line number from the compiler-set global
+     * before snapshotting — fpy_current_line is updated by the compiler
+     * before every statement via a direct store (no function call). */
+    if (fpy_shadow_depth > 0)
+        fpy_shadow_stack[fpy_shadow_depth - 1].lineno = fpy_current_line;
+    /* Snapshot the shadow stack at the point of the raise. */
+    fpy_traceback_depth = fpy_shadow_depth;
+    if (fpy_shadow_depth > 0)
+        memcpy(fpy_traceback, fpy_shadow_stack,
+               sizeof(FpyShadowFrame) * fpy_shadow_depth);
 }
 
 /* Check if an exception is pending */
@@ -345,6 +519,7 @@ void fastpy_exc_clear(void) {
     fpy_exc_type = FPY_EXC_NONE;
     fpy_exc_msg = "";
     fpy_exc_group_inner = FPY_EXC_NONE;
+    fpy_traceback_depth = 0;
 }
 
 /* Set the inner exception type for ExceptionGroup */
@@ -368,20 +543,23 @@ int fastpy_exc_name_to_id(const char *name) {
     if (strcmp(name, "StopIteration") == 0) return FPY_EXC_STOPITERATION;
     if (strcmp(name, "ExceptionGroup") == 0) return FPY_EXC_EXCEPTIONGROUP;
     if (strcmp(name, "NameError") == 0) return FPY_EXC_NAMEERROR;
+    if (strcmp(name, "OverflowError") == 0) return FPY_EXC_OVERFLOWERROR;
+    if (strcmp(name, "AttributeError") == 0) return FPY_EXC_ATTRIBUTEERROR;
     return FPY_EXC_GENERIC;
 }
 
-/* Print unhandled exception and exit */
+/* Print unhandled exception with traceback and exit */
 void fastpy_exc_unhandled(void) {
     if (fpy_exc_type == FPY_EXC_NONE) return;
     const char *names[] = {
         "Exception", "ZeroDivisionError", "ValueError", "TypeError",
         "IndexError", "KeyError", "RuntimeError", "StopIteration",
-        "ExceptionGroup", "NameError"
+        "ExceptionGroup", "NameError", "OverflowError", "AttributeError"
     };
-    const char *name = (fpy_exc_type >= 1 && fpy_exc_type <= 9)
+    const char *name = (fpy_exc_type >= 1 && fpy_exc_type <= 11)
         ? names[fpy_exc_type] : "Exception";
-    fprintf(stderr, "Traceback (most recent call last):\n  %s: %s\n", name, fpy_exc_msg);
+    fpy_shadow_print_traceback();
+    fprintf(stderr, "%s: %s\n", name, fpy_exc_msg);
     exit(1);
 }
 
@@ -560,6 +738,8 @@ static FpySymEntry fpy_jit_symbols[] = {
     SYM(fpy_rc_incref), SYM(fpy_rc_decref),
     SYM(fpy_cpython_binop), SYM(fpy_cpython_rbinop),
     SYM(fpy_cpython_compare), SYM(fpy_cpython_concat),
+    SYM(fpy_shadow_push), SYM(fpy_shadow_pop), SYM(fpy_shadow_update_line),
+    SYM(fpy_shadow_set_arg),
     {NULL, NULL}
 };
 
@@ -618,8 +798,11 @@ int main(void) {
             case FPY_EXC_RUNTIMEERROR: name = "RuntimeError"; break;
             case FPY_EXC_STOPITERATION: name = "StopIteration"; break;
             case FPY_EXC_NAMEERROR:    name = "NameError"; break;
+            case FPY_EXC_OVERFLOWERROR: name = "OverflowError"; break;
+            case FPY_EXC_ATTRIBUTEERROR: name = "AttributeError"; break;
             default: break;
         }
+        fpy_shadow_print_traceback();
         fprintf(stderr, "%s: %s\n", name, fpy_exc_msg ? fpy_exc_msg : "");
         return 1;
     }

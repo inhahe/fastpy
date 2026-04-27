@@ -15,12 +15,19 @@ void fastpy_obj_write(FpyObj *obj);
 
 /* External exception-raising API (defined in runtime.c) */
 extern void fastpy_raise(int exc_type, const char *msg);
+extern int fastpy_exc_pending(void);
 
 /* Exception type constants (mirror runtime.c) */
+#define FPY_EXC_ZERODIVISION   1
 #define FPY_EXC_VALUEERROR     2
 #define FPY_EXC_TYPEERROR      3
 #define FPY_EXC_INDEXERROR     4
 #define FPY_EXC_KEYERROR       5
+#define FPY_EXC_ATTRIBUTEERROR 11
+
+/* Thread-local buffer for formatted error messages. Only one exception
+ * can be pending per thread, so a single buffer is safe. */
+static FPY_THREAD_LOCAL char _err_buf[256];
 
 /* --- List operations --- */
 
@@ -58,6 +65,7 @@ typedef struct {
 /* Forward declarations for recursive destroy and class registry */
 static void fpy_list_destroy(FpyList *list);
 static void fpy_dict_destroy(FpyDict *dict);
+static int fpy_list_all_scalar(FpyList *list);
 void fpy_rc_decref(int32_t tag, int64_t data);
 extern FpyClassDef fpy_classes[];  /* defined later in this file */
 
@@ -70,8 +78,10 @@ extern void fpy_bridge_pyobj_decref(void *ptr);
 
 static void fpy_list_destroy(FpyList *list) {
     fpy_gc_untrack(&list->gc_node);
-    for (int64_t i = 0; i < list->length; i++) {
-        fpy_rc_decref(list->items[i].tag, list->items[i].data.i);
+    if (!fpy_list_all_scalar(list)) {
+        for (int64_t i = 0; i < list->length; i++) {
+            fpy_rc_decref(list->items[i].tag, list->items[i].data.i);
+        }
     }
     free(list->items);
     free(list);
@@ -179,10 +189,24 @@ void fpy_rc_decref(int32_t tag, int64_t data) {
                 FpyObj *obj = (FpyObj*)ptr;
                 if (obj->magic == FPY_OBJ_MAGIC) {
                     if (fpy_decref(&obj->refcount)) {
+                        /* Untrack from GC before freeing — the gc_node would
+                         * otherwise dangle in the tracked list, causing a
+                         * segfault on the next GC traversal. */
+                        fpy_gc_untrack(&obj->gc_node);
                         /* Call per-class destructor if set (e.g., generator cleanup).
                          * Runs before slots are freed so the destructor can access attrs. */
                         void (*dtor)(FpyObj*) = fpy_classes[obj->class_id].destructor;
                         if (dtor) dtor(obj);
+                        /* Invalidate all weak references to this object.
+                         * Walk the singly-linked list and null out target pointers
+                         * so deref returns None instead of a dangling pointer. */
+                        FpyWeakRef *wr = obj->weakref_list;
+                        while (wr) {
+                            FpyWeakRef *next = wr->next;
+                            wr->target = NULL;
+                            /* TODO: invoke callbacks if set */
+                            wr = next;
+                        }
                         /* Free slots (decref each), dynamic_attrs, and the obj */
                         if (obj->slots) {
                             int sc = fpy_classes[obj->class_id].slot_count;
@@ -260,8 +284,8 @@ void fpy_list_append(FpyList *list, FpyValue value) {
 FpyValue fpy_list_get(FpyList *list, int64_t index) {
     if (index < 0) index += list->length;
     if (index < 0 || index >= list->length) {
-        fprintf(stderr, "IndexError: list index out of range\n");
-        exit(1);
+        fastpy_raise(FPY_EXC_INDEXERROR, "list index out of range");
+        FpyValue _err = {0}; return _err;
     }
     return list->items[index];
 }
@@ -271,8 +295,8 @@ void fpy_list_set(FpyList *list, int64_t index, FpyValue value) {
     if (index < 0) index += list->length;
     if (index < 0 || index >= list->length) {
         FPY_UNLOCK(list);
-        fprintf(stderr, "IndexError: list assignment index out of range\n");
-        exit(1);
+        fastpy_raise(FPY_EXC_INDEXERROR, "list assignment index out of range");
+        return;
     }
     FPY_VAL_DECREF(list->items[index]);
     FPY_VAL_INCREF(value);
@@ -781,8 +805,14 @@ FpyList* fastpy_list_slice(FpyList *list, int64_t start, int64_t stop,
     if (start >= stop) return fpy_list_new(0);
     int64_t rlen = stop - start;
     FpyList *result = fpy_list_new(rlen);
-    for (int64_t i = start; i < stop; i++) {
-        fpy_list_append(result, list->items[i]);
+    if (rlen > 0) {
+        memcpy(result->items, list->items + start, rlen * sizeof(FpyValue));
+        result->length = rlen;
+        if (!fpy_list_all_scalar(result)) {
+            for (int64_t i = 0; i < rlen; i++) {
+                FPY_VAL_INCREF(result->items[i]);
+            }
+        }
     }
     return result;
 }
@@ -791,7 +821,7 @@ FpyList* fastpy_list_slice(FpyList *list, int64_t start, int64_t stop,
 FpyList* fastpy_list_slice_step(FpyList *list, int64_t start, int64_t stop,
                                 int64_t step, int64_t has_start, int64_t has_stop) {
     int64_t len = list->length;
-    if (step == 0) { fprintf(stderr, "ValueError: slice step cannot be zero\n"); exit(1); }
+    if (step == 0) { fastpy_raise(FPY_EXC_VALUEERROR, "slice step cannot be zero"); return NULL; }
 
     if (step > 0) {
         if (!has_start) start = 0;
@@ -1163,8 +1193,8 @@ FpyValue fpy_dict_get(FpyDict *dict, FpyValue key) {
             return dict->values[idx];
         slot = (slot + 1) & mask;
     }
-    fprintf(stderr, "KeyError\n");
-    exit(1);
+    fastpy_raise(FPY_EXC_KEYERROR, "KeyError");
+    FpyValue _err = {0}; return _err;
 }
 
 /* --- Dict wrapper functions for LLVM --- */
@@ -1229,8 +1259,8 @@ void fastpy_dict_get_fv(FpyDict *dict, const char *key,
         }
         slot = (slot + 1) & mask;
     }
-    fprintf(stderr, "KeyError: '%s'\n", key);
-    exit(1);
+    fastpy_raise(FPY_EXC_KEYERROR, key);
+    *out_tag = FPY_TAG_NONE; *out_data = 0; return;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1339,8 +1369,8 @@ void fastpy_dict_get_int_fv(FpyDict *dict, int64_t key,
         }
         slot = (slot + 1) & mask;
     }
-    fprintf(stderr, "KeyError\n");
-    exit(1);
+    fastpy_raise(FPY_EXC_KEYERROR, "KeyError");
+    *out_tag = FPY_TAG_NONE; *out_data = 0; return;
 }
 
 /* Direct int-value return for int-keyed dicts with known int values.
@@ -1360,8 +1390,8 @@ int64_t fastpy_dict_get_int_val(FpyDict *dict, int64_t key) {
         }
         slot = (slot + 1) & mask;
     }
-    fprintf(stderr, "KeyError\n");
-    exit(1);
+    fastpy_raise(FPY_EXC_KEYERROR, "KeyError");
+    return 0;
 }
 
 int32_t fastpy_dict_has_int_key(FpyDict *dict, int64_t key) {
@@ -1744,11 +1774,28 @@ int64_t fastpy_list_pop_int(FpyList *list) {
     FPY_LOCK(list);
     if (list->length == 0) {
         FPY_UNLOCK(list);
-        fprintf(stderr, "IndexError: pop from empty list\n");
-        exit(1);
+        fastpy_raise(FPY_EXC_INDEXERROR, "pop from empty list");
+        return 0;
     }
     list->length--;
     int64_t result = list->items[list->length].data.i;
+    FPY_UNLOCK(list);
+    return result;
+}
+
+int64_t fastpy_list_pop_at(FpyList *list, int64_t index) {
+    FPY_LOCK(list);
+    if (index < 0) index += list->length;
+    if (index < 0 || index >= list->length) {
+        FPY_UNLOCK(list);
+        fastpy_raise(FPY_EXC_INDEXERROR, "pop index out of range");
+        return 0;
+    }
+    int64_t result = list->items[index].data.i;
+    for (int64_t i = index; i < list->length - 1; i++) {
+        list->items[i] = list->items[i + 1];
+    }
+    list->length--;
     FPY_UNLOCK(list);
     return result;
 }
@@ -1758,8 +1805,8 @@ void fastpy_list_delete_at(FpyList *list, int64_t index) {
     if (index < 0) index += list->length;
     if (index < 0 || index >= list->length) {
         FPY_UNLOCK(list);
-        fprintf(stderr, "IndexError: list index out of range\n");
-        exit(1);
+        fastpy_raise(FPY_EXC_INDEXERROR, "list index out of range");
+        return;
     }
     FPY_VAL_DECREF(list->items[index]);
     for (int64_t i = index; i < list->length - 1; i++) {
@@ -1799,8 +1846,8 @@ void fastpy_dict_delete(FpyDict *dict, const char *key) {
         slot = (slot + 1) & mask;
     }
     FPY_UNLOCK(dict);
-    fprintf(stderr, "KeyError: '%s'\n", key);
-    exit(1);
+    fastpy_raise(FPY_EXC_KEYERROR, key);
+    return;
 }
 
 void fastpy_list_remove(FpyList *list, int64_t value) {
@@ -1818,8 +1865,8 @@ void fastpy_list_remove(FpyList *list, int64_t value) {
         }
     }
     FPY_UNLOCK(list);
-    fprintf(stderr, "ValueError: list.remove(x): x not in list\n");
-    exit(1);
+    fastpy_raise(FPY_EXC_VALUEERROR, "list.remove(x): x not in list");
+    return;
 }
 
 void fastpy_list_remove_str(FpyList *list, const char *value) {
@@ -1836,8 +1883,8 @@ void fastpy_list_remove_str(FpyList *list, const char *value) {
         }
     }
     FPY_UNLOCK(list);
-    fprintf(stderr, "ValueError: list.remove(x): x not in list\n");
-    exit(1);
+    fastpy_raise(FPY_EXC_VALUEERROR, "list.remove(x): x not in list");
+    return;
 }
 
 void fastpy_list_insert_int(FpyList *list, int64_t index, int64_t value) {
@@ -1907,8 +1954,8 @@ const char* fastpy_dict_pop(FpyDict *dict, const char *key) {
         slot = (slot + 1) & mask;
     }
     FPY_UNLOCK(dict);
-    fprintf(stderr, "KeyError: '%s'\n", key);
-    exit(1);
+    fastpy_raise(FPY_EXC_KEYERROR, key);
+    return NULL;
 }
 
 int64_t fastpy_dict_pop_int(FpyDict *dict, const char *key) {
@@ -1938,8 +1985,8 @@ int64_t fastpy_dict_pop_int(FpyDict *dict, const char *key) {
         slot = (slot + 1) & mask;
     }
     FPY_UNLOCK(dict);
-    fprintf(stderr, "KeyError: '%s'\n", key);
-    exit(1);
+    fastpy_raise(FPY_EXC_KEYERROR, key);
+    return 0;
 }
 
 void fastpy_dict_setdefault_list(FpyDict *dict, const char *key, FpyList *default_val) {
@@ -2723,11 +2770,31 @@ int64_t fastpy_str_count(const char *s, const char *sub) {
     return count;
 }
 
-/* List copy — shallow copy of the list */
+/* Check if all elements are scalar (int/float/bool/none) — no refcounting needed */
+static int fpy_list_all_scalar(FpyList *list) {
+    for (int64_t i = 0; i < list->length; i++) {
+        int tag = list->items[i].tag;
+        if (tag != FPY_TAG_INT && tag != FPY_TAG_FLOAT &&
+            tag != FPY_TAG_BOOL && tag != FPY_TAG_NONE)
+            return 0;
+    }
+    return 1;
+}
+
+/* List copy — shallow copy of the list.
+ * Uses memcpy instead of per-element fpy_list_append. Skips incref
+ * entirely for scalar-only lists (int/float/bool/none have no refcount). */
 FpyList* fastpy_list_copy(FpyList *list) {
     FpyList *result = fpy_list_new(list->length);
-    for (int64_t i = 0; i < list->length; i++)
-        fpy_list_append(result, list->items[i]);
+    if (list->length > 0) {
+        memcpy(result->items, list->items, list->length * sizeof(FpyValue));
+        result->length = list->length;
+        if (!fpy_list_all_scalar(list)) {
+            for (int64_t i = 0; i < list->length; i++) {
+                FPY_VAL_INCREF(result->items[i]);
+            }
+        }
+    }
     result->is_tuple = list->is_tuple;
     return result;
 }
@@ -3584,14 +3651,11 @@ FpyObj* fastpy_obj_new(int class_id) {
     size_t total = sizeof(FpyObj) + sizeof(FpyValue) * sc;
     FpyObj *obj = (FpyObj*)malloc(total);
     obj->refcount = 1;
-    memset(&obj->gc_node, 0, sizeof(FpyGCNode));
-    obj->gc_node.gc_type = FPY_GC_TYPE_OBJ;
-    fpy_gc_track(&obj->gc_node);
-    fpy_gc_maybe_collect();
     obj->magic = FPY_OBJ_MAGIC;
     obj->class_id = class_id;
     if (fpy_threading_mode == FPY_THREADING_FREE) fpy_mutex_init(&obj->lock);
     obj->dynamic_attrs = NULL;
+    obj->weakref_list = NULL;
     if (sc > 0) {
         obj->slots = (FpyValue*)(obj + 1);
         for (int i = 0; i < sc; i++) {
@@ -3601,13 +3665,23 @@ FpyObj* fastpy_obj_new(int class_id) {
     } else {
         obj->slots = NULL;
     }
+    /* Track AFTER the object is fully initialized — gc_maybe_collect may
+     * traverse this object's slots, so magic/class_id/slots must be valid. */
+    memset(&obj->gc_node, 0, sizeof(FpyGCNode));
+    obj->gc_node.gc_type = FPY_GC_TYPE_OBJ;
+    fpy_gc_track(&obj->gc_node);
+    fpy_gc_maybe_collect();
     return obj;
 }
 
-/* Fast-path static slot access. Slot index is known at compile time. */
+/* Fast-path static slot access. Slot index is known at compile time.
+ * Manages refcounts: increfs the new value, decrefs the old. */
 void fastpy_obj_set_slot(FpyObj *obj, int slot, int32_t tag, int64_t data) {
+    FpyValue old = obj->slots[slot];
+    fpy_rc_incref(tag, data);
     obj->slots[slot].tag = tag;
     obj->slots[slot].data.i = data;
+    fpy_rc_decref(old.tag, old.data.i);
 }
 
 void fastpy_obj_get_slot(FpyObj *obj, int slot,
@@ -3624,10 +3698,14 @@ void fastpy_obj_set_fv(FpyObj *obj, const char *name, int32_t tag, int64_t data)
     FpyValue v;
     v.tag = tag;
     v.data.i = data;
+    /* Incref the new value up-front (before any slot/dyn store). */
+    fpy_rc_incref(tag, data);
     /* Check static slots first (covers all compiler-known attrs) */
     int slot = fpy_find_slot(obj->class_id, name);
     if (slot >= 0) {
+        FpyValue old = obj->slots[slot];
         obj->slots[slot] = v;
+        fpy_rc_decref(old.tag, old.data.i);
         return;
     }
     /* Dynamic attr fallback — lazily allocate the side table on first use. */
@@ -3636,7 +3714,9 @@ void fastpy_obj_set_fv(FpyObj *obj, const char *name, int32_t tag, int64_t data)
         for (int i = 0; i < a->count; i++) {
             if (a->names[i] == name
                     || strcmp(a->names[i], name) == 0) {
+                FpyValue old = a->values[i];
                 a->values[i] = v;
+                fpy_rc_decref(old.tag, old.data.i);
                 return;
             }
         }
@@ -3650,6 +3730,7 @@ void fastpy_obj_set_fv(FpyObj *obj, const char *name, int32_t tag, int64_t data)
     a->names[a->count] = name;
     a->values[a->count] = v;
     a->count++;
+    /* New dynamic slot — no old value to decref. */
 }
 
 /* Get an attribute as FpyValue, writing tag+data to output params.
@@ -3675,9 +3756,10 @@ void fastpy_obj_get_fv(FpyObj *obj, const char *name, int32_t *out_tag, int64_t 
             }
         }
     }
-    fprintf(stderr, "AttributeError: '%s' object has no attribute '%s'\n",
-            fpy_classes[obj->class_id].name, name);
-    exit(1);
+    snprintf(_err_buf, sizeof(_err_buf), "'%s' object has no attribute '%s'",
+             fpy_classes[obj->class_id].name, name);
+    fastpy_raise(FPY_EXC_ATTRIBUTEERROR, _err_buf);
+    *out_tag = FPY_TAG_NONE; *out_data = 0; return;
 }
 
 /* Get attribute as string representation (works for any type).
@@ -3686,9 +3768,10 @@ void fastpy_obj_get_fv(FpyObj *obj, const char *name, int32_t *out_tag, int64_t 
 int64_t fastpy_obj_call_method0(FpyObj *obj, const char *name) {
     FpyMethodDef *m = fastpy_find_method(obj->class_id, name);
     if (!m) {
-        fprintf(stderr, "AttributeError: '%s' object has no method '%s'\n",
-                fpy_classes[obj->class_id].name, name);
-        exit(1);
+        snprintf(_err_buf, sizeof(_err_buf), "'%s' object has no method '%s'",
+                 fpy_classes[obj->class_id].name, name);
+        fastpy_raise(FPY_EXC_ATTRIBUTEERROR, _err_buf);
+        return 0;
     }
     return ((FpyMethodFunc)m->func)(obj);
 }
@@ -3696,9 +3779,10 @@ int64_t fastpy_obj_call_method0(FpyObj *obj, const char *name) {
 int64_t fastpy_obj_call_method1(FpyObj *obj, const char *name, int64_t a) {
     FpyMethodDef *m = fastpy_find_method(obj->class_id, name);
     if (!m) {
-        fprintf(stderr, "AttributeError: '%s' object has no method '%s'\n",
-                fpy_classes[obj->class_id].name, name);
-        exit(1);
+        snprintf(_err_buf, sizeof(_err_buf), "'%s' object has no method '%s'",
+                 fpy_classes[obj->class_id].name, name);
+        fastpy_raise(FPY_EXC_ATTRIBUTEERROR, _err_buf);
+        return 0;
     }
     return ((FpyMethod1Func)m->func)(obj, a);
 }
@@ -3706,9 +3790,10 @@ int64_t fastpy_obj_call_method1(FpyObj *obj, const char *name, int64_t a) {
 int64_t fastpy_obj_call_method2(FpyObj *obj, const char *name, int64_t a, int64_t b) {
     FpyMethodDef *m = fastpy_find_method(obj->class_id, name);
     if (!m) {
-        fprintf(stderr, "AttributeError: '%s' object has no method '%s'\n",
-                fpy_classes[obj->class_id].name, name);
-        exit(1);
+        snprintf(_err_buf, sizeof(_err_buf), "'%s' object has no method '%s'",
+                 fpy_classes[obj->class_id].name, name);
+        fastpy_raise(FPY_EXC_ATTRIBUTEERROR, _err_buf);
+        return 0;
     }
     return ((FpyMethod2Func)m->func)(obj, a, b);
 }
@@ -3716,9 +3801,10 @@ int64_t fastpy_obj_call_method2(FpyObj *obj, const char *name, int64_t a, int64_
 int64_t fastpy_obj_call_method3(FpyObj *obj, const char *name, int64_t a, int64_t b, int64_t c) {
     FpyMethodDef *m = fastpy_find_method(obj->class_id, name);
     if (!m) {
-        fprintf(stderr, "AttributeError: '%s' object has no method '%s'\n",
-                fpy_classes[obj->class_id].name, name);
-        exit(1);
+        snprintf(_err_buf, sizeof(_err_buf), "'%s' object has no method '%s'",
+                 fpy_classes[obj->class_id].name, name);
+        fastpy_raise(FPY_EXC_ATTRIBUTEERROR, _err_buf);
+        return 0;
     }
     return ((FpyMethod3Func)m->func)(obj, a, b, c);
 }
@@ -3726,9 +3812,10 @@ int64_t fastpy_obj_call_method3(FpyObj *obj, const char *name, int64_t a, int64_
 int64_t fastpy_obj_call_method4(FpyObj *obj, const char *name, int64_t a, int64_t b, int64_t c, int64_t d) {
     FpyMethodDef *m = fastpy_find_method(obj->class_id, name);
     if (!m) {
-        fprintf(stderr, "AttributeError: '%s' object has no method '%s'\n",
-                fpy_classes[obj->class_id].name, name);
-        exit(1);
+        snprintf(_err_buf, sizeof(_err_buf), "'%s' object has no method '%s'",
+                 fpy_classes[obj->class_id].name, name);
+        fastpy_raise(FPY_EXC_ATTRIBUTEERROR, _err_buf);
+        return 0;
     }
     return ((FpyMethod4Func)m->func)(obj, a, b, c, d);
 }
@@ -3739,13 +3826,23 @@ typedef double (*FpyMethodDouble1Func)(FpyObj *self, int64_t a);
 
 double fastpy_obj_call_method0_double(FpyObj *obj, const char *name) {
     FpyMethodDef *m = fastpy_find_method(obj->class_id, name);
-    if (!m) { fprintf(stderr, "AttributeError: no method '%s'\n", name); exit(1); }
+    if (!m) {
+        snprintf(_err_buf, sizeof(_err_buf), "'%s' object has no method '%s'",
+                 fpy_classes[obj->class_id].name, name);
+        fastpy_raise(FPY_EXC_ATTRIBUTEERROR, _err_buf);
+        return 0.0;
+    }
     return ((FpyMethodDoubleFunc)m->func)(obj);
 }
 
 double fastpy_obj_call_method1_double(FpyObj *obj, const char *name, int64_t a) {
     FpyMethodDef *m = fastpy_find_method(obj->class_id, name);
-    if (!m) { fprintf(stderr, "AttributeError: no method '%s'\n", name); exit(1); }
+    if (!m) {
+        snprintf(_err_buf, sizeof(_err_buf), "'%s' object has no method '%s'",
+                 fpy_classes[obj->class_id].name, name);
+        fastpy_raise(FPY_EXC_ATTRIBUTEERROR, _err_buf);
+        return 0.0;
+    }
     return ((FpyMethodDouble1Func)m->func)(obj, a);
 }
 
@@ -3847,8 +3944,8 @@ FpyComplex* fpy_complex_mul(FpyComplex *a, FpyComplex *b) {
 FpyComplex* fpy_complex_div(FpyComplex *a, FpyComplex *b) {
     double denom = b->real * b->real + b->imag * b->imag;
     if (denom == 0.0) {
-        fprintf(stderr, "ZeroDivisionError: complex division by zero\n");
-        exit(1);
+        fastpy_raise(FPY_EXC_ZERODIVISION, "complex division by zero");
+        return NULL;
     }
     return fpy_complex_new(
         (a->real * b->real + a->imag * b->imag) / denom,
@@ -3990,8 +4087,8 @@ FpyDecimal* fpy_decimal_mul(FpyDecimal *a, FpyDecimal *b) {
 
 FpyDecimal* fpy_decimal_div(FpyDecimal *a, FpyDecimal *b) {
     if (b->coefficient == 0) {
-        fprintf(stderr, "DivisionError: division by zero\n");
-        return fpy_decimal_new(0, 0, 0);
+        fastpy_raise(FPY_EXC_ZERODIVISION, "division by zero");
+        return NULL;
     }
     /* Scale numerator for precision (18 digits) */
     int64_t scale = 1000000000LL;  /* 9 extra digits of precision */
@@ -4731,8 +4828,8 @@ void fastpy_deque_appendleft(FpyDeque *dq, int32_t tag, int64_t data) {
 
 void fastpy_deque_pop(FpyDeque *dq, int32_t *out_tag, int64_t *out_data) {
     if (dq->length == 0) {
-        fprintf(stderr, "IndexError: pop from an empty deque\n");
-        exit(1);
+        fastpy_raise(FPY_EXC_INDEXERROR, "pop from an empty deque");
+        *out_tag = FPY_TAG_NONE; *out_data = 0; return;
     }
     dq->length--;
     int64_t tail = (dq->head + dq->length) % dq->capacity;
@@ -4742,8 +4839,8 @@ void fastpy_deque_pop(FpyDeque *dq, int32_t *out_tag, int64_t *out_data) {
 
 void fastpy_deque_popleft(FpyDeque *dq, int32_t *out_tag, int64_t *out_data) {
     if (dq->length == 0) {
-        fprintf(stderr, "IndexError: pop from an empty deque\n");
-        exit(1);
+        fastpy_raise(FPY_EXC_INDEXERROR, "pop from an empty deque");
+        *out_tag = FPY_TAG_NONE; *out_data = 0; return;
     }
     *out_tag = dq->items[dq->head].tag;
     *out_data = dq->items[dq->head].data.i;
@@ -4758,8 +4855,8 @@ int64_t fastpy_deque_length(FpyDeque *dq) {
 void fastpy_deque_get(FpyDeque *dq, int64_t index, int32_t *out_tag, int64_t *out_data) {
     if (index < 0) index += dq->length;
     if (index < 0 || index >= dq->length) {
-        fprintf(stderr, "IndexError: deque index out of range\n");
-        exit(1);
+        fastpy_raise(FPY_EXC_INDEXERROR, "deque index out of range");
+        *out_tag = FPY_TAG_NONE; *out_data = 0; return;
     }
     int64_t actual = (dq->head + index) % dq->capacity;
     *out_tag = dq->items[actual].tag;
@@ -4913,8 +5010,8 @@ void fastpy_chainmap_get(FpyChainMap *cm, const char *key,
             slot = (slot + 1) & mask;
         }
     }
-    fprintf(stderr, "KeyError: '%s'\n", key);
-    exit(1);
+    fastpy_raise(FPY_EXC_KEYERROR, key);
+    *out_tag = FPY_TAG_NONE; *out_data = 0; return;
 }
 
 void fastpy_chainmap_set(FpyChainMap *cm, const char *key,
@@ -5582,4 +5679,61 @@ const char* fastpy_logging_format_msg(const char *fmt, FpyList *args) {
     }
     *out = '\0';
     return buf;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+ * Weak references
+ *
+ * A weak reference points to an FpyObj without preventing its collection.
+ * When the target is destroyed, all its weakrefs are invalidated (target
+ * set to NULL). Deref on a dead weakref returns None.
+ *
+ * The FpyWeakRef is itself refcounted and heap-allocated. It participates
+ * in the target's weakref_list (singly-linked). Creating a weakref
+ * inserts it at the head of the list; destruction removes it.
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+/* Create a weak reference to target. The target must be an FpyObj*.
+ * Returns the weakref as an i64 (pointer cast). The caller stores it
+ * as an FPY_TAG_OBJ value. */
+FpyWeakRef* fpy_weakref_new(FpyObj *target) {
+    FpyWeakRef *wr = (FpyWeakRef*)malloc(sizeof(FpyWeakRef));
+    wr->refcount = 1;
+    wr->magic = FPY_WEAKREF_MAGIC;
+    wr->target = target;
+    wr->callback = 0;
+    wr->callback_tag = 0;
+    /* Insert at head of target's weakref list */
+    wr->next = target->weakref_list;
+    target->weakref_list = wr;
+    return wr;
+}
+
+/* Dereference a weak reference. Returns the target as an FpyObj*, or
+ * NULL if the target has been collected. The caller checks NULL and
+ * produces None. */
+FpyObj* fpy_weakref_deref(FpyWeakRef *wr) {
+    if (!wr || wr->magic != FPY_WEAKREF_MAGIC) return NULL;
+    return wr->target;  /* NULL if invalidated */
+}
+
+/* Check if a weakref is alive (target not yet collected). */
+int32_t fpy_weakref_alive(FpyWeakRef *wr) {
+    if (!wr || wr->magic != FPY_WEAKREF_MAGIC) return 0;
+    return (wr->target != NULL) ? 1 : 0;
+}
+
+/* Free a weakref. Unlinks it from the target's list (if target is alive). */
+void fpy_weakref_destroy(FpyWeakRef *wr) {
+    if (!wr) return;
+    /* Unlink from target's list if target is still alive */
+    if (wr->target) {
+        FpyObj *obj = wr->target;
+        FpyWeakRef **pp = &obj->weakref_list;
+        while (*pp) {
+            if (*pp == wr) { *pp = wr->next; break; }
+            pp = &(*pp)->next;
+        }
+    }
+    free(wr);
 }

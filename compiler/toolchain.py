@@ -454,7 +454,7 @@ def _compile_shared_runtime_windows(vcvars_cmd: str) -> None:
         bat_path.write_text(bat_content, encoding="ascii")
         try:
             result = subprocess.run(
-                ["cmd.exe", "/c", str(bat_path)],
+                ["cmd.exe", "/c", str(bat_path.resolve())],
                 capture_output=True, text=True, timeout=30,
             )
             if result.returncode != 0 or not obj.exists():
@@ -517,7 +517,7 @@ def _compile_bridge_windows(vcvars_cmd: str, install: PythonInstall) -> Path:
     bat_path.write_bytes(bat_bytes)
     try:
         result = subprocess.run(
-            ["cmd.exe", "/c", str(bat_path)],
+            ["cmd.exe", "/c", str(bat_path.resolve())],
             capture_output=True, text=True, timeout=30,
         )
         if result.returncode != 0 or not out_obj.exists():
@@ -750,7 +750,7 @@ def _link_windows(obj_files: list[Path], output_path: Path,
 
     try:
         result = subprocess.run(
-            ["cmd.exe", "/c", str(bat_path)],
+            ["cmd.exe", "/c", str(bat_path.resolve())],
             capture_output=True, text=True, timeout=30,
         )
         if "LINK_FAILED" in result.stdout or result.returncode != 0:

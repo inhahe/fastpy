@@ -17,7 +17,7 @@
 static FpyGCNode gc_sentinel = { &gc_sentinel, &gc_sentinel, 0, 0 };
 static int64_t gc_tracked = 0;
 static int64_t gc_alloc_count = 0;
-static int64_t gc_threshold = 700;  /* collect after this many allocations */
+static int64_t gc_threshold = 700;
 
 void fpy_gc_track(FpyGCNode *node) {
     node->gc_flags |= FPY_GC_TRACKED;
