@@ -3588,6 +3588,17 @@ class CodeGen:
         for fname, fnode in func_asts.items():
             # Collect function-local variable types
             local_types: dict[str, str] = {}
+
+            def _binop_has_float(bn):
+                """Check if a BinOp tree involves float constants or float-typed locals."""
+                if isinstance(bn, ast.Constant) and isinstance(bn.value, float):
+                    return True
+                if isinstance(bn, ast.BinOp):
+                    return _binop_has_float(bn.left) or _binop_has_float(bn.right)
+                if isinstance(bn, ast.Name) and bn.id in local_types and local_types[bn.id] == "float":
+                    return True
+                return False
+
             for n in ast.walk(fnode):
                 if isinstance(n, ast.Assign) and len(n.targets) == 1:
                     if isinstance(n.targets[0], ast.Name):
@@ -3600,6 +3611,61 @@ class CodeGen:
                             local_types[tgt] = "str"
                         elif isinstance(n.value, ast.Constant) and isinstance(n.value.value, float):
                             local_types[tgt] = "float"
+                        elif isinstance(n.value, ast.BinOp):
+                            # Detect float from arithmetic with float constants
+                            if _binop_has_float(n.value):
+                                local_types[tgt] = "float"
+                        elif isinstance(n.value, ast.Call) and isinstance(n.value.func, ast.Name):
+                            _call_name = n.value.func.id
+                            _param_names_set = {a.arg for a in fnode.args.args}
+                            # max(a, b, c) / min(a, b, c) where any arg is float or parameter
+                            if _call_name in ("max", "min") and n.value.args:
+                                for a in n.value.args:
+                                    if isinstance(a, ast.Name) and local_types.get(a.id) == "float":
+                                        local_types[tgt] = "float"
+                                        break
+                                    if isinstance(a, ast.Name) and a.id in _param_names_set:
+                                        # Parameter in a function with float operations
+                                        local_types[tgt] = "float"
+                                        break
+                                    if isinstance(a, ast.Constant) and isinstance(a.value, float):
+                                        local_types[tgt] = "float"
+                                        break
+                            # User function that returns float
+                            if tgt not in local_types and _call_name in self._user_functions:
+                                if self._user_functions[_call_name].ret_tag == "float":
+                                    local_types[tgt] = "float"
+                            # Also check _func_ret_types (populated earlier in this pass)
+                            if tgt not in local_types and _call_name in _func_ret_types:
+                                if _func_ret_types[_call_name] == "float":
+                                    local_types[tgt] = "float"
+            # Propagate float type through Name assignments (v = maxc → float)
+            # and function calls to float-returning functions.
+            _changed = True
+            while _changed:
+                _changed = False
+                for n in ast.walk(fnode):
+                    if (isinstance(n, ast.Assign) and len(n.targets) == 1
+                            and isinstance(n.targets[0], ast.Name)):
+                        tgt = n.targets[0].id
+                        if tgt in local_types:
+                            continue
+                        if isinstance(n.value, ast.Name) and local_types.get(n.value.id) == "float":
+                            local_types[tgt] = "float"
+                            _changed = True
+                        elif isinstance(n.value, ast.BinOp) and _binop_has_float(n.value):
+                            local_types[tgt] = "float"
+                            _changed = True
+                        elif (isinstance(n.value, ast.Call)
+                              and isinstance(n.value.func, ast.Name)):
+                            _cn = n.value.func.id
+                            if (_cn in self._user_functions
+                                    and self._user_functions[_cn].ret_tag == "float"):
+                                local_types[tgt] = "float"
+                                _changed = True
+                            elif _cn in _func_ret_types and _func_ret_types[_cn] == "float":
+                                local_types[tgt] = "float"
+                                _changed = True
             # Detect list element types from append patterns
             for n in ast.walk(fnode):
                 if (isinstance(n, ast.Expr) and isinstance(n.value, ast.Call)
@@ -3707,6 +3773,64 @@ class CodeGen:
                             _func_ret_types[fname] = var_types[ret_var]
                         elif ret_var in _fn_list_vars:
                             _func_ret_types[fname] = "list"
+                    elif isinstance(n.value, ast.Tuple):
+                        # Return of tuple literal: determine element type.
+                        # If all elements are float-typed (constants, local
+                        # float vars, or parameters in a float-heavy body),
+                        # mark as "tuple:float" so unpack sites extract doubles.
+                        _all_float_elts = True
+                        _param_names = {a.arg for a in fnode.args.args}
+                        for elt in n.value.elts:
+                            if isinstance(elt, ast.Constant) and isinstance(elt.value, float):
+                                continue
+                            elif isinstance(elt, ast.Name) and local_types.get(elt.id) == "float":
+                                continue
+                            elif isinstance(elt, ast.Name) and elt.id in _param_names:
+                                # Parameter — assume float if body contains float ops
+                                continue
+                            elif isinstance(elt, ast.BinOp):
+                                # Arithmetic expression — float if contains float constants
+                                if _binop_has_float(elt):
+                                    continue
+                                _all_float_elts = False
+                                break
+                            elif isinstance(elt, ast.Call) and isinstance(elt.func, ast.Name):
+                                # Function call — float if callee returns float
+                                _callee = elt.func.id
+                                _callee_info = self._user_functions.get(_callee)
+                                if _callee_info and _callee_info.ret_tag == "float":
+                                    continue
+                                if _callee in _func_ret_types and _func_ret_types[_callee] == "float":
+                                    continue
+                                # Callee is in a float-heavy context (has float
+                                # constants) — assume float return
+                                if _callee in func_asts:
+                                    _callee_has_float = any(
+                                        isinstance(_c, ast.Constant) and isinstance(_c.value, float)
+                                        for _c in ast.walk(func_asts[_callee])
+                                    )
+                                    if _callee_has_float:
+                                        continue
+                                _all_float_elts = False
+                                break
+                            else:
+                                _all_float_elts = False
+                                break
+                        if _all_float_elts:
+                            # Verify function body actually works with floats
+                            _body_has_float = any(
+                                isinstance(_c, ast.Constant) and isinstance(_c.value, float)
+                                for _c in ast.walk(fnode)
+                            )
+                            if _body_has_float:
+                                _func_ret_types[fname] = "tuple:float"
+                    elif isinstance(n.value, ast.BinOp):
+                        # return a * 2.0 — float if BinOp involves floats
+                        if _binop_has_float(n.value):
+                            _func_ret_types[fname] = "float"
+                    elif isinstance(n.value, ast.Constant) and isinstance(n.value.value, float):
+                        # return 3.14
+                        _func_ret_types[fname] = "float"
                     elif (isinstance(n.value, ast.Call)
                           and isinstance(n.value.func, ast.Name)):
                         # return func() — propagate callee's return type
@@ -5337,6 +5461,23 @@ class CodeGen:
             ret_type = i8_ptr
             ret_tag = "ptr:list"
 
+        # Float-returning functions: if a parameter's type wasn't determined
+        # by call-site analysis or defaults, and the function body uses
+        # floats, promote the parameter to double. This ensures FV-ABI
+        # unwrapping uses bitcast (correct for float data) instead of
+        # sitofp (correct only for integer data).
+        if ret_type == double:
+            _body_has_float = any(
+                isinstance(_c, ast.Constant) and isinstance(_c.value, float)
+                for _c in ast.walk(node)
+            )
+            if _body_has_float:
+                for i in range(len(param_types)):
+                    if param_types[i] == i64:
+                        # Only promote if call-site didn't specify a type
+                        if not (i < len(call_types) and call_types[i] is not None):
+                            param_types[i] = double
+
         # Remember the statically-inferred bare types — the body expects
         # these, and we'll unwrap FpyValue params at entry to match.
         static_param_types = list(param_types)
@@ -5755,7 +5896,6 @@ class CodeGen:
             return
 
         info = self._user_functions[effective_name]
-
         # Save outer state. Dict-value-type sets are scoped per-function so
         # a `d` param in one function doesn't pollute another's heuristics.
         saved = (self.function, self.builder, self.variables, self._loop_stack,
@@ -12033,10 +12173,13 @@ class CodeGen:
                         self._bridge_fallback_stmt(node, "unsupported unpack target")
             else:
                 # Simple unpacking: a, b, c = list
+                # Determine element type (default "int"; "float" for
+                # tuple-of-floats from user functions like colorsys).
+                elem_type = self._get_list_elem_type(value_node)
                 for i, tgt in enumerate(target.elts):
                     if isinstance(tgt, ast.Name):
-                        elem = self._list_get_as_bare(val, ir.Constant(i64, i), "int")
-                        self._store_variable(tgt.id, elem, "int")
+                        elem = self._list_get_as_bare(val, ir.Constant(i64, i), elem_type)
+                        self._store_variable(tgt.id, elem, elem_type)
                     else:
                         self._bridge_fallback_stmt(node, "unsupported unpack target")
         else:
@@ -14901,13 +15044,39 @@ class CodeGen:
                 if (ret_info is not None
                         and ret_info.static_ret_type is double):
                     # Force float tag: evaluate, promote int→double, wrap.
-                    bare = self._emit_expr_value(node.value)
-                    if isinstance(bare.type, ir.IntType):
-                        if bare.type.width == 1 or bare.type.width == 32:
-                            bare = self.builder.zext(bare, i64)
+                    # In FV-ABI, parameters may carry float values with
+                    # "int" static tag (because call-site analysis couldn't
+                    # determine types).  For Name returns that might be
+                    # FV-backed, load the raw FpyValue and use the runtime
+                    # tag to pick bitcast (float data) vs sitofp (int data).
+                    if (self._USE_FV_LOCALS
+                            and isinstance(node.value, ast.Name)
+                            and node.value.id in self.variables):
+                        alloca, _vtag = self.variables[node.value.id]
+                        if (isinstance(alloca.type, ir.PointerType)
+                                and alloca.type.pointee is fpy_val):
+                            fv = self.builder.load(alloca, name=f"{node.value.id}.retfv")
+                            tag = self.builder.extract_value(fv, 0)
+                            data = self.builder.extract_value(fv, 1)
+                            is_float = self.builder.icmp_unsigned(
+                                "==", tag, ir.Constant(i32, FPY_TAG_FLOAT))
+                            float_val = self.builder.bitcast(data, double)
+                            int_val = self.builder.sitofp(data, double)
+                            bare = self.builder.select(is_float, float_val, int_val)
+                            value = self._fv_from_float(bare)
+                        else:
+                            bare = self._emit_expr_value(node.value)
+                            if isinstance(bare.type, ir.IntType):
+                                bare = self.builder.sitofp(bare, double)
+                            value = self._fv_from_float(bare)
+                    else:
+                        bare = self._emit_expr_value(node.value)
                         if isinstance(bare.type, ir.IntType):
-                            bare = self.builder.sitofp(bare, double)
-                    value = self._fv_from_float(bare)
+                            if bare.type.width == 1 or bare.type.width == 32:
+                                bare = self.builder.zext(bare, i64)
+                            if isinstance(bare.type, ir.IntType):
+                                bare = self.builder.sitofp(bare, double)
+                        value = self._fv_from_float(bare)
                 else:
                     value = self._load_or_wrap_fv(node.value)
             else:
@@ -18457,11 +18626,17 @@ class CodeGen:
                     return "int"
                 return "str"
         # Check if this is a function call that returns a list of lists
+        # or a tuple of floats (from _func_ret_types analysis).
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
             if node.func.id in self._user_functions:
                 info = self._user_functions[node.func.id]
                 if info.ret_tag == "ptr:list":
                     return "list"
+                if info.ret_tag == "ptr":
+                    frt = getattr(self, '_func_ret_types', {})
+                    rt = frt.get(node.func.id, "")
+                    if rt.startswith("tuple:"):
+                        return rt.split(":", 1)[1]  # e.g. "float"
         # Global variable whose element type isn't in the tag: look up the
         # module-level AST definition and infer element type from the literal.
         if isinstance(node, ast.Name):
@@ -19769,7 +19944,16 @@ class CodeGen:
             floor_fn = self.module.declare_intrinsic("llvm.floor", [double])
             return self.builder.call(floor_fn, [result])
         elif isinstance(op, ast.Mod):
-            return self.builder.frem(left, right)
+            # Python-compatible float modulo: result has same sign as divisor.
+            # rem = fmod(a, b); if sign(rem) != sign(b) and rem != 0: rem += b
+            rem = self.builder.frem(left, right)
+            rem_neg = self.builder.fcmp_ordered("<", rem, ir.Constant(double, 0.0))
+            b_neg = self.builder.fcmp_ordered("<", right, ir.Constant(double, 0.0))
+            signs_differ = self.builder.xor(rem_neg, b_neg)
+            rem_nonzero = self.builder.fcmp_ordered("!=", rem, ir.Constant(double, 0.0))
+            needs_adjust = self.builder.and_(signs_differ, rem_nonzero)
+            adjusted = self.builder.fadd(rem, right)
+            return self.builder.select(needs_adjust, adjusted, rem)
         elif isinstance(op, ast.Div):
             return self.builder.call(self.runtime["safe_fdiv"],
                                      [left, right])
@@ -21077,7 +21261,11 @@ class CodeGen:
                     op = "<" if name == "min" else ">"
                     for arg_node in node.args[1:]:
                         other = self._emit_expr_value(arg_node)
-                        is_better = self.builder.icmp_signed(op, other, result)
+                        # Use fcmp for floats, icmp for ints
+                        if isinstance(result.type, ir.DoubleType):
+                            is_better = self.builder.fcmp_ordered(op, other, result)
+                        else:
+                            is_better = self.builder.icmp_signed(op, other, result)
                         result = self.builder.select(is_better, other, result)
                     return result
                 return self._bridge_fallback_expr(node, f"{name}() with unsupported args")
