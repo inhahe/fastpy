@@ -4,13 +4,6 @@ Covers: heappush, heappop, heapify, heapreplace, heappushpop (min-heap),
         heappush_max, heappop_max, heapify_max, heapreplace_max,
         heappushpop_max (max-heap), and internal _siftdown/_siftup functions.
 Skipped: merge (generators), nlargest/nsmallest (iterators, key=), key= params.
-
-NOTE: Test sections are wrapped in functions because the compiler has a known
-refcount bug with repeated global list variable reassignment. Wrapping in
-functions makes the lists function-local, avoiding the issue.
-
-NOTE: All h=[] are replaced with h=[0]; h.pop() to avoid a known compiler bug
-where freeing an empty-list literal causes heap corruption on reassignment.
 """
 
 # ---------------------------------------------------------------------------
@@ -231,8 +224,7 @@ def _check_maxheap(heap):
 
 def test_heappush_basic():
     _start_group("heappush_basic")
-    h = [0]
-    h.pop()
+    h = []
     heappush(h, 5)
     _assert_list_eq(h, [5], "push to empty")
     heappush(h, 3)
@@ -335,8 +327,7 @@ def test_heapify_two():
 
 def test_heapify_100():
     _start_group("heapify_100")
-    h = [0]
-    h.pop()
+    h = []
     v = 73
     for i in range(100):
         v = (v * 1103515245 + 12345) % (2 ** 31)
@@ -347,8 +338,7 @@ def test_heapify_100():
 
 def test_heapify_1000():
     _start_group("heapify_1000")
-    h = [0]
-    h.pop()
+    h = []
     v = 42
     for i in range(1000):
         v = (v * 6364136223846793005 + 1) % (2 ** 31)
@@ -438,8 +428,7 @@ def test_heappushpop_equal():
 
 def test_heappushpop_empty():
     _start_group("heappushpop_empty")
-    h = [0]
-    h.pop()
+    h = []
     v = heappushpop(h, 5)
     _assert_eq(v, 5, "pushpop empty returns item")
     _assert_eq(len(h), 0, "heap still empty")
@@ -457,12 +446,10 @@ test_heappushpop_empty()
 def test_heapsort_basic():
     _start_group("heapsort_basic")
     data = [5, 3, 7, 1, 9, 2, 8, 4, 6, 0]
-    h = [0]
-    h.pop()
+    h = []
     for x in data:
         heappush(h, x)
-    result = [0]
-    result.pop()
+    result = []
     while h:
         result.append(heappop(h))
     _assert_list_eq(result, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9], "heapsort basic")
@@ -471,12 +458,10 @@ def test_heapsort_basic():
 def test_heapsort_sorted_input():
     _start_group("heapsort_sorted_input")
     data = [1, 2, 3, 4, 5]
-    h = [0]
-    h.pop()
+    h = []
     for x in data:
         heappush(h, x)
-    result = [0]
-    result.pop()
+    result = []
     while h:
         result.append(heappop(h))
     _assert_list_eq(result, [1, 2, 3, 4, 5], "heapsort sorted input")
@@ -485,12 +470,10 @@ def test_heapsort_sorted_input():
 def test_heapsort_reverse_input():
     _start_group("heapsort_reverse_input")
     data = [5, 4, 3, 2, 1]
-    h = [0]
-    h.pop()
+    h = []
     for x in data:
         heappush(h, x)
-    result = [0]
-    result.pop()
+    result = []
     while h:
         result.append(heappop(h))
     _assert_list_eq(result, [1, 2, 3, 4, 5], "heapsort reverse input")
@@ -499,12 +482,10 @@ def test_heapsort_reverse_input():
 def test_heapsort_duplicates():
     _start_group("heapsort_duplicates")
     data = [3, 1, 4, 1, 5, 9, 2, 6, 5, 3, 5]
-    h = [0]
-    h.pop()
+    h = []
     for x in data:
         heappush(h, x)
-    result = [0]
-    result.pop()
+    result = []
     while h:
         result.append(heappop(h))
     _assert_list_eq(result, [1, 1, 2, 3, 3, 4, 5, 5, 5, 6, 9], "heapsort duplicates")
@@ -512,11 +493,9 @@ def test_heapsort_duplicates():
 
 def test_heapsort_single():
     _start_group("heapsort_single")
-    h = [0]
-    h.pop()
+    h = []
     heappush(h, 42)
-    result = [0]
-    result.pop()
+    result = []
     while h:
         result.append(heappop(h))
     _assert_list_eq(result, [42], "heapsort single")
@@ -524,14 +503,12 @@ def test_heapsort_single():
 
 def test_heapsort_large():
     _start_group("heapsort_large")
-    h = [0]
-    h.pop()
+    h = []
     v = 17
     for i in range(500):
         v = (v * 1103515245 + 12345) % (2 ** 31)
         heappush(h, v % 10000)
-    result = [0]
-    result.pop()
+    result = []
     while h:
         result.append(heappop(h))
     ok = True
@@ -556,13 +533,11 @@ test_heapsort_large()
 def test_heapify_sort_basic():
     _start_group("heapify_sort_basic")
     data = [8, 3, 6, 1, 9, 4, 7, 2, 5, 0]
-    h = [0]
-    h.pop()
+    h = []
     for x in data:
         h.append(x)
     heapify(h)
-    result = [0]
-    result.pop()
+    result = []
     while h:
         result.append(heappop(h))
     _assert_list_eq(result, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9], "heapify+pop sort")
@@ -570,15 +545,13 @@ def test_heapify_sort_basic():
 
 def test_heapify_sort_large():
     _start_group("heapify_sort_large")
-    h = [0]
-    h.pop()
+    h = []
     v = 99
     for i in range(1000):
         v = (v * 6364136223846793005 + 1) % (2 ** 31)
         h.append(v % 50000)
     heapify(h)
-    result = [0]
-    result.pop()
+    result = []
     while h:
         result.append(heappop(h))
     ok = True
@@ -598,8 +571,7 @@ test_heapify_sort_large()
 
 def test_maxheap_push():
     _start_group("maxheap_push")
-    h = [0]
-    h.pop()
+    h = []
     heappush_max(h, 5)
     _assert_list_eq(h, [5], "maxheap push to empty")
     heappush_max(h, 3)
@@ -670,8 +642,7 @@ def test_heapify_max_random():
 
 def test_heapify_max_empty():
     _start_group("heapify_max_empty")
-    h = [0]
-    h.pop()
+    h = []
     heapify_max(h)
     _assert_true(_check_maxheap(h), "heapify_max empty")
     _end_group("heapify_max_empty")
@@ -685,8 +656,7 @@ def test_heapify_max_single():
 
 def test_heapify_max_large():
     _start_group("heapify_max_large")
-    h = [0]
-    h.pop()
+    h = []
     v = 31
     for i in range(500):
         v = (v * 1103515245 + 12345) % (2 ** 31)
@@ -762,8 +732,7 @@ def test_heappushpop_max_equal():
 
 def test_heappushpop_max_empty():
     _start_group("heappushpop_max_empty")
-    h = [0]
-    h.pop()
+    h = []
     v = heappushpop_max(h, 5)
     _assert_eq(v, 5, "maxheap pushpop empty")
     _end_group("heappushpop_max_empty")
@@ -780,12 +749,10 @@ test_heappushpop_max_empty()
 def test_maxheap_sort_push():
     _start_group("maxheap_sort_push")
     data = [5, 3, 7, 1, 9, 2, 8, 4, 6, 0]
-    h = [0]
-    h.pop()
+    h = []
     for x in data:
         heappush_max(h, x)
-    result = [0]
-    result.pop()
+    result = []
     while h:
         result.append(heappop_max(h))
     _assert_list_eq(result, [9, 8, 7, 6, 5, 4, 3, 2, 1, 0], "maxheap sort desc")
@@ -795,8 +762,7 @@ def test_maxheap_sort_heapify():
     _start_group("maxheap_sort_heapify")
     h = [8, 3, 6, 1, 9, 4, 7, 2, 5, 0]
     heapify_max(h)
-    result = [0]
-    result.pop()
+    result = []
     while h:
         result.append(heappop_max(h))
     _assert_list_eq(result, [9, 8, 7, 6, 5, 4, 3, 2, 1, 0], "heapify_max+pop desc")
@@ -804,15 +770,13 @@ def test_maxheap_sort_heapify():
 
 def test_maxheap_sort_large():
     _start_group("maxheap_sort_large")
-    h = [0]
-    h.pop()
+    h = []
     v = 53
     for i in range(500):
         v = (v * 1103515245 + 12345) % (2 ** 31)
         h.append(v % 10000)
     heapify_max(h)
-    result = [0]
-    result.pop()
+    result = []
     while h:
         result.append(heappop_max(h))
     ok = True
@@ -833,12 +797,10 @@ test_maxheap_sort_large()
 
 def test_precomputed_push09():
     _start_group("precomputed_push09")
-    h = [0]
-    h.pop()
+    h = []
     for i in range(10):
         heappush(h, i)
-    result = [0]
-    result.pop()
+    result = []
     for i in range(10):
         result.append(heappop(h))
     _assert_list_eq(result, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9], "push 0-9 pop all")
@@ -846,12 +808,10 @@ def test_precomputed_push09():
 
 def test_precomputed_push90():
     _start_group("precomputed_push90")
-    h = [0]
-    h.pop()
+    h = []
     for i in range(10):
         heappush(h, 9 - i)
-    result = [0]
-    result.pop()
+    result = []
     for i in range(10):
         result.append(heappop(h))
     _assert_list_eq(result, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9], "push 9-0 pop all")
@@ -859,8 +819,7 @@ def test_precomputed_push90():
 
 def test_precomputed_interleaved():
     _start_group("precomputed_interleaved")
-    h = [0]
-    h.pop()
+    h = []
     heappush(h, 5)
     heappush(h, 3)
     v1 = heappop(h)
@@ -881,8 +840,7 @@ def test_precomputed_replacements():
     heapify(h)
     for i in range(10):
         heapreplace(h, i + 6)
-    result = [0]
-    result.pop()
+    result = []
     while h:
         result.append(heappop(h))
     _assert_list_eq(result, [11, 12, 13, 14, 15], "10 replacements")
@@ -928,8 +886,7 @@ test_precomputed_pushpop_replace()
 
 def test_stress_invariant_min():
     _start_group("stress_invariant_min")
-    h = [0]
-    h.pop()
+    h = []
     v = 7
     ok = True
     for i in range(200):
@@ -966,8 +923,7 @@ def test_stress_invariant_min():
 
 def test_stress_invariant_max():
     _start_group("stress_invariant_max")
-    h = [0]
-    h.pop()
+    h = []
     v = 13
     ok = True
     for i in range(200):
@@ -1010,8 +966,7 @@ test_stress_invariant_max()
 # ---------------------------------------------------------------------------
 
 def _heapsort_one_size(size):
-    h = [0]
-    h.pop()
+    h = []
     v = size * 7 + 3
     expected_sum = 0
     for i in range(size):
@@ -1019,8 +974,7 @@ def _heapsort_one_size(size):
         val = v % 10000
         heappush(h, val)
         expected_sum = expected_sum + val
-    result = [0]
-    result.pop()
+    result = []
     actual_sum = 0
     while h:
         val = heappop(h)
@@ -1048,8 +1002,7 @@ test_heapsort_sizes()
 # ---------------------------------------------------------------------------
 
 def _maxheap_sort_one_size(size):
-    h = [0]
-    h.pop()
+    h = []
     v = size * 11 + 5
     expected_sum = 0
     for i in range(size):
@@ -1058,8 +1011,7 @@ def _maxheap_sort_one_size(size):
         h.append(val)
         expected_sum = expected_sum + val
     heapify_max(h)
-    result = [0]
-    result.pop()
+    result = []
     actual_sum = 0
     while h:
         val = heappop_max(h)
@@ -1167,8 +1119,7 @@ def test_edge_negative():
     heapify(h)
     _assert_eq(h[0], -5, "heapify neg: root = -5")
     _assert_true(_check_heap(h), "heapify neg: invariant")
-    result = [0]
-    result.pop()
+    result = []
     while h:
         result.append(heappop(h))
     _assert_list_eq(result, [-5, -4, -3, -2, -1], "heapsort neg")
@@ -1241,8 +1192,7 @@ def test_heapify_idempotent_order():
     for x in data:
         h_copy.append(x)
     heapify(h_copy)
-    result = [0]
-    result.pop()
+    result = []
     while h_copy:
         result.append(heappop(h_copy))
     _assert_list_eq(result, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9], "heapify pop order")
@@ -1293,12 +1243,10 @@ test_all_equal_max()
 def test_combined():
     _start_group("combined_ops")
     data = [15, 8, 23, 4, 42, 16, 1, 30, 7, 20]
-    min_h = [0]
-    min_h.pop()
+    min_h = []
     for x in data:
         heappush(min_h, x)
-    max_h = [0]
-    max_h.pop()
+    max_h = []
     for x in data:
         heappush_max(max_h, x)
     min_sorted = [0]
@@ -1388,8 +1336,7 @@ test_pushpop_boundary_max_below()
 
 def test_large_random_min():
     _start_group("large_random_min")
-    h = [0]
-    h.pop()
+    h = []
     v = 2023
     for i in range(2000):
         v = (v * 1103515245 + 12345) % (2 ** 31)
@@ -1405,8 +1352,7 @@ def test_large_random_min():
         heappushpop(h, v % 100000)
     _assert_true(_check_heap(h), "after 500 pushpops invariant")
     _assert_eq(len(h), 1000, "after 500 pushpops length")
-    result = [0]
-    result.pop()
+    result = []
     while h:
         result.append(heappop(h))
     ok = True
@@ -1419,8 +1365,7 @@ def test_large_random_min():
 
 def test_large_random_max():
     _start_group("large_random_max")
-    h = [0]
-    h.pop()
+    h = []
     v = 2024
     for i in range(2000):
         v = (v * 6364136223846793005 + 1) % (2 ** 31)
@@ -1433,8 +1378,7 @@ def test_large_random_max():
         v = (v * 6364136223846793005 + 1) % (2 ** 31)
         heappushpop_max(h, v % 100000)
     _assert_true(_check_maxheap(h), "maxheap after 500 pushpops invariant")
-    result = [0]
-    result.pop()
+    result = []
     while h:
         result.append(heappop_max(h))
     ok = True

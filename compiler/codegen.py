@@ -11989,6 +11989,15 @@ class CodeGen:
                         list_vars.add(tgt)
                         if not node.value.elts:
                             empty_list_vars.add(tgt)
+                        elif len(node.value.elts) == 1:
+                            # Single-element sentinel pattern: x = [0]
+                            # followed by x.pop(); x.append(typed_val).
+                            # Track these for append-type inference too.
+                            elt = node.value.elts[0]
+                            if (isinstance(elt, ast.Constant)
+                                    and isinstance(elt.value, (int, float))
+                                    and not isinstance(elt.value, bool)):
+                                empty_list_vars.add(tgt)
                     elif isinstance(node.value, ast.ListComp):
                         list_vars.add(tgt)
                     elif (isinstance(node.value, ast.Constant)
@@ -11999,17 +12008,54 @@ class CodeGen:
                         local_var_types[tgt] = "float"
                     elif isinstance(node.value, ast.JoinedStr):
                         local_var_types[tgt] = "str"
-                    elif (isinstance(node.value, ast.Call)
-                          and isinstance(node.value.func, ast.Attribute)
-                          and isinstance(node.value.func.value, ast.Name)):
-                        # Call on module attribute: t = mod.Cls(...)
-                        # If mod is a bridge module (imported but NOT native),
-                        # the result is a pyobj.
-                        _mod = node.value.func.value.id
-                        if (_mod in _imported_modules
-                                and _mod not in self._NATIVE_MODULES
-                                and _mod not in self._user_classes):
-                            local_var_types[tgt] = "pyobj"
+                    elif isinstance(node.value, ast.Call):
+                        _call = node.value
+                        if (isinstance(_call.func, ast.Attribute)
+                                and isinstance(_call.func.value, ast.Name)):
+                            # Call on module attribute: t = mod.Cls(...)
+                            # If mod is a bridge module, result is pyobj.
+                            _mod = _call.func.value.id
+                            if (_mod in _imported_modules
+                                    and _mod not in self._NATIVE_MODULES
+                                    and _mod not in self._user_classes):
+                                local_var_types[tgt] = "pyobj"
+                        elif isinstance(_call.func, ast.Name):
+                            _fn = _call.func.id
+                            # User function with known return type
+                            if _fn in self._user_functions:
+                                _rt = self._user_functions[_fn].ret_tag
+                                if _rt in ("float", "str"):
+                                    local_var_types[tgt] = _rt
+                            # Builtin type conversions
+                            elif _fn == "float":
+                                local_var_types[tgt] = "float"
+                            elif _fn == "str":
+                                local_var_types[tgt] = "str"
+                    elif isinstance(node.value, ast.BinOp):
+                        # Arithmetic with any float operand → float result
+                        _lhs = node.value.left
+                        _rhs = node.value.right
+                        _is_float = False
+                        for _op in (_lhs, _rhs):
+                            if (isinstance(_op, ast.Constant)
+                                    and isinstance(_op.value, float)):
+                                _is_float = True
+                            elif (isinstance(_op, ast.Name)
+                                  and _op.id in local_var_types
+                                  and local_var_types[_op.id] == "float"):
+                                _is_float = True
+                        if _is_float:
+                            local_var_types[tgt] = "float"
+                    elif (isinstance(node.value, ast.UnaryOp)
+                          and isinstance(node.value.op, ast.USub)):
+                        _inner = node.value.operand
+                        if (isinstance(_inner, ast.Constant)
+                                and isinstance(_inner.value, float)):
+                            local_var_types[tgt] = "float"
+                        elif (isinstance(_inner, ast.Name)
+                              and _inner.id in local_var_types
+                              and local_var_types[_inner.id] == "float"):
+                            local_var_types[tgt] = "float"
                 if isinstance(node, ast.For) and isinstance(node.target, ast.Name):
                     name = node.target.id
                     it = node.iter
@@ -12075,8 +12121,17 @@ class CodeGen:
                     # Appending a variable that is a list
                     self._list_append_types[var_name] = "list"
                 elif isinstance(arg, ast.Call) and isinstance(arg.func, ast.Name):
-                    if arg.func.id in self._user_classes:
+                    _fn = arg.func.id
+                    if _fn in self._user_classes:
                         self._list_append_types[var_name] = "obj"
+                    elif _fn in self._user_functions:
+                        _rt = self._user_functions[_fn].ret_tag
+                        if _rt in ("float", "str"):
+                            self._list_append_types[var_name] = _rt
+                    elif _fn == "float":
+                        self._list_append_types[var_name] = "float"
+                    elif _fn == "str":
+                        self._list_append_types[var_name] = "str"
                 elif (isinstance(arg, ast.Call)
                       and isinstance(arg.func, ast.Attribute)
                       and isinstance(arg.func.value, ast.Name)):
@@ -12091,6 +12146,33 @@ class CodeGen:
                     if isinstance(arg.value, str):
                         self._list_append_types[var_name] = "str"
                     elif isinstance(arg.value, float):
+                        self._list_append_types[var_name] = "float"
+                elif isinstance(arg, ast.BinOp):
+                    # Arithmetic expression: x.append(a * 1.0) or
+                    # x.append(0.0 - val) — detect float from operands
+                    _is_float_binop = False
+                    for _operand in (arg.left, arg.right):
+                        if (isinstance(_operand, ast.Constant)
+                                and isinstance(_operand.value, float)):
+                            _is_float_binop = True
+                        elif isinstance(_operand, ast.Name):
+                            if (_operand.id in local_var_types
+                                    and local_var_types[_operand.id] == "float"):
+                                _is_float_binop = True
+                            elif (_operand.id in loop_var_types
+                                    and loop_var_types[_operand.id] == "float"):
+                                _is_float_binop = True
+                    if _is_float_binop:
+                        self._list_append_types[var_name] = "float"
+                elif isinstance(arg, ast.UnaryOp) and isinstance(arg.op, ast.USub):
+                    # Negation: x.append(-val) — detect float from operand
+                    _inner = arg.operand
+                    if (isinstance(_inner, ast.Constant)
+                            and isinstance(_inner.value, float)):
+                        self._list_append_types[var_name] = "float"
+                    elif (isinstance(_inner, ast.Name)
+                          and _inner.id in local_var_types
+                          and local_var_types[_inner.id] == "float"):
                         self._list_append_types[var_name] = "float"
                 elif isinstance(arg, ast.JoinedStr):
                     self._list_append_types[var_name] = "str"
@@ -12118,6 +12200,13 @@ class CodeGen:
                 if isinstance(first.value, str):
                     return "str"
                 elif isinstance(first.value, float):
+                    return "float"
+            # Handle negative float literals: -1.0 is parsed as
+            # UnaryOp(USub, Constant(1.0)), not Constant(-1.0).
+            if (isinstance(first, ast.UnaryOp)
+                    and isinstance(first.op, ast.USub)
+                    and isinstance(first.operand, ast.Constant)):
+                if isinstance(first.operand.value, float):
                     return "float"
             # Check if elements are nested lists or tuples (both stored as list pointers)
             if isinstance(first, (ast.List, ast.ListComp, ast.Tuple)):
@@ -15922,7 +16011,14 @@ class CodeGen:
         if isinstance(node, ast.Compare):
             return self._emit_compare(node)
         elif isinstance(node, ast.BoolOp):
-            # BoolOp returns the operand value; convert to truthiness here
+            # In condition context, emit short-circuit conditions directly.
+            # This ensures each operand uses type-aware truthiness
+            # (list_length, str_len, etc.) via _emit_condition, instead of
+            # evaluating the BoolOp to a value and doing a null-pointer check.
+            if isinstance(node.op, ast.And):
+                return self._emit_condition_and(node.values)
+            elif isinstance(node.op, ast.Or):
+                return self._emit_condition_or(node.values)
             val = self._emit_boolop(node)
             return self._truthiness(val)
         elif isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
@@ -15944,6 +16040,47 @@ class CodeGen:
         else:
             # General expression: evaluate and check truthiness
             return self._truthiness_of_expr(node)
+
+    def _emit_condition_and(self, values: list[ast.expr]) -> ir.Value:
+        """Emit short-circuit AND for boolean condition context (returns i1).
+
+        Unlike ``_emit_short_circuit_and`` (which returns operand values),
+        this evaluates each operand as a condition via ``_emit_condition``,
+        ensuring type-aware truthiness (list_length, str_len, etc.).
+        """
+        result_alloca = self._create_entry_alloca(ir.IntType(1), "cond.and")
+        merge_block = self._new_block("cond.and.end")
+
+        for i, val_node in enumerate(values):
+            cond = self._emit_condition(val_node)
+            self.builder.store(cond, result_alloca)
+            if i < len(values) - 1:
+                next_block = self._new_block("cond.and.next")
+                self.builder.cbranch(cond, next_block, merge_block)
+                self.builder.position_at_end(next_block)
+            else:
+                self.builder.branch(merge_block)
+
+        self.builder.position_at_end(merge_block)
+        return self.builder.load(result_alloca)
+
+    def _emit_condition_or(self, values: list[ast.expr]) -> ir.Value:
+        """Emit short-circuit OR for boolean condition context (returns i1)."""
+        result_alloca = self._create_entry_alloca(ir.IntType(1), "cond.or")
+        merge_block = self._new_block("cond.or.end")
+
+        for i, val_node in enumerate(values):
+            cond = self._emit_condition(val_node)
+            self.builder.store(cond, result_alloca)
+            if i < len(values) - 1:
+                next_block = self._new_block("cond.or.next")
+                self.builder.cbranch(cond, merge_block, next_block)
+                self.builder.position_at_end(next_block)
+            else:
+                self.builder.branch(merge_block)
+
+        self.builder.position_at_end(merge_block)
+        return self.builder.load(result_alloca)
 
     def _truthiness(self, value: ir.Value) -> ir.Value:
         """Convert an LLVM value to a boolean (i1) via Python truthiness.
@@ -16626,10 +16763,16 @@ class CodeGen:
 
         for i, val_node in enumerate(values):
             val = self._emit_expr_value(val_node)
-            val = self._coerce_to_type(val, result_type)
-            self.builder.store(val, result_alloca)
             if i < len(values) - 1:
-                truthy = self._value_truthiness(val)
+                # Test truthiness BEFORE coercion so the original type
+                # (pointer vs int) is preserved. Coercing a list pointer
+                # to i64 via ptrtoint always yields non-zero (truthy),
+                # which breaks empty-list semantics.
+                is_list = self._is_list_expr(val_node)
+                truthy = self._value_truthiness(val, is_list=is_list)
+            coerced = self._coerce_to_type(val, result_type)
+            self.builder.store(coerced, result_alloca)
+            if i < len(values) - 1:
                 next_block = self._new_block("and.next")
                 # If truthy, continue; else short-circuit with current value
                 self.builder.cbranch(truthy, next_block, merge_block)
@@ -16651,10 +16794,13 @@ class CodeGen:
 
         for i, val_node in enumerate(values):
             val = self._emit_expr_value(val_node)
-            val = self._coerce_to_type(val, result_type)
-            self.builder.store(val, result_alloca)
             if i < len(values) - 1:
-                truthy = self._value_truthiness(val)
+                # Test truthiness BEFORE coercion (see _emit_short_circuit_and).
+                is_list = self._is_list_expr(val_node)
+                truthy = self._value_truthiness(val, is_list=is_list)
+            coerced = self._coerce_to_type(val, result_type)
+            self.builder.store(coerced, result_alloca)
+            if i < len(values) - 1:
                 next_block = self._new_block("or.next")
                 # If truthy, short-circuit; else continue
                 self.builder.cbranch(truthy, merge_block, next_block)
@@ -16740,15 +16886,22 @@ class CodeGen:
                 return self.builder.call(self.runtime["float_to_str"], [value])
         return value
 
-    def _value_truthiness(self, value: ir.Value) -> ir.Value:
-        """Return i1 indicating whether the value is truthy."""
+    def _value_truthiness(self, value: ir.Value, *, is_list: bool = False) -> ir.Value:
+        """Return i1 indicating whether the value is truthy.
+
+        When *is_list* is True the pointer is treated as a list (uses
+        list_length) rather than as a string (str_len).
+        """
         if isinstance(value.type, ir.IntType):
             return self.builder.icmp_signed("!=", value, ir.Constant(value.type, 0))
         if isinstance(value.type, ir.DoubleType):
             return self.builder.fcmp_ordered("!=", value, ir.Constant(double, 0.0))
         if isinstance(value.type, ir.PointerType):
-            # Empty string is falsy; also check non-null pointer
-            length = self._rt_call("str_len", [value])
+            if is_list:
+                length = self._rt_call("list_length", [value])
+            else:
+                # Empty string is falsy; also check non-null pointer
+                length = self._rt_call("str_len", [value])
             return self.builder.icmp_signed("!=", length, ir.Constant(i64, 0))
         return ir.Constant(ir.IntType(1), 0)
 
