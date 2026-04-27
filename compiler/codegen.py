@@ -4374,6 +4374,13 @@ class CodeGen:
                         if existing[i] == "mixed":
                             continue  # already mixed, can't refine further
                         if arg_types[i] is None:
+                            # Unknown call site + existing "float" is dangerous:
+                            # the unknown caller might pass int, which would
+                            # corrupt data if the function expects double params.
+                            # Reset to None so the function uses i64 (safe for
+                            # both int and FpyValue-wrapped float).
+                            if existing[i] == "float":
+                                existing[i] = None
                             continue  # unknown doesn't override known
                         if existing[i] is None:
                             existing[i] = arg_types[i]  # first known type
@@ -4393,6 +4400,50 @@ class CodeGen:
                         else:
                             # Genuine type conflict (e.g. int vs str)
                             existing[i] = "mixed"
+
+        # Post-merge: clear param types when CONCRETE call-site signatures
+        # have incompatible type *categories* for the same position.
+        # Categories: P=pointer (str, list, dict, obj, list:*, dict:*),
+        #             D=double (float), I=i64 (int, bool).
+        # None (unknown) is NOT a concrete type — it doesn't count as a
+        # conflict by itself. Only clear when two CONCRETE sig types have
+        # different categories (e.g., "float" in one sig and "str" in
+        # another), OR when the merged type is D/P and there's an unknown
+        # (None) sig that could be any category.
+        def _type_cat(t):
+            if t is None:
+                return None  # unknown
+            if t == "int" or t == "bool":
+                return "I"  # i64-safe
+            if t == "float":
+                return "D"  # double
+            return "P"  # pointer (str, list, dict, obj, list:*, dict:*)
+
+        for fname, sigs in self._function_signatures.items():
+            if fname not in self._call_site_param_types:
+                continue
+            merged = self._call_site_param_types[fname]
+            for i, mt in enumerate(merged):
+                mc = _type_cat(mt)
+                if mc is None or mc == "I":
+                    continue  # i64 is the default, always safe
+                # Collect concrete (non-None) categories from all sigs
+                concrete_cats = set()
+                has_none = False
+                for sig in sigs:
+                    st = sig[i] if i < len(sig) else None
+                    sc = _type_cat(st)
+                    if sc is None:
+                        has_none = True
+                    else:
+                        concrete_cats.add(sc)
+                # Clear if: (1) merged is D (float) and there's an unknown
+                # caller (could be int), OR (2) concrete types span multiple
+                # categories (genuine conflict like float+str).
+                if mc == "D" and has_none:
+                    merged[i] = None
+                elif len(concrete_cats) > 1:
+                    merged[i] = None
 
         # Store refined module-level dict value types so codegen can
         # populate _dict_var_dict_values for nested subscript handling.
@@ -4737,13 +4788,21 @@ class CodeGen:
         max_len = max(len(s) for s in sigs)
         for i in range(max_len):
             seen: set[str] = set()
+            has_none = False
             for s in sigs:
                 if i < len(s) and s[i] in SCALARS:
                     seen.add(s[i])
+                elif i >= len(s) or s[i] is None:
+                    has_none = True
             # Ignore bool-vs-int (compatible)
             if seen == {"int", "bool"} or seen == {"bool", "int"}:
                 seen = {"int"}
             if len(seen) > 1:
+                return True
+            # None (unknown) + float = conflict: the unknown call site might
+            # pass int, which would corrupt data if the function expects double.
+            # Monomorphize so each call site gets the correct specialization.
+            if has_none and "float" in seen:
                 return True
         return False
 
@@ -4849,20 +4908,30 @@ class CodeGen:
         for sig in specs:
             if call_sig_t == sig:
                 return f"{func_name}__{self._mangle_sig(sig)}"
-        # Partial match — match scalar positions
+        # Partial match — find the best-matching signature by scoring:
+        # concrete type matches count +1, mismatches reject the sig.
+        best_sig = None
+        best_score = -1
         for sig in specs:
             matches = True
+            score = 0
             for i, (ct, st) in enumerate(zip(call_sig_t, sig)):
                 if ct is None or st is None:
                     continue
-                if ct != st:
-                    # bool/int compatible
-                    if {ct, st} == {"bool", "int"}:
-                        continue
-                    matches = False
-                    break
-            if matches:
-                return f"{func_name}__{self._mangle_sig(sig)}"
+                if ct == st:
+                    score += 1
+                    continue
+                # bool/int compatible
+                if {ct, st} == {"bool", "int"}:
+                    score += 1
+                    continue
+                matches = False
+                break
+            if matches and score > best_score:
+                best_score = score
+                best_sig = sig
+        if best_sig is not None:
+            return f"{func_name}__{self._mangle_sig(best_sig)}"
         # Fall back to first spec
         return f"{func_name}__{self._mangle_sig(specs[0])}"
 
@@ -4986,11 +5055,28 @@ class CodeGen:
                           or node.args.kwarg is not None)
             if (not is_special
                     and self._signature_scalar_conflict(sigs)):
-                self._monomorphized[node.name] = list(sigs)
+                # Fill None positions in each sig from the merged
+                # _call_site_param_types. This ensures specializations
+                # inherit pointer types (list, dict, str, obj) that are
+                # consistent across all call sites but missing from
+                # individual sigs (e.g., forwarded params from callers).
+                merged_types = self._call_site_param_types.get(
+                    node.name, [])
+                filled_sigs = []
                 for sig in sigs:
-                    mangled = f"{node.name}__{self._mangle_sig(sig)}"
+                    filled = list(sig)
+                    # Pad to at least merged length
+                    while len(filled) < len(merged_types):
+                        filled.append(None)
+                    for fi in range(min(len(filled), len(merged_types))):
+                        if filled[fi] is None and merged_types[fi] is not None:
+                            filled[fi] = merged_types[fi]
+                    filled_sigs.append(tuple(filled))
+                self._monomorphized[node.name] = filled_sigs
+                for fsig in filled_sigs:
+                    mangled = f"{node.name}__{self._mangle_sig(fsig)}"
                     self._declare_user_function(
-                        node, _sig_override=list(sig),
+                        node, _sig_override=list(fsig),
                         _name_override=mangled)
                 # Register the original name as an alias pointing to the
                 # first specialization's FuncInfo. This keeps "name in
@@ -4998,7 +5084,7 @@ class CodeGen:
                 # monomorphization-aware dispatch. The actual call sites
                 # resolve to the correct specialization via
                 # _resolve_specialization before calling.
-                first_mangled = f"{node.name}__{self._mangle_sig(sigs[0])}"
+                first_mangled = f"{node.name}__{self._mangle_sig(filled_sigs[0])}"
                 if first_mangled in self._user_functions:
                     self._user_functions[node.name] = self._user_functions[first_mangled]
                     self._function_def_nodes[node.name] = node
