@@ -263,7 +263,7 @@ class ValueType:
             "counter": VKind.DICT, "defaultdict": VKind.DICT,
             "deque": VKind.LIST,
             "chainmap": VKind.OBJ, "logger": VKind.OBJ,
-            "path": VKind.STR, "native_func": VKind.UNKNOWN,
+            "path": VKind.PYOBJ, "native_func": VKind.UNKNOWN,
             "native_mod": VKind.PYOBJ, "cls": VKind.INT,
             "cell": VKind.UNKNOWN, "namedtuple_type": VKind.INT,
         }
@@ -697,6 +697,9 @@ class _SafeIRBuilder(ir.IRBuilder):
             value = super().extract_value(value, 1)
         if isinstance(value.type, ir.PointerType):
             value = super().ptrtoint(value, i64)
+        if isinstance(value.type, ir.DoubleType):
+            # zext is only valid for integers; convert double → i64 first
+            value = super().fptosi(value, i64)
         if value.type == typ:
             return value
         return super().zext(value, typ, name=name)
@@ -707,9 +710,53 @@ class _SafeIRBuilder(ir.IRBuilder):
             value = super().extract_value(value, 1)
         if isinstance(value.type, ir.PointerType):
             value = super().ptrtoint(value, i64)
+        if isinstance(value.type, ir.DoubleType):
+            value = super().fptosi(value, i64)
         if value.type == typ:
             return value
         return super().trunc(value, typ, name=name)
+
+    def bitcast(self, value, typ, name=''):
+        """Safe bitcast that routes int↔ptr through inttoptr/ptrtoint.
+
+        LLVM does not allow bitcast between integers and pointers (or
+        between scalars and aggregate types).  This override transparently
+        uses the correct conversion instruction so callers don't need to
+        worry about the distinction.
+        """
+        if value.type == typ:
+            return value
+        val_is_int = isinstance(value.type, ir.IntType)
+        val_is_ptr = isinstance(value.type, ir.PointerType)
+        val_is_dbl = isinstance(value.type, ir.DoubleType)
+        tgt_is_int = isinstance(typ, ir.IntType)
+        tgt_is_ptr = isinstance(typ, ir.PointerType)
+        tgt_is_dbl = isinstance(typ, ir.DoubleType)
+        # int → pointer: use inttoptr
+        if val_is_int and tgt_is_ptr:
+            return super().inttoptr(value, typ)
+        # pointer → int: use ptrtoint
+        if val_is_ptr and tgt_is_int:
+            return super().ptrtoint(value, typ)
+        # pointer → pointer: allowed bitcast (or just use value as-is
+        # with opaque pointers)
+        if val_is_ptr and tgt_is_ptr:
+            return super().bitcast(value, typ, name=name)
+        # FpyValue struct → scalar: extract data field first
+        if isinstance(value.type, ir.LiteralStructType) and tgt_is_int:
+            data = super().extract_value(value, 1)
+            if data.type == typ:
+                return data
+            return super().zext(data, typ) if typ.width > data.type.width \
+                else super().trunc(data, typ)
+        if isinstance(value.type, ir.LiteralStructType) and tgt_is_dbl:
+            data = super().extract_value(value, 1)
+            return super().bitcast(data, typ, name=name)
+        if isinstance(value.type, ir.LiteralStructType) and tgt_is_ptr:
+            data = super().extract_value(value, 1)
+            return super().inttoptr(data, typ)
+        # All remaining same-width scalar↔scalar bitcasts are valid
+        return super().bitcast(value, typ, name=name)
 
     def fadd(self, lhs, rhs, name=''):
         lhs, rhs = self._coerce_float_pair(lhs, rhs)
@@ -1349,6 +1396,8 @@ class CodeGen:
         self.runtime["list_sort"] = ir.Function(self.module, ft, name="fastpy_list_sort")
         ft = ir.FunctionType(void, [i8_ptr])
         self.runtime["list_reverse_inplace"] = ir.Function(self.module, ft, name="fastpy_list_reverse")
+        ft = ir.FunctionType(void, [i8_ptr, i64])
+        self.runtime["list_reverse_prefix"] = ir.Function(self.module, ft, name="fastpy_list_reverse_prefix")
         ft = ir.FunctionType(i64, [i8_ptr, i8_ptr])
         self.runtime["str_find"] = ir.Function(self.module, ft, name="fastpy_str_find")
         self.runtime["str_rfind"] = ir.Function(self.module, ft, name="fastpy_str_rfind")
@@ -1709,6 +1758,9 @@ class CodeGen:
         self.runtime["cpython_import"] = ir.Function(self.module, ft, name="fpy_cpython_import")
         ft = ir.FunctionType(i8_ptr, [i8_ptr, i8_ptr])  # fpy_cpython_getattr(obj, name) -> PyObject*
         self.runtime["cpython_getattr"] = ir.Function(self.module, ft, name="fpy_cpython_getattr")
+        # get_builtin(name) -> PyObject* (str, int, float, list, …)
+        ft = ir.FunctionType(i8_ptr, [i8_ptr])
+        self.runtime["cpython_get_builtin"] = ir.Function(self.module, ft, name="fpy_cpython_get_builtin")
         # hasattr(obj, name) -> i32 (0 or 1)
         ft = ir.FunctionType(i32, [i8_ptr, i8_ptr])
         self.runtime["cpython_hasattr"] = ir.Function(self.module, ft, name="fpy_cpython_hasattr")
@@ -2635,6 +2687,37 @@ class CodeGen:
                         info = self._user_functions[var_name]
                         self._emit_lambda_body(info.func, lam)
 
+        # Pass 1.5: pre-create LLVM globals for module-level imports
+        # so that user functions (emitted in Pass 2) can reference them.
+        # Without this, `from pathlib import Path` followed by `Path`
+        # inside a function would fail because _global_vars isn't populated
+        # until fastpy_main runs in Pass 3.
+        for node in tree.body:
+            if isinstance(node, ast.ImportFrom) and node.module:
+                for alias in node.names:
+                    if alias.name == '*':
+                        continue
+                    var_name = alias.asname if alias.asname else alias.name
+                    if var_name not in self._global_vars:
+                        gvar = ir.GlobalVariable(
+                            self.module, i8_ptr,
+                            name=f"fastpy.fromimport.{var_name}")
+                        gvar.initializer = ir.Constant(i8_ptr, None)
+                        gvar.linkage = "private"
+                        self._global_vars[var_name] = (
+                            gvar, ValueType.from_old_tag("pyobj"))
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    var_name = alias.asname if alias.asname else alias.name
+                    if "." not in var_name and var_name not in self._global_vars:
+                        gvar = ir.GlobalVariable(
+                            self.module, i8_ptr,
+                            name=f"fastpy.import.{var_name}")
+                        gvar.initializer = ir.Constant(i8_ptr, None)
+                        gvar.linkage = "private"
+                        self._global_vars[var_name] = (
+                            gvar, ValueType.from_old_tag("pyobj"))
+
         # Pass 2: generate code for user functions and class methods
         for node in tree.body:
             if isinstance(node, ast.FunctionDef):
@@ -3251,6 +3334,7 @@ class CodeGen:
         self._emit_stmts(node.body)
 
         if not self.builder.block.is_terminated:
+            self._emit_scope_decref()
             if func.return_value.type == void:
                 self.builder.ret_void()
             else:
@@ -6806,6 +6890,12 @@ class CodeGen:
         if not self.builder.block.is_terminated:
             if not info.uses_bare_abi:
                 self.builder.call(self.runtime["shadow_pop"], [])
+            # Decref all FV locals before implicit return — mirrors the
+            # explicit return path in _emit_return which calls
+            # _emit_scope_decref.  Without this, every function that falls
+            # off the end leaks all its FV-local variables, causing O(n²)
+            # GC slowdown as the cycle collector has more objects to scan.
+            self._emit_scope_decref()
             if is_gen:
                 # Generator: return the collected list
                 ret_ty = info.func.return_value.type
@@ -8518,8 +8608,20 @@ class CodeGen:
                                f"list, or a known class)",
                 )
 
-        for item in node.body:
+        # Deduplicate methods: Python allows redefining a method in the same
+        # class body — the last definition wins.  Build a map of method_name →
+        # last body index so we skip earlier (shadowed) definitions and avoid
+        # generating duplicate LLVM functions.
+        _last_method_idx: dict[str, int] = {}
+        for _mi, _mitem in enumerate(node.body):
+            if isinstance(_mitem, ast.FunctionDef):
+                _last_method_idx[_mitem.name] = _mi
+
+        for _item_idx, item in enumerate(node.body):
             if isinstance(item, ast.FunctionDef):
+                # Skip shadowed duplicate — only compile the last definition
+                if _last_method_idx.get(item.name, _item_idx) != _item_idx:
+                    continue
                 dec_names = [d.id for d in item.decorator_list if isinstance(d, ast.Name)]
                 method_name = item.name
                 is_static = "staticmethod" in dec_names
@@ -9509,8 +9611,16 @@ class CodeGen:
         self._per_class_string_attrs[effective_name] = set(self._class_string_attrs)
         self._per_class_bool_attrs[effective_name] = set(self._class_bool_attrs)
 
-        for item in node.body:
+        # Deduplicate: only emit the last definition of each method name
+        _last_emit_idx: dict[str, int] = {}
+        for _ei, _eitem in enumerate(node.body):
+            if isinstance(_eitem, ast.FunctionDef):
+                _last_emit_idx[_eitem.name] = _ei
+
+        for _ei2, item in enumerate(node.body):
             if isinstance(item, ast.FunctionDef):
+                if _last_emit_idx.get(item.name, _ei2) != _ei2:
+                    continue
                 method_key = item.name
                 # @x.setter methods are stored as x__set
                 is_setter = any(
@@ -9805,6 +9915,7 @@ class CodeGen:
         self._emit_stmts(node.body)
 
         if not self.builder.block.is_terminated:
+            self._emit_scope_decref()
             if func.return_value.type == void:
                 self.builder.ret_void()
             elif isinstance(func.return_value.type, ir.PointerType):
@@ -10407,15 +10518,24 @@ class CodeGen:
                 and len(node.targets) == 1
                 and isinstance(node.targets[0], ast.Name)):
             rhs = node.value
+            # Helper: check if a Name node refers to a path-typed variable.
+            # Path variables use VKind.PYOBJ but have dedicated native
+            # handlers, so they must NOT be routed through the generic
+            # CPython bridge.
+            def _is_path_var(n):
+                return (isinstance(n, ast.Name) and n.id in self.variables
+                        and self._is_path_expr(n))
             is_pyobj_attr = (isinstance(rhs, ast.Attribute)
                              and isinstance(rhs.value, ast.Name)
                              and rhs.value.id in self.variables
-                             and self._var_kind(rhs.value.id) == VKind.PYOBJ)
+                             and self._var_kind(rhs.value.id) == VKind.PYOBJ
+                             and not _is_path_var(rhs.value))
             # Chained pyobj attribute: foo.bar.baz where foo is pyobj
-            # Exclude direct native module attributes
+            # Exclude direct native module attributes and path variables
             is_pyobj_attr_chain = (not is_pyobj_attr
                                    and isinstance(rhs, ast.Attribute)
                                    and self._is_pyobj_receiver(rhs.value)
+                                   and not _is_path_var(rhs.value)
                                    and not (isinstance(rhs.value, ast.Name)
                                             and rhs.value.id in getattr(self, '_native_modules', set())))
             is_pyobj_call = (isinstance(rhs, ast.Call)
@@ -10425,13 +10545,16 @@ class CodeGen:
                              and self._var_kind(rhs.func.value.id) == VKind.PYOBJ
                              # Exclude native modules — they have PYOBJ kind but
                              # should use the native dispatch path, not bridge
-                             and rhs.func.value.id not in getattr(self, '_native_modules', set()))
+                             and rhs.func.value.id not in getattr(self, '_native_modules', set())
+                             # Exclude path variables — they have dedicated handlers
+                             and not _is_path_var(rhs.func.value))
             # Chained pyobj call: urllib.parse.urlparse(...) where urllib is pyobj
             # Exclude direct native module calls (collections.Counter, etc.)
             is_pyobj_call_chain = (not is_pyobj_call
                                    and isinstance(rhs, ast.Call)
                                    and isinstance(rhs.func, ast.Attribute)
                                    and self._is_pyobj_receiver(rhs.func.value)
+                                   and not (isinstance(rhs.func.value, ast.Name) and _is_path_var(rhs.func.value))
                                    and not (isinstance(rhs.func.value, ast.Name)
                                             and rhs.func.value.id in getattr(self, '_native_modules', set())))
             is_pyobj_direct = (isinstance(rhs, ast.Call)
@@ -10768,6 +10891,23 @@ class CodeGen:
                         self._obj_var_class[target_name] = _sub_cls
                     return
 
+        # Early-out: in-place prefix reverse  a[:N] = a[M::-1]
+        # Must be detected BEFORE evaluating the RHS, otherwise
+        # list_slice_step allocates a temporary reversed list that we
+        # never use (and never free), causing O(n²) memory growth.
+        for target in node.targets:
+            if isinstance(target, ast.Subscript) and isinstance(target.slice, ast.Slice):
+                rev = self._match_prefix_reverse(target, node.value)
+                if rev is not None:
+                    list_name, count_node = rev
+                    obj = self._emit_expr_value(target.value)
+                    if isinstance(obj.type, ir.IntType):
+                        obj = self.builder.inttoptr(obj, i8_ptr)
+                    count = self._emit_expr_value(count_node)
+                    self.builder.call(self.runtime["list_reverse_prefix"],
+                                      [obj, count])
+                    return
+
         value = self._emit_expr_value(node.value)
 
         type_tag = self._infer_type_tag(node.value, value)
@@ -10976,6 +11116,18 @@ class CodeGen:
         determined by AST-level container-attribute detection. Since obj_get_fv
         stores the exact tag, this works without the old pointer-heuristic.
         """
+        # Module attribute: if the receiver is a CPython-imported module,
+        # resolve via cpython_getattr.  This catches `ast.Constant`,
+        # `os.path`, etc. inside function bodies where the import is a
+        # module-level global not in self.variables.
+        if (isinstance(node.value, ast.Name)
+                and node.value.id in self._cpython_modules):
+            mod_gvar = self._cpython_modules[node.value.id]
+            obj = self.builder.load(mod_gvar)
+            attr_name = self._make_string_constant(node.attr)
+            return self.builder.call(
+                self.runtime["cpython_getattr"], [obj, attr_name])
+
         # Nested class chained access: Outer.Inner.x
         # The AST is Attribute(Attribute(Name("Outer"), "Inner"), "x")
         if (isinstance(node.value, ast.Attribute)
@@ -11037,6 +11189,34 @@ class CodeGen:
                 name_ptr = self._make_string_constant(node.attr)
                 return self.builder.call(
                     self.runtime["obj_call_method0"], [obj, name_ptr])
+
+        # --- pathlib.Path property access: .name, .parent, .suffix, .stem ---
+        if self._is_path_expr(node.value):
+            obj = self._emit_expr_value(node.value)
+            if isinstance(obj.type, ir.IntType):
+                obj = self.builder.inttoptr(obj, i8_ptr)
+            _path_props = {
+                "name": "path_name", "parent": "path_parent",
+                "suffix": "path_suffix", "stem": "path_stem",
+            }
+            if node.attr in _path_props:
+                return self.builder.call(
+                    self.runtime[_path_props[node.attr]], [obj])
+            # Unknown path attribute — use CPython bridge
+            attr_name = self._make_string_constant(node.attr)
+            return self.builder.call(
+                self.runtime["cpython_getattr"], [obj, attr_name])
+
+        # --- pyobj attribute access: use CPython bridge ---
+        if (isinstance(node.value, ast.Name)
+                and node.value.id in self.variables
+                and self._var_kind(node.value.id) == VKind.PYOBJ):
+            obj = self._emit_expr_value(node.value)
+            if isinstance(obj.type, ir.IntType):
+                obj = self.builder.inttoptr(obj, i8_ptr)
+            attr_name = self._make_string_constant(node.attr)
+            return self.builder.call(
+                self.runtime["cpython_getattr"], [obj, attr_name])
 
         obj = self._emit_expr_value(node.value)
         # Attribute access always operates on an object pointer.  When the
@@ -11143,6 +11323,20 @@ class CodeGen:
             return
         # Slice assignment: a[start:stop] = new_values
         if isinstance(target.slice, ast.Slice):
+            # Optimization: detect in-place prefix reverse pattern
+            # a[:k+1] = a[k::-1]  →  list_reverse_prefix(a, k+1)
+            # Avoids allocating a temporary reversed list every iteration.
+            rev = self._match_prefix_reverse(target, value_node)
+            if rev is not None:
+                list_name, count_node = rev
+                obj = self._emit_expr_value(target.value)
+                if isinstance(obj.type, ir.IntType):
+                    obj = self.builder.inttoptr(obj, i8_ptr)
+                count = self._emit_expr_value(count_node)
+                self.builder.call(self.runtime["list_reverse_prefix"],
+                                  [obj, count])
+                return
+
             obj = self._emit_expr_value(target.value)
             if isinstance(obj.type, ir.IntType):
                 obj = self.builder.inttoptr(obj, i8_ptr)
@@ -11384,6 +11578,19 @@ class CodeGen:
                         return FPY_TAG_DICT, value
                     if self._is_deque_expr(value_node):
                         return FPY_TAG_LIST, value  # deque serialized as list
+                    # Builtin names loaded via cpython_get_builtin are
+                    # real PyObject* pointers packed as i64.  Tag as OBJ
+                    # so the bridge passes them through correctly (e.g.
+                    # type=str in argparse.add_argument).
+                    if (isinstance(value_node, ast.Name)
+                            and value_node.id in self._BUILTIN_NAMES):
+                        return FPY_TAG_OBJ, value
+                    # Module-level from-import globals are PyObject* too.
+                    if (isinstance(value_node, ast.Name)
+                            and value_node.id in self._global_vars):
+                        gvar, gtag = self._global_vars[value_node.id]
+                        if isinstance(gtag, ValueType) and gtag.kind == VKind.PYOBJ:
+                            return FPY_TAG_OBJ, value
                 return FPY_TAG_INT, value
             # Odd-width int — zext/trunc to i64
             if value.type.width < 64:
@@ -12067,6 +12274,15 @@ class CodeGen:
         # Attribute access: detect container (list/dict) and object attrs
         # so len(), print, and binops dispatch correctly.
         if isinstance(node, ast.Attribute):
+            # Path attribute types: .name/.stem/.suffix return str,
+            # .parent/.resolve() return path (PyObject*)
+            if self._is_path_expr(node.value):
+                _path_str_attrs = {"name", "stem", "suffix"}
+                _path_path_attrs = {"parent"}
+                if node.attr in _path_str_attrs:
+                    return "str"
+                if node.attr in _path_path_attrs:
+                    return "path"
             obj_cls = self._infer_object_class(node.value)
             if obj_cls and obj_cls in self._class_container_attrs:
                 list_attrs, dict_attrs = self._class_container_attrs[obj_cls]
@@ -12335,10 +12551,11 @@ class CodeGen:
             else:
                 return "pyobj"
         # Chained pyobj attribute: foo.bar.baz where foo is pyobj
-        # Exclude direct native module attributes (math.pi, etc.)
+        # Exclude native module attributes (math.pi) and path attributes (p.name)
         if (isinstance(node, ast.Attribute) and self._is_pyobj_receiver(node.value)
                 and not (isinstance(node.value, ast.Name)
-                         and node.value.id in getattr(self, '_native_modules', set()))):
+                         and node.value.id in getattr(self, '_native_modules', set()))
+                and not self._is_path_expr(node.value)):
             return "pyobj"
         # Method calls that return lists
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
@@ -13724,8 +13941,12 @@ class CodeGen:
                          "ModuleNotFoundError", "RecursionError",
                          "BrokenPipeError", "EOFError",
                          "BufferError", "AssertionError"):
-                # Built-in names used as values (isinstance, annotations, etc.)
-                return ir.Constant(i64, hash(name) & 0x7FFFFFFFFFFFFFFF)
+                # Fetch the real CPython builtin object so the value
+                # can be passed to bridge calls (e.g. type=str).
+                name_ptr = self._make_string_constant(name)
+                pyobj = self.builder.call(
+                    self.runtime["cpython_get_builtin"], [name_ptr])
+                return self.builder.ptrtoint(pyobj, i64)
             elif name in ("__name__", "__file__", "__doc__",
                           "__loader__", "__spec__", "__package__",
                           "__builtins__", "__cached__", "__all__"):
@@ -13833,8 +14054,8 @@ class CodeGen:
                 # CPython PyObject* — store as OBJ tag with raw pointer
                 return self._fv_from_obj(value)
             if type_tag == "path":
-                # Path is a string pointer — store as STR tag
-                return self._fv_from_str(value)
+                # Path is a real CPython PyObject* — store as OBJ tag
+                return self._fv_from_obj(value)
             if type_tag == "decimal":
                 # Decimal is a pointer — store with DECIMAL tag (12)
                 tag = ir.Constant(i32, FPY_TAG_DECIMAL)
@@ -14788,6 +15009,42 @@ class CodeGen:
         else:
             self._bridge_fallback_stmt(node, "yield from requires an iterable")
 
+    # Python builtin names — values are real PyObject* via cpython_get_builtin.
+    _BUILTIN_NAMES = frozenset({
+        "str", "int", "float", "bool", "list", "dict",
+        "tuple", "set", "type", "object", "bytes",
+        "None", "True", "False", "Exception",
+        "ValueError", "TypeError", "KeyError",
+        "IndexError", "RuntimeError", "StopIteration",
+        "AttributeError", "NotImplementedError",
+        "ZeroDivisionError", "OSError", "IOError",
+        "FileNotFoundError", "ImportError",
+        "OverflowError", "UnicodeError",
+        "UnicodeDecodeError", "UnicodeEncodeError",
+        "PermissionError", "IsADirectoryError",
+        "ConnectionError", "TimeoutError",
+        "DeprecationWarning", "UserWarning",
+        "FutureWarning", "ResourceWarning",
+        "Ellipsis", "NotImplemented",
+        "classmethod", "staticmethod", "property",
+        "super", "callable", "iter", "next",
+        "reversed", "sorted", "enumerate", "zip",
+        "map", "filter", "any", "all",
+        "min", "max", "sum", "abs", "round",
+        "print", "input", "open", "range", "len",
+        "id", "hash", "repr", "format",
+        "isinstance", "issubclass", "hasattr",
+        "getattr", "setattr", "delattr",
+        "complex", "memoryview", "bytearray",
+        "frozenset", "slice", "BaseException",
+        "GeneratorExit", "SystemExit",
+        "KeyboardInterrupt", "ArithmeticError",
+        "LookupError", "SyntaxError", "NameError",
+        "ModuleNotFoundError", "RecursionError",
+        "BrokenPipeError", "EOFError",
+        "BufferError", "AssertionError",
+    })
+
     # Modules with native implementations (no CPython bridge needed)
     _NATIVE_MODULES = {"math", "json", "os", "os.path", "asyncio", "collections", "_collections",
                         "typing", "abc", "functools", "_functools",
@@ -14868,11 +15125,13 @@ class CodeGen:
                 gvar.linkage = "private"
                 self._cpython_modules[mod_name] = gvar
 
-            # Call fpy_jit_import(name) — tries native compilation first,
-            # falls back to CPython import if JIT unavailable or module is .pyd/.so
+            # Import via CPython's import mechanism.  The JIT import
+            # (fpy_jit_import) tried to compile modules at runtime, but
+            # it applies name prefixing that breaks attribute access for
+            # stdlib modules.  CPython import is correct for all modules.
             name_ptr = self._make_string_constant(mod_name)
             mod_ptr = self.builder.call(
-                self.runtime["jit_import"], [name_ptr])
+                self.runtime["cpython_import"], [name_ptr])
             self.builder.store(mod_ptr, self._cpython_modules[mod_name])
 
             # For dotted imports (e.g. `import os.path`), Python binds
@@ -14893,12 +15152,29 @@ class CodeGen:
                 self.builder.store(top_mod, self._cpython_modules[top_name])
                 self._store_variable(top_name, top_mod, "pyobj")
             else:
-                # Store as a local variable with "pyobj" tag
+                # Module-level imports must be LLVM globals so user
+                # functions can access them as bare names.
+                if (self.function.name == "fastpy_main"
+                        and var_name not in self._global_vars):
+                    gvar = ir.GlobalVariable(
+                        self.module, i8_ptr,
+                        name=f"fastpy.import.{var_name}")
+                    gvar.initializer = ir.Constant(i8_ptr, None)
+                    gvar.linkage = "private"
+                    self._global_vars[var_name] = (
+                        gvar, ValueType.from_old_tag("pyobj"))
                 self._store_variable(var_name, mod_ptr, "pyobj")
 
     def _emit_import_from(self, node: ast.ImportFrom) -> None:
         """Emit `from module import name1, name2`."""
         mod_name = node.module
+
+        # Star imports (`from X import *`) cannot be resolved at compile
+        # time — they depend on the module's __all__ or dir().  Fall back
+        # to CPython exec so the runtime handles the namespace injection.
+        if any(alias.name == '*' for alias in node.names):
+            return self._bridge_fallback_stmt(
+                node, f"star import: from {mod_name} import *")
 
         # Native module: store function markers instead of pyobj
         if mod_name in self._NATIVE_MODULES:
@@ -14910,6 +15186,38 @@ class CodeGen:
                 self._native_imports[var_name] = (mod_name, attr_name)
                 # Store dummy — calls are intercepted in _emit_call_expr
                 self._store_variable(var_name, ir.Constant(i64, 0), "native_func")
+            # At module level, also import the real objects via CPython
+            # bridge so they're accessible as values (e.g. `type=Path`
+            # passes the callable as an argument, not via native dispatch).
+            if self.function.name == "fastpy_main":
+                if mod_name not in self._cpython_modules:
+                    gv = ir.GlobalVariable(
+                        self.module, i8_ptr,
+                        name=f"fastpy.pymod.{mod_name}")
+                    gv.initializer = ir.Constant(i8_ptr, None)
+                    gv.linkage = "private"
+                    self._cpython_modules[mod_name] = gv
+                name_ptr = self._make_string_constant(mod_name)
+                mod_ptr = self.builder.call(
+                    self.runtime["cpython_import"], [name_ptr])
+                self.builder.store(mod_ptr, self._cpython_modules[mod_name])
+                for alias in node.names:
+                    attr_name = alias.name
+                    var_name = alias.asname if alias.asname else attr_name
+                    if var_name not in self._global_vars:
+                        gvar = ir.GlobalVariable(
+                            self.module, i8_ptr,
+                            name=f"fastpy.fromimport.{var_name}")
+                        gvar.initializer = ir.Constant(i8_ptr, None)
+                        gvar.linkage = "private"
+                        self._global_vars[var_name] = (
+                            gvar, ValueType.from_old_tag("pyobj"))
+                    attr_ptr = self._make_string_constant(attr_name)
+                    pyobj = self.builder.call(
+                        self.runtime["cpython_getattr"],
+                        [mod_ptr, attr_ptr])
+                    self.builder.store(
+                        pyobj, self._global_vars[var_name][0])
             return
 
         if mod_name not in self._cpython_modules:
@@ -14922,7 +15230,7 @@ class CodeGen:
 
         name_ptr = self._make_string_constant(mod_name)
         mod_ptr = self.builder.call(
-            self.runtime["jit_import"], [name_ptr])
+            self.runtime["cpython_import"], [name_ptr])
         self.builder.store(mod_ptr, self._cpython_modules[mod_name])
 
         for alias in node.names:
@@ -14937,6 +15245,19 @@ class CodeGen:
             # Use cpython_to_fv to convert — if it's a callable, it will
             # come back as OBJ tag (opaque). Store as pyobj either way
             # since we need the callable pointer for function calls.
+            # Module-level from-imports must be LLVM globals so user
+            # functions can access them (e.g. `from pathlib import Path`
+            # then `Path(...)` inside a function).  Stack allocas in
+            # fastpy_main are invisible to other LLVM functions.
+            if (self.function.name == "fastpy_main"
+                    and var_name not in self._global_vars):
+                gvar = ir.GlobalVariable(
+                    self.module, i8_ptr,
+                    name=f"fastpy.fromimport.{var_name}")
+                gvar.initializer = ir.Constant(i8_ptr, None)
+                gvar.linkage = "private"
+                self._global_vars[var_name] = (
+                    gvar, ValueType.from_old_tag("pyobj"))
             self._store_variable(var_name, pyobj, "pyobj")
             # Track the module/attr so we can re-fetch at call time
             if not hasattr(self, '_bridge_imports'):
@@ -16215,9 +16536,115 @@ class CodeGen:
                     return sub.value
         return None
 
+    def _emit_for_enumerate_inline(self, node: ast.For) -> None:
+        """Optimized `for idx, val in enumerate(lst):` — no tuple allocation.
+
+        Instead of calling fastpy_enumerate() which materializes N tuples,
+        emit an inline indexed loop:
+            counter = start
+            for __idx in range(len(lst)):
+                idx_var = counter
+                val_var = lst[__idx]
+                ... body ...
+                counter += 1
+        """
+        targets = node.target.elts
+        call = node.iter  # Call(func=Name('enumerate'), args=[lst], ...)
+
+        # Get the list argument and optional start
+        lst_node = call.args[0]
+        start_val = ir.Constant(i64, 0)
+        if len(call.args) >= 2:
+            start_val = self._emit_expr_value(call.args[1])
+
+        # Evaluate the list
+        lst_tv = self._emit_expr(lst_node)
+        lst_ptr = lst_tv.as_ptr(self.builder)
+        lst_len = self._rt_call("list_length", [lst_ptr])
+
+        # Index and counter variables
+        self._block_counter += 1
+        idx_name = f"__enum_idx_{self._block_counter}"
+        cnt_name = f"__enum_cnt_{self._block_counter}"
+        self._store_variable(idx_name, ir.Constant(i64, 0), "int")
+        self._store_variable(cnt_name, start_val, "int")
+
+        cond_block = self._new_block("forenum.cond")
+        body_block = self._new_block("forenum.body")
+        incr_block = self._new_block("forenum.incr")
+        end_block = self._new_block("forenum.end")
+
+        self.builder.branch(cond_block)
+
+        self.builder.position_at_end(cond_block)
+        idx = self._load_variable(idx_name, node)
+        cond = self.builder.icmp_signed("<", idx, lst_len)
+        self.builder.cbranch(cond, body_block, end_block)
+
+        self.builder.position_at_end(body_block)
+        idx = self._load_variable(idx_name, node)
+        cnt = self._load_variable(cnt_name, node)
+
+        # Assign the counter variable (first target)
+        idx_target = targets[0]
+        if isinstance(idx_target, ast.Name):
+            self._store_variable(idx_target.id, cnt, "int")
+
+        # Assign the element variable (second target)
+        val_target = targets[1]
+        if isinstance(val_target, ast.Name):
+            elem_type = self._get_list_elem_type(lst_node)
+            if elem_type == "float":
+                var_tag = "float"
+            elif elem_type == "str":
+                var_tag = "str"
+            elif elem_type.startswith("list"):
+                var_tag = elem_type if ":" in elem_type else "list:int"
+            elif elem_type == "obj":
+                var_tag = "obj"
+            elif elem_type == "pyobj":
+                var_tag = "pyobj"
+            else:
+                var_tag = "int"
+            self._fv_store_from_list(val_target.id, lst_ptr, idx, var_tag)
+        elif isinstance(val_target, (ast.Tuple, ast.List)):
+            # Nested unpack: for i, (a, b) in enumerate(pairs)
+            inner_list = self._list_get_as_bare(lst_ptr, idx, "list")
+            for j, inner_tgt in enumerate(val_target.elts):
+                if isinstance(inner_tgt, ast.Name):
+                    self._fv_store_from_list(
+                        inner_tgt.id, inner_list, ir.Constant(i64, j), "unknown")
+
+        self._loop_stack.append((end_block, incr_block))
+        _prev_hot = self._in_hot_loop
+        self._in_hot_loop = True
+        self._emit_stmts(node.body)
+        self._in_hot_loop = _prev_hot
+        self._loop_stack.pop()
+        if not self.builder.block.is_terminated:
+            self.builder.branch(incr_block)
+
+        self.builder.position_at_end(incr_block)
+        idx = self._load_variable(idx_name, node)
+        cnt = self._load_variable(cnt_name, node)
+        self._store_variable(idx_name, self.builder.add(idx, ir.Constant(i64, 1)), "int")
+        self._store_variable(cnt_name, self.builder.add(cnt, ir.Constant(i64, 1)), "int")
+        self.builder.branch(cond_block)
+
+        self.builder.position_at_end(end_block)
+
     def _emit_for_tuple_unpack(self, node: ast.For) -> None:
         """Emit for (k, v) in <list> or for i, (name, score) in enumerate(zip(...))."""
         targets = node.target.elts
+
+        # Optimization: for i, val in enumerate(lst) — avoid tuple allocation
+        if (len(targets) == 2
+                and isinstance(node.iter, ast.Call)
+                and isinstance(node.iter.func, ast.Name)
+                and node.iter.func.id == "enumerate"
+                and len(node.iter.args) >= 1):
+            self._emit_for_enumerate_inline(node)
+            return
 
         iter_tv = self._emit_expr(node.iter)
         iter_val = iter_tv.as_ptr(self.builder)
@@ -16298,6 +16725,15 @@ class CodeGen:
 
         self.builder.position_at_end(end_block)
 
+        # Decref temporary iterables (e.g. `for k, v in enumerate(lst):`)
+        _is_named_var = (isinstance(node.iter, ast.Name)
+                         and (node.iter.id in self.variables
+                              or node.iter.id in self._global_vars))
+        if not _is_named_var and self._USE_REFCOUNT:
+            _tag = ir.Constant(i32, FPY_TAG_LIST)
+            _data = self.builder.ptrtoint(iter_val, i64)
+            self.builder.call(self.runtime["rc_decref"], [_tag, _data])
+
     def _emit_for_string(self, node: ast.For) -> None:
         """Emit for ch in string: iterate over characters."""
         var_name = node.target.id
@@ -16339,6 +16775,15 @@ class CodeGen:
         self.builder.branch(cond_block)
 
         self.builder.position_at_end(end_block)
+
+        # Decref temporary string iterables (e.g. `for ch in get_str():`)
+        _is_named_var = (isinstance(node.iter, ast.Name)
+                         and (node.iter.id in self.variables
+                              or node.iter.id in self._global_vars))
+        if not _is_named_var and self._USE_REFCOUNT:
+            _tag = ir.Constant(i32, FPY_TAG_STR)
+            _data = self.builder.ptrtoint(str_val, i64)
+            self.builder.call(self.runtime["rc_decref"], [_tag, _data])
 
     def _emit_for_iter_protocol(self, node: ast.For) -> None:
         """Emit `for x in obj` using __iter__/__next__ protocol.
@@ -16502,6 +16947,12 @@ class CodeGen:
 
         self.builder.position_at_end(end_block)
 
+        # deque_to_list() always returns a temporary list — decref it
+        if self._USE_REFCOUNT:
+            _tag = ir.Constant(i32, FPY_TAG_LIST)
+            _data = self.builder.ptrtoint(lst, i64)
+            self.builder.call(self.runtime["rc_decref"], [_tag, _data])
+
     def _emit_for_list(self, node: ast.For) -> None:
         """Emit for x in <list>: iterate over list elements by index."""
         var_name = node.target.id
@@ -16585,6 +17036,17 @@ class CodeGen:
 
         self.builder.position_at_end(end_block)
 
+        # Decref temporary iterables (e.g. `for x in make_list():`).
+        # Named variables are borrowed references — the variable owns
+        # them, so only decref when the iterable is a temporary.
+        _is_named_var = (isinstance(node.iter, ast.Name)
+                         and (node.iter.id in self.variables
+                              or node.iter.id in self._global_vars))
+        if not _is_named_var and self._USE_REFCOUNT:
+            _tag = ir.Constant(i32, FPY_TAG_LIST)
+            _data = self.builder.ptrtoint(list_val, i64)
+            self.builder.call(self.runtime["rc_decref"], [_tag, _data])
+
     def _emit_for_dict(self, node: ast.For) -> None:
         """Emit for k in <dict>/<set>: iterate over dict's keys (= set elements)."""
         var_name = node.target.id
@@ -16653,6 +17115,12 @@ class CodeGen:
                 self.builder.branch(end_block)
 
         self.builder.position_at_end(end_block)
+
+        # dict_keys() always returns a temporary list — decref it
+        if self._USE_REFCOUNT:
+            _tag = ir.Constant(i32, FPY_TAG_LIST)
+            _data = self.builder.ptrtoint(keys_list, i64)
+            self.builder.call(self.runtime["rc_decref"], [_tag, _data])
 
     def _emit_break(self, node: ast.Break) -> None:
         if not self._loop_stack:
@@ -17521,34 +17989,6 @@ class CodeGen:
         if has_float:
             return double
         return i64
-
-    def _coerce_to_type(self, value: ir.Value, target_type: ir.Type) -> ir.Value:
-        """Coerce a value to target_type for boolop result unification."""
-        if value.type == target_type:
-            return value
-        if isinstance(target_type, ir.IntType) and target_type.width == 64:
-            if isinstance(value.type, ir.IntType) and value.type.width < 64:
-                return self.builder.zext(value, i64)
-            if isinstance(value.type, ir.DoubleType):
-                return self.builder.fptosi(value, i64)
-            if isinstance(value.type, ir.PointerType):
-                return self.builder.ptrtoint(value, i64)
-        if isinstance(target_type, ir.IntType) and target_type.width == 32:
-            if isinstance(value.type, ir.IntType):
-                if value.type.width < 32:
-                    return self.builder.zext(value, i32)
-                if value.type.width > 32:
-                    return self.builder.trunc(value, i32)
-        if isinstance(target_type, ir.DoubleType):
-            if isinstance(value.type, ir.IntType):
-                return self.builder.sitofp(value, double)
-        if isinstance(target_type, ir.PointerType):
-            if isinstance(value.type, ir.IntType):
-                # Convert int to string for string-typed boolop results
-                return self.builder.call(self.runtime["int_to_str"], [value])
-            if isinstance(value.type, ir.DoubleType):
-                return self.builder.call(self.runtime["float_to_str"], [value])
-        return value
 
     def _value_truthiness(self, value: ir.Value, *, is_list: bool = False) -> ir.Value:
         """Return i1 indicating whether the value is truthy.
@@ -19071,11 +19511,12 @@ class CodeGen:
             elif self._is_pyobj_receiver(node.value):
                 _is_pyobj_print = True
         # Attribute access on pyobj: http.HTTPStatus.OK.value, parsed.scheme
-        # Exclude native module attributes — they have native handlers
+        # Exclude native module attributes and path variables — they have native handlers
         if isinstance(node, ast.Attribute) and self._is_pyobj_receiver(node.value):
             _is_native_mod_attr = (isinstance(node.value, ast.Name)
                                    and node.value.id in getattr(self, '_native_modules', set()))
-            if not _is_native_mod_attr:
+            _is_path_attr = self._is_path_expr(node.value)
+            if not _is_native_mod_attr and not _is_path_attr:
                 _is_pyobj_print = True
         # Call on pyobj receiver: mimetypes.guess_type("file.txt")
         # Exclude native module calls — they have native handlers that return
@@ -19707,16 +20148,130 @@ class CodeGen:
             return self._is_pyobj_receiver(node.func.value)
         return False
 
+    def _match_prefix_reverse(self, target: ast.Subscript,
+                              value_node: ast.expr | None
+                              ) -> tuple[str, ast.expr] | None:
+        """Detect `a[:N] = a[M::-1]` where N = M+1 (in-place prefix reverse).
+
+        Returns (list_name, count_ast_node) so the caller can emit
+        list_reverse_prefix(list, count) instead of allocating a reversed
+        copy via list_slice_step + list_slice_assign.
+
+        Matches patterns like:
+          a[:k+1] = a[k::-1]     count = k+1
+          a[:n]   = a[n-1::-1]   count = n
+        """
+        if value_node is None:
+            return None
+        # Both sides must be subscripts on the same named variable
+        if not (isinstance(target, ast.Subscript)
+                and isinstance(value_node, ast.Subscript)):
+            return None
+        if not (isinstance(target.value, ast.Name)
+                and isinstance(value_node.value, ast.Name)):
+            return None
+        if target.value.id != value_node.value.id:
+            return None
+        # LHS must be a slice with lower=None or 0, upper present, no step
+        lslice = target.slice
+        if not isinstance(lslice, ast.Slice):
+            return None
+        if lslice.step is not None:
+            return None
+        if lslice.lower is not None:
+            if not (isinstance(lslice.lower, ast.Constant)
+                    and lslice.lower.value == 0):
+                return None
+        if lslice.upper is None:
+            return None
+        # RHS must be a slice with step=-1, upper=None
+        rslice = value_node.slice
+        if not isinstance(rslice, ast.Slice):
+            return None
+        if rslice.upper is not None:
+            return None
+        # Check step is -1: either Constant(-1) or UnaryOp(USub, Constant(1))
+        step = rslice.step
+        if step is None:
+            return None
+        if isinstance(step, ast.Constant) and step.value == -1:
+            pass
+        elif (isinstance(step, ast.UnaryOp)
+              and isinstance(step.op, ast.USub)
+              and isinstance(step.operand, ast.Constant)
+              and step.operand.value == 1):
+            pass
+        else:
+            return None
+        # RHS lower exists (the start of the reverse)
+        if rslice.lower is None:
+            return None
+        # The count is the LHS upper.  For correctness we check that
+        # lhs.upper == rhs.lower + 1  (i.e. they cover the same prefix).
+        # Pattern 1: a[:k+1] = a[k::-1]
+        #   lhs.upper = BinOp(k, Add, 1), rhs.lower = k
+        upper = lslice.upper
+        lower = rslice.lower
+        if (isinstance(upper, ast.BinOp)
+                and isinstance(upper.op, ast.Add)
+                and isinstance(upper.right, ast.Constant)
+                and upper.right.value == 1
+                and ast.dump(upper.left) == ast.dump(lower)):
+            return (target.value.id, upper)
+        # Pattern 2: a[:n] = a[n-1::-1]
+        #   lhs.upper = n, rhs.lower = BinOp(n, Sub, 1)
+        if (isinstance(lower, ast.BinOp)
+                and isinstance(lower.op, ast.Sub)
+                and isinstance(lower.right, ast.Constant)
+                and lower.right.value == 1
+                and ast.dump(lower.left) == ast.dump(upper)):
+            return (target.value.id, upper)
+        # Pattern 3: a[:N] = a[N-1::-1] where N is a constant
+        if (isinstance(upper, ast.Constant)
+                and isinstance(lower, ast.Constant)
+                and isinstance(upper.value, int)
+                and isinstance(lower.value, int)
+                and upper.value == lower.value + 1):
+            return (target.value.id, upper)
+        return None
+
     def _is_path_expr(self, node: ast.expr) -> bool:
         """Check if an AST expression evaluates to a pathlib.Path."""
         if isinstance(node, ast.Name) and node.id in self.variables:
             _, type_tag = self.variables[node.id]
             return type_tag == "path"
+        # Direct Path(...) call via imported name
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
             native_imports = getattr(self, '_native_imports', {})
             if node.func.id in native_imports:
                 mod, fn = native_imports[node.func.id]
                 return mod == "pathlib" and fn == "Path"
+        # Module-qualified call: pathlib.Path(...)
+        if (isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "pathlib"
+                and node.func.attr == "Path"):
+            return True
+        # Path method calls that return Path: .resolve(), .parent (as call), .with_suffix()
+        _PATH_RETURNING_METHODS = {
+            "resolve", "parent", "with_suffix", "joinpath", "absolute",
+        }
+        if (isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr in _PATH_RETURNING_METHODS
+                and self._is_path_expr(node.func.value)):
+            return True
+        # Path attribute that returns Path: .parent
+        if (isinstance(node, ast.Attribute)
+                and node.attr == "parent"
+                and self._is_path_expr(node.value)):
+            return True
+        # Path / str division
+        if (isinstance(node, ast.BinOp)
+                and isinstance(node.op, ast.Div)
+                and self._is_path_expr(node.left)):
+            return True
         return False
 
     def _is_list_expr(self, node: ast.expr) -> bool:
@@ -20191,6 +20746,17 @@ class CodeGen:
                 right_v = right_v if isinstance(right_v.type, ir.DoubleType) \
                     else self.builder.sitofp(right_v, double) \
                     if isinstance(right_v.type, ir.IntType) else right_v
+            # Safety: if either operand is still an FpyValue struct (not a
+            # bare scalar), extract the data i64 and convert to double.
+            for lbl, v, setter in [("left", left_v, "left_v"),
+                                   ("right", right_v, "right_v")]:
+                if isinstance(v.type, ir.LiteralStructType):
+                    data = self.builder.extract_value(v, 1)
+                    converted = self.builder.bitcast(data, double)
+                    if setter == "left_v":
+                        left_v = converted
+                    else:
+                        right_v = converted
             return self._emit_float_binop(node.op, left_v, right_v, node)
 
         # ── Fast path: int op int ──────────────────────────────────────
@@ -21111,19 +21677,31 @@ class CodeGen:
             # CPython module/object attribute (e.g. os.sep, response.status_code)
             # Returns raw PyObject* — callers that need FpyValue (print, etc.)
             # go through _load_or_wrap_fv which does bridge conversion.
-            if (isinstance(node.value, ast.Name)
-                    and node.value.id in self.variables
-                    and self.variables[node.value.id][1] in ("pyobj", "native_mod")):
-                actual_tag = self.variables[node.value.id][1]
+            # Check both local scope (self.variables) and module-level
+            # imports (_cpython_modules) so that module attributes are
+            # resolved correctly inside functions, not just at module scope.
+            _is_pyobj_var = (isinstance(node.value, ast.Name)
+                             and node.value.id in self.variables
+                             and self.variables[node.value.id][1] in (
+                                 "pyobj", "native_mod"))
+            _is_module_import = (isinstance(node.value, ast.Name)
+                                 and node.value.id in self._cpython_modules)
+            if _is_pyobj_var or _is_module_import:
+                if _is_pyobj_var:
+                    actual_tag = self.variables[node.value.id][1]
+                else:
+                    actual_tag = "pyobj"
                 if actual_tag == "native_mod":
                     # For native_mod: try native attr first, fall back to bridge
                     result = self._emit_native_module_attr(node.value.id, node.attr)
                     if result is not None:
                         return result
                 # Load the stored object pointer and getattr on it.
-                # For native_mod, the stored value IS the module PyObject*.
-                # For pyobj, it's the PyObject* returned from a bridge call.
-                obj = self._load_variable(node.value.id, node)
+                if _is_module_import and not _is_pyobj_var:
+                    # Module-level import: load from the global variable
+                    obj = self.builder.load(self._cpython_modules[node.value.id])
+                else:
+                    obj = self._load_variable(node.value.id, node)
                 if isinstance(obj.type, ir.IntType):
                     obj = self.builder.inttoptr(obj, i8_ptr)
                 attr_name = self._make_string_constant(node.attr)
@@ -21720,7 +22298,7 @@ class CodeGen:
                     self.builder.branch(cond_b)
                     self.builder.position_at_end(end_b)
                     return self.builder.zext(self.builder.load(result_alloca), i32)
-                raise CodeGenError("any() requires a list argument", node)
+                return self._bridge_fallback_expr(node, "any() with non-list argument")
             if name == "all":
                 if len(node.args) == 1 and self._is_list_expr(node.args[0]):
                     lst = self._emit_expr_value(node.args[0])
@@ -21751,7 +22329,7 @@ class CodeGen:
                     self.builder.branch(cond_b)
                     self.builder.position_at_end(end_b)
                     return self.builder.zext(self.builder.load(result_alloca), i32)
-                raise CodeGenError("all() requires a list argument", node)
+                return self._bridge_fallback_expr(node, "all() with non-list argument")
             if name == "bool":
                 if len(node.args) == 1:
                     return self.builder.zext(self._truthiness_of_expr(node.args[0]), i32)
@@ -24601,12 +25179,9 @@ class CodeGen:
                     coerced.append(val)
                 return self.builder.call(func, coerced)
 
-        # --- pyobj method calls (bridge objects: Django models, etc.) ---
-        # Route through CPython bridge if the receiver is a pyobj in any form.
-        if self._is_pyobj_receiver(attr.value):
-            return self._emit_cpython_method_call(node)
-
         # --- pathlib.Path method calls ---
+        # Must come BEFORE the generic pyobj receiver check because
+        # Path is VKind.PYOBJ but has optimized native handlers.
         if self._is_path_expr(attr.value):
             obj = self._emit_expr_value(attr.value)
             if isinstance(obj.type, ir.IntType):
@@ -24655,7 +25230,13 @@ class CodeGen:
             # __str__ / as_posix
             if method in ("__str__", "as_posix", "__fspath__"):
                 return self.builder.call(self.runtime["path_str"], [obj])
-            # Phase 4: fall through to runtime dispatch below
+            # Unrecognized path method: fall through to CPython bridge
+            return self._emit_cpython_method_call(node)
+
+        # --- pyobj method calls (bridge objects: Django models, etc.) ---
+        # Route through CPython bridge if the receiver is a pyobj in any form.
+        if self._is_pyobj_receiver(attr.value):
+            return self._emit_cpython_method_call(node)
 
         # --- Logging module: logger method calls ---
         if self._is_logger_expr(attr.value):
@@ -26535,10 +27116,19 @@ class CodeGen:
                 self.builder.call(self.runtime["dict_set_fv"],
                                   [dict_ptr, key,
                                    ir.Constant(i32, tag), data])
+            elif isinstance(key.type, ir.LiteralStructType):
+                # FpyValue key (e.g. a boxed variable used as dict key).
+                # Extract the i64 data field and use it as an int key.
+                # This is correct for int/bool/float keys whose identity
+                # is captured by the data word.
+                key_data = self.builder.extract_value(key, 1)
+                self.builder.call(self.runtime["dict_set_int_fv"],
+                                  [dict_ptr, key_data,
+                                   ir.Constant(i32, tag), data])
             else:
-                raise CodeGenError(
-                    f"Dict literal key/value type combination not yet supported: "
-                    f"{key.type}/{val.type}", node)
+                # Truly unsupported key type — bridge fallback
+                return self._bridge_fallback_expr(
+                    node, f"dict literal with {key.type} key type")
         return dict_ptr
 
     def _emit_dict_comprehension(self, node: ast.DictComp) -> ir.Value:

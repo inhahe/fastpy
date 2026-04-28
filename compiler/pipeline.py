@@ -191,6 +191,12 @@ def compile_file(path: Path, output: Path | None = None,
     source = path.read_text(encoding="utf-8")
     base_dir = path.resolve().parent
 
+    # Compute project root: if the source file lives inside a Python package,
+    # walk up to the directory *containing* the top-level package.  This lets
+    # absolute intra-package imports (e.g. ``from compiler.codegen import X``)
+    # resolve correctly — the same way CPython uses sys.path.
+    project_root = _find_project_root(base_dir)
+
     # Set up stdlib resolution if enabled
     stdlib_resolver = None
     stdlib_cache = None
@@ -207,7 +213,8 @@ def compile_file(path: Path, output: Path | None = None,
     # Resolve local imports (and optionally stdlib) and merge
     merged = _resolve_and_merge(source, base_dir,
                                 _stdlib_resolver=stdlib_resolver,
-                                _stdlib_cache=stdlib_cache)
+                                _stdlib_cache=stdlib_cache,
+                                _project_root=project_root)
 
     return compile_source(merged, output, threading_mode=threading_mode,
                           int64_mode=int64_mode, typed_mode=typed_mode,
@@ -220,7 +227,8 @@ def _resolve_and_merge(source: str, base_dir: Path,
                         _visited: set | None = None,
                         _current_pkg: str = "",
                         _stdlib_resolver=None,
-                        _stdlib_cache=None) -> str:
+                        _stdlib_cache=None,
+                        _project_root: Path | None = None) -> str:
     """Recursively resolve local imports and merge modules into one source.
 
     For each `import X` or `from X import Y` where X.py exists locally:
@@ -234,6 +242,11 @@ def _resolve_and_merge(source: str, base_dir: Path,
 
     Handles: `from X import Y`, `import X` (dotted access), relative imports,
     package imports (`from pkg.mod import func`), name collision avoidance.
+
+    _project_root: the directory containing the top-level package (like a
+    sys.path entry).  Used as fallback when base_dir can't resolve an
+    absolute package import (e.g. ``from compiler.codegen import X`` when
+    base_dir is already inside ``compiler/``).
     """
     if _visited is None:
         _visited = set()
@@ -247,7 +260,8 @@ def _resolve_and_merge(source: str, base_dir: Path,
     for i, node in enumerate(tree.body):
         if isinstance(node, ast.Import):
             for alias in node.names:
-                mod_path = _find_local_module(alias.name, base_dir)
+                mod_path = _find_local_module(alias.name, base_dir,
+                                              _project_root)
                 if mod_path is None and _stdlib_resolver is not None:
                     mod_path = _find_compilable_stdlib(
                         alias.name, _stdlib_resolver, _stdlib_cache)
@@ -262,18 +276,21 @@ def _resolve_and_merge(source: str, base_dir: Path,
                 for _ in range(node.level - 1):
                     rel_base = rel_base.parent
                 if mod_name:
-                    mod_path = _find_local_module(mod_name, rel_base)
+                    mod_path = _find_local_module(mod_name, rel_base,
+                                                  _project_root)
                 else:
                     # from . import X — look for X.py in current dir
                     for alias in node.names:
-                        p = _find_local_module(alias.name, rel_base)
+                        p = _find_local_module(alias.name, rel_base,
+                                               _project_root)
                         if p is not None:
                             imports_to_resolve.append((i, node, alias.name, p))
                     continue
                 if mod_path is not None:
                     imports_to_resolve.append((i, node, mod_name, mod_path))
             elif mod_name:
-                mod_path = _find_local_module(mod_name, base_dir)
+                mod_path = _find_local_module(mod_name, base_dir,
+                                              _project_root)
                 if mod_path is None and _stdlib_resolver is not None:
                     mod_path = _find_compilable_stdlib(
                         mod_name, _stdlib_resolver, _stdlib_cache)
@@ -301,7 +318,8 @@ def _resolve_and_merge(source: str, base_dir: Path,
             resolved_mod = _resolve_and_merge(
                 mod_source, mod_base, _visited,
                 _stdlib_resolver=_stdlib_resolver,
-                _stdlib_cache=_stdlib_cache)
+                _stdlib_cache=_stdlib_cache,
+                _project_root=_project_root)
             resolved_mod = _strip_main_block(resolved_mod)
             prefixed_mod = _prefix_module_defs(resolved_mod, safe_prefix)
             prepended_sources.append(prefixed_mod)
@@ -319,11 +337,20 @@ def _resolve_and_merge(source: str, base_dir: Path,
                 safe = mod_name.replace(".", "_")
                 local_modules[var] = safe
 
-    # Build the remaining body: skip resolved imports, keep everything else
+    # Build the remaining body: skip resolved imports and __future__ imports
+    # (__future__ imports from the main module would end up after prepended
+    # module code, causing SyntaxError; they are hoisted to the top below)
     new_body: list[ast.stmt] = []
+    future_imports: list[str] = []
     for i, stmt in enumerate(tree.body):
-        if i not in import_indices_to_remove:
-            new_body.append(stmt)
+        if i in import_indices_to_remove:
+            continue
+        if (isinstance(stmt, ast.ImportFrom) and stmt.module == '__future__'):
+            # Collect __future__ import names to hoist to the top
+            for alias in stmt.names:
+                future_imports.append(alias.name)
+            continue
+        new_body.append(stmt)
 
     # Rewrite names: imported names → prefixed names, dotted access → prefixed
     if all_name_maps or local_modules:
@@ -345,7 +372,12 @@ def _resolve_and_merge(source: str, base_dir: Path,
         new_body = wrapper.body
 
     main_source = ast.unparse(ast.Module(body=new_body, type_ignores=[]))
-    merged = '\n'.join(prepended_sources) + '\n' + main_source
+    # Hoist __future__ imports to the very top of the merged source
+    future_line = ""
+    if future_imports:
+        unique = sorted(set(future_imports))
+        future_line = f"from __future__ import {', '.join(unique)}\n"
+    merged = future_line + '\n'.join(prepended_sources) + '\n' + main_source
     return merged
 
 
@@ -412,14 +444,31 @@ def _generate_name_map(node: ast.stmt, mod_name: str,
     return name_map
 
 
-def _find_local_module(module_name: str, base_dir: Path) -> Path | None:
+def _find_local_module(module_name: str, base_dir: Path,
+                       project_root: Path | None = None) -> Path | None:
     """Find a local .py file for the given module name.
 
-    Checks:
-      - base_dir/module_name.py
-      - base_dir/module_name/__init__.py
-      - base_dir/parts[0]/parts[1]/...py (for dotted names)
+    Checks (relative to base_dir, then project_root as fallback):
+      - dir/module_name.py
+      - dir/module_name/__init__.py
+      - dir/parts[0]/parts[1]/...py (for dotted names)
+
+    The project_root fallback mirrors how CPython resolves absolute package
+    imports via sys.path: ``from compiler.codegen import X`` works even when
+    base_dir is already inside ``compiler/`` because project_root points to
+    the directory *containing* the package.
     """
+    result = _find_local_module_in(module_name, base_dir)
+    if result is not None:
+        return result
+    # Fallback: try project root (like CPython's sys.path resolution)
+    if project_root is not None and project_root != base_dir:
+        return _find_local_module_in(module_name, project_root)
+    return None
+
+
+def _find_local_module_in(module_name: str, base_dir: Path) -> Path | None:
+    """Find a local .py file for the given module name in a single directory."""
     parts = module_name.split('.')
     # Direct file: foo.py
     candidate = base_dir / (parts[0] + '.py')
@@ -442,8 +491,32 @@ def _find_local_module(module_name: str, base_dir: Path) -> Path | None:
     return None
 
 
+def _find_project_root(source_dir: Path) -> Path:
+    """Find the project root by walking up from a package directory.
+
+    If source_dir is inside a Python package (has __init__.py), walks up
+    until the parent no longer has __init__.py.  Returns the directory
+    *containing* the top-level package — equivalent to a sys.path entry.
+
+    If source_dir is not inside a package, returns source_dir itself.
+    """
+    current = source_dir.resolve()
+    # Walk up while __init__.py exists in the current directory
+    while (current / '__init__.py').is_file():
+        current = current.parent
+    return current
+
+
 def _strip_main_block(source: str) -> str:
-    """Remove `if __name__ == '__main__':` blocks from imported module source."""
+    """Remove `if __name__ == '__main__':` blocks and `from __future__`
+    imports from imported module source.
+
+    ``from __future__ import annotations`` (and others) must appear at the
+    very beginning of a file.  When a module is merged into a larger source,
+    its __future__ imports would end up in the middle, causing SyntaxError
+    in the CPython bridge.  Since __future__ directives only affect runtime
+    annotation evaluation (not compilation), stripping them is safe.
+    """
     try:
         tree = ast.parse(source)
     except SyntaxError:
@@ -455,6 +528,9 @@ def _strip_main_block(source: str) -> str:
                 and isinstance(node.test.left, ast.Name)
                 and node.test.left.id == '__name__'):
             continue  # Skip if __name__ == '__main__' block
+        if (isinstance(node, ast.ImportFrom)
+                and node.module == '__future__'):
+            continue  # Strip __future__ imports from merged modules
         new_body.append(node)
     if len(new_body) == len(tree.body):
         return source  # No change

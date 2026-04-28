@@ -35,6 +35,33 @@ from pathlib import Path
 _CACHE_VERSION = "1"
 
 
+def _is_c_extension_wrapper(source_path: Path) -> bool:
+    """Detect stdlib modules that are thin wrappers around C extensions.
+
+    Many stdlib .py files (ast, collections, json, …) get most of their
+    public API from ``from _foo import *``.  The source merger can't prefix
+    star-imported names, so merging these modules breaks attribute access
+    (e.g. ``ast.Constant`` → ``ast__Constant`` but ``Constant`` was never
+    defined in the prefixed Python source).
+
+    Heuristic: parse the first ~50 statements; if any is
+    ``from _<name> import *``, treat the module as a C-extension wrapper.
+    """
+    try:
+        source = source_path.read_text(encoding="utf-8")
+        tree = ast.parse(source)
+    except (OSError, SyntaxError):
+        return False
+    for node in tree.body[:50]:
+        if (isinstance(node, ast.ImportFrom)
+                and node.module
+                and node.module.startswith("_")
+                and node.names
+                and any(alias.name == "*" for alias in node.names)):
+            return True
+    return False
+
+
 @dataclass
 class CacheEntry:
     """Cached compilability verdict for a single stdlib module."""
@@ -106,6 +133,13 @@ class StdlibResolver:
         # Look for module_name.py in stdlib
         candidate = self._stdlib_dir / (module_name + ".py")
         if candidate.is_file():
+            # Reject thin wrappers around C extensions.  Many stdlib
+            # modules (ast, collections, json, …) are Python files whose
+            # public API comes entirely from ``from _foo import *``.
+            # The merger can't prefix star-imported names, so attribute
+            # access (e.g. ``ast.Constant``) breaks after rewriting.
+            if _is_c_extension_wrapper(candidate):
+                return None
             return candidate
 
         # Look for package: module_name/__init__.py

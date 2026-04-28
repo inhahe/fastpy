@@ -292,6 +292,17 @@ void fpy_gc_maybe_collect(void) {
     gc_alloc_count++;
     if (gc_alloc_count >= gc_threshold) {
         gc_alloc_count = 0;
-        fpy_gc_collect();
+        int64_t freed = fpy_gc_collect();
+        /* Adaptive threshold: if the GC scan found nothing to free,
+         * double the threshold so we don't keep re-scanning a stable
+         * working set.  This prevents O(n²) when many long-lived objects
+         * exist (e.g. 100K Point objects).  Cap at 50K to ensure cycles
+         * are eventually detected.  When objects ARE freed, shrink back
+         * toward the base threshold to stay responsive. */
+        if (freed == 0 && gc_threshold < 50000) {
+            gc_threshold *= 2;
+        } else if (freed > 0 && gc_threshold > 700) {
+            gc_threshold = (gc_threshold > 1400) ? gc_threshold / 2 : 700;
+        }
     }
 }

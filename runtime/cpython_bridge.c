@@ -47,6 +47,27 @@ void fpy_cpython_init(void) {
     }
 #endif
     Py_Initialize();
+    /* Set sys.argv from the real command-line arguments so bridge-imported
+     * modules (e.g. argparse) see the correct argv.  fpy_argc/fpy_argv
+     * are set by main() in runtime.c before any fastpy code runs. */
+    {
+        extern int    fpy_argc;
+        extern char **fpy_argv;
+        if (fpy_argc > 0 && fpy_argv != NULL) {
+            /* Build a wchar_t argv for PySys_SetArgvEx. */
+            wchar_t **wargv = (wchar_t **)calloc(fpy_argc, sizeof(wchar_t *));
+            if (wargv) {
+                for (int i = 0; i < fpy_argc; i++) {
+                    wargv[i] = Py_DecodeLocale(fpy_argv[i], NULL);
+                }
+                PySys_SetArgvEx(fpy_argc, wargv, 0);
+                for (int i = 0; i < fpy_argc; i++) {
+                    PyMem_RawFree(wargv[i]);
+                }
+                free(wargv);
+            }
+        }
+    }
     /* ABI version check: compare the compile-time Python version (from
      * headers) with the actual runtime version (from the loaded DLL/SO).
      * Py_GetVersion() returns the runtime version string like "3.14.0".
@@ -75,6 +96,23 @@ void fpy_cpython_init(void) {
     _setmode(_fileno(stdout), _O_TEXT);
     _setmode(_fileno(stderr), _O_TEXT);
 #endif
+}
+
+/* Get a Python builtin by name (str, int, float, list, dict, …).
+ * Returns a borrowed reference as PyObject*.  Initialises CPython
+ * on first call (same as fpy_cpython_import). */
+void* fpy_cpython_get_builtin(const char *name) {
+    fpy_cpython_init();
+    FPY_BRIDGE_ENTER();
+    PyObject *builtins = PyEval_GetBuiltins();  /* borrowed */
+    PyObject *obj = PyDict_GetItemString(builtins, name);  /* borrowed */
+    FPY_BRIDGE_LEAVE();
+    if (!obj) {
+        fprintf(stderr, "NameError: builtin '%s' not found\n", name);
+        exit(1);
+    }
+    Py_INCREF(obj);  /* caller owns a reference */
+    return (void*)obj;
 }
 
 void fpy_cpython_fini(void) {
@@ -763,6 +801,161 @@ void* fpy_cpython_call_kw_raw(void *callable,
     if (kwargs) Py_DECREF(kwargs);
     if (!result) { bridge_propagate_exception(); return NULL; }
     return (void*)result;
+}
+
+/* ── pathlib.Path functions (all operate on real PyObject* paths) ── */
+
+extern char* fpy_strdup(const char *);
+
+/* Helper: extract C string from a Path/str PyObject*. */
+static const char* _path_as_cstr(void *path_obj) {
+    fpy_cpython_init();
+    PyObject *fspath = PyOS_FSPath((PyObject*)path_obj);
+    if (!fspath) { PyErr_Clear(); return "."; }
+    const char *s = PyUnicode_AsUTF8(fspath);
+    const char *dup = fpy_strdup(s ? s : ".");
+    Py_DECREF(fspath);
+    return dup;
+}
+
+static void* _path_get_prop(void *obj, const char *prop) {
+    PyObject *r = PyObject_GetAttrString((PyObject*)obj, prop);
+    if (!r) { PyErr_Print(); exit(1); }
+    return (void*)r;
+}
+
+static void* _path_call0(void *obj, const char *method) {
+    PyObject *r = PyObject_CallMethod((PyObject*)obj, method, NULL);
+    if (!r) { PyErr_Print(); exit(1); }
+    return (void*)r;
+}
+
+void* fastpy_path_new(const char *s) {
+    fpy_cpython_init();
+    PyObject *mod = PyImport_ImportModule("pathlib");
+    PyObject *cls = PyObject_GetAttrString(mod, "Path");
+    PyObject *arg = PyUnicode_FromString(s ? s : ".");
+    PyObject *args_tuple = PyTuple_Pack(1, arg);
+    PyObject *result = PyObject_Call(cls, args_tuple, NULL);
+    Py_DECREF(arg);
+    Py_DECREF(args_tuple);
+    Py_DECREF(cls);
+    Py_DECREF(mod);
+    if (!result) { PyErr_Print(); exit(1); }
+    return (void*)result;
+}
+
+void* fastpy_path_cwd(void) {
+    fpy_cpython_init();
+    PyObject *mod = PyImport_ImportModule("pathlib");
+    PyObject *cls = PyObject_GetAttrString(mod, "Path");
+    void *r = _path_call0(cls, "cwd");
+    Py_DECREF(cls);
+    Py_DECREF(mod);
+    return r;
+}
+
+void* fastpy_path_join(void *self, void *other) {
+    fpy_cpython_init();
+    /* Try Path / other (truediv). If other is a C string, wrap first. */
+    PyObject *r = PyNumber_TrueDivide((PyObject*)self, (PyObject*)other);
+    if (!r) {
+        PyErr_Clear();
+        PyObject *ostr = PyUnicode_FromString((const char*)other);
+        r = PyNumber_TrueDivide((PyObject*)self, ostr);
+        Py_DECREF(ostr);
+    }
+    if (!r) { PyErr_Print(); exit(1); }
+    return (void*)r;
+}
+
+int64_t fastpy_path_exists(void *self) {
+    void *r = _path_call0(self, "exists");
+    int64_t v = (PyObject_IsTrue((PyObject*)r) == 1) ? 1 : 0;
+    Py_DECREF((PyObject*)r);
+    return v;
+}
+
+int64_t fastpy_path_is_file(void *self) {
+    void *r = _path_call0(self, "is_file");
+    int64_t v = (PyObject_IsTrue((PyObject*)r) == 1) ? 1 : 0;
+    Py_DECREF((PyObject*)r);
+    return v;
+}
+
+int64_t fastpy_path_is_dir(void *self) {
+    void *r = _path_call0(self, "is_dir");
+    int64_t v = (PyObject_IsTrue((PyObject*)r) == 1) ? 1 : 0;
+    Py_DECREF((PyObject*)r);
+    return v;
+}
+
+const char* fastpy_path_name(void *self) {
+    PyObject *r = PyObject_GetAttrString((PyObject*)self, "name");
+    if (!r) return fpy_strdup("");
+    const char *s = PyUnicode_AsUTF8(r);
+    const char *dup = fpy_strdup(s ? s : "");
+    Py_DECREF(r);
+    return dup;
+}
+
+void* fastpy_path_parent(void *self) { return _path_get_prop(self, "parent"); }
+
+const char* fastpy_path_suffix(void *self) {
+    PyObject *r = PyObject_GetAttrString((PyObject*)self, "suffix");
+    if (!r) return fpy_strdup("");
+    const char *s = PyUnicode_AsUTF8(r);
+    const char *dup = fpy_strdup(s ? s : "");
+    Py_DECREF(r);
+    return dup;
+}
+
+const char* fastpy_path_stem(void *self) {
+    PyObject *r = PyObject_GetAttrString((PyObject*)self, "stem");
+    if (!r) return fpy_strdup("");
+    const char *s = PyUnicode_AsUTF8(r);
+    const char *dup = fpy_strdup(s ? s : "");
+    Py_DECREF(r);
+    return dup;
+}
+
+void* fastpy_path_resolve(void *self) { return _path_call0(self, "resolve"); }
+
+const char* fastpy_path_read_text(void *self) {
+    const char *cpath = _path_as_cstr(self);
+    FILE *f = fopen(cpath, "rb");
+    if (!f) return fpy_strdup("");
+    fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    char *buf = (char*)malloc(size + 1);
+    fread(buf, 1, size, f);
+    buf[size] = '\0';
+    fclose(f);
+    return buf;
+}
+
+void fastpy_path_write_text(void *self, const char *content) {
+    const char *cpath = _path_as_cstr(self);
+    FILE *f = fopen(cpath, "w");
+    if (!f) return;
+    fputs(content, f);
+    fclose(f);
+}
+
+const char* fastpy_path_str(void *self) { return _path_as_cstr(self); }
+
+/* iterdir: returns a Python iterator as PyObject* (the codegen
+ * handles list conversion at a higher level). */
+void* fastpy_path_iterdir(void *self) {
+    fpy_cpython_init();
+    /* Return a Python list of Path objects for compatibility */
+    PyObject *iter = PyObject_CallMethod((PyObject*)self, "iterdir", NULL);
+    if (!iter) { PyErr_Print(); Py_RETURN_NONE; }
+    PyObject *lst = PySequence_List(iter);
+    Py_DECREF(iter);
+    if (!lst) { PyErr_Print(); Py_RETURN_NONE; }
+    return (void*)lst;
 }
 
 /* ── Flush Python's stdout (important for subprocess capture) ──── */

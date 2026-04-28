@@ -2737,6 +2737,21 @@ void fastpy_list_reverse(FpyList *list) {
     FPY_UNLOCK(list);
 }
 
+/* Reverse the first `count` elements of a list in place.
+ * Used to optimize `a[:k+1] = a[k::-1]` (prefix reverse)
+ * without allocating a temporary reversed copy.  O(count/2) swaps. */
+void fastpy_list_reverse_prefix(FpyList *list, int64_t count) {
+    if (count > list->length) count = list->length;
+    if (count <= 1) return;
+    FPY_LOCK(list);
+    for (int64_t i = 0; i < count / 2; i++) {
+        FpyValue tmp = list->items[i];
+        list->items[i] = list->items[count - 1 - i];
+        list->items[count - 1 - i] = tmp;
+    }
+    FPY_UNLOCK(list);
+}
+
 /* String find — return index of substring, -1 if not found */
 int64_t fastpy_str_find(const char *s, const char *sub) {
     const char *p = strstr(s, sub);

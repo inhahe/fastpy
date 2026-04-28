@@ -104,6 +104,109 @@ These features work correctly but use the embedded CPython interpreter:
 - **Other stdlib modules** not implemented natively (e.g., collections,
   itertools, functools — except singledispatch which is native)
 
+## Bugs fixed (2026-04-28, performance)
+
+### 22. Implicit function returns leaked all FV-local variables (fixed)
+Functions that fell off the end without an explicit `return` statement
+never called `_emit_scope_decref()`. Every FV-local variable's refcount
+was never decremented, causing permanent leaks. Over millions of calls,
+accumulated objects made the GC scan O(n) objects per collection, with
+collections triggered every 700 allocations — resulting in O(n²) total
+GC time.
+Fix: Added `_emit_scope_decref()` before all implicit return sites:
+`_emit_function_def` (main functions), `_emit_method_body` (class
+methods), and closure bodies. Mirrors the explicit `return` path in
+`_emit_return` which already called it.
+
+### 23. Temporary iterables in for-loops leaked (fixed)
+`for x in make_list():` and `for k, v in enumerate(lst):` created
+temporary FpyList* values for the iterable but never decremented them
+after the loop ended. Named-variable iterables (`for x in my_list:`)
+are borrowed references and don't need decref, but function-call results,
+literals, and comprehensions are temporaries that must be freed.
+Fix: Added `rc_decref` after the end block of `_emit_for_list`,
+`_emit_for_tuple_unpack`, `_emit_for_string`, `_emit_for_dict` (always
+for dict_keys() temporary), and `_emit_for_deque` (always for
+deque_to_list() temporary).
+
+### 24. `for i, val in enumerate(lst)` materialized N tuples (fixed)
+`fastpy_enumerate()` allocated N 2-element lists (one per index-value
+pair) up front, even though the loop immediately destructures them. For
+N=130 in a tight loop called ~78K times (bm_spectral_norm), this created
+10M+ temporary lists, causing massive allocation/GC overhead.
+Fix: Added `_emit_for_enumerate_inline()` that detects `for i, val in
+enumerate(lst)` and emits an inline indexed loop instead. Counter and
+element are assigned directly from the list — zero tuple allocations.
+Result: bm_spectral_norm 155s → 0.16s (now 11x faster than CPython).
+
+### 25. GC threshold was fixed at 700, causing O(n²) collection (fixed)
+The cycle collector ran a full scan of ALL tracked objects every 700
+allocations. With 100K+ long-lived objects (bm_float_adapted: 100K Point
+objects), each scan cost O(100K) and occurred ~143 times during object
+creation, giving O(n²) total GC time.
+Fix: Made the GC threshold adaptive — doubles when a collection finds
+nothing to free (up to 50K cap), halves when objects are freed (down to
+700 floor). Mirrors CPython's generational strategy without full
+generational implementation.
+Result: bm_float_adapted 212s → 1.9s.
+
+### 26. In-place prefix reverse `a[:k+1] = a[k::-1]` allocated temp list (fixed)
+The slice pattern `a[:k+1] = a[k::-1]` was compiled as: (1) call
+`list_slice_step` to create a reversed copy (O(k) allocation), then (2)
+call `list_slice_assign` to overwrite the prefix. The temporary reversed
+list was also never freed (leaked on every iteration). In bm_fannkuch
+with ~7M flip operations, this dominated runtime.
+Fix: Added `_match_prefix_reverse()` AST pattern matcher that detects
+the pattern. Added `fastpy_list_reverse_prefix()` runtime function that
+reverses in place with O(k/2) swaps and zero allocations. The pattern is
+detected BEFORE the RHS is evaluated, preventing the temp list from ever
+being created.
+Result: bm_fannkuch 440s → 8.3s.
+
+## Bugs fixed (2026-04-28, self-hosting attempt)
+
+### 17. C-extension wrapper modules merged incorrectly (fixed)
+Stdlib modules like `ast`, `collections`, `json` that are thin wrappers
+around C extensions (`from _ast import *`) were being source-merged by the
+compiler. The merger's name prefixing turned `ast.Constant` into
+`ast__Constant`, but since star-imported names couldn't be enumerated at
+compile time, attribute access broke at runtime.
+Fix: Added `_is_c_extension_wrapper()` to `stdlib_cache.py` — parses the
+first ~50 statements and rejects any module with `from _<name> import *`.
+
+### 18. Module-level from-imports invisible to user functions (fixed)
+`from pathlib import Path` stored `Path` as a stack alloca in `fastpy_main`,
+but user functions emitted in Pass 2 couldn't see it (functions are emitted
+before `fastpy_main` runs in Pass 3).
+Fix: Added "Pass 1.5" pre-scan that creates LLVM globals for all
+module-level import names before function bodies are emitted.
+
+### 19. Builtin names resolved as hash constants, not real objects (fixed)
+`parser.add_argument("--python-version", type=str)` failed because `str` was
+passed as `hash("str") & 0x7FFFFFFFFFFFFFFF` (an integer) instead of the
+real Python `str` type object.
+Fix: Added `fpy_cpython_get_builtin()` runtime function; changed
+`_load_variable` for builtin names to return real PyObject*; fixed
+`_bare_to_tag_data` to tag builtin names as OBJ instead of INT.
+
+### 20. sys.argv empty in compiled binaries (fixed)
+`main(void)` didn't pass argc/argv, so `sys.argv` was always empty and
+`argparse` couldn't parse command-line arguments.
+Fix: Changed to `main(int argc, char *argv[])` with global storage,
+updated `fastpy_sys_argv()`, added `PySys_SetArgvEx` in CPython bridge init.
+
+### 21. pathlib.Path as C strings caused segfaults on chained calls (fixed)
+`Path("test.py").resolve().parent` segfaulted because native pathlib functions
+returned C strings, but `.resolve()` results needed to be real Python objects
+for further method calls.
+Fix: Moved all pathlib functions from `runtime.c` to `cpython_bridge.c`.
+`fastpy_path_new` now returns a real CPython `pathlib.Path` PyObject*.
+Changed path VKind from STR to PYOBJ, fixed FV store to use OBJ tag,
+moved path method dispatch before generic pyobj receiver check, added path
+attribute handling to `_emit_attr_load`, added path exclusions in
+`_is_pyobj_receiver` / `_infer_type_tag` / `_load_or_wrap_fv` to prevent
+path variables from being hijacked by the generic bridge path.
+
 ## Bugs fixed (2026-04-22)
 
 ### 15. Runtime errors bypassed exception system (fixed)
@@ -286,12 +389,45 @@ Systematic comparison against the Python 3.14 PEG grammar (`Grammar/python.gram`
 
 ## Known limitations (not bugs)
 
+### Type system
+
+- **No interprocedural type inference** — Function parameters have no
+  compile-time type. When a Path, PyObject*, or other typed value is passed
+  as a function argument, the callee sees it as an untyped FpyValue.
+  Method calls on the parameter (e.g. `source_dir.resolve()`) cannot
+  dispatch to native handlers because `_is_path_expr` / `_is_pyobj_receiver`
+  don't recognize untyped parameters.
+  **Impact:** Any function that receives a Path (or other bridge object) and
+  calls methods on it will hang or crash. The caller correctly wraps the
+  value into an FpyValue with the right runtime tag, but the callee's
+  codegen doesn't read the runtime tag for method dispatch — it relies
+  entirely on compile-time type analysis.
+  **Example:** `def find_root(d): return d.resolve()` — the `.resolve()`
+  call doesn't know `d` is a Path, so it falls through to generic dispatch
+  which doesn't handle it.
+  **Planned fix:** Read `typing` annotations on parameters at codegen time
+  (e.g. `def find_root(d: Path)`) and/or add runtime tag-based method
+  dispatch: when calling a method on an FV-backed variable with unknown
+  compile-time type, check the runtime tag and dispatch to
+  `cpython_getattr` + `cpython_call` for OBJ-tagged values.
+
 - **BigInt through function calls** — BigInt values passed through function
   parameters lose their BIGINT tag (treated as regular i64). Direct BigInt
-  constants and variables work correctly.
+  constants and variables work correctly. Same root cause as above: no
+  interprocedural type inference.
+
+- **Type annotations ignored for codegen** — `def f(x: int) -> str` has no
+  effect on code generation. The compiler does not read parameter types,
+  return types, or variable annotations from `typing` for type inference.
+  All type inference is structural (AST pattern matching on assignments,
+  known module functions, etc.).
+
 - **Mixed-type dict value access** — Dict values from dynamic sources (json.loads)
   return raw i64 data. Works for int/float/str values; nested list/dict values
   need explicit subscript on the extracted value.
+
+### Object model
+
 - **Fastpy objects are not PyObjects** — CPython cannot treat fastpy-compiled
   functions, classes, or instances as `PyObject*`. Passing fastpy callables
   (lambdas, closures) to CPython APIs that expect Python callables fails.
@@ -308,6 +444,24 @@ Systematic comparison against the Python 3.14 PEG grammar (`Grammar/python.gram`
   optional `py_origin` field so round-trips preserve identity. For functions
   and lambdas, `cpython_wrap_native` already creates PyCFunction wrappers —
   extend this to class instances and arbitrary objects.
+
+- **PyObject* values in FpyValue OBJ tag are not FpyObj** — When a CPython
+  PyObject* (e.g. a `pathlib.Path`) is stored in an FpyValue with OBJ tag,
+  the runtime `fv_write` / `fv_print` functions treat the data as an
+  `FpyObj*` (native user-class object). This causes incorrect output (empty
+  string or garbage) when printing PyObject* values through the generic
+  FV path. Single-arg `print(p)` works because `_emit_print_single` detects
+  VKind.PYOBJ and uses `cpython_print_obj`. Multi-arg `print("x:", p)`
+  goes through `_emit_write_single` → `_load_or_wrap_fv` → `cpython_to_fv`,
+  which converts the PyObject* to a new FV. For known types (int, str, list,
+  dict) this works. For opaque objects (Path, custom classes), the conversion
+  produces OBJ tag + raw PyObject* data, and `fv_write` misinterprets it.
+  **Planned fix:** Add a `FPY_TAG_PYOBJ` distinct from `FPY_TAG_OBJ`, or
+  teach `fv_write`/`fv_print` to distinguish FpyObj* from PyObject* by
+  checking a magic header field.
+
+### Bridge
+
 - **Bridge mutation is silently dropped** — Passing an FpyList or FpyDict to
   a CPython function creates a copy. In-place mutations (e.g. `heapq.heapify`,
   `struct.pack_into`) happen on the copy and are discarded. Workaround: capture
@@ -326,3 +480,42 @@ Systematic comparison against the Python 3.14 PEG grammar (`Grammar/python.gram`
   mutable arg but the copy-out is already O(n), so total cost doubles but
   order doesn't change. For bytearrays (pack_into), the same pattern
   applies: copy the PyByteArray buffer back into the FpyValue.
+
+### Source merger
+
+- **Packages cannot be merged** — Only single-file stdlib modules can be
+  source-merged. Packages with `__init__.py` and submodules are skipped
+  entirely and fall back to the CPython bridge. This is because the merger
+  operates on individual .py files; resolving intra-package imports and
+  prefixing across multiple files is not implemented.
+
+- **C-extension wrapper modules rejected** — Stdlib modules whose public
+  API comes from `from _foo import *` (e.g. `ast`, `collections`, `json`,
+  `operator`, `functools`) cannot be source-merged. The merger's name
+  prefixing (`ast__Constant`) fails because star-imported names are not
+  enumerable at compile time. Detected by `_is_c_extension_wrapper()` in
+  `stdlib_cache.py`.
+
+### Self-hosting status (2026-04-28)
+
+Attempted to compile the fastpy compiler with itself. Current status:
+**partially working** — basic compilation pipeline steps execute but
+full self-hosting fails due to the limitations above.
+
+**What works in the self-compiled binary:**
+- `from pathlib import Path` → Path objects as real CPython PyObject*
+- `Path("file.py").read_text()` → reads file contents correctly
+- `Path("file.py").resolve().parent` → chained path operations
+- `Path("file.py").name`, `.stem`, `.suffix` → string properties
+- `from compiler.pipeline import compile_source` → module import via merger
+- `sys.argv` propagation to compiled binaries
+- Builtin names (`str`, `int`, `Exception`, etc.) as real PyObject* values
+
+**What blocks full self-hosting:**
+- Functions that receive Path/PyObject* parameters and call methods on them
+  crash (no interprocedural type inference — see above).
+  Example: `_find_project_root(base_dir)` receives a Path, calls
+  `.resolve()` and `/ "__init__.py"` on it — the callee can't dispatch these.
+- The pipeline functions use extensive dynamic typing (dicts of mixed types,
+  AST node manipulation, `isinstance` checks) that requires the CPython
+  bridge for every operation on untyped parameters.
