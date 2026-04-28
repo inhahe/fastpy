@@ -27534,6 +27534,32 @@ class CodeGen:
                               [list_ptr, ir.Constant(i32, FPY_TAG_OBJ), data])
             return
 
+        # BigInt constants / expressions — tag as BIGINT, not INT
+        if self._is_bigint_expr(node):
+            value = self._emit_expr_value(node)
+            if isinstance(value.type, ir.PointerType):
+                data = self.builder.ptrtoint(value, i64)
+            elif isinstance(value.type, ir.IntType) and value.type.width == 64:
+                data = value
+            else:
+                data = self.builder.zext(value, i64) if isinstance(value.type, ir.IntType) else value
+            self.builder.call(self.runtime["list_append_fv"],
+                              [list_ptr, ir.Constant(i32, FPY_TAG_BIGINT), data])
+            return
+
+        # Complex constants / expressions — tag as COMPLEX
+        if self._is_complex_expr(node):
+            value = self._emit_expr_value(node)
+            if isinstance(value.type, ir.PointerType):
+                data = self.builder.ptrtoint(value, i64)
+            elif isinstance(value.type, ir.IntType) and value.type.width == 64:
+                data = value
+            else:
+                data = self.builder.zext(value, i64) if isinstance(value.type, ir.IntType) else value
+            self.builder.call(self.runtime["list_append_fv"],
+                              [list_ptr, ir.Constant(i32, FPY_TAG_COMPLEX), data])
+            return
+
         # For all other expressions, evaluate and dispatch by LLVM type
         value = self._emit_expr_value(node)
         self._emit_list_append_value(list_ptr, value)

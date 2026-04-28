@@ -527,7 +527,17 @@ int32_t fastpy_fv_truthy(int32_t tag, int64_t data) {
             FpyDict *d = (FpyDict*)data;
             return d && d->length != 0;
         }
-        case FPY_TAG_OBJ: return data != 0;
+        case FPY_TAG_OBJ: {
+            if (data == 0) return 0;
+            FpyObj *obj = (FpyObj*)(intptr_t)data;
+            if (obj->magic != FPY_OBJ_MAGIC) {
+                /* CPython PyObject* — use PyObject_IsTrue */
+                extern int64_t fpy_cpython_bool(void*);
+                return (int32_t)fpy_cpython_bool((void*)(intptr_t)data);
+            }
+            /* Native FpyObj — check __bool__ / __len__, default true */
+            return 1;
+        }
         case FPY_TAG_SET: {
             FpyDict *s = (FpyDict*)data;
             return s && s->length != 0;
@@ -610,6 +620,37 @@ void fastpy_fv_binop(int32_t lt, int64_t ld, int32_t rt, int64_t rd,
             fpy_cpython_rbinop(lt, ld, (void*)(intptr_t)rd, op, out_tag, out_data);
         }
         return;
+    }
+    /* BigInt arithmetic — promote INT/BOOL to BigInt if needed */
+    if (lt == FPY_TAG_BIGINT || rt == FPY_TAG_BIGINT) {
+        extern FpyBigInt* fpy_bigint_from_i64(int64_t);
+        extern FpyBigInt* fpy_bigint_add(FpyBigInt*, FpyBigInt*);
+        extern FpyBigInt* fpy_bigint_sub(FpyBigInt*, FpyBigInt*);
+        extern FpyBigInt* fpy_bigint_mul(FpyBigInt*, FpyBigInt*);
+        extern FpyBigInt* fpy_bigint_floordiv(FpyBigInt*, FpyBigInt*);
+        extern FpyBigInt* fpy_bigint_mod(FpyBigInt*, FpyBigInt*);
+        extern FpyBigInt* fpy_bigint_pow(FpyBigInt*, FpyBigInt*);
+        FpyBigInt *la, *ra;
+        if (lt == FPY_TAG_BIGINT) la = (FpyBigInt*)(intptr_t)ld;
+        else la = fpy_bigint_from_i64(ld);
+        if (rt == FPY_TAG_BIGINT) ra = (FpyBigInt*)(intptr_t)rd;
+        else ra = fpy_bigint_from_i64(rd);
+        FpyBigInt *result = NULL;
+        switch (op) {
+            case 0: result = fpy_bigint_add(la, ra); break;
+            case 1: result = fpy_bigint_sub(la, ra); break;
+            case 2: result = fpy_bigint_mul(la, ra); break;
+            case 3: /* truediv — fall through to float */ break;
+            case 4: result = fpy_bigint_floordiv(la, ra); break;
+            case 5: result = fpy_bigint_mod(la, ra); break;
+            default: break;
+        }
+        if (result) {
+            *out_tag = FPY_TAG_BIGINT;
+            *out_data = (int64_t)(intptr_t)result;
+            return;
+        }
+        /* truediv falls through (BigInt / BigInt → float not implemented yet) */
     }
     /* Promote to float if either operand is float */
     if (lt == FPY_TAG_FLOAT || rt == FPY_TAG_FLOAT) {
@@ -864,6 +905,12 @@ static int fpy_value_compare(const void *a, const void *b) {
             return (va->data.f > vb->data.f) - (va->data.f < vb->data.f);
         case FPY_TAG_STR:
             return strcmp(va->data.s, vb->data.s);
+        case FPY_TAG_BIGINT: {
+            extern int fpy_bigint_cmp(FpyBigInt*, FpyBigInt*);
+            FpyBigInt *ba = (FpyBigInt*)(intptr_t)va->data.i;
+            FpyBigInt *bb = (FpyBigInt*)(intptr_t)vb->data.i;
+            return fpy_bigint_cmp(ba, bb);
+        }
         case FPY_TAG_LIST: {
             /* Lexicographic compare of element lists */
             FpyList *la = va->data.list;
@@ -877,6 +924,26 @@ static int fpy_value_compare(const void *a, const void *b) {
                 if (c != 0) return c;
             }
             return (la->length > lb->length) - (la->length < lb->length);
+        }
+        case FPY_TAG_OBJ: {
+            /* Compare by pointer identity for native objects.
+             * For PyObject*, use CPython rich comparison. */
+            void *pa = va->data.obj;
+            void *pb = vb->data.obj;
+            if (!pa && !pb) return 0;
+            if (!pa) return -1;
+            if (!pb) return 1;
+            FpyObj *oa = (FpyObj*)pa;
+            if (oa->magic != FPY_OBJ_MAGIC) {
+                /* Both are PyObject* (same tag) — use CPython compare */
+                extern int32_t fpy_cpython_compare(void*, void*, int32_t);
+                /* Lt returns 1 if pa < pb */
+                if (fpy_cpython_compare(pa, pb, 2)) return -1;
+                if (fpy_cpython_compare(pa, pb, 4)) return 1;
+                return 0;
+            }
+            /* Native FpyObj — compare by pointer identity */
+            return (pa > pb) - (pa < pb);
         }
         default:
             return 0;
@@ -3238,10 +3305,24 @@ int64_t fastpy_list_compare(FpyList *a, FpyList *b) {
         if (va.tag != vb.tag) {
             /* Coerce int/bool/float to double for numeric compare */
             int num_a = va.tag == FPY_TAG_INT || va.tag == FPY_TAG_BOOL
-                        || va.tag == FPY_TAG_FLOAT;
+                        || va.tag == FPY_TAG_FLOAT || va.tag == FPY_TAG_BIGINT;
             int num_b = vb.tag == FPY_TAG_INT || vb.tag == FPY_TAG_BOOL
-                        || vb.tag == FPY_TAG_FLOAT;
+                        || vb.tag == FPY_TAG_FLOAT || vb.tag == FPY_TAG_BIGINT;
             if (num_a && num_b) {
+                /* If either is BigInt, use BigInt comparison */
+                if (va.tag == FPY_TAG_BIGINT || vb.tag == FPY_TAG_BIGINT) {
+                    extern int fpy_bigint_cmp(FpyBigInt*, FpyBigInt*);
+                    extern FpyBigInt* fpy_bigint_from_i64(int64_t);
+                    FpyBigInt *ba = va.tag == FPY_TAG_BIGINT
+                        ? (FpyBigInt*)(intptr_t)va.data.i
+                        : fpy_bigint_from_i64(va.data.i);
+                    FpyBigInt *bb = vb.tag == FPY_TAG_BIGINT
+                        ? (FpyBigInt*)(intptr_t)vb.data.i
+                        : fpy_bigint_from_i64(vb.data.i);
+                    int r = fpy_bigint_cmp(ba, bb);
+                    if (r != 0) { return r < 0 ? -1 : 1; }
+                    continue;
+                }
                 double fa = va.tag == FPY_TAG_FLOAT ? va.data.f : (double)va.data.i;
                 double fb = vb.tag == FPY_TAG_FLOAT ? vb.data.f : (double)vb.data.i;
                 if (fa < fb) return -1;
@@ -3268,6 +3349,14 @@ int64_t fastpy_list_compare(FpyList *a, FpyList *b) {
             }
             case FPY_TAG_NONE:
                 break;
+            case FPY_TAG_BIGINT: {
+                extern int fpy_bigint_cmp(FpyBigInt*, FpyBigInt*);
+                int r = fpy_bigint_cmp(
+                    (FpyBigInt*)(intptr_t)va.data.i,
+                    (FpyBigInt*)(intptr_t)vb.data.i);
+                if (r != 0) return r < 0 ? -1 : 1;
+                break;
+            }
             case FPY_TAG_LIST: {
                 int64_t r = fastpy_list_compare(va.data.list, vb.data.list);
                 if (r != 0) return r;
