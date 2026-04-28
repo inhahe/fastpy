@@ -2028,6 +2028,20 @@ class CodeGen:
         self.runtime["bigint_to_str"] = ir.Function(self.module, ft, name="fpy_bigint_to_str")
         self.runtime["bigint_from_str"] = ir.Function(self.module, ft, name="fpy_bigint_from_str")
         self.runtime["bigint_neg"] = ir.Function(self.module, ft, name="fpy_bigint_neg")
+        # BigInt arithmetic (two FpyBigInt* → FpyBigInt*)
+        ft = ir.FunctionType(i8_ptr, [i8_ptr, i8_ptr])
+        self.runtime["bigint_add"] = ir.Function(self.module, ft, name="fpy_bigint_add")
+        self.runtime["bigint_sub"] = ir.Function(self.module, ft, name="fpy_bigint_sub")
+        self.runtime["bigint_mul"] = ir.Function(self.module, ft, name="fpy_bigint_mul")
+        self.runtime["bigint_floordiv"] = ir.Function(self.module, ft, name="fpy_bigint_floordiv")
+        self.runtime["bigint_mod"] = ir.Function(self.module, ft, name="fpy_bigint_mod")
+        self.runtime["bigint_pow"] = ir.Function(self.module, ft, name="fpy_bigint_pow")
+        # BigInt comparison (returns i32: -1, 0, 1)
+        ft = ir.FunctionType(i32, [i8_ptr, i8_ptr])
+        self.runtime["bigint_cmp"] = ir.Function(self.module, ft, name="fpy_bigint_cmp")
+        # BigInt construction from i64
+        ft = ir.FunctionType(i8_ptr, [i64])
+        self.runtime["bigint_from_i64"] = ir.Function(self.module, ft, name="fpy_bigint_from_i64")
 
         # Complex number operations
         ft = ir.FunctionType(i8_ptr, [double, double])
@@ -3953,6 +3967,15 @@ class CodeGen:
                             var_types[tgt.id] = "str"
                         elif isinstance(node.value.value, float):
                             var_types[tgt.id] = "float"
+                        elif isinstance(node.value.value, complex):
+                            var_types[tgt.id] = "complex"
+                        elif isinstance(node.value.value, bytes):
+                            var_types[tgt.id] = "bytes"
+                        elif (isinstance(node.value.value, int)
+                              and not isinstance(node.value.value, bool)
+                              and (node.value.value > 2**63 - 1
+                                   or node.value.value < -(2**63))):
+                            var_types[tgt.id] = "bigint"
                     # list * N or N * list (e.g. [0] * 4, [1.0] * n)
                     elif (isinstance(node.value, ast.BinOp)
                           and isinstance(node.value.op, ast.Mult)
@@ -3974,6 +3997,20 @@ class CodeGen:
                             var_types[tgt.id] = "list:float"
                         else:
                             var_types[tgt.id] = "list"
+                    # BinOp/UnaryOp that constant-folds to bigint/complex
+                    elif isinstance(node.value, (ast.BinOp, ast.UnaryOp)):
+                        try:
+                            folded = self._try_constant_fold(node.value)
+                            if (folded is not None and isinstance(folded, int)
+                                    and not isinstance(folded, bool)
+                                    and (folded > 2**63 - 1
+                                         or folded < -(2**63))):
+                                var_types[tgt.id] = "bigint"
+                            elif (folded is not None
+                                    and isinstance(folded, complex)):
+                                var_types[tgt.id] = "complex"
+                        except Exception:
+                            pass
                     # range(), sorted(), reversed(), list() calls
                     elif (isinstance(node.value, ast.Call)
                           and isinstance(node.value.func, ast.Name)
@@ -4551,7 +4588,15 @@ class CodeGen:
                     elif isinstance(arg.value, float):
                         arg_types.append("float")
                     elif isinstance(arg.value, int):
-                        arg_types.append("int")
+                        if (arg.value > 2**63 - 1
+                                or arg.value < -(2**63)):
+                            arg_types.append("bigint")
+                        else:
+                            arg_types.append("int")
+                    elif isinstance(arg.value, complex):
+                        arg_types.append("complex")
+                    elif isinstance(arg.value, bytes):
+                        arg_types.append("bytes")
                     else:
                         arg_types.append(None)
                 elif (isinstance(arg, ast.UnaryOp)
@@ -4668,6 +4713,26 @@ class CodeGen:
                       and var_types[arg.id] in ("path", "pyobj")):
                     # Variable with known path/pyobj type
                     arg_types.append(var_types[arg.id])
+                elif isinstance(arg, (ast.BinOp, ast.UnaryOp)):
+                    # Constant-foldable expressions: 10**20, 2**63, etc.
+                    try:
+                        folded = self._try_constant_fold(arg)
+                        if (folded is not None and isinstance(folded, int)
+                                and not isinstance(folded, bool)
+                                and (folded > 2**63 - 1
+                                     or folded < -(2**63))):
+                            arg_types.append("bigint")
+                        elif (folded is not None
+                                and isinstance(folded, complex)):
+                            arg_types.append("complex")
+                        else:
+                            has_float = any(
+                                isinstance(sub, ast.Constant)
+                                and isinstance(sub.value, float)
+                                for sub in ast.walk(arg))
+                            arg_types.append("float" if has_float else None)
+                    except Exception:
+                        arg_types.append(None)
                 else:
                     # Check if expression contains float constants (e.g. 2.0 * 3.0)
                     # but NOT if it contains a class constructor (those would
@@ -4834,6 +4899,14 @@ class CodeGen:
                             pass  # bool is a subtype of int, keep int
                         elif (existing[i] == "bool" and arg_types[i] == "int"):
                             existing[i] = "int"  # widen to int
+                        elif (arg_types[i] == "bigint" and existing[i] == "int"):
+                            existing[i] = "bigint"  # widen to bigint
+                        elif (existing[i] == "bigint" and arg_types[i] == "int"):
+                            pass  # keep bigint (int is a subset)
+                        elif (arg_types[i] == "bigint" and existing[i] == "bool"):
+                            existing[i] = "bigint"  # widen to bigint
+                        elif (existing[i] == "bigint" and arg_types[i] == "bool"):
+                            pass  # keep bigint
                         else:
                             # Genuine type conflict (e.g. int vs str)
                             existing[i] = "mixed"
@@ -4850,8 +4923,8 @@ class CodeGen:
         def _type_cat(t):
             if t is None:
                 return None  # unknown
-            if t == "int" or t == "bool":
-                return "I"  # i64-safe
+            if t in ("int", "bool", "bigint"):
+                return "I"  # numeric (i64 or BigInt pointer, both safe in FpyValue)
             if t == "float":
                 return "D"  # double
             return "P"  # pointer (str, list, dict, obj, list:*, dict:*)
@@ -5648,7 +5721,10 @@ class CodeGen:
                 # param is used in an f-string (where it'd be int_to_str'd).
                 if i < len(call_types) and call_types[i] is not None:
                     ct = call_types[i]
-                    if (ct in ("str", "list", "dict", "obj")
+                    if (ct in ("str", "list", "dict", "obj",
+                               "bigint", "complex", "decimal",
+                               "set", "bytes", "path", "pyobj",
+                               "closure", "tuple")
                             or ct.startswith("list:")
                             or ct.startswith("dict:")):
                         param_types.append(i8_ptr)
@@ -12439,6 +12515,13 @@ class CodeGen:
         if isinstance(node, ast.BinOp):
             if self._is_complex_expr(node.left) or self._is_complex_expr(node.right):
                 return "complex"
+        # BinOp with a BigInt operand produces BigInt
+        if isinstance(node, ast.BinOp):
+            if self._is_bigint_expr(node.left) or self._is_bigint_expr(node.right):
+                return "bigint"
+        # UnaryOp on BigInt produces BigInt
+        if isinstance(node, ast.UnaryOp) and self._is_bigint_expr(node.operand):
+            return "bigint"
         # UnaryOp on complex produces complex
         if isinstance(node, ast.UnaryOp) and self._is_complex_expr(node.operand):
             return "complex"
@@ -14292,9 +14375,22 @@ class CodeGen:
         # Phase 3: VKind fast path
         if isinstance(type_tag, ValueType):
             kind = type_tag.kind
+            if kind == VKind.BIGINT:
+                # BigInt param may receive INT values from callers that
+                # pass regular ints. Check runtime tag: if INT, promote
+                # to BigInt via bigint_from_i64. If already BIGINT,
+                # extract the pointer directly.
+                rt_tag = self._fv_tag(fv)
+                is_int = self.builder.icmp_unsigned(
+                    "==", rt_tag, ir.Constant(i32, FPY_TAG_INT))
+                data = self._fv_as_int(fv)
+                promoted = self.builder.call(
+                    self.runtime["bigint_from_i64"], [data])
+                existing = self._fv_as_ptr(fv)
+                return self.builder.select(is_int, promoted, existing)
             if kind.is_ptr:
                 # All pointer-stored types: STR, LIST, DICT, SET, TUPLE,
-                # OBJ, PYOBJ, DECIMAL, COMPLEX, BIGINT, CLOSURE
+                # OBJ, PYOBJ, DECIMAL, COMPLEX, CLOSURE
                 return self._fv_as_ptr(fv)
             if kind == VKind.FLOAT:
                 return self._fv_as_float(fv)
@@ -14332,7 +14428,15 @@ class CodeGen:
         if type_tag == "none":
             return ir.Constant(i64, 0)
         if type_tag == "bigint":
-            return self._fv_as_int(fv)
+            # Runtime tag check: INT callers need promotion to BigInt
+            rt_tag = self._fv_tag(fv)
+            is_int = self.builder.icmp_unsigned(
+                "==", rt_tag, ir.Constant(i32, FPY_TAG_INT))
+            data = self._fv_as_int(fv)
+            promoted = self.builder.call(
+                self.runtime["bigint_from_i64"], [data])
+            existing = self._fv_as_ptr(fv)
+            return self.builder.select(is_int, promoted, existing)
         # Default: int
         return self._fv_as_int(fv)
 
@@ -14533,6 +14637,10 @@ class CodeGen:
         if isinstance(node, ast.BinOp):
             if self._is_complex_expr(node.left) or self._is_complex_expr(node.right):
                 return TypedValue(val, ValueType(VKind.COMPLEX))
+        # Fast path: BinOp with BigInt operands → result is BigInt
+        if isinstance(node, ast.BinOp):
+            if self._is_bigint_expr(node.left) or self._is_bigint_expr(node.right):
+                return TypedValue(val, ValueType(VKind.BIGINT))
         # Fast path: container literals
         if isinstance(node, ast.Set):
             return TypedValue(val, ValueType(VKind.SET))
@@ -17809,6 +17917,38 @@ class CodeGen:
                         truthy = self.builder.not_(truthy)
                     cmp = truthy
 
+                # BIGINT comparison
+                elif (left_kind == VKind.BIGINT
+                        or tv_right.vtype.kind == VKind.BIGINT):
+                    # Promote INT operand to BigInt if needed
+                    if left_kind == VKind.BIGINT:
+                        l_ptr = tv_left.as_ptr(self.builder)
+                    else:
+                        l_ptr = self.builder.call(
+                            self.runtime["bigint_from_i64"],
+                            [tv_left.as_i64(self.builder)])
+                    if tv_right.vtype.kind == VKind.BIGINT:
+                        r_ptr = tv_right.as_ptr(self.builder)
+                    else:
+                        r_ptr = self.builder.call(
+                            self.runtime["bigint_from_i64"],
+                            [tv_right.as_i64(self.builder)])
+                    cmp_result = self.builder.call(
+                        self.runtime["bigint_cmp"], [l_ptr, r_ptr])
+                    zero = ir.Constant(i32, 0)
+                    if isinstance(op, ast.Eq):
+                        cmp = self.builder.icmp_signed("==", cmp_result, zero)
+                    elif isinstance(op, ast.NotEq):
+                        cmp = self.builder.icmp_signed("!=", cmp_result, zero)
+                    elif isinstance(op, ast.Lt):
+                        cmp = self.builder.icmp_signed("<", cmp_result, zero)
+                    elif isinstance(op, ast.LtE):
+                        cmp = self.builder.icmp_signed("<=", cmp_result, zero)
+                    elif isinstance(op, ast.Gt):
+                        cmp = self.builder.icmp_signed(">", cmp_result, zero)
+                    else:
+                        cmp = self.builder.icmp_signed(">=", cmp_result, zero)
+
                 # STR comparison (only when we KNOW it's a string, not a generic ptr)
                 elif (left_kind == VKind.STR
                         and isinstance(op, (ast.Eq, ast.NotEq, ast.Lt, ast.LtE,
@@ -20295,6 +20435,10 @@ class CodeGen:
 
         # Containers: tag from AST or inferred type
         if isinstance(value.type, ir.PointerType):
+            if inferred == "bigint":
+                ptr_as_i64 = self.builder.ptrtoint(value, i64)
+                return self._fv_build_from_slots(
+                    ir.Constant(i32, FPY_TAG_BIGINT), ptr_as_i64)
             if inferred.startswith("list") or inferred == "tuple":
                 return self._fv_from_list(value)
             if inferred == "dict":
@@ -21060,6 +21204,19 @@ class CodeGen:
             return self.builder.select(is_float, float_val, int_as_float)
         return None  # not a pyobj
 
+    def _is_bigint_expr(self, node: ast.expr) -> bool:
+        """Check if an expression evaluates to a BigInt value."""
+        if isinstance(node, ast.Constant) and isinstance(node.value, int):
+            return (node.value > 2**63 - 1 or node.value < -(2**63))
+        if isinstance(node, ast.Name) and node.id in self.variables:
+            return self._var_kind(node.id) == VKind.BIGINT
+        if isinstance(node, ast.BinOp):
+            return (self._is_bigint_expr(node.left)
+                    or self._is_bigint_expr(node.right))
+        if isinstance(node, ast.UnaryOp):
+            return self._is_bigint_expr(node.operand)
+        return False
+
     def _is_complex_expr(self, node: ast.expr) -> bool:
         """Check if an expression evaluates to a complex number."""
         if isinstance(node, ast.Constant) and isinstance(node.value, complex):
@@ -21293,6 +21450,31 @@ class CodeGen:
                     else:
                         right_v = converted
             return self._emit_float_binop(node.op, left_v, right_v, node)
+
+        # ── Fast path: BigInt arithmetic ───────────────────────────────
+        if lk == VKind.BIGINT or rk == VKind.BIGINT:
+            # Promote INT operand to BigInt if needed
+            if lk == VKind.BIGINT:
+                l_ptr = ltv.as_ptr(self.builder)
+            else:
+                l_ptr = self.builder.call(
+                    self.runtime["bigint_from_i64"],
+                    [ltv.as_i64(self.builder)])
+            if rk == VKind.BIGINT:
+                r_ptr = rtv.as_ptr(self.builder)
+            else:
+                r_ptr = self.builder.call(
+                    self.runtime["bigint_from_i64"],
+                    [rtv.as_i64(self.builder)])
+            _bigint_ops = {
+                ast.Add: "bigint_add", ast.Sub: "bigint_sub",
+                ast.Mult: "bigint_mul", ast.FloorDiv: "bigint_floordiv",
+                ast.Mod: "bigint_mod", ast.Pow: "bigint_pow",
+            }
+            rt_name = _bigint_ops.get(op)
+            if rt_name:
+                return self.builder.call(
+                    self.runtime[rt_name], [l_ptr, r_ptr])
 
         # ── Fast path: int op int ──────────────────────────────────────
         if lk == VKind.INT and rk == VKind.INT:
