@@ -961,6 +961,18 @@ class CodeGen:
         # Reference counting: emit incref/decref at variable stores and scope exits.
         self._USE_REFCOUNT = True
 
+        # Module-level flag: True only when the program uses integer operations
+        # that could produce BigInt (e.g. ** with large exponents, huge int
+        # literals).  When False, integer arithmetic uses plain LLVM add/sub/mul
+        # (no fpy_checked_add runtime call overhead).
+        self._program_uses_bigint = False
+
+        # Hot-loop flag: True while emitting statements inside a while/for loop
+        # body.  Suppresses per-statement fpy_current_line stores that prevent
+        # LLVM from optimizing the loop.  The line number at loop entry is
+        # still recorded.
+        self._in_hot_loop = False
+
         # Per-function bare-ABI flag: True when the current function being
         # compiled uses bare-type ABI (direct i64/double params/locals/return)
         # instead of FpyValue wrappers.  Checked by _store_variable and
@@ -1069,6 +1081,11 @@ class CodeGen:
         # Built by scanning all methods for self.attr and obj.attr patterns.
         # Inherited attrs keep the parent's slot index (child slots start after).
         self._class_attr_slots: dict[str, dict[str, int]] = {}
+        # Per-class init-only attributes: attrs set in __init__ and NEVER
+        # modified by any other method, module code, or external store.
+        # Loads from these slots can be marked !invariant.load, enabling
+        # LLVM to hoist them out of loops (e.g., `p.x` in a tight loop).
+        self._class_init_only_attrs: dict[str, set[str]] = {}
 
     def _declare_runtime_functions(self) -> None:
         """Declare external runtime functions we can call."""
@@ -2441,6 +2458,29 @@ class CodeGen:
         # Pass 0.8: discover static attribute slots per class
         self._assign_attribute_slots(tree)
 
+        # Pass 0.85: detect init-only attributes for !invariant.load
+        self._detect_init_only_attrs(tree)
+
+        # Pass 0.9: detect whether program needs BigInt support.
+        # Only set _program_uses_bigint=True when the AST contains integer
+        # literals exceeding 62-bit range or ** power ops with large exponents.
+        # When False, integer add/sub/mul use plain LLVM instructions (no
+        # fpy_checked_add call overhead).
+        _BIGINT_THRESHOLD = (1 << 62)
+        for n in ast.walk(tree):
+            if (isinstance(n, ast.Constant) and isinstance(n.value, int)
+                    and not isinstance(n.value, bool)
+                    and abs(n.value) >= _BIGINT_THRESHOLD):
+                self._program_uses_bigint = True
+                break
+            if isinstance(n, ast.BinOp) and isinstance(n.op, ast.Pow):
+                # x ** y with y > 30 could overflow i64
+                if (isinstance(n.right, ast.Constant)
+                        and isinstance(n.right.value, int)
+                        and n.right.value > 30):
+                    self._program_uses_bigint = True
+                    break
+
         # Pre-scan: detect singledispatch functions and their .register variants.
         # Compiled natively — each variant becomes a separate function, and
         # Pre-scan native module imports so they're known during function
@@ -3515,6 +3555,123 @@ class CodeGen:
 
         for cls_name in class_nodes:
             assign(cls_name)
+
+    def _detect_init_only_attrs(self, tree: ast.Module) -> None:
+        """Detect per-class attributes that are ONLY set in ``__init__`` and
+        never modified by any other method, module-level code, or external
+        ``obj.attr = expr`` store.  Loads from these slots can be annotated
+        with ``!invariant.load`` so LLVM's LICM can hoist them out of loops.
+        Must run after ``_assign_attribute_slots`` (needs class AST nodes)."""
+        class_nodes: dict[str, ast.ClassDef] = {}
+        class_parents: dict[str, str | None] = {}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ClassDef):
+                parent = (node.bases[0].id
+                          if node.bases and isinstance(node.bases[0], ast.Name)
+                          else None)
+                class_parents[node.name] = parent
+                class_nodes[node.name] = node
+
+        # Track which local variables are instances of which class so we
+        # can attribute external ``obj.attr = expr`` stores to specific
+        # classes rather than conservatively excluding from all.
+        obj_var_class: dict[str, str] = {}
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Assign) and len(node.targets) == 1
+                    and isinstance(node.targets[0], ast.Name)
+                    and isinstance(node.value, ast.Call)
+                    and isinstance(node.value.func, ast.Name)
+                    and node.value.func.id in class_nodes):
+                obj_var_class[node.targets[0].id] = node.value.func.id
+
+        # Collect external (non-self) obj.attr Store targets per class.
+        external_stores_per_class: dict[str, set[str]] = {
+            c: set() for c in class_nodes}
+        unknown_external_stores: set[str] = set()
+
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Attribute)
+                    and isinstance(node.ctx, ast.Store)
+                    and isinstance(node.value, ast.Name)
+                    and node.value.id != "self"):
+                var = node.value.id
+                if var in obj_var_class:
+                    external_stores_per_class[obj_var_class[var]].add(
+                        node.attr)
+                else:
+                    unknown_external_stores.add(node.attr)
+
+        # Module-wide setattr/delattr → escape hatch, disable for all.
+        has_global_dynamic = False
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name)
+                    and node.func.id in ("setattr", "delattr")):
+                has_global_dynamic = True
+                break
+
+        # Process in parent-before-child order so inheritance works.
+        processed: set[str] = set()
+
+        def process(cls_name: str) -> None:
+            if cls_name in processed:
+                return
+            parent = class_parents.get(cls_name)
+            if parent and parent in class_nodes:
+                process(parent)
+
+            cls_node = class_nodes[cls_name]
+            init_attrs: set[str] = set()
+            non_init_stores: set[str] = set()
+            class_has_dynamic = False
+
+            for member in cls_node.body:
+                if not isinstance(member, ast.FunctionDef):
+                    continue
+                is_init = member.name == "__init__"
+                for n in ast.walk(member):
+                    # self.attr stores (includes AugAssign targets)
+                    if (isinstance(n, ast.Attribute)
+                            and isinstance(n.value, ast.Name)
+                            and n.value.id == "self"
+                            and isinstance(n.ctx, ast.Store)):
+                        if is_init:
+                            init_attrs.add(n.attr)
+                        else:
+                            non_init_stores.add(n.attr)
+                    # setattr(self, ...) inside any method
+                    if (isinstance(n, ast.Call)
+                            and isinstance(n.func, ast.Name)
+                            and n.func.id in ("setattr", "delattr")
+                            and len(n.args) >= 1
+                            and isinstance(n.args[0], ast.Name)
+                            and n.args[0].id == "self"):
+                        class_has_dynamic = True
+
+            if class_has_dynamic or has_global_dynamic:
+                self._class_init_only_attrs[cls_name] = set()
+                processed.add(cls_name)
+                return
+
+            init_only = (init_attrs - non_init_stores
+                         - external_stores_per_class.get(cls_name, set())
+                         - unknown_external_stores)
+
+            # Inherit init-only attrs from parent that this child doesn't
+            # override (parent sets in __init__, child never stores).
+            if parent and parent in self._class_init_only_attrs:
+                for attr in self._class_init_only_attrs[parent]:
+                    if (attr not in non_init_stores
+                            and attr not in external_stores_per_class.get(
+                                cls_name, set())
+                            and attr not in unknown_external_stores):
+                        init_only.add(attr)
+
+            self._class_init_only_attrs[cls_name] = init_only
+            processed.add(cls_name)
+
+        for cls_name in class_nodes:
+            process(cls_name)
 
     def _analyze_call_sites(self, tree: ast.Module) -> None:
         """Scan all call sites to determine argument types for each function."""
@@ -9680,7 +9837,8 @@ class CodeGen:
         # Skip for bare-ABI functions: no shadow frame, and the store to a
         # global prevents LLVM from optimizing the loop body.
         if (hasattr(node, 'lineno') and node.lineno
-                and not self._current_fn_bare_abi):
+                and not self._current_fn_bare_abi
+                and not self._in_hot_loop):
             self.builder.store(ir.Constant(i32, node.lineno),
                                self._shadow_line_global)
         # Yield statements: must come before generic Expr handler
@@ -10685,7 +10843,9 @@ class CodeGen:
         # emit a data-only load (Phase 9: skip unused tag load).
         slot_idx = self._get_attr_slot(node)
         if slot_idx is not None:
-            data_i64 = self._emit_slot_get_data_only(obj, slot_idx)
+            init_only = self._is_init_only_attr(node)
+            data_i64 = self._emit_slot_get_data_only(
+                obj, slot_idx, init_only=init_only)
         else:
             # Fall back to FV-ABI getter with name lookup
             tag_slot = self._create_entry_alloca(i32, "attr.tag")
@@ -11089,6 +11249,15 @@ class CodeGen:
             return None
         return slots.get(attr_node.attr)
 
+    def _is_init_only_attr(self, attr_node: ast.Attribute) -> bool:
+        """Return True if the attribute load targets an init-only slot,
+        meaning the value is set in ``__init__`` and never modified after."""
+        obj_cls = self._infer_object_class(attr_node.value)
+        if not obj_cls:
+            return False
+        return attr_node.attr in self._class_init_only_attrs.get(
+            obj_cls, set())
+
     # Constants for direct slot offset computation (must match C layout).
     # FpyObj: { i32 class_id, 4 pad, i8* slots, i8* dynamic_attrs } = 24 bytes
     # FpyValue: { i32 tag, 4 pad, i64 data } = 16 bytes
@@ -11124,28 +11293,46 @@ class CodeGen:
             inbounds=True)
         return tag_addr, data_addr
 
-    def _emit_slot_get_direct(self, obj: ir.Value, slot_idx: int
+    def _emit_slot_get_direct(self, obj: ir.Value, slot_idx: int,
+                               init_only: bool = False
                                ) -> tuple[ir.Value, ir.Value]:
         """Emit direct IR to load obj->slots[slot_idx], returning (tag, data).
 
         Skips the fastpy_obj_get_slot function-call overhead. Uses GEP into
         the FpyObj struct (data layout set at module level matches MSVC x64,
         so struct offsets match C's).
+
+        When *init_only* is True the slot value was set in ``__init__`` and
+        never modified, so both loads are annotated ``!invariant.load`` —
+        LLVM can hoist them out of loops and CSE redundant accesses.
         """
         tag_addr, data_addr = self._emit_slot_addr_direct(obj, slot_idx)
         tag = self.builder.load(tag_addr)
         data = self.builder.load(data_addr)
+        if init_only:
+            if not hasattr(self, "_invariant_md"):
+                self._invariant_md = self.module.add_metadata([])
+            tag.set_metadata("invariant.load", self._invariant_md)
+            data.set_metadata("invariant.load", self._invariant_md)
         return tag, data
 
-    def _emit_slot_get_data_only(self, obj: ir.Value, slot_idx: int
-                                  ) -> ir.Value:
+    def _emit_slot_get_data_only(self, obj: ir.Value, slot_idx: int,
+                                  init_only: bool = False) -> ir.Value:
         """Load only obj->slots[slot_idx].data (i64) — skips the tag load
         for statically-typed slot accesses (where the caller doesn't need
         the runtime tag). Shaves one memory load and its dead-load hazards
         off the hot path. (Phase 9 optimization: type-specialized slot reads.)
+
+        When *init_only* is True the data load is annotated
+        ``!invariant.load`` — LLVM can hoist it out of loops.
         """
         _, data_addr = self._emit_slot_addr_direct(obj, slot_idx)
-        return self.builder.load(data_addr)
+        data = self.builder.load(data_addr)
+        if init_only:
+            if not hasattr(self, "_invariant_md"):
+                self._invariant_md = self.module.add_metadata([])
+            data.set_metadata("invariant.load", self._invariant_md)
+        return data
 
     def _emit_slot_set_direct(self, obj: ir.Value, slot_idx: int,
                                tag: ir.Value, data: ir.Value) -> None:
@@ -11216,12 +11403,16 @@ class CodeGen:
         bad = self.builder.or_(oob, still_neg)
         bb_ok = self.builder.append_basic_block("lget.ok")
         bb_err = self.builder.append_basic_block("lget.err")
+        bb_merge = self.builder.append_basic_block("lget.merge")
         self.builder.cbranch(bad, bb_err, bb_ok)
+        # --- Error path: raise IndexError, return dummy 0 ---
         self.builder.position_at_start(bb_err)
         msg = self._make_string_constant("list index out of range")
         self.builder.call(self.runtime["raise"],
                           [ir.Constant(i32, 4), msg])  # FPY_EXC_INDEXERROR=4
-        self.builder.unreachable()
+        self.builder.branch(bb_merge)
+        bb_err_end = self.builder.block
+        # --- OK path: load element data ---
         self.builder.position_at_start(bb_ok)
         # GEP into items[real_idx] — FpyValue is {i32, i64} (fpy_val)
         elem_addr = self.builder.gep(
@@ -11232,9 +11423,16 @@ class CodeGen:
             [ir.Constant(i32, 0), ir.Constant(i32, 1)],
             inbounds=True)
         data = self.builder.load(data_addr)
+        self.builder.branch(bb_merge)
+        bb_ok_end = self.builder.block
+        # --- Merge: phi selects real data or dummy 0 ---
+        self.builder.position_at_start(bb_merge)
+        phi = self.builder.phi(i64, "lget.val")
+        phi.add_incoming(ir.Constant(i64, 0), bb_err_end)
+        phi.add_incoming(data, bb_ok_end)
         if elem_type == "float":
-            return self.builder.bitcast(data, double)
-        return data
+            return self.builder.bitcast(phi, double)
+        return phi
 
     def _inline_list_set(self, list_ptr: ir.Value, index: ir.Value,
                           tag_const: int, data: ir.Value) -> None:
@@ -11265,12 +11463,15 @@ class CodeGen:
         bad = self.builder.or_(oob, still_neg)
         bb_ok = self.builder.append_basic_block("lset.ok")
         bb_err = self.builder.append_basic_block("lset.err")
+        bb_after = self.builder.append_basic_block("lset.after")
         self.builder.cbranch(bad, bb_err, bb_ok)
+        # --- Error path: raise IndexError ---
         self.builder.position_at_start(bb_err)
         msg = self._make_string_constant("list index out of range")
         self.builder.call(self.runtime["raise"],
                           [ir.Constant(i32, 4), msg])  # FPY_EXC_INDEXERROR=4
-        self.builder.unreachable()
+        self.builder.branch(bb_after)
+        # --- OK path: store element ---
         self.builder.position_at_start(bb_ok)
         # GEP into items[real_idx]
         elem_addr = self.builder.gep(
@@ -11289,6 +11490,9 @@ class CodeGen:
         if isinstance(data.type, ir.DoubleType):
             data = self.builder.bitcast(data, i64)
         self.builder.store(data, data_addr)
+        self.builder.branch(bb_after)
+        # --- After: continue (exc_pending check will catch if error) ---
+        self.builder.position_at_start(bb_after)
 
     def _can_inline_list_access(self, node: ast.expr) -> str | None:
         """Check if a list subscript can use inline access.
@@ -12889,16 +13093,33 @@ class CodeGen:
                 type_tag = ValueType(VKind.OBJ)
             else:
                 fv = self._wrap_bare_to_fv(value, type_tag)
+        # Scalar fast path: int/float/bool are value types with no heap
+        # allocation, so incref/decref is a no-op at runtime.  Skip the
+        # call entirely to avoid function-call overhead in hot loops.
+        _SCALAR_VKINDS = (VKind.INT, VKind.FLOAT, VKind.BOOL)
+        _new_is_scalar = (isinstance(type_tag, ValueType)
+                          and type_tag.kind in _SCALAR_VKINDS)
+
         if name in self.variables:
             alloca, old_tag = self.variables[name]
+            _old_is_scalar = False
+            if isinstance(old_tag, ValueType):
+                _old_is_scalar = old_tag.kind in _SCALAR_VKINDS
+            elif isinstance(old_tag, str):
+                _old_is_scalar = old_tag in ("int", "float", "bool")
             # If the existing alloca is not fpy_val (e.g., a cell or a
             # pre-existing bare alloca), create a new one.
             if not (isinstance(alloca.type, ir.PointerType)
                     and alloca.type.pointee is fpy_val):
                 alloca = self._create_entry_alloca(fpy_val, name)
+                # Always zero-init new FV allocas — even for scalar types.
+                # _emit_scope_decref unconditionally decrefs all FV locals,
+                # so if this variable is only assigned in a conditional branch,
+                # the uninitialized alloca would contain garbage tag/data that
+                # fpy_rc_decref interprets as a pointer, causing crashes.
                 if self._USE_REFCOUNT:
                     self._entry_store_fv_none(alloca)
-            elif self._USE_REFCOUNT:
+            elif self._USE_REFCOUNT and not _old_is_scalar:
                 # Decref the old value being overwritten
                 old_fv = self.builder.load(alloca, name=f"{name}.old")
                 old_tag_val = self.builder.extract_value(old_fv, 0)
@@ -12907,12 +13128,11 @@ class CodeGen:
                                   [old_tag_val, old_data])
         else:
             alloca = self._create_entry_alloca(fpy_val, name)
+            # Always zero-init new FV allocas so _emit_scope_decref is safe
+            # even if the variable is only assigned in a conditional branch.
             if self._USE_REFCOUNT:
-                # Initialize in entry block (not here) so that the first-
-                # iteration decref loads a valid NONE tag instead of garbage.
-                # Emitting the init at the current position would clobber the
-                # old value without decref on every loop iteration.
                 self._entry_store_fv_none(alloca)
+            if self._USE_REFCOUNT and not _new_is_scalar:
                 # Decref old value — safe because alloca is initialized to
                 # NONE in the entry block, so first-iteration decref is a
                 # no-op (tag=NONE → rc_decref skips it).
@@ -12922,7 +13142,7 @@ class CodeGen:
                 self.builder.call(self.runtime["rc_decref"],
                                   [old_tag_val, old_data])
         # Incref the new value being stored (skip if stealing an owned ref)
-        if self._USE_REFCOUNT and not steal:
+        if self._USE_REFCOUNT and not steal and not _new_is_scalar:
             new_tag = self.builder.extract_value(fv, 0)
             new_data = self.builder.extract_value(fv, 1)
             self.builder.call(self.runtime["rc_incref"],
@@ -13530,7 +13750,13 @@ class CodeGen:
         # Without this, for-loop iterations leak the old loop variable
         # (never decref'd) and the last element gets an unbalanced
         # decref from scope_decref.
-        if self._USE_REFCOUNT:
+        # Scalar fast path: skip for int/float/bool (value types, no heap).
+        _is_scalar_elem = (isinstance(type_tag, ValueType)
+                           and type_tag.kind in (VKind.INT, VKind.FLOAT,
+                                                 VKind.BOOL))
+        if not _is_scalar_elem and isinstance(type_tag, str):
+            _is_scalar_elem = type_tag in ("int", "float", "bool")
+        if self._USE_REFCOUNT and not _is_scalar_elem:
             old_fv = self.builder.load(alloca)
             old_tag = self.builder.extract_value(old_fv, 0)
             old_data = self.builder.extract_value(old_fv, 1)
@@ -13748,7 +13974,10 @@ class CodeGen:
         # Body
         self.builder.position_at_end(body_block)
         self._loop_stack.append((end_block, cond_block))
+        _prev_hot = self._in_hot_loop
+        self._in_hot_loop = True
         self._emit_stmts(node.body)
+        self._in_hot_loop = _prev_hot
         self._loop_stack.pop()
         if not self.builder.block.is_terminated:
             self.builder.branch(cond_block)
@@ -13884,7 +14113,10 @@ class CodeGen:
         # Body
         self.builder.position_at_end(body_block)
         self._loop_stack.append((end_block, incr_block))
+        _prev_hot = self._in_hot_loop
+        self._in_hot_loop = True
         self._emit_stmts(node.body)
+        self._in_hot_loop = _prev_hot
         self._loop_stack.pop()
         if not self.builder.block.is_terminated:
             self.builder.branch(incr_block)
@@ -15780,7 +16012,10 @@ class CodeGen:
                 self._bridge_fallback_stmt(node, "unsupported for tuple unpack target")
 
         self._loop_stack.append((end_block, incr_block))
+        _prev_hot = self._in_hot_loop
+        self._in_hot_loop = True
         self._emit_stmts(node.body)
+        self._in_hot_loop = _prev_hot
         self._loop_stack.pop()
         if not self.builder.block.is_terminated:
             self.builder.branch(incr_block)
@@ -15819,7 +16054,10 @@ class CodeGen:
         self._store_variable(var_name, ch, "str")
 
         self._loop_stack.append((end_block, incr_block))
+        _prev_hot = self._in_hot_loop
+        self._in_hot_loop = True
         self._emit_stmts(node.body)
+        self._in_hot_loop = _prev_hot
         self._loop_stack.pop()
         if not self.builder.block.is_terminated:
             self.builder.branch(incr_block)
@@ -15873,7 +16111,10 @@ class CodeGen:
         self._store_variable(var_name, result, "int")
 
         self._loop_stack.append((end_block, cond_block))
+        _prev_hot = self._in_hot_loop
+        self._in_hot_loop = True
         self._emit_stmts(node.body)
+        self._in_hot_loop = _prev_hot
         self._loop_stack.pop()
         if not self.builder.block.is_terminated:
             self.builder.branch(cond_block)
@@ -15933,7 +16174,10 @@ class CodeGen:
         self._store_variable(var_name, raw_item, "pyobj")
 
         self._loop_stack.append((end_block, cond_block))
+        _prev_hot = self._in_hot_loop
+        self._in_hot_loop = True
         self._emit_stmts(node.body)
+        self._in_hot_loop = _prev_hot
         self._loop_stack.pop()
         if not self.builder.block.is_terminated:
             self.builder.branch(cond_block)
@@ -15974,7 +16218,10 @@ class CodeGen:
         self._store_variable(var_name, elem, "int")
 
         self._loop_stack.append((end_block, cond_block))
+        _prev_hot = self._in_hot_loop
+        self._in_hot_loop = True
         self._emit_stmts(node.body)
+        self._in_hot_loop = _prev_hot
         self._loop_stack.pop()
         if not self.builder.block.is_terminated:
             next_idx = self.builder.add(
@@ -16045,7 +16292,10 @@ class CodeGen:
                 self._dict_var_key_types[var_name] = key_types
 
         self._loop_stack.append((end_block, incr_block))
+        _prev_hot = self._in_hot_loop
+        self._in_hot_loop = True
         self._emit_stmts(node.body)
+        self._in_hot_loop = _prev_hot
         self._loop_stack.pop()
         if not self.builder.block.is_terminated:
             self.builder.branch(incr_block)
@@ -16111,7 +16361,10 @@ class CodeGen:
         self._fv_store_from_list(var_name, keys_list, idx, key_type)
 
         self._loop_stack.append((end_block, incr_block))
+        _prev_hot = self._in_hot_loop
+        self._in_hot_loop = True
         self._emit_stmts(node.body)
+        self._in_hot_loop = _prev_hot
         self._loop_stack.pop()
         if not self.builder.block.is_terminated:
             self.builder.branch(incr_block)
@@ -18753,8 +19006,9 @@ class CodeGen:
             if isinstance(obj.type, ir.PointerType):
                 slot_idx = self._get_attr_slot(node)
                 if slot_idx is not None:
+                    init_only = self._is_init_only_attr(node)
                     tag_val, data_val = self._emit_slot_get_direct(
-                        obj, slot_idx)
+                        obj, slot_idx, init_only=init_only)
                     return self._fv_build_from_slots(tag_val, data_val)
                 tag_slot = self._create_entry_alloca(i32, "aget.tag")
                 data_slot = self._create_entry_alloca(i64, "aget.data")
@@ -20143,6 +20397,20 @@ class CodeGen:
             if plain is not None:
                 return plain(left, right)
             # Pow: fall through to checked_pow runtime (rare in tight loops)
+
+        # Programs that don't need BigInt: use plain LLVM arithmetic (same
+        # as bare-ABI).  The _program_uses_bigint flag is set during AST
+        # analysis only when the source contains very large int literals or
+        # ** with large exponents.  This eliminates the fpy_checked_add
+        # function-call overhead for the vast majority of programs.
+        if not self._program_uses_bigint and not force_overflow_error:
+            plain = {
+                ast.Add: self.builder.add,
+                ast.Sub: self.builder.sub,
+                ast.Mult: self.builder.mul,
+            }.get(type(op))
+            if plain is not None:
+                return plain(left, right)
 
         # --typed --int64 (or per-variable Checked): use LLVM overflow
         # intrinsics — no BigInt fallback, no runtime function calls,
@@ -26232,7 +26500,9 @@ class CodeGen:
                         obj = self.builder.inttoptr(obj, i8_ptr, name="obj.ptr")
                     slot_idx = self._get_attr_slot(value.value)
                     if slot_idx is not None:
-                        tag, data = self._emit_slot_get_direct(obj, slot_idx)
+                        init_only = self._is_init_only_attr(value.value)
+                        tag, data = self._emit_slot_get_direct(
+                            obj, slot_idx, init_only=init_only)
                     else:
                         tag_slot = self._create_entry_alloca(i32, "fattr.tag")
                         data_slot = self._create_entry_alloca(i64, "fattr.data")
