@@ -494,9 +494,13 @@ Systematic comparison against the Python 3.14 PEG grammar (`Grammar/python.gram`
   arguments, and the FV dispatch fallback routes path/pyobj-tagged receivers
   through `fpy_fv_call_method` (CPython bridge). For native types (str, list,
   dict), the existing type-specific handlers catch them correctly.
-  **Remaining gap:** Unannotated parameters whose type can't be inferred from
-  call-site analysis (e.g., argument is itself an untyped variable) still
-  default to "str" or "int", preventing correct method dispatch.
+  **Remaining gap:** Cross-category conflicts (e.g., same function called
+  with both int and str) still fall back to "int" (the post-merge cleanup
+  clears conflicting categories to None). Same-category pointer conflicts
+  (str+list, str+dict, etc.) now work via "mixed" tag with runtime dispatch
+  through `fastpy_fv_len` and `fastpy_fv_print`. Unannotated parameters
+  whose type can't be inferred from call-site analysis (argument is itself
+  an untyped variable) still default to the first caller's type.
 
 - **BigInt through function calls** *(fixed)* — BigInt values passed through
   function parameters now work correctly. Fixes: BigInt param types use i8_ptr
