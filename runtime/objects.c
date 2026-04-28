@@ -546,6 +546,42 @@ int32_t fastpy_fv_truthy(int32_t tag, int64_t data) {
     return 0;
 }
 
+/* FpyValue len() — runtime dispatch based on tag.
+ * Returns the length of the value (string length, list/tuple size,
+ * dict/set size). Returns 0 for types without length. */
+int64_t fastpy_fv_len(int32_t tag, int64_t data) {
+    switch (tag) {
+        case FPY_TAG_STR: {
+            const char *s = (const char*)(intptr_t)data;
+            return s ? (int64_t)strlen(s) : 0;
+        }
+        case FPY_TAG_LIST: {
+            FpyList *lst = (FpyList*)(intptr_t)data;
+            return lst ? lst->length : 0;
+        }
+        case FPY_TAG_DICT:
+        case FPY_TAG_SET: {
+            FpyDict *d = (FpyDict*)(intptr_t)data;
+            return d ? d->length : 0;
+        }
+        case FPY_TAG_OBJ: {
+            /* For objects, try __len__ via bridge or return 0 */
+            FpyObj *obj = (FpyObj*)(intptr_t)data;
+            if (obj && obj->magic != FPY_OBJ_MAGIC) {
+                /* CPython PyObject* — use PyObject_Length */
+                extern int64_t fpy_cpython_len(void*);
+                return fpy_cpython_len((void*)(intptr_t)data);
+            }
+            return 0;  /* native obj without __len__ */
+        }
+        case FPY_TAG_BYTES: {
+            const char *s = (const char*)(intptr_t)data;
+            return s ? (int64_t)strlen(s) : 0;
+        }
+    }
+    return 0;
+}
+
 /* FpyValue binary operation — runtime dispatch for Add/Sub/Mul/etc.
  * op: 0=add, 1=sub, 2=mul, 3=div, 4=floordiv, 5=mod
  * Results are written to *out_tag, *out_data. */

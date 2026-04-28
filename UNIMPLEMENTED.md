@@ -431,15 +431,7 @@ nested list types through function return boundaries.
 
 Systematic comparison against the Python 3.14 PEG grammar (`Grammar/python.gram`).
 
-### Silently wrong (compiles, produces incorrect results)
-- **MatchStar** — `case [first, *rest]:` treated as never-match. Should capture
-  remaining sequence elements.
-- **MatchMapping** — `case {"key": val}:` treated as never-match. Should match
-  dict structure and bind values.
-- **MatchClass** — `case Point(x, y):` treated as never-match. Should match
-  class instances and bind attributes. **(implemented 2026-04-28)**
-
-### Formerly blocked, now implemented
+### Formerly silently wrong, now implemented
 - **`type` statement** (Python 3.12+) — `type X = int | str` silently ignored
   (no runtime effect). Tested.
 - **`@` operator** (MatMult) — `a @ b` dispatches to `__matmul__` on user
@@ -506,10 +498,13 @@ Systematic comparison against the Python 3.14 PEG grammar (`Grammar/python.gram`
   call-site analysis (e.g., argument is itself an untyped variable) still
   default to "str" or "int", preventing correct method dispatch.
 
-- **BigInt through function calls** — BigInt values passed through function
-  parameters lose their BIGINT tag (treated as regular i64). Direct BigInt
-  constants and variables work correctly. Same root cause as above: no
-  interprocedural type inference.
+- **BigInt through function calls** *(fixed)* — BigInt values passed through
+  function parameters now work correctly. Fixes: BigInt param types use i8_ptr
+  (pointer), BigInt fast paths in `_emit_binop` and `_emit_compare`, BinOp
+  constant-fold detection for expressions like `10**20`, `_type_cat` treats
+  bigint as numeric ("I") for merge compatibility with int, and runtime
+  INT→BigInt promotion in `_unwrap_fv_for_tag` handles mixed int/bigint
+  callers. See bugs fixed section.
 
 - **Return type annotations ignored** *(fixed)* — `-> str` on function
   definitions now propagates to `ret_tag`, so call sites see the correct
@@ -540,16 +535,14 @@ Systematic comparison against the Python 3.14 PEG grammar (`Grammar/python.gram`
   and lambdas, `cpython_wrap_native` already creates PyCFunction wrappers —
   extend this to class instances and arbitrary objects.
 
-- **PyObject* values in FpyValue OBJ tag are not FpyObj** *(mostly fixed)* —
+- **PyObject* values in FpyValue OBJ tag are not FpyObj** *(fixed)* —
   CPython PyObject* (e.g. `pathlib.Path`) stored in FpyValue with OBJ tag.
-  The runtime `fastpy_obj_write` checks the magic field (`FPY_OBJ_MAGIC`)
-  to distinguish native FpyObj* from CPython PyObject* and routes to
-  `fpy_cpython_print_obj` for the latter. `fpy_value_repr` has the same
-  check. Multi-arg print (`print("x:", p)`) works correctly via the
-  `_load_or_wrap_fv` → `cpython_to_fv` → `fv_write` → magic check path.
-  Remaining edge case: `fv_cmp` and `fv_truthy` don't distinguish the two
-  (minor: truthy works because `data != 0` is correct for both; comparison
-  may produce wrong results for PyObject* values).
+  All runtime paths now check `FPY_OBJ_MAGIC` to distinguish native FpyObj*
+  from CPython PyObject*: `fastpy_obj_write`, `fpy_value_repr`,
+  `fpy_rc_incref/decref`, `fastpy_fv_truthy` (delegates to `PyObject_IsTrue`),
+  and `fpy_value_compare` (delegates to `fpy_cpython_compare` for rich
+  comparison). Multi-arg print, truthiness, and comparison all work correctly
+  for both native objects and CPython PyObject* values.
 
 ### Bridge
 

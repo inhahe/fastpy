@@ -1164,6 +1164,9 @@ class CodeGen:
         self.runtime["fv_str"] = ir.Function(self.module, ft, name="fastpy_fv_str")
         ft = ir.FunctionType(i32, [i32, i64])
         self.runtime["fv_truthy"] = ir.Function(self.module, ft, name="fastpy_fv_truthy")
+        # int64_t fastpy_fv_len(i32 tag, i64 data)
+        ft = ir.FunctionType(i64, [i32, i64])
+        self.runtime["fv_len"] = ir.Function(self.module, ft, name="fastpy_fv_len")
         # void fastpy_fv_binop(i32 lt, i64 ld, i32 rt, i64 rd, i32 op, i32* out_tag, i64* out_data)
         ft = ir.FunctionType(void, [i32, i64, i32, i64, i32, ir.PointerType(i32), ir.PointerType(i64)])
         self.runtime["fv_binop"] = ir.Function(self.module, ft, name="fastpy_fv_binop")
@@ -5724,7 +5727,7 @@ class CodeGen:
                     if (ct in ("str", "list", "dict", "obj",
                                "bigint", "complex", "decimal",
                                "set", "bytes", "path", "pyobj",
-                               "closure", "tuple")
+                               "closure", "tuple", "mixed")
                             or ct.startswith("list:")
                             or ct.startswith("dict:")):
                         param_types.append(i8_ptr)
@@ -6867,6 +6870,8 @@ class CodeGen:
                                       "counter", "defaultdict", "deque",
                                       "logger", "native_mod"):
                         tag = call_tag
+                    elif call_tag == "mixed":
+                        tag = "mixed"  # VKind.UNKNOWN — runtime dispatch
                     else:
                         tag = "str"
                 elif isinstance(static_type, ir.DoubleType):
@@ -12578,7 +12583,7 @@ class CodeGen:
                                 "none", "complex", "counter", "defaultdict",
                                 "deque", "chainmap", "namedtuple_type", "logger",
                                 "path", "decimal", "set", "bigint", "pyobj",
-                                "closure", "native_mod", "unknown"):
+                                "closure", "native_mod", "unknown", "mixed"):
                     return var_tag
                 if var_tag.startswith("list"):
                     return var_tag
@@ -25293,6 +25298,17 @@ class CodeGen:
         if self._is_deque_expr(arg_node):
             return self.builder.call(self.runtime["deque_length"],
                                       [tv.as_ptr(self.builder)])
+
+        # Runtime dispatch for UNKNOWN/mixed types: extract tag+data
+        # from FpyValue and let the C runtime choose the right len().
+        if kind == VKind.UNKNOWN:
+            fv = None
+            if isinstance(arg_node, ast.Name):
+                fv = self._load_fv_raw(arg_node.id)
+            if fv is not None:
+                tag = self._fv_tag(fv)
+                data = self._fv_data_i64(fv)
+                return self.builder.call(self.runtime["fv_len"], [tag, data])
 
         # Slow path: CPython bridge (works for any type)
         return self.builder.call(self.runtime["cpython_len"],
