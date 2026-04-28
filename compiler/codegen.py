@@ -263,6 +263,7 @@ class ValueType:
             "counter": VKind.DICT, "defaultdict": VKind.DICT,
             "deque": VKind.LIST,
             "chainmap": VKind.OBJ, "logger": VKind.OBJ,
+            "ptr": VKind.LIST, "ptr:list": VKind.LIST,
             "path": VKind.PYOBJ, "native_func": VKind.UNKNOWN,
             "native_mod": VKind.PYOBJ, "cls": VKind.INT,
             "cell": VKind.UNKNOWN, "namedtuple_type": VKind.INT,
@@ -1786,6 +1787,27 @@ class CodeGen:
         # to_pyobj(tag, data) → PyObject* — convert FpyValue to PyObject*
         ft = ir.FunctionType(i8_ptr, [i32, i64])
         self.runtime["cpython_to_pyobj"] = ir.Function(self.module, ft, name="fpy_cpython_to_pyobj")
+        # FpyValue method dispatch — call method on any FpyValue type
+        # fv_call_method0(rcv_tag, rcv_data, name, &out_tag, &out_data)
+        ft = ir.FunctionType(void, [i32, i64, i8_ptr,
+                                     ir.PointerType(i32), ir.PointerType(i64)])
+        self.runtime["fv_call_method0"] = ir.Function(self.module, ft, name="fpy_fv_call_method0")
+        # fv_call_method1(rcv_tag, rcv_data, name, a1_tag, a1_data, &out, &out)
+        ft = ir.FunctionType(void, [i32, i64, i8_ptr, i32, i64,
+                                     ir.PointerType(i32), ir.PointerType(i64)])
+        self.runtime["fv_call_method1"] = ir.Function(self.module, ft, name="fpy_fv_call_method1")
+        # fv_call_method2(rcv_tag, rcv_data, name, a1t,a1d, a2t,a2d, &out, &out)
+        ft = ir.FunctionType(void, [i32, i64, i8_ptr, i32, i64, i32, i64,
+                                     ir.PointerType(i32), ir.PointerType(i64)])
+        self.runtime["fv_call_method2"] = ir.Function(self.module, ft, name="fpy_fv_call_method2")
+        # fv_call_method3(rcv_tag, rcv_data, name, a1,a2,a3, &out, &out)
+        ft = ir.FunctionType(void, [i32, i64, i8_ptr, i32, i64, i32, i64, i32, i64,
+                                     ir.PointerType(i32), ir.PointerType(i64)])
+        self.runtime["fv_call_method3"] = ir.Function(self.module, ft, name="fpy_fv_call_method3")
+        # fv_getattr(rcv_tag, rcv_data, name, &out_tag, &out_data)
+        ft = ir.FunctionType(void, [i32, i64, i8_ptr,
+                                     ir.PointerType(i32), ir.PointerType(i64)])
+        self.runtime["fv_getattr"] = ir.Function(self.module, ft, name="fpy_fv_getattr")
         # Direct len/bool on PyObject*
         ft = ir.FunctionType(i64, [i8_ptr])
         self.runtime["cpython_len"] = ir.Function(self.module, ft, name="fpy_cpython_len")
@@ -2162,6 +2184,30 @@ class CodeGen:
         """Extract the i64 data payload from an FpyValue."""
         return self.builder.extract_value(fv, 1)
 
+    def _load_fv_raw(self, name: str) -> 'ir.Value | None':
+        """Load an FpyValue variable without unwrapping — preserves the
+        runtime tag. Returns the fpy_val struct, or None if the variable
+        is not stored as an FpyValue alloca."""
+        if name not in self.variables:
+            return None
+        alloca, _ = self.variables[name]
+        if (isinstance(alloca.type, ir.PointerType)
+                and alloca.type.pointee is fpy_val):
+            return self.builder.load(alloca, name=f"{name}.fv_raw")
+        return None
+
+    def _expr_to_tag_data(self, node: ast.expr) -> tuple:
+        """Convert an AST expression to (tag_ir, data_ir) while preserving
+        runtime FpyValue tags. For FpyValue-backed variables, loads the raw
+        struct. For all others, evaluates and infers the tag at compile time.
+        Returns (ir.Value, ir.Value) — both IR values."""
+        if isinstance(node, ast.Name):
+            fv = self._load_fv_raw(node.id)
+            if fv is not None:
+                return self._fv_tag(fv), self._fv_data_i64(fv)
+        val = self._emit_expr_value(node)
+        return self._to_tag_data_ir(val, node)
+
     def _fv_as_int(self, fv: ir.Value) -> ir.Value:
         """Extract data as i64 (assumes tag is INT or BOOL)."""
         return self._fv_data_i64(fv)
@@ -2503,6 +2549,25 @@ class CodeGen:
                         var_name = alias.asname if alias.asname else attr_name
                         self._bridge_imports[var_name] = (mod, attr_name)
 
+        # Pre-scan native module imports: MUST run before _analyze_call_sites
+        # so that Path(...) calls in arguments can be recognized as path-typed.
+        if not hasattr(self, '_native_modules'):
+            self._native_modules = set()
+        if not hasattr(self, '_native_imports'):
+            self._native_imports = {}
+        for node in tree.body:
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.name in self._NATIVE_MODULES:
+                        var = alias.asname if alias.asname else alias.name
+                        self._native_modules.add(var)
+            elif isinstance(node, ast.ImportFrom):
+                mod = node.module or ""
+                if mod in self._NATIVE_MODULES:
+                    for alias in node.names:
+                        var = alias.asname if alias.asname else alias.name
+                        self._native_imports[var] = (mod, alias.name)
+
         self._analyze_call_sites(tree)
 
         # Pass 0.76: expand @dataclass classes into vanilla classes with
@@ -2545,26 +2610,7 @@ class CodeGen:
 
         # Pre-scan: detect singledispatch functions and their .register variants.
         # Compiled natively — each variant becomes a separate function, and
-        # Pre-scan native module imports so they're known during function
-        # compilation (before _emit_import runs at module level).
-        if not hasattr(self, '_native_modules'):
-            self._native_modules = set()
-        if not hasattr(self, '_native_imports'):
-            self._native_imports = {}
-        for node in tree.body:
-            if isinstance(node, ast.Import):
-                for alias in node.names:
-                    if alias.name in self._NATIVE_MODULES:
-                        var = alias.asname if alias.asname else alias.name
-                        self._native_modules.add(var)
-            elif isinstance(node, ast.ImportFrom):
-                mod = node.module or ""
-                if mod in self._NATIVE_MODULES:
-                    for alias in node.names:
-                        var = alias.asname if alias.asname else alias.name
-                        self._native_imports[var] = (mod, alias.name)
-
-        # (Bridge imports pre-scan moved earlier, before _analyze_call_sites.)
+        # (Native module imports pre-scan moved earlier, before _analyze_call_sites.)
 
         # the call site emits a switch on the first argument's runtime tag.
         if not hasattr(self, '_cpython_functions'):
@@ -4608,6 +4654,20 @@ class CodeGen:
                         arg_types.append("obj")
                     else:
                         arg_types.append(None)
+                elif (isinstance(arg, ast.Call)
+                      and isinstance(arg.func, ast.Name)
+                      and arg.func.id in getattr(self, '_native_imports', {})):
+                    # Native import call: Path(...), etc.
+                    _mod, _fn = self._native_imports[arg.func.id]
+                    if _mod == "pathlib" and _fn == "Path":
+                        arg_types.append("path")
+                    else:
+                        arg_types.append("pyobj")
+                elif (isinstance(arg, ast.Name)
+                      and arg.id in var_types
+                      and var_types[arg.id] in ("path", "pyobj")):
+                    # Variable with known path/pyobj type
+                    arg_types.append(var_types[arg.id])
                 else:
                     # Check if expression contains float constants (e.g. 2.0 * 3.0)
                     # but NOT if it contains a class constructor (those would
@@ -6724,6 +6784,13 @@ class CodeGen:
                             self._dict_var_dict_values.add(param.name)
                     elif call_tag == "obj":
                         tag = "obj"
+                    elif call_tag in ("path", "pyobj"):
+                        tag = call_tag
+                    elif call_tag in ("set", "complex", "bigint",
+                                      "decimal", "bytes", "closure",
+                                      "counter", "defaultdict", "deque",
+                                      "logger", "native_mod"):
+                        tag = call_tag
                     else:
                         tag = "str"
                 elif isinstance(static_type, ir.DoubleType):
@@ -10797,11 +10864,12 @@ class CodeGen:
                 self._store_variable(node.targets[0].id, pyobj_ptr, "pyobj")
             return
 
-        # For FV-ABI user function calls that may return None, store the raw
-        # FpyValue directly to preserve the runtime tag. This avoids the
-        # unwrap/re-wrap cycle that loses the NONE tag. Only applies when the
-        # function is known to have a `return None` path — other functions
-        # (closures, single-type returns) use the normal unwrap flow.
+        # For FV-ABI user function calls, store the raw FpyValue directly
+        # to preserve the runtime tag. This avoids the unwrap/re-wrap cycle
+        # that loses type information (e.g., a string return gets unwrapped
+        # via static_ret_type=i64 → bare integer, then re-wrapped as INT
+        # instead of STR). The callee's FpyValue already has the correct
+        # runtime tag, so storing it directly is always correct.
         if (self._USE_FV_LOCALS
                 and len(node.targets) == 1
                 and isinstance(node.targets[0], ast.Name)
@@ -10814,10 +10882,15 @@ class CodeGen:
                 lookup_name = self._resolve_specialization(
                     lookup_name, node.value.args, node.value.keywords)
             info = self._user_functions[lookup_name]
-            if (info.uses_fv_abi and info.ret_tag != "void"
-                    and info.may_return_none):
+            if (info.uses_fv_abi and info.ret_tag != "void"):
                 fv = self._emit_user_call_fv(node.value)
                 type_tag = info.ret_tag
+                # Normalize legacy "ptr" tag → "list" so downstream checks
+                # (_is_list_expr, _get_list_elem_type) recognize the variable.
+                if type_tag == "ptr":
+                    type_tag = "list:int"
+                elif type_tag == "ptr:list":
+                    type_tag = "list:list"
                 self._store_variable(node.targets[0].id, fv, type_tag)
                 return
 
@@ -11332,13 +11405,14 @@ class CodeGen:
                 self.runtime["cpython_getattr"], [obj, attr_name])
 
         obj = self._emit_expr_value(node.value)
+        attr_name = self._make_string_constant(node.attr)
+
         # Attribute access always operates on an object pointer.  When the
         # object comes from an FV-backed variable with "int" tag (before the
         # call-site "obj" fix), the data is i64.  Convert to i8* so that
         # obj_get_fv receives the correct pointer type.
         if isinstance(obj.type, ir.IntType) and obj.type.width == 64:
             obj = self.builder.inttoptr(obj, i8_ptr, name="obj.ptr")
-        attr_name = self._make_string_constant(node.attr)
 
         # Try static slot fast path first — direct GEP IR skips the
         # fastpy_obj_get_slot call overhead. Since the caller only uses
@@ -14158,7 +14232,7 @@ class CodeGen:
                 tag = ir.Constant(i32, FPY_TAG_SET)
                 data = self.builder.ptrtoint(value, i64)
                 return self._fv_build_from_slots(tag, data)
-            if type_tag == "tuple" or type_tag.startswith("list"):
+            if type_tag == "tuple" or type_tag.startswith("list") or type_tag.startswith("ptr"):
                 return self._fv_from_list(value)
             if type_tag == "closure":
                 # Closures are pointers — treat as OBJ for now
@@ -14240,7 +14314,7 @@ class CodeGen:
             return self._fv_as_ptr(fv)
         if type_tag == "set":
             return self._fv_as_ptr(fv)
-        if type_tag == "tuple" or type_tag.startswith("list"):
+        if type_tag == "tuple" or type_tag.startswith("list") or type_tag.startswith("ptr"):
             return self._fv_as_ptr(fv)
         if type_tag == "closure":
             return self._fv_as_ptr(fv)
@@ -15887,13 +15961,16 @@ class CodeGen:
                 self.builder.ptrtoint(sig_obj, i64))
         # Get the module/object pointer
         obj = self._emit_expr_value(attr.value)
-        if isinstance(obj.type, ir.IntType):
-            obj = self.builder.inttoptr(obj, i8_ptr)
-        elif (isinstance(obj.type, ir.LiteralStructType)
+        if (isinstance(obj.type, ir.LiteralStructType)
               and obj.type == fpy_val):
-            # FpyValue returned from attribute access — extract data as pointer
-            data = self.builder.extract_value(obj, 1)
-            obj = self.builder.inttoptr(data, i8_ptr)
+            # FpyValue — convert to PyObject* properly via bridge
+            # (raw data extraction is wrong for STR/LIST/DICT/etc.)
+            rcv_tag = self.builder.extract_value(obj, 0)
+            rcv_data = self.builder.extract_value(obj, 1)
+            obj = self.builder.call(
+                self.runtime["cpython_to_pyobj"], [rcv_tag, rcv_data])
+        elif isinstance(obj.type, ir.IntType):
+            obj = self.builder.inttoptr(obj, i8_ptr)
         # Get the callable attribute
         attr_name = self._make_string_constant(attr.attr)
         callable_ptr = self.builder.call(
@@ -26305,9 +26382,66 @@ class CodeGen:
             if method == "encode":
                 # str.encode() → bytes (same UTF-8 content, tagged as BYTES)
                 return self._rt_call("str_encode", [obj])
-        # Fallback: runtime method dispatch for unknown objects.
-        # This handles generated code (e.g. yield-from delegation)
-        # where the receiver's class isn't statically known.
+        # Fallback: method dispatch for unknown objects.
+        # Two paths:
+        # (a) Path/pyobj-tagged variables: use fpy_fv_call_method which
+        #     converts to PyObject* safely (handles Path, Django models, etc.)
+        # (b) All other variables (obj, unknown): use obj_call_method which
+        #     assumes FpyObj* (the common case for polymorphic class objects)
+        #
+        # IMPORTANT: We condition on the compile-time tag, NOT on whether the
+        # variable is FV-backed. FpyObj* values stored in fpy_val allocas have
+        # unreliable runtime tags (often INT instead of OBJ), so _load_fv_raw
+        # would misroute them through FV dispatch → AttributeError.
+        _use_fv_dispatch = False
+        if isinstance(node.func.value, ast.Name) and node.func.value.id in self.variables:
+            _, _rcv_tag = self.variables[node.func.value.id]
+            _rcv_tag_str = str(_rcv_tag)
+            if _rcv_tag_str in ("path", "pyobj"):
+                _use_fv_dispatch = True
+
+        if _use_fv_dispatch:
+            fv_raw = self._load_fv_raw(node.func.value.id)
+            if fv_raw is None:
+                # Not FV-backed despite path/pyobj tag — use CPython bridge
+                return self._emit_cpython_method_call(node)
+            # Path (a): FpyValue-backed — use safe FV dispatch
+            rcv_tag = self._fv_tag(fv_raw)
+            rcv_data = self._fv_data_i64(fv_raw)
+            name_ptr = self._make_string_constant(method)
+            out_tag = self._create_entry_alloca(i32, "fvcall.tag")
+            out_data = self._create_entry_alloca(i64, "fvcall.data")
+            n_args = len(node.args)
+            if n_args == 0:
+                self.builder.call(self.runtime["fv_call_method0"],
+                                  [rcv_tag, rcv_data, name_ptr,
+                                   out_tag, out_data])
+            elif n_args == 1:
+                a1t, a1d = self._expr_to_tag_data(node.args[0])
+                self.builder.call(self.runtime["fv_call_method1"],
+                                  [rcv_tag, rcv_data, name_ptr,
+                                   a1t, a1d, out_tag, out_data])
+            elif n_args == 2:
+                a1t, a1d = self._expr_to_tag_data(node.args[0])
+                a2t, a2d = self._expr_to_tag_data(node.args[1])
+                self.builder.call(self.runtime["fv_call_method2"],
+                                  [rcv_tag, rcv_data, name_ptr,
+                                   a1t, a1d, a2t, a2d, out_tag, out_data])
+            elif n_args == 3:
+                a1t, a1d = self._expr_to_tag_data(node.args[0])
+                a2t, a2d = self._expr_to_tag_data(node.args[1])
+                a3t, a3d = self._expr_to_tag_data(node.args[2])
+                self.builder.call(self.runtime["fv_call_method3"],
+                                  [rcv_tag, rcv_data, name_ptr,
+                                   a1t, a1d, a2t, a2d, a3t, a3d,
+                                   out_tag, out_data])
+            else:
+                return self._emit_cpython_method_call(node)
+            result_tag = self.builder.load(out_tag)
+            result_data = self.builder.load(out_data)
+            return self._fv_build_from_slots(result_tag, result_data)
+
+        # Path (b): bare pointer — assume FpyObj* (class instance)
         obj = self._emit_expr_value(node.func.value)
         if isinstance(obj.type, ir.IntType):
             obj = self.builder.inttoptr(obj, i8_ptr)

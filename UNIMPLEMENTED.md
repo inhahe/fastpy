@@ -498,11 +498,13 @@ Systematic comparison against the Python 3.14 PEG grammar (`Grammar/python.gram`
   on the parameter (e.g. `source_dir.resolve()`) cannot dispatch to native
   handlers.
   **Partially fixed:** Adding `d: Path` annotations now works (see bug 27).
-  The remaining gap is unannotated parameters: `def find_root(d): return
-  d.resolve()` still fails because the codegen can't know `d` is a Path.
-  **Planned fix:** Runtime tag-based method dispatch — when calling a method
-  on an FV-backed variable with unknown compile-time type, check the runtime
-  tag and dispatch to `cpython_getattr` + `cpython_call` for OBJ-tagged values.
+  Call-site analysis now propagates `path`/`pyobj` tags through function
+  arguments, and the FV dispatch fallback routes path/pyobj-tagged receivers
+  through `fpy_fv_call_method` (CPython bridge). For native types (str, list,
+  dict), the existing type-specific handlers catch them correctly.
+  **Remaining gap:** Unannotated parameters whose type can't be inferred from
+  call-site analysis (e.g., argument is itself an untyped variable) still
+  default to "str" or "int", preventing correct method dispatch.
 
 - **BigInt through function calls** — BigInt values passed through function
   parameters lose their BIGINT tag (treated as regular i64). Direct BigInt
@@ -589,10 +591,11 @@ full self-hosting fails due to the limitations above.
 - Builtin names (`str`, `int`, `Exception`, etc.) as real PyObject* values
 
 **What blocks full self-hosting:**
-- Functions that receive Path/PyObject* parameters and call methods on them
-  crash (no interprocedural type inference — see above).
-  Example: `_find_project_root(base_dir)` receives a Path, calls
-  `.resolve()` and `/ "__init__.py"` on it — the callee can't dispatch these.
+- Functions that receive Path/PyObject* parameters *whose type cannot be
+  inferred from call-site analysis* still fail to dispatch methods.
+  Call-site analysis now handles `Path(...)` constructor calls and
+  path/pyobj-tagged variables as arguments, but deeply nested or dynamic
+  dispatch chains remain unresolved.
 - The pipeline functions use extensive dynamic typing (dicts of mixed types,
   AST node manipulation, `isinstance` checks) that requires the CPython
   bridge for every operation on untyped parameters.

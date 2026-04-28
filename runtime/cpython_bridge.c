@@ -535,6 +535,145 @@ void* fpy_cpython_to_pyobj(int32_t tag, int64_t data) {
     return (void*)fpy_to_pyobject(tag, data);
 }
 
+/* ── FpyValue method dispatch ─────────────────────────────────────
+ * These functions call a method on ANY FpyValue (int, str, list, dict,
+ * FpyObj, PyObject*, etc.) by converting to PyObject* first and
+ * dispatching through CPython.  This is the universal fallback for
+ * variables whose compile-time type is unknown.
+ */
+
+void fpy_fv_call_method0(int32_t rcv_tag, int64_t rcv_data,
+                         const char *name,
+                         int32_t *out_tag, int64_t *out_data) {
+    PyObject *py_rcv = fpy_to_pyobject(rcv_tag, rcv_data);
+    PyObject *method = PyObject_GetAttrString(py_rcv, name);
+    if (!method) {
+        bridge_propagate_exception();
+        *out_tag = FPY_TAG_NONE; *out_data = 0;
+        Py_DECREF(py_rcv);
+        return;
+    }
+    PyObject *result = PyObject_CallNoArgs(method);
+    Py_DECREF(method);
+    Py_DECREF(py_rcv);
+    if (!result) {
+        bridge_propagate_exception();
+        *out_tag = FPY_TAG_NONE; *out_data = 0;
+        return;
+    }
+    pyobject_to_fpy(result, out_tag, out_data);
+    if (*out_tag == FPY_TAG_OBJ) Py_INCREF(result);
+    Py_DECREF(result);
+}
+
+void fpy_fv_call_method1(int32_t rcv_tag, int64_t rcv_data,
+                         const char *name,
+                         int32_t a1_tag, int64_t a1_data,
+                         int32_t *out_tag, int64_t *out_data) {
+    PyObject *py_rcv = fpy_to_pyobject(rcv_tag, rcv_data);
+    PyObject *method = PyObject_GetAttrString(py_rcv, name);
+    if (!method) {
+        bridge_propagate_exception();
+        *out_tag = FPY_TAG_NONE; *out_data = 0;
+        Py_DECREF(py_rcv);
+        return;
+    }
+    PyObject *a1 = fpy_to_pyobject(a1_tag, a1_data);
+    PyObject *result = PyObject_CallOneArg(method, a1);
+    Py_DECREF(a1);
+    Py_DECREF(method);
+    Py_DECREF(py_rcv);
+    if (!result) {
+        bridge_propagate_exception();
+        *out_tag = FPY_TAG_NONE; *out_data = 0;
+        return;
+    }
+    pyobject_to_fpy(result, out_tag, out_data);
+    if (*out_tag == FPY_TAG_OBJ) Py_INCREF(result);
+    Py_DECREF(result);
+}
+
+void fpy_fv_call_method2(int32_t rcv_tag, int64_t rcv_data,
+                         const char *name,
+                         int32_t a1_tag, int64_t a1_data,
+                         int32_t a2_tag, int64_t a2_data,
+                         int32_t *out_tag, int64_t *out_data) {
+    PyObject *py_rcv = fpy_to_pyobject(rcv_tag, rcv_data);
+    PyObject *method = PyObject_GetAttrString(py_rcv, name);
+    if (!method) {
+        bridge_propagate_exception();
+        *out_tag = FPY_TAG_NONE; *out_data = 0;
+        Py_DECREF(py_rcv);
+        return;
+    }
+    PyObject *a1 = fpy_to_pyobject(a1_tag, a1_data);
+    PyObject *a2 = fpy_to_pyobject(a2_tag, a2_data);
+    PyObject *result = PyObject_CallFunctionObjArgs(method, a1, a2, NULL);
+    Py_DECREF(a2);
+    Py_DECREF(a1);
+    Py_DECREF(method);
+    Py_DECREF(py_rcv);
+    if (!result) {
+        bridge_propagate_exception();
+        *out_tag = FPY_TAG_NONE; *out_data = 0;
+        return;
+    }
+    pyobject_to_fpy(result, out_tag, out_data);
+    if (*out_tag == FPY_TAG_OBJ) Py_INCREF(result);
+    Py_DECREF(result);
+}
+
+void fpy_fv_call_method3(int32_t rcv_tag, int64_t rcv_data,
+                         const char *name,
+                         int32_t a1_tag, int64_t a1_data,
+                         int32_t a2_tag, int64_t a2_data,
+                         int32_t a3_tag, int64_t a3_data,
+                         int32_t *out_tag, int64_t *out_data) {
+    PyObject *py_rcv = fpy_to_pyobject(rcv_tag, rcv_data);
+    PyObject *method = PyObject_GetAttrString(py_rcv, name);
+    if (!method) {
+        bridge_propagate_exception();
+        *out_tag = FPY_TAG_NONE; *out_data = 0;
+        Py_DECREF(py_rcv);
+        return;
+    }
+    PyObject *a1 = fpy_to_pyobject(a1_tag, a1_data);
+    PyObject *a2 = fpy_to_pyobject(a2_tag, a2_data);
+    PyObject *a3 = fpy_to_pyobject(a3_tag, a3_data);
+    PyObject *result = PyObject_CallFunctionObjArgs(method, a1, a2, a3, NULL);
+    Py_DECREF(a3);
+    Py_DECREF(a2);
+    Py_DECREF(a1);
+    Py_DECREF(method);
+    Py_DECREF(py_rcv);
+    if (!result) {
+        bridge_propagate_exception();
+        *out_tag = FPY_TAG_NONE; *out_data = 0;
+        return;
+    }
+    pyobject_to_fpy(result, out_tag, out_data);
+    if (*out_tag == FPY_TAG_OBJ) Py_INCREF(result);
+    Py_DECREF(result);
+}
+
+/* FpyValue attribute access — get an attribute from any FpyValue type.
+ * Returns the attribute as an FpyValue. */
+void fpy_fv_getattr(int32_t rcv_tag, int64_t rcv_data,
+                    const char *name,
+                    int32_t *out_tag, int64_t *out_data) {
+    PyObject *py_rcv = fpy_to_pyobject(rcv_tag, rcv_data);
+    PyObject *result = PyObject_GetAttrString(py_rcv, name);
+    Py_DECREF(py_rcv);
+    if (!result) {
+        bridge_propagate_exception();
+        *out_tag = FPY_TAG_NONE; *out_data = 0;
+        return;
+    }
+    pyobject_to_fpy(result, out_tag, out_data);
+    if (*out_tag == FPY_TAG_OBJ) Py_INCREF(result);
+    Py_DECREF(result);
+}
+
 /* Direct subscript on a PyObject*. Returns raw PyObject* (no conversion).
  * Keeps the result in Python object form for chained operations. */
 void* fpy_cpython_getitem(void *obj, int32_t key_tag, int64_t key_data) {

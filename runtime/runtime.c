@@ -687,6 +687,11 @@ extern void fpy_cpython_call2(void*, int32_t, int64_t, int32_t, int64_t, int32_t
 extern void fpy_cpython_call3(void*, int32_t, int64_t, int32_t, int64_t, int32_t, int64_t, int32_t*, int64_t*);
 extern void fpy_cpython_call_kw(void*, int32_t, int32_t*, int64_t*, int32_t, const char**, int32_t*, int64_t*, int32_t*, int64_t*);
 extern void fpy_cpython_to_fv(void*, int32_t*, int64_t*);
+extern void fpy_fv_call_method0(int32_t, int64_t, const char*, int32_t*, int64_t*);
+extern void fpy_fv_call_method1(int32_t, int64_t, const char*, int32_t, int64_t, int32_t*, int64_t*);
+extern void fpy_fv_call_method2(int32_t, int64_t, const char*, int32_t, int64_t, int32_t, int64_t, int32_t*, int64_t*);
+extern void fpy_fv_call_method3(int32_t, int64_t, const char*, int32_t, int64_t, int32_t, int64_t, int32_t, int64_t, int32_t*, int64_t*);
+extern void fpy_fv_getattr(int32_t, int64_t, const char*, int32_t*, int64_t*);
 extern int64_t fpy_cpython_len(void*);
 extern int64_t fpy_cpython_bool(void*);
 extern void fpy_cpython_flush(void);
@@ -735,7 +740,11 @@ static FpySymEntry fpy_jit_symbols[] = {
     SYM(fpy_cpython_import), SYM(fpy_cpython_getattr),
     SYM(fpy_cpython_call0), SYM(fpy_cpython_call1), SYM(fpy_cpython_call2),
     SYM(fpy_cpython_call3), SYM(fpy_cpython_call_kw),
-    SYM(fpy_cpython_to_fv), SYM(fpy_cpython_len), SYM(fpy_cpython_bool),
+    SYM(fpy_cpython_to_fv),
+    SYM(fpy_fv_call_method0), SYM(fpy_fv_call_method1),
+    SYM(fpy_fv_call_method2), SYM(fpy_fv_call_method3),
+    SYM(fpy_fv_getattr),
+    SYM(fpy_cpython_len), SYM(fpy_cpython_bool),
     SYM(fpy_cpython_flush), SYM(fpy_cpython_iter), SYM(fpy_cpython_iter_next),
     SYM(fpy_jit_exec), SYM(fpy_jit_import),
     SYM(fpy_rc_incref), SYM(fpy_rc_decref),
