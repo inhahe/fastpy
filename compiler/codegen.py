@@ -4953,11 +4953,13 @@ class CodeGen:
                         has_none = True
                     else:
                         concrete_cats.add(sc)
-                # Clear if: (1) merged is D (float) and there's an unknown
-                # caller (could be int), OR (2) concrete types span multiple
-                # categories (genuine conflict like float+str).
+                # Clear if: (1) merged is D/P (float/pointer) and there's an
+                # unknown caller (could be any type), OR (2) concrete types
+                # span multiple categories (genuine conflict like float+str).
                 if mc == "D" and has_none:
                     merged[i] = None
+                elif mc == "P" and has_none:
+                    merged[i] = None  # unknown callers might pass int/str/list
                 elif len(concrete_cats) > 1:
                     merged[i] = None
 
@@ -6903,11 +6905,22 @@ class CodeGen:
                         # int/list/dict callers.
                         _sigs = self._function_signatures.get(node.name, [])
                         _sig_types = set()
+                        _has_unknown_caller = False
                         for sig in _sigs:
-                            if param_idx < len(sig) and sig[param_idx] is not None:
-                                _sig_types.add(sig[param_idx])
+                            if param_idx < len(sig):
+                                if sig[param_idx] is not None:
+                                    _sig_types.add(sig[param_idx])
+                                else:
+                                    _has_unknown_caller = True
                         if len(_sig_types) > 1:
                             tag = "mixed"  # conflicting types → runtime dispatch
+                        elif _has_unknown_caller and _sig_types:
+                            # Some callers have known pointer types, others
+                            # don't — use runtime dispatch to be safe.
+                            tag = "mixed"
+                        elif _has_unknown_caller and not _sig_types:
+                            # ALL callers unknown: use runtime dispatch.
+                            tag = "mixed"
                         else:
                             tag = "str"
                 elif isinstance(static_type, ir.DoubleType):
@@ -6922,11 +6935,21 @@ class CodeGen:
                     # str/list/dict callers.
                     _sigs = self._function_signatures.get(node.name, [])
                     _sig_types = set()
+                    _has_unknown_caller = False
                     for sig in _sigs:
-                        if param_idx < len(sig) and sig[param_idx] is not None:
-                            _sig_types.add(sig[param_idx])
+                        if param_idx < len(sig):
+                            if sig[param_idx] is not None:
+                                _sig_types.add(sig[param_idx])
+                            else:
+                                _has_unknown_caller = True
                     if len(_sig_types) > 1:
                         tag = "mixed"  # conflicting types → runtime dispatch
+                    elif _has_unknown_caller and _sig_types:
+                        # Known type + unknown caller: the unknown caller
+                        # might pass a different type.  For non-pointer
+                        # params only escalate when the known type is also
+                        # non-scalar (pointer types already get i8_ptr above).
+                        tag = "mixed"
                     else:
                         tag = "int"
 
@@ -21780,6 +21803,31 @@ class CodeGen:
         if lk in (VKind.INT, VKind.BOOL, VKind.UNKNOWN) and rk in (VKind.INT, VKind.BOOL, VKind.UNKNOWN):
             return self._emit_int_binop(node.op, ltv.as_i64(self.builder),
                                          rtv.as_i64(self.builder), node)
+
+        # ── Guard: native container types must not reach cpython_binop ──
+        # Native containers (FpyList*, FpyDict*, etc.) are not PyObject*;
+        # passing them to cpython_binop causes an access violation.  Route
+        # through fv_binop which handles valid ops (concat, repeat) and
+        # raises TypeError for invalid combinations.
+        _container_kinds = (VKind.LIST, VKind.DICT, VKind.SET, VKind.TUPLE,
+                            VKind.STR, VKind.BYTES)
+        if lk in _container_kinds or rk in _container_kinds:
+            _fv_ops = {ast.Add: 0, ast.Sub: 1, ast.Mult: 2, ast.Div: 3,
+                       ast.FloorDiv: 4, ast.Mod: 5}
+            if op in _fv_ops:
+                lt_tag = ir.Constant(i32, ltv.vtype.kind.fpy_tag)
+                lt_data = ltv.as_i64(self.builder)
+                rt_tag = ir.Constant(i32, rtv.vtype.kind.fpy_tag)
+                rt_data = rtv.as_i64(self.builder)
+                out_tag = self._create_entry_alloca(i32, "ctbop.tag")
+                out_data = self._create_entry_alloca(i64, "ctbop.data")
+                self.builder.call(self.runtime["fv_binop"],
+                                  [lt_tag, lt_data, rt_tag, rt_data,
+                                   ir.Constant(i32, _fv_ops[op]),
+                                   out_tag, out_data])
+                return self._fv_build_from_slots(
+                    self.builder.load(out_tag),
+                    self.builder.load(out_data))
 
         # ── Slow path: CPython bridge (works for ANY type) ─────────────
         op_code = {ast.Add: 0, ast.Sub: 1, ast.Mult: 2, ast.Div: 3,

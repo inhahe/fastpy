@@ -116,6 +116,33 @@ These features work correctly but use the embedded CPython interpreter:
 - **Other stdlib modules** not implemented natively (e.g., collections,
   itertools, functools — except singledispatch which is native)
 
+## Bugs fixed (2026-04-28, type dispatch & merger)
+
+### 37. Invalid binop type combinations crashed with access violation (fixed)
+`[1,2,3] + 5` caused an access violation instead of raising TypeError.
+Root cause: (1) The compiler's slow-path binop handler passed native
+container pointers (FpyList*, FpyDict*) to `cpython_binop` which expects
+PyObject*. (2) The runtime `fastpy_fv_binop` had no guard before the
+INT/BOOL arithmetic fallback — list pointers were treated as integers.
+Fix: Added a compiler guard that routes native container types (list, dict,
+set, tuple, str, bytes) through `fv_binop` instead of `cpython_binop`.
+Added `list * int` / `int * list` repeat support to `fv_binop`. Added a
+TypeError guard in `fv_binop` before the INT/BOOL fallback for any
+remaining container+scalar combinations. Error message matches CPython:
+`unsupported operand type(s) for +: 'list' and 'int'`.
+
+### 38. Unknown-type parameters defaulted to int/str instead of runtime dispatch (fixed)
+Functions called with forwarded or dynamically-typed arguments had their
+parameters tagged as "str" (pointer) or "int" (non-pointer) even when
+the actual type was unknown. This caused incorrect method dispatch (e.g.
+`len(item)` on a list param tagged "str" would call `str_len`).
+Root cause: Post-merge cleanup only cleared float+unknown conflicts, not
+pointer+unknown. The parameter tag fallback only checked for multiple
+conflicting types, not for the presence of unknown callers.
+Fix: Extended post-merge cleanup to clear pointer-type param tags when
+unknown callers exist. Extended the tag fallback to use "mixed" (runtime
+dispatch via FpyValue tags) when any caller has an unknown argument type.
+
 ## Bugs fixed (2026-04-28, annotations & dispatch)
 
 ### 27. Type annotations ignored for codegen (fixed)
@@ -494,9 +521,12 @@ Systematic comparison against the Python 3.14 PEG grammar (`Grammar/python.gram`
   arguments, and the FV dispatch fallback routes path/pyobj-tagged receivers
   through `fpy_fv_call_method` (CPython bridge). For native types (str, list,
   dict), the existing type-specific handlers catch them correctly.
-  **Remaining gap:** Unannotated parameters whose type can't be inferred
-  from call-site analysis (argument is itself an untyped variable) still
-  default to the first caller's type.
+  **Remaining gap fixed:** When call-site analysis can't determine an
+  argument's type (e.g., the argument is itself an untyped variable), the
+  post-merge cleanup now clears pointer-type param tags that have unknown
+  callers, and the parameter tag fallback uses "mixed" (runtime dispatch)
+  instead of defaulting to "str"/"int". This ensures functions called
+  with forwarded or dynamically-typed arguments dispatch correctly.
   **Cross-category conflicts fixed:** Same function called with both int
   and str (or int+list, str+int+list, etc.) now correctly uses "mixed" tag
   with runtime dispatch. Both the pointer branch (formerly defaulted to
@@ -565,11 +595,18 @@ Systematic comparison against the Python 3.14 PEG grammar (`Grammar/python.gram`
 
 ### Source merger
 
-- **Packages cannot be merged** — Only single-file stdlib modules can be
-  source-merged. Packages with `__init__.py` and submodules are skipped
-  entirely and fall back to the CPython bridge. This is because the merger
-  operates on individual .py files; resolving intra-package imports and
-  prefixing across multiple files is not implemented.
+- **Packages can now be merged** *(fixed)* — Stdlib packages with
+  `__init__.py` are now supported. Self-contained packages (no submodule
+  imports) are merged directly as single files. Packages with simple
+  submodule imports are also supported — the recursive merger resolves
+  relative imports within package directories and merges submodules with
+  appropriate prefixing. Dotted module names (`from html.entities import
+  name2codepoint`) are also resolved to the correct submodule file.
+  **Tested working:** `html.escape`, `html.entities` name lookups.
+  **Limitation:** Many stdlib packages use advanced Python features
+  (metaclasses, complex enums, regex) that the AOT compiler can't handle
+  yet, so the merge succeeds but the compiled binary crashes. These
+  modules fall back to the CPython bridge.
 
 - **C-extension wrapper modules rejected** — Stdlib modules whose public
   API comes from `from _foo import *` (e.g. `ast`, `collections`, `json`,

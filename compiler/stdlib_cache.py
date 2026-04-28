@@ -62,6 +62,98 @@ def _is_c_extension_wrapper(source_path: Path) -> bool:
     return False
 
 
+def _is_self_contained_package(init_path: Path) -> bool:
+    """Check if a package __init__.py is self-contained (no submodule imports).
+
+    A self-contained package has all its code in __init__.py without
+    importing from its own submodules.  Such packages can be merged as if
+    they were single-file modules.
+
+    Returns False if the __init__.py has relative imports (``from . import X``,
+    ``from .submod import Y``) or if it imports from its own submodules
+    via absolute imports (``from pkg.submod import Y``).
+    """
+    try:
+        source = init_path.read_text(encoding="utf-8")
+        tree = ast.parse(source)
+    except (OSError, SyntaxError):
+        return False
+
+    pkg_name = init_path.parent.name
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            # Any relative import (level > 0) means submodule dependency
+            if node.level and node.level > 0:
+                return False
+            # Absolute import from own package: from pkg.sub import X
+            if node.module and node.module.startswith(pkg_name + "."):
+                return False
+        elif isinstance(node, ast.Import):
+            # import pkg.submod
+            for alias in node.names:
+                if alias.name.startswith(pkg_name + "."):
+                    return False
+    return True
+
+
+def _get_package_submodule_imports(init_path: Path) -> list[str] | None:
+    """Get list of submodule names imported by a package's __init__.py.
+
+    Returns a list of submodule names (e.g. ["decoder", "encoder"] for json)
+    or None if the package uses patterns too complex to handle (star imports
+    from submodules, dynamic imports, etc.).
+
+    Only handles:
+    - ``from .submod import name1, name2``
+    - ``from . import submod``
+    """
+    try:
+        source = init_path.read_text(encoding="utf-8")
+        tree = ast.parse(source)
+    except (OSError, SyntaxError):
+        return None
+
+    pkg_dir = init_path.parent
+    pkg_name = init_path.parent.name
+    submodules: list[str] = []
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            if node.level and node.level > 0:
+                # Relative import
+                if node.module:
+                    # from .decoder import X — module is the submodule
+                    parts = node.module.split(".")
+                    submod = parts[0]
+                    # Reject star imports from submodules
+                    if any(a.name == "*" for a in node.names):
+                        return None
+                    # Only include if the submodule is a .py file
+                    submod_path = pkg_dir / (submod + ".py")
+                    if submod_path.is_file():
+                        if submod not in submodules:
+                            submodules.append(submod)
+                else:
+                    # from . import submod1, submod2
+                    for alias in node.names:
+                        submod_path = pkg_dir / (alias.name + ".py")
+                        if submod_path.is_file():
+                            if alias.name not in submodules:
+                                submodules.append(alias.name)
+            elif node.module and node.module.startswith(pkg_name + "."):
+                # Absolute import from own package: from pkg.sub import X
+                submod = node.module[len(pkg_name) + 1:].split(".")[0]
+                if any(a.name == "*" for a in node.names):
+                    return None
+                submod_path = pkg_dir / (submod + ".py")
+                if submod_path.is_file():
+                    if submod not in submodules:
+                        submodules.append(submod)
+
+    return submodules
+
+
 @dataclass
 class CacheEntry:
     """Cached compilability verdict for a single stdlib module."""
@@ -122,8 +214,27 @@ class StdlibResolver:
         if module_name in self._hard_blocklist:
             return None
 
-        # Skip dotted names for now (packages like xml.etree.ElementTree)
+        # Handle dotted names: pkg.submod → pkg/submod.py
         if "." in module_name:
+            parts = module_name.split(".")
+            # Check if the top-level package is in the blocklist
+            if parts[0] in self._native_blocklist:
+                return None
+            if parts[0] in self._hard_blocklist:
+                return None
+            # Resolve: pkg/submod.py or pkg/submod/__init__.py
+            rel = Path(*parts[:-1]) / (parts[-1] + ".py")
+            candidate = self._stdlib_dir / rel
+            if candidate.is_file():
+                if _is_c_extension_wrapper(candidate):
+                    return None
+                return candidate
+            rel = Path(*parts) / "__init__.py"
+            candidate = self._stdlib_dir / rel
+            if candidate.is_file():
+                if _is_c_extension_wrapper(candidate):
+                    return None
+                return candidate
             return None
 
         # Skip private/internal modules
@@ -145,10 +256,36 @@ class StdlibResolver:
         # Look for package: module_name/__init__.py
         candidate = self._stdlib_dir / module_name / "__init__.py"
         if candidate.is_file():
-            # Only merge simple packages (single __init__.py without
-            # complex submodule imports). For now, skip packages entirely
-            # and only merge single-file modules.
-            return None
+            # Reject C-extension wrapper packages
+            if _is_c_extension_wrapper(candidate):
+                return None
+            # Self-contained packages (no submodule imports): merge as
+            # single file, treating __init__.py like a regular module.
+            if _is_self_contained_package(candidate):
+                return candidate
+            # Packages with simple submodule imports: still return the
+            # __init__.py — the merger will handle submodule resolution
+            # via _get_package_submodule_imports().
+            submodules = _get_package_submodule_imports(candidate)
+            if submodules is not None:
+                # Check submodules are not C-extension wrappers
+                pkg_dir = candidate.parent
+                all_ok = True
+                for sub in submodules:
+                    sub_path = pkg_dir / (sub + ".py")
+                    if sub_path.is_file() and _is_c_extension_wrapper(sub_path):
+                        all_ok = False
+                        break
+                    # Also reject private submodules that are C extensions
+                    if sub.startswith("_"):
+                        sub_c = pkg_dir / (sub + ".pyd")
+                        sub_so = pkg_dir / (sub + ".so")
+                        if (not (pkg_dir / (sub + ".py")).is_file()
+                                and (sub_c.is_file() or sub_so.is_file())):
+                            all_ok = False
+                            break
+                if all_ok:
+                    return candidate
 
         return None
 

@@ -651,6 +651,7 @@ void fastpy_fv_subscript(int32_t c_tag, int64_t c_data,
 extern const char* fastpy_str_concat(const char*, const char*);
 extern const char* fastpy_str_repeat(const char*, int64_t);
 extern FpyList* fastpy_list_concat(FpyList*, FpyList*);
+extern FpyList* fastpy_list_repeat(FpyList*, int64_t);
 void fastpy_fv_binop(int32_t lt, int64_t ld, int32_t rt, int64_t rd,
                       int32_t op, int32_t *out_tag, int64_t *out_data) {
     /* String + String → concat */
@@ -675,7 +676,20 @@ void fastpy_fv_binop(int32_t lt, int64_t ld, int32_t rt, int64_t rd,
     }
     /* List + List → concat */
     if (lt == FPY_TAG_LIST && rt == FPY_TAG_LIST && op == 0) {
-        FpyList *result = fastpy_list_concat((FpyList*)ld, (FpyList*)rd);
+        FpyList *result = fastpy_list_concat((FpyList*)(intptr_t)ld, (FpyList*)(intptr_t)rd);
+        *out_tag = FPY_TAG_LIST;
+        *out_data = (int64_t)(intptr_t)result;
+        return;
+    }
+    /* List * Int or Int * List → repeat */
+    if (lt == FPY_TAG_LIST && (rt == FPY_TAG_INT || rt == FPY_TAG_BOOL) && op == 2) {
+        FpyList *result = fastpy_list_repeat((FpyList*)(intptr_t)ld, rd);
+        *out_tag = FPY_TAG_LIST;
+        *out_data = (int64_t)(intptr_t)result;
+        return;
+    }
+    if ((lt == FPY_TAG_INT || lt == FPY_TAG_BOOL) && rt == FPY_TAG_LIST && op == 2) {
+        FpyList *result = fastpy_list_repeat((FpyList*)(intptr_t)rd, ld);
         *out_tag = FPY_TAG_LIST;
         *out_data = (int64_t)(intptr_t)result;
         return;
@@ -774,6 +788,27 @@ void fastpy_fv_binop(int32_t lt, int64_t ld, int32_t rt, int64_t rd,
         }
         *out_tag = FPY_TAG_FLOAT;
         memcpy(out_data, &result, sizeof(double));
+        return;
+    }
+    /* Guard: container types that weren't handled above → TypeError */
+    if (lt == FPY_TAG_LIST || lt == FPY_TAG_DICT || lt == FPY_TAG_SET ||
+        rt == FPY_TAG_LIST || rt == FPY_TAG_DICT || rt == FPY_TAG_SET ||
+        lt == FPY_TAG_STR  || rt == FPY_TAG_STR) {
+        /* If we reach here, no valid handler matched (e.g. list+int, dict-int,
+         * str+list, etc.) — raise TypeError like CPython does. */
+        static const char *_op_syms[] = {"+", "-", "*", "/", "//", "%"};
+        static const char *_tnames[] = {
+            "int", "float", "str", "bool", "NoneType",
+            "list", "object", "dict", "bytes", "set",
+            "bigint", "complex", "Decimal"};
+        const char *ln = (lt >= 0 && lt <= 12) ? _tnames[lt] : "object";
+        const char *rn = (rt >= 0 && rt <= 12) ? _tnames[rt] : "object";
+        const char *on = (op >= 0 && op <= 5) ? _op_syms[op] : "?";
+        snprintf(_err_buf, sizeof(_err_buf),
+                 "unsupported operand type(s) for %s: '%.40s' and '%.40s'",
+                 on, ln, rn);
+        fastpy_raise(FPY_EXC_TYPEERROR, _err_buf);
+        *out_tag = FPY_TAG_NONE; *out_data = 0;
         return;
     }
     /* Int/Bool arithmetic */
