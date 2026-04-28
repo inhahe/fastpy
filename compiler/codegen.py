@@ -1167,6 +1167,9 @@ class CodeGen:
         # int64_t fastpy_fv_len(i32 tag, i64 data)
         ft = ir.FunctionType(i64, [i32, i64])
         self.runtime["fv_len"] = ir.Function(self.module, ft, name="fastpy_fv_len")
+        # void fastpy_fv_subscript(i32 c_tag, i64 c_data, i32 k_tag, i64 k_data, i32* out_tag, i64* out_data)
+        ft = ir.FunctionType(void, [i32, i64, i32, i64, ir.PointerType(i32), ir.PointerType(i64)])
+        self.runtime["fv_subscript"] = ir.Function(self.module, ft, name="fastpy_fv_subscript")
         # void fastpy_fv_binop(i32 lt, i64 ld, i32 rt, i64 rd, i32 op, i32* out_tag, i64* out_data)
         ft = ir.FunctionType(void, [i32, i64, i32, i64, i32, ir.PointerType(i32), ir.PointerType(i64)])
         self.runtime["fv_binop"] = ir.Function(self.module, ft, name="fastpy_fv_binop")
@@ -5777,7 +5780,27 @@ class CodeGen:
                     elif _def_is_float:
                         param_types.append(double)
                     else:
-                        param_types.append(i64)
+                        # Check if the param has conflicting types across
+                        # call sites (post-merge cleared to None). If any
+                        # call site passes a pointer type, use i8_ptr to
+                        # avoid truncating pointers to i64.
+                        _sigs = self._function_signatures.get(node.name, [])
+                        _has_ptr_sig = False
+                        for sig in _sigs:
+                            if i < len(sig) and sig[i] is not None:
+                                st = sig[i]
+                                if (st in ("str", "list", "dict", "obj",
+                                           "set", "bytes", "path", "pyobj",
+                                           "complex", "bigint", "decimal",
+                                           "closure", "tuple")
+                                        or st.startswith("list:")
+                                        or st.startswith("dict:")):
+                                    _has_ptr_sig = True
+                                    break
+                        if _has_ptr_sig:
+                            param_types.append(i8_ptr)
+                        else:
+                            param_types.append(i64)
 
         ret_type = i8_ptr if returns_param else i64
 
@@ -6873,13 +6896,39 @@ class CodeGen:
                     elif call_tag == "mixed":
                         tag = "mixed"  # VKind.UNKNOWN — runtime dispatch
                     else:
-                        tag = "str"
+                        # Check if this param has conflicting types across
+                        # call sites (cleared by post-merge cleanup). If so,
+                        # use "mixed" to enable runtime dispatch instead of
+                        # defaulting to "str" which would be wrong for
+                        # int/list/dict callers.
+                        _sigs = self._function_signatures.get(node.name, [])
+                        _sig_types = set()
+                        for sig in _sigs:
+                            if param_idx < len(sig) and sig[param_idx] is not None:
+                                _sig_types.add(sig[param_idx])
+                        if len(_sig_types) > 1:
+                            tag = "mixed"  # conflicting types → runtime dispatch
+                        else:
+                            tag = "str"
                 elif isinstance(static_type, ir.DoubleType):
                     tag = "float"
                 elif param.name in bool_default_params:
                     tag = "bool"
                 else:
-                    tag = "int"
+                    # Check if this param has conflicting types across
+                    # call sites (cleared by post-merge cleanup). If so,
+                    # use "mixed" to enable runtime dispatch instead of
+                    # defaulting to "int" which would be wrong for
+                    # str/list/dict callers.
+                    _sigs = self._function_signatures.get(node.name, [])
+                    _sig_types = set()
+                    for sig in _sigs:
+                        if param_idx < len(sig) and sig[param_idx] is not None:
+                            _sig_types.add(sig[param_idx])
+                    if len(_sig_types) > 1:
+                        tag = "mixed"  # conflicting types → runtime dispatch
+                    else:
+                        tag = "int"
 
                 if self._USE_FV_LOCALS:
                     # Store FpyValue directly — _load_variable unwraps on demand
@@ -10711,6 +10760,25 @@ class CodeGen:
             self._store_variable(varname, value, "int")
             return
 
+        # Track defaultdict factory type: d = defaultdict(list)
+        # Records the factory name so _is_list_expr can detect that
+        # d["key"] returns a list (not int) for append/len dispatch.
+        if (len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+                and isinstance(node.value, ast.Call)
+                and isinstance(node.value.func, ast.Name)
+                and node.value.args):
+            _dd_func = node.value.func.id
+            _ni = getattr(self, '_native_imports', {})
+            _is_dd = (_dd_func == "defaultdict"
+                      or (_dd_func in _ni
+                          and _ni[_dd_func] == ("collections", "defaultdict")))
+            if _is_dd and isinstance(node.value.args[0], ast.Name):
+                if not hasattr(self, '_defaultdict_var_factories'):
+                    self._defaultdict_var_factories = {}
+                self._defaultdict_var_factories[
+                    node.targets[0].id] = node.value.args[0].id
+
         # Track weakref variables: r = weakref.ref(obj) or r = ref(obj)
         # where ref was imported from weakref/_weakref. Mark target as a
         # weakref variable so r() emits deref, not closure call.
@@ -12866,12 +12934,37 @@ class CodeGen:
                         elem = self._get_list_elem_type(node.args[0])
                         return f"list:{elem}"
                 return "list:int"
+        # Defaultdict subscript: infer value type from factory
+        if (isinstance(node, ast.Subscript)
+                and not isinstance(node.slice, ast.Slice)
+                and isinstance(node.value, ast.Name)
+                and self._is_defaultdict_expr(node.value)):
+            factory = getattr(self, '_defaultdict_var_factories', {}).get(
+                node.value.id)
+            if factory == "list":
+                return "list:int"
+            if factory == "dict":
+                return "dict"
+            if factory == "str":
+                return "str"
+            if factory == "float":
+                return "float"
+            return "int"
         # Dict subscript: infer value type from known dict-value-type sets
         if (isinstance(node, ast.Subscript)
                 and not isinstance(node.slice, ast.Slice)
                 and isinstance(node.value, ast.Name)
                 and self._is_dict_expr(node.value)):
             name = node.value.id
+            # Per-key type lookup: for mixed-value literal dicts, each key's
+            # value type was recorded at assignment time.
+            if (name in self._dict_var_key_types
+                    and isinstance(node.slice, ast.Constant)
+                    and isinstance(node.slice.value, str)):
+                key_type = self._dict_var_key_types[name].get(
+                    node.slice.value)
+                if key_type is not None:
+                    return key_type
             if name in self._dict_var_list_values:
                 return "list:int"
             if name in self._dict_var_dict_values:
@@ -14365,6 +14458,17 @@ class CodeGen:
             if type_tag == "complex":
                 return self._fv_build_from_slots(
                     ir.Constant(i32, FPY_TAG_COMPLEX), value)
+            # Pointer types stored as i64 (e.g. from defaultdict subscript
+            # which returns bare out_data): convert to pointer and wrap.
+            if isinstance(type_tag, ValueType) and type_tag.kind.is_ptr:
+                ptr = self.builder.inttoptr(value, i8_ptr)
+                return self._wrap_bare_to_fv(ptr, type_tag)
+            if isinstance(type_tag, str):
+                if (type_tag.startswith("list") or type_tag == "tuple"
+                        or type_tag == "str" or type_tag == "dict"
+                        or type_tag == "obj" or type_tag == "set"):
+                    ptr = self.builder.inttoptr(value, i8_ptr)
+                    return self._wrap_bare_to_fv(ptr, type_tag)
             return self._fv_from_int(value)
         # Double
         if isinstance(value.type, ir.DoubleType):
@@ -20179,11 +20283,10 @@ class CodeGen:
             index = self._emit_expr_value(node.slice)
             tag, data = self._fv_list_get(obj, index)
             return self._fv_build_from_slots(tag, data)
-        # FV-backed "unknown" type variable subscript: the variable came from
-        # deep nested unpacking (e.g. `for (([x1,y1,z1], v1, m1), ...) in
-        # pairs`) and has no compile-time type.  Its runtime data IS a list
-        # pointer stored as i64 in the FV.  Use list_get_fv so the runtime
-        # tag drives the element type (same as the list handler above).
+        # FV-backed "unknown" type variable subscript: the variable holds
+        # an FpyValue whose runtime tag determines the container type (list,
+        # dict, str).  Use fv_subscript for runtime dispatch instead of
+        # assuming list.
         if (isinstance(node, ast.Subscript)
                 and isinstance(node.value, ast.Name)
                 and node.value.id in self.variables
@@ -20192,11 +20295,21 @@ class CodeGen:
             if (str(_unk_tag) == "unknown"
                     and isinstance(_unk_alloca.type, ir.PointerType)
                     and _unk_alloca.type.pointee is fpy_val):
-                _unk_i64 = self._emit_expr_value(node.value)
-                _unk_obj = self.builder.inttoptr(_unk_i64, i8_ptr)
-                index = self._emit_expr_value(node.slice)
-                tag, data = self._fv_list_get(_unk_obj, index)
-                return self._fv_build_from_slots(tag, data)
+                # Load the container's runtime tag and data
+                _fv = self._load_fv_raw(node.value.id)
+                _c_tag = self._fv_tag(_fv)
+                _c_data = self._fv_data_i64(_fv)
+                # Load the key and convert to tag+data
+                _k_tag_ir, _k_data_ir = self._expr_to_tag_data(node.slice)
+                tag_slot = self._create_entry_alloca(i32, "ufv.tag")
+                data_slot = self._create_entry_alloca(i64, "ufv.data")
+                self.builder.call(self.runtime["fv_subscript"],
+                                  [_c_tag, _c_data,
+                                   _k_tag_ir, _k_data_ir,
+                                   tag_slot, data_slot])
+                return self._fv_build_from_slots(
+                    self.builder.load(tag_slot),
+                    self.builder.load(data_slot))
         # CPython module attribute (e.g. math.pi) — must come BEFORE the
         # generic Attribute handler which calls obj_get_fv.
         # Native module attribute (math.pi): return constant as FpyValue
@@ -20895,6 +21008,13 @@ class CodeGen:
             if (isinstance(node.value, ast.Name)
                     and node.value.id in self._dict_var_list_values):
                 return True
+            # Defaultdict with list factory: d["x"] returns a list
+            if (isinstance(node.value, ast.Name)
+                    and self._is_defaultdict_expr(node.value)):
+                factory = getattr(self, '_defaultdict_var_factories', {}).get(
+                    node.value.id)
+                if factory == "list":
+                    return True
         # BinOp on lists (concatenation, set ops) returns a list
         if isinstance(node, ast.BinOp):
             if self._is_list_expr(node.left) or self._is_list_expr(node.right):
@@ -24479,6 +24599,9 @@ class CodeGen:
             # Track this variable as a defaultdict for subscript interception
             if not hasattr(self, '_defaultdict_vars'):
                 self._defaultdict_vars = set()
+            # Track factory type so _is_list_expr can detect defaultdict(list)
+            _factory_names = {0: "list", 1: "int", 2: "str", 3: "float", 4: "dict"}
+            self._last_dd_factory = _factory_names.get(factory_tag, "int")
             # Mark the result — caller will store in a variable name
             self._last_collections_type = "defaultdict"
             return result
@@ -25625,6 +25748,29 @@ class CodeGen:
             builtin_types = ("int", "str", "float", "list", "dict", "bool", "tuple")
             # Fast path: all builtin types
             if all(t in builtin_types for t in type_names):
+                # Runtime dispatch for FpyValue-backed variables
+                fv = None
+                if isinstance(arg, ast.Name):
+                    fv = self._load_fv_raw(arg.id)
+                if fv is not None:
+                        rt_tag = self._fv_tag(fv)
+                        _type_to_tag = {
+                            "int": FPY_TAG_INT, "str": FPY_TAG_STR,
+                            "float": FPY_TAG_FLOAT, "list": FPY_TAG_LIST,
+                            "dict": FPY_TAG_DICT, "bool": FPY_TAG_BOOL,
+                            "tuple": FPY_TAG_LIST,
+                        }
+                        result = None
+                        for tname in type_names:
+                            exp_tag = _type_to_tag.get(tname, -1)
+                            check = self.builder.icmp_unsigned(
+                                "==", rt_tag, ir.Constant(i32, exp_tag))
+                            if tname == "int":
+                                is_bool = self.builder.icmp_unsigned(
+                                    "==", rt_tag, ir.Constant(i32, FPY_TAG_BOOL))
+                                check = self.builder.or_(check, is_bool)
+                            result = self.builder.or_(result, check) if result is not None else check
+                        return self.builder.zext(result, i32) if result else ir.Constant(i32, 0)
                 for tname in type_names:
                     if tname == "int" and actual in ("int", "bool"):
                         return ir.Constant(i32, 1)
@@ -25657,6 +25803,30 @@ class CodeGen:
         if class_name in ("int", "str", "float", "list", "dict", "bool", "tuple"):
             arg = node.args[0]
             actual = self._static_type_of(arg)
+            # Runtime dispatch: if the arg is stored as FpyValue, check the
+            # runtime tag. This handles mixed-type params (explicit "mixed"),
+            # cleared params (cross-category → None → "int"), and any other
+            # case where the static type might not match the runtime value.
+            fv = None
+            if isinstance(arg, ast.Name):
+                fv = self._load_fv_raw(arg.id)
+            if fv is not None:
+                    rt_tag = self._fv_tag(fv)
+                    _type_to_tag = {
+                        "int": FPY_TAG_INT, "str": FPY_TAG_STR,
+                        "float": FPY_TAG_FLOAT, "list": FPY_TAG_LIST,
+                        "dict": FPY_TAG_DICT, "bool": FPY_TAG_BOOL,
+                        "tuple": FPY_TAG_LIST,  # tuples are FpyList internally
+                    }
+                    expected_tag = _type_to_tag.get(class_name, -1)
+                    result = self.builder.icmp_unsigned(
+                        "==", rt_tag, ir.Constant(i32, expected_tag))
+                    # isinstance(x, int) is True for both int and bool
+                    if class_name == "int":
+                        is_bool = self.builder.icmp_unsigned(
+                            "==", rt_tag, ir.Constant(i32, FPY_TAG_BOOL))
+                        result = self.builder.or_(result, is_bool)
+                    return self.builder.zext(result, i32)
             # Python: isinstance(True, int) is True; we follow that.
             if class_name == "int" and actual in ("int", "bool"):
                 return ir.Constant(i32, 1)
@@ -27331,11 +27501,11 @@ class CodeGen:
                 return self.builder.bitcast(data, double)
             return data
 
-        # FV-backed "unknown" type variable subscript: from deep nested
-        # unpacking.  The variable's FV data is a list pointer stored as i64.
-        # Route through list_get_fv so the pyobj fallback doesn't crash.
-        # Returns raw i64 data — callers needing float should use
-        # _load_or_wrap_fv (which returns a full FV with runtime tag).
+        # FV-backed "unknown" type variable subscript: the variable holds
+        # an FpyValue whose runtime tag determines the container type (list,
+        # dict, str).  Route through fastpy_fv_subscript for runtime dispatch.
+        # Returns a full FpyValue so downstream print/assignment preserves
+        # the runtime tag.
         if (isinstance(node.value, ast.Name)
                 and node.value.id in self.variables
                 and not isinstance(node.slice, ast.Slice)):
@@ -27343,14 +27513,25 @@ class CodeGen:
             if (str(_unk_tag) == "unknown"
                     and isinstance(_unk_alloca.type, ir.PointerType)
                     and _unk_alloca.type.pointee is fpy_val):
-                _unk_i64 = self._emit_expr_value(node.value)
-                _unk_obj = self.builder.inttoptr(_unk_i64, i8_ptr)
-                index = self._emit_expr_value(node.slice)
+                # Load the container's runtime tag and data
+                _fv = self._load_fv_raw(node.value.id)
+                _c_tag = self._fv_tag(_fv)
+                _c_data = self._fv_data_i64(_fv)
+                # Load the key and convert to tag+data
+                _k_tag_ir, _k_data_ir = self._expr_to_tag_data(node.slice)
                 tag_slot = self._create_entry_alloca(i32, "uget.tag")
                 data_slot = self._create_entry_alloca(i64, "uget.data")
-                self._rt_call("list_get_fv",
-                                  [_unk_obj, index, tag_slot, data_slot])
-                return self.builder.load(data_slot)
+                self.builder.call(self.runtime["fv_subscript"],
+                                  [_c_tag, _c_data,
+                                   _k_tag_ir, _k_data_ir,
+                                   tag_slot, data_slot])
+                # Return full FpyValue to preserve runtime tag
+                _out_tag = self.builder.load(tag_slot)
+                _out_data = self.builder.load(data_slot)
+                fv = ir.Constant(fpy_val, ir.Undefined)
+                fv = self.builder.insert_value(fv, _out_tag, 0)
+                fv = self.builder.insert_value(fv, _out_data, 1)
+                return fv
 
         # Check for __getitem__ on user-class objects
         if self._is_obj_expr(node.value):

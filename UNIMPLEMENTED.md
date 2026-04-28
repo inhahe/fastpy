@@ -494,13 +494,17 @@ Systematic comparison against the Python 3.14 PEG grammar (`Grammar/python.gram`
   arguments, and the FV dispatch fallback routes path/pyobj-tagged receivers
   through `fpy_fv_call_method` (CPython bridge). For native types (str, list,
   dict), the existing type-specific handlers catch them correctly.
-  **Remaining gap:** Cross-category conflicts (e.g., same function called
-  with both int and str) still fall back to "int" (the post-merge cleanup
-  clears conflicting categories to None). Same-category pointer conflicts
-  (str+list, str+dict, etc.) now work via "mixed" tag with runtime dispatch
-  through `fastpy_fv_len` and `fastpy_fv_print`. Unannotated parameters
-  whose type can't be inferred from call-site analysis (argument is itself
-  an untyped variable) still default to the first caller's type.
+  **Remaining gap:** Unannotated parameters whose type can't be inferred
+  from call-site analysis (argument is itself an untyped variable) still
+  default to the first caller's type.
+  **Cross-category conflicts fixed:** Same function called with both int
+  and str (or int+list, str+int+list, etc.) now correctly uses "mixed" tag
+  with runtime dispatch. Both the pointer branch (formerly defaulted to
+  "str") and non-pointer branch (formerly defaulted to "int") now detect
+  conflicting types via `_function_signatures` and set tag="mixed".
+  Same-category pointer conflicts (str+list, str+dict, etc.) also work
+  via "mixed" tag with runtime dispatch through `fastpy_fv_len` and
+  `fastpy_fv_print`.
 
 - **BigInt through function calls** *(fixed)* — BigInt values passed through
   function parameters now work correctly. Fixes: BigInt param types use i8_ptr
@@ -516,28 +520,30 @@ Systematic comparison against the Python 3.14 PEG grammar (`Grammar/python.gram`
   (list, dict, set, tuple), user classes, None, and bridge types (Path).
   See bug 34.
 
-- **Mixed-type dict value access** — Dict values from dynamic sources (json.loads)
-  return raw i64 data. Works for int/float/str values; nested list/dict values
-  need explicit subscript on the extracted value.
+- **Mixed-type dict value access** *(fixed)* — Dict values from dynamic
+  sources (json.loads) and mixed-value literal dicts now preserve runtime
+  tags through nested subscript access. `addr = data["address"]` stores a
+  full FpyValue with runtime tag; `addr["city"]` dispatches through
+  `fastpy_fv_subscript` which checks the tag at runtime (dict→dict_get_fv,
+  list→list_get_fv, str→str_index). Also fixed: `_infer_type_tag` now
+  checks per-key types for literal dicts, so `d["address"]` where the
+  compiler tracked `"address" → dict` correctly tags the variable.
 
 ### Object model
 
-- **Fastpy objects are not PyObjects** — CPython cannot treat fastpy-compiled
-  functions, classes, or instances as `PyObject*`. Passing fastpy callables
-  (lambdas, closures) to CPython APIs that expect Python callables fails.
-  This affects `functools.reduce(lambda ...)`, `collections.defaultdict(int)`,
-  and similar patterns. Workaround: use CPython-side
-  callables or avoid bridge calls that need fastpy values as callbacks.
-  **Planned fix (mirror object pattern):**
-  Add an optional `PyObject* py_mirror` field to FpyObj. When a native object
-  is passed to CPython, lazily create a PyObject* wrapper backed by a custom
-  PyTypeObject (`FpyWrapperType`) that delegates `tp_getattro`, `tp_setattro`,
-  `tp_call`, `tp_richcompare`, and `tp_hash` back to the FpyObj's slot system.
-  Cache the wrapper in `py_mirror` for identity preservation. For the reverse
-  direction (PyObject* → FpyObj), store the original PyObject* pointer in an
-  optional `py_origin` field so round-trips preserve identity. For functions
-  and lambdas, `cpython_wrap_native` already creates PyCFunction wrappers —
-  extend this to class instances and arbitrary objects.
+- **Fastpy objects are not PyObjects** *(largely fixed)* — The mirror object
+  pattern is implemented via `FpyObjProxyType`, `FpyNativeCallableType`,
+  `FpyClosureProxyType`, and `FpyBoundMethodProxyType` in `cpython_bridge.c`.
+  Native objects, functions, lambdas, and closures are automatically wrapped
+  as PyObject* when passed to CPython APIs. Tested working:
+  `functools.reduce(lambda ...)`, `map(lambda ...)`, `filter(lambda ...)`,
+  `sorted(key=lambda ...)`, `collections.defaultdict(int)`, passing class
+  instances to CPython functions. Round-trip unwrapping preserves identity
+  (`pyobject_to_fpy` detects FpyObjProxy and unwraps to original FpyObj*).
+  `defaultdict(list)` now works correctly: factory type tracking
+  (`_defaultdict_var_factories`) lets `_is_list_expr` and `_infer_type_tag`
+  recognize `d["key"]` as a list when `d = defaultdict(list)`, enabling
+  native `.append()`, `len()`, and print dispatch.
 
 - **PyObject* values in FpyValue OBJ tag are not FpyObj** *(fixed)* —
   CPython PyObject* (e.g. `pathlib.Path`) stored in FpyValue with OBJ tag.

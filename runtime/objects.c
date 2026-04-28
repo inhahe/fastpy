@@ -582,6 +582,69 @@ int64_t fastpy_fv_len(int32_t tag, int64_t data) {
     return 0;
 }
 
+/* FpyValue subscript — runtime dispatch for container[key].
+ * Handles list (int key), dict (str or int key), and string (int key).
+ * Results are written to *out_tag, *out_data. */
+extern const char* fastpy_str_index(const char*, int64_t);
+/* Forward-declare dict getters (defined later in this file) */
+void fastpy_dict_get_fv(FpyDict*, const char*, int32_t*, int64_t*);
+void fastpy_dict_get_int_fv(FpyDict*, int64_t, int32_t*, int64_t*);
+void fastpy_fv_subscript(int32_t c_tag, int64_t c_data,
+                          int32_t k_tag, int64_t k_data,
+                          int32_t *out_tag, int64_t *out_data) {
+    switch (c_tag) {
+        case FPY_TAG_LIST: {
+            FpyList *lst = (FpyList*)(intptr_t)c_data;
+            /* key must be int for list subscript */
+            int64_t idx = k_data;
+            if (idx < 0) idx += lst->length;
+            if (idx < 0 || idx >= lst->length) {
+                fastpy_raise(FPY_EXC_INDEXERROR, "list index out of range");
+                *out_tag = FPY_TAG_NONE;
+                *out_data = 0;
+                return;
+            }
+            *out_tag = lst->items[idx].tag;
+            *out_data = lst->items[idx].data.i;
+            return;
+        }
+        case FPY_TAG_DICT: {
+            FpyDict *d = (FpyDict*)(intptr_t)c_data;
+            if (k_tag == FPY_TAG_STR) {
+                const char *key = (const char*)(intptr_t)k_data;
+                fastpy_dict_get_fv(d, key, out_tag, out_data);
+            } else {
+                fastpy_dict_get_int_fv(d, k_data, out_tag, out_data);
+            }
+            return;
+        }
+        case FPY_TAG_STR: {
+            const char *s = (const char*)(intptr_t)c_data;
+            int64_t idx = k_data;
+            const char *ch = fastpy_str_index(s, idx);
+            *out_tag = FPY_TAG_STR;
+            *out_data = (int64_t)(intptr_t)ch;
+            return;
+        }
+        case FPY_TAG_OBJ: {
+            /* CPython PyObject* — use bridge __getitem__ */
+            FpyObj *obj = (FpyObj*)(intptr_t)c_data;
+            if (obj && obj->magic != FPY_OBJ_MAGIC) {
+                extern void* fpy_cpython_getitem(void*, int32_t, int64_t);
+                void *result = fpy_cpython_getitem(
+                    (void*)(intptr_t)c_data, k_tag, k_data);
+                *out_tag = FPY_TAG_OBJ;
+                *out_data = (int64_t)(intptr_t)result;
+                return;
+            }
+            break;
+        }
+    }
+    /* Fallback: unsupported subscript */
+    *out_tag = FPY_TAG_NONE;
+    *out_data = 0;
+}
+
 /* FpyValue binary operation — runtime dispatch for Add/Sub/Mul/etc.
  * op: 0=add, 1=sub, 2=mul, 3=div, 4=floordiv, 5=mod
  * Results are written to *out_tag, *out_data. */
