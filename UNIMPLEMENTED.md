@@ -1,6 +1,6 @@
 # Fastpy Python 3.14 Compatibility Status
 
-Last updated 2026-04-22.
+Last updated 2026-04-28.
 
 ## Fully native (no CPython bridge)
 
@@ -47,10 +47,22 @@ match/case with literal, capture, guard, or, wildcard, sequence, singleton
 patterns. Tested: literal, string, capture, wildcard, or, guard, sequence,
 nested sequence, singleton (None/True/False), mixed singleton+literal.
 
-**Missing pattern types** (silently treated as never-match):
-- `MatchStar` — `case [first, *rest]:`
-- `MatchMapping` — `case {"key": val}:`
-- `MatchClass` — `case Point(x, y):`
+**Missing pattern types**: none — all pattern types are now implemented.
+
+**Formerly missing, now implemented:**
+- `MatchStar` — `case [first, *rest]:` captures remaining elements into
+  a sub-list. Supports prefix-only (`[first, *rest]`), suffix-only
+  (`[*rest, last]`), and both (`[first, *mid, last]`). Unnamed star
+  (`*_`) acts as wildcard.
+- `MatchMapping` — `case {"key": val}:` matches dict structure by
+  probing for each key. Uses safe lookup (`dict_get_fv_safe`) that
+  returns NONE for missing keys instead of raising KeyError. Supports
+  nested pattern matching on values.
+- `MatchClass` — `case Point(x=1, y=2):` and `case int(n):`. Supports
+  builtin type patterns (int/str/float/bool/list/dict), user class
+  keyword patterns, and positional patterns via `__match_args__`.
+  isinstance check short-circuits before slot reads to prevent
+  cross-class memory access.
 
 ### Imports (native)
 math module (direct libm calls), json module (native parser/serializer),
@@ -103,6 +115,95 @@ These features work correctly but use the embedded CPython interpreter:
 - **Dynamic eval()/exec()** with non-literal string arguments
 - **Other stdlib modules** not implemented natively (e.g., collections,
   itertools, functools — except singledispatch which is native)
+
+## Bugs fixed (2026-04-28, annotations & dispatch)
+
+### 27. Type annotations ignored for codegen (fixed)
+`def f(x: int) -> str` had no effect on code generation. All type inference
+was structural (AST pattern matching on assignments).
+Fix: Added always-on annotation reading for function parameters (no --typed
+flag required). Reads container annotations (list[int], dict[str,int]),
+scalar types (int, float, str, bool), bridge types (Path), module-qualified
+types (pathlib.Path), and user class names. Sets the compile-time type tag
+on FV-backed variables, enabling correct method dispatch for typed parameters.
+Example: `def find_root(d: Path): return d.resolve()` now works because
+`d` is tagged as "path", enabling `_is_path_expr` to recognize it.
+
+### 28. `enumerate(..., start=N)` keyword argument ignored (fixed)
+`for i, v in enumerate(lst, start=10)` started at 0 instead of 10.
+Root cause: The inline enumerate optimization (`_emit_for_enumerate_inline`)
+only checked positional args (`call.args`), not keyword args (`call.keywords`).
+`start=10` is a keyword argument, not positional.
+Fix: Added keyword argument scan for "start" in the inline enumerate emitter.
+
+### 29. `MatchStar` pattern treated as never-match (fixed)
+`case [first, *rest]:` silently failed to match. The MatchSequence handler
+only supported exact-length matching, with no MatchStar support.
+Fix: Enhanced MatchSequence to detect MatchStar sub-patterns. Uses
+`>= min_length` instead of `== exact_length`. Matches prefix patterns from
+the start, suffix patterns from the end, and creates a sub-list via
+`list_slice` for the star capture variable.
+
+### 30. `MatchMapping` pattern treated as never-match (fixed)
+`case {"key": val}:` silently failed to match. No MatchMapping handler existed.
+Fix: Added MatchMapping handler that checks tag==DICT, probes for each key
+using `dict_get_fv_safe` (new function: returns NONE for missing keys without
+raising KeyError), and recursively matches sub-patterns on the values.
+
+### 31. Path attribute chaining crashed in FV context (fixed)
+`p.parent.name` where `p: Path` crashed with access violation. The
+intermediate `p.parent` result (a PyObject*) was caught by the generic
+object attribute handler in `_load_or_wrap_fv`, which called `obj_get_fv`
+on a PyObject* (expects FpyObj*).
+Fix: Added path-expression early-exit in `_load_or_wrap_fv` before the
+generic object handler — evaluates the full expression via `_emit_expr_value`
+which correctly dispatches to path runtime functions.
+
+### 32. MatchClass builtin type patterns caused refcount corruption (fixed)
+`case int(n): / case str(s):` stored the capture variable unconditionally
+even when the tag check failed. With compile-time type_tag "int", the
+scalar-optimization path skipped rc_incref. At scope exit, rc_decref ran
+on the runtime tag (e.g. STR for a string subject), freeing memory
+without a matching incref → heap corruption (non-deterministic crashes).
+Fix: Added conditional branch so variable binding only executes when the
+tag check passes. Also use correct per-type compile-time tag ("str" for
+str patterns, "float" for float, etc.).
+
+### 33. MatchClass user-class patterns read slots on wrong class (fixed)
+`case Point(x=x, y=y):` followed by `case Color(r=r, g=g, b=b):`
+read Point's slot indices on a Color object when isinstance failed,
+potentially corrupting refcounts for heap-typed attributes.
+Fix: Added isinstance short-circuit — branch to fail_block immediately
+on isinstance failure before any slot reads.
+
+### 34. Return type annotations ignored (fixed)
+`-> str` on function definitions had no effect on code generation. The
+LLVM return type was set correctly from the annotation, but `ret_tag`
+(the semantic type visible to call sites) was computed solely from
+analyzing return statements in the function body.
+Fix: After structural inference, override `ret_tag` from the return
+annotation when present. Supports scalar types, containers, user
+classes, None, and bridge types (pathlib.Path). Call sites now see
+the annotated return type for correct dispatch (e.g., `.upper()` on
+a `-> str` function's return value).
+
+### 35. Unknown-type `+` on FpyValues corrupted string data (fixed)
+`d["a"] + d["b"]` where both values are strings returned garbage
+(string pointers bitcast to double). The UNKNOWN+UNKNOWN binop path
+had no handler for string concatenation — it unconditionally converted
+both operands to double and did float arithmetic.
+Fix: Added runtime tag check in the UNKNOWN binop Add path. If both
+FpyValue operands have tag STR, dispatch to str_concat. Otherwise
+fall through to the numeric path.
+
+### 36. Bridge dict mutation silently dropped (fixed)
+Passing an FpyDict to a CPython function created a PyDict copy; in-place
+mutations by the CPython function were discarded. List sync-back already
+existed via `fpy_sync_pylist_to_fpylist`.
+Fix: Implemented `fpy_sync_pydict_to_fpydict` — clears the FpyDict and
+rebuilds from the mutated PyDict after every bridge call. Handles
+add/modify/delete with proper rehashing on growth. Added to all bridge
+call variants (1-arg through N-arg).
 
 ## Bugs fixed (2026-04-28, performance)
 
@@ -336,7 +437,7 @@ Systematic comparison against the Python 3.14 PEG grammar (`Grammar/python.gram`
 - **MatchMapping** — `case {"key": val}:` treated as never-match. Should match
   dict structure and bind values.
 - **MatchClass** — `case Point(x, y):` treated as never-match. Should match
-  class instances and bind attributes.
+  class instances and bind attributes. **(implemented 2026-04-28)**
 
 ### Formerly blocked, now implemented
 - **`type` statement** (Python 3.12+) — `type X = int | str` silently ignored
@@ -391,36 +492,28 @@ Systematic comparison against the Python 3.14 PEG grammar (`Grammar/python.gram`
 
 ### Type system
 
-- **No interprocedural type inference** — Function parameters have no
-  compile-time type. When a Path, PyObject*, or other typed value is passed
-  as a function argument, the callee sees it as an untyped FpyValue.
-  Method calls on the parameter (e.g. `source_dir.resolve()`) cannot
-  dispatch to native handlers because `_is_path_expr` / `_is_pyobj_receiver`
-  don't recognize untyped parameters.
-  **Impact:** Any function that receives a Path (or other bridge object) and
-  calls methods on it will hang or crash. The caller correctly wraps the
-  value into an FpyValue with the right runtime tag, but the callee's
-  codegen doesn't read the runtime tag for method dispatch — it relies
-  entirely on compile-time type analysis.
-  **Example:** `def find_root(d): return d.resolve()` — the `.resolve()`
-  call doesn't know `d` is a Path, so it falls through to generic dispatch
-  which doesn't handle it.
-  **Planned fix:** Read `typing` annotations on parameters at codegen time
-  (e.g. `def find_root(d: Path)`) and/or add runtime tag-based method
-  dispatch: when calling a method on an FV-backed variable with unknown
-  compile-time type, check the runtime tag and dispatch to
-  `cpython_getattr` + `cpython_call` for OBJ-tagged values.
+- **No interprocedural type inference without annotations** — When a Path,
+  PyObject*, or other typed value is passed as a function argument *without*
+  a type annotation, the callee sees it as an untyped FpyValue. Method calls
+  on the parameter (e.g. `source_dir.resolve()`) cannot dispatch to native
+  handlers.
+  **Partially fixed:** Adding `d: Path` annotations now works (see bug 27).
+  The remaining gap is unannotated parameters: `def find_root(d): return
+  d.resolve()` still fails because the codegen can't know `d` is a Path.
+  **Planned fix:** Runtime tag-based method dispatch — when calling a method
+  on an FV-backed variable with unknown compile-time type, check the runtime
+  tag and dispatch to `cpython_getattr` + `cpython_call` for OBJ-tagged values.
 
 - **BigInt through function calls** — BigInt values passed through function
   parameters lose their BIGINT tag (treated as regular i64). Direct BigInt
   constants and variables work correctly. Same root cause as above: no
   interprocedural type inference.
 
-- **Type annotations ignored for codegen** — `def f(x: int) -> str` has no
-  effect on code generation. The compiler does not read parameter types,
-  return types, or variable annotations from `typing` for type inference.
-  All type inference is structural (AST pattern matching on assignments,
-  known module functions, etc.).
+- **Return type annotations ignored** *(fixed)* — `-> str` on function
+  definitions now propagates to `ret_tag`, so call sites see the correct
+  type. Supports scalar types (int, float, str, bool), containers
+  (list, dict, set, tuple), user classes, None, and bridge types (Path).
+  See bug 34.
 
 - **Mixed-type dict value access** — Dict values from dynamic sources (json.loads)
   return raw i64 data. Works for int/float/str values; nested list/dict values
@@ -445,41 +538,25 @@ Systematic comparison against the Python 3.14 PEG grammar (`Grammar/python.gram`
   and lambdas, `cpython_wrap_native` already creates PyCFunction wrappers —
   extend this to class instances and arbitrary objects.
 
-- **PyObject* values in FpyValue OBJ tag are not FpyObj** — When a CPython
-  PyObject* (e.g. a `pathlib.Path`) is stored in an FpyValue with OBJ tag,
-  the runtime `fv_write` / `fv_print` functions treat the data as an
-  `FpyObj*` (native user-class object). This causes incorrect output (empty
-  string or garbage) when printing PyObject* values through the generic
-  FV path. Single-arg `print(p)` works because `_emit_print_single` detects
-  VKind.PYOBJ and uses `cpython_print_obj`. Multi-arg `print("x:", p)`
-  goes through `_emit_write_single` → `_load_or_wrap_fv` → `cpython_to_fv`,
-  which converts the PyObject* to a new FV. For known types (int, str, list,
-  dict) this works. For opaque objects (Path, custom classes), the conversion
-  produces OBJ tag + raw PyObject* data, and `fv_write` misinterprets it.
-  **Planned fix:** Add a `FPY_TAG_PYOBJ` distinct from `FPY_TAG_OBJ`, or
-  teach `fv_write`/`fv_print` to distinguish FpyObj* from PyObject* by
-  checking a magic header field.
+- **PyObject* values in FpyValue OBJ tag are not FpyObj** *(mostly fixed)* —
+  CPython PyObject* (e.g. `pathlib.Path`) stored in FpyValue with OBJ tag.
+  The runtime `fastpy_obj_write` checks the magic field (`FPY_OBJ_MAGIC`)
+  to distinguish native FpyObj* from CPython PyObject* and routes to
+  `fpy_cpython_print_obj` for the latter. `fpy_value_repr` has the same
+  check. Multi-arg print (`print("x:", p)`) works correctly via the
+  `_load_or_wrap_fv` → `cpython_to_fv` → `fv_write` → magic check path.
+  Remaining edge case: `fv_cmp` and `fv_truthy` don't distinguish the two
+  (minor: truthy works because `data != 0` is correct for both; comparison
+  may produce wrong results for PyObject* values).
 
 ### Bridge
 
-- **Bridge mutation is silently dropped** — Passing an FpyList or FpyDict to
-  a CPython function creates a copy. In-place mutations (e.g. `heapq.heapify`,
-  `struct.pack_into`) happen on the copy and are discarded. Workaround: capture
-  the return value instead of relying on in-place mutation.
-  **Planned fix (copy + sync-back):** True shared backing is impossible because
-  CPython C extensions use macros (`PyList_GET_ITEM`, `PyDict_Next`) that
-  directly access `PyListObject->ob_item[]` / `PyDictObject` internals,
-  bypassing any custom type's protocol methods. The element representations
-  are also incompatible (FpyValue is 16 bytes, PyObject* is 8 bytes).
-  Instead, after each bridge call, for each LIST/DICT argument that was
-  passed to CPython, re-read the PyList/PyDict contents back into the
-  original FpyList/FpyDict. Implementation: in `fpy_cpython_call_kw` (and
-  the call0/1/2/3 variants), after `PyObject_Call` returns, iterate the
-  mutable args: if tag==LIST, clear the FpyList and re-append from the
-  PyList; if tag==DICT, clear and re-insert from PyDict. This is O(n) per
-  mutable arg but the copy-out is already O(n), so total cost doubles but
-  order doesn't change. For bytearrays (pack_into), the same pattern
-  applies: copy the PyByteArray buffer back into the FpyValue.
+- **Bridge dict mutation silently dropped** *(fixed)* — Passing an FpyDict to
+  a CPython function now syncs mutations back. `fpy_sync_pydict_to_fpydict`
+  clears and rebuilds the FpyDict from the mutated PyDict after every bridge
+  call. Handles add/modify/delete, rehashes index table on growth. Added to
+  all call variants (1-arg, 2-arg, 3-arg, N-arg) alongside existing list
+  sync-back. See bug 36.
 
 ### Source merger
 

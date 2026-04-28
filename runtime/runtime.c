@@ -637,6 +637,7 @@ extern FpyList* fastpy_list_concat(FpyList*, FpyList*);
 extern FpyDict* fastpy_dict_new(void);
 extern void fastpy_dict_set_fv(FpyDict*, const char*, int32_t, int64_t);
 extern void fastpy_dict_get_fv(FpyDict*, const char*, int32_t*, int64_t*);
+extern void fastpy_dict_get_fv_safe(FpyDict*, const char*, int32_t*, int64_t*);
 extern int64_t fastpy_dict_length(FpyDict*);
 extern FpyList* fastpy_dict_keys(FpyDict*);
 extern FpyList* fastpy_dict_values(FpyDict*);
@@ -713,7 +714,7 @@ static FpySymEntry fpy_jit_symbols[] = {
     SYM(fastpy_list_reverse_prefix),
     SYM(fastpy_list_copy), SYM(fastpy_list_clear),
     SYM(fastpy_list_extend), SYM(fastpy_list_sort), SYM(fastpy_list_concat),
-    SYM(fastpy_dict_new), SYM(fastpy_dict_set_fv), SYM(fastpy_dict_get_fv),
+    SYM(fastpy_dict_new), SYM(fastpy_dict_set_fv), SYM(fastpy_dict_get_fv), SYM(fastpy_dict_get_fv_safe),
     SYM(fastpy_dict_length), SYM(fastpy_dict_keys), SYM(fastpy_dict_values),
     SYM(fastpy_dict_items), SYM(fastpy_dict_has_key), SYM(fastpy_dict_update),
     SYM(fastpy_dict_equal), SYM(fastpy_set_equal),

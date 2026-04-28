@@ -1263,6 +1263,29 @@ void fastpy_dict_get_fv(FpyDict *dict, const char *key,
     *out_tag = FPY_TAG_NONE; *out_data = 0; return;
 }
 
+/* Safe variant: returns NONE for missing keys without raising.
+ * Used by match/case MatchMapping pattern to probe for keys. */
+void fastpy_dict_get_fv_safe(FpyDict *dict, const char *key,
+                              int32_t *out_tag, int64_t *out_data) {
+    uint64_t h = fpy_hash_string(key);
+    int64_t mask = dict->table_size - 1;
+    int64_t slot = (int64_t)(h & (uint64_t)mask);
+    while (1) {
+        int64_t idx = dict->indices[slot];
+        if (idx == FPY_DICT_EMPTY) break;
+        if (idx != FPY_DICT_DELETED
+                && dict->keys[idx].tag == FPY_TAG_STR
+                && (dict->keys[idx].data.s == key
+                    || strcmp(dict->keys[idx].data.s, key) == 0)) {
+            *out_tag = dict->values[idx].tag;
+            *out_data = dict->values[idx].data.i;
+            return;
+        }
+        slot = (slot + 1) & mask;
+    }
+    *out_tag = FPY_TAG_NONE; *out_data = 0;
+}
+
 /* ------------------------------------------------------------------ */
 /* Specialized int-key dict operations.                                */
 /*                                                                     */

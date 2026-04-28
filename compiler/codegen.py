@@ -392,6 +392,7 @@ class ClassInfo:
     classmethods: set = None            # set of method names marked @classmethod
     staticmethods: set = None           # set of method names marked @staticmethod
     properties: set = None              # set of method names marked @property
+    match_args: list = None             # __match_args__ tuple entries (list[str])
 
 # Type tag constants for our tagged value system (future use)
 TAG_INT = 0
@@ -1215,6 +1216,7 @@ class CodeGen:
         self.runtime["dict_set_fv"] = ir.Function(self.module, ft, name="fastpy_dict_set_fv")
         ft = ir.FunctionType(void, [i8_ptr, i8_ptr, ir.PointerType(i32), ir.PointerType(i64)])
         self.runtime["dict_get_fv"] = ir.Function(self.module, ft, name="fastpy_dict_get_fv")
+        self.runtime["dict_get_fv_safe"] = ir.Function(self.module, ft, name="fastpy_dict_get_fv_safe")
         ft = ir.FunctionType(i64, [i8_ptr])
         self.runtime["list_length"] = ir.Function(self.module, ft, name="fastpy_list_length")
         ft = ir.FunctionType(i8_ptr, [i8_ptr])
@@ -6343,6 +6345,50 @@ class CodeGen:
                         break
         else:
             ret_tag = "void"
+
+        # Override ret_tag from return type annotation when present.
+        # The LLVM ret_type was already set from the annotation above;
+        # now propagate the semantic tag so call sites see the correct type.
+        if node.returns is not None:
+            ann = node.returns
+            ann, _ = self._unwrap_annotated(ann) if hasattr(self, '_unwrap_annotated') else (ann, [])
+            if isinstance(ann, ast.Name):
+                _RET_ANN_TAG = {
+                    "int": "int", "float": "float", "str": "str",
+                    "bool": "bool", "list": "ptr", "dict": "dict",
+                    "tuple": "ptr", "set": "set", "None": "void",
+                }
+                ann_tag = _RET_ANN_TAG.get(ann.id)
+                if ann_tag is not None:
+                    ret_tag = ann_tag
+                elif ann.id in self._user_classes:
+                    ret_tag = "obj"
+                else:
+                    _native_imports = getattr(self, '_native_imports', {})
+                    if ann.id in _native_imports:
+                        mod, fn = _native_imports[ann.id]
+                        if mod == "pathlib" and fn == "Path":
+                            ret_tag = "path"
+                        else:
+                            ret_tag = "pyobj"
+            elif isinstance(ann, ast.Constant) and ann.value is None:
+                ret_tag = "void"
+            elif (isinstance(ann, ast.Attribute)
+                    and isinstance(ann.value, ast.Name)
+                    and ann.value.id == "pathlib" and ann.attr == "Path"):
+                ret_tag = "path"
+            # Container annotations: list[int] etc.
+            elif isinstance(ann, ast.Subscript):
+                if isinstance(ann.value, ast.Name):
+                    if ann.value.id in ("list", "List"):
+                        ret_tag = "ptr"
+                    elif ann.value.id in ("dict", "Dict"):
+                        ret_tag = "dict"
+                    elif ann.value.id in ("set", "Set"):
+                        ret_tag = "set"
+                    elif ann.value.id in ("tuple", "Tuple"):
+                        ret_tag = "ptr"
+
         # For functions with keyword-only args, combine their defaults into
         # one right-aligned list matching the combined param_names.
         # kw_defaults has one entry per kwonlyarg (None if no default).
@@ -6786,34 +6832,86 @@ class CodeGen:
                 # Update self.variables so _emit_expr sees the correct VKind
                 self.variables[pname] = (native_alloca, ValueType(kind))
 
-        # --typed mode: container parameter annotations (list[int], dict[str, int], etc.)
-        # Don't create native allocas — just override the type tag with element info.
-        if self._typed_mode and info.uses_fv_abi:
+        # Always-on annotation reading: parse parameter annotations to refine
+        # variable type tags even without --typed mode.  This enables correct
+        # method dispatch for typed parameters (e.g. def f(p: Path) allows
+        # p.resolve() to dispatch to native path handlers).
+        # Reads container annotations (list[int], dict[str,int]), scalar types
+        # (int, float, str, bool), bridge types (Path), and user classes.
+        # No native allocas — just tag updates for compile-time type inference.
+        if info.uses_fv_abi:
             ast_params = list(node.args.args)
+            _native_imports = getattr(self, '_native_imports', {})
             for _pidx, ast_arg in enumerate(ast_params):
-                container_tag = self._parse_container_annotation(ast_arg.annotation)
-                if container_tag is None:
-                    continue
                 pname = ast_arg.arg
                 if pname not in self.variables or pname in self._native_vars:
                     continue
-                alloca, _ = self.variables[pname]
-                self.variables[pname] = (alloca, container_tag)
-                # Dict value type tracking: extract from annotation node
-                if (container_tag == "dict"
-                        and isinstance(ast_arg.annotation, ast.Subscript)
-                        and isinstance(ast_arg.annotation.slice, ast.Tuple)
-                        and len(ast_arg.annotation.slice.elts) == 2):
-                    val_kind = self._parse_annotation(ast_arg.annotation.slice.elts[1])
-                    if val_kind == VKind.INT:
-                        self._dict_var_int_values.add(pname)
-                    val_nested = self._parse_container_annotation(
-                        ast_arg.annotation.slice.elts[1])
-                    if val_nested is not None:
-                        if val_nested.startswith("list"):
-                            self._dict_var_list_values.add(pname)
-                        elif val_nested == "dict":
-                            self._dict_var_dict_values.add(pname)
+
+                # (a) Container annotations: list[int], dict[str,int], set, tuple
+                container_tag = self._parse_container_annotation(ast_arg.annotation)
+                if container_tag is not None:
+                    alloca, _ = self.variables[pname]
+                    self.variables[pname] = (alloca, container_tag)
+                    # Dict value type tracking: extract from annotation node
+                    if (container_tag == "dict"
+                            and isinstance(ast_arg.annotation, ast.Subscript)
+                            and isinstance(ast_arg.annotation.slice, ast.Tuple)
+                            and len(ast_arg.annotation.slice.elts) == 2):
+                        val_kind = self._parse_annotation(ast_arg.annotation.slice.elts[1])
+                        if val_kind == VKind.INT:
+                            self._dict_var_int_values.add(pname)
+                        val_nested = self._parse_container_annotation(
+                            ast_arg.annotation.slice.elts[1])
+                        if val_nested is not None:
+                            if val_nested.startswith("list"):
+                                self._dict_var_list_values.add(pname)
+                            elif val_nested == "dict":
+                                self._dict_var_dict_values.add(pname)
+                    continue
+
+                # (b) Scalar and special type annotations
+                ann = ast_arg.annotation
+                if ann is None:
+                    continue
+                ann, _ = self._unwrap_annotated(ann)
+
+                if isinstance(ann, ast.Name):
+                    ann_name = ann.id
+                    # Scalar builtins: int, float, str, bool
+                    scalar_kind = self._ANNOTATION_TO_VKIND.get(ann_name)
+                    if scalar_kind is not None:
+                        alloca, _ = self.variables[pname]
+                        self.variables[pname] = (alloca, scalar_kind.old_tag)
+                        continue
+                    # Bridge-imported types: from pathlib import Path, etc.
+                    if ann_name in _native_imports:
+                        mod, fn = _native_imports[ann_name]
+                        if mod == "pathlib" and fn == "Path":
+                            alloca, _ = self.variables[pname]
+                            self.variables[pname] = (alloca, "path")
+                        else:
+                            # Other native-imported types → pyobj
+                            alloca, _ = self.variables[pname]
+                            self.variables[pname] = (alloca, "pyobj")
+                        continue
+                    # User-defined class names → obj
+                    if ann_name in self._user_classes:
+                        alloca, _ = self.variables[pname]
+                        self.variables[pname] = (alloca, "obj")
+                        continue
+                    # Bare "Path" when pathlib is imported as module
+                    if ann_name == "Path" and "pathlib" in getattr(self, '_native_modules', set()):
+                        alloca, _ = self.variables[pname]
+                        self.variables[pname] = (alloca, "path")
+                        continue
+
+                # (c) Module-qualified annotations: pathlib.Path, etc.
+                if (isinstance(ann, ast.Attribute)
+                        and isinstance(ann.value, ast.Name)):
+                    if ann.value.id == "pathlib" and ann.attr == "Path":
+                        alloca, _ = self.variables[pname]
+                        self.variables[pname] = (alloca, "path")
+                        continue
 
         # Phase 4: set up function aliases for parameters that received
         # function references at call sites. E.g., apply(add, 5, 6) where
@@ -9029,6 +9127,20 @@ class CodeGen:
             self._per_class_string_attrs[class_name] |= self._per_class_string_attrs.get(sec_base, set())
             self._per_class_bool_attrs[class_name] |= self._per_class_bool_attrs.get(sec_base, set())
 
+        # Extract __match_args__ from class body (if present)
+        match_args = None
+        for stmt in node.body:
+            if (isinstance(stmt, ast.Assign)
+                    and len(stmt.targets) == 1
+                    and isinstance(stmt.targets[0], ast.Name)
+                    and stmt.targets[0].id == "__match_args__"
+                    and isinstance(stmt.value, ast.Tuple)):
+                match_args = [
+                    elt.value for elt in stmt.value.elts
+                    if isinstance(elt, ast.Constant) and isinstance(elt.value, str)
+                ]
+                break
+
         self._user_classes[class_name] = ClassInfo(
             name=class_name,
             class_id_global=class_id_global,
@@ -9040,6 +9152,7 @@ class CodeGen:
             classmethods=classmethods,
             staticmethods=staticmethods,
             properties=properties,
+            match_args=match_args,
         )
 
     def _detect_class_container_attrs(self, node: ast.ClassDef,
@@ -14913,22 +15026,82 @@ class CodeGen:
             self.builder.position_at_end(check_block)
             list_ptr = self.builder.inttoptr(subject_data, i8_ptr)
             length = self._rt_call("list_length", [list_ptr])
-            expected_len = len(pattern.patterns)
-            len_ok = self.builder.icmp_signed(
-                "==", length, ir.Constant(i64, expected_len))
+
+            # Check for MatchStar: case [first, *rest, last]
+            star_idx = None
+            for _si, _sp in enumerate(pattern.patterns):
+                if isinstance(_sp, ast.MatchStar):
+                    star_idx = _si
+                    break
+
+            if star_idx is not None:
+                # Star-sequence: length >= prefix_count + suffix_count
+                prefix_count = star_idx
+                suffix_count = len(pattern.patterns) - star_idx - 1
+                min_len = prefix_count + suffix_count
+                len_ok = self.builder.icmp_signed(
+                    ">=", length, ir.Constant(i64, min_len))
+            else:
+                # Exact-length: length == expected_len
+                expected_len = len(pattern.patterns)
+                len_ok = self.builder.icmp_signed(
+                    "==", length, ir.Constant(i64, expected_len))
+
             self.builder.cbranch(len_ok, elem_block, fail_block)
 
             # Extract each element as FpyValue and match sub-patterns
             self.builder.position_at_end(elem_block)
             elem_ok = ir.Constant(ir.IntType(1), 1)
-            for i, sub_pat in enumerate(pattern.patterns):
-                tag_i, data_i = self._fv_list_get(
-                    list_ptr, ir.Constant(i64, i), f"mseq.{i}")
-                elem_fv = self._fv_build_from_slots(tag_i, data_i)
-                sub_cond = self._emit_match_pattern(
-                    elem_fv, tag_i, data_i, sub_pat, node)
-                if sub_cond is not None:
-                    elem_ok = self.builder.and_(elem_ok, sub_cond)
+
+            if star_idx is not None:
+                # Match prefix patterns (indices 0..prefix_count-1)
+                for i in range(prefix_count):
+                    sub_pat = pattern.patterns[i]
+                    tag_i, data_i = self._fv_list_get(
+                        list_ptr, ir.Constant(i64, i), f"mseq.{i}")
+                    elem_fv = self._fv_build_from_slots(tag_i, data_i)
+                    sub_cond = self._emit_match_pattern(
+                        elem_fv, tag_i, data_i, sub_pat, node)
+                    if sub_cond is not None:
+                        elem_ok = self.builder.and_(elem_ok, sub_cond)
+
+                # Match suffix patterns (indices length-suffix_count..length-1)
+                for j in range(suffix_count):
+                    sub_pat = pattern.patterns[star_idx + 1 + j]
+                    # Index from end: length - suffix_count + j
+                    offset = self.builder.sub(
+                        length, ir.Constant(i64, suffix_count - j))
+                    tag_j, data_j = self._fv_list_get(
+                        list_ptr, offset, f"mseq.s{j}")
+                    elem_fv = self._fv_build_from_slots(tag_j, data_j)
+                    sub_cond = self._emit_match_pattern(
+                        elem_fv, tag_j, data_j, sub_pat, node)
+                    if sub_cond is not None:
+                        elem_ok = self.builder.and_(elem_ok, sub_cond)
+
+                # Bind the star variable: sub-list [prefix_count : length-suffix_count]
+                star_pat = pattern.patterns[star_idx]
+                if isinstance(star_pat, ast.MatchStar) and star_pat.name:
+                    star_start = ir.Constant(i64, prefix_count)
+                    star_stop = self.builder.sub(
+                        length, ir.Constant(i64, suffix_count))
+                    star_list = self._rt_call("list_slice", [
+                        list_ptr, star_start, star_stop,
+                        ir.Constant(i64, 1),  # has_start
+                        ir.Constant(i64, 1),  # has_stop
+                    ])
+                    star_fv = self._fv_from_list(star_list)
+                    self._store_variable(star_pat.name, star_fv, "list:int")
+            else:
+                # No star — exact-length matching (original code)
+                for i, sub_pat in enumerate(pattern.patterns):
+                    tag_i, data_i = self._fv_list_get(
+                        list_ptr, ir.Constant(i64, i), f"mseq.{i}")
+                    elem_fv = self._fv_build_from_slots(tag_i, data_i)
+                    sub_cond = self._emit_match_pattern(
+                        elem_fv, tag_i, data_i, sub_pat, node)
+                    if sub_cond is not None:
+                        elem_ok = self.builder.and_(elem_ok, sub_cond)
 
             last_elem_block = self.builder.block
             self.builder.branch(done_block)
@@ -14942,12 +15115,180 @@ class CodeGen:
             phi.add_incoming(ir.Constant(ir.IntType(1), 0), fail_block)
             return phi
 
+        # ── MatchMapping: case {"key": val} ──────────────────────────
+        if isinstance(pattern, ast.MatchMapping):
+            # Subject must be a dict (tag DICT=7)
+            is_dict = self.builder.icmp_signed(
+                "==", subject_tag, ir.Constant(i32, FPY_TAG_DICT))
+            check_block = self._new_block("mmap.check")
+            fail_block = self._new_block("mmap.fail")
+            done_block = self._new_block("mmap.done")
+            self.builder.cbranch(is_dict, check_block, fail_block)
+
+            self.builder.position_at_end(check_block)
+            dict_ptr = self.builder.inttoptr(subject_data, i8_ptr)
+            elem_ok = ir.Constant(ir.IntType(1), 1)
+
+            for key_node, pat in zip(pattern.keys, pattern.patterns):
+                # Check key exists and get value
+                key_val = self._emit_expr_value(key_node)
+                tag_slot = self._create_entry_alloca(i32, "mmap.tag")
+                data_slot = self._create_entry_alloca(i64, "mmap.data")
+                if isinstance(key_val.type, ir.PointerType):
+                    self.builder.call(self.runtime["dict_get_fv_safe"],
+                                      [dict_ptr, key_val, tag_slot, data_slot])
+                else:
+                    # int key — convert to string for safe lookup
+                    key_str = self.builder.call(
+                        self.runtime["int_to_str"], [key_val])
+                    self.builder.call(self.runtime["dict_get_fv_safe"],
+                                      [dict_ptr, key_str, tag_slot, data_slot])
+                val_tag = self.builder.load(tag_slot)
+                val_data = self.builder.load(data_slot)
+                # A missing key returns tag=NONE, data=0 — check tag != NONE
+                # (unless the pattern expects None)
+                has_key = self.builder.icmp_signed(
+                    "!=", val_tag, ir.Constant(i32, FPY_TAG_NONE))
+                elem_ok = self.builder.and_(elem_ok, has_key)
+                val_fv = self._fv_build_from_slots(val_tag, val_data)
+                sub_cond = self._emit_match_pattern(
+                    val_fv, val_tag, val_data, pat, node)
+                if sub_cond is not None:
+                    elem_ok = self.builder.and_(elem_ok, sub_cond)
+
+            # Bind **rest if present
+            if pattern.rest:
+                # TODO: create a dict minus the matched keys
+                pass
+
+            last_check = self.builder.block
+            self.builder.branch(done_block)
+            self.builder.position_at_end(fail_block)
+            self.builder.branch(done_block)
+            self.builder.position_at_end(done_block)
+            phi = self.builder.phi(ir.IntType(1), "mmap.result")
+            phi.add_incoming(elem_ok, last_check)
+            phi.add_incoming(ir.Constant(ir.IntType(1), 0), fail_block)
+            return phi
+
+        # ── MatchClass: case Point(x=1, y=2), case int(n) ─────────────
+        if isinstance(pattern, ast.MatchClass):
+            cls_name = (pattern.cls.id
+                        if isinstance(pattern.cls, ast.Name) else None)
+            if cls_name is None:
+                return ir.Constant(ir.IntType(1), 0)
+
+            # Builtin type patterns: case int(n), case str(s), etc.
+            _BUILTIN_TAG = {
+                "int": FPY_TAG_INT, "float": FPY_TAG_FLOAT,
+                "str": FPY_TAG_STR, "bool": FPY_TAG_BOOL,
+                "list": FPY_TAG_LIST, "dict": FPY_TAG_DICT,
+                "tuple": FPY_TAG_LIST,
+            }
+            _BUILTIN_TYPE_TAG = {
+                "int": "int", "float": "float", "str": "str",
+                "bool": "bool", "list": "list", "dict": "dict",
+                "tuple": "list",
+            }
+            if cls_name in _BUILTIN_TAG:
+                tag_expected = ir.Constant(i32, _BUILTIN_TAG[cls_name])
+                tag_ok = self.builder.icmp_signed(
+                    "==", subject_tag, tag_expected)
+                # If there's a single positional capture: case int(n)
+                # Only store when the tag matches — storing unconditionally
+                # with a scalar type_tag skips incref, but the value may
+                # actually be a heap type (str/list) → refcount imbalance.
+                if (len(pattern.patterns) == 1
+                        and isinstance(pattern.patterns[0], ast.MatchAs)
+                        and pattern.patterns[0].name):
+                    store_blk = self._new_block("mtype.store")
+                    skip_blk = self._new_block("mtype.skip")
+                    self.builder.cbranch(tag_ok, store_blk, skip_blk)
+                    self.builder.position_at_end(store_blk)
+                    self._store_variable(
+                        pattern.patterns[0].name, subject_fv,
+                        _BUILTIN_TYPE_TAG.get(cls_name, "int"))
+                    self.builder.branch(skip_blk)
+                    self.builder.position_at_end(skip_blk)
+                return tag_ok
+
+            # User class patterns: case Point(x=1, y=2)
+            if cls_name in self._user_classes:
+                cls_info = self._user_classes[cls_name]
+                # Check tag == OBJ
+                is_obj = self.builder.icmp_signed(
+                    "==", subject_tag, ir.Constant(i32, FPY_TAG_OBJ))
+                isinstance_block = self._new_block("mcls.isinstance")
+                fail_block = self._new_block("mcls.fail")
+                done_block = self._new_block("mcls.done")
+                self.builder.cbranch(is_obj, isinstance_block, fail_block)
+
+                # isinstance check — short-circuit to fail if wrong class
+                self.builder.position_at_end(isinstance_block)
+                obj_ptr = self.builder.inttoptr(subject_data, i8_ptr)
+                expected_id = self.builder.load(cls_info.class_id_global)
+                isinstance_result = self.builder.call(
+                    self.runtime["isinstance"], [obj_ptr, expected_id])
+                id_ok = self.builder.icmp_signed(
+                    "!=", isinstance_result, ir.Constant(i32, 0))
+
+                # Only read slots if isinstance passed — reading slots on a
+                # different class's object causes refcount corruption.
+                has_attrs = (pattern.kwd_attrs or pattern.patterns)
+                if has_attrs:
+                    attr_block = self._new_block("mcls.attrs")
+                    self.builder.cbranch(id_ok, attr_block, fail_block)
+                    self.builder.position_at_end(attr_block)
+                    elem_ok = ir.Constant(ir.IntType(1), 1)
+                else:
+                    elem_ok = id_ok
+
+                # Slot name → index mapping from class analysis
+                slots = self._class_attr_slots.get(cls_name, {})
+
+                # Match keyword attributes: x=1, y=2
+                for attr_name, kwd_pat in zip(
+                        pattern.kwd_attrs, pattern.kwd_patterns):
+                    slot_idx = slots.get(attr_name)
+                    if slot_idx is not None:
+                        tag_a, data_a = self._emit_slot_get_direct(
+                            obj_ptr, slot_idx)
+                        fv_a = self._fv_build_from_slots(tag_a, data_a)
+                        cond = self._emit_match_pattern(
+                            fv_a, tag_a, data_a, kwd_pat, node)
+                        if cond is not None:
+                            elem_ok = self.builder.and_(elem_ok, cond)
+                    else:
+                        # Unknown attr → never matches
+                        elem_ok = self.builder.and_(
+                            elem_ok, ir.Constant(ir.IntType(1), 0))
+
+                # Match positional patterns using __match_args__
+                # __match_args__ maps position → attribute name
+                ma = cls_info.match_args
+                for pi, pos_pat in enumerate(pattern.patterns):
+                    attr_name = ma[pi] if ma and pi < len(ma) else None
+                    si = slots.get(attr_name) if attr_name else None
+                    if si is not None:
+                        tag_p, data_p = self._emit_slot_get_direct(
+                            obj_ptr, si)
+                        fv_p = self._fv_build_from_slots(tag_p, data_p)
+                        cond = self._emit_match_pattern(
+                            fv_p, tag_p, data_p, pos_pat, node)
+                        if cond is not None:
+                            elem_ok = self.builder.and_(elem_ok, cond)
+
+                last_check = self.builder.block
+                self.builder.branch(done_block)
+                self.builder.position_at_end(fail_block)
+                self.builder.branch(done_block)
+                self.builder.position_at_end(done_block)
+                phi = self.builder.phi(ir.IntType(1), "mcls.result")
+                phi.add_incoming(elem_ok, last_check)
+                phi.add_incoming(ir.Constant(ir.IntType(1), 0), fail_block)
+                return phi
+
         # ── Unsupported patterns ──────────────────────────────────────
-        # MatchStar, MatchMapping, MatchClass: return false (never
-        # matches) instead of the old behaviour of returning None
-        # (always matches, silently wrong).  These need proper
-        # implementation — for now, at least they won't produce
-        # incorrect positive matches.
         return ir.Constant(ir.IntType(1), 0)
 
     def _generator_needs_cpython(self, node: ast.FunctionDef) -> bool:
@@ -16551,11 +16892,16 @@ class CodeGen:
         targets = node.target.elts
         call = node.iter  # Call(func=Name('enumerate'), args=[lst], ...)
 
-        # Get the list argument and optional start
+        # Get the list argument and optional start (positional or keyword)
         lst_node = call.args[0]
         start_val = ir.Constant(i64, 0)
         if len(call.args) >= 2:
             start_val = self._emit_expr_value(call.args[1])
+        else:
+            for kw in call.keywords:
+                if kw.arg == "start":
+                    start_val = self._emit_expr_value(kw.value)
+                    break
 
         # Evaluate the list
         lst_tv = self._emit_expr(lst_node)
@@ -19707,6 +20053,12 @@ class CodeGen:
                     if method_func:
                         result = self.builder.call(method_func, [obj])
                         return self._wrap_for_print(result, node)
+        # Path attribute access in FV context: evaluate the path expression
+        # normally and wrap the result for the correct FpyValue tag.  Must come
+        # before the generic obj handler which would call obj_get_fv on a PyObject*.
+        if isinstance(node, ast.Attribute) and self._is_path_expr(node.value):
+            val = self._emit_expr_value(node)
+            return self._wrap_for_print(val, node)
         # Object attribute access: load the FV directly via obj_get_slot
         # (or obj_get_fv as fallback) so the runtime tag is preserved.
         if (isinstance(node, ast.Attribute)
@@ -20728,6 +21080,112 @@ class CodeGen:
         # — the i64 data may be a float bit-pattern, not an integer.
         # Convert to double via a select(tag==FLOAT, bitcast, sitofp).
         if lk == VKind.UNKNOWN or rk == VKind.UNKNOWN:
+            # For Add with FpyValue operands, check runtime tags for STR.
+            # String pointers bitcast to double produce garbage, so we must
+            # dispatch to str_concat when both operands are strings.
+            if op == ast.Add:
+                l_fv = ltv.val
+                r_fv = rtv.val
+                # Extract runtime tags from FpyValue operands
+                l_tag = r_tag = None
+                if isinstance(l_fv.type, ir.LiteralStructType):
+                    l_tag = self.builder.extract_value(l_fv, 0)
+                elif lk == VKind.UNKNOWN and isinstance(node.left, ast.Name):
+                    alloca, _ = self.variables.get(node.left.id, (None, None))
+                    if (alloca and isinstance(alloca.type, ir.PointerType)
+                            and alloca.type.pointee is fpy_val):
+                        fv = self.builder.load(alloca)
+                        l_tag = self.builder.extract_value(fv, 0)
+                if isinstance(r_fv.type, ir.LiteralStructType):
+                    r_tag = self.builder.extract_value(r_fv, 0)
+                elif rk == VKind.UNKNOWN and isinstance(node.right, ast.Name):
+                    alloca, _ = self.variables.get(node.right.id, (None, None))
+                    if (alloca and isinstance(alloca.type, ir.PointerType)
+                            and alloca.type.pointee is fpy_val):
+                        fv = self.builder.load(alloca)
+                        r_tag = self.builder.extract_value(fv, 0)
+                if l_tag is not None and r_tag is not None:
+                    both_str = self.builder.and_(
+                        self.builder.icmp_unsigned(
+                            "==", l_tag, ir.Constant(i32, FPY_TAG_STR)),
+                        self.builder.icmp_unsigned(
+                            "==", r_tag, ir.Constant(i32, FPY_TAG_STR)))
+                    str_blk = self._new_block("unkn.str_add")
+                    num_blk = self._new_block("unkn.num_add")
+                    join_blk = self._new_block("unkn.add_join")
+                    self.builder.cbranch(both_str, str_blk, num_blk)
+
+                    # String path: extract data as pointers, call str_concat
+                    self.builder.position_at_end(str_blk)
+                    l_data = self.builder.extract_value(l_fv, 1) \
+                        if isinstance(l_fv.type, ir.LiteralStructType) \
+                        else ltv.as_i64(self.builder)
+                    r_data = self.builder.extract_value(r_fv, 1) \
+                        if isinstance(r_fv.type, ir.LiteralStructType) \
+                        else rtv.as_i64(self.builder)
+                    l_ptr = self.builder.inttoptr(l_data, i8_ptr)
+                    r_ptr = self.builder.inttoptr(r_data, i8_ptr)
+                    str_result = self.builder.call(
+                        self.runtime["str_concat"], [l_ptr, r_ptr])
+                    # Convert to i8* result (same as VKind.STR)
+                    str_as_i64 = self.builder.ptrtoint(str_result, i64)
+                    self.builder.branch(join_blk)
+                    str_end = self.builder.block
+
+                    # Numeric path: original float conversion
+                    self.builder.position_at_end(num_blk)
+                    lv = ltv.val
+                    rv = rtv.val
+                    if lk == VKind.UNKNOWN:
+                        lv = self._unknown_fv_to_double(node.left, lv)
+                    elif lk == VKind.INT:
+                        lv = self.builder.sitofp(lv, double)
+                    elif lk != VKind.FLOAT:
+                        lv = lv if isinstance(lv.type, ir.DoubleType) \
+                            else self.builder.sitofp(lv, double) \
+                            if isinstance(lv.type, ir.IntType) else lv
+                    if rk == VKind.UNKNOWN:
+                        rv = self._unknown_fv_to_double(node.right, rv)
+                    elif rk == VKind.INT:
+                        rv = self.builder.sitofp(rv, double)
+                    elif rk != VKind.FLOAT:
+                        rv = rv if isinstance(rv.type, ir.DoubleType) \
+                            else self.builder.sitofp(rv, double) \
+                            if isinstance(rv.type, ir.IntType) else rv
+                    for lbl, v, setter in [("left", lv, "lv"),
+                                           ("right", rv, "rv")]:
+                        if isinstance(v.type, ir.LiteralStructType):
+                            data = self.builder.extract_value(v, 1)
+                            converted = self.builder.bitcast(data, double)
+                            if setter == "lv":
+                                lv = converted
+                            else:
+                                rv = converted
+                    num_result = self._emit_float_binop(node.op, lv, rv, node)
+                    # Convert numeric result (double or i64) to i64
+                    if isinstance(num_result.type, ir.DoubleType):
+                        num_as_i64 = self.builder.bitcast(num_result, i64)
+                    elif isinstance(num_result.type, ir.IntType):
+                        num_as_i64 = num_result if num_result.type.width == 64 \
+                            else self.builder.sext(num_result, i64)
+                    else:
+                        num_as_i64 = self.builder.ptrtoint(num_result, i64)
+                    self.builder.branch(join_blk)
+                    num_end = self.builder.block
+
+                    # Join: phi between string result and numeric result
+                    self.builder.position_at_end(join_blk)
+                    # Build FpyValue with correct tag
+                    tag_phi = self.builder.phi(i32, "unkn.add.tag")
+                    tag_phi.add_incoming(ir.Constant(i32, FPY_TAG_STR), str_end)
+                    # For numeric: check if result was float or int
+                    tag_phi.add_incoming(ir.Constant(i32, FPY_TAG_FLOAT), num_end)
+                    data_phi = self.builder.phi(i64, "unkn.add.data")
+                    data_phi.add_incoming(str_as_i64, str_end)
+                    data_phi.add_incoming(num_as_i64, num_end)
+                    fv = self._fv_build_from_slots(tag_phi, data_phi)
+                    return fv
+
             left_v = ltv.val
             right_v = rtv.val
             if lk == VKind.UNKNOWN:

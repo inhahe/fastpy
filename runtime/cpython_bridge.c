@@ -216,8 +216,9 @@ static PyObject* fpy_closure_to_pyobject(void *closure_ptr);
 static PyTypeObject FpyClosureProxyType;
 static int fpy_closure_proxy_type_ready;
 
-/* List sync-back (defined below closure proxy section) */
+/* Container sync-back (defined below closure proxy section) */
 static void fpy_sync_pylist_to_fpylist(FpyList *orig, PyObject *mutated);
+static void fpy_sync_pydict_to_fpydict(FpyDict *orig, PyObject *mutated);
 static void fpy_sync_list_args(int32_t argc, int32_t *arg_tags,
                                 int64_t *arg_data, PyObject *args_tuple);
 
@@ -596,9 +597,12 @@ void fpy_cpython_call1(void *callable,
 
     PyObject *result = PyObject_CallObject((PyObject*)callable, args);
 
-    /* Sync-back: if the argument was a list, copy mutations back */
+    /* Sync-back: if the argument was a list/dict, copy mutations back */
     if (arg_tag == FPY_TAG_LIST) {
         fpy_sync_pylist_to_fpylist((FpyList*)(intptr_t)arg_data,
+                                    PyTuple_GET_ITEM(args, 0));
+    } else if (arg_tag == FPY_TAG_DICT) {
+        fpy_sync_pydict_to_fpydict((FpyDict*)(intptr_t)arg_data,
                                     PyTuple_GET_ITEM(args, 0));
     }
     Py_DECREF(args);
@@ -628,12 +632,18 @@ void fpy_cpython_call2(void *callable,
 
     PyObject *result = PyObject_CallObject((PyObject*)callable, args);
 
-    /* Sync-back: if any argument was a list, copy mutations back */
+    /* Sync-back: if any argument was a list/dict, copy mutations back */
     if (tag1 == FPY_TAG_LIST)
         fpy_sync_pylist_to_fpylist((FpyList*)(intptr_t)data1,
                                     PyTuple_GET_ITEM(args, 0));
+    else if (tag1 == FPY_TAG_DICT)
+        fpy_sync_pydict_to_fpydict((FpyDict*)(intptr_t)data1,
+                                    PyTuple_GET_ITEM(args, 0));
     if (tag2 == FPY_TAG_LIST)
         fpy_sync_pylist_to_fpylist((FpyList*)(intptr_t)data2,
+                                    PyTuple_GET_ITEM(args, 1));
+    else if (tag2 == FPY_TAG_DICT)
+        fpy_sync_pydict_to_fpydict((FpyDict*)(intptr_t)data2,
                                     PyTuple_GET_ITEM(args, 1));
     Py_DECREF(args);
 
@@ -667,6 +677,9 @@ void* fpy_cpython_call1_raw(void *callable,
     if (arg_tag == FPY_TAG_LIST)
         fpy_sync_pylist_to_fpylist((FpyList*)(intptr_t)arg_data,
                                     PyTuple_GET_ITEM(args, 0));
+    else if (arg_tag == FPY_TAG_DICT)
+        fpy_sync_pydict_to_fpydict((FpyDict*)(intptr_t)arg_data,
+                                    PyTuple_GET_ITEM(args, 0));
     Py_DECREF(args);
     if (!result) { bridge_propagate_exception(); return NULL; }
     return (void*)result;
@@ -684,8 +697,14 @@ void* fpy_cpython_call2_raw(void *callable,
     if (t1 == FPY_TAG_LIST)
         fpy_sync_pylist_to_fpylist((FpyList*)(intptr_t)d1,
                                     PyTuple_GET_ITEM(args, 0));
+    else if (t1 == FPY_TAG_DICT)
+        fpy_sync_pydict_to_fpydict((FpyDict*)(intptr_t)d1,
+                                    PyTuple_GET_ITEM(args, 0));
     if (t2 == FPY_TAG_LIST)
         fpy_sync_pylist_to_fpylist((FpyList*)(intptr_t)d2,
+                                    PyTuple_GET_ITEM(args, 1));
+    else if (t2 == FPY_TAG_DICT)
+        fpy_sync_pydict_to_fpydict((FpyDict*)(intptr_t)d2,
                                     PyTuple_GET_ITEM(args, 1));
     Py_DECREF(args);
     if (!result) { bridge_propagate_exception(); return NULL; }
@@ -708,15 +727,24 @@ void fpy_cpython_call3(void *callable,
 
     PyObject *result = PyObject_CallObject((PyObject*)callable, args);
 
-    /* Sync-back: if any argument was a list, copy mutations back */
+    /* Sync-back: if any argument was a list/dict, copy mutations back */
     if (tag1 == FPY_TAG_LIST)
         fpy_sync_pylist_to_fpylist((FpyList*)(intptr_t)data1,
+                                    PyTuple_GET_ITEM(args, 0));
+    else if (tag1 == FPY_TAG_DICT)
+        fpy_sync_pydict_to_fpydict((FpyDict*)(intptr_t)data1,
                                     PyTuple_GET_ITEM(args, 0));
     if (tag2 == FPY_TAG_LIST)
         fpy_sync_pylist_to_fpylist((FpyList*)(intptr_t)data2,
                                     PyTuple_GET_ITEM(args, 1));
+    else if (tag2 == FPY_TAG_DICT)
+        fpy_sync_pydict_to_fpydict((FpyDict*)(intptr_t)data2,
+                                    PyTuple_GET_ITEM(args, 1));
     if (tag3 == FPY_TAG_LIST)
         fpy_sync_pylist_to_fpylist((FpyList*)(intptr_t)data3,
+                                    PyTuple_GET_ITEM(args, 2));
+    else if (tag3 == FPY_TAG_DICT)
+        fpy_sync_pydict_to_fpydict((FpyDict*)(intptr_t)data3,
                                     PyTuple_GET_ITEM(args, 2));
     Py_DECREF(args);
 
@@ -1520,8 +1548,87 @@ static void fpy_sync_pylist_to_fpylist(FpyList *orig, PyObject *mutated) {
     }
 }
 
-/* Sync all LIST-tagged positional arguments from a PyTuple back to
- * their original FpyList after a bridge call. */
+/* FNV-1a hash for string keys — mirrors fpy_bridge_hash_string in objects.c */
+static uint64_t fpy_bridge_hash_string(const char *s) {
+    uint64_t h = 14695981039346656037ULL;
+    while (*s) { h ^= (uint8_t)*s++; h *= 1099511628211ULL; }
+    return h;
+}
+
+/* Sync a mutated PyDict back to the original FpyDict.
+ * Clear all existing entries and rebuild from the PyDict contents. */
+static void fpy_sync_pydict_to_fpydict(FpyDict *orig, PyObject *mutated) {
+    if (!orig || !mutated || !PyDict_Check(mutated)) return;
+
+    /* Clear existing entries — decref values, reset indices */
+    for (int64_t i = 0; i < orig->length; i++) {
+        fpy_rc_decref(orig->keys[i].tag, orig->keys[i].data.i);
+        fpy_rc_decref(orig->values[i].tag, orig->values[i].data.i);
+    }
+    orig->length = 0;
+    for (int64_t i = 0; i < orig->table_size; i++) {
+        orig->indices[i] = FPY_DICT_EMPTY;
+    }
+
+    /* Rebuild from PyDict */
+    PyObject *key, *value;
+    Py_ssize_t pos = 0;
+    while (PyDict_Next(mutated, &pos, &key, &value)) {
+        FpyValue fk, fv;
+        pyobject_to_fpy(key, &fk.tag, &fk.data.i);
+        pyobject_to_fpy(value, &fv.tag, &fv.data.i);
+
+        /* Grow compact arrays if needed */
+        if (orig->length >= orig->capacity) {
+            orig->capacity *= 2;
+            orig->keys = (FpyValue*)realloc(orig->keys,
+                sizeof(FpyValue) * orig->capacity);
+            orig->values = (FpyValue*)realloc(orig->values,
+                sizeof(FpyValue) * orig->capacity);
+        }
+
+        /* Rehash the indices table if load factor > 0.66 */
+        if (orig->length * 3 >= orig->table_size * 2) {
+            int64_t new_size = orig->table_size * 2;
+            orig->indices = (int64_t*)realloc(orig->indices,
+                sizeof(int64_t) * new_size);
+            for (int64_t j = 0; j < new_size; j++)
+                orig->indices[j] = FPY_DICT_EMPTY;
+            orig->table_size = new_size;
+            /* Re-insert all existing entries into new index table */
+            for (int64_t j = 0; j < orig->length; j++) {
+                uint64_t h;
+                if (orig->keys[j].tag == FPY_TAG_STR)
+                    h = fpy_bridge_hash_string(orig->keys[j].data.s);
+                else
+                    h = (uint64_t)orig->keys[j].data.i * 0x9E3779B97F4A7C15ULL;
+                int64_t mask = new_size - 1;
+                int64_t slot = (int64_t)(h & (uint64_t)mask);
+                while (orig->indices[slot] != FPY_DICT_EMPTY)
+                    slot = (slot + 1) & mask;
+                orig->indices[slot] = j;
+            }
+        }
+
+        /* Insert the new entry */
+        uint64_t h;
+        if (fk.tag == FPY_TAG_STR)
+            h = fpy_bridge_hash_string(fk.data.s);
+        else
+            h = (uint64_t)fk.data.i * 0x9E3779B97F4A7C15ULL;
+        int64_t mask = orig->table_size - 1;
+        int64_t slot = (int64_t)(h & (uint64_t)mask);
+        while (orig->indices[slot] != FPY_DICT_EMPTY)
+            slot = (slot + 1) & mask;
+        orig->keys[orig->length] = fk;
+        orig->values[orig->length] = fv;
+        orig->indices[slot] = orig->length;
+        orig->length++;
+    }
+}
+
+/* Sync all LIST-tagged and DICT-tagged positional arguments from a PyTuple
+ * back to their original native containers after a bridge call. */
 static void fpy_sync_list_args(int32_t argc, int32_t *arg_tags,
                                 int64_t *arg_data, PyObject *args_tuple) {
     for (int i = 0; i < argc; i++) {
@@ -1529,6 +1636,10 @@ static void fpy_sync_list_args(int32_t argc, int32_t *arg_tags,
             FpyList *orig = (FpyList*)(intptr_t)arg_data[i];
             PyObject *mutated = PyTuple_GET_ITEM(args_tuple, i);
             fpy_sync_pylist_to_fpylist(orig, mutated);
+        } else if (arg_tags[i] == FPY_TAG_DICT) {
+            FpyDict *orig = (FpyDict*)(intptr_t)arg_data[i];
+            PyObject *mutated = PyTuple_GET_ITEM(args_tuple, i);
+            fpy_sync_pydict_to_fpydict(orig, mutated);
         }
     }
 }
