@@ -47,6 +47,27 @@ void fpy_cpython_init(void) {
     }
 #endif
     Py_Initialize();
+    /* Set sys.argv from the real command-line arguments so bridge-imported
+     * modules (e.g. argparse) see the correct argv.  fpy_argc/fpy_argv
+     * are set by main() in runtime.c before any fastpy code runs. */
+    {
+        extern int    fpy_argc;
+        extern char **fpy_argv;
+        if (fpy_argc > 0 && fpy_argv != NULL) {
+            /* Build a wchar_t argv for PySys_SetArgvEx. */
+            wchar_t **wargv = (wchar_t **)calloc(fpy_argc, sizeof(wchar_t *));
+            if (wargv) {
+                for (int i = 0; i < fpy_argc; i++) {
+                    wargv[i] = Py_DecodeLocale(fpy_argv[i], NULL);
+                }
+                PySys_SetArgvEx(fpy_argc, wargv, 0);
+                for (int i = 0; i < fpy_argc; i++) {
+                    PyMem_RawFree(wargv[i]);
+                }
+                free(wargv);
+            }
+        }
+    }
     /* ABI version check: compare the compile-time Python version (from
      * headers) with the actual runtime version (from the loaded DLL/SO).
      * Py_GetVersion() returns the runtime version string like "3.14.0".
@@ -75,6 +96,23 @@ void fpy_cpython_init(void) {
     _setmode(_fileno(stdout), _O_TEXT);
     _setmode(_fileno(stderr), _O_TEXT);
 #endif
+}
+
+/* Get a Python builtin by name (str, int, float, list, dict, …).
+ * Returns a borrowed reference as PyObject*.  Initialises CPython
+ * on first call (same as fpy_cpython_import). */
+void* fpy_cpython_get_builtin(const char *name) {
+    fpy_cpython_init();
+    FPY_BRIDGE_ENTER();
+    PyObject *builtins = PyEval_GetBuiltins();  /* borrowed */
+    PyObject *obj = PyDict_GetItemString(builtins, name);  /* borrowed */
+    FPY_BRIDGE_LEAVE();
+    if (!obj) {
+        fprintf(stderr, "NameError: builtin '%s' not found\n", name);
+        exit(1);
+    }
+    Py_INCREF(obj);  /* caller owns a reference */
+    return (void*)obj;
 }
 
 void fpy_cpython_fini(void) {
@@ -178,8 +216,9 @@ static PyObject* fpy_closure_to_pyobject(void *closure_ptr);
 static PyTypeObject FpyClosureProxyType;
 static int fpy_closure_proxy_type_ready;
 
-/* List sync-back (defined below closure proxy section) */
+/* Container sync-back (defined below closure proxy section) */
 static void fpy_sync_pylist_to_fpylist(FpyList *orig, PyObject *mutated);
+static void fpy_sync_pydict_to_fpydict(FpyDict *orig, PyObject *mutated);
 static void fpy_sync_list_args(int32_t argc, int32_t *arg_tags,
                                 int64_t *arg_data, PyObject *args_tuple);
 
@@ -496,6 +535,145 @@ void* fpy_cpython_to_pyobj(int32_t tag, int64_t data) {
     return (void*)fpy_to_pyobject(tag, data);
 }
 
+/* ── FpyValue method dispatch ─────────────────────────────────────
+ * These functions call a method on ANY FpyValue (int, str, list, dict,
+ * FpyObj, PyObject*, etc.) by converting to PyObject* first and
+ * dispatching through CPython.  This is the universal fallback for
+ * variables whose compile-time type is unknown.
+ */
+
+void fpy_fv_call_method0(int32_t rcv_tag, int64_t rcv_data,
+                         const char *name,
+                         int32_t *out_tag, int64_t *out_data) {
+    PyObject *py_rcv = fpy_to_pyobject(rcv_tag, rcv_data);
+    PyObject *method = PyObject_GetAttrString(py_rcv, name);
+    if (!method) {
+        bridge_propagate_exception();
+        *out_tag = FPY_TAG_NONE; *out_data = 0;
+        Py_DECREF(py_rcv);
+        return;
+    }
+    PyObject *result = PyObject_CallNoArgs(method);
+    Py_DECREF(method);
+    Py_DECREF(py_rcv);
+    if (!result) {
+        bridge_propagate_exception();
+        *out_tag = FPY_TAG_NONE; *out_data = 0;
+        return;
+    }
+    pyobject_to_fpy(result, out_tag, out_data);
+    if (*out_tag == FPY_TAG_OBJ) Py_INCREF(result);
+    Py_DECREF(result);
+}
+
+void fpy_fv_call_method1(int32_t rcv_tag, int64_t rcv_data,
+                         const char *name,
+                         int32_t a1_tag, int64_t a1_data,
+                         int32_t *out_tag, int64_t *out_data) {
+    PyObject *py_rcv = fpy_to_pyobject(rcv_tag, rcv_data);
+    PyObject *method = PyObject_GetAttrString(py_rcv, name);
+    if (!method) {
+        bridge_propagate_exception();
+        *out_tag = FPY_TAG_NONE; *out_data = 0;
+        Py_DECREF(py_rcv);
+        return;
+    }
+    PyObject *a1 = fpy_to_pyobject(a1_tag, a1_data);
+    PyObject *result = PyObject_CallOneArg(method, a1);
+    Py_DECREF(a1);
+    Py_DECREF(method);
+    Py_DECREF(py_rcv);
+    if (!result) {
+        bridge_propagate_exception();
+        *out_tag = FPY_TAG_NONE; *out_data = 0;
+        return;
+    }
+    pyobject_to_fpy(result, out_tag, out_data);
+    if (*out_tag == FPY_TAG_OBJ) Py_INCREF(result);
+    Py_DECREF(result);
+}
+
+void fpy_fv_call_method2(int32_t rcv_tag, int64_t rcv_data,
+                         const char *name,
+                         int32_t a1_tag, int64_t a1_data,
+                         int32_t a2_tag, int64_t a2_data,
+                         int32_t *out_tag, int64_t *out_data) {
+    PyObject *py_rcv = fpy_to_pyobject(rcv_tag, rcv_data);
+    PyObject *method = PyObject_GetAttrString(py_rcv, name);
+    if (!method) {
+        bridge_propagate_exception();
+        *out_tag = FPY_TAG_NONE; *out_data = 0;
+        Py_DECREF(py_rcv);
+        return;
+    }
+    PyObject *a1 = fpy_to_pyobject(a1_tag, a1_data);
+    PyObject *a2 = fpy_to_pyobject(a2_tag, a2_data);
+    PyObject *result = PyObject_CallFunctionObjArgs(method, a1, a2, NULL);
+    Py_DECREF(a2);
+    Py_DECREF(a1);
+    Py_DECREF(method);
+    Py_DECREF(py_rcv);
+    if (!result) {
+        bridge_propagate_exception();
+        *out_tag = FPY_TAG_NONE; *out_data = 0;
+        return;
+    }
+    pyobject_to_fpy(result, out_tag, out_data);
+    if (*out_tag == FPY_TAG_OBJ) Py_INCREF(result);
+    Py_DECREF(result);
+}
+
+void fpy_fv_call_method3(int32_t rcv_tag, int64_t rcv_data,
+                         const char *name,
+                         int32_t a1_tag, int64_t a1_data,
+                         int32_t a2_tag, int64_t a2_data,
+                         int32_t a3_tag, int64_t a3_data,
+                         int32_t *out_tag, int64_t *out_data) {
+    PyObject *py_rcv = fpy_to_pyobject(rcv_tag, rcv_data);
+    PyObject *method = PyObject_GetAttrString(py_rcv, name);
+    if (!method) {
+        bridge_propagate_exception();
+        *out_tag = FPY_TAG_NONE; *out_data = 0;
+        Py_DECREF(py_rcv);
+        return;
+    }
+    PyObject *a1 = fpy_to_pyobject(a1_tag, a1_data);
+    PyObject *a2 = fpy_to_pyobject(a2_tag, a2_data);
+    PyObject *a3 = fpy_to_pyobject(a3_tag, a3_data);
+    PyObject *result = PyObject_CallFunctionObjArgs(method, a1, a2, a3, NULL);
+    Py_DECREF(a3);
+    Py_DECREF(a2);
+    Py_DECREF(a1);
+    Py_DECREF(method);
+    Py_DECREF(py_rcv);
+    if (!result) {
+        bridge_propagate_exception();
+        *out_tag = FPY_TAG_NONE; *out_data = 0;
+        return;
+    }
+    pyobject_to_fpy(result, out_tag, out_data);
+    if (*out_tag == FPY_TAG_OBJ) Py_INCREF(result);
+    Py_DECREF(result);
+}
+
+/* FpyValue attribute access — get an attribute from any FpyValue type.
+ * Returns the attribute as an FpyValue. */
+void fpy_fv_getattr(int32_t rcv_tag, int64_t rcv_data,
+                    const char *name,
+                    int32_t *out_tag, int64_t *out_data) {
+    PyObject *py_rcv = fpy_to_pyobject(rcv_tag, rcv_data);
+    PyObject *result = PyObject_GetAttrString(py_rcv, name);
+    Py_DECREF(py_rcv);
+    if (!result) {
+        bridge_propagate_exception();
+        *out_tag = FPY_TAG_NONE; *out_data = 0;
+        return;
+    }
+    pyobject_to_fpy(result, out_tag, out_data);
+    if (*out_tag == FPY_TAG_OBJ) Py_INCREF(result);
+    Py_DECREF(result);
+}
+
 /* Direct subscript on a PyObject*. Returns raw PyObject* (no conversion).
  * Keeps the result in Python object form for chained operations. */
 void* fpy_cpython_getitem(void *obj, int32_t key_tag, int64_t key_data) {
@@ -558,9 +736,12 @@ void fpy_cpython_call1(void *callable,
 
     PyObject *result = PyObject_CallObject((PyObject*)callable, args);
 
-    /* Sync-back: if the argument was a list, copy mutations back */
+    /* Sync-back: if the argument was a list/dict, copy mutations back */
     if (arg_tag == FPY_TAG_LIST) {
         fpy_sync_pylist_to_fpylist((FpyList*)(intptr_t)arg_data,
+                                    PyTuple_GET_ITEM(args, 0));
+    } else if (arg_tag == FPY_TAG_DICT) {
+        fpy_sync_pydict_to_fpydict((FpyDict*)(intptr_t)arg_data,
                                     PyTuple_GET_ITEM(args, 0));
     }
     Py_DECREF(args);
@@ -590,12 +771,18 @@ void fpy_cpython_call2(void *callable,
 
     PyObject *result = PyObject_CallObject((PyObject*)callable, args);
 
-    /* Sync-back: if any argument was a list, copy mutations back */
+    /* Sync-back: if any argument was a list/dict, copy mutations back */
     if (tag1 == FPY_TAG_LIST)
         fpy_sync_pylist_to_fpylist((FpyList*)(intptr_t)data1,
                                     PyTuple_GET_ITEM(args, 0));
+    else if (tag1 == FPY_TAG_DICT)
+        fpy_sync_pydict_to_fpydict((FpyDict*)(intptr_t)data1,
+                                    PyTuple_GET_ITEM(args, 0));
     if (tag2 == FPY_TAG_LIST)
         fpy_sync_pylist_to_fpylist((FpyList*)(intptr_t)data2,
+                                    PyTuple_GET_ITEM(args, 1));
+    else if (tag2 == FPY_TAG_DICT)
+        fpy_sync_pydict_to_fpydict((FpyDict*)(intptr_t)data2,
                                     PyTuple_GET_ITEM(args, 1));
     Py_DECREF(args);
 
@@ -629,6 +816,9 @@ void* fpy_cpython_call1_raw(void *callable,
     if (arg_tag == FPY_TAG_LIST)
         fpy_sync_pylist_to_fpylist((FpyList*)(intptr_t)arg_data,
                                     PyTuple_GET_ITEM(args, 0));
+    else if (arg_tag == FPY_TAG_DICT)
+        fpy_sync_pydict_to_fpydict((FpyDict*)(intptr_t)arg_data,
+                                    PyTuple_GET_ITEM(args, 0));
     Py_DECREF(args);
     if (!result) { bridge_propagate_exception(); return NULL; }
     return (void*)result;
@@ -646,8 +836,14 @@ void* fpy_cpython_call2_raw(void *callable,
     if (t1 == FPY_TAG_LIST)
         fpy_sync_pylist_to_fpylist((FpyList*)(intptr_t)d1,
                                     PyTuple_GET_ITEM(args, 0));
+    else if (t1 == FPY_TAG_DICT)
+        fpy_sync_pydict_to_fpydict((FpyDict*)(intptr_t)d1,
+                                    PyTuple_GET_ITEM(args, 0));
     if (t2 == FPY_TAG_LIST)
         fpy_sync_pylist_to_fpylist((FpyList*)(intptr_t)d2,
+                                    PyTuple_GET_ITEM(args, 1));
+    else if (t2 == FPY_TAG_DICT)
+        fpy_sync_pydict_to_fpydict((FpyDict*)(intptr_t)d2,
                                     PyTuple_GET_ITEM(args, 1));
     Py_DECREF(args);
     if (!result) { bridge_propagate_exception(); return NULL; }
@@ -670,15 +866,24 @@ void fpy_cpython_call3(void *callable,
 
     PyObject *result = PyObject_CallObject((PyObject*)callable, args);
 
-    /* Sync-back: if any argument was a list, copy mutations back */
+    /* Sync-back: if any argument was a list/dict, copy mutations back */
     if (tag1 == FPY_TAG_LIST)
         fpy_sync_pylist_to_fpylist((FpyList*)(intptr_t)data1,
+                                    PyTuple_GET_ITEM(args, 0));
+    else if (tag1 == FPY_TAG_DICT)
+        fpy_sync_pydict_to_fpydict((FpyDict*)(intptr_t)data1,
                                     PyTuple_GET_ITEM(args, 0));
     if (tag2 == FPY_TAG_LIST)
         fpy_sync_pylist_to_fpylist((FpyList*)(intptr_t)data2,
                                     PyTuple_GET_ITEM(args, 1));
+    else if (tag2 == FPY_TAG_DICT)
+        fpy_sync_pydict_to_fpydict((FpyDict*)(intptr_t)data2,
+                                    PyTuple_GET_ITEM(args, 1));
     if (tag3 == FPY_TAG_LIST)
         fpy_sync_pylist_to_fpylist((FpyList*)(intptr_t)data3,
+                                    PyTuple_GET_ITEM(args, 2));
+    else if (tag3 == FPY_TAG_DICT)
+        fpy_sync_pydict_to_fpydict((FpyDict*)(intptr_t)data3,
                                     PyTuple_GET_ITEM(args, 2));
     Py_DECREF(args);
 
@@ -763,6 +968,161 @@ void* fpy_cpython_call_kw_raw(void *callable,
     if (kwargs) Py_DECREF(kwargs);
     if (!result) { bridge_propagate_exception(); return NULL; }
     return (void*)result;
+}
+
+/* ── pathlib.Path functions (all operate on real PyObject* paths) ── */
+
+extern char* fpy_strdup(const char *);
+
+/* Helper: extract C string from a Path/str PyObject*. */
+static const char* _path_as_cstr(void *path_obj) {
+    fpy_cpython_init();
+    PyObject *fspath = PyOS_FSPath((PyObject*)path_obj);
+    if (!fspath) { PyErr_Clear(); return "."; }
+    const char *s = PyUnicode_AsUTF8(fspath);
+    const char *dup = fpy_strdup(s ? s : ".");
+    Py_DECREF(fspath);
+    return dup;
+}
+
+static void* _path_get_prop(void *obj, const char *prop) {
+    PyObject *r = PyObject_GetAttrString((PyObject*)obj, prop);
+    if (!r) { PyErr_Print(); exit(1); }
+    return (void*)r;
+}
+
+static void* _path_call0(void *obj, const char *method) {
+    PyObject *r = PyObject_CallMethod((PyObject*)obj, method, NULL);
+    if (!r) { PyErr_Print(); exit(1); }
+    return (void*)r;
+}
+
+void* fastpy_path_new(const char *s) {
+    fpy_cpython_init();
+    PyObject *mod = PyImport_ImportModule("pathlib");
+    PyObject *cls = PyObject_GetAttrString(mod, "Path");
+    PyObject *arg = PyUnicode_FromString(s ? s : ".");
+    PyObject *args_tuple = PyTuple_Pack(1, arg);
+    PyObject *result = PyObject_Call(cls, args_tuple, NULL);
+    Py_DECREF(arg);
+    Py_DECREF(args_tuple);
+    Py_DECREF(cls);
+    Py_DECREF(mod);
+    if (!result) { PyErr_Print(); exit(1); }
+    return (void*)result;
+}
+
+void* fastpy_path_cwd(void) {
+    fpy_cpython_init();
+    PyObject *mod = PyImport_ImportModule("pathlib");
+    PyObject *cls = PyObject_GetAttrString(mod, "Path");
+    void *r = _path_call0(cls, "cwd");
+    Py_DECREF(cls);
+    Py_DECREF(mod);
+    return r;
+}
+
+void* fastpy_path_join(void *self, void *other) {
+    fpy_cpython_init();
+    /* Try Path / other (truediv). If other is a C string, wrap first. */
+    PyObject *r = PyNumber_TrueDivide((PyObject*)self, (PyObject*)other);
+    if (!r) {
+        PyErr_Clear();
+        PyObject *ostr = PyUnicode_FromString((const char*)other);
+        r = PyNumber_TrueDivide((PyObject*)self, ostr);
+        Py_DECREF(ostr);
+    }
+    if (!r) { PyErr_Print(); exit(1); }
+    return (void*)r;
+}
+
+int64_t fastpy_path_exists(void *self) {
+    void *r = _path_call0(self, "exists");
+    int64_t v = (PyObject_IsTrue((PyObject*)r) == 1) ? 1 : 0;
+    Py_DECREF((PyObject*)r);
+    return v;
+}
+
+int64_t fastpy_path_is_file(void *self) {
+    void *r = _path_call0(self, "is_file");
+    int64_t v = (PyObject_IsTrue((PyObject*)r) == 1) ? 1 : 0;
+    Py_DECREF((PyObject*)r);
+    return v;
+}
+
+int64_t fastpy_path_is_dir(void *self) {
+    void *r = _path_call0(self, "is_dir");
+    int64_t v = (PyObject_IsTrue((PyObject*)r) == 1) ? 1 : 0;
+    Py_DECREF((PyObject*)r);
+    return v;
+}
+
+const char* fastpy_path_name(void *self) {
+    PyObject *r = PyObject_GetAttrString((PyObject*)self, "name");
+    if (!r) return fpy_strdup("");
+    const char *s = PyUnicode_AsUTF8(r);
+    const char *dup = fpy_strdup(s ? s : "");
+    Py_DECREF(r);
+    return dup;
+}
+
+void* fastpy_path_parent(void *self) { return _path_get_prop(self, "parent"); }
+
+const char* fastpy_path_suffix(void *self) {
+    PyObject *r = PyObject_GetAttrString((PyObject*)self, "suffix");
+    if (!r) return fpy_strdup("");
+    const char *s = PyUnicode_AsUTF8(r);
+    const char *dup = fpy_strdup(s ? s : "");
+    Py_DECREF(r);
+    return dup;
+}
+
+const char* fastpy_path_stem(void *self) {
+    PyObject *r = PyObject_GetAttrString((PyObject*)self, "stem");
+    if (!r) return fpy_strdup("");
+    const char *s = PyUnicode_AsUTF8(r);
+    const char *dup = fpy_strdup(s ? s : "");
+    Py_DECREF(r);
+    return dup;
+}
+
+void* fastpy_path_resolve(void *self) { return _path_call0(self, "resolve"); }
+
+const char* fastpy_path_read_text(void *self) {
+    const char *cpath = _path_as_cstr(self);
+    FILE *f = fopen(cpath, "rb");
+    if (!f) return fpy_strdup("");
+    fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    char *buf = (char*)malloc(size + 1);
+    fread(buf, 1, size, f);
+    buf[size] = '\0';
+    fclose(f);
+    return buf;
+}
+
+void fastpy_path_write_text(void *self, const char *content) {
+    const char *cpath = _path_as_cstr(self);
+    FILE *f = fopen(cpath, "w");
+    if (!f) return;
+    fputs(content, f);
+    fclose(f);
+}
+
+const char* fastpy_path_str(void *self) { return _path_as_cstr(self); }
+
+/* iterdir: returns a Python iterator as PyObject* (the codegen
+ * handles list conversion at a higher level). */
+void* fastpy_path_iterdir(void *self) {
+    fpy_cpython_init();
+    /* Return a Python list of Path objects for compatibility */
+    PyObject *iter = PyObject_CallMethod((PyObject*)self, "iterdir", NULL);
+    if (!iter) { PyErr_Print(); Py_RETURN_NONE; }
+    PyObject *lst = PySequence_List(iter);
+    Py_DECREF(iter);
+    if (!lst) { PyErr_Print(); Py_RETURN_NONE; }
+    return (void*)lst;
 }
 
 /* ── Flush Python's stdout (important for subprocess capture) ──── */
@@ -1327,8 +1687,87 @@ static void fpy_sync_pylist_to_fpylist(FpyList *orig, PyObject *mutated) {
     }
 }
 
-/* Sync all LIST-tagged positional arguments from a PyTuple back to
- * their original FpyList after a bridge call. */
+/* FNV-1a hash for string keys — mirrors fpy_bridge_hash_string in objects.c */
+static uint64_t fpy_bridge_hash_string(const char *s) {
+    uint64_t h = 14695981039346656037ULL;
+    while (*s) { h ^= (uint8_t)*s++; h *= 1099511628211ULL; }
+    return h;
+}
+
+/* Sync a mutated PyDict back to the original FpyDict.
+ * Clear all existing entries and rebuild from the PyDict contents. */
+static void fpy_sync_pydict_to_fpydict(FpyDict *orig, PyObject *mutated) {
+    if (!orig || !mutated || !PyDict_Check(mutated)) return;
+
+    /* Clear existing entries — decref values, reset indices */
+    for (int64_t i = 0; i < orig->length; i++) {
+        fpy_rc_decref(orig->keys[i].tag, orig->keys[i].data.i);
+        fpy_rc_decref(orig->values[i].tag, orig->values[i].data.i);
+    }
+    orig->length = 0;
+    for (int64_t i = 0; i < orig->table_size; i++) {
+        orig->indices[i] = FPY_DICT_EMPTY;
+    }
+
+    /* Rebuild from PyDict */
+    PyObject *key, *value;
+    Py_ssize_t pos = 0;
+    while (PyDict_Next(mutated, &pos, &key, &value)) {
+        FpyValue fk, fv;
+        pyobject_to_fpy(key, &fk.tag, &fk.data.i);
+        pyobject_to_fpy(value, &fv.tag, &fv.data.i);
+
+        /* Grow compact arrays if needed */
+        if (orig->length >= orig->capacity) {
+            orig->capacity *= 2;
+            orig->keys = (FpyValue*)realloc(orig->keys,
+                sizeof(FpyValue) * orig->capacity);
+            orig->values = (FpyValue*)realloc(orig->values,
+                sizeof(FpyValue) * orig->capacity);
+        }
+
+        /* Rehash the indices table if load factor > 0.66 */
+        if (orig->length * 3 >= orig->table_size * 2) {
+            int64_t new_size = orig->table_size * 2;
+            orig->indices = (int64_t*)realloc(orig->indices,
+                sizeof(int64_t) * new_size);
+            for (int64_t j = 0; j < new_size; j++)
+                orig->indices[j] = FPY_DICT_EMPTY;
+            orig->table_size = new_size;
+            /* Re-insert all existing entries into new index table */
+            for (int64_t j = 0; j < orig->length; j++) {
+                uint64_t h;
+                if (orig->keys[j].tag == FPY_TAG_STR)
+                    h = fpy_bridge_hash_string(orig->keys[j].data.s);
+                else
+                    h = (uint64_t)orig->keys[j].data.i * 0x9E3779B97F4A7C15ULL;
+                int64_t mask = new_size - 1;
+                int64_t slot = (int64_t)(h & (uint64_t)mask);
+                while (orig->indices[slot] != FPY_DICT_EMPTY)
+                    slot = (slot + 1) & mask;
+                orig->indices[slot] = j;
+            }
+        }
+
+        /* Insert the new entry */
+        uint64_t h;
+        if (fk.tag == FPY_TAG_STR)
+            h = fpy_bridge_hash_string(fk.data.s);
+        else
+            h = (uint64_t)fk.data.i * 0x9E3779B97F4A7C15ULL;
+        int64_t mask = orig->table_size - 1;
+        int64_t slot = (int64_t)(h & (uint64_t)mask);
+        while (orig->indices[slot] != FPY_DICT_EMPTY)
+            slot = (slot + 1) & mask;
+        orig->keys[orig->length] = fk;
+        orig->values[orig->length] = fv;
+        orig->indices[slot] = orig->length;
+        orig->length++;
+    }
+}
+
+/* Sync all LIST-tagged and DICT-tagged positional arguments from a PyTuple
+ * back to their original native containers after a bridge call. */
 static void fpy_sync_list_args(int32_t argc, int32_t *arg_tags,
                                 int64_t *arg_data, PyObject *args_tuple) {
     for (int i = 0; i < argc; i++) {
@@ -1336,6 +1775,10 @@ static void fpy_sync_list_args(int32_t argc, int32_t *arg_tags,
             FpyList *orig = (FpyList*)(intptr_t)arg_data[i];
             PyObject *mutated = PyTuple_GET_ITEM(args_tuple, i);
             fpy_sync_pylist_to_fpylist(orig, mutated);
+        } else if (arg_tags[i] == FPY_TAG_DICT) {
+            FpyDict *orig = (FpyDict*)(intptr_t)arg_data[i];
+            PyObject *mutated = PyTuple_GET_ITEM(args_tuple, i);
+            fpy_sync_pydict_to_fpydict(orig, mutated);
         }
     }
 }

@@ -527,7 +527,17 @@ int32_t fastpy_fv_truthy(int32_t tag, int64_t data) {
             FpyDict *d = (FpyDict*)data;
             return d && d->length != 0;
         }
-        case FPY_TAG_OBJ: return data != 0;
+        case FPY_TAG_OBJ: {
+            if (data == 0) return 0;
+            FpyObj *obj = (FpyObj*)(intptr_t)data;
+            if (obj->magic != FPY_OBJ_MAGIC) {
+                /* CPython PyObject* — use PyObject_IsTrue */
+                extern int64_t fpy_cpython_bool(void*);
+                return (int32_t)fpy_cpython_bool((void*)(intptr_t)data);
+            }
+            /* Native FpyObj — check __bool__ / __len__, default true */
+            return 1;
+        }
         case FPY_TAG_SET: {
             FpyDict *s = (FpyDict*)data;
             return s && s->length != 0;
@@ -536,12 +546,112 @@ int32_t fastpy_fv_truthy(int32_t tag, int64_t data) {
     return 0;
 }
 
+/* FpyValue len() — runtime dispatch based on tag.
+ * Returns the length of the value (string length, list/tuple size,
+ * dict/set size). Returns 0 for types without length. */
+int64_t fastpy_fv_len(int32_t tag, int64_t data) {
+    switch (tag) {
+        case FPY_TAG_STR: {
+            const char *s = (const char*)(intptr_t)data;
+            return s ? (int64_t)strlen(s) : 0;
+        }
+        case FPY_TAG_LIST: {
+            FpyList *lst = (FpyList*)(intptr_t)data;
+            return lst ? lst->length : 0;
+        }
+        case FPY_TAG_DICT:
+        case FPY_TAG_SET: {
+            FpyDict *d = (FpyDict*)(intptr_t)data;
+            return d ? d->length : 0;
+        }
+        case FPY_TAG_OBJ: {
+            /* For objects, try __len__ via bridge or return 0 */
+            FpyObj *obj = (FpyObj*)(intptr_t)data;
+            if (obj && obj->magic != FPY_OBJ_MAGIC) {
+                /* CPython PyObject* — use PyObject_Length */
+                extern int64_t fpy_cpython_len(void*);
+                return fpy_cpython_len((void*)(intptr_t)data);
+            }
+            return 0;  /* native obj without __len__ */
+        }
+        case FPY_TAG_BYTES: {
+            const char *s = (const char*)(intptr_t)data;
+            return s ? (int64_t)strlen(s) : 0;
+        }
+    }
+    return 0;
+}
+
+/* FpyValue subscript — runtime dispatch for container[key].
+ * Handles list (int key), dict (str or int key), and string (int key).
+ * Results are written to *out_tag, *out_data. */
+extern const char* fastpy_str_index(const char*, int64_t);
+/* Forward-declare dict getters (defined later in this file) */
+void fastpy_dict_get_fv(FpyDict*, const char*, int32_t*, int64_t*);
+void fastpy_dict_get_int_fv(FpyDict*, int64_t, int32_t*, int64_t*);
+void fastpy_fv_subscript(int32_t c_tag, int64_t c_data,
+                          int32_t k_tag, int64_t k_data,
+                          int32_t *out_tag, int64_t *out_data) {
+    switch (c_tag) {
+        case FPY_TAG_LIST: {
+            FpyList *lst = (FpyList*)(intptr_t)c_data;
+            /* key must be int for list subscript */
+            int64_t idx = k_data;
+            if (idx < 0) idx += lst->length;
+            if (idx < 0 || idx >= lst->length) {
+                fastpy_raise(FPY_EXC_INDEXERROR, "list index out of range");
+                *out_tag = FPY_TAG_NONE;
+                *out_data = 0;
+                return;
+            }
+            *out_tag = lst->items[idx].tag;
+            *out_data = lst->items[idx].data.i;
+            return;
+        }
+        case FPY_TAG_DICT: {
+            FpyDict *d = (FpyDict*)(intptr_t)c_data;
+            if (k_tag == FPY_TAG_STR) {
+                const char *key = (const char*)(intptr_t)k_data;
+                fastpy_dict_get_fv(d, key, out_tag, out_data);
+            } else {
+                fastpy_dict_get_int_fv(d, k_data, out_tag, out_data);
+            }
+            return;
+        }
+        case FPY_TAG_STR: {
+            const char *s = (const char*)(intptr_t)c_data;
+            int64_t idx = k_data;
+            const char *ch = fastpy_str_index(s, idx);
+            *out_tag = FPY_TAG_STR;
+            *out_data = (int64_t)(intptr_t)ch;
+            return;
+        }
+        case FPY_TAG_OBJ: {
+            /* CPython PyObject* — use bridge __getitem__ */
+            FpyObj *obj = (FpyObj*)(intptr_t)c_data;
+            if (obj && obj->magic != FPY_OBJ_MAGIC) {
+                extern void* fpy_cpython_getitem(void*, int32_t, int64_t);
+                void *result = fpy_cpython_getitem(
+                    (void*)(intptr_t)c_data, k_tag, k_data);
+                *out_tag = FPY_TAG_OBJ;
+                *out_data = (int64_t)(intptr_t)result;
+                return;
+            }
+            break;
+        }
+    }
+    /* Fallback: unsupported subscript */
+    *out_tag = FPY_TAG_NONE;
+    *out_data = 0;
+}
+
 /* FpyValue binary operation — runtime dispatch for Add/Sub/Mul/etc.
  * op: 0=add, 1=sub, 2=mul, 3=div, 4=floordiv, 5=mod
  * Results are written to *out_tag, *out_data. */
 extern const char* fastpy_str_concat(const char*, const char*);
 extern const char* fastpy_str_repeat(const char*, int64_t);
 extern FpyList* fastpy_list_concat(FpyList*, FpyList*);
+extern FpyList* fastpy_list_repeat(FpyList*, int64_t);
 void fastpy_fv_binop(int32_t lt, int64_t ld, int32_t rt, int64_t rd,
                       int32_t op, int32_t *out_tag, int64_t *out_data) {
     /* String + String → concat */
@@ -566,7 +676,20 @@ void fastpy_fv_binop(int32_t lt, int64_t ld, int32_t rt, int64_t rd,
     }
     /* List + List → concat */
     if (lt == FPY_TAG_LIST && rt == FPY_TAG_LIST && op == 0) {
-        FpyList *result = fastpy_list_concat((FpyList*)ld, (FpyList*)rd);
+        FpyList *result = fastpy_list_concat((FpyList*)(intptr_t)ld, (FpyList*)(intptr_t)rd);
+        *out_tag = FPY_TAG_LIST;
+        *out_data = (int64_t)(intptr_t)result;
+        return;
+    }
+    /* List * Int or Int * List → repeat */
+    if (lt == FPY_TAG_LIST && (rt == FPY_TAG_INT || rt == FPY_TAG_BOOL) && op == 2) {
+        FpyList *result = fastpy_list_repeat((FpyList*)(intptr_t)ld, rd);
+        *out_tag = FPY_TAG_LIST;
+        *out_data = (int64_t)(intptr_t)result;
+        return;
+    }
+    if ((lt == FPY_TAG_INT || lt == FPY_TAG_BOOL) && rt == FPY_TAG_LIST && op == 2) {
+        FpyList *result = fastpy_list_repeat((FpyList*)(intptr_t)rd, ld);
         *out_tag = FPY_TAG_LIST;
         *out_data = (int64_t)(intptr_t)result;
         return;
@@ -611,6 +734,37 @@ void fastpy_fv_binop(int32_t lt, int64_t ld, int32_t rt, int64_t rd,
         }
         return;
     }
+    /* BigInt arithmetic — promote INT/BOOL to BigInt if needed */
+    if (lt == FPY_TAG_BIGINT || rt == FPY_TAG_BIGINT) {
+        extern FpyBigInt* fpy_bigint_from_i64(int64_t);
+        extern FpyBigInt* fpy_bigint_add(FpyBigInt*, FpyBigInt*);
+        extern FpyBigInt* fpy_bigint_sub(FpyBigInt*, FpyBigInt*);
+        extern FpyBigInt* fpy_bigint_mul(FpyBigInt*, FpyBigInt*);
+        extern FpyBigInt* fpy_bigint_floordiv(FpyBigInt*, FpyBigInt*);
+        extern FpyBigInt* fpy_bigint_mod(FpyBigInt*, FpyBigInt*);
+        extern FpyBigInt* fpy_bigint_pow(FpyBigInt*, FpyBigInt*);
+        FpyBigInt *la, *ra;
+        if (lt == FPY_TAG_BIGINT) la = (FpyBigInt*)(intptr_t)ld;
+        else la = fpy_bigint_from_i64(ld);
+        if (rt == FPY_TAG_BIGINT) ra = (FpyBigInt*)(intptr_t)rd;
+        else ra = fpy_bigint_from_i64(rd);
+        FpyBigInt *result = NULL;
+        switch (op) {
+            case 0: result = fpy_bigint_add(la, ra); break;
+            case 1: result = fpy_bigint_sub(la, ra); break;
+            case 2: result = fpy_bigint_mul(la, ra); break;
+            case 3: /* truediv — fall through to float */ break;
+            case 4: result = fpy_bigint_floordiv(la, ra); break;
+            case 5: result = fpy_bigint_mod(la, ra); break;
+            default: break;
+        }
+        if (result) {
+            *out_tag = FPY_TAG_BIGINT;
+            *out_data = (int64_t)(intptr_t)result;
+            return;
+        }
+        /* truediv falls through (BigInt / BigInt → float not implemented yet) */
+    }
     /* Promote to float if either operand is float */
     if (lt == FPY_TAG_FLOAT || rt == FPY_TAG_FLOAT) {
         double lf, rf;
@@ -634,6 +788,27 @@ void fastpy_fv_binop(int32_t lt, int64_t ld, int32_t rt, int64_t rd,
         }
         *out_tag = FPY_TAG_FLOAT;
         memcpy(out_data, &result, sizeof(double));
+        return;
+    }
+    /* Guard: container types that weren't handled above → TypeError */
+    if (lt == FPY_TAG_LIST || lt == FPY_TAG_DICT || lt == FPY_TAG_SET ||
+        rt == FPY_TAG_LIST || rt == FPY_TAG_DICT || rt == FPY_TAG_SET ||
+        lt == FPY_TAG_STR  || rt == FPY_TAG_STR) {
+        /* If we reach here, no valid handler matched (e.g. list+int, dict-int,
+         * str+list, etc.) — raise TypeError like CPython does. */
+        static const char *_op_syms[] = {"+", "-", "*", "/", "//", "%"};
+        static const char *_tnames[] = {
+            "int", "float", "str", "bool", "NoneType",
+            "list", "object", "dict", "bytes", "set",
+            "bigint", "complex", "Decimal"};
+        const char *ln = (lt >= 0 && lt <= 12) ? _tnames[lt] : "object";
+        const char *rn = (rt >= 0 && rt <= 12) ? _tnames[rt] : "object";
+        const char *on = (op >= 0 && op <= 5) ? _op_syms[op] : "?";
+        snprintf(_err_buf, sizeof(_err_buf),
+                 "unsupported operand type(s) for %s: '%.40s' and '%.40s'",
+                 on, ln, rn);
+        fastpy_raise(FPY_EXC_TYPEERROR, _err_buf);
+        *out_tag = FPY_TAG_NONE; *out_data = 0;
         return;
     }
     /* Int/Bool arithmetic */
@@ -864,6 +1039,12 @@ static int fpy_value_compare(const void *a, const void *b) {
             return (va->data.f > vb->data.f) - (va->data.f < vb->data.f);
         case FPY_TAG_STR:
             return strcmp(va->data.s, vb->data.s);
+        case FPY_TAG_BIGINT: {
+            extern int fpy_bigint_cmp(FpyBigInt*, FpyBigInt*);
+            FpyBigInt *ba = (FpyBigInt*)(intptr_t)va->data.i;
+            FpyBigInt *bb = (FpyBigInt*)(intptr_t)vb->data.i;
+            return fpy_bigint_cmp(ba, bb);
+        }
         case FPY_TAG_LIST: {
             /* Lexicographic compare of element lists */
             FpyList *la = va->data.list;
@@ -877,6 +1058,26 @@ static int fpy_value_compare(const void *a, const void *b) {
                 if (c != 0) return c;
             }
             return (la->length > lb->length) - (la->length < lb->length);
+        }
+        case FPY_TAG_OBJ: {
+            /* Compare by pointer identity for native objects.
+             * For PyObject*, use CPython rich comparison. */
+            void *pa = va->data.obj;
+            void *pb = vb->data.obj;
+            if (!pa && !pb) return 0;
+            if (!pa) return -1;
+            if (!pb) return 1;
+            FpyObj *oa = (FpyObj*)pa;
+            if (oa->magic != FPY_OBJ_MAGIC) {
+                /* Both are PyObject* (same tag) — use CPython compare */
+                extern int32_t fpy_cpython_compare(void*, void*, int32_t);
+                /* Lt returns 1 if pa < pb */
+                if (fpy_cpython_compare(pa, pb, 2)) return -1;
+                if (fpy_cpython_compare(pa, pb, 4)) return 1;
+                return 0;
+            }
+            /* Native FpyObj — compare by pointer identity */
+            return (pa > pb) - (pa < pb);
         }
         default:
             return 0;
@@ -1261,6 +1462,29 @@ void fastpy_dict_get_fv(FpyDict *dict, const char *key,
     }
     fastpy_raise(FPY_EXC_KEYERROR, key);
     *out_tag = FPY_TAG_NONE; *out_data = 0; return;
+}
+
+/* Safe variant: returns NONE for missing keys without raising.
+ * Used by match/case MatchMapping pattern to probe for keys. */
+void fastpy_dict_get_fv_safe(FpyDict *dict, const char *key,
+                              int32_t *out_tag, int64_t *out_data) {
+    uint64_t h = fpy_hash_string(key);
+    int64_t mask = dict->table_size - 1;
+    int64_t slot = (int64_t)(h & (uint64_t)mask);
+    while (1) {
+        int64_t idx = dict->indices[slot];
+        if (idx == FPY_DICT_EMPTY) break;
+        if (idx != FPY_DICT_DELETED
+                && dict->keys[idx].tag == FPY_TAG_STR
+                && (dict->keys[idx].data.s == key
+                    || strcmp(dict->keys[idx].data.s, key) == 0)) {
+            *out_tag = dict->values[idx].tag;
+            *out_data = dict->values[idx].data.i;
+            return;
+        }
+        slot = (slot + 1) & mask;
+    }
+    *out_tag = FPY_TAG_NONE; *out_data = 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -2737,6 +2961,21 @@ void fastpy_list_reverse(FpyList *list) {
     FPY_UNLOCK(list);
 }
 
+/* Reverse the first `count` elements of a list in place.
+ * Used to optimize `a[:k+1] = a[k::-1]` (prefix reverse)
+ * without allocating a temporary reversed copy.  O(count/2) swaps. */
+void fastpy_list_reverse_prefix(FpyList *list, int64_t count) {
+    if (count > list->length) count = list->length;
+    if (count <= 1) return;
+    FPY_LOCK(list);
+    for (int64_t i = 0; i < count / 2; i++) {
+        FpyValue tmp = list->items[i];
+        list->items[i] = list->items[count - 1 - i];
+        list->items[count - 1 - i] = tmp;
+    }
+    FPY_UNLOCK(list);
+}
+
 /* String find — return index of substring, -1 if not found */
 int64_t fastpy_str_find(const char *s, const char *sub) {
     const char *p = strstr(s, sub);
@@ -3200,10 +3439,24 @@ int64_t fastpy_list_compare(FpyList *a, FpyList *b) {
         if (va.tag != vb.tag) {
             /* Coerce int/bool/float to double for numeric compare */
             int num_a = va.tag == FPY_TAG_INT || va.tag == FPY_TAG_BOOL
-                        || va.tag == FPY_TAG_FLOAT;
+                        || va.tag == FPY_TAG_FLOAT || va.tag == FPY_TAG_BIGINT;
             int num_b = vb.tag == FPY_TAG_INT || vb.tag == FPY_TAG_BOOL
-                        || vb.tag == FPY_TAG_FLOAT;
+                        || vb.tag == FPY_TAG_FLOAT || vb.tag == FPY_TAG_BIGINT;
             if (num_a && num_b) {
+                /* If either is BigInt, use BigInt comparison */
+                if (va.tag == FPY_TAG_BIGINT || vb.tag == FPY_TAG_BIGINT) {
+                    extern int fpy_bigint_cmp(FpyBigInt*, FpyBigInt*);
+                    extern FpyBigInt* fpy_bigint_from_i64(int64_t);
+                    FpyBigInt *ba = va.tag == FPY_TAG_BIGINT
+                        ? (FpyBigInt*)(intptr_t)va.data.i
+                        : fpy_bigint_from_i64(va.data.i);
+                    FpyBigInt *bb = vb.tag == FPY_TAG_BIGINT
+                        ? (FpyBigInt*)(intptr_t)vb.data.i
+                        : fpy_bigint_from_i64(vb.data.i);
+                    int r = fpy_bigint_cmp(ba, bb);
+                    if (r != 0) { return r < 0 ? -1 : 1; }
+                    continue;
+                }
                 double fa = va.tag == FPY_TAG_FLOAT ? va.data.f : (double)va.data.i;
                 double fb = vb.tag == FPY_TAG_FLOAT ? vb.data.f : (double)vb.data.i;
                 if (fa < fb) return -1;
@@ -3230,6 +3483,14 @@ int64_t fastpy_list_compare(FpyList *a, FpyList *b) {
             }
             case FPY_TAG_NONE:
                 break;
+            case FPY_TAG_BIGINT: {
+                extern int fpy_bigint_cmp(FpyBigInt*, FpyBigInt*);
+                int r = fpy_bigint_cmp(
+                    (FpyBigInt*)(intptr_t)va.data.i,
+                    (FpyBigInt*)(intptr_t)vb.data.i);
+                if (r != 0) return r < 0 ? -1 : 1;
+                break;
+            }
             case FPY_TAG_LIST: {
                 int64_t r = fastpy_list_compare(va.data.list, vb.data.list);
                 if (r != 0) return r;

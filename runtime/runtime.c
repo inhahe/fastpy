@@ -614,6 +614,8 @@ extern void fastpy_fv_write(int32_t, int64_t);
 extern const char* fastpy_fv_repr(int32_t, int64_t);
 extern const char* fastpy_fv_str(int32_t, int64_t);
 extern int32_t fastpy_fv_truthy(int32_t, int64_t);
+extern int64_t fastpy_fv_len(int32_t, int64_t);
+extern void fastpy_fv_subscript(int32_t, int64_t, int32_t, int64_t, int32_t*, int64_t*);
 extern void fastpy_fv_binop(int32_t, int64_t, int32_t, int64_t, int32_t, int32_t*, int64_t*);
 extern void fastpy_raise(int, const char*);
 extern int32_t fastpy_exc_pending(void);
@@ -628,6 +630,7 @@ extern void fastpy_list_set_fv(FpyList*, int64_t, int32_t, int64_t);
 extern int64_t fastpy_list_length(FpyList*);
 extern FpyList* fastpy_list_sorted(FpyList*);
 extern FpyList* fastpy_list_reversed(FpyList*);
+extern void fastpy_list_reverse_prefix(FpyList*, int64_t);
 extern FpyList* fastpy_list_copy(FpyList*);
 extern void fastpy_list_clear(FpyList*);
 extern void fastpy_list_extend(FpyList*, FpyList*);
@@ -636,6 +639,7 @@ extern FpyList* fastpy_list_concat(FpyList*, FpyList*);
 extern FpyDict* fastpy_dict_new(void);
 extern void fastpy_dict_set_fv(FpyDict*, const char*, int32_t, int64_t);
 extern void fastpy_dict_get_fv(FpyDict*, const char*, int32_t*, int64_t*);
+extern void fastpy_dict_get_fv_safe(FpyDict*, const char*, int32_t*, int64_t*);
 extern int64_t fastpy_dict_length(FpyDict*);
 extern FpyList* fastpy_dict_keys(FpyDict*);
 extern FpyList* fastpy_dict_values(FpyDict*);
@@ -685,6 +689,11 @@ extern void fpy_cpython_call2(void*, int32_t, int64_t, int32_t, int64_t, int32_t
 extern void fpy_cpython_call3(void*, int32_t, int64_t, int32_t, int64_t, int32_t, int64_t, int32_t*, int64_t*);
 extern void fpy_cpython_call_kw(void*, int32_t, int32_t*, int64_t*, int32_t, const char**, int32_t*, int64_t*, int32_t*, int64_t*);
 extern void fpy_cpython_to_fv(void*, int32_t*, int64_t*);
+extern void fpy_fv_call_method0(int32_t, int64_t, const char*, int32_t*, int64_t*);
+extern void fpy_fv_call_method1(int32_t, int64_t, const char*, int32_t, int64_t, int32_t*, int64_t*);
+extern void fpy_fv_call_method2(int32_t, int64_t, const char*, int32_t, int64_t, int32_t, int64_t, int32_t*, int64_t*);
+extern void fpy_fv_call_method3(int32_t, int64_t, const char*, int32_t, int64_t, int32_t, int64_t, int32_t, int64_t, int32_t*, int64_t*);
+extern void fpy_fv_getattr(int32_t, int64_t, const char*, int32_t*, int64_t*);
 extern int64_t fpy_cpython_len(void*);
 extern int64_t fpy_cpython_bool(void*);
 extern void fpy_cpython_flush(void);
@@ -703,15 +712,16 @@ static FpySymEntry fpy_jit_symbols[] = {
     SYM(fastpy_print_newline),
     SYM(fastpy_fv_print), SYM(fastpy_fv_write),
     SYM(fastpy_fv_repr), SYM(fastpy_fv_str), SYM(fastpy_fv_truthy),
-    SYM(fastpy_fv_binop),
+    SYM(fastpy_fv_len), SYM(fastpy_fv_subscript), SYM(fastpy_fv_binop),
     SYM(fastpy_raise), SYM(fastpy_exc_pending), SYM(fastpy_exc_clear),
     SYM(fastpy_exc_get_type), SYM(fastpy_exc_get_msg), SYM(fastpy_exc_name_to_id),
     SYM(fastpy_list_new), SYM(fastpy_list_append_fv),
     SYM(fastpy_list_get_fv), SYM(fastpy_list_set_fv),
     SYM(fastpy_list_length), SYM(fastpy_list_sorted), SYM(fastpy_list_reversed),
+    SYM(fastpy_list_reverse_prefix),
     SYM(fastpy_list_copy), SYM(fastpy_list_clear),
     SYM(fastpy_list_extend), SYM(fastpy_list_sort), SYM(fastpy_list_concat),
-    SYM(fastpy_dict_new), SYM(fastpy_dict_set_fv), SYM(fastpy_dict_get_fv),
+    SYM(fastpy_dict_new), SYM(fastpy_dict_set_fv), SYM(fastpy_dict_get_fv), SYM(fastpy_dict_get_fv_safe),
     SYM(fastpy_dict_length), SYM(fastpy_dict_keys), SYM(fastpy_dict_values),
     SYM(fastpy_dict_items), SYM(fastpy_dict_has_key), SYM(fastpy_dict_update),
     SYM(fastpy_dict_equal), SYM(fastpy_set_equal),
@@ -732,7 +742,11 @@ static FpySymEntry fpy_jit_symbols[] = {
     SYM(fpy_cpython_import), SYM(fpy_cpython_getattr),
     SYM(fpy_cpython_call0), SYM(fpy_cpython_call1), SYM(fpy_cpython_call2),
     SYM(fpy_cpython_call3), SYM(fpy_cpython_call_kw),
-    SYM(fpy_cpython_to_fv), SYM(fpy_cpython_len), SYM(fpy_cpython_bool),
+    SYM(fpy_cpython_to_fv),
+    SYM(fpy_fv_call_method0), SYM(fpy_fv_call_method1),
+    SYM(fpy_fv_call_method2), SYM(fpy_fv_call_method3),
+    SYM(fpy_fv_getattr),
+    SYM(fpy_cpython_len), SYM(fpy_cpython_bool),
     SYM(fpy_cpython_flush), SYM(fpy_cpython_iter), SYM(fpy_cpython_iter_next),
     SYM(fpy_jit_exec), SYM(fpy_jit_import),
     SYM(fpy_rc_incref), SYM(fpy_rc_decref),
@@ -761,7 +775,14 @@ int fastpy_get_jit_symbol_count(void) {
     return n;
 }
 
-int main(void) {
+/* Command-line argument storage (populated by main).
+ * Non-static so cpython_bridge.c can extern-reference them. */
+int    fpy_argc = 0;
+char **fpy_argv = NULL;
+
+int main(int argc, char *argv[]) {
+    fpy_argc = argc;
+    fpy_argv = argv;
 #ifdef _WIN32
     /* Ensure stdout/stderr are in text mode so \n → \r\n conversion
      * matches CPython's behavior. C runtime may default to binary
@@ -818,10 +839,16 @@ void fastpy_sys_exit(int64_t code) {
     exit((int)code);
 }
 
-/* sys.argv — returns an empty list (AOT-compiled programs don't
- * receive Python argv by default; future: link to main(argc, argv)) */
+/* sys.argv — returns the real command-line arguments. */
 FpyList* fastpy_sys_argv(void) {
-    return fpy_list_new(4);
+    FpyList *lst = fpy_list_new(fpy_argc > 4 ? fpy_argc : 4);
+    for (int i = 0; i < fpy_argc; i++) {
+        FpyValue v;
+        v.tag = FPY_TAG_STR;
+        v.data.s = fpy_argv[i];
+        fpy_list_append(lst, v);
+    }
+    return lst;
 }
 
 /* sys.platform */
@@ -1337,118 +1364,12 @@ extern const char* fastpy_os_getcwd(void);
 extern FpyList* fastpy_os_listdir(const char *path);
 
 /* Path(str) → just returns the string (Path IS a string internally) */
-const char* fastpy_path_new(const char *s) {
-    return s ? fpy_strdup(s) : fpy_strdup(".");
-}
+/* Path() — implemented in cpython_bridge.c */
 
-/* Path.cwd() → current working directory */
-const char* fastpy_path_cwd(void) {
-    return fastpy_os_getcwd();
-}
-
-/* path / other → join paths (operator /) */
-const char* fastpy_path_join(const char *self, const char *other) {
-    return fastpy_os_path_join(self, other);
-}
-
-/* path.exists() → bool */
-int64_t fastpy_path_exists(const char *self) {
-    return fastpy_os_path_exists(self);
-}
-
-/* path.is_file() → bool */
-int64_t fastpy_path_is_file(const char *self) {
-    return fastpy_os_path_isfile(self);
-}
-
-/* path.is_dir() → bool */
-int64_t fastpy_path_is_dir(const char *self) {
-    return fastpy_os_path_isdir(self);
-}
-
-/* path.name → basename */
-const char* fastpy_path_name(const char *self) {
-    return fastpy_os_path_basename(self);
-}
-
-/* path.parent → dirname */
-const char* fastpy_path_parent(const char *self) {
-    return fastpy_os_path_dirname(self);
-}
-
-/* path.suffix → extension (e.g. ".py") */
-const char* fastpy_path_suffix(const char *self) {
-    const char *base = fastpy_os_path_basename(self);
-    const char *dot = NULL;
-    for (const char *p = base; *p; p++) {
-        if (*p == '.') dot = p;
-    }
-    if (dot && dot != base) return fpy_strdup(dot);
-    return fpy_strdup("");
-}
-
-/* path.stem → filename without extension */
-const char* fastpy_path_stem(const char *self) {
-    const char *base = fastpy_os_path_basename(self);
-    const char *dot = NULL;
-    for (const char *p = base; *p; p++) {
-        if (*p == '.') dot = p;
-    }
-    if (dot && dot != base) {
-        int len = (int)(dot - base);
-        char *buf = (char*)malloc(len + 1);
-        memcpy(buf, base, len);
-        buf[len] = '\0';
-        return buf;
-    }
-    return fpy_strdup(base);
-}
-
-/* path.resolve() → absolute path */
-const char* fastpy_path_resolve(const char *self) {
-#ifdef _WIN32
-    char buf[4096];
-    DWORD n = GetFullPathNameA(self, sizeof(buf), buf, NULL);
-    if (n > 0 && n < sizeof(buf)) return fpy_strdup(buf);
-    return fpy_strdup(self);
-#else
-    char *resolved = realpath(self, NULL);
-    if (resolved) return resolved;  /* realpath mallocs */
-    return fpy_strdup(self);
-#endif
-}
-
-/* path.iterdir() → list of Path strings in directory */
-FpyList* fastpy_path_iterdir(const char *self) {
-    return fastpy_os_listdir(self);
-}
-
-/* path.read_text() → file contents as string */
-const char* fastpy_path_read_text(const char *self) {
-    FILE *f = fopen(self, "rb");
-    if (!f) return fpy_strdup("");
-    fseek(f, 0, SEEK_END);
-    long size = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    char *buf = (char*)malloc(size + 1);
-    fread(buf, 1, size, f);
-    buf[size] = '\0';
-    fclose(f);
-    return buf;
-}
-
-/* path.write_text(content) → writes string to file */
-void fastpy_path_write_text(const char *self, const char *content) {
-    FILE *f = fopen(self, "w");
-    if (!f) return;
-    fputs(content, f);
-    fclose(f);
-}
-
-/* str(path) / repr(path) — just returns the path string */
-const char* fastpy_path_str(const char *self) {
-    return self;
-}
+/* ── Path functions: now implemented in cpython_bridge.c ──
+ * All path functions accept PyObject* (real pathlib.Path objects).
+ * Declarations are extern — implementations live in cpython_bridge.c
+ * where Python.h is available. */
 
 /* path.with_suffix(suffix) → new path with different extension */
 const char* fastpy_path_with_suffix(const char *self, const char *suffix) {

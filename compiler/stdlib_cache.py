@@ -35,6 +35,178 @@ from pathlib import Path
 _CACHE_VERSION = "1"
 
 
+def _is_c_extension_wrapper(source_path: Path) -> bool:
+    """Detect stdlib modules that are thin wrappers around C extensions.
+
+    Many stdlib .py files (ast, collections, json, …) get most of their
+    public API from ``from _foo import *``.  The source merger can't prefix
+    star-imported names, so merging these modules breaks attribute access
+    (e.g. ``ast.Constant`` → ``ast__Constant`` but ``Constant`` was never
+    defined in the prefixed Python source).
+
+    Heuristic: parse the first ~50 statements; if any is
+    ``from _<name> import *``, treat the module as a C-extension wrapper.
+    """
+    try:
+        source = source_path.read_text(encoding="utf-8")
+        tree = ast.parse(source)
+    except (OSError, SyntaxError):
+        return False
+    for node in tree.body[:50]:
+        if (isinstance(node, ast.ImportFrom)
+                and node.module
+                and node.module.startswith("_")
+                and node.names
+                and any(alias.name == "*" for alias in node.names)):
+            return True
+    return False
+
+
+def _expand_star_imports(source: str) -> str | None:
+    """Try to expand star imports from C extension modules.
+
+    Replaces ``from _foo import *`` with explicit named imports by
+    importing the C extension module at compile time and enumerating
+    its ``__all__`` (or ``dir()`` for modules without ``__all__``).
+
+    Returns the expanded source string, or None if expansion fails
+    (e.g. the C extension can't be imported).
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return None
+
+    modified = False
+    new_body: list[ast.stmt] = []
+
+    for node in tree.body:
+        if (isinstance(node, ast.ImportFrom)
+                and node.module
+                and node.module.startswith("_")
+                and node.names
+                and any(alias.name == "*" for alias in node.names)):
+            # Try to import the C extension and enumerate names
+            try:
+                mod = __import__(node.module)
+                if hasattr(mod, "__all__"):
+                    names = list(mod.__all__)
+                else:
+                    names = [n for n in dir(mod) if not n.startswith("_")]
+                if not names:
+                    return None  # empty module — can't expand
+                # Replace star import with explicit named imports
+                new_names = [ast.alias(name=n) for n in sorted(names)]
+                new_node = ast.ImportFrom(
+                    module=node.module, names=new_names, level=0)
+                ast.copy_location(new_node, node)
+                new_body.append(new_node)
+                modified = True
+            except (ImportError, ModuleNotFoundError):
+                return None  # can't import → can't expand
+        else:
+            new_body.append(node)
+
+    if not modified:
+        return None
+
+    new_tree = ast.Module(body=new_body, type_ignores=[])
+    ast.fix_missing_locations(new_tree)
+    return ast.unparse(new_tree)
+
+
+def _is_self_contained_package(init_path: Path) -> bool:
+    """Check if a package __init__.py is self-contained (no submodule imports).
+
+    A self-contained package has all its code in __init__.py without
+    importing from its own submodules.  Such packages can be merged as if
+    they were single-file modules.
+
+    Returns False if the __init__.py has relative imports (``from . import X``,
+    ``from .submod import Y``) or if it imports from its own submodules
+    via absolute imports (``from pkg.submod import Y``).
+    """
+    try:
+        source = init_path.read_text(encoding="utf-8")
+        tree = ast.parse(source)
+    except (OSError, SyntaxError):
+        return False
+
+    pkg_name = init_path.parent.name
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            # Any relative import (level > 0) means submodule dependency
+            if node.level and node.level > 0:
+                return False
+            # Absolute import from own package: from pkg.sub import X
+            if node.module and node.module.startswith(pkg_name + "."):
+                return False
+        elif isinstance(node, ast.Import):
+            # import pkg.submod
+            for alias in node.names:
+                if alias.name.startswith(pkg_name + "."):
+                    return False
+    return True
+
+
+def _get_package_submodule_imports(init_path: Path) -> list[str] | None:
+    """Get list of submodule names imported by a package's __init__.py.
+
+    Returns a list of submodule names (e.g. ["decoder", "encoder"] for json)
+    or None if the package uses patterns too complex to handle (star imports
+    from submodules, dynamic imports, etc.).
+
+    Only handles:
+    - ``from .submod import name1, name2``
+    - ``from . import submod``
+    """
+    try:
+        source = init_path.read_text(encoding="utf-8")
+        tree = ast.parse(source)
+    except (OSError, SyntaxError):
+        return None
+
+    pkg_dir = init_path.parent
+    pkg_name = init_path.parent.name
+    submodules: list[str] = []
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            if node.level and node.level > 0:
+                # Relative import
+                if node.module:
+                    # from .decoder import X — module is the submodule
+                    parts = node.module.split(".")
+                    submod = parts[0]
+                    # Reject star imports from submodules
+                    if any(a.name == "*" for a in node.names):
+                        return None
+                    # Only include if the submodule is a .py file
+                    submod_path = pkg_dir / (submod + ".py")
+                    if submod_path.is_file():
+                        if submod not in submodules:
+                            submodules.append(submod)
+                else:
+                    # from . import submod1, submod2
+                    for alias in node.names:
+                        submod_path = pkg_dir / (alias.name + ".py")
+                        if submod_path.is_file():
+                            if alias.name not in submodules:
+                                submodules.append(alias.name)
+            elif node.module and node.module.startswith(pkg_name + "."):
+                # Absolute import from own package: from pkg.sub import X
+                submod = node.module[len(pkg_name) + 1:].split(".")[0]
+                if any(a.name == "*" for a in node.names):
+                    return None
+                submod_path = pkg_dir / (submod + ".py")
+                if submod_path.is_file():
+                    if submod not in submodules:
+                        submodules.append(submod)
+
+    return submodules
+
+
 @dataclass
 class CacheEntry:
     """Cached compilability verdict for a single stdlib module."""
@@ -67,6 +239,11 @@ class StdlibResolver:
         self._hard_blocklist: set[str] = set()
         # Cache find results
         self._find_cache: dict[str, Path | None] = {}
+        # Star-import expanded sources: path → expanded source text.
+        # When a C-extension wrapper has its star imports expanded, the
+        # expanded source is stored here so test_compilability and the
+        # pipeline merger read the expanded version instead of the original.
+        self.expanded_sources: dict[str, str] = {}
 
     @property
     def stdlib_dir(self) -> Path:
@@ -95,8 +272,39 @@ class StdlibResolver:
         if module_name in self._hard_blocklist:
             return None
 
-        # Skip dotted names for now (packages like xml.etree.ElementTree)
+        # Handle dotted names: pkg.submod → pkg/submod.py
         if "." in module_name:
+            parts = module_name.split(".")
+            # Check if the top-level package is in the blocklist
+            if parts[0] in self._native_blocklist:
+                return None
+            if parts[0] in self._hard_blocklist:
+                return None
+            # Resolve: pkg/submod.py or pkg/submod/__init__.py
+            rel = Path(*parts[:-1]) / (parts[-1] + ".py")
+            candidate = self._stdlib_dir / rel
+            if candidate.is_file():
+                if _is_c_extension_wrapper(candidate):
+                    source = candidate.read_text(encoding="utf-8")
+                    expanded = _expand_star_imports(source)
+                    if expanded is not None:
+                        key = str(candidate.resolve())
+                        self.expanded_sources[key] = expanded
+                        return candidate
+                    return None
+                return candidate
+            rel = Path(*parts) / "__init__.py"
+            candidate = self._stdlib_dir / rel
+            if candidate.is_file():
+                if _is_c_extension_wrapper(candidate):
+                    source = candidate.read_text(encoding="utf-8")
+                    expanded = _expand_star_imports(source)
+                    if expanded is not None:
+                        key = str(candidate.resolve())
+                        self.expanded_sources[key] = expanded
+                        return candidate
+                    return None
+                return candidate
             return None
 
         # Skip private/internal modules
@@ -106,15 +314,58 @@ class StdlibResolver:
         # Look for module_name.py in stdlib
         candidate = self._stdlib_dir / (module_name + ".py")
         if candidate.is_file():
+            # C-extension wrappers: try to expand star imports by
+            # importing the C extension at compile time and enumerating
+            # its exported names.  If expansion succeeds, the module can
+            # be merged with the expanded (explicit) imports.
+            if _is_c_extension_wrapper(candidate):
+                source = candidate.read_text(encoding="utf-8")
+                expanded = _expand_star_imports(source)
+                if expanded is not None:
+                    key = str(candidate.resolve())
+                    self.expanded_sources[key] = expanded
+                    return candidate
+                return None  # can't expand → reject
             return candidate
 
         # Look for package: module_name/__init__.py
         candidate = self._stdlib_dir / module_name / "__init__.py"
         if candidate.is_file():
-            # Only merge simple packages (single __init__.py without
-            # complex submodule imports). For now, skip packages entirely
-            # and only merge single-file modules.
-            return None
+            # C-extension wrapper packages: try to expand star imports
+            if _is_c_extension_wrapper(candidate):
+                source = candidate.read_text(encoding="utf-8")
+                expanded = _expand_star_imports(source)
+                if expanded is None:
+                    return None
+                key = str(candidate.resolve())
+                self.expanded_sources[key] = expanded
+            # Self-contained packages (no submodule imports): merge as
+            # single file, treating __init__.py like a regular module.
+            if _is_self_contained_package(candidate):
+                return candidate
+            # Packages with simple submodule imports: still return the
+            # __init__.py — the merger will handle submodule resolution
+            # via _get_package_submodule_imports().
+            submodules = _get_package_submodule_imports(candidate)
+            if submodules is not None:
+                # Check submodules are not C-extension wrappers
+                pkg_dir = candidate.parent
+                all_ok = True
+                for sub in submodules:
+                    sub_path = pkg_dir / (sub + ".py")
+                    if sub_path.is_file() and _is_c_extension_wrapper(sub_path):
+                        all_ok = False
+                        break
+                    # Also reject private submodules that are C extensions
+                    if sub.startswith("_"):
+                        sub_c = pkg_dir / (sub + ".pyd")
+                        sub_so = pkg_dir / (sub + ".so")
+                        if (not (pkg_dir / (sub + ".py")).is_file()
+                                and (sub_c.is_file() or sub_so.is_file())):
+                            all_ok = False
+                            break
+                if all_ok:
+                    return candidate
 
         return None
 
@@ -303,14 +554,18 @@ def _get_native_modules() -> set[str]:
         }
 
 
-def test_compilability(module_name: str, source_path: Path) -> tuple[bool, str | None, str | None]:
+def test_compilability(module_name: str, source_path: Path,
+                       expanded_source: str | None = None) -> tuple[bool, str | None, str | None]:
     """Test whether a stdlib module can be compiled by fastpy.
+
+    When *expanded_source* is provided (from star-import expansion), use
+    it instead of reading from *source_path*.
 
     Returns (compilable, prefixed_source_or_none, error_or_none).
     """
     from compiler.pipeline import _strip_main_block, _prefix_module_defs
 
-    source = source_path.read_text(encoding="utf-8")
+    source = expanded_source or source_path.read_text(encoding="utf-8")
     source = _strip_main_block(source)
     prefix = module_name.replace(".", "_")
     prefixed = _prefix_module_defs(source, prefix)

@@ -1,6 +1,6 @@
 # Fastpy Python 3.14 Compatibility Status
 
-Last updated 2026-04-22.
+Last updated 2026-04-28.
 
 ## Fully native (no CPython bridge)
 
@@ -47,10 +47,22 @@ match/case with literal, capture, guard, or, wildcard, sequence, singleton
 patterns. Tested: literal, string, capture, wildcard, or, guard, sequence,
 nested sequence, singleton (None/True/False), mixed singleton+literal.
 
-**Missing pattern types** (silently treated as never-match):
-- `MatchStar` — `case [first, *rest]:`
-- `MatchMapping` — `case {"key": val}:`
-- `MatchClass` — `case Point(x, y):`
+**Missing pattern types**: none — all pattern types are now implemented.
+
+**Formerly missing, now implemented:**
+- `MatchStar` — `case [first, *rest]:` captures remaining elements into
+  a sub-list. Supports prefix-only (`[first, *rest]`), suffix-only
+  (`[*rest, last]`), and both (`[first, *mid, last]`). Unnamed star
+  (`*_`) acts as wildcard.
+- `MatchMapping` — `case {"key": val}:` matches dict structure by
+  probing for each key. Uses safe lookup (`dict_get_fv_safe`) that
+  returns NONE for missing keys instead of raising KeyError. Supports
+  nested pattern matching on values.
+- `MatchClass` — `case Point(x=1, y=2):` and `case int(n):`. Supports
+  builtin type patterns (int/str/float/bool/list/dict), user class
+  keyword patterns, and positional patterns via `__match_args__`.
+  isinstance check short-circuits before slot reads to prevent
+  cross-class memory access.
 
 ### Imports (native)
 math module (direct libm calls), json module (native parser/serializer),
@@ -103,6 +115,225 @@ These features work correctly but use the embedded CPython interpreter:
 - **Dynamic eval()/exec()** with non-literal string arguments
 - **Other stdlib modules** not implemented natively (e.g., collections,
   itertools, functools — except singledispatch which is native)
+
+## Bugs fixed (2026-04-28, type dispatch & merger)
+
+### 37. Invalid binop type combinations crashed with access violation (fixed)
+`[1,2,3] + 5` caused an access violation instead of raising TypeError.
+Root cause: (1) The compiler's slow-path binop handler passed native
+container pointers (FpyList*, FpyDict*) to `cpython_binop` which expects
+PyObject*. (2) The runtime `fastpy_fv_binop` had no guard before the
+INT/BOOL arithmetic fallback — list pointers were treated as integers.
+Fix: Added a compiler guard that routes native container types (list, dict,
+set, tuple, str, bytes) through `fv_binop` instead of `cpython_binop`.
+Added `list * int` / `int * list` repeat support to `fv_binop`. Added a
+TypeError guard in `fv_binop` before the INT/BOOL fallback for any
+remaining container+scalar combinations. Error message matches CPython:
+`unsupported operand type(s) for +: 'list' and 'int'`.
+
+### 38. Unknown-type parameters defaulted to int/str instead of runtime dispatch (fixed)
+Functions called with forwarded or dynamically-typed arguments had their
+parameters tagged as "str" (pointer) or "int" (non-pointer) even when
+the actual type was unknown. This caused incorrect method dispatch (e.g.
+`len(item)` on a list param tagged "str" would call `str_len`).
+Root cause: Post-merge cleanup only cleared float+unknown conflicts, not
+pointer+unknown. The parameter tag fallback only checked for multiple
+conflicting types, not for the presence of unknown callers.
+Fix: Extended post-merge cleanup to clear pointer-type param tags when
+unknown callers exist. Extended the tag fallback to use "mixed" (runtime
+dispatch via FpyValue tags) when any caller has an unknown argument type.
+
+## Bugs fixed (2026-04-28, annotations & dispatch)
+
+### 27. Type annotations ignored for codegen (fixed)
+`def f(x: int) -> str` had no effect on code generation. All type inference
+was structural (AST pattern matching on assignments).
+Fix: Added always-on annotation reading for function parameters (no --typed
+flag required). Reads container annotations (list[int], dict[str,int]),
+scalar types (int, float, str, bool), bridge types (Path), module-qualified
+types (pathlib.Path), and user class names. Sets the compile-time type tag
+on FV-backed variables, enabling correct method dispatch for typed parameters.
+Example: `def find_root(d: Path): return d.resolve()` now works because
+`d` is tagged as "path", enabling `_is_path_expr` to recognize it.
+
+### 28. `enumerate(..., start=N)` keyword argument ignored (fixed)
+`for i, v in enumerate(lst, start=10)` started at 0 instead of 10.
+Root cause: The inline enumerate optimization (`_emit_for_enumerate_inline`)
+only checked positional args (`call.args`), not keyword args (`call.keywords`).
+`start=10` is a keyword argument, not positional.
+Fix: Added keyword argument scan for "start" in the inline enumerate emitter.
+
+### 29. `MatchStar` pattern treated as never-match (fixed)
+`case [first, *rest]:` silently failed to match. The MatchSequence handler
+only supported exact-length matching, with no MatchStar support.
+Fix: Enhanced MatchSequence to detect MatchStar sub-patterns. Uses
+`>= min_length` instead of `== exact_length`. Matches prefix patterns from
+the start, suffix patterns from the end, and creates a sub-list via
+`list_slice` for the star capture variable.
+
+### 30. `MatchMapping` pattern treated as never-match (fixed)
+`case {"key": val}:` silently failed to match. No MatchMapping handler existed.
+Fix: Added MatchMapping handler that checks tag==DICT, probes for each key
+using `dict_get_fv_safe` (new function: returns NONE for missing keys without
+raising KeyError), and recursively matches sub-patterns on the values.
+
+### 31. Path attribute chaining crashed in FV context (fixed)
+`p.parent.name` where `p: Path` crashed with access violation. The
+intermediate `p.parent` result (a PyObject*) was caught by the generic
+object attribute handler in `_load_or_wrap_fv`, which called `obj_get_fv`
+on a PyObject* (expects FpyObj*).
+Fix: Added path-expression early-exit in `_load_or_wrap_fv` before the
+generic object handler — evaluates the full expression via `_emit_expr_value`
+which correctly dispatches to path runtime functions.
+
+### 32. MatchClass builtin type patterns caused refcount corruption (fixed)
+`case int(n): / case str(s):` stored the capture variable unconditionally
+even when the tag check failed. With compile-time type_tag "int", the
+scalar-optimization path skipped rc_incref. At scope exit, rc_decref ran
+on the runtime tag (e.g. STR for a string subject), freeing memory
+without a matching incref → heap corruption (non-deterministic crashes).
+Fix: Added conditional branch so variable binding only executes when the
+tag check passes. Also use correct per-type compile-time tag ("str" for
+str patterns, "float" for float, etc.).
+
+### 33. MatchClass user-class patterns read slots on wrong class (fixed)
+`case Point(x=x, y=y):` followed by `case Color(r=r, g=g, b=b):`
+read Point's slot indices on a Color object when isinstance failed,
+potentially corrupting refcounts for heap-typed attributes.
+Fix: Added isinstance short-circuit — branch to fail_block immediately
+on isinstance failure before any slot reads.
+
+### 34. Return type annotations ignored (fixed)
+`-> str` on function definitions had no effect on code generation. The
+LLVM return type was set correctly from the annotation, but `ret_tag`
+(the semantic type visible to call sites) was computed solely from
+analyzing return statements in the function body.
+Fix: After structural inference, override `ret_tag` from the return
+annotation when present. Supports scalar types, containers, user
+classes, None, and bridge types (pathlib.Path). Call sites now see
+the annotated return type for correct dispatch (e.g., `.upper()` on
+a `-> str` function's return value).
+
+### 35. Unknown-type `+` on FpyValues corrupted string data (fixed)
+`d["a"] + d["b"]` where both values are strings returned garbage
+(string pointers bitcast to double). The UNKNOWN+UNKNOWN binop path
+had no handler for string concatenation — it unconditionally converted
+both operands to double and did float arithmetic.
+Fix: Added runtime tag check in the UNKNOWN binop Add path. If both
+FpyValue operands have tag STR, dispatch to str_concat. Otherwise
+fall through to the numeric path.
+
+### 36. Bridge dict mutation silently dropped (fixed)
+Passing an FpyDict to a CPython function created a PyDict copy; in-place
+mutations by the CPython function were discarded. List sync-back already
+existed via `fpy_sync_pylist_to_fpylist`.
+Fix: Implemented `fpy_sync_pydict_to_fpydict` — clears the FpyDict and
+rebuilds from the mutated PyDict after every bridge call. Handles
+add/modify/delete with proper rehashing on growth. Added to all bridge
+call variants (1-arg through N-arg).
+
+## Bugs fixed (2026-04-28, performance)
+
+### 22. Implicit function returns leaked all FV-local variables (fixed)
+Functions that fell off the end without an explicit `return` statement
+never called `_emit_scope_decref()`. Every FV-local variable's refcount
+was never decremented, causing permanent leaks. Over millions of calls,
+accumulated objects made the GC scan O(n) objects per collection, with
+collections triggered every 700 allocations — resulting in O(n²) total
+GC time.
+Fix: Added `_emit_scope_decref()` before all implicit return sites:
+`_emit_function_def` (main functions), `_emit_method_body` (class
+methods), and closure bodies. Mirrors the explicit `return` path in
+`_emit_return` which already called it.
+
+### 23. Temporary iterables in for-loops leaked (fixed)
+`for x in make_list():` and `for k, v in enumerate(lst):` created
+temporary FpyList* values for the iterable but never decremented them
+after the loop ended. Named-variable iterables (`for x in my_list:`)
+are borrowed references and don't need decref, but function-call results,
+literals, and comprehensions are temporaries that must be freed.
+Fix: Added `rc_decref` after the end block of `_emit_for_list`,
+`_emit_for_tuple_unpack`, `_emit_for_string`, `_emit_for_dict` (always
+for dict_keys() temporary), and `_emit_for_deque` (always for
+deque_to_list() temporary).
+
+### 24. `for i, val in enumerate(lst)` materialized N tuples (fixed)
+`fastpy_enumerate()` allocated N 2-element lists (one per index-value
+pair) up front, even though the loop immediately destructures them. For
+N=130 in a tight loop called ~78K times (bm_spectral_norm), this created
+10M+ temporary lists, causing massive allocation/GC overhead.
+Fix: Added `_emit_for_enumerate_inline()` that detects `for i, val in
+enumerate(lst)` and emits an inline indexed loop instead. Counter and
+element are assigned directly from the list — zero tuple allocations.
+Result: bm_spectral_norm 155s → 0.16s (now 11x faster than CPython).
+
+### 25. GC threshold was fixed at 700, causing O(n²) collection (fixed)
+The cycle collector ran a full scan of ALL tracked objects every 700
+allocations. With 100K+ long-lived objects (bm_float_adapted: 100K Point
+objects), each scan cost O(100K) and occurred ~143 times during object
+creation, giving O(n²) total GC time.
+Fix: Made the GC threshold adaptive — doubles when a collection finds
+nothing to free (up to 50K cap), halves when objects are freed (down to
+700 floor). Mirrors CPython's generational strategy without full
+generational implementation.
+Result: bm_float_adapted 212s → 1.9s.
+
+### 26. In-place prefix reverse `a[:k+1] = a[k::-1]` allocated temp list (fixed)
+The slice pattern `a[:k+1] = a[k::-1]` was compiled as: (1) call
+`list_slice_step` to create a reversed copy (O(k) allocation), then (2)
+call `list_slice_assign` to overwrite the prefix. The temporary reversed
+list was also never freed (leaked on every iteration). In bm_fannkuch
+with ~7M flip operations, this dominated runtime.
+Fix: Added `_match_prefix_reverse()` AST pattern matcher that detects
+the pattern. Added `fastpy_list_reverse_prefix()` runtime function that
+reverses in place with O(k/2) swaps and zero allocations. The pattern is
+detected BEFORE the RHS is evaluated, preventing the temp list from ever
+being created.
+Result: bm_fannkuch 440s → 8.3s.
+
+## Bugs fixed (2026-04-28, self-hosting attempt)
+
+### 17. C-extension wrapper modules merged incorrectly (fixed)
+Stdlib modules like `ast`, `collections`, `json` that are thin wrappers
+around C extensions (`from _ast import *`) were being source-merged by the
+compiler. The merger's name prefixing turned `ast.Constant` into
+`ast__Constant`, but since star-imported names couldn't be enumerated at
+compile time, attribute access broke at runtime.
+Fix: Added `_is_c_extension_wrapper()` to `stdlib_cache.py` — parses the
+first ~50 statements and rejects any module with `from _<name> import *`.
+
+### 18. Module-level from-imports invisible to user functions (fixed)
+`from pathlib import Path` stored `Path` as a stack alloca in `fastpy_main`,
+but user functions emitted in Pass 2 couldn't see it (functions are emitted
+before `fastpy_main` runs in Pass 3).
+Fix: Added "Pass 1.5" pre-scan that creates LLVM globals for all
+module-level import names before function bodies are emitted.
+
+### 19. Builtin names resolved as hash constants, not real objects (fixed)
+`parser.add_argument("--python-version", type=str)` failed because `str` was
+passed as `hash("str") & 0x7FFFFFFFFFFFFFFF` (an integer) instead of the
+real Python `str` type object.
+Fix: Added `fpy_cpython_get_builtin()` runtime function; changed
+`_load_variable` for builtin names to return real PyObject*; fixed
+`_bare_to_tag_data` to tag builtin names as OBJ instead of INT.
+
+### 20. sys.argv empty in compiled binaries (fixed)
+`main(void)` didn't pass argc/argv, so `sys.argv` was always empty and
+`argparse` couldn't parse command-line arguments.
+Fix: Changed to `main(int argc, char *argv[])` with global storage,
+updated `fastpy_sys_argv()`, added `PySys_SetArgvEx` in CPython bridge init.
+
+### 21. pathlib.Path as C strings caused segfaults on chained calls (fixed)
+`Path("test.py").resolve().parent` segfaulted because native pathlib functions
+returned C strings, but `.resolve()` results needed to be real Python objects
+for further method calls.
+Fix: Moved all pathlib functions from `runtime.c` to `cpython_bridge.c`.
+`fastpy_path_new` now returns a real CPython `pathlib.Path` PyObject*.
+Changed path VKind from STR to PYOBJ, fixed FV store to use OBJ tag,
+moved path method dispatch before generic pyobj receiver check, added path
+attribute handling to `_emit_attr_load`, added path exclusions in
+`_is_pyobj_receiver` / `_infer_type_tag` / `_load_or_wrap_fv` to prevent
+path variables from being hijacked by the generic bridge path.
 
 ## Bugs fixed (2026-04-22)
 
@@ -227,15 +458,7 @@ nested list types through function return boundaries.
 
 Systematic comparison against the Python 3.14 PEG grammar (`Grammar/python.gram`).
 
-### Silently wrong (compiles, produces incorrect results)
-- **MatchStar** — `case [first, *rest]:` treated as never-match. Should capture
-  remaining sequence elements.
-- **MatchMapping** — `case {"key": val}:` treated as never-match. Should match
-  dict structure and bind values.
-- **MatchClass** — `case Point(x, y):` treated as never-match. Should match
-  class instances and bind attributes.
-
-### Formerly blocked, now implemented
+### Formerly silently wrong, now implemented
 - **`type` statement** (Python 3.12+) — `type X = int | str` silently ignored
   (no runtime effect). Tested.
 - **`@` operator** (MatMult) — `a @ b` dispatches to `__matmul__` on user
@@ -286,43 +509,133 @@ Systematic comparison against the Python 3.14 PEG grammar (`Grammar/python.gram`
 
 ## Known limitations (not bugs)
 
-- **BigInt through function calls** — BigInt values passed through function
-  parameters lose their BIGINT tag (treated as regular i64). Direct BigInt
-  constants and variables work correctly.
-- **Mixed-type dict value access** — Dict values from dynamic sources (json.loads)
-  return raw i64 data. Works for int/float/str values; nested list/dict values
-  need explicit subscript on the extracted value.
-- **Fastpy objects are not PyObjects** — CPython cannot treat fastpy-compiled
-  functions, classes, or instances as `PyObject*`. Passing fastpy callables
-  (lambdas, closures) to CPython APIs that expect Python callables fails.
-  This affects `functools.reduce(lambda ...)`, `collections.defaultdict(int)`,
-  and similar patterns. Workaround: use CPython-side
-  callables or avoid bridge calls that need fastpy values as callbacks.
-  **Planned fix (mirror object pattern):**
-  Add an optional `PyObject* py_mirror` field to FpyObj. When a native object
-  is passed to CPython, lazily create a PyObject* wrapper backed by a custom
-  PyTypeObject (`FpyWrapperType`) that delegates `tp_getattro`, `tp_setattro`,
-  `tp_call`, `tp_richcompare`, and `tp_hash` back to the FpyObj's slot system.
-  Cache the wrapper in `py_mirror` for identity preservation. For the reverse
-  direction (PyObject* → FpyObj), store the original PyObject* pointer in an
-  optional `py_origin` field so round-trips preserve identity. For functions
-  and lambdas, `cpython_wrap_native` already creates PyCFunction wrappers —
-  extend this to class instances and arbitrary objects.
-- **Bridge mutation is silently dropped** — Passing an FpyList or FpyDict to
-  a CPython function creates a copy. In-place mutations (e.g. `heapq.heapify`,
-  `struct.pack_into`) happen on the copy and are discarded. Workaround: capture
-  the return value instead of relying on in-place mutation.
-  **Planned fix (copy + sync-back):** True shared backing is impossible because
-  CPython C extensions use macros (`PyList_GET_ITEM`, `PyDict_Next`) that
-  directly access `PyListObject->ob_item[]` / `PyDictObject` internals,
-  bypassing any custom type's protocol methods. The element representations
-  are also incompatible (FpyValue is 16 bytes, PyObject* is 8 bytes).
-  Instead, after each bridge call, for each LIST/DICT argument that was
-  passed to CPython, re-read the PyList/PyDict contents back into the
-  original FpyList/FpyDict. Implementation: in `fpy_cpython_call_kw` (and
-  the call0/1/2/3 variants), after `PyObject_Call` returns, iterate the
-  mutable args: if tag==LIST, clear the FpyList and re-append from the
-  PyList; if tag==DICT, clear and re-insert from PyDict. This is O(n) per
-  mutable arg but the copy-out is already O(n), so total cost doubles but
-  order doesn't change. For bytearrays (pack_into), the same pattern
-  applies: copy the PyByteArray buffer back into the FpyValue.
+### Type system
+
+- **No interprocedural type inference without annotations** — When a Path,
+  PyObject*, or other typed value is passed as a function argument *without*
+  a type annotation, the callee sees it as an untyped FpyValue. Method calls
+  on the parameter (e.g. `source_dir.resolve()`) cannot dispatch to native
+  handlers.
+  **Partially fixed:** Adding `d: Path` annotations now works (see bug 27).
+  Call-site analysis now propagates `path`/`pyobj` tags through function
+  arguments, and the FV dispatch fallback routes path/pyobj-tagged receivers
+  through `fpy_fv_call_method` (CPython bridge). For native types (str, list,
+  dict), the existing type-specific handlers catch them correctly.
+  **Remaining gap fixed:** When call-site analysis can't determine an
+  argument's type (e.g., the argument is itself an untyped variable), the
+  post-merge cleanup now clears pointer-type param tags that have unknown
+  callers, and the parameter tag fallback uses "mixed" (runtime dispatch)
+  instead of defaulting to "str"/"int". This ensures functions called
+  with forwarded or dynamically-typed arguments dispatch correctly.
+  **Cross-category conflicts fixed:** Same function called with both int
+  and str (or int+list, str+int+list, etc.) now correctly uses "mixed" tag
+  with runtime dispatch. Both the pointer branch (formerly defaulted to
+  "str") and non-pointer branch (formerly defaulted to "int") now detect
+  conflicting types via `_function_signatures` and set tag="mixed".
+  Same-category pointer conflicts (str+list, str+dict, etc.) also work
+  via "mixed" tag with runtime dispatch through `fastpy_fv_len` and
+  `fastpy_fv_print`.
+
+- **BigInt through function calls** *(fixed)* — BigInt values passed through
+  function parameters now work correctly. Fixes: BigInt param types use i8_ptr
+  (pointer), BigInt fast paths in `_emit_binop` and `_emit_compare`, BinOp
+  constant-fold detection for expressions like `10**20`, `_type_cat` treats
+  bigint as numeric ("I") for merge compatibility with int, and runtime
+  INT→BigInt promotion in `_unwrap_fv_for_tag` handles mixed int/bigint
+  callers. See bugs fixed section.
+
+- **Return type annotations ignored** *(fixed)* — `-> str` on function
+  definitions now propagates to `ret_tag`, so call sites see the correct
+  type. Supports scalar types (int, float, str, bool), containers
+  (list, dict, set, tuple), user classes, None, and bridge types (Path).
+  See bug 34.
+
+- **Mixed-type dict value access** *(fixed)* — Dict values from dynamic
+  sources (json.loads) and mixed-value literal dicts now preserve runtime
+  tags through nested subscript access. `addr = data["address"]` stores a
+  full FpyValue with runtime tag; `addr["city"]` dispatches through
+  `fastpy_fv_subscript` which checks the tag at runtime (dict→dict_get_fv,
+  list→list_get_fv, str→str_index). Also fixed: `_infer_type_tag` now
+  checks per-key types for literal dicts, so `d["address"]` where the
+  compiler tracked `"address" → dict` correctly tags the variable.
+
+### Object model
+
+- **Fastpy objects are not PyObjects** *(largely fixed)* — The mirror object
+  pattern is implemented via `FpyObjProxyType`, `FpyNativeCallableType`,
+  `FpyClosureProxyType`, and `FpyBoundMethodProxyType` in `cpython_bridge.c`.
+  Native objects, functions, lambdas, and closures are automatically wrapped
+  as PyObject* when passed to CPython APIs. Tested working:
+  `functools.reduce(lambda ...)`, `map(lambda ...)`, `filter(lambda ...)`,
+  `sorted(key=lambda ...)`, `collections.defaultdict(int)`, passing class
+  instances to CPython functions. Round-trip unwrapping preserves identity
+  (`pyobject_to_fpy` detects FpyObjProxy and unwraps to original FpyObj*).
+  `defaultdict(list)` now works correctly: factory type tracking
+  (`_defaultdict_var_factories`) lets `_is_list_expr` and `_infer_type_tag`
+  recognize `d["key"]` as a list when `d = defaultdict(list)`, enabling
+  native `.append()`, `len()`, and print dispatch.
+
+- **PyObject* values in FpyValue OBJ tag are not FpyObj** *(fixed)* —
+  CPython PyObject* (e.g. `pathlib.Path`) stored in FpyValue with OBJ tag.
+  All runtime paths now check `FPY_OBJ_MAGIC` to distinguish native FpyObj*
+  from CPython PyObject*: `fastpy_obj_write`, `fpy_value_repr`,
+  `fpy_rc_incref/decref`, `fastpy_fv_truthy` (delegates to `PyObject_IsTrue`),
+  and `fpy_value_compare` (delegates to `fpy_cpython_compare` for rich
+  comparison). Multi-arg print, truthiness, and comparison all work correctly
+  for both native objects and CPython PyObject* values.
+
+### Bridge
+
+- **Bridge dict mutation silently dropped** *(fixed)* — Passing an FpyDict to
+  a CPython function now syncs mutations back. `fpy_sync_pydict_to_fpydict`
+  clears and rebuilds the FpyDict from the mutated PyDict after every bridge
+  call. Handles add/modify/delete, rehashes index table on growth. Added to
+  all call variants (1-arg, 2-arg, 3-arg, N-arg) alongside existing list
+  sync-back. See bug 36.
+
+### Source merger
+
+- **Packages can now be merged** *(fixed)* — Stdlib packages with
+  `__init__.py` are now supported. Self-contained packages (no submodule
+  imports) are merged directly as single files. Packages with simple
+  submodule imports are also supported — the recursive merger resolves
+  relative imports within package directories and merges submodules with
+  appropriate prefixing. Dotted module names (`from html.entities import
+  name2codepoint`) are also resolved to the correct submodule file.
+  **Tested working:** `html.escape`, `html.entities` name lookups.
+  **Limitation:** Many stdlib packages use advanced Python features
+  (metaclasses, complex enums, regex) that the AOT compiler can't handle
+  yet, so the merge succeeds but the compiled binary crashes. These
+  modules fall back to the CPython bridge.
+
+- **C-extension wrapper modules rejected** — Stdlib modules whose public
+  API comes from `from _foo import *` (e.g. `ast`, `collections`, `json`,
+  `operator`, `functools`) cannot be source-merged. The merger's name
+  prefixing (`ast__Constant`) fails because star-imported names are not
+  enumerable at compile time. Detected by `_is_c_extension_wrapper()` in
+  `stdlib_cache.py`.
+
+### Self-hosting status (2026-04-28)
+
+Attempted to compile the fastpy compiler with itself. Current status:
+**partially working** — basic compilation pipeline steps execute but
+full self-hosting fails due to the limitations above.
+
+**What works in the self-compiled binary:**
+- `from pathlib import Path` → Path objects as real CPython PyObject*
+- `Path("file.py").read_text()` → reads file contents correctly
+- `Path("file.py").resolve().parent` → chained path operations
+- `Path("file.py").name`, `.stem`, `.suffix` → string properties
+- `from compiler.pipeline import compile_source` → module import via merger
+- `sys.argv` propagation to compiled binaries
+- Builtin names (`str`, `int`, `Exception`, etc.) as real PyObject* values
+
+**What blocks full self-hosting:**
+- Functions that receive Path/PyObject* parameters *whose type cannot be
+  inferred from call-site analysis* still fail to dispatch methods.
+  Call-site analysis now handles `Path(...)` constructor calls and
+  path/pyobj-tagged variables as arguments, but deeply nested or dynamic
+  dispatch chains remain unresolved.
+- The pipeline functions use extensive dynamic typing (dicts of mixed types,
+  AST node manipulation, `isinstance` checks) that requires the CPython
+  bridge for every operation on untyped parameters.
