@@ -373,6 +373,10 @@ class FuncInfo:
     # Used to decide whether the call site should preserve the raw FpyValue
     # (to keep the NONE tag) rather than unwrapping to a bare LLVM value.
     may_return_none: bool = False
+    # True if function uses bare-type ABI (direct i64/double params and
+    # return) instead of FpyValue wrappers.  Enables LLVM to constant-fold,
+    # inline, and apply SROA to tight loops and simple arithmetic functions.
+    uses_bare_abi: bool = False
 
 
 @dataclass
@@ -957,6 +961,24 @@ class CodeGen:
         # Reference counting: emit incref/decref at variable stores and scope exits.
         self._USE_REFCOUNT = True
 
+        # Module-level flag: True only when the program uses integer operations
+        # that could produce BigInt (e.g. ** with large exponents, huge int
+        # literals).  When False, integer arithmetic uses plain LLVM add/sub/mul
+        # (no fpy_checked_add runtime call overhead).
+        self._program_uses_bigint = False
+
+        # Hot-loop flag: True while emitting statements inside a while/for loop
+        # body.  Suppresses per-statement fpy_current_line stores that prevent
+        # LLVM from optimizing the loop.  The line number at loop entry is
+        # still recorded.
+        self._in_hot_loop = False
+
+        # Per-function bare-ABI flag: True when the current function being
+        # compiled uses bare-type ABI (direct i64/double params/locals/return)
+        # instead of FpyValue wrappers.  Checked by _store_variable and
+        # _load_variable to bypass FV wrapping/unwrapping.
+        self._current_fn_bare_abi = False
+
         # Temporary value tracking for GC: expressions that create heap
         # objects (string concat, list literal, etc.) push FpyValue pairs
         # here. Statement boundaries flush with decref.
@@ -1059,6 +1081,11 @@ class CodeGen:
         # Built by scanning all methods for self.attr and obj.attr patterns.
         # Inherited attrs keep the parent's slot index (child slots start after).
         self._class_attr_slots: dict[str, dict[str, int]] = {}
+        # Per-class init-only attributes: attrs set in __init__ and NEVER
+        # modified by any other method, module code, or external store.
+        # Loads from these slots can be marked !invariant.load, enabling
+        # LLVM to hoist them out of loops (e.g., `p.x` in a tight loop).
+        self._class_init_only_attrs: dict[str, set[str]] = {}
 
     def _declare_runtime_functions(self) -> None:
         """Declare external runtime functions we can call."""
@@ -2431,6 +2458,29 @@ class CodeGen:
         # Pass 0.8: discover static attribute slots per class
         self._assign_attribute_slots(tree)
 
+        # Pass 0.85: detect init-only attributes for !invariant.load
+        self._detect_init_only_attrs(tree)
+
+        # Pass 0.9: detect whether program needs BigInt support.
+        # Only set _program_uses_bigint=True when the AST contains integer
+        # literals exceeding 62-bit range or ** power ops with large exponents.
+        # When False, integer add/sub/mul use plain LLVM instructions (no
+        # fpy_checked_add call overhead).
+        _BIGINT_THRESHOLD = (1 << 62)
+        for n in ast.walk(tree):
+            if (isinstance(n, ast.Constant) and isinstance(n.value, int)
+                    and not isinstance(n.value, bool)
+                    and abs(n.value) >= _BIGINT_THRESHOLD):
+                self._program_uses_bigint = True
+                break
+            if isinstance(n, ast.BinOp) and isinstance(n.op, ast.Pow):
+                # x ** y with y > 30 could overflow i64
+                if (isinstance(n.right, ast.Constant)
+                        and isinstance(n.right.value, int)
+                        and n.right.value > 30):
+                    self._program_uses_bigint = True
+                    break
+
         # Pre-scan: detect singledispatch functions and their .register variants.
         # Compiled natively — each variant becomes a separate function, and
         # Pre-scan native module imports so they're known during function
@@ -2773,18 +2823,42 @@ class CodeGen:
                     self.runtime["cpython_exec_get"], [source_ptr, name_ptr])
                 self._store_variable(base_name, func_ptr, "pyobj")
 
-        # Push shadow frame for module-level code
-        main_name_ptr = self._make_string_constant("<module>")
-        main_file_ptr = self._make_string_constant(self._source_filename)
-        self.builder.call(self.runtime["shadow_push"],
-                          [main_name_ptr, main_file_ptr, ir.Constant(i32, 1)])
+        # Determine if module-level code can use bare-ABI mode.
+        # When True: plain arithmetic (no BigInt), no shadow stack, no
+        # line tracking — lets LLVM optimize module-level tight loops
+        # at C++ speed.  Safe because module-level vars are globals.
+        # Disabled when module-level code uses OOP features (attr access,
+        # subscript), exception handling, or imports — these interact
+        # with FpyValue tags and shadow stack in ways bare-ABI can't handle.
+        _main_stmts = [n for n in tree.body
+                       if not isinstance(n, (ast.FunctionDef, ast.ClassDef))]
+        _has_classes = any(isinstance(n, ast.ClassDef) for n in tree.body)
+        _main_has_complex = _has_classes or any(
+            isinstance(n, (ast.List, ast.Dict, ast.Set, ast.ListComp,
+                           ast.DictComp, ast.SetComp, ast.Subscript,
+                           ast.Attribute, ast.JoinedStr, ast.Try,
+                           ast.Raise, ast.Import, ast.ImportFrom,
+                           ast.Tuple))
+            or (isinstance(n, ast.Constant) and isinstance(n.value, str))
+            for stmt in _main_stmts
+            for n in ast.walk(stmt)
+        )
+        self._current_fn_bare_abi = not _main_has_complex
+
+        # Push shadow frame for module-level code (skip for bare-ABI main)
+        if not self._current_fn_bare_abi:
+            main_name_ptr = self._make_string_constant("<module>")
+            main_file_ptr = self._make_string_constant(self._source_filename)
+            self.builder.call(self.runtime["shadow_push"],
+                              [main_name_ptr, main_file_ptr, ir.Constant(i32, 1)])
 
         for node in tree.body:
             if not isinstance(node, (ast.FunctionDef, ast.ClassDef)):
                 self._emit_stmt(node)
 
         if not self.builder.block.is_terminated:
-            self.builder.call(self.runtime["shadow_pop"], [])
+            if not self._current_fn_bare_abi:
+                self.builder.call(self.runtime["shadow_pop"], [])
             self.builder.ret_void()
 
         return str(self.module)
@@ -3102,9 +3176,11 @@ class CodeGen:
     def _emit_closure_body(self, func: ir.Function, node: ast.FunctionDef,
                            captures: list[str]) -> None:
         """Generate code for a closure's body."""
-        saved = (self.function, self.builder, self.variables, self._loop_stack)
+        saved = (self.function, self.builder, self.variables, self._loop_stack,
+                 self._current_fn_bare_abi)
 
         self.function = func
+        self._current_fn_bare_abi = False  # closures are never bare-ABI
         entry = func.append_basic_block("entry")
         self.builder = _SafeIRBuilder(entry)
         self.variables = {}
@@ -3140,7 +3216,8 @@ class CodeGen:
             else:
                 self.builder.ret(ir.Constant(i64, 0))
 
-        self.function, self.builder, self.variables, self._loop_stack = saved
+        (self.function, self.builder, self.variables, self._loop_stack,
+         self._current_fn_bare_abi) = saved
 
     def _emit_inline_lambda(self, node: ast.Lambda) -> ir.Value:
         """Compile an inline lambda and return function pointer as i64."""
@@ -3478,6 +3555,123 @@ class CodeGen:
 
         for cls_name in class_nodes:
             assign(cls_name)
+
+    def _detect_init_only_attrs(self, tree: ast.Module) -> None:
+        """Detect per-class attributes that are ONLY set in ``__init__`` and
+        never modified by any other method, module-level code, or external
+        ``obj.attr = expr`` store.  Loads from these slots can be annotated
+        with ``!invariant.load`` so LLVM's LICM can hoist them out of loops.
+        Must run after ``_assign_attribute_slots`` (needs class AST nodes)."""
+        class_nodes: dict[str, ast.ClassDef] = {}
+        class_parents: dict[str, str | None] = {}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ClassDef):
+                parent = (node.bases[0].id
+                          if node.bases and isinstance(node.bases[0], ast.Name)
+                          else None)
+                class_parents[node.name] = parent
+                class_nodes[node.name] = node
+
+        # Track which local variables are instances of which class so we
+        # can attribute external ``obj.attr = expr`` stores to specific
+        # classes rather than conservatively excluding from all.
+        obj_var_class: dict[str, str] = {}
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Assign) and len(node.targets) == 1
+                    and isinstance(node.targets[0], ast.Name)
+                    and isinstance(node.value, ast.Call)
+                    and isinstance(node.value.func, ast.Name)
+                    and node.value.func.id in class_nodes):
+                obj_var_class[node.targets[0].id] = node.value.func.id
+
+        # Collect external (non-self) obj.attr Store targets per class.
+        external_stores_per_class: dict[str, set[str]] = {
+            c: set() for c in class_nodes}
+        unknown_external_stores: set[str] = set()
+
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Attribute)
+                    and isinstance(node.ctx, ast.Store)
+                    and isinstance(node.value, ast.Name)
+                    and node.value.id != "self"):
+                var = node.value.id
+                if var in obj_var_class:
+                    external_stores_per_class[obj_var_class[var]].add(
+                        node.attr)
+                else:
+                    unknown_external_stores.add(node.attr)
+
+        # Module-wide setattr/delattr → escape hatch, disable for all.
+        has_global_dynamic = False
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name)
+                    and node.func.id in ("setattr", "delattr")):
+                has_global_dynamic = True
+                break
+
+        # Process in parent-before-child order so inheritance works.
+        processed: set[str] = set()
+
+        def process(cls_name: str) -> None:
+            if cls_name in processed:
+                return
+            parent = class_parents.get(cls_name)
+            if parent and parent in class_nodes:
+                process(parent)
+
+            cls_node = class_nodes[cls_name]
+            init_attrs: set[str] = set()
+            non_init_stores: set[str] = set()
+            class_has_dynamic = False
+
+            for member in cls_node.body:
+                if not isinstance(member, ast.FunctionDef):
+                    continue
+                is_init = member.name == "__init__"
+                for n in ast.walk(member):
+                    # self.attr stores (includes AugAssign targets)
+                    if (isinstance(n, ast.Attribute)
+                            and isinstance(n.value, ast.Name)
+                            and n.value.id == "self"
+                            and isinstance(n.ctx, ast.Store)):
+                        if is_init:
+                            init_attrs.add(n.attr)
+                        else:
+                            non_init_stores.add(n.attr)
+                    # setattr(self, ...) inside any method
+                    if (isinstance(n, ast.Call)
+                            and isinstance(n.func, ast.Name)
+                            and n.func.id in ("setattr", "delattr")
+                            and len(n.args) >= 1
+                            and isinstance(n.args[0], ast.Name)
+                            and n.args[0].id == "self"):
+                        class_has_dynamic = True
+
+            if class_has_dynamic or has_global_dynamic:
+                self._class_init_only_attrs[cls_name] = set()
+                processed.add(cls_name)
+                return
+
+            init_only = (init_attrs - non_init_stores
+                         - external_stores_per_class.get(cls_name, set())
+                         - unknown_external_stores)
+
+            # Inherit init-only attrs from parent that this child doesn't
+            # override (parent sets in __init__, child never stores).
+            if parent and parent in self._class_init_only_attrs:
+                for attr in self._class_init_only_attrs[parent]:
+                    if (attr not in non_init_stores
+                            and attr not in external_stores_per_class.get(
+                                cls_name, set())
+                            and attr not in unknown_external_stores):
+                        init_only.add(attr)
+
+            self._class_init_only_attrs[cls_name] = init_only
+            processed.add(cls_name)
+
+        for cls_name in class_nodes:
+            process(cls_name)
 
     def _analyze_call_sites(self, tree: ast.Module) -> None:
         """Scan all call sites to determine argument types for each function."""
@@ -4745,9 +4939,11 @@ class CodeGen:
 
     def _emit_lambda_body(self, func: ir.Function, lam: ast.Lambda) -> None:
         """Generate code for a lambda's body (single expression)."""
-        saved = (self.function, self.builder, self.variables, self._loop_stack)
+        saved = (self.function, self.builder, self.variables, self._loop_stack,
+                 self._current_fn_bare_abi)
 
         self.function = func
+        self._current_fn_bare_abi = False  # lambdas are never bare-ABI
         entry = func.append_basic_block("entry")
         self.builder = _SafeIRBuilder(entry)
         self.variables = {}
@@ -4774,7 +4970,8 @@ class CodeGen:
         func.linkage = "internal"
         func.attributes.add('alwaysinline')
 
-        self.function, self.builder, self.variables, self._loop_stack = saved
+        (self.function, self.builder, self.variables, self._loop_stack,
+         self._current_fn_bare_abi) = saved
 
     def _signature_scalar_conflict(self, sigs: list[tuple]) -> bool:
         """True if two signatures differ in scalar (int/float/bool) types
@@ -5210,6 +5407,18 @@ class CodeGen:
 
         ret_type = i8_ptr if returns_param else i64
 
+        # Return type annotation overrides: -> float, -> bool, -> str
+        if node.returns is not None:
+            if (isinstance(node.returns, ast.Name)
+                    and node.returns.id == 'float'):
+                ret_type = double
+            elif (isinstance(node.returns, ast.Name)
+                    and node.returns.id == 'bool'):
+                ret_type = i32
+            elif (isinstance(node.returns, ast.Name)
+                    and node.returns.id in ('str', 'list', 'dict', 'tuple')):
+                ret_type = i8_ptr
+
         # Only scan returns in THIS function, not nested defs.
         _nested_ids = set()
         for _item in ast.walk(node):
@@ -5499,6 +5708,10 @@ class CodeGen:
                                 and sub.id in float_params):
                             returns_float = True
                             break
+                        if (isinstance(sub, ast.Name)
+                                and sub.id in float_vars):
+                            returns_float = True
+                            break
                     if returns_float:
                         ret_type = double
                         break
@@ -5569,12 +5782,91 @@ class CodeGen:
         static_param_types = list(param_types)
         static_ret_type = ret_type
 
-        # Post-refactor ABI: regular user functions take FpyValue params
-        # and return FpyValue. Vararg/kwarg functions keep their special
-        # signatures (they pack args into a list/dict themselves) but
-        # ALSO return FpyValue for proper runtime-typed returns.
-        uses_fv = not (has_vararg or has_kwarg)
-        if uses_fv:
+        # --- Detect may_return_none early (needed for ABI classification) ---
+        _may_return_none = False
+        has_value_return = False
+        none_default_params: set[str] = set()
+        n_params = len(param_names)
+        for di, d in enumerate(node.args.defaults):
+            if isinstance(d, ast.Constant) and d.value is None:
+                pidx = n_params - len(node.args.defaults) + di
+                if pidx < n_params:
+                    none_default_params.add(param_names[pidx])
+        for n in ast.walk(node):
+            if isinstance(n, ast.Return):
+                if n.value is None:
+                    _may_return_none = True
+                elif (isinstance(n.value, ast.Constant)
+                        and n.value.value is None):
+                    _may_return_none = True
+                elif (isinstance(n.value, ast.Name)
+                        and n.value.id in none_default_params):
+                    _may_return_none = True
+                else:
+                    has_value_return = True
+        if has_value_return and not _may_return_none:
+            last_stmt = node.body[-1] if node.body else None
+            if not isinstance(last_stmt, ast.Return):
+                _may_return_none = True
+
+        # --- ABI selection: bare-type vs FpyValue ---
+        # Bare-type ABI: direct i64/double/i32 params and return.  Enables
+        # LLVM to constant-fold, inline, and apply SROA.  Only for simple
+        # scalar functions with no runtime-typed behaviour.
+        # Note: ret_tag isn't computed yet, so we check ret_type directly.
+        # Scalar ret_types: i64 (int), double (float), i32 (bool), void.
+        # Non-scalar: i8_ptr (str/list/dict/obj) — excluded.
+        _SCALAR_TYPES = (ir.IntType, ir.DoubleType)
+        _is_scalar_ret = (isinstance(ret_type, (ir.IntType, ir.DoubleType))
+                          or isinstance(ret_type, ir.VoidType))
+        # Body analysis: reject functions whose body uses non-scalar types.
+        # Check for AST nodes that imply pointer/heap operations:
+        #   lists, dicts, strings, subscripts, attributes, comprehensions,
+        #   try/except, class instantiation, etc.
+        _NON_SCALAR_AST = (
+            ast.List, ast.Dict, ast.Set, ast.ListComp, ast.DictComp,
+            ast.SetComp, ast.Subscript, ast.Attribute, ast.JoinedStr,
+            ast.Try, ast.Raise, ast.Import, ast.ImportFrom,
+            ast.Tuple, ast.FunctionDef, ast.AsyncFunctionDef,
+        )
+        _body_is_scalar = not any(
+            (isinstance(n, _NON_SCALAR_AST) and n is not node)
+            or (isinstance(n, ast.Constant) and isinstance(n.value, str))
+            for n in ast.walk(node)
+        )
+        # If any call-site signature has a pointer type (str, list, dict,
+        # obj), the function handles non-scalar values and needs FpyValue
+        # tags to distinguish types at runtime. Check both the merged
+        # call_types and the raw per-call-site signatures.
+        _has_mixed_call_types = any(
+            ct == "mixed" for ct in call_types
+        )
+        _SCALAR_CALL_TYPES = {"int", "float", "bool"}
+        _sigs = self._function_signatures.get(node.name, [])
+        _has_ptr_in_sigs = any(
+            st is not None and st not in _SCALAR_CALL_TYPES
+            for sig in _sigs
+            for st in sig
+        )
+        uses_bare = (
+            not has_vararg
+            and not has_kwarg
+            and not _may_return_none
+            and _is_scalar_ret
+            and _body_is_scalar
+            and all(isinstance(t, _SCALAR_TYPES) for t in param_types)
+            and not node.decorator_list
+            and not _has_mixed_call_types
+            and not _has_ptr_in_sigs
+            and node.name not in getattr(self, '_generator_funcs', set())
+        )
+
+        uses_fv = not (has_vararg or has_kwarg) and not uses_bare
+        if uses_bare:
+            # Bare-type ABI: direct scalar params and return
+            func_type = ir.FunctionType(
+                ret_type if ret_type != void else void, param_types)
+        elif uses_fv:
             fv_ret = fpy_val if ret_type != void else void
             func_type = ir.FunctionType(fv_ret, [fpy_val] * len(param_names))
         else:
@@ -5792,41 +6084,7 @@ class CodeGen:
                 # kwonly without default: must be provided via keyword,
                 # otherwise call will fail. We don't append a placeholder
                 # since defaults is right-aligned.
-        # Detect whether any return path yields None (explicit `return None`,
-        # bare `return`, implicit fallthrough, or `return param` where param
-        # has a None default). Used by the call site to decide whether to
-        # preserve the raw FpyValue (NONE tag).
-        _may_return_none = False
-        has_value_return = False
-        # Collect params with None defaults
-        none_default_params: set[str] = set()
-        n_params = len(param_names)
-        for di, d in enumerate(node.args.defaults):
-            if isinstance(d, ast.Constant) and d.value is None:
-                pidx = n_params - len(node.args.defaults) + di
-                if pidx < n_params:
-                    none_default_params.add(param_names[pidx])
-        for n in ast.walk(node):
-            if isinstance(n, ast.Return):
-                if n.value is None:
-                    _may_return_none = True
-                elif (isinstance(n.value, ast.Constant)
-                        and n.value.value is None):
-                    _may_return_none = True
-                elif (isinstance(n.value, ast.Name)
-                        and n.value.id in none_default_params):
-                    # `return default` where default=None
-                    _may_return_none = True
-                else:
-                    has_value_return = True
-        # Implicit None: if the function has `return <value>` somewhere but
-        # the body can fall through without hitting a return (e.g., the
-        # body ends with an `if` without `else`), it implicitly returns
-        # None on the fallthrough path.
-        if has_value_return and not _may_return_none:
-            last_stmt = node.body[-1] if node.body else None
-            if not isinstance(last_stmt, ast.Return):
-                _may_return_none = True
+        # (_may_return_none already computed above for ABI classification)
         self._user_functions[effective_name] = FuncInfo(
             func=func,
             ret_tag=ret_tag,
@@ -5840,6 +6098,7 @@ class CodeGen:
             static_ret_type=static_ret_type,
             uses_fv_abi=uses_fv,
             may_return_none=_may_return_none,
+            uses_bare_abi=uses_bare,
         )
         # Track the function's AST so callers can inspect what it returns
         # (used to propagate dict-value-type flags to assignment targets).
@@ -5990,10 +6249,12 @@ class CodeGen:
                  self._dict_var_dict_values, self._dict_var_obj_values,
                  self._dict_var_key_types,
                  self._obj_var_class, self._native_vars,
-                 self._unsafe_typed_vars, self._int_mode_vars)
+                 self._unsafe_typed_vars, self._int_mode_vars,
+                 self._current_fn_bare_abi)
 
         # Set up function state
         self.function = info.func
+        self._current_fn_bare_abi = info.uses_bare_abi
         entry = info.func.append_basic_block("entry")
         self.builder = _SafeIRBuilder(entry)
         self.variables = {}
@@ -6069,6 +6330,24 @@ class CodeGen:
             call_types = self._call_site_param_types.get(node.name, [])
 
         for param_idx, param in enumerate(info.func.args):
+            if info.uses_bare_abi:
+                # Bare-type ABI: params are already native types (i64/double).
+                # Store directly into native-type allocas — no FpyValue wrapping.
+                # This lets LLVM see through to the bare arithmetic and inline,
+                # constant-fold, and SROA exactly as it did before the FV ABI.
+                static_type = info.static_param_types[param_idx]
+                if isinstance(static_type, ir.DoubleType):
+                    tag = "float"
+                elif (isinstance(static_type, ir.IntType)
+                        and static_type.width == 32):
+                    tag = "bool"
+                else:
+                    tag = "int"
+                alloca = self.builder.alloca(param.type, name=param.name)
+                self.builder.store(param, alloca)
+                self.variables[param.name] = (alloca, tag)
+                continue
+
             if info.uses_fv_abi:
                 # Param is an FpyValue struct. With _USE_FV_LOCALS, we store
                 # it directly into an fpy_val alloca — _load_variable will
@@ -6279,16 +6558,22 @@ class CodeGen:
             gen_list = self.builder.call(self.runtime["list_new"], [])
             self._gen_list = gen_list  # store for yield emission
 
-        # Push shadow stack frame for traceback
-        func_name_ptr = self._make_string_constant(effective_name)
-        file_name_ptr = self._make_string_constant(self._source_filename)
-        start_line = ir.Constant(i32, node.lineno if hasattr(node, 'lineno') else 0)
-        self.builder.call(self.runtime["shadow_push"],
-                          [func_name_ptr, file_name_ptr, start_line])
+        # Push shadow stack frame for traceback.
+        # Skip for bare-ABI functions: shadow stack prevents LLVM inlining
+        # and adds per-call overhead that destroys tight-loop performance.
+        if not info.uses_bare_abi:
+            func_name_ptr = self._make_string_constant(effective_name)
+            file_name_ptr = self._make_string_constant(self._source_filename)
+            start_line = ir.Constant(i32, node.lineno if hasattr(node, 'lineno') else 0)
+            self.builder.call(self.runtime["shadow_push"],
+                              [func_name_ptr, file_name_ptr, start_line])
 
         # Register function arguments in shadow frame for traceback debugging.
         # Only the first 8 parameters are tracked (FPY_SHADOW_MAX_ARGS).
+        # Skip for bare-ABI functions (no shadow frame was pushed).
         ast_params = list(node.args.args)
+        if info.uses_bare_abi:
+            ast_params = []  # skip arg registration for bare-ABI
         for _arg_idx, _ast_arg in enumerate(ast_params):
             if _arg_idx >= 8:
                 break
@@ -6328,9 +6613,10 @@ class CodeGen:
         # Emit function body
         self._emit_stmts(node.body)
 
-        # Pop shadow stack before implicit return
+        # Pop shadow stack before implicit return (skip for bare-ABI)
         if not self.builder.block.is_terminated:
-            self.builder.call(self.runtime["shadow_pop"], [])
+            if not info.uses_bare_abi:
+                self.builder.call(self.runtime["shadow_pop"], [])
             if is_gen:
                 # Generator: return the collected list
                 ret_ty = info.func.return_value.type
@@ -6358,7 +6644,8 @@ class CodeGen:
          self._dict_var_dict_values, self._dict_var_obj_values,
          self._dict_var_key_types,
          self._obj_var_class, self._native_vars,
-         self._unsafe_typed_vars, self._int_mode_vars) = saved
+         self._unsafe_typed_vars, self._int_mode_vars,
+         self._current_fn_bare_abi) = saved
 
     # -----------------------------------------------------------------
     # Class support
@@ -9033,9 +9320,11 @@ class CodeGen:
 
     def _emit_method_body(self, func: ir.Function, node: ast.FunctionDef) -> None:
         """Generate code for a single method body."""
-        saved = (self.function, self.builder, self.variables, self._loop_stack)
+        saved = (self.function, self.builder, self.variables, self._loop_stack,
+                 self._current_fn_bare_abi)
 
         self.function = func
+        self._current_fn_bare_abi = False  # methods are never bare-ABI
         entry = func.append_basic_block("entry")
         # Now that the function has a body (is a definition, not declaration),
         # set internal linkage for inlining optimization.
@@ -9315,7 +9604,8 @@ class CodeGen:
             else:
                 self.builder.ret(ir.Constant(func.return_value.type, 0))
 
-        self.function, self.builder, self.variables, self._loop_stack = saved
+        (self.function, self.builder, self.variables, self._loop_stack,
+         self._current_fn_bare_abi) = saved
 
     def _emit_class_registration(self, cls_info: ClassInfo) -> None:
         """Emit runtime calls to register a class and its methods."""
@@ -9544,7 +9834,11 @@ class CodeGen:
         # because adding a function call before every statement disrupts
         # LLVM's optimizer in certain control flow patterns (closures +
         # exception handling combinations).
-        if hasattr(node, 'lineno') and node.lineno:
+        # Skip for bare-ABI functions: no shadow frame, and the store to a
+        # global prevents LLVM from optimizing the loop body.
+        if (hasattr(node, 'lineno') and node.lineno
+                and not self._current_fn_bare_abi
+                and not self._in_hot_loop):
             self.builder.store(ir.Constant(i32, node.lineno),
                                self._shadow_line_global)
         # Yield statements: must come before generic Expr handler
@@ -10549,7 +10843,9 @@ class CodeGen:
         # emit a data-only load (Phase 9: skip unused tag load).
         slot_idx = self._get_attr_slot(node)
         if slot_idx is not None:
-            data_i64 = self._emit_slot_get_data_only(obj, slot_idx)
+            init_only = self._is_init_only_attr(node)
+            data_i64 = self._emit_slot_get_data_only(
+                obj, slot_idx, init_only=init_only)
         else:
             # Fall back to FV-ABI getter with name lookup
             tag_slot = self._create_entry_alloca(i32, "attr.tag")
@@ -10953,6 +11249,15 @@ class CodeGen:
             return None
         return slots.get(attr_node.attr)
 
+    def _is_init_only_attr(self, attr_node: ast.Attribute) -> bool:
+        """Return True if the attribute load targets an init-only slot,
+        meaning the value is set in ``__init__`` and never modified after."""
+        obj_cls = self._infer_object_class(attr_node.value)
+        if not obj_cls:
+            return False
+        return attr_node.attr in self._class_init_only_attrs.get(
+            obj_cls, set())
+
     # Constants for direct slot offset computation (must match C layout).
     # FpyObj: { i32 class_id, 4 pad, i8* slots, i8* dynamic_attrs } = 24 bytes
     # FpyValue: { i32 tag, 4 pad, i64 data } = 16 bytes
@@ -10988,28 +11293,46 @@ class CodeGen:
             inbounds=True)
         return tag_addr, data_addr
 
-    def _emit_slot_get_direct(self, obj: ir.Value, slot_idx: int
+    def _emit_slot_get_direct(self, obj: ir.Value, slot_idx: int,
+                               init_only: bool = False
                                ) -> tuple[ir.Value, ir.Value]:
         """Emit direct IR to load obj->slots[slot_idx], returning (tag, data).
 
         Skips the fastpy_obj_get_slot function-call overhead. Uses GEP into
         the FpyObj struct (data layout set at module level matches MSVC x64,
         so struct offsets match C's).
+
+        When *init_only* is True the slot value was set in ``__init__`` and
+        never modified, so both loads are annotated ``!invariant.load`` —
+        LLVM can hoist them out of loops and CSE redundant accesses.
         """
         tag_addr, data_addr = self._emit_slot_addr_direct(obj, slot_idx)
         tag = self.builder.load(tag_addr)
         data = self.builder.load(data_addr)
+        if init_only:
+            if not hasattr(self, "_invariant_md"):
+                self._invariant_md = self.module.add_metadata([])
+            tag.set_metadata("invariant.load", self._invariant_md)
+            data.set_metadata("invariant.load", self._invariant_md)
         return tag, data
 
-    def _emit_slot_get_data_only(self, obj: ir.Value, slot_idx: int
-                                  ) -> ir.Value:
+    def _emit_slot_get_data_only(self, obj: ir.Value, slot_idx: int,
+                                  init_only: bool = False) -> ir.Value:
         """Load only obj->slots[slot_idx].data (i64) — skips the tag load
         for statically-typed slot accesses (where the caller doesn't need
         the runtime tag). Shaves one memory load and its dead-load hazards
         off the hot path. (Phase 9 optimization: type-specialized slot reads.)
+
+        When *init_only* is True the data load is annotated
+        ``!invariant.load`` — LLVM can hoist it out of loops.
         """
         _, data_addr = self._emit_slot_addr_direct(obj, slot_idx)
-        return self.builder.load(data_addr)
+        data = self.builder.load(data_addr)
+        if init_only:
+            if not hasattr(self, "_invariant_md"):
+                self._invariant_md = self.module.add_metadata([])
+            data.set_metadata("invariant.load", self._invariant_md)
+        return data
 
     def _emit_slot_set_direct(self, obj: ir.Value, slot_idx: int,
                                tag: ir.Value, data: ir.Value) -> None:
@@ -11080,12 +11403,16 @@ class CodeGen:
         bad = self.builder.or_(oob, still_neg)
         bb_ok = self.builder.append_basic_block("lget.ok")
         bb_err = self.builder.append_basic_block("lget.err")
+        bb_merge = self.builder.append_basic_block("lget.merge")
         self.builder.cbranch(bad, bb_err, bb_ok)
+        # --- Error path: raise IndexError, return dummy 0 ---
         self.builder.position_at_start(bb_err)
         msg = self._make_string_constant("list index out of range")
         self.builder.call(self.runtime["raise"],
                           [ir.Constant(i32, 4), msg])  # FPY_EXC_INDEXERROR=4
-        self.builder.unreachable()
+        self.builder.branch(bb_merge)
+        bb_err_end = self.builder.block
+        # --- OK path: load element data ---
         self.builder.position_at_start(bb_ok)
         # GEP into items[real_idx] — FpyValue is {i32, i64} (fpy_val)
         elem_addr = self.builder.gep(
@@ -11096,9 +11423,16 @@ class CodeGen:
             [ir.Constant(i32, 0), ir.Constant(i32, 1)],
             inbounds=True)
         data = self.builder.load(data_addr)
+        self.builder.branch(bb_merge)
+        bb_ok_end = self.builder.block
+        # --- Merge: phi selects real data or dummy 0 ---
+        self.builder.position_at_start(bb_merge)
+        phi = self.builder.phi(i64, "lget.val")
+        phi.add_incoming(ir.Constant(i64, 0), bb_err_end)
+        phi.add_incoming(data, bb_ok_end)
         if elem_type == "float":
-            return self.builder.bitcast(data, double)
-        return data
+            return self.builder.bitcast(phi, double)
+        return phi
 
     def _inline_list_set(self, list_ptr: ir.Value, index: ir.Value,
                           tag_const: int, data: ir.Value) -> None:
@@ -11129,12 +11463,15 @@ class CodeGen:
         bad = self.builder.or_(oob, still_neg)
         bb_ok = self.builder.append_basic_block("lset.ok")
         bb_err = self.builder.append_basic_block("lset.err")
+        bb_after = self.builder.append_basic_block("lset.after")
         self.builder.cbranch(bad, bb_err, bb_ok)
+        # --- Error path: raise IndexError ---
         self.builder.position_at_start(bb_err)
         msg = self._make_string_constant("list index out of range")
         self.builder.call(self.runtime["raise"],
                           [ir.Constant(i32, 4), msg])  # FPY_EXC_INDEXERROR=4
-        self.builder.unreachable()
+        self.builder.branch(bb_after)
+        # --- OK path: store element ---
         self.builder.position_at_start(bb_ok)
         # GEP into items[real_idx]
         elem_addr = self.builder.gep(
@@ -11153,6 +11490,9 @@ class CodeGen:
         if isinstance(data.type, ir.DoubleType):
             data = self.builder.bitcast(data, i64)
         self.builder.store(data, data_addr)
+        self.builder.branch(bb_after)
+        # --- After: continue (exc_pending check will catch if error) ---
+        self.builder.position_at_start(bb_after)
 
     def _can_inline_list_access(self, node: ast.expr) -> str | None:
         """Check if a list subscript can use inline access.
@@ -12661,8 +13001,9 @@ class CodeGen:
             self.variables[name] = (alloca, ValueType(kind))
             return
 
-        if not self._USE_FV_LOCALS:
-            # Legacy path: bare-type alloca
+        if not self._USE_FV_LOCALS or self._current_fn_bare_abi:
+            # Bare-type alloca: store native values directly (no FpyValue wrapping).
+            # Used in both legacy mode (_USE_FV_LOCALS=False) and bare-ABI functions.
             if name in self.variables:
                 alloca, _ = self.variables[name]
                 if value.type != alloca.type.pointee:
@@ -12752,16 +13093,33 @@ class CodeGen:
                 type_tag = ValueType(VKind.OBJ)
             else:
                 fv = self._wrap_bare_to_fv(value, type_tag)
+        # Scalar fast path: int/float/bool are value types with no heap
+        # allocation, so incref/decref is a no-op at runtime.  Skip the
+        # call entirely to avoid function-call overhead in hot loops.
+        _SCALAR_VKINDS = (VKind.INT, VKind.FLOAT, VKind.BOOL)
+        _new_is_scalar = (isinstance(type_tag, ValueType)
+                          and type_tag.kind in _SCALAR_VKINDS)
+
         if name in self.variables:
             alloca, old_tag = self.variables[name]
+            _old_is_scalar = False
+            if isinstance(old_tag, ValueType):
+                _old_is_scalar = old_tag.kind in _SCALAR_VKINDS
+            elif isinstance(old_tag, str):
+                _old_is_scalar = old_tag in ("int", "float", "bool")
             # If the existing alloca is not fpy_val (e.g., a cell or a
             # pre-existing bare alloca), create a new one.
             if not (isinstance(alloca.type, ir.PointerType)
                     and alloca.type.pointee is fpy_val):
                 alloca = self._create_entry_alloca(fpy_val, name)
+                # Always zero-init new FV allocas — even for scalar types.
+                # _emit_scope_decref unconditionally decrefs all FV locals,
+                # so if this variable is only assigned in a conditional branch,
+                # the uninitialized alloca would contain garbage tag/data that
+                # fpy_rc_decref interprets as a pointer, causing crashes.
                 if self._USE_REFCOUNT:
                     self._entry_store_fv_none(alloca)
-            elif self._USE_REFCOUNT:
+            elif self._USE_REFCOUNT and not _old_is_scalar:
                 # Decref the old value being overwritten
                 old_fv = self.builder.load(alloca, name=f"{name}.old")
                 old_tag_val = self.builder.extract_value(old_fv, 0)
@@ -12770,12 +13128,11 @@ class CodeGen:
                                   [old_tag_val, old_data])
         else:
             alloca = self._create_entry_alloca(fpy_val, name)
+            # Always zero-init new FV allocas so _emit_scope_decref is safe
+            # even if the variable is only assigned in a conditional branch.
             if self._USE_REFCOUNT:
-                # Initialize in entry block (not here) so that the first-
-                # iteration decref loads a valid NONE tag instead of garbage.
-                # Emitting the init at the current position would clobber the
-                # old value without decref on every loop iteration.
                 self._entry_store_fv_none(alloca)
+            if self._USE_REFCOUNT and not _new_is_scalar:
                 # Decref old value — safe because alloca is initialized to
                 # NONE in the entry block, so first-iteration decref is a
                 # no-op (tag=NONE → rc_decref skips it).
@@ -12785,7 +13142,7 @@ class CodeGen:
                 self.builder.call(self.runtime["rc_decref"],
                                   [old_tag_val, old_data])
         # Incref the new value being stored (skip if stealing an owned ref)
-        if self._USE_REFCOUNT and not steal:
+        if self._USE_REFCOUNT and not steal and not _new_is_scalar:
             new_tag = self.builder.extract_value(fv, 0)
             new_data = self.builder.extract_value(fv, 1)
             self.builder.call(self.runtime["rc_incref"],
@@ -13187,7 +13544,7 @@ class CodeGen:
         if name in self._global_vars:
             return self.builder.load(alloca, name=name)
 
-        if not self._USE_FV_LOCALS:
+        if not self._USE_FV_LOCALS or self._current_fn_bare_abi:
             return self.builder.load(alloca, name=name)
 
         # FV path: load FpyValue, unwrap to the bare type expected by callers
@@ -13351,9 +13708,9 @@ class CodeGen:
         the variable's FV alloca. Avoids the unwrap-then-rewrap round-trip
         that happens if you call list_get_* → _store_variable.
         """
-        if not self._USE_FV_LOCALS:
-            # Legacy path: unwrap and go through _store_variable
-            # (kept for safety if someone flips the flag off)
+        if not self._USE_FV_LOCALS or self._current_fn_bare_abi:
+            # Bare-type path: unwrap FV element to bare type, then store
+            # via _store_variable (which uses bare allocas in bare-ABI).
             tag_slot = self._create_entry_alloca(i32, "lget.tag")
             data_slot = self._create_entry_alloca(i64, "lget.data")
             self._rt_call("list_get_fv",
@@ -13393,7 +13750,13 @@ class CodeGen:
         # Without this, for-loop iterations leak the old loop variable
         # (never decref'd) and the last element gets an unbalanced
         # decref from scope_decref.
-        if self._USE_REFCOUNT:
+        # Scalar fast path: skip for int/float/bool (value types, no heap).
+        _is_scalar_elem = (isinstance(type_tag, ValueType)
+                           and type_tag.kind in (VKind.INT, VKind.FLOAT,
+                                                 VKind.BOOL))
+        if not _is_scalar_elem and isinstance(type_tag, str):
+            _is_scalar_elem = type_tag in ("int", "float", "bool")
+        if self._USE_REFCOUNT and not _is_scalar_elem:
             old_fv = self.builder.load(alloca)
             old_tag = self.builder.extract_value(old_fv, 0)
             old_data = self.builder.extract_value(old_fv, 1)
@@ -13611,7 +13974,10 @@ class CodeGen:
         # Body
         self.builder.position_at_end(body_block)
         self._loop_stack.append((end_block, cond_block))
+        _prev_hot = self._in_hot_loop
+        self._in_hot_loop = True
         self._emit_stmts(node.body)
+        self._in_hot_loop = _prev_hot
         self._loop_stack.pop()
         if not self.builder.block.is_terminated:
             self.builder.branch(cond_block)
@@ -13747,7 +14113,10 @@ class CodeGen:
         # Body
         self.builder.position_at_end(body_block)
         self._loop_stack.append((end_block, incr_block))
+        _prev_hot = self._in_hot_loop
+        self._in_hot_loop = True
         self._emit_stmts(node.body)
+        self._in_hot_loop = _prev_hot
         self._loop_stack.pop()
         if not self.builder.block.is_terminated:
             self.builder.branch(incr_block)
@@ -15156,7 +15525,8 @@ class CodeGen:
             if not self._in_try_block:
                 # Pop shadow frame before early return (traceback already
                 # snapshotted by fastpy_raise above)
-                self.builder.call(self.runtime["shadow_pop"], [])
+                if not self._current_fn_bare_abi:
+                    self.builder.call(self.runtime["shadow_pop"], [])
                 ret_type = self.function.return_value.type
                 if isinstance(ret_type, ir.VoidType):
                     self.builder.ret_void()
@@ -15178,7 +15548,8 @@ class CodeGen:
             msg = self._make_string_constant("")
             self.builder.call(self.runtime["raise"], [exc_id, msg])
             if not self._in_try_block:
-                self.builder.call(self.runtime["shadow_pop"], [])
+                if not self._current_fn_bare_abi:
+                    self.builder.call(self.runtime["shadow_pop"], [])
                 ret_type = self.function.return_value.type
                 if isinstance(ret_type, ir.VoidType):
                     self.builder.ret_void()
@@ -15285,8 +15656,9 @@ class CodeGen:
                 if self.builder.block.is_terminated:
                     return  # finally block unconditionally terminated
 
-        # Pop shadow stack before returning
-        self.builder.call(self.runtime["shadow_pop"], [])
+        # Pop shadow stack before returning (skip for bare-ABI — no frame pushed)
+        if not self._current_fn_bare_abi:
+            self.builder.call(self.runtime["shadow_pop"], [])
 
         # Scope cleanup: decref all locals except the return value
         ret_var_name = None
@@ -15640,7 +16012,10 @@ class CodeGen:
                 self._bridge_fallback_stmt(node, "unsupported for tuple unpack target")
 
         self._loop_stack.append((end_block, incr_block))
+        _prev_hot = self._in_hot_loop
+        self._in_hot_loop = True
         self._emit_stmts(node.body)
+        self._in_hot_loop = _prev_hot
         self._loop_stack.pop()
         if not self.builder.block.is_terminated:
             self.builder.branch(incr_block)
@@ -15679,7 +16054,10 @@ class CodeGen:
         self._store_variable(var_name, ch, "str")
 
         self._loop_stack.append((end_block, incr_block))
+        _prev_hot = self._in_hot_loop
+        self._in_hot_loop = True
         self._emit_stmts(node.body)
+        self._in_hot_loop = _prev_hot
         self._loop_stack.pop()
         if not self.builder.block.is_terminated:
             self.builder.branch(incr_block)
@@ -15733,7 +16111,10 @@ class CodeGen:
         self._store_variable(var_name, result, "int")
 
         self._loop_stack.append((end_block, cond_block))
+        _prev_hot = self._in_hot_loop
+        self._in_hot_loop = True
         self._emit_stmts(node.body)
+        self._in_hot_loop = _prev_hot
         self._loop_stack.pop()
         if not self.builder.block.is_terminated:
             self.builder.branch(cond_block)
@@ -15793,7 +16174,10 @@ class CodeGen:
         self._store_variable(var_name, raw_item, "pyobj")
 
         self._loop_stack.append((end_block, cond_block))
+        _prev_hot = self._in_hot_loop
+        self._in_hot_loop = True
         self._emit_stmts(node.body)
+        self._in_hot_loop = _prev_hot
         self._loop_stack.pop()
         if not self.builder.block.is_terminated:
             self.builder.branch(cond_block)
@@ -15834,7 +16218,10 @@ class CodeGen:
         self._store_variable(var_name, elem, "int")
 
         self._loop_stack.append((end_block, cond_block))
+        _prev_hot = self._in_hot_loop
+        self._in_hot_loop = True
         self._emit_stmts(node.body)
+        self._in_hot_loop = _prev_hot
         self._loop_stack.pop()
         if not self.builder.block.is_terminated:
             next_idx = self.builder.add(
@@ -15905,7 +16292,10 @@ class CodeGen:
                 self._dict_var_key_types[var_name] = key_types
 
         self._loop_stack.append((end_block, incr_block))
+        _prev_hot = self._in_hot_loop
+        self._in_hot_loop = True
         self._emit_stmts(node.body)
+        self._in_hot_loop = _prev_hot
         self._loop_stack.pop()
         if not self.builder.block.is_terminated:
             self.builder.branch(incr_block)
@@ -15971,7 +16361,10 @@ class CodeGen:
         self._fv_store_from_list(var_name, keys_list, idx, key_type)
 
         self._loop_stack.append((end_block, incr_block))
+        _prev_hot = self._in_hot_loop
+        self._in_hot_loop = True
         self._emit_stmts(node.body)
+        self._in_hot_loop = _prev_hot
         self._loop_stack.pop()
         if not self.builder.block.is_terminated:
             self.builder.branch(incr_block)
@@ -18613,8 +19006,9 @@ class CodeGen:
             if isinstance(obj.type, ir.PointerType):
                 slot_idx = self._get_attr_slot(node)
                 if slot_idx is not None:
+                    init_only = self._is_init_only_attr(node)
                     tag_val, data_val = self._emit_slot_get_direct(
-                        obj, slot_idx)
+                        obj, slot_idx, init_only=init_only)
                     return self._fv_build_from_slots(tag_val, data_val)
                 tag_slot = self._create_entry_alloca(i32, "aget.tag")
                 data_slot = self._create_entry_alloca(i64, "aget.data")
@@ -19990,6 +20384,34 @@ class CodeGen:
         the intrinsic / OverflowError path is used regardless of the global
         ``--int64`` flag — equivalent to ``--typed --int64`` for this one op.
         """
+        # Bare-ABI functions: use plain LLVM arithmetic (add/sub/mul).
+        # No BigInt, no function calls — lets LLVM constant-fold, inline,
+        # and vectorize exactly as C++ would.  Bare-ABI functions are
+        # guaranteed to have only i64/double locals.
+        if self._current_fn_bare_abi:
+            plain = {
+                ast.Add: self.builder.add,
+                ast.Sub: self.builder.sub,
+                ast.Mult: self.builder.mul,
+            }.get(type(op))
+            if plain is not None:
+                return plain(left, right)
+            # Pow: fall through to checked_pow runtime (rare in tight loops)
+
+        # Programs that don't need BigInt: use plain LLVM arithmetic (same
+        # as bare-ABI).  The _program_uses_bigint flag is set during AST
+        # analysis only when the source contains very large int literals or
+        # ** with large exponents.  This eliminates the fpy_checked_add
+        # function-call overhead for the vast majority of programs.
+        if not self._program_uses_bigint and not force_overflow_error:
+            plain = {
+                ast.Add: self.builder.add,
+                ast.Sub: self.builder.sub,
+                ast.Mult: self.builder.mul,
+            }.get(type(op))
+            if plain is not None:
+                return plain(left, right)
+
         # --typed --int64 (or per-variable Checked): use LLVM overflow
         # intrinsics — no BigInt fallback, no runtime function calls,
         # SIMD-vectorisable by LLVM.  Still raises OverflowError on
@@ -23549,8 +23971,10 @@ class CodeGen:
 
         # Save current emission state
         saved = (self.function, self.builder, self.variables, self._loop_stack,
-                 self._finally_stack, self._list_append_types, self._current_scope_stmts)
+                 self._finally_stack, self._list_append_types, self._current_scope_stmts,
+                 self._current_fn_bare_abi)
         self.function = func
+        self._current_fn_bare_abi = False  # inline key lambdas are never bare-ABI
         entry = func.append_basic_block("entry")
         self.builder = _SafeIRBuilder(entry)
         self.variables = {}
@@ -23587,7 +24011,8 @@ class CodeGen:
 
         # Restore
         (self.function, self.builder, self.variables, self._loop_stack,
-         self._finally_stack, self._list_append_types, self._current_scope_stmts) = saved
+         self._finally_stack, self._list_append_types, self._current_scope_stmts,
+         self._current_fn_bare_abi) = saved
         return func
 
     def _emit_builtin_isinstance(self, node: ast.Call) -> ir.Value:
@@ -26075,7 +26500,9 @@ class CodeGen:
                         obj = self.builder.inttoptr(obj, i8_ptr, name="obj.ptr")
                     slot_idx = self._get_attr_slot(value.value)
                     if slot_idx is not None:
-                        tag, data = self._emit_slot_get_direct(obj, slot_idx)
+                        init_only = self._is_init_only_attr(value.value)
+                        tag, data = self._emit_slot_get_direct(
+                            obj, slot_idx, init_only=init_only)
                     else:
                         tag_slot = self._create_entry_alloca(i32, "fattr.tag")
                         data_slot = self._create_entry_alloca(i64, "fattr.data")

@@ -57,7 +57,7 @@ An ABI version check at startup verifies the compiled-against Python version mat
 
 ## What's supported
 
-### Language features (66/66 audit, 405/405 tests, 100/100 regressions)
+### Language features (66/66 audit, 405/405 tests, 101/101 regressions)
 
 **Error reporting:**
 - **Syntax errors**: CPython-quality display with source line, caret, and column position (via `traceback.format_exception_only`)
@@ -74,7 +74,7 @@ An ABI version check at startup verifies the compiled-against Python version mat
 - **Pattern matching**: match/case with literal, capture, guard, or, wildcard, sequence, singleton (None/True/False) patterns (missing: star/mapping/class patterns — see [UNIMPLEMENTED.md](UNIMPLEMENTED.md))
 - **Exceptions**: try/except/finally/else, except* (ExceptionGroup), bare raise, raise from
 - **Multi-file compilation**: `from mymodule import func` resolves local `.py` files and packages (`mylib/module.py`), compiles them inline. Recursive import resolution with circular import detection.
-- **Imports**: native math/json/os/asyncio, local `.py` modules compiled inline, `.pyd` modules via CPython bridge
+- **Imports**: native math/json/os/asyncio/weakref, local `.py` modules compiled inline, `.pyd` modules via CPython bridge
 - **Builtins**: print, range, len, sorted (with key=, reverse=), min/max (with key=), int, float, str, bool, abs, sum, map, filter, enumerate, zip, isinstance, type, any, all, hash, next, iter, eval, exec, repr, pow, divmod, chr, ord, hex, oct, bin, round, dict, list, tuple, set, locals, globals, getattr/setattr/hasattr/delattr
 - **Type hints**: accepted and ignored (full compatibility with annotated code). With `--typed`/`-T`, type annotations drive native LLVM code generation for annotated variables (skip FpyValue overhead). Container annotations (`list[int]`, `list[str]`, `dict[str, int]`) provide element type info for optimized subscript access and iteration. Annotations are validated: if any assignment in scope contradicts the declared type, the variable silently falls back to full box (with a compile-time warning). With `--typed --int64`, annotated `int` arithmetic uses LLVM overflow intrinsics (SIMD-friendly, no runtime calls). Per-variable overflow control via `typing.Annotated` markers and constructor functions for both 64-bit (`Unchecked`/`Checked`, `unchecked_int()`/`checked_int()`) and 32-bit (`Unchecked32`/`Checked32`, `unchecked_int32()`/`checked_int32()`) arithmetic — see [fastpy shim package](#fastpy-shim-package)
 

@@ -165,6 +165,20 @@ int fpy_decref_atomic(int32_t *rc);
 
 #define FPY_OBJ_MAGIC 0x4F424A53  /* "OBJS" — distinguishes FpyObj from PyObject* */
 
+/* Weak reference: points to an object without preventing its collection.
+ * When the target object is destroyed, all its weakrefs are invalidated
+ * (target set to NULL). Weakrefs form a singly-linked list per object. */
+typedef struct FpyWeakRef {
+    int32_t refcount;
+    int32_t magic;                   /* FPY_WEAKREF_MAGIC */
+    FpyObj *target;                  /* the referenced object, NULL if collected */
+    struct FpyWeakRef *next;         /* next weakref in the target's chain */
+    int64_t callback;                /* optional callback (FpyValue data, tag=0 if none) */
+    int32_t callback_tag;            /* FpyValue tag for callback */
+} FpyWeakRef;
+
+#define FPY_WEAKREF_MAGIC 0x57454146  /* "WEAF" */
+
 struct FpyObj {
     int32_t refcount;                    /* reference count (first field for all GC'd objects) */
     FpyGCNode gc_node;                   /* cycle collector tracking */
@@ -172,6 +186,7 @@ struct FpyObj {
     int class_id;
     FpyValue *slots;                 /* size = class's slot_count, NULL if 0 */
     FpyObjAttrs *dynamic_attrs;      /* NULL unless used */
+    FpyWeakRef *weakref_list;        /* singly-linked list of weak refs, NULL if none */
     fpy_mutex_t lock;                /* per-object lock (free-threaded mode) */
 };
 
@@ -289,5 +304,11 @@ int32_t fastpy_set_equal(FpyDict *a, FpyDict *b);
 
 /* Variadic closure call: takes a list of args, unpacks and dispatches. */
 int64_t fastpy_closure_call_list(void *closure, void *args_list);
+
+/* --- Weak references --- */
+FpyWeakRef* fpy_weakref_new(FpyObj *target);
+FpyObj* fpy_weakref_deref(FpyWeakRef *wr);
+int32_t fpy_weakref_alive(FpyWeakRef *wr);
+void fpy_weakref_destroy(FpyWeakRef *wr);
 
 #endif /* FASTPY_OBJECTS_H */

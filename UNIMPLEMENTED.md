@@ -278,6 +278,11 @@ Systematic comparison against the Python 3.14 PEG grammar (`Grammar/python.gram`
 - **C extension for Int32/UInt32/Int64/UInt64** — `fastpy/_fastints.c` replaces
   pure-Python `ints.py` for CPython-side fixed-width integer performance.
   Falls back to pure Python if the extension is not compiled.
+- **Native `weakref` module** — `weakref.ref(obj)` and `_weakref.ref(obj)` create
+  native weak references (FpyWeakRef). Calling the weakref dereferences it,
+  returning the target object or None if the target has been collected. Each
+  FpyObj carries a `weakref_list` linked list; all weakrefs are invalidated
+  (target set to NULL) when the object is destroyed.
 
 ## Known limitations (not bugs)
 
@@ -291,7 +296,7 @@ Systematic comparison against the Python 3.14 PEG grammar (`Grammar/python.gram`
   functions, classes, or instances as `PyObject*`. Passing fastpy callables
   (lambdas, closures) to CPython APIs that expect Python callables fails.
   This affects `functools.reduce(lambda ...)`, `collections.defaultdict(int)`,
-  `weakref.ref(...)`, and similar patterns. Workaround: use CPython-side
+  and similar patterns. Workaround: use CPython-side
   callables or avoid bridge calls that need fastpy values as callbacks.
   **Planned fix (mirror object pattern):**
   Add an optional `PyObject* py_mirror` field to FpyObj. When a native object
