@@ -46,8 +46,15 @@ def main() -> int:
                              "populate the cache, and exit")
     parser.add_argument("--repl", action="store_true",
                         help="Start interactive REPL (compile-and-run each input)")
+    parser.add_argument("--analyze", action="store_true",
+                        help="Produce optimization analysis report showing "
+                             "which code patterns prevent fast-path optimizations")
+    parser.add_argument("--analyze-json", action="store_true",
+                        help="Output analysis report as JSON (implies --analyze)")
 
     args = parser.parse_args()
+    if args.analyze_json:
+        args.analyze = True
 
     if args.repl:
         from compiler.repl import start_repl
@@ -90,11 +97,11 @@ def main() -> int:
                           int64_mode=args.int64,
                           typed_mode=args.typed,
                           python_version=args.python_version,
-                          merge_stdlib=not args.no_stdlib_merge)
+                          merge_stdlib=not args.no_stdlib_merge,
+                          analyze=args.analyze)
 
     if result.success:
         print(f"Compiled: {result.executable}")
-        return 0
     else:
         for err in result.errors:
             msg = str(err)
@@ -105,7 +112,16 @@ def main() -> int:
                 print(msg, file=sys.stderr)
             else:
                 print(f"Error: {msg}", file=sys.stderr)
-        return 1
+
+    # Print analysis report (even on failure — codegen findings
+    # are available if the failure was in linking, not codegen)
+    if args.analyze and result.analysis_report:
+        if args.analyze_json:
+            print(result.analysis_report.to_json_str())
+        else:
+            print(result.analysis_report.to_text(), file=sys.stderr)
+
+    return 0 if result.success else 1
 
 
 if __name__ == "__main__":

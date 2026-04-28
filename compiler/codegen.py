@@ -903,7 +903,8 @@ class CodeGen:
 
     def __init__(self, threading_mode: int = 0, int64_mode: bool = False,
                  typed_mode: bool = False,
-                 source_filename: str = "<module>") -> None:
+                 source_filename: str = "<module>",
+                 analyze_mode: bool = False) -> None:
         self._current_scope_stmts = []  # Phase 4: initialize early
         self.module = ir.Module(name="fastpy_module")
         # Use the host platform's LLVM triple and data layout for correct
@@ -923,6 +924,13 @@ class CodeGen:
         # code generation — annotated vars use native LLVM types instead of FpyValue.
         self._typed_mode = typed_mode
         self._source_filename = source_filename
+
+        # Optimization analysis mode: when True, every optimization decision
+        # records a finding for the analysis report.  Zero overhead when False.
+        self._analyze_mode = analyze_mode
+        self._opt_findings: list = []   # list[OptimizationFinding]
+        self._current_scope = "module"  # updated on function/class/method entry
+
         # Per-function dict mapping variable name → (native_alloca, VKind).
         # Populated from function parameter annotations and AnnAssign statements
         # when _typed_mode is True.  Variables in this dict bypass the FpyValue
@@ -2845,6 +2853,38 @@ class CodeGen:
         )
         self._current_fn_bare_abi = not _main_has_complex
 
+        if _main_has_complex and self._analyze_mode:
+            from compiler.analysis import HIGH, IMPACT_BARE_ABI_MODULE
+            # Identify what specifically disabled bare-ABI
+            _COMPLEX_NAMES = {
+                ast.List: "list literal", ast.Dict: "dict literal",
+                ast.Set: "set literal", ast.ListComp: "list comprehension",
+                ast.DictComp: "dict comprehension",
+                ast.SetComp: "set comprehension",
+                ast.Subscript: "subscript access", ast.Attribute: "attribute access",
+                ast.JoinedStr: "f-string", ast.Try: "try/except",
+                ast.Raise: "raise", ast.Import: "import",
+                ast.ImportFrom: "import", ast.Tuple: "tuple literal",
+            }
+            blockers = set()
+            if _has_classes:
+                blockers.add("class definition")
+            for stmt in _main_stmts:
+                for n in ast.walk(stmt):
+                    if type(n) in _COMPLEX_NAMES:
+                        blockers.add(_COMPLEX_NAMES[type(n)])
+                    elif isinstance(n, ast.Constant) and isinstance(n.value, str):
+                        blockers.add("string constant")
+            self._record_finding(
+                HIGH, "bare_abi_disabled", None,
+                construct=", ".join(sorted(blockers)),
+                missed="Module-level bare-ABI mode",
+                reason=f"Module code uses: {', '.join(sorted(blockers))}",
+                impact=IMPACT_BARE_ABI_MODULE,
+                suggestion="Move complex operations into functions; keep "
+                           "module-level code as simple scalar arithmetic",
+            )
+
         # Push shadow frame for module-level code (skip for bare-ABI main)
         if not self._current_fn_bare_abi:
             main_name_ptr = self._make_string_constant("<module>")
@@ -3672,6 +3712,63 @@ class CodeGen:
 
         for cls_name in class_nodes:
             process(cls_name)
+
+        # ── Analysis: report attrs that are NOT init-only ──
+        if self._analyze_mode:
+            from compiler.analysis import MEDIUM, IMPACT_INIT_ONLY_MISSED
+            for cls_name, cls_node in class_nodes.items():
+                init_only_set = self._class_init_only_attrs.get(cls_name, set())
+                slots = self._class_attr_slots.get(cls_name, {})
+                # Find attrs set in __init__ but also modified elsewhere
+                init_a = set()
+                non_init_s = set()
+                for member in cls_node.body:
+                    if not isinstance(member, ast.FunctionDef):
+                        continue
+                    is_init = member.name == "__init__"
+                    for n in ast.walk(member):
+                        if (isinstance(n, ast.Attribute)
+                                and isinstance(n.value, ast.Name)
+                                and n.value.id == "self"
+                                and isinstance(n.ctx, ast.Store)):
+                            if is_init:
+                                init_a.add(n.attr)
+                            else:
+                                non_init_s.add(n.attr)
+                # Only report attrs that ARE in __init__ but lost init-only
+                # status (not attrs that were never in __init__)
+                lost = (init_a & non_init_s) - init_only_set
+                for attr in sorted(lost):
+                    # Find which method modifies it
+                    modifier = ""
+                    for member in cls_node.body:
+                        if (isinstance(member, ast.FunctionDef)
+                                and member.name != "__init__"):
+                            for n in ast.walk(member):
+                                if (isinstance(n, ast.Attribute)
+                                        and isinstance(n.value, ast.Name)
+                                        and n.value.id == "self"
+                                        and n.attr == attr
+                                        and isinstance(n.ctx, ast.Store)):
+                                    modifier = f" (modified in {cls_name}.{member.name})"
+                                    break
+                            if modifier:
+                                break
+                    old_scope = self._current_scope
+                    self._current_scope = f"class:{cls_name}"
+                    self._record_finding(
+                        MEDIUM, "init_only_missed", cls_node,
+                        construct=f"self.{attr}",
+                        missed=f"Init-only attribute "
+                               f"({cls_name}.{attr})",
+                        reason=f"Attribute set in __init__ but also "
+                               f"stored outside it{modifier}",
+                        impact=IMPACT_INIT_ONLY_MISSED,
+                        suggestion=f"If possible, compute self.{attr} "
+                                   f"once in __init__ instead of mutating "
+                                   f"it in other methods",
+                    )
+                    self._current_scope = old_scope
 
     def _analyze_call_sites(self, tree: ast.Module) -> None:
         """Scan all call sites to determine argument types for each function."""
@@ -4899,6 +4996,41 @@ class CodeGen:
                     elif existing[0] is None:
                         existing[0] = elem_type
 
+        # ── Analysis: report functions with unresolved parameter types ──
+        if self._analyze_mode:
+            from compiler.analysis import LOW, IMPACT_UNRESOLVED_TYPE
+            for fname, types in self._call_site_param_types.items():
+                # Skip qualified method names (Class.method) and built-ins
+                if "." in fname or fname.startswith("__"):
+                    continue
+                if fname not in func_asts:
+                    continue
+                none_params = [
+                    i for i, t in enumerate(types) if t is None
+                ]
+                if not none_params:
+                    continue
+                fnode = func_asts[fname]
+                params = [arg.arg for arg in fnode.args.args]
+                unknown = []
+                for pi in none_params:
+                    if pi < len(params):
+                        # Skip 'self'/'cls' — always unresolved for methods
+                        if params[pi] in ("self", "cls"):
+                            continue
+                        unknown.append(params[pi])
+                if unknown:
+                    self._record_finding(
+                        LOW, "unresolved_type", fnode,
+                        construct=f"function {fname}({', '.join(unknown)})",
+                        missed=f"Type inference for {fname}() parameters",
+                        reason=f"Could not determine types for parameter(s): "
+                               f"{', '.join(unknown)}",
+                        impact=IMPACT_UNRESOLVED_TYPE,
+                        suggestion="Call the function with typed literals or "
+                                   "variables with known types",
+                    )
+
     def _declare_lambda(self, var_name: str, lam: ast.Lambda) -> None:
         """Create a hidden function for a lambda assigned to a variable."""
         param_names = [arg.arg for arg in lam.args.args]
@@ -5270,6 +5402,23 @@ class CodeGen:
                             filled[fi] = merged_types[fi]
                     filled_sigs.append(tuple(filled))
                 self._monomorphized[node.name] = filled_sigs
+                if self._analyze_mode:
+                    from compiler.analysis import LOW, IMPACT_MONOMORPHIZED
+                    sig_strs = [
+                        "(" + ", ".join(s or "?" for s in sig) + ")"
+                        for sig in filled_sigs
+                    ]
+                    self._record_finding(
+                        LOW, "monomorphized", node,
+                        construct=f"function {node.name}()",
+                        missed=f"Single function body for {node.name}",
+                        reason=f"Scalar type conflict across {len(filled_sigs)}"
+                               f" call signatures: {', '.join(sig_strs)}",
+                        impact=IMPACT_MONOMORPHIZED,
+                        suggestion="Call the function with consistent "
+                                   "argument types (all int or all float) "
+                                   "to avoid generating multiple variants",
+                    )
                 for fsig in filled_sigs:
                     mangled = f"{node.name}__{self._mangle_sig(fsig)}"
                     self._declare_user_function(
@@ -5860,6 +6009,46 @@ class CodeGen:
             and not _has_ptr_in_sigs
             and node.name not in getattr(self, '_generator_funcs', set())
         )
+
+        if not uses_bare and self._analyze_mode:
+            from compiler.analysis import HIGH, IMPACT_BARE_ABI_FUNC
+            blockers = []
+            if has_vararg:
+                blockers.append("*args parameter")
+            if has_kwarg:
+                blockers.append("**kwargs parameter")
+            if _may_return_none:
+                blockers.append("may return None")
+            if not _is_scalar_ret:
+                blockers.append("non-scalar return type")
+            if not _body_is_scalar:
+                blockers.append("non-scalar body (strings, lists, dicts, "
+                                "attrs, or exceptions)")
+            if not all(isinstance(t, _SCALAR_TYPES) for t in param_types):
+                blockers.append("non-scalar parameter types")
+            if node.decorator_list:
+                blockers.append("has decorator(s)")
+            if _has_mixed_call_types:
+                blockers.append("mixed-type call sites")
+            if _has_ptr_in_sigs:
+                blockers.append("pointer types in call signatures")
+            if node.name in getattr(self, '_generator_funcs', set()):
+                blockers.append("generator function (contains yield)")
+            if blockers:
+                effective = _name_override or node.name
+                old_scope = self._current_scope
+                self._current_scope = f"function:{effective}"
+                self._record_finding(
+                    HIGH, "bare_abi_disabled", node,
+                    construct=f"function {effective}()",
+                    missed="Function bare-ABI mode (C-speed scalar ops)",
+                    reason="; ".join(blockers),
+                    impact=IMPACT_BARE_ABI_FUNC,
+                    suggestion="Keep function body to pure scalar arithmetic "
+                               "(int/float/bool); avoid strings, lists, "
+                               "attrs, or returning None",
+                )
+                self._current_scope = old_scope
 
         uses_fv = not (has_vararg or has_kwarg) and not uses_bare
         if uses_bare:
@@ -8307,6 +8496,27 @@ class CodeGen:
         self._per_class_float_attrs[class_name] = float_attrs
         self._per_class_string_attrs[class_name] = string_attrs
         self._per_class_bool_attrs[class_name] = bool_attrs
+
+        # ── Analysis: report boxed (untyped) attributes ──
+        if self._analyze_mode and class_name in self._class_attr_slots:
+            from compiler.analysis import MEDIUM, IMPACT_BOXED_ATTR
+            all_slots = set(self._class_attr_slots[class_name].keys())
+            typed = (float_attrs | string_attrs | bool_attrs
+                     | list_attrs | dict_attrs
+                     | set(self._class_obj_attr_types.get(class_name, {}).keys()))
+            boxed = all_slots - typed
+            for attr in sorted(boxed):
+                self._record_finding(
+                    MEDIUM, "boxed_attr", node,
+                    construct=f"self.{attr}",
+                    missed=f"Native-typed attribute ({class_name}.{attr})",
+                    reason=f"Could not infer type of {class_name}.{attr} "
+                           f"from constructor or assignments",
+                    impact=IMPACT_BOXED_ATTR,
+                    suggestion=f"Ensure self.{attr} is always assigned a "
+                               f"consistent type (int, float, str, bool, "
+                               f"list, or a known class)",
+                )
 
         for item in node.body:
             if isinstance(item, ast.FunctionDef):
@@ -11505,6 +11715,22 @@ class CodeGen:
         elem_type = self._get_list_elem_type(node)
         if elem_type in ("int", "float"):
             return elem_type
+        # Analysis: list IS a list but elements aren't scalar → generic access
+        if self._analyze_mode:
+            from compiler.analysis import MEDIUM, IMPACT_GENERIC_LIST
+            var_name = (node.id if isinstance(node, ast.Name)
+                        else f"<expr at line {getattr(node, 'lineno', '?')}>")
+            et = elem_type or "unknown"
+            self._record_finding(
+                MEDIUM, "generic_list_access", node,
+                construct=f"{var_name}[i]",
+                missed=f"Inline list access for {var_name}",
+                reason=f"Element type is '{et}' (needs int or float "
+                       f"for inline access)",
+                impact=IMPACT_GENERIC_LIST,
+                suggestion="Use lists with uniform int or float elements "
+                           "for fastest access",
+            )
         return None
 
     def _emit_attr_store(self, target: ast.Attribute, value: ir.Value, node: ast.AST,
@@ -14888,6 +15114,31 @@ class CodeGen:
 
         self.builder.position_at_end(end_block)
 
+    # ── Optimization analysis recording ─────────────────────────────────
+
+    def _record_finding(self, severity: str, category: str,
+                        node_or_line, construct: str,
+                        missed: str, reason: str,
+                        impact: str, suggestion: str = "") -> None:
+        """Record an optimization finding (no-op when analyze_mode is off)."""
+        if not self._analyze_mode:
+            return
+        from compiler.analysis import OptimizationFinding
+        line = (getattr(node_or_line, 'lineno', None)
+                if not isinstance(node_or_line, int)
+                else node_or_line)
+        self._opt_findings.append(OptimizationFinding(
+            severity=severity,
+            category=category,
+            line=line,
+            scope=self._current_scope,
+            construct=construct,
+            optimization_missed=missed,
+            reason=reason,
+            impact_estimate=impact,
+            suggestion=suggestion,
+        ))
+
     # ── Phase 4: Bridge fallback infrastructure ─────────────────────────
     # When the compiler encounters a pattern it can't handle natively,
     # these methods fall back to CPython instead of raising CodeGenError.
@@ -14906,6 +15157,16 @@ class CodeGen:
         efficient direct bridge path instead of exec."""
         self._bridge_fallback_log.append(
             f"line {getattr(node, 'lineno', '?')}: {reason}")
+        from compiler.analysis import CRITICAL, IMPACT_BRIDGE
+        self._record_finding(
+            CRITICAL, "bridge_fallback", node,
+            construct=reason,
+            missed="Bridge fallback (CPython interpreter)",
+            reason=reason,
+            impact=IMPACT_BRIDGE,
+            suggestion="Simplify this expression to use constructs "
+                       "the compiler handles natively",
+        )
 
         # Don't retry method/call paths — they may have called us, causing
         # infinite recursion. Just return 0 as a safe default.
@@ -14916,6 +15177,16 @@ class CodeGen:
         Currently a no-op (skips the statement) — logged for documentation."""
         self._bridge_fallback_log.append(
             f"line {getattr(node, 'lineno', '?')}: {reason}")
+        from compiler.analysis import CRITICAL, IMPACT_BRIDGE
+        self._record_finding(
+            CRITICAL, "bridge_fallback", node,
+            construct=reason,
+            missed="Bridge fallback (CPython interpreter)",
+            reason=reason,
+            impact=IMPACT_BRIDGE,
+            suggestion="Simplify this statement to use constructs "
+                       "the compiler handles natively",
+        )
 
     def _emit_cpython_method_call(self, node: ast.Call) -> ir.Value:
         """Emit a call to a function accessed via CPython module attribute.

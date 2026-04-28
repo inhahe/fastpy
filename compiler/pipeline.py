@@ -47,6 +47,7 @@ class CompileResult:
     errors: list[CompileError] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     ir: str | None = None  # LLVM IR for debugging
+    analysis_report: 'OptimizationReport | None' = None  # --analyze output
 
     def __str__(self) -> str:
         if self.success:
@@ -59,7 +60,8 @@ def compile_source(source: str, output: Path | None = None,
                    int64_mode: bool = False,
                    typed_mode: bool = False,
                    python_version: str | None = None,
-                   source_filename: str = "<module>") -> CompileResult:
+                   source_filename: str = "<module>",
+                   analyze: bool = False) -> CompileResult:
     """
     Compile a Python source string to a native executable.
 
@@ -108,7 +110,8 @@ def compile_source(source: str, output: Path | None = None,
     try:
         codegen = CodeGen(threading_mode=threading_mode, int64_mode=int64_mode,
                           typed_mode=typed_mode,
-                          source_filename=source_filename)
+                          source_filename=source_filename,
+                          analyze_mode=analyze)
         ir_string = codegen.generate(tree)
     except CodeGenError as e:
         return CompileResult(
@@ -143,6 +146,12 @@ def compile_source(source: str, output: Path | None = None,
         exe_name = "output.exe" if _sys.platform == "win32" else "output"
         output = Path(tmp_dir) / exe_name
 
+    # Build analysis report if requested
+    report = None
+    if analyze:
+        from compiler.analysis import build_report
+        report = build_report(codegen)
+
     try:
         from compiler.toolchain import compile_and_link
         exe_path = compile_and_link(ir_string, output,
@@ -151,12 +160,14 @@ def compile_source(source: str, output: Path | None = None,
             success=True,
             executable=exe_path,
             ir=ir_string,
+            analysis_report=report,
         )
     except Exception as e:
         return CompileResult(
             success=False,
             errors=[CompileError(message=f"Build failed: {e}")],
             ir=ir_string,
+            analysis_report=report,
         )
 
 
@@ -165,7 +176,8 @@ def compile_file(path: Path, output: Path | None = None,
                  int64_mode: bool = False,
                  typed_mode: bool = False,
                  python_version: str | None = None,
-                 merge_stdlib: bool = True) -> CompileResult:
+                 merge_stdlib: bool = True,
+                 analyze: bool = False) -> CompileResult:
     """Compile a Python source file to a native executable.
 
     Resolves local imports: if the source contains `import foo` or
@@ -200,7 +212,8 @@ def compile_file(path: Path, output: Path | None = None,
     return compile_source(merged, output, threading_mode=threading_mode,
                           int64_mode=int64_mode, typed_mode=typed_mode,
                           python_version=python_version,
-                          source_filename=str(path))
+                          source_filename=str(path),
+                          analyze=analyze)
 
 
 def _resolve_and_merge(source: str, base_dir: Path,
