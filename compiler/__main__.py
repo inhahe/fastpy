@@ -44,8 +44,15 @@ def main() -> int:
     parser.add_argument("--warm-stdlib-cache", action="store_true",
                         help="Pre-test all stdlib modules for compilability, "
                              "populate the cache, and exit")
+    parser.add_argument("--repl", action="store_true",
+                        help="Start interactive REPL (compile-and-run each input)")
 
     args = parser.parse_args()
+
+    if args.repl:
+        from compiler.repl import start_repl
+        start_repl()
+        return 0
 
     if args.list_pythons:
         from compiler.toolchain import discover_pythons
@@ -64,7 +71,8 @@ def main() -> int:
         return 0
 
     if args.source is None:
-        parser.error("the following arguments are required: source")
+        parser.error("the following arguments are required: source"
+                     " (or use --repl for interactive mode)")
 
     if not args.source.exists():
         print(f"Error: {args.source} not found", file=sys.stderr)

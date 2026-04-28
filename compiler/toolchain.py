@@ -430,6 +430,13 @@ def _find_msvc_cl() -> str | None:
     return None
 
 
+def _obj_is_current(src: Path, obj: Path) -> bool:
+    """Check if an object file exists and is newer than its source."""
+    if not obj.exists():
+        return False
+    return obj.stat().st_mtime >= src.stat().st_mtime
+
+
 def _compile_shared_runtime_windows(vcvars_cmd: str) -> None:
     """Build the shared (Python-independent) runtime .obj files on Windows."""
     c_files = {
@@ -441,7 +448,7 @@ def _compile_shared_runtime_windows(vcvars_cmd: str) -> None:
     }
     for name, src in c_files.items():
         obj = RUNTIME_DIR / f"{name}.obj"
-        if obj.exists():
+        if _obj_is_current(src, obj):
             continue
         bat_content = (
             f"@echo off\r\n"
@@ -474,8 +481,9 @@ def _compile_bridge_windows(vcvars_cmd: str, install: PythonInstall) -> Path:
     out_dir = RUNTIME_DIR / install.version_tag
     out_dir.mkdir(parents=True, exist_ok=True)
     out_obj = out_dir / "cpython_bridge.obj"
+    bridge_src = RUNTIME_DIR / "cpython_bridge.c"
 
-    if out_obj.exists():
+    if _obj_is_current(bridge_src, out_obj):
         return out_obj
 
     # For the C preprocessor, PYTHON_HOME_STR must be a string literal.
@@ -554,7 +562,7 @@ def _compile_shared_runtime_posix() -> None:
     }
     for name, src in c_files.items():
         obj = RUNTIME_DIR / f"{name}.o"
-        if obj.exists():
+        if _obj_is_current(src, obj):
             continue
         result = subprocess.run(
             [cc, "-c", "-O2", "-fPIC", str(src), "-o", str(obj)],
@@ -581,8 +589,9 @@ def _compile_bridge_posix(install: PythonInstall) -> Path:
     out_dir = RUNTIME_DIR / install.version_tag
     out_dir.mkdir(parents=True, exist_ok=True)
     out_obj = out_dir / "cpython_bridge.o"
+    bridge_src = RUNTIME_DIR / "cpython_bridge.c"
 
-    if out_obj.exists():
+    if _obj_is_current(bridge_src, out_obj):
         return out_obj
 
     python_home = str(install.prefix)
@@ -629,14 +638,16 @@ def ensure_runtime_built(python_exe: str | Path | None = None,
     """
     install = resolve_python(python_version=python_version, python_exe=python_exe)
 
-    # Check if the version-specific bridge exists. If not, we need to build
-    # it even if the legacy flat layout is complete (the legacy bridge may
-    # be for a different Python version).
+    # Check if the version-specific bridge exists and is up to date.
     versioned_bridge = _version_bridge_obj(install)
-    need_bridge_build = not versioned_bridge.exists()
+    bridge_src = RUNTIME_DIR / "cpython_bridge.c"
+    need_bridge_build = not _obj_is_current(bridge_src, versioned_bridge)
 
-    # Check shared objects
-    need_shared_build = not all(obj.exists() for obj in SHARED_RUNTIME_OBJS)
+    # Check shared objects — rebuild any that are missing or stale
+    need_shared_build = not all(
+        _obj_is_current(RUNTIME_DIR / (name + ".c"), obj)
+        for name, obj in zip(_SHARED_RUNTIME_NAMES, SHARED_RUNTIME_OBJS)
+    )
 
     if not need_bridge_build and not need_shared_build:
         return get_runtime_objs(install)
