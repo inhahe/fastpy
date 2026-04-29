@@ -1642,6 +1642,9 @@ class CodeGen:
         self.runtime["chainmap_set"] = ir.Function(self.module, ft, name="fastpy_chainmap_set")
         ft = ir.FunctionType(i8_ptr, [i8_ptr])  # chainmap_new_child(cm) -> chainmap
         self.runtime["chainmap_new_child"] = ir.Function(self.module, ft, name="fastpy_chainmap_new_child")
+        # chainmap_from_dicts(FpyDict**, n) -> chainmap
+        ft = ir.FunctionType(i8_ptr, [ir.PointerType(i8_ptr), i32])
+        self.runtime["chainmap_from_dicts"] = ir.Function(self.module, ft, name="fastpy_chainmap_from_dicts")
         ft = ir.FunctionType(i32, [i8_ptr, i8_ptr])  # chainmap_contains(cm, key) -> bool
         self.runtime["chainmap_contains"] = ir.Function(self.module, ft, name="fastpy_chainmap_contains")
         # OrderedDict (alias for regular dict)
@@ -15638,10 +15641,22 @@ class CodeGen:
                 if sub_cond is not None:
                     elem_ok = self.builder.and_(elem_ok, sub_cond)
 
-            # Bind **rest if present
+            # Bind **rest if present: copy the dict, remove matched keys
             if pattern.rest:
-                # TODO: create a dict minus the matched keys
-                pass
+                rest_ptr = self._rt_call("dict_copy", [dict_ptr])
+                for key_node in pattern.keys:
+                    key_val = self._emit_expr_value(key_node)
+                    if not isinstance(key_val.type, ir.PointerType):
+                        key_val = self._rt_call("int_to_str", [key_val])
+                    self._rt_call("dict_delete", [rest_ptr, key_val])
+                rest_data = self.builder.ptrtoint(rest_ptr, i64)
+                rest_fv = self._create_entry_alloca(fpy_val, f"{pattern.rest}.fv")
+                tag_val = ir.Constant(i32, FPY_TAG_DICT)
+                tmp = self.builder.insert_value(
+                    ir.Constant(fpy_val, ir.Undefined), tag_val, 0)
+                tmp = self.builder.insert_value(tmp, rest_data, 1)
+                self.builder.store(tmp, rest_fv)
+                self.variables[pattern.rest] = (rest_fv, "dict")
 
             last_check = self.builder.block
             self.builder.branch(done_block)
@@ -24984,9 +24999,20 @@ class CodeGen:
                 result = self.builder.call(self.runtime["chainmap_new"], [])
             else:
                 # ChainMap(dict1, dict2, ...) — build from dicts
-                result = self.builder.call(self.runtime["chainmap_new"], [])
-                # For now, use the simple new + later populate approach
-                # TODO: implement chainmap_from_dicts with varargs
+                n = len(node.args)
+                arr_type = ir.ArrayType(i8_ptr, n)
+                arr = self._create_entry_alloca(arr_type, "cm.dicts")
+                for idx, arg in enumerate(node.args):
+                    dict_val = self._emit_expr_value(arg)
+                    if not isinstance(dict_val.type, ir.PointerType):
+                        dict_val = self.builder.inttoptr(dict_val, i8_ptr)
+                    ptr = self.builder.gep(arr, [
+                        ir.Constant(i64, 0), ir.Constant(i32, idx)])
+                    self.builder.store(dict_val, ptr)
+                arr_ptr = self.builder.bitcast(arr, ir.PointerType(i8_ptr))
+                result = self._rt_call(
+                    "chainmap_from_dicts",
+                    [arr_ptr, ir.Constant(i32, n)])
             self._last_collections_type = "chainmap"
             return result
 
