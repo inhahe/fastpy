@@ -1453,3 +1453,110 @@ class TestAdvanced:
             "    def __repr__(self):\n        return f'N({self.v})'\n"
             "a = [N(5), N(2), N(8), N(1)]\nprint(sorted(a))"
         )
+
+    def test_min_max_obj_lt(self, assert_compiles):
+        """Bug #143: min/max on list of objects with __lt__."""
+        assert_compiles(
+            "class N:\n"
+            "    def __init__(self, v):\n        self.v = v\n"
+            "    def __lt__(self, o):\n        return self.v < o.v\n"
+            "    def __repr__(self):\n"
+            "        return 'N(' + str(self.v) + ')'\n"
+            "items = [N(5), N(2), N(8), N(1), N(3)]\n"
+            "print(repr(min(items)))\n"
+            "print(repr(max(items)))\n"
+            "x = min(items)\nprint(x.v)\n"
+            "y = max(items)\nprint(y.v)"
+        )
+
+    # --- Bug #144: dict comp tuple-unpack key type dispatch ---
+    def test_dict_comp_enumerate_key(self, assert_compiles):
+        """Bug #144: dict comp with enumerate uses int keys → dict_set_int_fv."""
+        assert_compiles(
+            "items = ['a', 'b', 'c']\n"
+            "d = {i: v for i, v in enumerate(items)}\n"
+            "print(d)"
+        )
+
+    # --- Bug #145: dict comp over string iteration ---
+    def test_dict_comp_string_iter(self, assert_compiles):
+        """Bug #145: dict comp iterating over string characters."""
+        assert_compiles(
+            "d = {c: i for i, c in enumerate('hello')}\n"
+            "print(d)"
+        )
+
+    # --- Bug #146: diamond MRO resolution ---
+    def test_diamond_mro(self, assert_compiles):
+        """Bug #146: diamond inheritance — D(B,C) with C overriding A.greet."""
+        assert_compiles(
+            "class A:\n"
+            "    def greet(self):\n        return 'A'\n"
+            "class B(A):\n    pass\n"
+            "class C(A):\n"
+            "    def greet(self):\n        return 'C'\n"
+            "class D(B, C):\n    pass\n"
+            "d = D()\nprint(d.greet())"
+        )
+
+    def test_diamond_mro_deeper(self, assert_compiles):
+        """Diamond MRO with method defined at intermediate level."""
+        assert_compiles(
+            "class A:\n"
+            "    def who(self):\n        return 'A'\n"
+            "class B(A):\n"
+            "    def who(self):\n        return 'B'\n"
+            "class C(A):\n"
+            "    def who(self):\n        return 'C'\n"
+            "class D(B, C):\n    pass\n"
+            "print(D().who())"
+        )
+
+    # --- Bug #147: closure with *args crashed or returned 0 ---
+    def test_closure_varargs_return(self, assert_compiles):
+        """Bug #147: closure with *args returning args[0] or len(args)."""
+        assert_compiles(
+            "def make():\n"
+            "    def inner(*args):\n"
+            "        return len(args)\n"
+            "    return inner\n"
+            "f = make()\nprint(f(1, 2, 3))"
+        )
+
+    def test_closure_varargs_capture(self, assert_compiles):
+        """Closure with *args and captured variable."""
+        assert_compiles(
+            "def make_adder(n):\n"
+            "    def adder(*args):\n"
+            "        return n + sum(args)\n"
+            "    return adder\n"
+            "f = make_adder(10)\nprint(f(1, 2, 3))"
+        )
+
+    def test_closure_varargs_subscript(self, assert_compiles):
+        """Closure with *args accessing args[0]."""
+        assert_compiles(
+            "def make():\n"
+            "    def inner(*args):\n"
+            "        return args[0]\n"
+            "    return inner\n"
+            "f = make()\nprint(f(42))"
+        )
+
+    # --- Bug #148: list(obj) with __iter__/__next__ ---
+    def test_list_from_iterator(self, assert_compiles):
+        """Bug #148: list(obj) on objects implementing __iter__/__next__."""
+        assert_compiles(
+            "class R:\n"
+            "    def __init__(self, n):\n"
+            "        self.n = n\n"
+            "    def __iter__(self):\n"
+            "        self.i = 0\n"
+            "        return self\n"
+            "    def __next__(self):\n"
+            "        if self.i >= self.n:\n"
+            "            raise StopIteration\n"
+            "        self.i = self.i + 1\n"
+            "        return self.i\n"
+            "print(list(R(5)))"
+        )

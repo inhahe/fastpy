@@ -397,6 +397,7 @@ class ClassInfo:
     staticmethods: set = None           # set of method names marked @staticmethod
     properties: set = None              # set of method names marked @property
     match_args: list = None             # __match_args__ tuple entries (list[str])
+    own_method_names: set = None        # methods defined in this class body (not inherited)
 
 # Type tag constants for our tagged value system (future use)
 TAG_INT = 0
@@ -1241,6 +1242,10 @@ class CodeGen:
         self.runtime["list_to_str"] = ir.Function(self.module, ft, name="fastpy_list_to_str")
         ft = ir.FunctionType(i8_ptr, [i8_ptr])
         self.runtime["list_sorted"] = ir.Function(self.module, ft, name="fastpy_list_sorted")
+        self.runtime["list_from_obj_iter"] = ir.Function(self.module, ft, name="fastpy_list_from_obj_iter")
+        ft = ir.FunctionType(i64, [i8_ptr])
+        self.runtime["list_min_fv"] = ir.Function(self.module, ft, name="fastpy_list_min_fv")
+        self.runtime["list_max_fv"] = ir.Function(self.module, ft, name="fastpy_list_max_fv")
         ft = ir.FunctionType(i8_ptr, [i8_ptr])
         self.runtime["list_reversed"] = ir.Function(self.module, ft, name="fastpy_list_reversed")
         ft = ir.FunctionType(i8_ptr, [i8_ptr])
@@ -2015,6 +2020,7 @@ class CodeGen:
         # enumerate and zip
         ft = ir.FunctionType(i8_ptr, [i8_ptr, i64])
         self.runtime["enumerate"] = ir.Function(self.module, ft, name="fastpy_enumerate")
+        self.runtime["enumerate_str"] = ir.Function(self.module, ft, name="fastpy_enumerate_str")
         ft = ir.FunctionType(i8_ptr, [i8_ptr, i8_ptr])
         self.runtime["zip"] = ir.Function(self.module, ft, name="fastpy_zip")
 
@@ -2238,6 +2244,10 @@ class CodeGen:
         # Mark a closure capture as a cell pointer (for GC cleanup)
         ft = ir.FunctionType(void, [i8_ptr, i32])
         self.runtime["closure_mark_cell"] = ir.Function(self.module, ft, name="fastpy_closure_mark_cell")
+
+        # Mark a closure as using *args (arguments will be packed into a list)
+        ft = ir.FunctionType(void, [i8_ptr])
+        self.runtime["closure_set_vararg"] = ir.Function(self.module, ft, name="fastpy_closure_set_vararg")
 
         # Closure return tag: set before ret, read after call
         ft = ir.FunctionType(void, [i32])
@@ -3658,6 +3668,11 @@ class CodeGen:
                         self.builder.call(self.runtime["closure_set_default"],
                                           [closure, ir.Constant(i32, di), def_val])
 
+                # Mark as *args closure if the function uses *args
+                if node.args.vararg:
+                    self.builder.call(self.runtime["closure_set_vararg"],
+                                      [closure])
+
                 # Store closure as a variable with the inner function's name
                 self._store_variable(node.name, closure, "closure")
                 return
@@ -3670,6 +3685,7 @@ class CodeGen:
         # the i64 calling convention used by call_ptr0/1/2).
         if node.name in self._user_functions:
             info = self._user_functions[node.name]
+            _inner_has_vararg = node.args.vararg is not None
             if info.uses_fv_abi:
                 wrapper = self._get_or_emit_i64_wrapper(info)
                 wrapper_ptr = self.builder.bitcast(wrapper, i8_ptr)
@@ -3679,6 +3695,35 @@ class CodeGen:
                     ir.Constant(i32, info.param_count),
                     ir.Constant(i32, 0),
                 ])
+                if _inner_has_vararg:
+                    self.builder.call(self.runtime["closure_set_vararg"],
+                                      [closure])
+                self._store_variable(node.name, closure, "closure")
+            elif _inner_has_vararg:
+                # *args function: returns FpyValue but closure expects i64.
+                # Create a thin wrapper that extracts .data from the return.
+                _wrap_name = f"{info.func.name}.__vararg_wrap"
+                try:
+                    wrapper = self.module.get_global(_wrap_name)
+                except KeyError:
+                    # Wrapper: (i8* args_list) -> i64
+                    _wt = ir.FunctionType(i64, [i8_ptr])
+                    wrapper = ir.Function(self.module, _wt, name=_wrap_name)
+                    wrapper.linkage = "internal"
+                    wrapper.attributes.add('alwaysinline')
+                    _wb = _SafeIRBuilder(wrapper.append_basic_block("entry"))
+                    _result = _wb.call(info.func, [wrapper.args[0]])
+                    # Extract data field (index 1) from FpyValue {i32, i64}
+                    _data = _wb.extract_value(_result, 1)
+                    _wb.ret(_data)
+                func_ptr = self.builder.bitcast(wrapper, i8_ptr)
+                closure = self.builder.call(self.runtime["closure_new"], [
+                    func_ptr,
+                    ir.Constant(i32, info.param_count),
+                    ir.Constant(i32, 0),
+                ])
+                self.builder.call(self.runtime["closure_set_vararg"],
+                                  [closure])
                 self._store_variable(node.name, closure, "closure")
             else:
                 func_ptr = self.builder.ptrtoint(info.func, i64)
@@ -10110,30 +10155,87 @@ class CodeGen:
                 methods[method_name] = func
                 method_asts[method_name] = item
 
-        # Multiple inheritance: flatten secondary-base methods into this
-        # class. The primary base is handled via the runtime parent_id
-        # chain; secondary bases' methods must be registered directly on
-        # this class so they're discoverable by fastpy_find_method.
-        # Build the set of methods available through the primary parent chain
-        # so we don't override them with secondary base methods (Python MRO
-        # gives priority to the primary parent chain).
-        _primary_chain_methods: set[str] = set(methods.keys())
+        # Record own methods (defined in this class body) before flattening
+        _own_method_names = set(methods.keys())
+        # Multiple inheritance: compute C3 MRO and flatten methods in
+        # MRO order. Each method is taken from the first class in the MRO
+        # that *directly defines* it (using own_method_names).
+        all_bases = [parent_name] + secondary_bases if parent_name else secondary_bases
+        # Compute C3 linearization for correct diamond-resolution
+        mro_names = self._compute_c3_mro(class_name, all_bases)
+        # Store MRO for runtime dispatch (used when >1 base)
+        if not hasattr(self, '_class_mro'):
+            self._class_mro = {}
+        self._class_mro[class_name] = mro_names
+        # Flatten methods from MRO (skip self, already collected).
+        # Only consider each class's OWN methods (not inherited ones)
+        # to respect C3 ordering: in D(B, C) where B(A) and C(A),
+        # B inherits A.greet but C defines its own greet. C's greet
+        # should win because C appears before A in D's MRO.
+        # Build the primary parent chain (accessible via runtime parent_id walk)
+        _primary_chain: set[str] = set()
+        _pn = parent_name
+        while _pn and _pn in self._user_classes:
+            _primary_chain.add(_pn)
+            _pn = self._user_classes[_pn].parent_name
+        # Collect methods visible through the primary parent chain
+        _primary_methods: set[str] = set(_own_method_names)
         _pn = parent_name
         while _pn and _pn in self._user_classes:
             _pi = self._user_classes[_pn]
             if _pi.methods:
-                _primary_chain_methods |= set(_pi.methods.keys())
+                _primary_methods |= set(_pi.methods.keys())
             _pn = _pi.parent_name
-        for sec_base in secondary_bases:
-            sec_info = self._user_classes.get(sec_base)
-            if sec_info is None:
+        # Walk MRO to flatten methods from secondary bases.
+        # Only add methods from classes NOT in the primary parent chain,
+        # OR methods that OVERRIDE a primary-chain method earlier in MRO.
+        _seen = set(_own_method_names)
+        for mro_cls in mro_names[1:]:  # skip self (index 0)
+            mro_info = self._user_classes.get(mro_cls)
+            if mro_info is None:
                 continue
-            for m_name, m_func in sec_info.methods.items():
-                if m_name not in _primary_chain_methods:
-                    methods[m_name] = m_func
-                    _primary_chain_methods.add(m_name)
-                    if sec_info.method_asts and m_name in sec_info.method_asts:
-                        method_asts[m_name] = sec_info.method_asts[m_name]
+            # Skip classes in the primary chain (their methods are
+            # accessible via runtime parent_id walk already)
+            if mro_cls in _primary_chain:
+                # But track their own methods as "seen" so we don't
+                # re-add them from later MRO entries
+                own = mro_info.own_method_names if mro_info.own_method_names is not None else set(mro_info.methods.keys())
+                _seen |= own
+                continue
+            # Secondary base: add its own methods if not already seen
+            # by an earlier class in the MRO (including primary chain classes).
+            # MRO position of the current secondary base:
+            _sec_pos = mro_names.index(mro_cls) if mro_cls in mro_names else 999
+            own = mro_info.own_method_names if mro_info.own_method_names is not None else set(mro_info.methods.keys())
+            for m_name in own:
+                if m_name in _seen or m_name not in mro_info.methods:
+                    continue
+                # Check if a primary-chain class that appears EARLIER
+                # in the MRO defines this method as its own. If so,
+                # that class takes precedence via the parent_id walk.
+                _earlier_primary_defines = m_name in _own_method_names
+                if not _earlier_primary_defines:
+                    _pn2 = parent_name
+                    while _pn2 and _pn2 in self._user_classes:
+                        _pi2 = self._user_classes[_pn2]
+                        if (_pi2.own_method_names is not None
+                                and m_name in _pi2.own_method_names):
+                            # This primary-chain class defines the method.
+                            # Only block the secondary base if this class
+                            # appears EARLIER in MRO than the secondary.
+                            _pn2_pos = mro_names.index(_pn2) if _pn2 in mro_names else 999
+                            if _pn2_pos < _sec_pos:
+                                _earlier_primary_defines = True
+                                break
+                        _pn2 = _pi2.parent_name
+                if not _earlier_primary_defines:
+                    # No earlier primary-chain class owns this method;
+                    # this secondary base's definition wins by MRO order.
+                    methods[m_name] = mro_info.methods[m_name]
+                    _seen.add(m_name)
+                    if mro_info.method_asts and m_name in mro_info.method_asts:
+                        method_asts[m_name] = mro_info.method_asts[m_name]
+        for sec_base in secondary_bases:
             # Inherit container/float/string/bool attrs from secondary bases
             if sec_base in self._class_container_attrs:
                 s_list, s_dict = self._class_container_attrs[sec_base]
@@ -10170,7 +10272,63 @@ class CodeGen:
             staticmethods=staticmethods,
             properties=properties,
             match_args=match_args,
+            own_method_names=_own_method_names,
         )
+
+    def _compute_c3_mro(self, cls_name: str, bases: list[str]) -> list[str]:
+        """Compute C3 linearization for a class with the given bases.
+        Returns the MRO as a list of class names (starting with cls_name).
+        Falls back to simple DFS if C3 fails (shouldn't for valid Python)."""
+        # Base case: no parents → just [self]
+        if not bases:
+            return [cls_name]
+        # Get parent MROs
+        parent_mros: list[list[str]] = []
+        for b in bases:
+            bi = self._user_classes.get(b)
+            if bi is None:
+                parent_mros.append([b])
+            else:
+                # Recursively compute parent MRO
+                p_bases: list[str] = []
+                if bi.parent_name and bi.parent_name in self._user_classes:
+                    p_bases.append(bi.parent_name)
+                # Check if parent has secondary bases stored
+                if hasattr(self, '_class_mro') and b in self._class_mro:
+                    parent_mros.append(list(self._class_mro[b]))
+                else:
+                    parent_mros.append(self._compute_c3_mro(b, p_bases))
+        # C3 merge: [cls] + merge(parent_mros + [bases])
+        lists = [list(m) for m in parent_mros] + [list(bases)]
+        result = [cls_name]
+        while True:
+            # Remove empty lists
+            lists = [l for l in lists if l]
+            if not lists:
+                break
+            # Find a good head: first element of any list that doesn't
+            # appear in the tail of any other list
+            head = None
+            for l in lists:
+                candidate = l[0]
+                in_tail = any(candidate in ll[1:] for ll in lists)
+                if not in_tail:
+                    head = candidate
+                    break
+            if head is None:
+                # C3 linearization failed — shouldn't happen for valid Python.
+                # Fall back to simple concatenation.
+                for l in lists:
+                    for c in l:
+                        if c not in result:
+                            result.append(c)
+                break
+            result.append(head)
+            # Remove head from all lists
+            for l in lists:
+                if l and l[0] == head:
+                    l.pop(0)
+        return result
 
     def _detect_class_container_attrs(self, node: ast.ClassDef,
                                         cname: str | None = None) -> tuple[set[str], set[str]]:
@@ -13468,6 +13626,8 @@ class CodeGen:
                 return "str"
             if et == "float":
                 return "float"
+            if et == "obj":
+                return "obj"
         # BoolOp (and/or) with all bool-typed operands → bool result; with
         # mixed types, the result is the left/right operand's type (we
         # conservatively return "int" for mixed since Python would too).
@@ -25143,6 +25303,12 @@ class CodeGen:
                         if isinstance(b.type, ir.IntType):
                             b = self.builder.inttoptr(b, i8_ptr)
                         return self.builder.call(self.runtime["bytes_to_list"], [b])
+                # list(obj) — iterate via __iter__/__next__ protocol
+                if len(node.args) == 1 and self._is_obj_expr(node.args[0]):
+                    obj = self._emit_expr_value(node.args[0])
+                    if isinstance(obj.type, ir.IntType):
+                        obj = self.builder.inttoptr(obj, i8_ptr)
+                    return self._rt_call("list_from_obj_iter", [obj])
                 # list(x) — for now, just return the arg (shallow copy would be better)
                 if len(node.args) == 1:
                     return self._emit_expr_value(node.args[0])
@@ -25408,6 +25574,17 @@ class CodeGen:
                                 break
                     if start is None:
                         start = ir.Constant(i64, 0)
+                    # Detect string argument → use enumerate_str
+                    _arg_is_str = False
+                    _arg0 = node.args[0]
+                    if isinstance(_arg0, ast.Constant) and isinstance(_arg0.value, str):
+                        _arg_is_str = True
+                    elif isinstance(_arg0, ast.Name) and _arg0.id in self.variables:
+                        _, _tag = self.variables[_arg0.id]
+                        if (isinstance(_tag, ValueType) and _tag.kind == VKind.STR) or _tag == "str":
+                            _arg_is_str = True
+                    if _arg_is_str:
+                        return self._rt_call("enumerate_str", [lst, start])
                     return self._rt_call("enumerate", [lst, start])
                 raise CodeGenError("enumerate() requires at least one argument", node)
             if name == "zip":
@@ -25906,6 +26083,14 @@ class CodeGen:
                                             "set", "deque", "bytes", "obj")
                     result_type = i8_ptr if is_ptr else i64
                     bare_tag = elem_type if is_ptr else "int"
+
+                    # OBJ elements: use runtime min/max that dispatches
+                    # to __lt__ — no need for our own loop
+                    if elem_type == "obj":
+                        rt_name = "list_min_fv" if name == "min" else "list_max_fv"
+                        data_i64 = self.builder.call(self.runtime[rt_name], [lst])
+                        return self.builder.inttoptr(data_i64, i8_ptr)
+
                     result_alloca = self._create_entry_alloca(result_type, f"{name}.result")
                     first = self._list_get_as_bare(
                         lst, ir.Constant(i64, 0), bare_tag)
@@ -30040,6 +30225,10 @@ class CodeGen:
                 ret_type = self._find_method_return_type(
                     node.args[0], "__abs__")
                 return ret_type is None or isinstance(ret_type, ir.PointerType)
+            # min/max on list of objects returns an object
+            if (node.func.id in ("min", "max") and len(node.args) == 1
+                    and self._get_list_elem_type(node.args[0]) == "obj"):
+                return True
             return False
         # Method calls that return an object (self or cls())
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
@@ -31250,6 +31439,39 @@ class CodeGen:
             cmp = self.builder.icmp_signed("<", idx, length)
             self.builder.cbranch(cmp, body_block, end_block)
             self.builder.position_at_end(body_block)
+            # Infer per-position types for tuple elements
+            n_targets = len(gen.target.elts)
+            pos_tags: list[str] = ["int"] * n_targets
+            # enumerate(iterable) → (int, elem_type)
+            if (isinstance(gen.iter, ast.Call)
+                    and isinstance(gen.iter.func, ast.Name)
+                    and gen.iter.func.id == "enumerate"
+                    and n_targets == 2):
+                pos_tags[0] = "int"
+                if gen.iter.args:
+                    et = self._get_list_elem_type(gen.iter.args[0])
+                    pos_tags[1] = et if et else "int"
+                    # String iteration yields str characters
+                    if (isinstance(gen.iter.args[0], ast.Constant)
+                            and isinstance(gen.iter.args[0].value, str)):
+                        pos_tags[1] = "str"
+                    elif (isinstance(gen.iter.args[0], ast.Name)
+                          and gen.iter.args[0].id in self.variables):
+                        _, _vt = self.variables[gen.iter.args[0].id]
+                        if _vt == "str" or (isinstance(_vt, ValueType)
+                                             and _vt.kind == VKind.STR):
+                            pos_tags[1] = "str"
+            # Literal list of tuples: infer from first tuple element types
+            elif isinstance(gen.iter, ast.List) and gen.iter.elts:
+                first_tup = gen.iter.elts[0]
+                if isinstance(first_tup, ast.Tuple):
+                    for _pi, _pel in enumerate(first_tup.elts):
+                        if _pi < n_targets:
+                            if isinstance(_pel, ast.Constant):
+                                if isinstance(_pel.value, str):
+                                    pos_tags[_pi] = "str"
+                                elif isinstance(_pel.value, float):
+                                    pos_tags[_pi] = "float"
             # Get the tuple element and unpack
             tag_s = self._create_entry_alloca(i32, "dc.tag")
             data_s = self._create_entry_alloca(i64, "dc.data")
@@ -31260,7 +31482,15 @@ class CodeGen:
                     t2 = self._create_entry_alloca(i32, f"dc.t{ti}")
                     d2 = self._create_entry_alloca(i64, f"dc.d{ti}")
                     self._rt_call("list_get_fv", [elem_ptr, ir.Constant(i64, ti), t2, d2])
-                    self._store_variable(tgt.id, self.builder.load(d2), "int")
+                    _var_tag = pos_tags[ti] if ti < len(pos_tags) else "int"
+                    if _var_tag in ("str", "list", "tuple", "dict", "obj"):
+                        # Pointer types: convert i64 data to pointer
+                        self._store_variable(
+                            tgt.id,
+                            self.builder.inttoptr(self.builder.load(d2), i8_ptr),
+                            _var_tag)
+                    else:
+                        self._store_variable(tgt.id, self.builder.load(d2), _var_tag)
             # Handle filter conditions (if clauses)
             incr_block = self._new_block("dc.incr")
             for if_clause in gen.ifs:
@@ -31274,9 +31504,18 @@ class CodeGen:
             # Evaluate key and value expressions
             key_val = self._emit_expr_value(node.key)
             val_val = self._emit_expr_value(node.value)
-            k_tag, k_data = self._bare_to_tag_data(key_val, node.key)
             v_tag, v_data = self._bare_to_tag_data(val_val, node.value)
-            self._rt_call("dict_set_fv", [result_dict, key_val, ir.Constant(i32, v_tag), v_data])
+            if isinstance(key_val.type, ir.IntType):
+                self.builder.call(self.runtime["dict_set_int_fv"],
+                                  [result_dict, key_val,
+                                   ir.Constant(i32, v_tag), v_data])
+            elif isinstance(key_val.type, ir.PointerType):
+                self.builder.call(self.runtime["dict_set_fv"],
+                                  [result_dict, key_val,
+                                   ir.Constant(i32, v_tag), v_data])
+            else:
+                return self._bridge_fallback_expr(
+                    node, "dict comprehension key type")
             self.builder.branch(incr_block)
             self.builder.position_at_end(incr_block)
             next_idx = self.builder.add(idx, ir.Constant(i64, 1))
@@ -31304,7 +31543,10 @@ class CodeGen:
                 # dict iteration yields keys — use dict_keys runtime
                 list_ptr = self.builder.call(
                     self.runtime["dict_keys"], [list_ptr])
-            list_len = self._rt_call("list_length", [list_ptr])
+            if iter_kind == VKind.STR:
+                list_len = self._rt_call("str_len", [list_ptr])
+            else:
+                list_len = self._rt_call("list_length", [list_ptr])
             var_name = gen.target.id
             # Determine element type for the loop variable
             if iter_kind == VKind.DICT:
@@ -31340,7 +31582,11 @@ class CodeGen:
             self.builder.cbranch(cond, body_block, end_block)
             self.builder.position_at_end(body_block)
             idx = self.builder.load(idx_alloca)
-            self._fv_store_from_list(var_name, list_ptr, idx, var_tag)
+            if iter_kind == VKind.STR:
+                char_ptr = self._rt_call("str_index", [list_ptr, idx])
+                self._store_variable(var_name, char_ptr, "str")
+            else:
+                self._fv_store_from_list(var_name, list_ptr, idx, var_tag)
             # Handle filter conditions
             for if_clause in gen.ifs:
                 cond_val = self._emit_condition(if_clause)

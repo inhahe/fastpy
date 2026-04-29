@@ -55,6 +55,7 @@ typedef struct {
     int n_params;
     void *func;
     uint8_t capture_is_cell;  /* bitmask: bit i set = captures[i] is a cell pointer */
+    uint8_t has_vararg;        /* 1 if function uses *args — args must be packed into list */
     int n_defaults;            /* number of default parameter values */
     int64_t defaults[8];       /* default values for last n_defaults params */
     int64_t captures[8];
@@ -1230,7 +1231,59 @@ static int fpy_value_compare(const void *a, const void *b) {
     }
 }
 
+/* Return min element's data (as i64) using fpy_value_compare.
+ * Returns the raw data field — caller knows the element type. */
+int64_t fastpy_list_min_fv(FpyList *list) {
+    FpyValue best = list->items[0];
+    for (int64_t i = 1; i < list->length; i++) {
+        if (fpy_value_compare(&list->items[i], &best) < 0)
+            best = list->items[i];
+    }
+    return best.data.i;
+}
+
+/* Return max element's data (as i64) using fpy_value_compare. */
+int64_t fastpy_list_max_fv(FpyList *list) {
+    FpyValue best = list->items[0];
+    for (int64_t i = 1; i < list->length; i++) {
+        if (fpy_value_compare(&list->items[i], &best) > 0)
+            best = list->items[i];
+    }
+    return best.data.i;
+}
+
 /* Return a new sorted copy of a list */
+/* list(obj) where obj implements __iter__/__next__: build a list by
+ * calling __iter__() then __next__() until StopIteration is raised. */
+extern int64_t fastpy_obj_call_method0(FpyObj*, const char*);
+extern void fastpy_exc_clear(void);
+extern int32_t fastpy_get_ret_tag(void);
+FpyList* fastpy_list_from_obj_iter(FpyObj *obj) {
+    FpyList *result = fpy_list_new(8);
+    /* Call __iter__() to get the iterator */
+    int64_t iter_raw = fastpy_obj_call_method0(obj, "__iter__");
+    if (fastpy_exc_pending()) {
+        fastpy_exc_clear();
+        return result;  /* empty list on error */
+    }
+    FpyObj *iter = (FpyObj*)(intptr_t)iter_raw;
+    /* Repeatedly call __next__() */
+    for (;;) {
+        int64_t val = fastpy_obj_call_method0(iter, "__next__");
+        if (fastpy_exc_pending()) {
+            fastpy_exc_clear();  /* StopIteration */
+            break;
+        }
+        /* Get the return tag to build the correct FpyValue */
+        int32_t tag = fastpy_get_ret_tag();
+        FpyValue fv;
+        fv.tag = tag;
+        fv.data.i = val;
+        fpy_list_append(result, fv);
+    }
+    return result;
+}
+
 FpyList* fastpy_list_sorted(FpyList *list) {
     FpyList *result = fpy_list_new(list->length);
     memcpy(result->items, list->items, sizeof(FpyValue) * list->length);
@@ -2072,6 +2125,7 @@ FpyClosure* fastpy_closure_new(void *func, int n_params, int n_captures) {
     c->n_params = n_params;
     c->n_captures = n_captures;
     c->capture_is_cell = 0;  /* caller sets bits for cell captures */
+    c->has_vararg = 0;       /* caller sets to 1 if function uses *args */
     c->n_defaults = 0;
     return c;
 }
@@ -2091,6 +2145,11 @@ void fastpy_closure_mark_cell(FpyClosure *c, int index) {
     c->capture_is_cell |= (1 << index);
 }
 
+/* Mark a closure as using *args (args must be packed into a list) */
+void fastpy_closure_set_vararg(FpyClosure *c) {
+    c->has_vararg = 1;
+}
+
 void fastpy_closure_set_capture(FpyClosure *c, int index, int64_t value) {
     c->captures[index] = value;
 }
@@ -2099,9 +2158,46 @@ void fastpy_closure_set_capture(FpyClosure *c, int index, int64_t value) {
 int64_t fastpy_closure_call1(FpyClosure *c, int64_t a);
 int64_t fastpy_closure_call2(FpyClosure *c, int64_t a, int64_t b);
 
+/* Helper: pack N i64 args into an FpyList for *args closures */
+static FpyList* _pack_args0(void) {
+    FpyList *lst = fpy_list_new(0);
+    lst->is_tuple = 1;
+    return lst;
+}
+static FpyList* _pack_args1(int64_t a) {
+    FpyList *lst = fpy_list_new(1);
+    lst->is_tuple = 1;
+    fpy_list_append(lst, fpy_int(a));
+    return lst;
+}
+static FpyList* _pack_args2(int64_t a, int64_t b) {
+    FpyList *lst = fpy_list_new(2);
+    lst->is_tuple = 1;
+    fpy_list_append(lst, fpy_int(a));
+    fpy_list_append(lst, fpy_int(b));
+    return lst;
+}
+
 /* Call closure with 0 explicit args + captures.
  * If the closure has default parameter values, fill them in. */
 int64_t fastpy_closure_call0(FpyClosure *c) {
+    /* *args closure: pack 0 args into empty list, pass as first param */
+    if (c->has_vararg) {
+        int64_t args_list = (int64_t)(intptr_t)_pack_args0();
+        typedef int64_t (*fn1_t)(int64_t);
+        typedef int64_t (*fn2c_t)(int64_t, int64_t);
+        typedef int64_t (*fn3c_t)(int64_t, int64_t, int64_t);
+        switch (c->n_captures) {
+            case 0: return ((fn1_t)c->func)(args_list);
+            case 1: return ((fn2c_t)c->func)(args_list, c->captures[0]);
+            case 2: return ((fn3c_t)c->func)(args_list, c->captures[0], c->captures[1]);
+            case 3: {
+                typedef int64_t (*fn4c_t)(int64_t, int64_t, int64_t, int64_t);
+                return ((fn4c_t)c->func)(args_list, c->captures[0], c->captures[1], c->captures[2]);
+            }
+            default: return 0;
+        }
+    }
     /* If closure expects explicit params and has defaults for all of them,
      * supply the default values as arguments. */
     if (c->n_params > 0 && c->n_defaults >= c->n_params) {
@@ -2126,6 +2222,23 @@ int64_t fastpy_closure_call0(FpyClosure *c) {
 /* Call closure with 1 explicit arg + captures.
  * If the closure expects more params and has defaults, fill them in. */
 int64_t fastpy_closure_call1(FpyClosure *c, int64_t a) {
+    /* *args closure: pack 1 arg into list, pass as first param */
+    if (c->has_vararg) {
+        int64_t args_list = (int64_t)(intptr_t)_pack_args1(a);
+        typedef int64_t (*fn1_t)(int64_t);
+        typedef int64_t (*fn2c_t)(int64_t, int64_t);
+        typedef int64_t (*fn3c_t)(int64_t, int64_t, int64_t);
+        switch (c->n_captures) {
+            case 0: return ((fn1_t)c->func)(args_list);
+            case 1: return ((fn2c_t)c->func)(args_list, c->captures[0]);
+            case 2: return ((fn3c_t)c->func)(args_list, c->captures[0], c->captures[1]);
+            case 3: {
+                typedef int64_t (*fn4c_t)(int64_t, int64_t, int64_t, int64_t);
+                return ((fn4c_t)c->func)(args_list, c->captures[0], c->captures[1], c->captures[2]);
+            }
+            default: return 0;
+        }
+    }
     /* If closure expects 2 params but only 1 provided, and the 2nd has a default */
     if (c->n_params == 2 && c->n_defaults >= 1) {
         /* defaults[n_defaults-1] is the last param's default */
@@ -2146,6 +2259,23 @@ int64_t fastpy_closure_call1(FpyClosure *c, int64_t a) {
 
 /* Call closure with 2 explicit args + captures */
 int64_t fastpy_closure_call2(FpyClosure *c, int64_t a, int64_t b) {
+    /* *args closure: pack 2 args into list, pass as first param */
+    if (c->has_vararg) {
+        int64_t args_list = (int64_t)(intptr_t)_pack_args2(a, b);
+        typedef int64_t (*fn1_t)(int64_t);
+        typedef int64_t (*fn2c_t)(int64_t, int64_t);
+        typedef int64_t (*fn3c_t)(int64_t, int64_t, int64_t);
+        switch (c->n_captures) {
+            case 0: return ((fn1_t)c->func)(args_list);
+            case 1: return ((fn2c_t)c->func)(args_list, c->captures[0]);
+            case 2: return ((fn3c_t)c->func)(args_list, c->captures[0], c->captures[1]);
+            case 3: {
+                typedef int64_t (*fn4c_t)(int64_t, int64_t, int64_t, int64_t);
+                return ((fn4c_t)c->func)(args_list, c->captures[0], c->captures[1], c->captures[2]);
+            }
+            default: return 0;
+        }
+    }
     typedef int64_t (*fn2_t)(int64_t, int64_t);
     typedef int64_t (*fn3c_t)(int64_t, int64_t, int64_t);
     typedef int64_t (*fn4c_t)(int64_t, int64_t, int64_t, int64_t);
@@ -2166,6 +2296,23 @@ int64_t fastpy_closure_call2(FpyClosure *c, int64_t a, int64_t b) {
 int64_t fastpy_closure_call_list(void *closure, void *args_list) {
     FpyClosure *c = (FpyClosure *)closure;
     FpyList *args = (FpyList *)args_list;
+
+    /* *args closure: pass the list directly as the first parameter */
+    if (c->has_vararg) {
+        int64_t list_val = (int64_t)(intptr_t)(args ? args : _pack_args0());
+        typedef int64_t (*fn1_t)(int64_t);
+        typedef int64_t (*fn2c_t)(int64_t, int64_t);
+        typedef int64_t (*fn3c_t)(int64_t, int64_t, int64_t);
+        typedef int64_t (*fn4c_t)(int64_t, int64_t, int64_t, int64_t);
+        switch (c->n_captures) {
+            case 0: return ((fn1_t)c->func)(list_val);
+            case 1: return ((fn2c_t)c->func)(list_val, c->captures[0]);
+            case 2: return ((fn3c_t)c->func)(list_val, c->captures[0], c->captures[1]);
+            case 3: return ((fn4c_t)c->func)(list_val, c->captures[0], c->captures[1], c->captures[2]);
+            default: return 0;
+        }
+    }
+
     int64_t n_args = args ? args->length : 0;
     int64_t n_caps = c->n_captures;
     int64_t total = n_args + n_caps;
@@ -2211,6 +2358,24 @@ FpyList* fastpy_enumerate(FpyList *list, int64_t start) {
         pair->is_tuple = 1;
         fpy_list_append(pair, fpy_int(start + i));
         fpy_list_append(pair, list->items[i]);
+        fpy_list_append(result, fpy_list(pair));
+    }
+    return result;
+}
+
+/* enumerate(string) -> list of [index, char] pairs */
+FpyList* fastpy_enumerate_str(const char *s, int64_t start) {
+    int64_t len = (int64_t)strlen(s);
+    FpyList *result = fpy_list_new(len);
+    for (int64_t i = 0; i < len; i++) {
+        FpyList *pair = fpy_list_new(2);
+        pair->is_tuple = 1;
+        fpy_list_append(pair, fpy_int(start + i));
+        /* Allocate a single-char string */
+        FpyString *ch = fpy_str_alloc(1);
+        ch->data[0] = s[i];
+        ch->data[1] = '\0';
+        fpy_list_append(pair, fpy_str(ch->data));
         fpy_list_append(result, fpy_list(pair));
     }
     return result;

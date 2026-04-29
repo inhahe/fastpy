@@ -147,7 +147,37 @@ These features work correctly but use the embedded CPython interpreter:
 - **Other stdlib modules** not implemented natively (e.g., collections,
   itertools, functools — except singledispatch which is native)
 
+## Bugs fixed (2026-04-28, list(iter), closure *args, diamond MRO, dict comp fixes, enumerate(str))
+
+### 148. list(iterator_object) crashed (fixed)
+`list(Range(1, 5))` where `Range` implements `__iter__`/`__next__` crashed with ACCESS_VIOLATION because the `list()` builtin just returned the raw object pointer without iterating. Fix: Added `fastpy_list_from_obj_iter` runtime function that calls `__iter__()` then repeatedly calls `__next__()` until `StopIteration`, building an FpyList from the results. Codegen detects OBJ-typed arguments to `list()` and routes through this function. Works with both user-defined iterator classes and generator objects.
+
+### 147. Closure with *args crashed or returned 0 (fixed)
+`def make(): def inner(*args): return args[0]; return inner; f = make(); f(5)` crashed with ACCESS_VIOLATION. Root cause: two separate issues. (1) For closures with captures: the runtime `closure_callN` didn't know the target function expects a packed args list, so it passed raw i64 values instead of a list pointer. Fix: Added `has_vararg` flag to FpyClosure struct and `fastpy_closure_set_vararg()`. When set, `closure_call0/1/2/call_list` pack call-site arguments into an FpyList and pass it as the first parameter. (2) For hoisted non-closure *args functions: the function returns FpyValue `{i32, i64}` (not plain i64), but the closure call mechanism casts to `int64_t(*)()` — ABI mismatch on Windows x64 where structs >8 bytes use sret. Fix: Generate a thin LLVM wrapper (`__vararg_wrap`) that calls the real function and extracts the data field from the FpyValue return. Both fixes work together: codegen sets `has_vararg` on the closure and uses the wrapper for correct ABI.
+
+### 146. Diamond inheritance MRO resolution wrong (fixed)
+`class A: def greet(self): return "A"` / `class B(A): pass` / `class C(A): def greet(self): return "C"` / `class D(B, C): pass` — `D().greet()` returned "A" instead of "C". Python's C3 MRO for D is [D, B, C, A], so C.greet should win over A.greet. Fix: Added compile-time C3 linearization (`_compute_c3_mro`) and MRO-aware method flattening. When walking the MRO, secondary base methods override primary-chain ancestor methods only when the secondary base appears earlier in MRO. Methods from classes in the primary parent chain (accessible via runtime `parent_id` walk) are tracked by MRO position so a secondary base can override deep ancestors while respecting earlier primary-chain definitions. Added `own_method_names` tracking to distinguish methods directly defined in a class body from inherited ones.
+
+### 145. Dict comprehension over enumerate(string) crashed (fixed)
+`{c: i for i, c in enumerate('hello')}` segfaulted because `fastpy_enumerate()` takes an `FpyList*` but received a `const char*` string pointer. The runtime tried to read `list->length` from the string, causing ACCESS_VIOLATION. Fix: Added `fastpy_enumerate_str(const char*, int64_t)` runtime function that iterates over string characters, allocating single-char FpyString values for each. Codegen detects string-typed enumerate arguments (string literals and string-typed variables) and dispatches to `enumerate_str` instead of `enumerate`.
+
+### 144. Dict comprehension with enumerate tuple-unpack used wrong key type (fixed)
+`{i: v for i, v in enumerate(items)}` crashed because the dict comprehension always called `dict_set_fv` (string-key setter) even when the key was an integer from enumerate. Fix: Added type dispatch — uses `dict_set_int_fv` for integer keys and `dict_set_fv` for pointer/string keys. Also added per-position type inference for tuple unpacking in dict comps: enumerate() → (int, elem_type), literal tuples → infer from first element.
+
 ## Bugs fixed (2026-04-28, type(obj), for-star-unpack, enumerate(str), sort(key=), print(sep=var), 3+ comprehensions)
+
+### 143. min/max on list of objects with __lt__ returned garbage (fixed)
+`min([N(5), N(2), N(8)])` and `max(...)` where `N` defines `__lt__` returned
+raw boolean values (`\x01`) instead of the actual min/max objects. Three
+issues: (1) No OBJ branch in the min/max codegen loop — fell through to
+integer comparison. (2) `_infer_type_tag` for min/max didn't handle
+`elem_type == "obj"`, so the result was tagged as "str". (3) `_is_obj_expr`
+didn't recognize `min()`/`max()` calls as potentially returning objects,
+so `repr(min(items))` used string repr instead of OBJ repr. Fix: Added
+`fastpy_list_min_fv`/`fastpy_list_max_fv` runtime functions that iterate
+using `fpy_value_compare` and return the raw data (i64). Codegen calls
+these before the loop when `elem_type == "obj"`. Added OBJ case to
+`_infer_type_tag` and `_is_obj_expr`.
 
 ### 142. sorted() on user-class objects with __lt__ used pointer comparison (fixed)
 `sorted([Item(3), Item(1), Item(2)])` where `Item` defines `__lt__` produced

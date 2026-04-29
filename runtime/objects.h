@@ -117,7 +117,7 @@ typedef struct {
 typedef struct {
     int class_id;
     const char *name;
-    int parent_id;          /* -1 if no parent */
+    int parent_id;          /* -1 if no parent (single-inheritance fast path) */
     FpyMethodDef *methods;
     int method_count;
     int slot_count;         /* number of pre-declared attribute slots */
