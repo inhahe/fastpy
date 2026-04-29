@@ -779,6 +779,8 @@ extern FpyList* fastpy_zip(FpyList*, FpyList*);
 extern FpyList* fastpy_range(int64_t, int64_t, int64_t);
 extern void* fastpy_closure_new(void*, int32_t, int32_t);
 extern void fastpy_closure_set_capture(void*, int32_t, int64_t);
+extern void fastpy_closure_set_defaults(void*, int32_t);
+extern void fastpy_closure_set_default(void*, int32_t, int64_t);
 extern int64_t fastpy_closure_call0(void*);
 extern int64_t fastpy_closure_call1(void*, int64_t);
 extern int64_t fastpy_closure_call2(void*, int64_t, int64_t);
@@ -882,6 +884,7 @@ static FpySymEntry fpy_jit_symbols[] = {
     SYM(fastpy_chr), SYM(fastpy_ord), SYM(fastpy_hex),
     SYM(fastpy_enumerate), SYM(fastpy_zip), SYM(fastpy_range),
     SYM(fastpy_closure_new), SYM(fastpy_closure_set_capture),
+    SYM(fastpy_closure_set_defaults), SYM(fastpy_closure_set_default),
     SYM(fastpy_closure_call0), SYM(fastpy_closure_call1), SYM(fastpy_closure_call2),
     SYM(fastpy_cell_new), SYM(fastpy_cell_set), SYM(fastpy_cell_get),
     SYM(fpy_cpython_import), SYM(fpy_cpython_getattr),

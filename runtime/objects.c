@@ -54,6 +54,8 @@ typedef struct {
     int n_params;
     void *func;
     uint8_t capture_is_cell;  /* bitmask: bit i set = captures[i] is a cell pointer */
+    int n_defaults;            /* number of default parameter values */
+    int64_t defaults[8];       /* default values for last n_defaults params */
     int64_t captures[8];
 } FpyClosure;
 
@@ -2007,7 +2009,18 @@ FpyClosure* fastpy_closure_new(void *func, int n_params, int n_captures) {
     c->n_params = n_params;
     c->n_captures = n_captures;
     c->capture_is_cell = 0;  /* caller sets bits for cell captures */
+    c->n_defaults = 0;
     return c;
+}
+
+/* Set default parameter values for the closure. defaults are stored
+ * for the LAST n_defaults parameters (like Python convention). */
+void fastpy_closure_set_defaults(FpyClosure *c, int n_defaults) {
+    c->n_defaults = n_defaults;
+}
+
+void fastpy_closure_set_default(FpyClosure *c, int index, int64_t value) {
+    if (index < 8) c->defaults[index] = value;
 }
 
 /* Mark a capture as a cell pointer (for proper cleanup) */
@@ -2019,8 +2032,21 @@ void fastpy_closure_set_capture(FpyClosure *c, int index, int64_t value) {
     c->captures[index] = value;
 }
 
-/* Call closure with 0 explicit args + captures */
+/* Forward declarations for default dispatch */
+int64_t fastpy_closure_call1(FpyClosure *c, int64_t a);
+int64_t fastpy_closure_call2(FpyClosure *c, int64_t a, int64_t b);
+
+/* Call closure with 0 explicit args + captures.
+ * If the closure has default parameter values, fill them in. */
 int64_t fastpy_closure_call0(FpyClosure *c) {
+    /* If closure expects explicit params and has defaults for all of them,
+     * supply the default values as arguments. */
+    if (c->n_params > 0 && c->n_defaults >= c->n_params) {
+        /* All params have defaults — call with defaults + captures */
+        int n = c->n_params;
+        if (n == 1) return fastpy_closure_call1(c, c->defaults[0]);
+        if (n == 2) return fastpy_closure_call2(c, c->defaults[0], c->defaults[1]);
+    }
     typedef int64_t (*fn0_t)(void);
     typedef int64_t (*fn1c_t)(int64_t);
     typedef int64_t (*fn2c_t)(int64_t, int64_t);
@@ -2034,8 +2060,14 @@ int64_t fastpy_closure_call0(FpyClosure *c) {
     }
 }
 
-/* Call closure with 1 explicit arg + captures */
+/* Call closure with 1 explicit arg + captures.
+ * If the closure expects more params and has defaults, fill them in. */
 int64_t fastpy_closure_call1(FpyClosure *c, int64_t a) {
+    /* If closure expects 2 params but only 1 provided, and the 2nd has a default */
+    if (c->n_params == 2 && c->n_defaults >= 1) {
+        /* defaults[n_defaults-1] is the last param's default */
+        return fastpy_closure_call2(c, a, c->defaults[c->n_defaults - 1]);
+    }
     typedef int64_t (*fn1_t)(int64_t);
     typedef int64_t (*fn2c_t)(int64_t, int64_t);
     typedef int64_t (*fn3c_t)(int64_t, int64_t, int64_t);

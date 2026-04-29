@@ -1871,6 +1871,12 @@ class CodeGen:
         self.runtime["closure_new"] = ir.Function(self.module, ft, name="fastpy_closure_new")
         ft = ir.FunctionType(void, [i8_ptr, i32, i64])  # closure_set_capture(closure, idx, val)
         self.runtime["closure_set_capture"] = ir.Function(self.module, ft, name="fastpy_closure_set_capture")
+        # closure_set_defaults(closure, n_defaults)
+        ft = ir.FunctionType(ir.VoidType(), [i8_ptr, i32])
+        self.runtime["closure_set_defaults"] = ir.Function(self.module, ft, name="fastpy_closure_set_defaults")
+        # closure_set_default(closure, index, value)
+        ft = ir.FunctionType(ir.VoidType(), [i8_ptr, i32, i64])
+        self.runtime["closure_set_default"] = ir.Function(self.module, ft, name="fastpy_closure_set_default")
         ft = ir.FunctionType(i64, [i8_ptr])  # closure_call0(closure)
         self.runtime["closure_call0"] = ir.Function(self.module, ft, name="fastpy_closure_call0")
         ft = ir.FunctionType(i64, [i8_ptr, i64])  # closure_call1(closure, a)
@@ -3486,6 +3492,20 @@ class CodeGen:
                             val = self.builder.zext(val, i64)
                         self.builder.call(self.runtime["closure_set_capture"], [
                             closure, ir.Constant(i32, i), val])
+
+                # Set default parameter values on the closure
+                if node.args.defaults:
+                    n_defaults = len(node.args.defaults)
+                    self.builder.call(self.runtime["closure_set_defaults"],
+                                      [closure, ir.Constant(i32, n_defaults)])
+                    for di, def_node in enumerate(node.args.defaults):
+                        def_val = self._emit_expr_value(def_node)
+                        if isinstance(def_val.type, ir.PointerType):
+                            def_val = self.builder.ptrtoint(def_val, i64)
+                        elif isinstance(def_val.type, ir.IntType) and def_val.type.width != 64:
+                            def_val = self.builder.zext(def_val, i64)
+                        self.builder.call(self.runtime["closure_set_default"],
+                                          [closure, ir.Constant(i32, di), def_val])
 
                 # Store closure as a variable with the inner function's name
                 self._store_variable(node.name, closure, "closure")
