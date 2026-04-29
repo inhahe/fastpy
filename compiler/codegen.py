@@ -13194,7 +13194,10 @@ class CodeGen:
                     ast.Add: "__add__", ast.Sub: "__sub__", ast.Mult: "__mul__",
                     ast.FloorDiv: "__floordiv__", ast.Div: "__truediv__",
                     ast.Mod: "__mod__", ast.Pow: "__pow__",
-                    ast.MatMult: "__matmul__"}
+                    ast.MatMult: "__matmul__",
+                    ast.BitAnd: "__and__", ast.BitOr: "__or__",
+                    ast.BitXor: "__xor__", ast.LShift: "__lshift__",
+                    ast.RShift: "__rshift__"}
                 dunder = _binop_dunders.get(type(node.op))
                 if dunder:
                     ret_type = self._find_method_return_type(node.left, dunder)
@@ -13206,6 +13209,26 @@ class CodeGen:
                         return "float"
                     return "int"
                 return "obj"  # fallback for unrecognized operators
+            # Reverse dunders: 10 + V(5) → V(5).__radd__(10)
+            if self._is_obj_expr(node.right):
+                _rbinop_dunders = {
+                    ast.Add: "__radd__", ast.Sub: "__rsub__", ast.Mult: "__rmul__",
+                    ast.FloorDiv: "__rfloordiv__", ast.Div: "__rtruediv__",
+                    ast.Mod: "__rmod__", ast.Pow: "__rpow__",
+                    ast.MatMult: "__rmatmul__",
+                    ast.BitAnd: "__rand__", ast.BitOr: "__ror__",
+                    ast.BitXor: "__rxor__", ast.LShift: "__rlshift__",
+                    ast.RShift: "__rrshift__"}
+                dunder = _rbinop_dunders.get(type(node.op))
+                if dunder:
+                    ret_type = self._find_method_return_type(node.right, dunder)
+                    if ret_type is None:
+                        return "obj"
+                    if isinstance(ret_type, ir.PointerType):
+                        return "obj"
+                    if isinstance(ret_type, ir.DoubleType):
+                        return "float"
+                    return "int"
             # List concat / repeat yield lists (Add / Mult only — not Mod,
             # because str % tuple is string formatting, not a list op).
             if (isinstance(node.op, (ast.Add, ast.Mult))
@@ -13804,6 +13827,33 @@ class CodeGen:
         rhs = self._emit_expr_value(node.value)
 
         # --- VKind-based dispatch for pointer types ---
+
+        # OBJ augmented assignment: dispatch to __iadd__/__isub__ etc.
+        if left_kind == VKind.OBJ:
+            _iaug_dunders = {
+                ast.Add: "__iadd__", ast.Sub: "__isub__",
+                ast.Mult: "__imul__", ast.FloorDiv: "__ifloordiv__",
+                ast.Div: "__itruediv__", ast.Mod: "__imod__",
+                ast.Pow: "__ipow__", ast.MatMult: "__imatmul__",
+                ast.BitOr: "__ior__", ast.BitAnd: "__iand__",
+                ast.BitXor: "__ixor__", ast.LShift: "__ilshift__",
+                ast.RShift: "__irshift__",
+            }
+            dunder = _iaug_dunders.get(type(node.op))
+            if dunder:
+                obj = tv_current.as_ptr(self.builder)
+                rhs_i64 = rhs
+                if isinstance(rhs.type, ir.PointerType):
+                    rhs_i64 = self.builder.ptrtoint(rhs, i64)
+                elif isinstance(rhs.type, ir.IntType) and rhs.type.width != 64:
+                    rhs_i64 = self.builder.zext(rhs, i64)
+                method_name = self._make_string_constant(dunder)
+                result_i64 = self.builder.call(
+                    self.runtime["obj_call_method1"],
+                    [obj, method_name, rhs_i64])
+                result = self.builder.inttoptr(result_i64, i8_ptr)
+                self._store_variable(target_name, result, "obj")
+                return
 
         # LIST += (list concatenation)
         if left_kind in (VKind.LIST, VKind.TUPLE) and isinstance(node.op, ast.Add):
@@ -15194,9 +15244,8 @@ class CodeGen:
             finally:
                 mgr.__exit__(None, None, None)
 
-        Note: exception suppression (__exit__ returning True) is not
-        yet implemented — __exit__ is always called for cleanup, but
-        its return value is ignored.
+        If __exit__ returns a truthy value and there is a pending
+        exception, the exception is suppressed (cleared).
         """
         for item in node.items:
             ctx_expr = item.context_expr
@@ -15337,15 +15386,46 @@ class CodeGen:
                  none_tag, none_data,
                  none_tag, none_data,
                  _exit_tag_slot, _exit_data_slot])
+            # Check if __exit__ returned truthy → suppress exception
+            _exit_tag_v = self.builder.load(_exit_tag_slot)
+            _exit_data_v = self.builder.load(_exit_data_slot)
+            _exit_truthy_py = self.builder.call(
+                self.runtime["fv_truthy"], [_exit_tag_v, _exit_data_v])
+            _is_truthy_py = self.builder.icmp_signed(
+                "!=", _exit_truthy_py, ir.Constant(i32, 0))
+            _pyobj_suppress = self._new_block("with.suppress.pyobj")
+            self.builder.cbranch(_is_truthy_py, _pyobj_suppress, after_exit_block)
+            self.builder.position_at_end(_pyobj_suppress)
+            _pend_py = self.builder.call(self.runtime["exc_pending"], [])
+            _has_exc_py = self.builder.icmp_signed(
+                "!=", _pend_py, ir.Constant(i32, 0))
+            _do_clear_py = self._new_block("with.clear.pyobj")
+            self.builder.cbranch(_has_exc_py, _do_clear_py, after_exit_block)
+            self.builder.position_at_end(_do_clear_py)
+            self.builder.call(self.runtime["exc_clear"], [])
             self.builder.branch(after_exit_block)
 
             # Native FpyObj* path: use obj_call_method3
             self.builder.position_at_end(native_exit_block)
             exit_name = self._make_string_constant("__exit__")
             zero = ir.Constant(i64, 0)
-            self.builder.call(
+            exit_ret = self.builder.call(
                 self.runtime["obj_call_method3"],
                 [saved_mgr, exit_name, zero, zero, zero])
+            # If __exit__ returned truthy and there's a pending exception,
+            # suppress it (clear the exception state).
+            exit_truthy = self.builder.icmp_signed(
+                "!=", exit_ret, ir.Constant(i64, 0))
+            _native_suppress = self._new_block("with.suppress.native")
+            self.builder.cbranch(exit_truthy, _native_suppress, after_exit_block)
+            self.builder.position_at_end(_native_suppress)
+            _pend = self.builder.call(self.runtime["exc_pending"], [])
+            _has_exc = self.builder.icmp_signed(
+                "!=", _pend, ir.Constant(i32, 0))
+            _do_clear = self._new_block("with.clear.native")
+            self.builder.cbranch(_has_exc, _do_clear, after_exit_block)
+            self.builder.position_at_end(_do_clear)
+            self.builder.call(self.runtime["exc_clear"], [])
             self.builder.branch(after_exit_block)
 
             self.builder.position_at_end(after_exit_block)
@@ -21939,7 +22019,10 @@ class CodeGen:
             _obj_ops = {ast.Add: "__add__", ast.Sub: "__sub__", ast.Mult: "__mul__",
                         ast.FloorDiv: "__floordiv__", ast.Div: "__truediv__",
                         ast.Mod: "__mod__", ast.Pow: "__pow__",
-                        ast.MatMult: "__matmul__"}
+                        ast.MatMult: "__matmul__",
+                        ast.BitAnd: "__and__", ast.BitOr: "__or__",
+                        ast.BitXor: "__xor__", ast.LShift: "__lshift__",
+                        ast.RShift: "__rshift__"}
             method = _obj_ops.get(op)
             if method:
                 name_ptr = self._make_string_constant(method)
@@ -21964,6 +22047,31 @@ class CodeGen:
         if rk == VKind.BOOL and lk == VKind.INT:
             return self._emit_int_binop(node.op, ltv.as_i64(self.builder),
                                          rtv.as_i64(self.builder), node)
+
+        # ── Reverse dunder: int + OBJ → OBJ.__radd__(int) ─────────────
+        if rk == VKind.OBJ and self._is_obj_expr(node.right):
+            _robj_ops = {
+                ast.Add: "__radd__", ast.Sub: "__rsub__", ast.Mult: "__rmul__",
+                ast.FloorDiv: "__rfloordiv__", ast.Div: "__rtruediv__",
+                ast.Mod: "__rmod__", ast.Pow: "__rpow__",
+                ast.MatMult: "__rmatmul__",
+                ast.BitAnd: "__rand__", ast.BitOr: "__ror__",
+                ast.BitXor: "__rxor__", ast.LShift: "__rlshift__",
+                ast.RShift: "__rrshift__"}
+            rmethod = _robj_ops.get(op)
+            if rmethod:
+                name_ptr = self._make_string_constant(rmethod)
+                result = self.builder.call(
+                    self.runtime["obj_call_method1"],
+                    [rtv.as_ptr(self.builder), name_ptr, ltv.as_i64(self.builder)])
+                ret_type = self._find_method_return_type(node.right, rmethod)
+                if ret_type is None:
+                    return self.builder.inttoptr(result, i8_ptr)
+                if isinstance(ret_type, ir.PointerType):
+                    return self.builder.inttoptr(result, i8_ptr)
+                if isinstance(ret_type, ir.DoubleType):
+                    return self.builder.bitcast(result, double)
+                return result
 
         # ── Fast path: OBJ used as int (e.g. attr from unknown-class
         #    receiver holding an integer value) ────────────────────────
@@ -22674,8 +22782,30 @@ class CodeGen:
                 return self.builder.fneg(operand)
             return self._bridge_fallback_expr(node, "unsupported unary operand type")
         elif isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.UAdd):
+            # __pos__ on user-class objects
+            if self._is_obj_expr(node.operand):
+                obj_cls = self._infer_object_class(node.operand)
+                if obj_cls and self._class_has_method(obj_cls, "__pos__"):
+                    obj = self._emit_expr_value(node.operand)
+                    if isinstance(obj.type, ir.IntType):
+                        obj = self.builder.inttoptr(obj, i8_ptr)
+                    name_ptr = self._make_string_constant("__pos__")
+                    result = self.builder.call(
+                        self.runtime["obj_call_method0"], [obj, name_ptr])
+                    return self.builder.inttoptr(result, i8_ptr)
             return self._emit_expr_value(node.operand)
         elif isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Invert):
+            # __invert__ on user-class objects
+            if self._is_obj_expr(node.operand):
+                obj_cls = self._infer_object_class(node.operand)
+                if obj_cls and self._class_has_method(obj_cls, "__invert__"):
+                    obj = self._emit_expr_value(node.operand)
+                    if isinstance(obj.type, ir.IntType):
+                        obj = self.builder.inttoptr(obj, i8_ptr)
+                    name_ptr = self._make_string_constant("__invert__")
+                    result = self.builder.call(
+                        self.runtime["obj_call_method0"], [obj, name_ptr])
+                    return self.builder.inttoptr(result, i8_ptr)
             operand = self._emit_expr_value(node.operand)
             if isinstance(operand.type, ir.IntType):
                 return self.builder.not_(operand)
@@ -23258,6 +23388,15 @@ class CodeGen:
             if name == "int":
                 if len(node.args) == 1:
                     arg_node = node.args[0]
+                    # User object with __int__: dispatch to dunder
+                    if self._is_obj_expr(arg_node):
+                        obj = self._emit_expr_value(arg_node)
+                        if isinstance(obj.type, ir.IntType):
+                            obj = self.builder.inttoptr(obj, i8_ptr)
+                        name_ptr = self._make_string_constant("__int__")
+                        return self.builder.call(
+                            self.runtime["obj_call_method0"],
+                            [obj, name_ptr])
                     # pyobj variable or CPython call expression:
                     # call Python's int() via bridge
                     is_pyobj_arg = self._is_pyobj_var(arg_node)
@@ -23495,6 +23634,18 @@ class CodeGen:
             if name == "float":
                 if len(node.args) == 1:
                     arg_node = node.args[0]
+                    # User object with __float__: dispatch to dunder
+                    if self._is_obj_expr(arg_node):
+                        obj = self._emit_expr_value(arg_node)
+                        if isinstance(obj.type, ir.IntType):
+                            obj = self.builder.inttoptr(obj, i8_ptr)
+                        name_ptr = self._make_string_constant("__float__")
+                        # Must use the double-returning variant because __float__
+                        # returns in XMM0, not RAX — calling through int64 ABI
+                        # would read RAX (garbage/zero).
+                        return self.builder.call(
+                            self.runtime["obj_call_method0_double"],
+                            [obj, name_ptr])
                     # pyobj: call Python's float() via bridge
                     if self._is_pyobj_var(arg_node):
                         ptr = self._load_variable(arg_node.id, arg_node)
@@ -27814,17 +27965,43 @@ class CodeGen:
                     ast.Add: "__add__", ast.Sub: "__sub__", ast.Mult: "__mul__",
                     ast.FloorDiv: "__floordiv__", ast.Div: "__truediv__",
                     ast.Mod: "__mod__", ast.Pow: "__pow__",
-                    ast.MatMult: "__matmul__"}
+                    ast.MatMult: "__matmul__",
+                    ast.BitAnd: "__and__", ast.BitOr: "__or__",
+                    ast.BitXor: "__xor__", ast.LShift: "__lshift__",
+                    ast.RShift: "__rshift__"}
                 dunder = _obj_binop_dunders.get(type(node.op))
                 if dunder:
                     ret_type = self._find_method_return_type(node.left, dunder)
                     # Only obj if method returns a pointer (another object)
                     return ret_type is None or isinstance(ret_type, ir.PointerType)
                 return True  # unknown op → assume obj
-        if (isinstance(node, ast.UnaryOp)
-                and isinstance(node.op, ast.USub)
-                and self._is_obj_expr(node.operand)):
-            return True
+            # Reverse dunders: 10 + V(5) → check __radd__ on right
+            if self._is_obj_expr(node.right):
+                _robj_binop_dunders = {
+                    ast.Add: "__radd__", ast.Sub: "__rsub__", ast.Mult: "__rmul__",
+                    ast.FloorDiv: "__rfloordiv__", ast.Div: "__rtruediv__",
+                    ast.Mod: "__rmod__", ast.Pow: "__rpow__",
+                    ast.MatMult: "__rmatmul__",
+                    ast.BitAnd: "__rand__", ast.BitOr: "__ror__",
+                    ast.BitXor: "__rxor__", ast.LShift: "__rlshift__",
+                    ast.RShift: "__rrshift__"}
+                dunder = _robj_binop_dunders.get(type(node.op))
+                if dunder:
+                    ret_type = self._find_method_return_type(node.right, dunder)
+                    return ret_type is None or isinstance(ret_type, ir.PointerType)
+        if isinstance(node, ast.UnaryOp) and self._is_obj_expr(node.operand):
+            if isinstance(node.op, ast.USub):
+                return True
+            if isinstance(node.op, ast.UAdd):
+                obj_cls = self._infer_object_class(node.operand)
+                if obj_cls and self._class_has_method(obj_cls, "__pos__"):
+                    ret_type = self._find_method_return_type(node.operand, "__pos__")
+                    return ret_type is None or isinstance(ret_type, ir.PointerType)
+            if isinstance(node.op, ast.Invert):
+                obj_cls = self._infer_object_class(node.operand)
+                if obj_cls and self._class_has_method(obj_cls, "__invert__"):
+                    ret_type = self._find_method_return_type(node.operand, "__invert__")
+                    return ret_type is None or isinstance(ret_type, ir.PointerType)
         return False
 
     def _method_returns_self(self, obj_node: ast.expr, method_name: str) -> bool:
@@ -29077,7 +29254,11 @@ class CodeGen:
                     val = self._emit_expr_value(value.value)
                     if isinstance(val.type, ir.IntType) and val.type.width == 64:
                         val = self.builder.inttoptr(val, i8_ptr, name="obj.ptr")
-                    str_val = self.builder.call(self.runtime["obj_to_str"], [val])
+                    if spec_str:
+                        # f"{obj:spec}" → dispatch to __format__ if available
+                        str_val = self._apply_format_spec(val, spec_str, value.value, node)
+                    else:
+                        str_val = self.builder.call(self.runtime["obj_to_str"], [val])
                 elif (isinstance(value.value, ast.Attribute)
                       and isinstance(value.value.value, ast.Name)
                       and self._is_obj_expr(value.value.value)):
@@ -29274,6 +29455,22 @@ class CodeGen:
         # Integer format
         if isinstance(value.type, ir.IntType) and value.type.width == 64:
             return self.builder.call(self.runtime["format_spec_int"], [value, spec_ptr])
+        # OBJ format: dispatch to __format__ if available, else __str__ + str format
+        if isinstance(value.type, ir.PointerType) and self._is_obj_expr(arg_node):
+            obj_cls = self._infer_object_class(arg_node)
+            if obj_cls and self._class_has_method(obj_cls, "__format__"):
+                name_ptr = self._make_string_constant("__format__")
+                spec_i64 = self.builder.ptrtoint(spec_ptr, i64)
+                result = self.builder.call(
+                    self.runtime["obj_call_method1"],
+                    [value, name_ptr, spec_i64])
+                return self.builder.inttoptr(result, i8_ptr)
+            # No __format__: convert to string via __str__, then apply str format
+            str_name = self._make_string_constant("__str__")
+            str_result = self.builder.call(
+                self.runtime["obj_call_method0"], [value, str_name])
+            str_ptr = self.builder.inttoptr(str_result, i8_ptr)
+            return self.builder.call(self.runtime["format_spec_str"], [str_ptr, spec_ptr])
         # String format
         if isinstance(value.type, ir.PointerType):
             return self.builder.call(self.runtime["format_spec_str"], [value, spec_ptr])
