@@ -860,8 +860,12 @@ void fastpy_fv_binop(int32_t lt, int64_t ld, int32_t rt, int64_t rd,
         }
         /* truediv falls through (BigInt / BigInt → float not implemented yet) */
     }
-    /* Promote to float if either operand is float */
-    if (lt == FPY_TAG_FLOAT || rt == FPY_TAG_FLOAT) {
+    /* Promote to float if either operand is float AND the other is numeric.
+     * Guard: float + container (str, list, dict, set, etc.) is TypeError,
+     * not float promotion. */
+    if ((lt == FPY_TAG_FLOAT || rt == FPY_TAG_FLOAT)
+        && (lt == FPY_TAG_FLOAT || lt == FPY_TAG_INT || lt == FPY_TAG_BOOL)
+        && (rt == FPY_TAG_FLOAT || rt == FPY_TAG_INT || rt == FPY_TAG_BOOL)) {
         double lf, rf;
         if (lt == FPY_TAG_FLOAT) { memcpy(&lf, &ld, sizeof(double)); }
         else if (lt == FPY_TAG_INT) { lf = (double)ld; }
@@ -885,10 +889,11 @@ void fastpy_fv_binop(int32_t lt, int64_t ld, int32_t rt, int64_t rd,
         memcpy(out_data, &result, sizeof(double));
         return;
     }
-    /* Guard: container types that weren't handled above → TypeError */
+    /* Guard: container types or mismatched numeric+container → TypeError */
     if (lt == FPY_TAG_LIST || lt == FPY_TAG_DICT || lt == FPY_TAG_SET ||
         rt == FPY_TAG_LIST || rt == FPY_TAG_DICT || rt == FPY_TAG_SET ||
-        lt == FPY_TAG_STR  || rt == FPY_TAG_STR) {
+        lt == FPY_TAG_STR  || rt == FPY_TAG_STR ||
+        lt == FPY_TAG_BYTES || rt == FPY_TAG_BYTES) {
         /* If we reach here, no valid handler matched (e.g. list+int, dict-int,
          * str+list, etc.) — raise TypeError like CPython does. */
         static const char *_op_syms[] = {"+", "-", "*", "/", "//", "%"};

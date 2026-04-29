@@ -23336,7 +23336,13 @@ class CodeGen:
             return self._rt_call("str_format_percent", [ltv, TypedValue(args_list, ValueType(VKind.LIST))])
 
         # ── Fast path: float op float (or int+float promotion) ─────────
-        if lk == VKind.FLOAT or rk == VKind.FLOAT:
+        # Guard: float+container is always TypeError (e.g. "hello" + 1.5).
+        # Only promote to float when the other side is numeric-compatible.
+        _float_incompatible = (VKind.STR, VKind.LIST, VKind.DICT, VKind.SET,
+                               VKind.TUPLE, VKind.BYTES)
+        if ((lk == VKind.FLOAT or rk == VKind.FLOAT)
+                and lk not in _float_incompatible
+                and rk not in _float_incompatible):
             left_d = ltv.val if lk == VKind.FLOAT else self.builder.sitofp(ltv.as_i64(self.builder), double)
             right_d = rtv.val if rk == VKind.FLOAT else self.builder.sitofp(rtv.as_i64(self.builder), double)
             return self._emit_float_binop(node.op, left_d, right_d, node)
@@ -23348,12 +23354,8 @@ class CodeGen:
             return self._rt_call("str_repeat", [ltv, rtv])
         if lk == VKind.INT and rk == VKind.STR and op == ast.Mult:
             return self._rt_call("str_repeat", [rtv, ltv])
-        if lk == VKind.STR and rk == VKind.INT and op == ast.Add:
-            r_str = self._rt_call("int_to_str", [rtv])
-            return self._rt_call("str_concat", [ltv, TypedValue(r_str, ValueType(VKind.STR))])
-        if lk == VKind.INT and rk == VKind.STR and op == ast.Add:
-            l_str = self._rt_call("int_to_str", [ltv])
-            return self._rt_call("str_concat", [TypedValue(l_str, ValueType(VKind.STR)), rtv])
+        # NOTE: str + int and int + str are NOT valid in Python (TypeError).
+        # These fall through to the container guard → fv_binop → TypeError.
 
         # ── Fast path: list + list → concat, list * int → repeat ───────
         if lk == VKind.LIST and rk == VKind.LIST and op == ast.Add:

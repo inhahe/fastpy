@@ -147,6 +147,29 @@ These features work correctly but use the embedded CPython interpreter:
 - **Other stdlib modules** not implemented natively (e.g., collections,
   itertools, functools — except singledispatch which is native)
 
+## Bugs fixed (2026-04-28, str+int/float TypeError, test generator expansion)
+
+### 112. `str + int` and `str + float` silently succeeded instead of TypeError (fixed)
+`"hello" + 5` produced `"hello5"` (auto-converted int to string) instead of
+raising TypeError. `"hello" + 1.5` silently computed float arithmetic on the
+string pointer, producing garbage. `"hello" * 1.5` similarly failed.
+Root causes: (a) Codegen had explicit `str + int → int_to_str + str_concat`
+and `int + str → int_to_str + str_concat` fast paths that auto-converted.
+Python never auto-converts types for `+` — only `str + str` is valid.
+(b) The codegen float fast path `if lk == VKind.FLOAT or rk == VKind.FLOAT`
+didn't guard against container types, so `str + float` promoted the string
+pointer to double and did float arithmetic.
+(c) The runtime `fastpy_fv_binop` float path `if (lt == FPY_TAG_FLOAT || rt
+== FPY_TAG_FLOAT)` also lacked a numeric-type guard, so str+float at runtime
+did float arithmetic on the string's pointer value.
+Fix: (a) Removed the str+int and int+str auto-conversion fast paths.
+(b) Added `_float_incompatible` guard to the codegen float fast path — only
+enters float arithmetic when the other operand is numeric (INT/BOOL/FLOAT).
+(c) Added numeric-type guard to runtime fv_binop float path — both operands
+must be FLOAT/INT/BOOL to enter float arithmetic. Also added FPY_TAG_BYTES
+to the TypeError guard. Invalid combinations now fall through to the TypeError
+guard which calls `fastpy_raise(FPY_EXC_TYPEERROR, ...)`.
+
 ## Bugs fixed (2026-04-28, module-level exception propagation)
 
 ### 111. Module-level uncaught exceptions didn't halt execution (fixed)
