@@ -147,7 +147,17 @@ These features work correctly but use the embedded CPython interpreter:
 - **Other stdlib modules** not implemented natively (e.g., collections,
   itertools, functools — except singledispatch which is native)
 
-## Bugs fixed (2026-04-28, nested closures, tuple repr, bytes, dict comp, deque, struct)
+## Bugs fixed (2026-04-28, closure defaults, nested closures, tuple repr, bytes, dict comp)
+
+### 96. Closure default parameter values not applied (fixed)
+`def inner(y=20)` inside `def outer(x)` — calling `outer(10)()` returned
+`10` instead of `30` (= 10+20). The default `y=20` was ignored.
+Root cause: FpyClosure struct had no default value storage. `closure_call0`
+called the function with only captures, never filling in parameter defaults.
+Fix: Added `n_defaults` and `defaults[8]` to FpyClosure. Codegen emits
+`closure_set_defaults`/`closure_set_default` after closure creation.
+`closure_call0` fills in defaults when all params have defaults;
+`closure_call1` fills in the 2nd param's default when `n_params == 2`.
 
 ### 95. Decorator-with-arguments failed: triple-nested closure name lookup (fixed)
 `@repeat(3) def f(x)` — decorator factories that return a decorator that
