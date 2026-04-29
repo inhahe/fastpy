@@ -6728,6 +6728,33 @@ class CodeGen:
                         ret_type = i32
                         break
 
+        # Conflicting return types: if ret_type is double but some returns
+        # are strings/pointers (f-strings, str literals, string vars), or if
+        # ret_type is i8_ptr but some returns are float, the function has
+        # mixed return types. Downgrade to i64 so FpyValue ABI handles it.
+        if ret_type == double and has_return_value:
+            _has_ptr_return = False
+            for n in ast.walk(node):
+                if id(n) in _nested_ids:
+                    continue
+                if isinstance(n, ast.Return) and n.value is not None:
+                    if isinstance(n.value, (ast.JoinedStr, ast.Tuple,
+                                            ast.List, ast.ListComp,
+                                            ast.Dict, ast.DictComp)):
+                        _has_ptr_return = True
+                        break
+                    if (isinstance(n.value, ast.Constant)
+                            and isinstance(n.value.value, str)):
+                        _has_ptr_return = True
+                        break
+                    if (isinstance(n.value, ast.Name)
+                            and n.value.id in str_vars):
+                        _has_ptr_return = True
+                        break
+            if _has_ptr_return:
+                # Mixed return types: use i64 (FpyValue ABI handles tag dispatch)
+                ret_type = i64
+
         # Detect generator functions (contain yield/yield from)
         is_generator = any(
             isinstance(n, (ast.Yield, ast.YieldFrom))

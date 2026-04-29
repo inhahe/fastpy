@@ -147,7 +147,19 @@ These features work correctly but use the embedded CPython interpreter:
 - **Other stdlib modules** not implemented natively (e.g., collections,
   itertools, functools — except singledispatch which is native)
 
-## Bugs fixed (2026-04-28, *args tuple, MRO, funcdef in loops, lambda captures)
+## Bugs fixed (2026-04-28, *args tuple, MRO, funcdef in loops, lambda captures, mixed returns)
+
+### 110. Mixed return types (float try + string except) produced garbage (fixed)
+`def classify(x): try: return 100/x; except: return f"error: {e}"` returned
+a garbage float (e.g. `1.27e-311`) for the string return path. The return
+type analysis set `ret_type = double` on seeing `ast.Div` in any return
+expression, then all returns were compiled as double — string pointers were
+bitcast to double.
+Fix: Added a post-analysis conflict check. After the return type is
+determined, re-scan all returns for pointer-type returns (f-strings, string
+literals, string variables, containers). If both float and pointer returns
+exist, downgrade `ret_type` from `double` to `i64` so the FpyValue ABI
+handles runtime type dispatch.
 
 ### 109. Lambda expressions inside functions didn't capture parent variables (fixed)
 `def make(n): return lambda: n` — calling `make(42)()` raised `NameError:
