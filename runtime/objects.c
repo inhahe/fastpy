@@ -4201,11 +4201,12 @@ FpyDict* fastpy_dict_merge(FpyDict *a, FpyDict *b) {
     return result;
 }
 
-/* List concatenation */
+/* List concatenation.  Preserves tuple flag when both inputs are tuples. */
 FpyList* fastpy_list_concat(FpyList *a, FpyList *b) {
     FpyList *result = fpy_list_new(a->length + b->length);
     for (int64_t i = 0; i < a->length; i++) fpy_list_append(result, a->items[i]);
     for (int64_t i = 0; i < b->length; i++) fpy_list_append(result, b->items[i]);
+    if (a->is_tuple && b->is_tuple) result->is_tuple = 1;
     return result;
 }
 
@@ -4598,6 +4599,50 @@ FpyList* fastpy_list_filter_int(FpyList *lst, void *fn) {
     return result;
 }
 
+/* In-place sort by key function: key_fn is int64_t(int64_t).
+   reverse=0 for ascending, reverse=1 for descending (stable). */
+void fastpy_list_sort_by_key_int(FpyList *lst, void *key_fn, int reverse) {
+    typedef int64_t (*keyfn_t)(int64_t);
+    keyfn_t fn = (keyfn_t)key_fn;
+    int64_t n = lst->length;
+    if (n <= 1) return;
+    FPY_LOCK(lst);
+    int64_t *keys = (int64_t*)malloc(sizeof(int64_t) * n);
+    int64_t *order = (int64_t*)malloc(sizeof(int64_t) * n);
+    for (int64_t i = 0; i < n; i++) {
+        order[i] = i;
+        keys[i] = fn(lst->items[i].data.i);
+    }
+    /* Stable insertion sort on order by keys */
+    for (int64_t i = 1; i < n; i++) {
+        int64_t cur = order[i];
+        int64_t cur_key = keys[cur];
+        int64_t j = i - 1;
+        if (reverse) {
+            while (j >= 0 && keys[order[j]] < cur_key) {
+                order[j + 1] = order[j];
+                j--;
+            }
+        } else {
+            while (j >= 0 && keys[order[j]] > cur_key) {
+                order[j + 1] = order[j];
+                j--;
+            }
+        }
+        order[j + 1] = cur;
+    }
+    /* Rearrange items in-place using temporary copy */
+    FpyValue *tmp = (FpyValue*)malloc(sizeof(FpyValue) * n);
+    for (int64_t i = 0; i < n; i++) {
+        tmp[i] = lst->items[order[i]];
+    }
+    memcpy(lst->items, tmp, sizeof(FpyValue) * n);
+    free(tmp);
+    free(keys);
+    free(order);
+    FPY_UNLOCK(lst);
+}
+
 /* List sorted by key function: key_fn is a function pointer int64_t(int64_t) */
 FpyList* fastpy_list_sorted_by_key_int(FpyList *lst, void *key_fn) {
     typedef int64_t (*keyfn_t)(int64_t);
@@ -4865,15 +4910,21 @@ int32_t fastpy_set_equal(FpyDict *a, FpyDict *b) {
     return 1;
 }
 
-/* List repetition: [1, 2] * 3 = [1, 2, 1, 2, 1, 2] */
+/* List repetition: [1, 2] * 3 = [1, 2, 1, 2, 1, 2].
+   Preserves tuple flag from the source list. */
 FpyList* fastpy_list_repeat(FpyList *lst, int64_t n) {
-    if (n <= 0) return fpy_list_new(0);
+    if (n <= 0) {
+        FpyList *empty = fpy_list_new(0);
+        empty->is_tuple = lst->is_tuple;
+        return empty;
+    }
     FpyList *result = fpy_list_new(lst->length * n);
     for (int64_t r = 0; r < n; r++) {
         for (int64_t i = 0; i < lst->length; i++) {
             fpy_list_append(result, lst->items[i]);
         }
     }
+    result->is_tuple = lst->is_tuple;
     return result;
 }
 
@@ -5475,6 +5526,17 @@ int fastpy_isinstance(FpyObj *obj, int class_id) {
 /* Get class name for an object */
 const char* fastpy_obj_classname(FpyObj *obj) {
     return fpy_classes[obj->class_id].name;
+}
+
+/* Get "<class '__main__.ClassName'>" for an object (type(obj) display) */
+const char* fastpy_obj_type_repr(FpyObj *obj) {
+    const char *name = fpy_classes[obj->class_id].name;
+    size_t len = strlen(name);
+    /* Match Python's output: "<class '__main__.ClassName'>" */
+    size_t buflen = len + 22; /* "<class '__main__.'>" + name + NUL */
+    char *buf = (char*)malloc(buflen);
+    snprintf(buf, buflen, "<class '__main__.%s'>", name);
+    return buf;
 }
 
 /* Call __str__ if it exists, otherwise return default repr */

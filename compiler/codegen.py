@@ -1553,6 +1553,8 @@ class CodeGen:
         ft = ir.FunctionType(i8_ptr, [i8_ptr, i8_ptr])
         self.runtime["list_sorted_by_key_int"] = ir.Function(self.module, ft, name="fastpy_list_sorted_by_key_int")
         self.runtime["list_sorted_by_key_str"] = ir.Function(self.module, ft, name="fastpy_list_sorted_by_key_str")
+        ft = ir.FunctionType(ir.VoidType(), [i8_ptr, i8_ptr, i32])
+        self.runtime["list_sort_by_key_int"] = ir.Function(self.module, ft, name="fastpy_list_sort_by_key_int")
         self.runtime["list_map_int"] = ir.Function(self.module, ft, name="fastpy_list_map_int")
         self.runtime["list_filter_int"] = ir.Function(self.module, ft, name="fastpy_list_filter_int")
         ft = ir.FunctionType(i8_ptr, [i8_ptr, i64])
@@ -2088,6 +2090,8 @@ class CodeGen:
         ft = ir.FunctionType(i8_ptr, [i8_ptr])
         self.runtime["obj_to_str"] = ir.Function(self.module, ft, name="fastpy_obj_to_str")
         self.runtime["obj_to_repr"] = ir.Function(self.module, ft, name="fastpy_obj_to_repr")
+        self.runtime["obj_classname"] = ir.Function(self.module, ft, name="fastpy_obj_classname")
+        self.runtime["obj_type_repr"] = ir.Function(self.module, ft, name="fastpy_obj_type_repr")
         ft = ir.FunctionType(double, [i8_ptr, i8_ptr])
         self.runtime["obj_call_method0_double"] = ir.Function(self.module, ft, name="fastpy_obj_call_method0_double")
         ft = ir.FunctionType(double, [i8_ptr, i8_ptr, i64])
@@ -6818,6 +6822,29 @@ class CodeGen:
             if _has_ptr_return:
                 # Mixed return types: use i64 (FpyValue ABI handles tag dispatch)
                 ret_type = i64
+            if not _has_ptr_return:
+                # Also check for float+int mixed returns (e.g. try: return 1/x
+                # except: return -1). If ret_type is double but some returns are
+                # plain integer constants/expressions, downgrade to i64 so the
+                # caller can print int vs float correctly.
+                _has_int_return = False
+                for n in ast.walk(node):
+                    if id(n) in _nested_ids:
+                        continue
+                    if isinstance(n, ast.Return) and n.value is not None:
+                        v = n.value
+                        # Plain integer constant
+                        if isinstance(v, ast.Constant) and isinstance(v.value, int) and not isinstance(v.value, bool):
+                            _has_int_return = True
+                            break
+                        # Unary minus on int constant: return -1
+                        if (isinstance(v, ast.UnaryOp) and isinstance(v.op, ast.USub)
+                                and isinstance(v.operand, ast.Constant)
+                                and isinstance(v.operand.value, int)):
+                            _has_int_return = True
+                            break
+                if _has_int_return:
+                    ret_type = i64
 
         # Detect generator functions (contain yield/yield from)
         is_generator = any(
@@ -16195,16 +16222,33 @@ class CodeGen:
 
                 # Bind `as var` if present
                 if opt_var is not None and isinstance(opt_var, ast.Name):
-                    # Determine type: if __enter__ returns self, tag as obj
+                    # Check if __enter__ returns self (common case) by
+                    # analyzing the class's __enter__ method AST.
                     cls = self._infer_object_class(ctx_expr)
+                    _returns_self = False
                     if cls:
+                        ci = self._user_classes.get(cls)
+                        if ci and ci.method_asts:
+                            enter_ast = ci.method_asts.get("__enter__")
+                            if enter_ast:
+                                for stmt in ast.walk(enter_ast):
+                                    if (isinstance(stmt, ast.Return)
+                                            and isinstance(stmt.value, ast.Name)
+                                            and stmt.value.id == "self"):
+                                        _returns_self = True
+                                        break
+                    if _returns_self and cls:
                         val_ptr = self.builder.inttoptr(
                             enter_result, i8_ptr, name="with.val")
                         self._store_variable(opt_var.id, val_ptr, "obj")
                         self._obj_var_class[opt_var.id] = cls
                     else:
-                        self._store_variable(
-                            opt_var.id, enter_result, "int")
+                        # __enter__ returns a non-self value (int, str, etc.)
+                        # Use get_ret_tag to determine the actual type
+                        ret_tag = self.builder.call(
+                            self.runtime["get_ret_tag"], [])
+                        fv = self._fv_build_from_slots(ret_tag, enter_result)
+                        self._store_variable(opt_var.id, fv, "int")
 
             # Store mgr pointer for the finally block's __exit__ call.
             # Use a local alloca so it survives across basic blocks.
@@ -18429,10 +18473,22 @@ class CodeGen:
                     start_val = self._emit_expr_value(kw.value)
                     break
 
-        # Evaluate the list
+        # Detect if the enumerate arg is a string (not a list)
+        _is_str_iter = False
+        if isinstance(lst_node, ast.Constant) and isinstance(lst_node.value, str):
+            _is_str_iter = True
+        elif (isinstance(lst_node, ast.Name) and lst_node.id in self.variables):
+            _, _tag = self.variables[lst_node.id]
+            if ValueType.from_old_tag(_tag).kind == VKind.STR:
+                _is_str_iter = True
+
+        # Evaluate the iterable
         lst_tv = self._emit_expr(lst_node)
         lst_ptr = lst_tv.as_ptr(self.builder)
-        lst_len = self._rt_call("list_length", [lst_ptr])
+        if _is_str_iter:
+            lst_len = self._rt_call("str_len", [lst_ptr])
+        else:
+            lst_len = self._rt_call("list_length", [lst_ptr])
 
         # Index and counter variables
         self._block_counter += 1
@@ -18464,7 +18520,12 @@ class CodeGen:
 
         # Assign the element variable (second target)
         val_target = targets[1]
-        if isinstance(val_target, ast.Name):
+        if _is_str_iter:
+            # String iteration: extract single character via str_index
+            if isinstance(val_target, ast.Name):
+                ch = self._rt_call("str_index", [lst_ptr, idx])
+                self._store_variable(val_target.id, ch, "str")
+        elif isinstance(val_target, ast.Name):
             elem_type = self._get_list_elem_type(lst_node)
             if elem_type == "float":
                 var_tag = "float"
@@ -18548,38 +18609,71 @@ class CodeGen:
         # Determine inner element types from AST: first tuple's elements
         inner_types = self._infer_for_tuple_elem_types(node.iter, len(targets))
 
-        # Unpack targets — handle both simple names and nested tuples
-        for i, tgt in enumerate(targets):
-            idx_const = ir.Constant(i64, i)
-            if isinstance(tgt, ast.Name):
-                elem_type = inner_types[i] if i < len(inner_types) else "str"
-                # Use _fv_store_from_list so the runtime tag is preserved
-                # (compile-time inference may be wrong for mixed-type tuples
-                # like dict.items() returning (str, int) pairs).
-                self._fv_store_from_list(tgt.id, elem_list, idx_const, elem_type)
-            elif isinstance(tgt, (ast.Tuple, ast.List)):
-                # Nested tuple/list: get the sub-list and unpack it
-                inner_list = self._list_get_as_bare(elem_list, idx_const, "list")
-                for j, inner_tgt in enumerate(tgt.elts):
-                    if isinstance(inner_tgt, ast.Name):
-                        self._fv_store_from_list(
-                            inner_tgt.id, inner_list, ir.Constant(i64, j), "unknown")
-                    elif isinstance(inner_tgt, (ast.Tuple, ast.List)):
-                        # Deep nesting: unpack one more level
-                        deep_list = self._list_get_as_bare(
-                            inner_list, ir.Constant(i64, j), "list")
-                        for k, deep_tgt in enumerate(inner_tgt.elts):
-                            if isinstance(deep_tgt, ast.Name):
-                                self._fv_store_from_list(
-                                    deep_tgt.id, deep_list,
-                                    ir.Constant(i64, k), "unknown")
-                            else:
-                                self._bridge_fallback_stmt(
-                                    node, "very deep nested unpack")
+        # Check for starred target in the tuple
+        star_idx = None
+        for _si, tgt in enumerate(targets):
+            if isinstance(tgt, ast.Starred):
+                star_idx = _si
+                break
+
+        if star_idx is not None:
+            # Starred unpacking: for a, *rest, z in data
+            inner_len = self._rt_call("list_length", [elem_list])
+            n_fixed = len(targets) - 1
+            for i, tgt in enumerate(targets):
+                if isinstance(tgt, ast.Starred):
+                    name = tgt.value.id if isinstance(tgt.value, ast.Name) else None
+                    if name is None or name == "_":
+                        continue
+                    start = ir.Constant(i64, star_idx)
+                    n_after = len(targets) - star_idx - 1
+                    stop = self.builder.sub(inner_len, ir.Constant(i64, n_after))
+                    rest = self._rt_call("list_slice", [
+                        elem_list, start, stop, ir.Constant(i64, 1),
+                        ir.Constant(i64, 1)])
+                    self._store_variable(name, rest, "list:int")
+                elif isinstance(tgt, ast.Name):
+                    if i < star_idx:
+                        el_idx = ir.Constant(i64, i)
                     else:
-                        self._bridge_fallback_stmt(node, "deep nested tuple unpacking")
-            else:
-                self._bridge_fallback_stmt(node, "unsupported for tuple unpack target")
+                        offset = len(targets) - i
+                        el_idx = self.builder.sub(inner_len, ir.Constant(i64, offset))
+                    self._fv_store_from_list(tgt.id, elem_list, el_idx, "unknown")
+                else:
+                    self._bridge_fallback_stmt(node, "unsupported starred for target")
+        else:
+            # Unpack targets — handle both simple names and nested tuples
+            for i, tgt in enumerate(targets):
+                idx_const = ir.Constant(i64, i)
+                if isinstance(tgt, ast.Name):
+                    elem_type = inner_types[i] if i < len(inner_types) else "str"
+                    # Use _fv_store_from_list so the runtime tag is preserved
+                    # (compile-time inference may be wrong for mixed-type tuples
+                    # like dict.items() returning (str, int) pairs).
+                    self._fv_store_from_list(tgt.id, elem_list, idx_const, elem_type)
+                elif isinstance(tgt, (ast.Tuple, ast.List)):
+                    # Nested tuple/list: get the sub-list and unpack it
+                    inner_list = self._list_get_as_bare(elem_list, idx_const, "list")
+                    for j, inner_tgt in enumerate(tgt.elts):
+                        if isinstance(inner_tgt, ast.Name):
+                            self._fv_store_from_list(
+                                inner_tgt.id, inner_list, ir.Constant(i64, j), "unknown")
+                        elif isinstance(inner_tgt, (ast.Tuple, ast.List)):
+                            # Deep nesting: unpack one more level
+                            deep_list = self._list_get_as_bare(
+                                inner_list, ir.Constant(i64, j), "list")
+                            for k, deep_tgt in enumerate(inner_tgt.elts):
+                                if isinstance(deep_tgt, ast.Name):
+                                    self._fv_store_from_list(
+                                        deep_tgt.id, deep_list,
+                                        ir.Constant(i64, k), "unknown")
+                                else:
+                                    self._bridge_fallback_stmt(
+                                        node, "very deep nested unpack")
+                        else:
+                            self._bridge_fallback_stmt(node, "deep nested tuple unpacking")
+                else:
+                    self._bridge_fallback_stmt(node, "unsupported for tuple unpack target")
 
         self._loop_stack.append((end_block, incr_block))
         _prev_hot = self._in_hot_loop
@@ -21518,34 +21612,65 @@ class CodeGen:
                                out_tag, out_data])
             return
 
-        # Extract sep= and end= keyword arguments (must be literal strings)
-        sep = " "
-        end = "\n"
+        # Extract sep= and end= keyword arguments.
+        # Accept both literal strings and variable expressions.
+        sep = " "           # Python-level default (None means default)
+        end = "\n"          # Python-level default
+        sep_ir = None       # LLVM value if non-literal
+        end_ir = None       # LLVM value if non-literal
         for kw in node.keywords:
             if kw.arg == "sep":
-                if not (isinstance(kw.value, ast.Constant) and isinstance(kw.value.value, str)):
-                    raise CodeGenError("print(sep=) must be a literal string", node)
-                sep = kw.value.value
+                if isinstance(kw.value, ast.Constant) and isinstance(kw.value.value, str):
+                    sep = kw.value.value
+                elif isinstance(kw.value, ast.Constant) and kw.value.value is None:
+                    sep = " "   # sep=None → default separator
+                else:
+                    # Non-literal sep: evaluate as string expression
+                    sep_ir = self._emit_expr_value(kw.value)
+                    if isinstance(sep_ir.type, ir.IntType):
+                        sep_ir = self.builder.inttoptr(sep_ir, i8_ptr)
+                    sep = None  # signal to use sep_ir
             elif kw.arg == "end":
-                if not (isinstance(kw.value, ast.Constant) and isinstance(kw.value.value, str)):
-                    raise CodeGenError("print(end=) must be a literal string", node)
-                end = kw.value.value
+                if isinstance(kw.value, ast.Constant) and isinstance(kw.value.value, str):
+                    end = kw.value.value
+                elif isinstance(kw.value, ast.Constant) and kw.value.value is None:
+                    end = "\n"  # end=None → default end
+                else:
+                    end_ir = self._emit_expr_value(kw.value)
+                    if isinstance(end_ir.type, ir.IntType):
+                        end_ir = self.builder.inttoptr(end_ir, i8_ptr)
+                    end = None  # signal to use end_ir
             else:
                 pass  # ignore unknown print kwargs (file=, flush=, etc.)
 
+        # Helper: emit write of end string
+        def _write_end():
+            if end_ir is not None:
+                self.builder.call(self.runtime["write_str"], [end_ir])
+            elif end == "\n":
+                self.builder.call(self.runtime["print_newline"], [])
+            elif end:
+                end_ptr = self._make_string_constant(end)
+                self.builder.call(self.runtime["write_str"], [end_ptr])
+        # Helper: emit write of sep string
+        def _write_sep():
+            if sep_ir is not None:
+                self.builder.call(self.runtime["write_str"], [sep_ir])
+            elif sep == " ":
+                self.builder.call(self.runtime["write_space"], [])
+            elif sep:
+                sep_ptr = self._make_string_constant(sep)
+                self.builder.call(self.runtime["write_str"], [sep_ptr])
+
         if len(node.args) == 0:
-            if end:
-                if end == "\n":
-                    self.builder.call(self.runtime["print_newline"], [])
-                else:
-                    end_ptr = self._make_string_constant(end)
-                    self.builder.call(self.runtime["write_str"], [end_ptr])
+            _write_end()
             return
 
         # Handle starred args: print(*[1,2,3]) → iterate the list
         has_star = any(isinstance(a, ast.Starred) for a in node.args)
         if has_star:
-            sep_ptr = self._make_string_constant(sep)
+            _sep_ptr_star = (sep_ir if sep_ir is not None
+                             else self._make_string_constant(sep if sep else " "))
             first_alloca = self._create_entry_alloca(ir.IntType(1), "print.first")
             self.builder.store(ir.Constant(ir.IntType(1), 1), first_alloca)
             for arg in node.args:
@@ -21573,7 +21698,7 @@ class CodeGen:
                     nosep_b = self._new_block("pstar.nosep")
                     self.builder.cbranch(not_first, sep_b, nosep_b)
                     self.builder.position_at_end(sep_b)
-                    self.builder.call(self.runtime["write_str"], [sep_ptr])
+                    self.builder.call(self.runtime["write_str"], [_sep_ptr_star])
                     self.builder.branch(nosep_b)
                     self.builder.position_at_end(nosep_b)
                     self.builder.store(
@@ -21600,38 +21725,27 @@ class CodeGen:
                     nosep_b2 = self._new_block("print.nosep")
                     self.builder.cbranch(not_first, sep_b2, nosep_b2)
                     self.builder.position_at_end(sep_b2)
-                    self.builder.call(self.runtime["write_str"], [sep_ptr])
+                    self.builder.call(self.runtime["write_str"], [_sep_ptr_star])
                     self.builder.branch(nosep_b2)
                     self.builder.position_at_end(nosep_b2)
                     self.builder.store(
                         ir.Constant(ir.IntType(1), 0), first_alloca)
                     self._emit_write_single(arg)
-            if end == "\n":
-                self.builder.call(self.runtime["print_newline"], [])
-            elif end:
-                end_ptr = self._make_string_constant(end)
-                self.builder.call(self.runtime["write_str"], [end_ptr])
+            _write_end()
             return
 
         # Simple case: no custom sep/end, single arg — use fast path
-        if len(node.args) == 1 and sep == " " and end == "\n":
+        if (len(node.args) == 1 and sep == " " and end == "\n"
+                and sep_ir is None and end_ir is None):
             self._emit_print_single(node.args[0])
             return
 
         # Write each arg separated by `sep`, then write `end`
         for i, arg in enumerate(node.args):
             if i > 0:
-                if sep == " ":
-                    self.builder.call(self.runtime["write_space"], [])
-                else:
-                    sep_ptr = self._make_string_constant(sep)
-                    self.builder.call(self.runtime["write_str"], [sep_ptr])
+                _write_sep()
             self._emit_write_single(arg)
-        if end == "\n":
-            self.builder.call(self.runtime["print_newline"], [])
-        elif end:
-            end_ptr = self._make_string_constant(end)
-            self.builder.call(self.runtime["write_str"], [end_ptr])
+        _write_end()
 
     def _emit_print_single(self, node: ast.expr) -> None:
         """Emit print() for a single argument via FpyValue runtime dispatch.
@@ -24566,8 +24680,8 @@ class CodeGen:
                             i8_ptr, "typename")
                         default = self._make_string_constant("object")
                         self.builder.store(default, result_alloca)
-                        # For OBJ tag, call cpython_typeof to get the
-                        # actual Python type name at runtime
+                        # For OBJ tag, use native obj_classname (NOT
+                        # cpython_typeof — native FpyObj isn't a PyObject*)
                         is_obj = self.builder.icmp_signed(
                             "==", fv_tag, ir.Constant(i32, FPY_TAG_OBJ))
                         obj_block = self._new_block("typename.obj")
@@ -24576,7 +24690,7 @@ class CodeGen:
                         self.builder.position_at_end(obj_block)
                         obj_ptr = self.builder.inttoptr(fv_data, i8_ptr)
                         runtime_name = self.builder.call(
-                            self.runtime["cpython_typeof"], [obj_ptr])
+                            self.runtime["obj_classname"], [obj_ptr])
                         self.builder.store(runtime_name, result_alloca)
                         self.builder.branch(merge_block)
                         self.builder.position_at_end(merge_block)
@@ -24893,7 +25007,8 @@ class CodeGen:
                             default_str = self._make_string_constant(
                                 "<class 'object'>")
                             self.builder.store(default_str, result_alloca)
-                            # For OBJ tag, call cpython_type_repr conditionally
+                            # For OBJ tag, use native obj_type_repr (NOT
+                            # cpython_type_repr — native FpyObj isn't PyObject*)
                             is_obj = self.builder.icmp_signed(
                                 "==", fv_tag, ir.Constant(i32, FPY_TAG_OBJ))
                             obj_block = self._new_block("type.obj")
@@ -24902,7 +25017,7 @@ class CodeGen:
                             self.builder.position_at_end(obj_block)
                             obj_ptr = self.builder.inttoptr(fv_data, i8_ptr)
                             runtime_type = self.builder.call(
-                                self.runtime["cpython_type_repr"], [obj_ptr])
+                                self.runtime["obj_type_repr"], [obj_ptr])
                             self.builder.store(runtime_type, result_alloca)
                             self.builder.branch(merge_block)
                             self.builder.position_at_end(merge_block)
@@ -24942,7 +25057,7 @@ class CodeGen:
                             default_str = self._make_string_constant(
                                 "<class 'object'>")
                             self.builder.store(default_str, result_alloca)
-                            # Only call cpython_type_repr when tag is OBJ
+                            # For OBJ tag, use native obj_type_repr
                             is_obj = self.builder.icmp_signed(
                                 "==", fv_tag, ir.Constant(i32, FPY_TAG_OBJ))
                             obj_block = self._new_block("type.expr.obj")
@@ -24951,7 +25066,7 @@ class CodeGen:
                             self.builder.position_at_end(obj_block)
                             obj_ptr = self.builder.inttoptr(fv_data, i8_ptr)
                             runtime_type = self.builder.call(
-                                self.runtime["cpython_type_repr"], [obj_ptr])
+                                self.runtime["obj_type_repr"], [obj_ptr])
                             self.builder.store(runtime_type, result_alloca)
                             self.builder.branch(merge_block)
                             self.builder.position_at_end(merge_block)
@@ -27977,6 +28092,16 @@ class CodeGen:
                     param_tag = "str"
                 elif elem_type.startswith("list") or elem_type == "tuple":
                     param_tag = "list"
+        # Method call: obj.sort(key=lambda) — infer from obj's element type
+        if (param_tag == "int" and isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "sort"):
+            obj_node = node.func.value
+            elem_type = self._get_list_elem_type(obj_node)
+            if elem_type == "str":
+                param_tag = "str"
+            elif elem_type.startswith("list") or elem_type == "tuple":
+                param_tag = "list"
 
         # Save current emission state
         saved = (self.function, self.builder, self.variables, self._loop_stack,
@@ -28598,8 +28723,8 @@ class CodeGen:
                 return self._rt_call("dict_items", [obj])
             # Phase 4: fall through to runtime dispatch below
 
-        # Check if object is a list
-        if self._is_list_expr(attr.value):
+        # Check if object is a list (or tuple — same FpyList struct)
+        if self._is_list_expr(attr.value) or self._is_tuple_expr(attr.value):
             obj = self._emit_expr_value(attr.value)
             if method == "append" and len(node.args) == 1:
                 self._emit_list_append_expr(obj, node.args[0])
@@ -28650,7 +28775,17 @@ class CodeGen:
                                 and kw.value.value is True):
                             has_reverse = True
                 if has_key:
-                    pass  # fall through to bridge for key= support
+                    # Native list.sort(key=func) — get key function pointer
+                    key_node = None
+                    for kw in node.keywords:
+                        if kw.arg == "key":
+                            key_node = kw.value
+                            break
+                    fn_ptr = self._get_unary_func_ptr(key_node, node)
+                    rev_flag = ir.Constant(i32, 1 if has_reverse else 0)
+                    self.builder.call(self.runtime["list_sort_by_key_int"],
+                                      [obj, fn_ptr, rev_flag])
+                    return obj
                 else:
                     self._rt_call("list_sort", [obj])
                     if has_reverse:
@@ -30690,8 +30825,8 @@ class CodeGen:
 
     def _emit_list_comprehension(self, node: ast.ListComp) -> ir.Value:
         """Emit [expr for target in iter]."""
-        if len(node.generators) > 2:
-            raise CodeGenError("Only 1-2 generator list comprehensions supported", node)
+        if len(node.generators) >= 3:
+            return self._emit_list_comprehension_multi(node)
 
         if len(node.generators) == 2:
             return self._emit_list_comprehension_nested(node)
@@ -30839,6 +30974,90 @@ class CodeGen:
 
         self._emit_list_append_expr(result_list, node.elt)
         self.builder.branch(incr_block)
+
+    def _emit_list_comprehension_multi(self, node: ast.ListComp) -> ir.Value:
+        """Emit [expr for x in a for y in b for z in c ...] with 3+ generators."""
+        result_list = self.builder.call(self.runtime["list_new"], [])
+
+        def _emit_gen_loop(gen_idx: int) -> None:
+            """Recursively emit nested for loops for generators[gen_idx:]."""
+            gen = node.generators[gen_idx]
+            if not isinstance(gen.target, ast.Name):
+                self._bridge_fallback_expr(node, "complex variable target in multi-comprehension")
+                return
+
+            var = gen.target.id
+            is_range = (isinstance(gen.iter, ast.Call)
+                        and isinstance(gen.iter.func, ast.Name)
+                        and gen.iter.func.id == "range")
+
+            self._block_counter += 1
+            lbl = f"mlc{gen_idx}_{self._block_counter}"
+            idx_name = f"__mlc_idx_{lbl}"
+
+            if is_range:
+                r_args = gen.iter.args
+                start = ir.Constant(i64, 0) if len(r_args) == 1 else self._emit_expr_value(r_args[0])
+                stop = self._emit_expr_value(r_args[0] if len(r_args) == 1 else r_args[1])
+                step = ir.Constant(i64, 1) if len(r_args) < 3 else self._emit_expr_value(r_args[2])
+                self._store_variable(var, start, "int")
+            else:
+                iter_val = self._emit_expr_value(gen.iter)
+                iter_len = self._rt_call("list_length", [iter_val])
+                self._store_variable(idx_name, ir.Constant(i64, 0), "int")
+
+            cond_b = self._new_block(f"{lbl}.cond")
+            body_b = self._new_block(f"{lbl}.body")
+            incr_b = self._new_block(f"{lbl}.incr")
+            end_b = self._new_block(f"{lbl}.end")
+
+            self.builder.branch(cond_b)
+            self.builder.position_at_end(cond_b)
+            if is_range:
+                cur = self._load_variable(var, node)
+                self.builder.cbranch(self.builder.icmp_signed("<", cur, stop), body_b, end_b)
+            else:
+                idx = self._load_variable(idx_name, node)
+                self.builder.cbranch(self.builder.icmp_signed("<", idx, iter_len), body_b, end_b)
+
+            self.builder.position_at_end(body_b)
+            if not is_range:
+                idx = self._load_variable(idx_name, node)
+                self._fv_store_from_list(var, iter_val, idx, "int")
+
+            # Apply 'if' conditions for this generator
+            if gen.ifs:
+                for cond_node in gen.ifs:
+                    cond_val = self._emit_expr_value(cond_node)
+                    if isinstance(cond_val.type, ir.IntType) and cond_val.type.width > 1:
+                        cond_val = self.builder.icmp_signed("!=", cond_val, ir.Constant(cond_val.type, 0))
+                    pass_b = self._new_block(f"{lbl}.pass")
+                    self.builder.cbranch(cond_val, pass_b, incr_b)
+                    self.builder.position_at_end(pass_b)
+
+            if gen_idx + 1 < len(node.generators):
+                # More generators: recurse
+                _emit_gen_loop(gen_idx + 1)
+            else:
+                # Innermost: append the element expression
+                self._emit_list_append_expr(result_list, node.elt)
+
+            if not self.builder.block.is_terminated:
+                self.builder.branch(incr_b)
+
+            self.builder.position_at_end(incr_b)
+            if is_range:
+                cur = self._load_variable(var, node)
+                self._store_variable(var, self.builder.add(cur, step), "int")
+            else:
+                idx = self._load_variable(idx_name, node)
+                self._store_variable(idx_name, self.builder.add(idx, ir.Constant(i64, 1)), "int")
+            self.builder.branch(cond_b)
+
+            self.builder.position_at_end(end_b)
+
+        _emit_gen_loop(0)
+        return result_list
 
     def _emit_list_comprehension_nested(self, node: ast.ListComp) -> ir.Value:
         """Emit [expr for x in outer for y in inner]."""

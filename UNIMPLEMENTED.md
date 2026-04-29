@@ -147,6 +147,88 @@ These features work correctly but use the embedded CPython interpreter:
 - **Other stdlib modules** not implemented natively (e.g., collections,
   itertools, functools — except singledispatch which is native)
 
+## Bugs fixed (2026-04-28, type(obj), for-star-unpack, enumerate(str), sort(key=), print(sep=var), 3+ comprehensions)
+
+### 141. Tuple methods and operations broken (fixed)
+`t.count(val)` and `t.index(val)` crashed because the list method dispatcher
+only checked `_is_list_expr`, missing tuple-typed expressions. Also,
+`(1,2) + (3,4)` printed as `[1,2,3,4]` (list brackets) instead of
+`(1,2,3,4)` (tuple parens), and `(1,2)*3` similarly lost the tuple format.
+Fix: (a) Extended list method dispatcher to also match `_is_tuple_expr`,
+since tuples use the same FpyList struct. (b) `fastpy_list_concat` now
+preserves the `is_tuple` flag when both inputs are tuples. (c)
+`fastpy_list_repeat` now preserves `is_tuple` from the source list.
+
+### 140. Mixed float/int return types printed as float (fixed)
+`def f(x): try: return 1/x; except: return -1` — calling `f(0)` printed
+`-1.0` instead of `-1`. The `1/x` true division forced the function's
+return type to `double`, so the except's `return -1` was promoted to
+`-1.0`. Fix: Extended the mixed-return-type detection to also check for
+float+int conflicts (not just float+pointer). When both float and plain
+integer returns exist, downgrade `ret_type` from `double` to `i64` so
+FpyValue ABI preserves the distinction.
+
+### 139. `with CM() as v` crashed when `__enter__` returns non-self (fixed)
+`with CM() as v` where `__enter__` returns an integer (e.g., 42) crashed
+with ACCESS_VIOLATION. The codegen assumed `__enter__` always returns self
+(an object pointer) and did `inttoptr(42)` → invalid pointer dereference.
+Fix: Added AST analysis of the `__enter__` method body to check if it
+returns `self`. If it returns a non-self value, uses `get_ret_tag` to
+determine the actual return type at runtime and stores the value as an
+FpyValue.
+
+### 138. List comprehensions with 3+ generators rejected at compile time (fixed)
+`[x+y+z for x in range(2) for y in range(2) for z in range(2)]` raised
+CodeGenError "Only 1-2 generator list comprehensions supported". The existing
+2-generator handler was manually inlined. Fix: Added recursive
+`_emit_list_comprehension_multi` that handles any number of generators by
+recursively nesting for-loops. Supports range() and list iterables, with
+per-generator if-conditions.
+
+## Bugs fixed (2026-04-28, type(obj), for-star-unpack, enumerate(str), sort(key=), print(sep=var))
+
+### 137. `print(sep=variable)` and `print(end=variable)` rejected at compile time (fixed)
+`print(1, 2, 3, sep=sep_char)` where `sep_char` is a variable raised a
+CodeGenError requiring `sep=` and `end=` to be literal strings. Now accepts
+any string expression — the value is evaluated at runtime and passed to the
+write_str runtime function. `sep=None` and `end=None` are handled as defaults.
+
+### 136. `list.sort(key=func)` fell through to CPython bridge (fixed)
+`a.sort(key=len)`, `a.sort(key=abs)`, and `a.sort(key=lambda s: len(s))`
+all fell through to the CPython bridge because the `.sort(key=...)` handler
+had no native implementation. Also, `sort(key=lambda)` on string lists
+crashed because the lambda parameter type was inferred as int instead of
+str when the key function was a keyword argument (no positional list arg).
+Fix: (a) Added `fastpy_list_sort_by_key_int` runtime function for in-place
+stable sort by key with a reverse flag for proper stable descending sort.
+(b) Added method-call context to `_emit_inline_unary_lambda` so `.sort(key=)`
+infers element types from the receiver object. (c) Integrated with existing
+`_get_unary_func_ptr` for builtin (len, abs) and lambda key functions.
+
+### 135. `enumerate("string")` crashed at runtime (fixed)
+`for i, c in enumerate("abc")` crashed with ACCESS_VIOLATION because the
+inline enumerate optimization called `list_length` on a string pointer.
+Strings aren't FpyList structs — `list_length` reads invalid memory.
+Fix: Added string detection in `_emit_for_enumerate_inline`. When the
+enumerate argument is a string, uses `str_len` for length and `str_index`
+for character extraction instead of list operations.
+
+### 134. `for a, *rest in list_of_lists` didn't unpack starred targets (fixed)
+`for first, *rest in [[1,2,3],[4,5,6]]` raised NameError because
+`_emit_for_tuple_unpack` had no handler for `ast.Starred` targets.
+Fix: Added starred target handling that computes inner list length, assigns
+fixed-position elements by index, and creates a sub-list slice for the
+starred variable.
+
+### 133. `type(obj).__name__` and `type(obj)` crashed for native user-class objects (fixed)
+`type(x).__name__` and `print(type(x))` on user-class instances crashed
+because the codegen called `cpython_typeof` / `cpython_type_repr` which
+interpret the pointer as a PyObject*. Native FpyObj has a completely
+different layout. Fix: Added `fastpy_obj_classname` and
+`fastpy_obj_type_repr` runtime functions that read the class name from the
+native class registry. `type(x).__name__` returns the bare class name;
+`type(x)` returns `"<class '__main__.ClassName'>"` matching Python output.
+
 ## Bugs fixed (2026-04-28, dunder dispatch & method return types)
 
 ### 127. f-string `!r` conversion ignored (fixed)
