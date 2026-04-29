@@ -10,7 +10,8 @@ defaults, *args, **kwargs, closures, nonlocal, global), classes (init,
 methods, inheritance, super, multiple inheritance, nested classes,
 full metaclass support, __slots__, staticmethod, classmethod, @property
 get/set, __new__, __init_subclass__, __class_getitem__), decorators
-(user decorators, decorators with args), @dataclass (native AST expansion),
+(user decorators, decorator chaining, decorators with args),
+@dataclass (native AST expansion),
 @singledispatch (native switch dispatch).
 
 ### Operator overloading (dunders)
@@ -146,6 +147,146 @@ These features work correctly but use the embedded CPython interpreter:
 - **Other stdlib modules** not implemented natively (e.g., collections,
   itertools, functools — except singledispatch which is native)
 
+## Bugs fixed (2026-04-28, deque misdispatch, struct bridge, callable monomorph, decorator chaining)
+
+### 90. struct module routed through CPython bridge instead of native handlers (fixed)
+`struct.pack("<HH", 1000, 2000)` followed by `struct.unpack("<HH", packed)`
+crashed with access violation (exit code 3221225477). Single-value pack/unpack
+worked but multi-value round-trips segfaulted.
+Root cause: `"struct"` was missing from the `_NATIVE_MODULES` set. The gate
+`if mod_name in self._NATIVE_MODULES` at the top of `_emit_native_module_call`
+exited early, so all struct operations fell through to the CPython bridge.
+The bridge returned `bytes` as a PyObject* which was then passed incorrectly
+to subsequent bridge calls, corrupting memory.
+Fix: Added `"struct"` to `_NATIVE_MODULES` so pack/unpack dispatch to the
+native `fastpy_struct_pack`/`fastpy_struct_unpack` runtime functions.
+Also added correct return type tags ("bytes" for pack, "tuple" for unpack)
+in `_infer_type_tag`.
+
+### 89. Deque len/for always returned 0 or empty due to VKind.LIST misdispatch (fixed)
+`len(d)` on a `collections.deque` always returned 0, and `for x in d` never
+iterated. Other deque operations (append, appendleft, popleft, extend) worked.
+Root cause: `ValueType.from_old_tag("deque")` maps to `VKind.LIST`, so both
+`_emit_builtin_len` and `_emit_for` dispatched to the list fast paths
+(`list_length` / `_emit_for_list`). But FpyDeque has a different struct layout
+than FpyList — `length` is at offset 4 (after head) in deque vs offset 2 in
+list — so `list_length` read the wrong field (always 0).
+Fix: Added explicit `_is_deque_expr()` / `tag == "deque"` checks BEFORE the
+`VKind.LIST` fast paths in both `_emit_builtin_len` and `_emit_for`, routing
+to `deque_length` and `_emit_for_deque` (which converts to list first via
+`deque_to_list`) respectively.
+
+### 88. Callable parameter monomorphization hardcoded first caller (fixed)
+`apply(func, x)` called with multiple different callables (named function,
+lambda, closure) always dispatched to the first function seen during
+call-site analysis. `apply(double, 5)` returned 10 (correct), but
+`apply(lambda x: x+1, 10)` also returned 20 (calling `double` instead of
+the lambda), and `apply(add5, 3)` segfaulted (calling `double` with a
+closure struct pointer).
+Root cause: `_param_func_map` recorded the first function name seen for
+each (func_name, param_index) pair and used it unconditionally as an alias,
+causing `_func_aliases` to map the parameter name to a single LLVM function.
+Fix: (1) call-site analysis now invalidates `_param_func_map[key] = None`
+when non-function arguments (closures, lambdas, non-Name variables) are
+passed at the same call site; (2) function body compilation tags ambiguous
+callable parameters (where `_param_func_map` is None) as `"closure"` kind
+in `self.variables`, causing them to dispatch through `call_ptr` (which
+auto-detects closure struct vs raw function pointer via `FPY_CLOSURE_MAGIC`)
+instead of being hardcoded to a single function.
+
+### 87. Multiple decorator chaining called wrong inner function (fixed)
+`@add_one @double_result def cube(x)` produced `x³*4` instead of `x³*2+1`.
+Two root causes:
+(a) Closure name collision: `_emit_nested_funcdef` found closures by suffix
+match (`full_name.endswith(".wrapper")`), so when both `double_result` and
+`add_one` defined inner functions called `wrapper`, the first match in
+`_closure_info` was always used. Fix: match by fully qualified name
+(`outer_func.inner_func`) using `_current_func_name` context.
+(b) Decorator application order: the decorator loop iterated forward
+(`[d1, d2]`) and always used the original function pointer for each
+decorator. Python semantics require bottom-up application: `@d1 @d2 def f`
+means `f = d1(d2(f))`. Fix: iterate `reversed(active_decos)` and chain
+results — each decorator receives the previous decorator's output as
+`func_ptr`, not the original function.
+
+### 86. Augmented assignment on attributes missing string/list/OBJ support (fixed)
+`self.name += " Smith"` printed a raw pointer value instead of the
+concatenated string. `self.items += [new]` and `self.vec += Vec(1,2)` also
+failed. Root cause: the attribute augmented assignment path only checked for
+`DoubleType` (float) vs everything-else (int), with no handlers for string
+concatenation, list operations, or OBJ dunder dispatch (`__iadd__` etc.).
+Fix: added string concat (pointer+pointer with Add → `str_concat`), list
+concat/repeat, and OBJ `__iadd__`/`__isub__`/etc. dispatch to the
+`ast.Attribute` target path in `_emit_aug_assign`, mirroring the existing
+`ast.Name` target dispatch.
+
+### 85. FpyValue struct in comparisons crashed with type mismatch (fixed)
+Comparisons where one operand was an FpyValue struct `{i32, i64}` (from
+tuple unpacking, `dict.get()`, etc.) and the other was a scalar (i64 or
+double) fell through to `_emit_int_compare` with mismatched types.
+Fix: expanded the FpyValue comparison handler from requiring BOTH operands
+to be FpyValue to requiring EITHER operand. The non-FpyValue side is
+converted to `(tag, data)` via `_to_tag_data_ir` and both sides are
+dispatched through `fv_compare` for runtime-tag-aware comparison.
+
+### 84. FpyValue struct in float/int binops crashed (fixed)
+`x + 0.5` where `x` came from tuple unpacking (UNKNOWN-typed) crashed
+with "Operands must be the same type, got (double, {i32, i64})". The
+FpyValue struct flowed into `_emit_float_binop` as a raw struct alongside
+a double operand. Fix: added FpyValue-to-double unwrapping at the top of
+`_emit_float_binop` (tag-aware: float→bitcast, int→sitofp), FpyValue-to-i64
+extraction in `_emit_int_binop`, and full tag-aware FpyValue handling in
+`_emit_aug_assign`. This fixed the bm_nbody benchmark compilation
+(305ms vs CPython 1058ms, ~3.5x faster).
+
+## Bugs fixed (2026-04-28, decorator application & UNKNOWN/FV arithmetic)
+
+### 83. Decorator application crashed or called original function (fixed)
+`@identity def greet(name)` crashed with access violation; `@double_result
+def square(x)` called the original function (returned 9 instead of 18).
+Three root causes:
+(a) Closure FpyValue tag: `VKind.CLOSURE.fpy_tag` returned 6 (OBJ), so
+`fpy_rc_incref` dereferred the function pointer as an FpyObj* struct.
+Fix: changed CLOSURE fpy_tag to 0 (INT) and added CLOSURE to the scalar
+fast path so refcount operations are skipped entirely.
+(b) ABI mismatch: `call_ptr1` calls functions with bare i64 ABI, but
+FV-ABI functions expect `{i32, i64}` (FpyValue) structs. When `@identity`
+returned the raw function pointer and `call_ptr1` called it, the i64
+argument was misinterpreted as a struct pointer.
+Fix: decorator application now creates an i64-ABI wrapper for FV-ABI
+functions (via `_get_or_emit_i64_wrapper`) so the function pointer stored
+in the closure variable is always i64-ABI-compatible.
+(c) Dispatch priority: `_load_or_wrap_fv` checked `self._user_functions`
+before `self.variables` for closure tag, so decorated functions were
+dispatched directly to the original LLVM function, bypassing the closure
+variable. Fix: moved closure variable check before user function check.
+Also fixed: `_emit_closure_call` now uses `call_ptr` (auto-detects closure
+vs raw pointer via magic number) instead of `closure_call` (assumes
+closure struct). The i64 wrapper now forwards the return tag via
+`set_ret_tag` for correct runtime type dispatch.
+
+### 81. dict.get() counter pattern produced float instead of int (fixed)
+`d[k] = d.get(k, 0) + 1` stored float values (printed as `5.0` instead of
+`5`). Root cause: `dict.get()` returns an FpyValue with VKind.UNKNOWN. The
+UNKNOWN BinOp path unconditionally promoted both operands to `double` via
+`sitofp`/`bitcast` and called `_emit_float_binop`, losing int-ness. Fix:
+added runtime-tag-aware branching in `_emit_binop` for UNKNOWN+INT and
+UNKNOWN+UNKNOWN operands. When the UNKNOWN tag is INT at runtime, integer
+arithmetic is used; when FLOAT, float arithmetic. The result is returned as
+an FpyValue with the correct runtime tag. Also fixed the Safety block
+fallback for FpyValue structs to use `select(is_float, bitcast, sitofp)`
+instead of always bitcasting.
+
+### 82. `int(float_param)` returned float in monomorphized functions (fixed)
+`def to_int(x): return int(x)` called with a float argument printed `3.0`
+instead of `3`. Root cause: the return-type analysis in
+`_declare_user_function` walked the entire return expression `int(x)` with
+`ast.walk`, found `x` in `float_params`, and set `ret_type = double`. It
+didn't understand that `int()` always returns an integer regardless of
+argument type. Fix: added a check for int-returning builtins (`int`, `len`,
+`ord`, `hash`, `id`, `abs`, `round`) — when the return expression is one
+of these calls, the float-parameter walk is skipped. Pre-existing bug.
+
 ## Bugs fixed (2026-04-28, method returns, comprehensions & type inference)
 
 ### 68. Property/method truediv return type (fixed)
@@ -203,6 +344,59 @@ propagation (`Circle(5)` → `Shape(5)`) ran first and wasn't overridden.
 Fix: added explicit super() call scanning that propagates argument types
 to parent class/method, with unconditional override (super() args are
 more accurate than the heuristic propagation).
+
+### 75. Dict `in` operator: string variable dispatch (fixed)
+`x = "hello"; print(x in cache)` inside a function printed `False` instead
+of `True`. Root cause: FV-backed string variables are loaded as i64 (data
+field of FpyValue), so `isinstance(left_val.type, ir.IntType)` was True,
+routing through `dict_has_int_key` (integer hash table) instead of
+`dict_has_key` (string hash table). Fix: pass `left_kind` (VKind from
+TypedValue) from `_emit_compare` into `_emit_in_compare`; when
+`left_kind == VKind.STR`, convert i64 → i8* via inttoptr and use
+`dict_has_key`.
+
+### 76. Global containers invisible inside functions (fixed)
+Global dicts, sets, tuples accessed inside functions were not recognized
+by `_infer_type_tag`, `_is_dict_expr`, `_is_set_expr`, `_is_tuple_expr`
+because these only checked `self.variables` (function-scoped, starts empty)
+and not `self._global_vars`. Fix: all four functions now check
+`_global_vars` as fallback when the variable is not in `self.variables`.
+Also fixed `_is_set_expr` fallback (was completely missing).
+
+### 77. Global set/tuple variables declared as i64 (fixed)
+`valid = {"a", "b", "c"}` at module level — when referenced from a
+function, the auto-created global variable was `i64` with tag "int"
+because `global_types` had no case for `ast.Set`/`ast.SetComp`/`ast.Tuple`.
+The pointer was stored via `ptrtoint` into i64, but type info was lost.
+Fix: added set/tuple detection to `global_types` dictionary, and added
+"set"/"tuple" to the pointer-type checks in both global creation blocks.
+
+### 78. `type(x) == int` always returned False (fixed)
+`type(x) == int`, `type(x) is str`, etc. always returned `False` because
+`type()` returned a CPython type object pointer that didn't compare equal
+to the builtin type name (also a CPython object). Fix: added
+`_try_fold_type_compare` that pattern-matches `type(arg) == <builtin>`
+and folds to a compile-time constant when the argument's VKind is known.
+Supports `==`, `!=`, `is`, `is not` with all builtin types (int, float,
+str, bool, list, dict, set, tuple, bytes, complex). For FV-backed
+variables with unknown compile-time type, emits a runtime FpyValue tag
+check.
+
+### 79. `int(string_param)` returned raw pointer (fixed)
+`int(s)` where `s` is an FV-backed string parameter returned the raw
+pointer value instead of parsing the string. Root cause: the FV-backed
+`int()` path only checked for `FPY_TAG_FLOAT` (float→int conversion) and
+fell through to returning `fv_data` as-is for all other tags. For string
+values, `fv_data` is `ptrtoint(str_ptr)`, not a parseable integer.
+Fix: added 3-way runtime branch — float tag → `fptosi`, string tag →
+`str_to_int(inttoptr(data))`, else → return data directly.
+
+### 80. `float(string_param)` returned raw pointer bits (fixed)
+Same pattern as bug #79 for `float()`. FV-backed string parameters hit
+the `isinstance(val.type, ir.IntType)` path which called `sitofp`,
+interpreting the raw pointer bits as an integer and converting to float.
+Fix: added 3-way FV runtime branch — str tag → `str_to_float`, float
+tag → bitcast, else (int/bool) → `sitofp`.
 
 ## New methods (2026-04-28, method coverage expansion)
 

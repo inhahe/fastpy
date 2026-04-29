@@ -6,8 +6,8 @@ c = Counter(["a", "b", "a", "c", "b", "a"])
 keys = c.keys()
 print(len(keys))      # 3
 
-# Counter: elements
-elems = c.elements()
+# Counter: elements (returns an iterator, need list() for len)
+elems = list(c.elements())
 print(len(elems))     # 6 (a*3 + b*2 + c*1)
 
 # deque: extend and extendleft
