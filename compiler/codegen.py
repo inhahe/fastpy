@@ -4933,12 +4933,43 @@ class CodeGen:
             # when calls mix positional and keyword args:
             #   f(2.5, factor=4.0)  →  ("float", "float") not just ("float",)
             sig_arg_types = list(arg_types)
-            if node.keywords and func_name in func_asts:
+            if func_name in func_asts:
                 fn_def = func_asts[func_name]
                 fn_params = [a.arg for a in fn_def.args.args]
                 fn_params += [a.arg for a in fn_def.args.kwonlyargs]
                 while len(sig_arg_types) < len(fn_params):
                     sig_arg_types.append(None)
+                # Fill in default value types for positions not provided
+                # by this caller.  When a caller uses a default, the callee
+                # receives a value of the default's type — not "unknown".
+                n_regular = len(fn_def.args.args)
+                defaults = fn_def.args.defaults or []
+                kw_defaults = fn_def.args.kw_defaults or []
+                def _const_type(d):
+                    if isinstance(d, ast.Constant):
+                        if isinstance(d.value, bool): return "bool"
+                        if isinstance(d.value, float): return "float"
+                        if isinstance(d.value, int): return "int"
+                        if isinstance(d.value, str): return "str"
+                        if isinstance(d.value, bytes): return "bytes"
+                    return None
+                # Regular param defaults (apply to last N params)
+                off = n_regular - len(defaults)
+                for di, d in enumerate(defaults):
+                    pi = off + di
+                    if pi < len(sig_arg_types) and sig_arg_types[pi] is None:
+                        dt = _const_type(d)
+                        if dt is not None:
+                            sig_arg_types[pi] = dt
+                # Kwonly param defaults
+                for di, d in enumerate(kw_defaults):
+                    if d is None:
+                        continue  # no default for this kwonly param
+                    pi = n_regular + di
+                    if pi < len(sig_arg_types) and sig_arg_types[pi] is None:
+                        dt = _const_type(d)
+                        if dt is not None:
+                            sig_arg_types[pi] = dt
                 for kw in node.keywords:
                     if kw.arg is None or kw.arg not in fn_params:
                         continue
@@ -4974,17 +5005,17 @@ class CodeGen:
 
             for name in names_to_register:
                 if name not in self._call_site_param_types:
-                    self._call_site_param_types[name] = list(arg_types)
+                    self._call_site_param_types[name] = list(sig_arg_types)
                 else:
                     existing = self._call_site_param_types[name]
                     # Extend when a later call provides more args (e.g. first
                     # call uses defaults, second provides explicit values).
-                    for i in range(len(existing), len(arg_types)):
-                        existing.append(arg_types[i])
-                    for i in range(min(len(existing), len(arg_types))):
+                    for i in range(len(existing), len(sig_arg_types)):
+                        existing.append(sig_arg_types[i])
+                    for i in range(min(len(existing), len(sig_arg_types))):
                         if existing[i] == "mixed":
                             continue  # already mixed, can't refine further
-                        if arg_types[i] is None:
+                        if sig_arg_types[i] is None:
                             # Unknown call site + existing "float" is dangerous:
                             # the unknown caller might pass int, which would
                             # corrupt data if the function expects double params.
@@ -4994,27 +5025,27 @@ class CodeGen:
                                 existing[i] = None
                             continue  # unknown doesn't override known
                         if existing[i] is None:
-                            existing[i] = arg_types[i]  # first known type
+                            existing[i] = sig_arg_types[i]  # first known type
                             continue
-                        if arg_types[i] == existing[i]:
+                        if sig_arg_types[i] == existing[i]:
                             continue  # same type, no conflict
                         # Types conflict — check if it's a safe refinement
                         # or a genuine conflict requiring "mixed"
-                        if (arg_types[i].startswith("list:") and existing[i] == "list"):
-                            existing[i] = arg_types[i]  # refine list element type
-                        elif (existing[i].startswith("list:") and arg_types[i] == "list"):
+                        if (sig_arg_types[i].startswith("list:") and existing[i] == "list"):
+                            existing[i] = sig_arg_types[i]  # refine list element type
+                        elif (existing[i].startswith("list:") and sig_arg_types[i] == "list"):
                             pass  # keep the more specific type
-                        elif (arg_types[i] == "bool" and existing[i] == "int"):
+                        elif (sig_arg_types[i] == "bool" and existing[i] == "int"):
                             pass  # bool is a subtype of int, keep int
-                        elif (existing[i] == "bool" and arg_types[i] == "int"):
+                        elif (existing[i] == "bool" and sig_arg_types[i] == "int"):
                             existing[i] = "int"  # widen to int
-                        elif (arg_types[i] == "bigint" and existing[i] == "int"):
+                        elif (sig_arg_types[i] == "bigint" and existing[i] == "int"):
                             existing[i] = "bigint"  # widen to bigint
-                        elif (existing[i] == "bigint" and arg_types[i] == "int"):
+                        elif (existing[i] == "bigint" and sig_arg_types[i] == "int"):
                             pass  # keep bigint (int is a subset)
-                        elif (arg_types[i] == "bigint" and existing[i] == "bool"):
+                        elif (sig_arg_types[i] == "bigint" and existing[i] == "bool"):
                             existing[i] = "bigint"  # widen to bigint
-                        elif (existing[i] == "bigint" and arg_types[i] == "bool"):
+                        elif (existing[i] == "bigint" and sig_arg_types[i] == "bool"):
                             pass  # keep bigint
                         else:
                             # Genuine type conflict (e.g. int vs str)
@@ -6864,7 +6895,12 @@ class CodeGen:
         prescan_known: dict[str, str] = {}
         pre_param_names = [a.arg for a in node.args.args]
         pre_param_names += [a.arg for a in node.args.kwonlyargs]
-        pre_call_types = self._call_site_param_types.get(node.name, [])
+        # For monomorphized variants, use the sig override directly instead
+        # of the original function's (possibly mixed) call-site types.
+        if _sig_override is not None:
+            pre_call_types = list(_sig_override)
+        else:
+            pre_call_types = self._call_site_param_types.get(node.name, [])
         for i, pname in enumerate(pre_param_names):
             if i < len(pre_call_types) and pre_call_types[i] is not None:
                 prescan_known[pname] = pre_call_types[i]
@@ -7031,30 +7067,39 @@ class CodeGen:
                 elif param.name in bool_default_params:
                     tag = "bool"
                 else:
-                    # Check if this param has conflicting types across
-                    # call sites (cleared by post-merge cleanup). If so,
-                    # use "mixed" to enable runtime dispatch instead of
-                    # defaulting to "int" which would be wrong for
-                    # str/list/dict callers.
-                    _sigs = self._function_signatures.get(node.name, [])
-                    _sig_types = set()
-                    _has_unknown_caller = False
-                    for sig in _sigs:
-                        if param_idx < len(sig):
-                            if sig[param_idx] is not None:
-                                _sig_types.add(sig[param_idx])
-                            else:
-                                _has_unknown_caller = True
-                    if len(_sig_types) > 1:
-                        tag = "mixed"  # conflicting types → runtime dispatch
-                    elif _has_unknown_caller and _sig_types:
-                        # Known type + unknown caller: the unknown caller
-                        # might pass a different type.  For non-pointer
-                        # params only escalate when the known type is also
-                        # non-scalar (pointer types already get i8_ptr above).
-                        tag = "mixed"
-                    else:
+                    # For monomorphized variants, the call_types from
+                    # _sig_override already has the concrete param type.
+                    # Use it directly instead of looking up the original
+                    # function's (conflicting) signatures.
+                    _ct = (call_types[param_idx]
+                           if param_idx < len(call_types) else None)
+                    if _ct == "int":
                         tag = "int"
+                    elif _ct == "bool":
+                        tag = "bool"
+                    elif _ct is not None:
+                        tag = "int"  # default non-pointer, non-float
+                    else:
+                        # Check if this param has conflicting types across
+                        # call sites (cleared by post-merge cleanup). If so,
+                        # use "mixed" to enable runtime dispatch instead of
+                        # defaulting to "int" which would be wrong for
+                        # str/list/dict callers.
+                        _sigs = self._function_signatures.get(node.name, [])
+                        _sig_types = set()
+                        _has_unknown_caller = False
+                        for sig in _sigs:
+                            if param_idx < len(sig):
+                                if sig[param_idx] is not None:
+                                    _sig_types.add(sig[param_idx])
+                                else:
+                                    _has_unknown_caller = True
+                        if len(_sig_types) > 1:
+                            tag = "mixed"  # conflicting types → runtime dispatch
+                        elif _has_unknown_caller and _sig_types:
+                            tag = "mixed"
+                        else:
+                            tag = "int"
 
                 if self._USE_FV_LOCALS:
                     # Store FpyValue directly — _load_variable unwraps on demand
