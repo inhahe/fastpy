@@ -403,6 +403,15 @@ def _prefix_module_defs(source: str, prefix: str) -> str:
         elif isinstance(node, ast.Assign) and len(node.targets) == 1:
             if isinstance(node.targets[0], ast.Name):
                 top_names[node.targets[0].id] = f"{prefix}__{node.targets[0].id}"
+        elif isinstance(node, ast.ImportFrom):
+            # Names imported from other modules (e.g. from _struct import pack)
+            # must also be prefixed so that user code referencing them via
+            # the module's dotted access (struct.pack → struct__pack) works.
+            for alias in node.names:
+                if alias.name == "*":
+                    continue  # star imports should have been expanded already
+                local = alias.asname if alias.asname else alias.name
+                top_names[local] = f"{prefix}__{local}"
 
     if not top_names:
         return source
@@ -422,6 +431,14 @@ def _prefix_module_defs(source: str, prefix: str) -> str:
             if node.name in top_names:
                 node.name = top_names[node.name]
             self.generic_visit(node)
+            return node
+        def visit_ImportFrom(self, node):
+            # Rewrite import aliases to use prefixed names:
+            # from _foo import bar → from _foo import bar as prefix__bar
+            for alias in node.names:
+                local = alias.asname if alias.asname else alias.name
+                if local in top_names:
+                    alias.asname = top_names[local]
             return node
 
     tree = NamePrefixer().visit(tree)

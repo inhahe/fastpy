@@ -62,6 +62,72 @@ def _is_c_extension_wrapper(source_path: Path) -> bool:
     return False
 
 
+def _expand_star_imports(source: str) -> str | None:
+    """Try to expand star imports from C extension modules.
+
+    Replaces ``from _foo import *`` with ``import _foo`` plus explicit
+    attribute assignments (``name = _foo.name``) for each public name.
+
+    We use ``import _foo`` + attribute access rather than
+    ``from _foo import name1, name2, ...`` because the codegen's CPython
+    bridge handles ``import mod; mod.func()`` correctly for C-extension
+    builtins, but ``from mod import func; func()`` crashes for them.
+
+    Returns the expanded source string, or None if expansion fails
+    (e.g. the C extension can't be imported).
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return None
+
+    modified = False
+    new_body: list[ast.stmt] = []
+
+    for node in tree.body:
+        if (isinstance(node, ast.ImportFrom)
+                and node.module
+                and node.module.startswith("_")
+                and node.names
+                and any(alias.name == "*" for alias in node.names)):
+            # Try to import the C extension and enumerate names
+            try:
+                mod = __import__(node.module)
+                if hasattr(mod, "__all__"):
+                    names = list(mod.__all__)
+                else:
+                    names = [n for n in dir(mod) if not n.startswith("_")]
+                if not names:
+                    return None  # empty module — can't expand
+                # Emit: import _foo
+                import_node = ast.Import(
+                    names=[ast.alias(name=node.module)])
+                ast.copy_location(import_node, node)
+                new_body.append(import_node)
+                # Emit: name = _foo.name  (for each exported name)
+                for name in sorted(names):
+                    assign = ast.Assign(
+                        targets=[ast.Name(id=name, ctx=ast.Store())],
+                        value=ast.Attribute(
+                            value=ast.Name(id=node.module, ctx=ast.Load()),
+                            attr=name, ctx=ast.Load()),
+                        lineno=node.lineno)
+                    ast.copy_location(assign, node)
+                    new_body.append(assign)
+                modified = True
+            except (ImportError, ModuleNotFoundError):
+                return None  # can't import → can't expand
+        else:
+            new_body.append(node)
+
+    if not modified:
+        return None
+
+    new_tree = ast.Module(body=new_body, type_ignores=[])
+    ast.fix_missing_locations(new_tree)
+    return ast.unparse(new_tree)
+
+
 def _is_self_contained_package(init_path: Path) -> bool:
     """Check if a package __init__.py is self-contained (no submodule imports).
 
@@ -186,6 +252,11 @@ class StdlibResolver:
         self._hard_blocklist: set[str] = set()
         # Cache find results
         self._find_cache: dict[str, Path | None] = {}
+        # Star-import expanded sources: path → expanded source text.
+        # When a C-extension wrapper has its star imports expanded, the
+        # expanded source is stored here so test_compilability and the
+        # pipeline merger read the expanded version instead of the original.
+        self.expanded_sources: dict[str, str] = {}
 
     @property
     def stdlib_dir(self) -> Path:
@@ -227,7 +298,7 @@ class StdlibResolver:
             candidate = self._stdlib_dir / rel
             if candidate.is_file():
                 if _is_c_extension_wrapper(candidate):
-                    return None
+                    return None  # can't merge C-extension wrappers
                 return candidate
             rel = Path(*parts) / "__init__.py"
             candidate = self._stdlib_dir / rel
@@ -244,11 +315,9 @@ class StdlibResolver:
         # Look for module_name.py in stdlib
         candidate = self._stdlib_dir / (module_name + ".py")
         if candidate.is_file():
-            # Reject thin wrappers around C extensions.  Many stdlib
-            # modules (ast, collections, json, …) are Python files whose
-            # public API comes entirely from ``from _foo import *``.
-            # The merger can't prefix star-imported names, so attribute
-            # access (e.g. ``ast.Constant``) breaks after rewriting.
+            # C-extension wrappers (from _foo import *) can't be merged:
+            # codegen can't call CPython bridge functions stored in variables.
+            # These stay on the CPython bridge import path.
             if _is_c_extension_wrapper(candidate):
                 return None
             return candidate
@@ -256,9 +325,8 @@ class StdlibResolver:
         # Look for package: module_name/__init__.py
         candidate = self._stdlib_dir / module_name / "__init__.py"
         if candidate.is_file():
-            # Reject C-extension wrapper packages
             if _is_c_extension_wrapper(candidate):
-                return None
+                return None  # can't merge C-extension wrapper packages
             # Self-contained packages (no submodule imports): merge as
             # single file, treating __init__.py like a regular module.
             if _is_self_contained_package(candidate):
@@ -474,14 +542,18 @@ def _get_native_modules() -> set[str]:
         }
 
 
-def test_compilability(module_name: str, source_path: Path) -> tuple[bool, str | None, str | None]:
+def test_compilability(module_name: str, source_path: Path,
+                       expanded_source: str | None = None) -> tuple[bool, str | None, str | None]:
     """Test whether a stdlib module can be compiled by fastpy.
+
+    When *expanded_source* is provided (from star-import expansion), use
+    it instead of reading from *source_path*.
 
     Returns (compilable, prefixed_source_or_none, error_or_none).
     """
     from compiler.pipeline import _strip_main_block, _prefix_module_defs
 
-    source = source_path.read_text(encoding="utf-8")
+    source = expanded_source or source_path.read_text(encoding="utf-8")
     source = _strip_main_block(source)
     prefix = module_name.replace(".", "_")
     prefixed = _prefix_module_defs(source, prefix)

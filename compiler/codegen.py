@@ -1242,6 +1242,18 @@ class CodeGen:
         self.runtime["set_difference"] = ir.Function(self.module, ft, name="fastpy_set_difference")
         ft = ir.FunctionType(i8_ptr, [i8_ptr, i8_ptr])
         self.runtime["set_symmetric_diff"] = ir.Function(self.module, ft, name="fastpy_set_symmetric_diff")
+        ft = ir.FunctionType(i32, [i8_ptr, i8_ptr])
+        self.runtime["set_issubset"] = ir.Function(self.module, ft, name="fastpy_set_issubset")
+        self.runtime["set_issuperset"] = ir.Function(self.module, ft, name="fastpy_set_issuperset")
+        self.runtime["set_isdisjoint"] = ir.Function(self.module, ft, name="fastpy_set_isdisjoint")
+        ft = ir.FunctionType(i8_ptr, [i8_ptr])
+        self.runtime["set_copy"] = ir.Function(self.module, ft, name="fastpy_set_copy")
+        ft = ir.FunctionType(void, [i8_ptr])
+        self.runtime["set_clear"] = ir.Function(self.module, ft, name="fastpy_set_clear")
+        ft = ir.FunctionType(void, [i8_ptr, i32.as_pointer(), i64.as_pointer()])
+        self.runtime["set_pop_fv"] = ir.Function(self.module, ft, name="fastpy_set_pop_fv")
+        ft = ir.FunctionType(void, [i8_ptr, i8_ptr])
+        self.runtime["set_update"] = ir.Function(self.module, ft, name="fastpy_set_update")
         ft = ir.FunctionType(i8_ptr, [i8_ptr])  # str_split(s) -> list
         self.runtime["str_split"] = ir.Function(self.module, ft, name="fastpy_str_split")
         ft = ir.FunctionType(i64, [i8_ptr, i8_ptr])
@@ -1250,12 +1262,38 @@ class CodeGen:
         self.runtime["str_upper"] = ir.Function(self.module, ft, name="fastpy_str_upper")
         ft = ir.FunctionType(i8_ptr, [i8_ptr, i8_ptr, i8_ptr])
         self.runtime["str_replace"] = ir.Function(self.module, ft, name="fastpy_str_replace")
+        ft = ir.FunctionType(i8_ptr, [i8_ptr, i8_ptr, i8_ptr, i64])
+        self.runtime["str_replace_count"] = ir.Function(self.module, ft, name="fastpy_str_replace_count")
         ft = ir.FunctionType(i32, [i8_ptr, i8_ptr])
         self.runtime["str_startswith"] = ir.Function(self.module, ft, name="fastpy_str_startswith")
         ft = ir.FunctionType(i32, [i8_ptr, i8_ptr])
         self.runtime["str_endswith"] = ir.Function(self.module, ft, name="fastpy_str_endswith")
         ft = ir.FunctionType(i32, [i8_ptr, i8_ptr])
         self.runtime["str_contains"] = ir.Function(self.module, ft, name="fastpy_str_contains")
+        ft = ir.FunctionType(i8_ptr, [i8_ptr, i8_ptr])
+        self.runtime["str_removeprefix"] = ir.Function(self.module, ft, name="fastpy_str_removeprefix")
+        self.runtime["str_removesuffix"] = ir.Function(self.module, ft, name="fastpy_str_removesuffix")
+        ft = ir.FunctionType(i8_ptr, [i8_ptr, i64, i8_ptr])
+        self.runtime["str_center_fill"] = ir.Function(self.module, ft, name="fastpy_str_center_fill")
+        self.runtime["str_ljust_fill"] = ir.Function(self.module, ft, name="fastpy_str_ljust_fill")
+        self.runtime["str_rjust_fill"] = ir.Function(self.module, ft, name="fastpy_str_rjust_fill")
+        ft = ir.FunctionType(i32, [i8_ptr])
+        self.runtime["str_isupper"] = ir.Function(self.module, ft, name="fastpy_str_isupper")
+        self.runtime["str_islower"] = ir.Function(self.module, ft, name="fastpy_str_islower")
+        self.runtime["str_istitle"] = ir.Function(self.module, ft, name="fastpy_str_istitle")
+        self.runtime["str_isidentifier"] = ir.Function(self.module, ft, name="fastpy_str_isidentifier")
+        self.runtime["str_isprintable"] = ir.Function(self.module, ft, name="fastpy_str_isprintable")
+        self.runtime["str_isdecimal"] = ir.Function(self.module, ft, name="fastpy_str_isdecimal")
+        self.runtime["str_isnumeric"] = ir.Function(self.module, ft, name="fastpy_str_isnumeric")
+        ft = ir.FunctionType(i8_ptr, [i8_ptr])
+        self.runtime["str_casefold"] = ir.Function(self.module, ft, name="fastpy_str_casefold")
+        ft = ir.FunctionType(i8_ptr, [i8_ptr, i64])
+        self.runtime["str_expandtabs"] = ir.Function(self.module, ft, name="fastpy_str_expandtabs")
+        ft = ir.FunctionType(i8_ptr, [i8_ptr, i8_ptr])
+        self.runtime["str_partition"] = ir.Function(self.module, ft, name="fastpy_str_partition")
+        self.runtime["str_rpartition"] = ir.Function(self.module, ft, name="fastpy_str_rpartition")
+        ft = ir.FunctionType(i8_ptr, [i8_ptr, i8_ptr, i64])
+        self.runtime["str_rsplit"] = ir.Function(self.module, ft, name="fastpy_str_rsplit")
         ft = ir.FunctionType(i8_ptr, [i8_ptr])
         self.runtime["str_strip"] = ir.Function(self.module, ft, name="fastpy_str_strip")
         self.runtime["str_lstrip"] = ir.Function(self.module, ft, name="fastpy_str_lstrip")
@@ -1379,6 +1417,17 @@ class CodeGen:
         self.runtime["dict_pop"] = ir.Function(self.module, ft, name="fastpy_dict_pop")
         ft = ir.FunctionType(i64, [i8_ptr, i8_ptr])
         self.runtime["dict_pop_int"] = ir.Function(self.module, ft, name="fastpy_dict_pop_int")
+        # dict_pop_fv(dict, key, def_tag, def_data, out_tag*, out_data*)
+        ft = ir.FunctionType(void, [i8_ptr, i8_ptr, i32, i64,
+                                     ir.PointerType(i32), ir.PointerType(i64)])
+        self.runtime["dict_pop_fv"] = ir.Function(self.module, ft, name="fastpy_dict_pop_fv")
+        ft = ir.FunctionType(void,
+                             [i8_ptr,
+                              i32.as_pointer(), i64.as_pointer(),
+                              i32.as_pointer(), i64.as_pointer()])
+        self.runtime["dict_popitem"] = ir.Function(self.module, ft, name="fastpy_dict_popitem")
+        ft = ir.FunctionType(i8_ptr, [i8_ptr])
+        self.runtime["dict_copy"] = ir.Function(self.module, ft, name="fastpy_dict_copy")
         ft = ir.FunctionType(void, [i8_ptr, i8_ptr, i8_ptr])
         self.runtime["dict_setdefault_list"] = ir.Function(self.module, ft, name="fastpy_dict_setdefault_list")
         ft = ir.FunctionType(void, [i8_ptr, i8_ptr, i64])
@@ -1410,6 +1459,8 @@ class CodeGen:
         ft = ir.FunctionType(i64, [i8_ptr, i8_ptr])
         self.runtime["str_find"] = ir.Function(self.module, ft, name="fastpy_str_find")
         self.runtime["str_rfind"] = ir.Function(self.module, ft, name="fastpy_str_rfind")
+        self.runtime["str_index_sub"] = ir.Function(self.module, ft, name="fastpy_str_index_sub")
+        self.runtime["str_rindex_sub"] = ir.Function(self.module, ft, name="fastpy_str_rindex_sub")
         ft = ir.FunctionType(i64, [i8_ptr, i8_ptr])
         self.runtime["str_count"] = ir.Function(self.module, ft, name="fastpy_str_count")
         ft = ir.FunctionType(i8_ptr, [i8_ptr, i8_ptr])
@@ -12923,15 +12974,28 @@ class CodeGen:
                          and node.value.id in getattr(self, '_native_modules', set()))
                 and not self._is_path_expr(node.value)):
             return "pyobj"
-        # Method calls that return lists
+        # Method calls that return lists/dicts/sets/tuples
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
             method = node.func.attr
-            if method == "split":
+            if method in ("split", "rsplit", "splitlines", "partition",
+                           "rpartition"):
                 return "list:str"
             if method in ("keys", "values", "items"):
                 return "list:str"
-            if method == "copy" and self._is_list_expr(node.func.value):
-                return "list:int"
+            if method == "popitem" and self._is_dict_expr(node.func.value):
+                return "tuple"
+            if method == "copy":
+                if self._is_list_expr(node.func.value):
+                    return "list:int"
+                if self._is_dict_expr(node.func.value):
+                    return "dict"
+                if self._is_set_expr(node.func.value):
+                    return "set"
+            # Set methods that return sets
+            if method in ("union", "intersection", "difference",
+                           "symmetric_difference"):
+                if self._is_set_expr(node.func.value):
+                    return "set"
             # Collections module methods that return lists
             if method in ("most_common", "elements"):
                 if self._is_counter_expr(node.func.value):
@@ -20141,10 +20205,19 @@ class CodeGen:
             self.builder.call(self.runtime["cpython_print_obj"], [ptr])
             self.builder.call(self.runtime["print_newline"], [])
             return
-        # For pyobj variables, print via CPython's str() directly
+        # For pyobj variables, print via CPython's str() directly.
+        # Exception: bridge call results are stored as FpyValue structs
+        # (not raw PyObject*), so check _load_fv_raw first to route them
+        # through the FV runtime dispatch path.
         if (isinstance(node, ast.Name)
                 and node.id in self.variables
                 and self._var_kind(node.id) == VKind.PYOBJ):
+            fv = self._load_fv_raw(node.id)
+            if fv is not None:
+                # FpyValue-backed PYOBJ: use runtime dispatch
+                tag, data = self._fv_unpack(fv)
+                self.builder.call(self.runtime["fv_print"], [tag, data])
+                return
             ptr = self._load_variable(node.id, node)
             if isinstance(ptr.type, ir.IntType):
                 ptr = self.builder.inttoptr(ptr, i8_ptr)
@@ -20182,9 +20255,14 @@ class CodeGen:
         # CPython pyobj-tagged variables: convert the PyObject* to a native
         # FpyValue via the bridge. Without this, the OBJ tag + raw PyObject*
         # data would crash fv_print (expects an FpyObj*, not PyObject*).
+        # Exception: bridge call results are already stored as FpyValue structs
+        # with correct runtime tags — return them directly without re-conversion.
         if (isinstance(node, ast.Name)
                 and node.id in self.variables
                 and self._var_kind(node.id) == VKind.PYOBJ):
+            fv = self._load_fv_raw(node.id)
+            if fv is not None:
+                return fv  # already an FpyValue with correct runtime tag
             ptr = self._load_variable(node.id, node)
             if isinstance(ptr.type, ir.IntType):
                 ptr = self.builder.inttoptr(ptr, i8_ptr)
@@ -20593,6 +20671,9 @@ class CodeGen:
                 return self._fv_from_list(value)  # tuples are lists with is_tuple
             if self._is_dict_expr(node):
                 return self._fv_from_dict(value)
+            if self._is_set_expr(node):
+                return self._fv_build_from_slots(
+                    ir.Constant(i32, FPY_TAG_SET), value)
             if self._is_obj_expr(node):
                 return self._fv_from_obj(value)
             # Check function calls that return strings
@@ -20793,6 +20874,12 @@ class CodeGen:
             if isinstance(node.op, ast.Sub):
                 if self._is_set_expr(node.left):
                     return True
+        # Set methods that return sets
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr in ("union", "intersection", "difference",
+                                        "symmetric_difference", "copy")
+                and self._is_set_expr(node.func.value)):
+            return True
         return False
 
     def _is_deque_expr(self, node: ast.expr) -> bool:
@@ -21011,7 +21098,8 @@ class CodeGen:
                     return True
         # .split(), .keys(), .values(), .items(), .copy() return lists
         if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-                and node.func.attr in ("split", "keys", "values", "items", "splitlines", "copy")):
+                and node.func.attr in ("split", "rsplit", "keys", "values", "items",
+                                      "splitlines", "copy", "partition", "rpartition")):
             return True
         # User class method returning list
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
@@ -21178,6 +21266,10 @@ class CodeGen:
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
             if self._method_returns_tuple(node.func.value, node.func.attr):
                 return True
+            # Built-in: dict.popitem() returns a tuple
+            if (node.func.attr == "popitem"
+                    and self._is_dict_expr(node.func.value)):
+                return True
         return False
 
     def _is_int_keyed_dict(self, node: ast.expr) -> bool:
@@ -21254,6 +21346,10 @@ class CodeGen:
         # Method calls that return dicts
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
             if self._method_returns_dict(node.func.value, node.func.attr):
+                return True
+            # Built-in dict.copy() returns a dict
+            if (node.func.attr == "copy"
+                    and self._is_dict_expr(node.func.value)):
                 return True
         # Dict merge: dict | dict → new dict
         if (isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr)
@@ -25451,7 +25547,7 @@ class CodeGen:
             return self._rt_call("list_length", [tv.as_ptr(self.builder)])
         if kind in (VKind.DICT, VKind.SET):
             return self._rt_call("dict_length", [tv.as_ptr(self.builder)])
-        if kind == VKind.STR:
+        if kind in (VKind.STR, VKind.BYTES):
             return self._rt_call("str_len", [tv.as_ptr(self.builder)])
 
         # OBJ with __len__: native dispatch
@@ -25472,7 +25568,11 @@ class CodeGen:
 
         # Runtime dispatch for UNKNOWN/mixed types: extract tag+data
         # from FpyValue and let the C runtime choose the right len().
-        if kind == VKind.UNKNOWN:
+        # Also handle PYOBJ — bridge call results are stored as FpyValue
+        # structs with runtime tags (e.g. tag=BYTES for struct.pack result),
+        # NOT as raw PyObject* pointers.  Passing the native data to
+        # cpython_len (which expects PyObject*) would crash.
+        if kind in (VKind.UNKNOWN, VKind.PYOBJ):
             fv = None
             if isinstance(arg_node, ast.Name):
                 fv = self._load_fv_raw(arg_node.id)
@@ -26411,6 +26511,59 @@ class CodeGen:
                 self.builder.call(self.runtime["set_discard_fv"],
                                   [obj, ir.Constant(i32, tag), data])
                 return obj
+            if method == "union" and len(node.args) == 1:
+                other = self._emit_expr_value(node.args[0])
+                if isinstance(other.type, ir.IntType):
+                    other = self.builder.inttoptr(other, i8_ptr)
+                return self._rt_call("set_union", [obj, other])
+            if method == "intersection" and len(node.args) == 1:
+                other = self._emit_expr_value(node.args[0])
+                if isinstance(other.type, ir.IntType):
+                    other = self.builder.inttoptr(other, i8_ptr)
+                return self._rt_call("set_intersection", [obj, other])
+            if method == "difference" and len(node.args) == 1:
+                other = self._emit_expr_value(node.args[0])
+                if isinstance(other.type, ir.IntType):
+                    other = self.builder.inttoptr(other, i8_ptr)
+                return self._rt_call("set_difference", [obj, other])
+            if method == "symmetric_difference" and len(node.args) == 1:
+                other = self._emit_expr_value(node.args[0])
+                if isinstance(other.type, ir.IntType):
+                    other = self.builder.inttoptr(other, i8_ptr)
+                return self._rt_call("set_symmetric_diff", [obj, other])
+            if method == "issubset" and len(node.args) == 1:
+                other = self._emit_expr_value(node.args[0])
+                if isinstance(other.type, ir.IntType):
+                    other = self.builder.inttoptr(other, i8_ptr)
+                return self._rt_call("set_issubset", [obj, other])
+            if method == "issuperset" and len(node.args) == 1:
+                other = self._emit_expr_value(node.args[0])
+                if isinstance(other.type, ir.IntType):
+                    other = self.builder.inttoptr(other, i8_ptr)
+                return self._rt_call("set_issuperset", [obj, other])
+            if method == "isdisjoint" and len(node.args) == 1:
+                other = self._emit_expr_value(node.args[0])
+                if isinstance(other.type, ir.IntType):
+                    other = self.builder.inttoptr(other, i8_ptr)
+                return self._rt_call("set_isdisjoint", [obj, other])
+            if method == "copy" and len(node.args) == 0:
+                return self._rt_call("set_copy", [obj])
+            if method == "clear" and len(node.args) == 0:
+                self._rt_call("set_clear", [obj])
+                return obj
+            if method == "pop" and len(node.args) == 0:
+                tag_slot = self._create_entry_alloca(i32, "spop.tag")
+                data_slot = self._create_entry_alloca(i64, "spop.data")
+                self.builder.call(self.runtime["set_pop_fv"],
+                                  [obj, tag_slot, data_slot])
+                return self._fv_build_from_slots(
+                    self.builder.load(tag_slot), self.builder.load(data_slot))
+            if method == "update" and len(node.args) == 1:
+                other = self._emit_expr_value(node.args[0])
+                if isinstance(other.type, ir.IntType):
+                    other = self.builder.inttoptr(other, i8_ptr)
+                self._rt_call("set_update", [obj, other])
+                return obj
             # Phase 4: fall through to runtime dispatch below
 
         # Check if object is a dict
@@ -26482,6 +26635,19 @@ class CodeGen:
                     key = self._emit_expr_value(node.args[0])
                     # Heuristic: use int pop if we can't tell; returning str by default
                     return self._rt_call("dict_pop_int", [obj, key])
+                if len(node.args) == 2:
+                    key = self._emit_expr_value(node.args[0])
+                    default_val = self._emit_expr_value(node.args[1])
+                    def_tag, def_data = self._to_tag_data_ir(
+                        default_val, node.args[1])
+                    out_tag = self._create_entry_alloca(i32, "dpop.tag")
+                    out_data = self._create_entry_alloca(i64, "dpop.data")
+                    self.builder.call(self.runtime["dict_pop_fv"],
+                                      [obj, key, def_tag, def_data,
+                                       out_tag, out_data])
+                    return self._fv_build_from_slots(
+                        self.builder.load(out_tag),
+                        self.builder.load(out_data))
             if method == "setdefault":
                 if len(node.args) == 2:
                     key = self._emit_expr_value(node.args[0])
@@ -26491,6 +26657,24 @@ class CodeGen:
                     else:
                         self._rt_call("dict_setdefault_int", [obj, key, default])
                     return obj
+            if method == "popitem" and len(node.args) == 0:
+                kt = self._create_entry_alloca(i32, "pi.kt")
+                kd = self._create_entry_alloca(i64, "pi.kd")
+                vt = self._create_entry_alloca(i32, "pi.vt")
+                vd = self._create_entry_alloca(i64, "pi.vd")
+                self.builder.call(self.runtime["dict_popitem"],
+                                  [obj, kt, kd, vt, vd])
+                # Return as a 2-element tuple (key, value)
+                tup = self._rt_call("tuple_new", [])
+                self.builder.call(self.runtime["list_append_fv"],
+                                  [tup, self.builder.load(kt),
+                                   self.builder.load(kd)])
+                self.builder.call(self.runtime["list_append_fv"],
+                                  [tup, self.builder.load(vt),
+                                   self.builder.load(vd)])
+                return tup
+            if method == "copy" and len(node.args) == 0:
+                return self._rt_call("dict_copy", [obj])
             # Phase 4: fall through to runtime dispatch below
 
         # Check if object is a known user-class instance
@@ -26741,14 +26925,65 @@ class CodeGen:
                 if len(node.args) == 1:
                     w = self._emit_expr_value(node.args[0])
                     return self._rt_call("str_center", [obj, w])
+                if len(node.args) == 2:
+                    w = self._emit_expr_value(node.args[0])
+                    fill = self._emit_expr_value(node.args[1])
+                    return self._rt_call("str_center_fill", [obj, w, fill])
             if method == "ljust":
                 if len(node.args) == 1:
                     w = self._emit_expr_value(node.args[0])
                     return self._rt_call("str_ljust", [obj, w])
+                if len(node.args) == 2:
+                    w = self._emit_expr_value(node.args[0])
+                    fill = self._emit_expr_value(node.args[1])
+                    return self._rt_call("str_ljust_fill", [obj, w, fill])
             if method == "rjust":
                 if len(node.args) == 1:
                     w = self._emit_expr_value(node.args[0])
                     return self._rt_call("str_rjust", [obj, w])
+                if len(node.args) == 2:
+                    w = self._emit_expr_value(node.args[0])
+                    fill = self._emit_expr_value(node.args[1])
+                    return self._rt_call("str_rjust_fill", [obj, w, fill])
+            if method == "isupper":
+                if len(node.args) == 0:
+                    return self._rt_call("str_isupper", [obj])
+            if method == "islower":
+                if len(node.args) == 0:
+                    return self._rt_call("str_islower", [obj])
+            if method == "istitle":
+                if len(node.args) == 0:
+                    return self._rt_call("str_istitle", [obj])
+            if method == "isidentifier":
+                if len(node.args) == 0:
+                    return self._rt_call("str_isidentifier", [obj])
+            if method == "isprintable":
+                if len(node.args) == 0:
+                    return self._rt_call("str_isprintable", [obj])
+            if method == "isdecimal":
+                if len(node.args) == 0:
+                    return self._rt_call("str_isdecimal", [obj])
+            if method == "isnumeric":
+                if len(node.args) == 0:
+                    return self._rt_call("str_isnumeric", [obj])
+            if method == "casefold":
+                if len(node.args) == 0:
+                    return self._rt_call("str_casefold", [obj])
+            if method == "expandtabs":
+                if len(node.args) == 0:
+                    return self._rt_call("str_expandtabs",
+                                          [obj, ir.Constant(i64, 8)])
+                if len(node.args) == 1:
+                    ts = self._emit_expr_value(node.args[0])
+                    return self._rt_call("str_expandtabs", [obj, ts])
+            if method == "partition":
+                if len(node.args) == 1:
+                    sep = self._emit_expr_value(node.args[0])
+                    return self._rt_call("str_partition", [obj, sep])
+            if method == "rpartition":
+                if len(node.args) == 1:
+                    sep = self._emit_expr_value(node.args[0])
+                    return self._rt_call("str_rpartition", [obj, sep])
             if method == "zfill":
                 if len(node.args) == 1:
                     w = self._emit_expr_value(node.args[0])
@@ -26764,11 +26999,26 @@ class CodeGen:
                     sep = self._emit_expr_value(node.args[0])
                     return self._rt_call("str_split_max", [obj, sep, ir.Constant(i64, -1)])
                 return self._rt_call("str_split", [obj])
+            if method == "rsplit":
+                if len(node.args) == 2:
+                    sep = self._emit_expr_value(node.args[0])
+                    maxsplit = self._emit_expr_value(node.args[1])
+                    return self._rt_call("str_rsplit", [obj, sep, maxsplit])
+                if len(node.args) == 1:
+                    sep = self._emit_expr_value(node.args[0])
+                    return self._rt_call("str_rsplit",
+                                          [obj, sep, ir.Constant(i64, -1)])
             if method == "join":
                 if len(node.args) == 1:
                     lst = self._emit_expr_value(node.args[0])
                     return self._rt_call("str_join", [obj, lst])
             if method == "replace":
+                if len(node.args) == 3:
+                    old = self._emit_expr_value(node.args[0])
+                    new = self._emit_expr_value(node.args[1])
+                    count = self._emit_expr_value(node.args[2])
+                    return self._rt_call("str_replace_count",
+                                          [obj, old, new, count])
                 if len(node.args) == 2:
                     old = self._emit_expr_value(node.args[0])
                     new = self._emit_expr_value(node.args[1])
@@ -26781,6 +27031,14 @@ class CodeGen:
                 if len(node.args) == 1:
                     suffix = self._emit_expr_value(node.args[0])
                     return self._rt_call("str_endswith", [obj, suffix])
+            if method == "removeprefix":
+                if len(node.args) == 1:
+                    prefix = self._emit_expr_value(node.args[0])
+                    return self._rt_call("str_removeprefix", [obj, prefix])
+            if method == "removesuffix":
+                if len(node.args) == 1:
+                    suffix = self._emit_expr_value(node.args[0])
+                    return self._rt_call("str_removesuffix", [obj, suffix])
             if method == "find":
                 if len(node.args) == 1:
                     sub = self._emit_expr_value(node.args[0])
@@ -26789,6 +27047,14 @@ class CodeGen:
                 if len(node.args) == 1:
                     sub = self._emit_expr_value(node.args[0])
                     return self._rt_call("str_rfind", [obj, sub])
+            if method == "index":
+                if len(node.args) == 1:
+                    sub = self._emit_expr_value(node.args[0])
+                    return self._rt_call("str_index_sub", [obj, sub])
+            if method == "rindex":
+                if len(node.args) == 1:
+                    sub = self._emit_expr_value(node.args[0])
+                    return self._rt_call("str_rindex_sub", [obj, sub])
             if method == "count":
                 if len(node.args) == 1:
                     sub = self._emit_expr_value(node.args[0])
@@ -26798,6 +27064,58 @@ class CodeGen:
             if method == "encode":
                 # str.encode() → bytes (same UTF-8 content, tagged as BYTES)
                 return self._rt_call("str_encode", [obj])
+        # int methods: bit_length, bit_count, to_bytes, etc.
+        if obj_kind == VKind.INT:
+            if method == "bit_length" and len(node.args) == 0:
+                # int.bit_length() — count significant bits
+                # Equivalent to (x.bit_length()) in Python
+                val = obj if isinstance(obj.type, ir.IntType) else \
+                    self.builder.ptrtoint(obj, i64)
+                # abs(val) for negative numbers
+                is_neg = self.builder.icmp_signed("<", val, ir.Constant(i64, 0))
+                abs_val = self.builder.sub(ir.Constant(i64, 0), val)
+                val = self.builder.select(is_neg, abs_val, val)
+                # Count bits: 64 - ctlz(val)
+                # llvm.ctlz.i64 takes (i64, i1) — must pass explicit fnty
+                ctlz_fnty = ir.FunctionType(i64, [i64, ir.IntType(1)])
+                ctlz = self.module.declare_intrinsic(
+                    "llvm.ctlz", [i64], ctlz_fnty)
+                leading_zeros = self.builder.call(
+                    ctlz, [val, ir.Constant(ir.IntType(1), 1)])
+                result = self.builder.sub(ir.Constant(i64, 64), leading_zeros)
+                # Special case: bit_length(0) == 0
+                is_zero = self.builder.icmp_signed(
+                    "==", obj if isinstance(obj.type, ir.IntType) else
+                    self.builder.ptrtoint(obj, i64), ir.Constant(i64, 0))
+                return self.builder.select(is_zero, ir.Constant(i64, 0), result)
+            if method == "bit_count" and len(node.args) == 0:
+                # int.bit_count() — count number of set bits (popcount)
+                val = obj if isinstance(obj.type, ir.IntType) else \
+                    self.builder.ptrtoint(obj, i64)
+                # abs(val) — bit_count(-5) == bit_count(5) in Python
+                # (two's complement bit count differs, but Python counts
+                #  the bits of the absolute value)
+                is_neg = self.builder.icmp_signed("<", val, ir.Constant(i64, 0))
+                abs_val = self.builder.sub(ir.Constant(i64, 0), val)
+                val = self.builder.select(is_neg, abs_val, val)
+                ctpop_fnty = ir.FunctionType(i64, [i64])
+                ctpop = self.module.declare_intrinsic(
+                    "llvm.ctpop", [i64], ctpop_fnty)
+                return self.builder.call(ctpop, [val])
+
+        # float methods: is_integer, conjugate, etc.
+        if obj_kind == VKind.FLOAT:
+            if method == "is_integer" and len(node.args) == 0:
+                # float.is_integer() — True if the float has no fractional part
+                fval = obj if isinstance(obj.type, ir.DoubleType) else \
+                    self.builder.bitcast(obj, double)
+                # floor(x) == x
+                floor_fn = self.module.declare_intrinsic(
+                    "llvm.floor", [double])
+                floored = self.builder.call(floor_fn, [fval])
+                is_int = self.builder.fcmp_ordered("==", fval, floored)
+                return self.builder.zext(is_int, i32)
+
         # Fallback: method dispatch for unknown objects.
         # Two paths:
         # (a) Path/pyobj-tagged variables: use fpy_fv_call_method which

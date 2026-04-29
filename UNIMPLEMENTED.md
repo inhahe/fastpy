@@ -20,13 +20,26 @@ __iter__/__next__, __call__, __hash__.
 
 ### Containers
 list (literals, comprehensions, all methods), dict (literals, comprehensions,
-get, pop, setdefault, keys, values, items, update, | merge, {**a, **b}),
+get, pop, pop with default, popitem, setdefault, keys, values, items, update,
+copy, clear, | merge, {**a, **b}),
 tuple (literals, unpacking, *mid unpack, swap), set (literals, comprehensions,
-add, discard, remove, |, &, -, ^, in — O(1) hash table), frozenset.
+add, discard, remove, union, intersection, difference, symmetric_difference,
+issubset, issuperset, isdisjoint, copy, clear, pop, update,
+|, &, -, ^, in — O(1) hash table), frozenset.
 
 ### Strings
 f-strings (with =, !r, format specs), all common methods, % formatting,
 .format(), raw strings, string multiplication, slicing, `in` operator.
+Methods: lower, upper, strip/lstrip/rstrip, replace, split, rsplit, join,
+find, rfind, count, startswith, endswith, removeprefix, removesuffix, center,
+ljust, rjust (with optional fill char), zfill, title, capitalize, swapcase,
+isdigit, isalpha, isalnum, isspace, isupper, islower, istitle, isidentifier,
+isprintable, isdecimal, isnumeric, casefold, encode, expandtabs, partition,
+rpartition, splitlines.
+
+### Number methods
+int: bit_length, bit_count (LLVM inline — ctlz/ctpop intrinsics).
+float: is_integer (LLVM inline — floor comparison).
 
 ### Exceptions
 try/except/finally/else, raise, bare raise, raise from, multiple except
@@ -115,6 +128,92 @@ These features work correctly but use the embedded CPython interpreter:
 - **Dynamic eval()/exec()** with non-literal string arguments
 - **Other stdlib modules** not implemented natively (e.g., collections,
   itertools, functools — except singledispatch which is native)
+
+## New methods (2026-04-28, method coverage expansion)
+
+### 43. `int.bit_length()` and `int.bit_count()` (new)
+Compiled inline using LLVM intrinsics `llvm.ctlz` (count leading zeros)
+and `llvm.ctpop` (population count). Both handle negative values via
+`abs()` before counting. Zero special-cased for `bit_length`.
+Note: `llvm.ctlz` requires explicit `fnty` parameter with 2-arg signature
+`(i64, i1)` — `declare_intrinsic` alone generates a 1-arg function.
+
+### 44. `float.is_integer()` (new)
+Compiled inline using `llvm.floor` intrinsic: `floor(x) == x`. Returns
+`i32` (not `i64`) so `_fv_wrap` correctly tags the result as BOOL
+(prints `True`/`False` not `1`/`0`).
+
+### 45. Seven new string methods (new)
+`str.rsplit(sep, maxsplit)`, `str.casefold()`, `str.istitle()`,
+`str.isidentifier()`, `str.isprintable()`, `str.isdecimal()`,
+`str.isnumeric()`. All with C runtime implementations and codegen dispatch.
+
+### 46. Full set method dispatch (new)
+`set.union()`, `set.intersection()`, `set.difference()`,
+`set.symmetric_difference()`, `set.issubset()`, `set.issuperset()`,
+`set.isdisjoint()`, `set.copy()`, `set.clear()`, `set.pop()`,
+`set.update()`. Runtime functions for issubset/issuperset/isdisjoint/
+copy/clear/pop/update are new. Union/intersection/difference/symmetric_diff
+existed in runtime but had no codegen dispatch.
+
+### 47. `dict.popitem()`, `dict.copy()` (new)
+`dict.popitem()` removes and returns the last (key, value) pair as a
+tuple. `dict.copy()` returns a shallow copy with correct "dict" type tag.
+Also fixed: `_infer_type_tag` and `_is_dict_expr` now recognize
+`dict.copy()` return type, and `_is_set_expr` recognizes set method
+return types.
+
+### 48. `dict.pop(key, default)` two-argument form (new)
+`d.pop("key", fallback)` returns the value if found, or the default.
+Uses `dict_pop_fv` with FpyValue-based default via out parameters.
+
+### 49. `str.index()`, `str.rindex()` (new)
+Like `str.find()`/`str.rfind()` but raise `ValueError` when substring
+is not found. Uses `fastpy_str_index_sub`/`fastpy_str_rindex_sub`
+C runtime functions (different names from `str_index` which is used
+for subscript indexing `s[i]`).
+
+### 50. `str.replace(old, new, count)` three-argument form (new)
+`s.replace("a", "x", 2)` replaces at most `count` occurrences.
+Uses `fastpy_str_replace_count` C runtime function.
+
+## Bugs fixed (2026-04-28, bridge dispatch & string methods)
+
+### 39. `len()` on bytes literals crashed (fixed)
+`len(b"hello")` caused an access violation. `_emit_builtin_len` had no
+handler for `VKind.BYTES` — it fell through to `cpython_len` which
+expects a PyObject*, but bytes are stored as native `char*` pointers.
+Fix: Added `VKind.BYTES` alongside `VKind.STR` in the `str_len` fast path.
+
+### 40. Bridge call results crashed on `len()`, `print()`, and other builtins (fixed)
+`from _struct import pack; data = pack('i', 42); len(data)` crashed.
+Bridge calls return FpyValue structs (tag+data) stored in `{i32, i64}`
+allocas, but PYOBJ-tagged variables were treated as raw PyObject*
+pointers. `len()` passed the FpyValue data field (a native bytes
+pointer) to `cpython_len` (expects PyObject*). Same crash with `print()`.
+Fix: Extended `_emit_builtin_len`, `_emit_print_single`, and
+`_load_or_wrap_fv` to check `_load_fv_raw` before assuming a raw pointer.
+FpyValue-backed PYOBJ variables now route through `fv_len`/`fv_print`
+runtime dispatch, which correctly handles all native types.
+
+### 41. Missing string methods: removeprefix, removesuffix, and 8 others (fixed)
+`str.removeprefix()` and `str.removesuffix()` (Python 3.9+) crashed
+because no codegen handler existed. Also missing: `center`/`ljust`/
+`rjust` with fill character, `isupper`, `islower`, `expandtabs`,
+`partition`, `rpartition`.
+Fix: Added C runtime implementations for all 10 methods and codegen
+dispatch. Fill-character versions use separate `_fill` variants.
+`partition`/`rpartition` return 3-element tuples (FpyList with
+`is_tuple=1`).
+
+### 42. Source merger didn't prefix from-import names (fixed)
+`_prefix_module_defs` only prefixed FunctionDef, ClassDef, and Assign.
+Names introduced by `from X import Y` were not prefixed, so dotted
+access after merging (`module.func` → `module__func`) couldn't find
+the imported names.
+Fix: Added ImportFrom handling to `_prefix_module_defs` — each imported
+name is added to `top_names`, and the import statement is rewritten
+with `as` aliases (e.g. `from _foo import bar as prefix__bar`).
 
 ## Bugs fixed (2026-04-28, type dispatch & merger)
 
@@ -610,10 +709,16 @@ Systematic comparison against the Python 3.14 PEG grammar (`Grammar/python.gram`
 
 - **C-extension wrapper modules rejected** — Stdlib modules whose public
   API comes from `from _foo import *` (e.g. `ast`, `collections`, `json`,
-  `operator`, `functools`) cannot be source-merged. The merger's name
-  prefixing (`ast__Constant`) fails because star-imported names are not
-  enumerable at compile time. Detected by `_is_c_extension_wrapper()` in
-  `stdlib_cache.py`.
+  `operator`, `functools`) cannot be source-merged. Star-imported names
+  ARE enumerable at compile time (via `__import__` + `__all__`/`dir()`),
+  and `_expand_star_imports()` in `stdlib_cache.py` can expand them to
+  explicit imports. However, the codegen can't call CPython bridge
+  functions stored in variables — `pack = _struct.pack; pack('i', 42)`
+  crashes because the codegen treats the variable as a native function
+  reference, not a PyObject* callable. Until `from X import Y` for C
+  extension builtins (or calling PyObject* through variables) is fixed
+  in codegen, these modules stay on the CPython bridge import path.
+  Detected by `_is_c_extension_wrapper()` in `stdlib_cache.py`.
 
 ### Self-hosting status (2026-04-28)
 
