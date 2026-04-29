@@ -147,7 +147,18 @@ These features work correctly but use the embedded CPython interpreter:
 - **Other stdlib modules** not implemented natively (e.g., collections,
   itertools, functools — except singledispatch which is native)
 
-## Bugs fixed (2026-04-28, tuple repr, bytes length, dict comp filter, deque, struct, callable)
+## Bugs fixed (2026-04-28, nested closures, tuple repr, bytes, dict comp, deque, struct)
+
+### 95. Decorator-with-arguments failed: triple-nested closure name lookup (fixed)
+`@repeat(3) def f(x)` — decorator factories that return a decorator that
+returns a wrapper (three levels of nesting) failed with "NameError: name
+'wrapper' is not defined". The inner `wrapper` function was compiled but
+couldn't be found when `decorator`'s body tried to create its closure.
+Root cause: `_emit_closure_body` didn't set `_current_func_name`, so when
+`decorator`'s body compiled `def wrapper(x)`, `_emit_nested_funcdef` looked
+for `repeat.wrapper` instead of `repeat.decorator.wrapper`.
+Fix: Save/restore `_current_func_name` in `_emit_closure_body`, deriving
+the full name from the LLVM function name.
 
 ### 94. Dict comprehension with tuple-unpacking target ignored if-clause filter (fixed)
 `{k: v for k, v in d.items() if v > 2}` included ALL items instead of only
