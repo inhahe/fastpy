@@ -146,6 +146,64 @@ These features work correctly but use the embedded CPython interpreter:
 - **Other stdlib modules** not implemented natively (e.g., collections,
   itertools, functools — except singledispatch which is native)
 
+## Bugs fixed (2026-04-28, method returns, comprehensions & type inference)
+
+### 68. Property/method truediv return type (fixed)
+`return self._c * 9 / 5 + 32` in a property getter or method returned
+`212` (int) instead of `212.0` (float). Root cause: method return type
+analysis defaulted to `i64` and had no check for `ast.Div` (Python's `/`
+always returns float). The `double` result was silently truncated to `i64`
+via `fptosi` in `_emit_return`. Fix: added `ast.Div` detection in the
+return-expression `ast.walk` scan — any expression containing truediv
+now sets `ret_type = double`.
+
+### 69. Dict comprehension with non-range iterators (fixed)
+`{w: len(w) for w in words}` crashed when `words` was a list variable
+(not `range()`). Dict comprehensions only supported `range()` iterators,
+falling back to CPython bridge for everything else. Fix: added native
+list/tuple/set/dict/string iteration path in `_emit_dict_comprehension`.
+Properly tracks element types (string keys from string lists, dict key
+iteration yields strings). Supports filter conditions.
+
+### 70. Nested dict subscript access crashed (fixed)
+`config["database"]["host"]` crashed when `config` was a mixed-type dict
+literal (`{"database": {...}, "debug": True}`). Root cause: chained
+subscript `config["database"]["host"]` — `_is_dict_expr` didn't check
+per-key types from `_dict_var_key_types`, so the intermediate subscript
+wasn't recognized as a dict. Fix: (a) added per-key type lookup to
+`_is_dict_expr` for subscripts on dicts with per-key type info;
+(b) extended `_infer_constant_value_type` to recognize dict/list/tuple/set
+literals and user class constructors, so mixed-type dict per-key maps
+include container values.
+
+### 71. Keyword-only args after `*args` (fixed)
+`def f(*args, sep=", "):` — keyword-only parameters after `*args` were
+not included in the function signature, causing missing arguments at call
+sites. Fix: comprehensive update across declaration (both vararg-only and
+mixed-vararg paths), body (FV local storage with correct type inference),
+and call-site emission (keyword matching with default fallback). The
+`FuncInfo` dataclass gained `n_kwonly` to track kwonly parameter count.
+
+### 72. Mixed vararg positional param type inference (fixed)
+`def show(msg, *args):` where `msg` was a string — positional params in
+mixed-vararg functions defaulted to `i64` even when call-site analysis
+returned "str". Fix: added full type checking for positional params in
+the mixed-vararg declaration path (str/list/dict/obj → i8_ptr).
+
+### 73. Nested tuple unpacking (fixed)
+`(a, b), c = (1, 2), 3` and similar nested tuple targets crashed or
+silently failed. Fix: added recursive `_emit_tuple_unpack` calls for
+`ast.Tuple`/`ast.List` targets in both the direct-tuple and list-unpack
+paths. Supports arbitrary nesting depth.
+
+### 74. `super().__init__()` type propagation (fixed)
+`super().__init__("circle")` in a child class constructor — the parent's
+`name` parameter was typed as "int" because the heuristic child→parent
+propagation (`Circle(5)` → `Shape(5)`) ran first and wasn't overridden.
+Fix: added explicit super() call scanning that propagates argument types
+to parent class/method, with unconditional override (super() args are
+more accurate than the heuristic propagation).
+
 ## New methods (2026-04-28, method coverage expansion)
 
 ### 43. `int.bit_length()` and `int.bit_count()` (new)

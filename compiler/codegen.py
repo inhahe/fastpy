@@ -378,6 +378,9 @@ class FuncInfo:
     # return) instead of FpyValue wrappers.  Enables LLVM to constant-fold,
     # inline, and apply SROA to tight loops and simple arithmetic functions.
     uses_bare_abi: bool = False
+    # Number of keyword-only params (after *args) — used by _emit_user_call
+    # to correctly partition args vs kwonly when calling vararg functions.
+    n_kwonly: int = 0
 
 
 @dataclass
@@ -1073,6 +1076,11 @@ class CodeGen:
 
         # Variables assigned Ellipsis literal (...) — tracked for print dispatch
         self._ellipsis_vars: set[str] = set()
+
+        # Exception variables from `except FooError as e:` — maps variable
+        # name → exception class name so type(e).__name__ returns the correct
+        # exception class (not "str", which is what the message string is).
+        self._exc_vars: dict[str, str] = {}
 
         # Annotated variable names whose annotations are contradicted by
         # assignments in the same scope.  Pre-scanned before codegen so the
@@ -5307,6 +5315,58 @@ class CodeGen:
                                     # handled by monomorphization pass).
                                     existing[i] = "mixed"
 
+        # Propagate super().__init__() arg types to parent class __init__.
+        # Without this, `class Circle(Shape): super().__init__("circle")`
+        # doesn't record "str" for Shape.__init__'s `name` parameter.
+        # For __init__, use the parent class name as the key (not
+        # "Parent.__init__"), because the method body looks up
+        # _call_site_param_types[class_name] for constructor types.
+        # For other methods, use "Parent.method" as the key.
+        for cls_name, cls_node in self._csa_class_asts.items():
+            parent = class_parents.get(cls_name)
+            if parent is None:
+                continue
+            for item in cls_node.body:
+                if not isinstance(item, ast.FunctionDef):
+                    continue
+                for n in ast.walk(item):
+                    if not isinstance(n, ast.Call):
+                        continue
+                    # Match super().__method(args...)
+                    if not (isinstance(n.func, ast.Attribute)
+                            and isinstance(n.func.value, ast.Call)
+                            and isinstance(n.func.value.func, ast.Name)
+                            and n.func.value.func.id == "super"):
+                        continue
+                    method_name = n.func.attr
+                    # Infer argument types (excluding self)
+                    arg_types: list[str | None] = []
+                    for arg in n.args:
+                        arg_types.append(
+                            self._infer_call_arg_type(arg))
+                    if not any(t is not None for t in arg_types):
+                        continue
+                    # For __init__, register under parent class name
+                    # (constructor call convention). For other methods,
+                    # register under "Parent.method".
+                    if method_name == "__init__":
+                        parent_key = parent
+                    else:
+                        parent_key = f"{parent}.{method_name}"
+                    existing = self._call_site_param_types.setdefault(
+                        parent_key, [])
+                    for i, t in enumerate(arg_types):
+                        if t is None:
+                            continue
+                        while len(existing) <= i:
+                            existing.append(None)
+                        # Override: super().__init__() arg types are more
+                        # accurate than the heuristic parent propagation
+                        # from child constructor calls (which assumes
+                        # child args == parent args, wrong when the child
+                        # passes different values to super().__init__).
+                        existing[i] = t
+
         # Register __setitem__ call-site types from `obj[key] = val` patterns.
         # This lets the method body know the param types (str key, int val, etc.)
         for node in ast.walk(tree):
@@ -5816,6 +5876,25 @@ class CodeGen:
         if has_vararg and not node.args.args:
             param_names = [node.args.vararg.arg]
             param_types = [i8_ptr]
+            # Add keyword-only params after *args (e.g. def f(*args, sep=", "):)
+            if node.args.kwonlyargs:
+                _str_heuristic = self._detect_string_params(node)
+                for ki, kw_arg in enumerate(node.args.kwonlyargs):
+                    param_names.append(kw_arg.arg)
+                    kwd = (node.args.kw_defaults[ki]
+                           if ki < len(node.args.kw_defaults) else None)
+                    if kw_arg.arg in _str_heuristic:
+                        param_types.append(i8_ptr)
+                    elif (kwd is not None and isinstance(kwd, ast.Constant)
+                          and isinstance(kwd.value, str)):
+                        param_types.append(i8_ptr)
+                    elif (kwd is not None and isinstance(kwd, ast.Constant)
+                          and isinstance(kwd.value, float)):
+                        param_types.append(double)
+                    elif (kwd is not None and isinstance(kwd, (ast.List, ast.Dict))):
+                        param_types.append(i8_ptr)
+                    else:
+                        param_types.append(i64)
             # Check if function returns the *args parameter itself
             for n in ast.walk(node):
                 if isinstance(n, ast.Return) and isinstance(n.value, ast.Name):
@@ -5828,14 +5907,67 @@ class CodeGen:
             param_names.append(node.args.vararg.arg)
             # Type analysis for positional params
             call_types = self._call_site_param_types.get(node.name, [])
+            _str_heuristic_mixed = self._detect_string_params(node)
             param_types = []
             for i, _pn in enumerate(node.args.args):
                 ct = call_types[i] if i < len(call_types) else None
-                if ct == "float":
-                    param_types.append(double)
+                if ct is not None:
+                    if (ct in ("str", "list", "dict", "obj", "bigint",
+                               "complex", "decimal", "set", "bytes",
+                               "path", "pyobj", "closure", "tuple",
+                               "mixed")
+                            or ct.startswith("list:")
+                            or ct.startswith("dict:")):
+                        param_types.append(i8_ptr)
+                    elif ct == "float":
+                        param_types.append(double)
+                    else:
+                        param_types.append(i64)
+                elif _pn.arg in _str_heuristic_mixed:
+                    param_types.append(i8_ptr)
                 else:
                     param_types.append(i64)
             param_types.append(i8_ptr)  # *rest is a list pointer
+            # Add keyword-only params after *rest
+            if node.args.kwonlyargs:
+                _str_heuristic = self._detect_string_params(node)
+                for ki, kw_arg in enumerate(node.args.kwonlyargs):
+                    param_names.append(kw_arg.arg)
+                    # call_types index for kwonly: positional count + ki
+                    # (call_types skips vararg in its positional indexing)
+                    ct_idx = len(node.args.args) + ki
+                    ct = call_types[ct_idx] if ct_idx < len(call_types) else None
+                    if ct is not None:
+                        if (ct in ("str", "list", "dict", "obj", "bigint",
+                                   "complex", "decimal", "set", "bytes",
+                                   "path", "pyobj", "closure", "tuple",
+                                   "mixed")
+                                or ct.startswith("list:")
+                                or ct.startswith("dict:")):
+                            param_types.append(i8_ptr)
+                        elif ct == "float":
+                            param_types.append(double)
+                        else:
+                            param_types.append(i64)
+                    elif kw_arg.arg in _str_heuristic:
+                        param_types.append(i8_ptr)
+                    else:
+                        kwd = (node.args.kw_defaults[ki]
+                               if ki < len(node.args.kw_defaults)
+                               else None)
+                        if (kwd is not None
+                                and isinstance(kwd, ast.Constant)
+                                and isinstance(kwd.value, str)):
+                            param_types.append(i8_ptr)
+                        elif (kwd is not None
+                                and isinstance(kwd, ast.Constant)
+                                and isinstance(kwd.value, float)):
+                            param_types.append(double)
+                        elif (kwd is not None
+                                and isinstance(kwd, (ast.List, ast.Dict))):
+                            param_types.append(i8_ptr)
+                        else:
+                            param_types.append(i64)
         elif has_kwarg and not node.args.args:
             param_names = [node.args.kwarg.arg]
             param_types = [i8_ptr]
@@ -6722,6 +6854,7 @@ class CodeGen:
             uses_fv_abi=uses_fv,
             may_return_none=_may_return_none,
             uses_bare_abi=uses_bare,
+            n_kwonly=len(node.args.kwonlyargs),
         )
         # Track the function's AST so callers can inspect what it returns
         # (used to propagate dict-value-type flags to assignment targets).
@@ -7140,8 +7273,37 @@ class CodeGen:
             # Old ABI path (vararg/kwarg only)
             alloca = self.builder.alloca(param.type, name=param.name)
             self.builder.store(param, alloca)
+            # Determine the kwonly param names so we can tag them correctly
+            # instead of defaulting to "list:int" for all pointer params.
+            _kwonly_names = {a.arg for a in node.args.kwonlyargs}
+            _vararg_name = (node.args.vararg.arg
+                            if node.args.vararg else None)
             if isinstance(param.type, ir.PointerType):
-                if has_vararg and not has_kwarg:
+                if param.name in _kwonly_names:
+                    # Keyword-only param: infer from kw_defaults
+                    _kw_idx = [a.arg for a in node.args.kwonlyargs].index(
+                        param.name)
+                    _kwd = (node.args.kw_defaults[_kw_idx]
+                            if _kw_idx < len(node.args.kw_defaults)
+                            else None)
+                    if (_kwd is not None and isinstance(_kwd, ast.Constant)
+                            and isinstance(_kwd.value, str)):
+                        tag = "str"
+                    elif (_kwd is not None
+                          and isinstance(_kwd, (ast.List, ast.ListComp))):
+                        tag = "list:int"
+                    elif (_kwd is not None
+                          and isinstance(_kwd, (ast.Dict, ast.DictComp))):
+                        tag = "dict"
+                    elif param.name in string_params:
+                        tag = "str"
+                    else:
+                        tag = "str"  # default pointer kwonly → str
+                elif param.name == _vararg_name:
+                    tag = "list:int"  # *args is always a list
+                elif has_kwarg and not has_vararg:
+                    tag = "dict"
+                elif has_vararg and not has_kwarg:
                     tag = "list:int"
                 elif has_kwarg:
                     tag = "dict"
@@ -9084,15 +9246,29 @@ class CodeGen:
         # class body — the last definition wins.  Build a map of method_name →
         # last body index so we skip earlier (shadowed) definitions and avoid
         # generating duplicate LLVM functions.
+        # Exception: @x.setter and @x.deleter are NOT redefinitions of the
+        # @property getter — they coexist as separate functions (getter stays
+        # as "x", setter becomes "x__set").  Skip them in the dedup map.
         _last_method_idx: dict[str, int] = {}
         for _mi, _mitem in enumerate(node.body):
             if isinstance(_mitem, ast.FunctionDef):
-                _last_method_idx[_mitem.name] = _mi
+                _is_prop_accessor = any(
+                    isinstance(d, ast.Attribute)
+                    and d.attr in ("setter", "deleter")
+                    for d in _mitem.decorator_list)
+                if not _is_prop_accessor:
+                    _last_method_idx[_mitem.name] = _mi
 
         for _item_idx, item in enumerate(node.body):
             if isinstance(item, ast.FunctionDef):
-                # Skip shadowed duplicate — only compile the last definition
-                if _last_method_idx.get(item.name, _item_idx) != _item_idx:
+                # Skip shadowed duplicate — only compile the last definition.
+                # @x.setter / @x.deleter methods are NOT shadowing the getter
+                # even though they share the same AST name — skip the dedup check.
+                _is_accessor = any(
+                    isinstance(d, ast.Attribute) and d.attr in ("setter", "deleter")
+                    for d in item.decorator_list)
+                if (not _is_accessor
+                        and _last_method_idx.get(item.name, _item_idx) != _item_idx):
                     continue
                 dec_names = [d.id for d in item.decorator_list if isinstance(d, ast.Name)]
                 method_name = item.name
@@ -9432,6 +9608,10 @@ class CodeGen:
                                             ret_type = inner_ret
                                             break
                             for sub in ast.walk(n.value):
+                                # Python's / (truediv) always returns float
+                                if isinstance(sub, ast.Div):
+                                    ret_type = double
+                                    break
                                 if isinstance(sub, ast.Constant) and isinstance(sub.value, float):
                                     ret_type = double
                                     break
@@ -10098,15 +10278,24 @@ class CodeGen:
         self._per_class_string_attrs[effective_name] = set(self._class_string_attrs)
         self._per_class_bool_attrs[effective_name] = set(self._class_bool_attrs)
 
-        # Deduplicate: only emit the last definition of each method name
+        # Deduplicate: only emit the last definition of each method name.
+        # @x.setter / @x.deleter are NOT redefinitions of the getter.
         _last_emit_idx: dict[str, int] = {}
         for _ei, _eitem in enumerate(node.body):
             if isinstance(_eitem, ast.FunctionDef):
-                _last_emit_idx[_eitem.name] = _ei
+                _is_accessor = any(
+                    isinstance(d, ast.Attribute) and d.attr in ("setter", "deleter")
+                    for d in _eitem.decorator_list)
+                if not _is_accessor:
+                    _last_emit_idx[_eitem.name] = _ei
 
         for _ei2, item in enumerate(node.body):
             if isinstance(item, ast.FunctionDef):
-                if _last_emit_idx.get(item.name, _ei2) != _ei2:
+                _is_accessor2 = any(
+                    isinstance(d, ast.Attribute) and d.attr in ("setter", "deleter")
+                    for d in item.decorator_list)
+                if (not _is_accessor2
+                        and _last_emit_idx.get(item.name, _ei2) != _ei2):
                     continue
                 method_key = item.name
                 # @x.setter methods are stored as x__set
@@ -12837,6 +13026,8 @@ class CodeGen:
         if isinstance(node, (ast.List, ast.ListComp, ast.GeneratorExp)):
             elem_type = self._infer_list_elem_type(node)
             return f"list:{elem_type}"
+        if isinstance(node, (ast.Dict, ast.DictComp)):
+            return "dict"
         if isinstance(node, ast.Tuple):
             return "tuple"
         # type(f) where f is a user function → pyobj (returns CPython type object)
@@ -12862,6 +13053,28 @@ class CodeGen:
             if node.func.id == "frozenset":
                 return "set"
             if node.func.id in ("list", "sorted", "reversed", "range"):
+                # Propagate element type from argument when possible:
+                # sorted(list_of_str) → list:str, list(d.keys()) → list:str, etc.
+                if node.args:
+                    arg = node.args[0]
+                    if self._is_list_expr(arg):
+                        elem = self._get_list_elem_type(arg)
+                        return f"list:{elem}"
+                    if self._is_dict_expr(arg):
+                        # sorted(d) / list(d) iterates keys → str keys
+                        return "list:str"
+                    if self._is_set_expr(arg):
+                        return "list:int"  # sets store int-keyed values
+                    if (isinstance(arg, ast.Call)
+                            and isinstance(arg.func, ast.Attribute)
+                            and arg.func.attr == "keys"
+                            and self._is_dict_expr(arg.func.value)):
+                        return "list:str"
+                    if (isinstance(arg, ast.Call)
+                            and isinstance(arg.func, ast.Attribute)
+                            and arg.func.attr == "values"
+                            and self._is_dict_expr(arg.func.value)):
+                        return "list:int"
                 return "list:int"
             # User function with known return type (from return-type propagation)
             frt = getattr(self, '_func_ret_types', {})
@@ -13669,13 +13882,17 @@ class CodeGen:
                 v = self._emit_expr_value(val)
                 tag = self._infer_type_tag(val, v)
                 values.append((v, tag))
-            for tgt, (v, tag) in zip(target.elts, values):
+            for tgt, (v, tag), val_elt in zip(target.elts, values,
+                                                value_node.elts):
                 if isinstance(tgt, ast.Name):
                     self._store_variable(tgt.id, v, tag)
                 elif isinstance(tgt, ast.Subscript):
                     self._emit_subscript_store(tgt, v, node)
                 elif isinstance(tgt, ast.Attribute):
                     self._emit_attr_store(tgt, v, node)
+                elif isinstance(tgt, (ast.Tuple, ast.List)):
+                    # Nested unpack: (a, b), c = (1, 2), 3
+                    self._emit_tuple_unpack(tgt, val_elt, node)
                 else:
                     self._bridge_fallback_stmt(node, "unsupported unpack target")
         elif self._is_list_expr(value_node) or self._is_tuple_expr(value_node) or isinstance(value_node, ast.List):
@@ -13726,6 +13943,17 @@ class CodeGen:
                     if isinstance(tgt, ast.Name):
                         elem = self._list_get_as_bare(val, ir.Constant(i64, i), elem_type)
                         self._store_variable(tgt.id, elem, elem_type)
+                    elif isinstance(tgt, (ast.Tuple, ast.List)):
+                        # Nested unpack from list: a, (b, c) = [1, [2, 3]]
+                        # Get sub-list as pointer and recursively unpack
+                        sub_list = self._list_get_as_bare(
+                            val, ir.Constant(i64, i), "list")
+                        # Create a synthetic Name node so recursive call
+                        # hits the list/tuple branch with the sub-list
+                        _sub_name = f"__nested_unp_{i}"
+                        self._store_variable(_sub_name, sub_list, "list:int")
+                        sub_val_node = ast.Name(id=_sub_name, ctx=ast.Load())
+                        self._emit_tuple_unpack(tgt, sub_val_node, node)
                     else:
                         self._bridge_fallback_stmt(node, "unsupported unpack target")
         else:
@@ -16961,6 +17189,15 @@ class CodeGen:
                     if handler.name:
                         msg = self.builder.call(self.runtime["exc_get_msg"], [])
                         self._store_variable(handler.name, msg, "str")
+                        # Track the exception class name for type(e).__name__
+                        if isinstance(handler.type, ast.Name):
+                            self._exc_vars[handler.name] = handler.type.id
+                        elif isinstance(handler.type, ast.Tuple):
+                            # except (TypeError, ValueError) as e: — use first
+                            for elt in handler.type.elts:
+                                if isinstance(elt, ast.Name):
+                                    self._exc_vars[handler.name] = elt.id
+                                    break
                     self.builder.call(self.runtime["exc_clear"], [])
                     self._emit_stmts(handler.body)
                     if not self.builder.block.is_terminated:
@@ -19894,20 +20131,52 @@ class CodeGen:
 
         # Check if this is a *args or **kwargs function
         if info.is_vararg and info.param_count > 1:
-            # Mixed: positional params + *rest list
-            # First N-1 args go to positional params, rest go to list
-            n_positional = info.param_count - 1  # last param is *rest
+            # Mixed: positional params + *rest list + optional kwonly params
+            # param_names layout: [pos0, pos1, ..., *rest, kw0, kw1, ...]
+            n_kwonly = info.n_kwonly
+            n_positional = info.param_count - 1 - n_kwonly  # plain positional
             positional_args = node.args[:n_positional]
             rest_args = node.args[n_positional:]
             # Emit positional args
             args = []
             for arg_node in positional_args:
                 args.append(self._emit_expr_value(arg_node))
-            # Pack remaining into list
+            # Pack remaining positional call args into *rest list
             rest_list = self.builder.call(self.runtime["list_new"], [])
             for arg_node in rest_args:
                 self._emit_list_append_expr(rest_list, arg_node)
             args.append(rest_list)
+            # Handle keyword-only params: map keywords to kwonly slots,
+            # fill defaults for missing ones.
+            if n_kwonly > 0:
+                fn_def = getattr(self, '_function_def_nodes', {}).get(name)
+                kwonly_names = (
+                    [a.arg for a in fn_def.args.kwonlyargs] if fn_def
+                    else info.param_names[n_positional + 1:])
+                kw_defaults = (
+                    fn_def.args.kw_defaults if fn_def
+                    else [None] * n_kwonly)
+                # Build map from keyword name → emitted value
+                kw_values: dict[str, ir.Value] = {}
+                if node.keywords:
+                    for kw in node.keywords:
+                        if kw.arg is not None and kw.arg in kwonly_names:
+                            kw_values[kw.arg] = self._emit_expr_value(
+                                kw.value)
+                # Append kwonly args in declaration order
+                for ki, kw_name in enumerate(kwonly_names):
+                    if kw_name in kw_values:
+                        args.append(kw_values[kw_name])
+                    else:
+                        # Use default value
+                        kwd = (kw_defaults[ki]
+                               if ki < len(kw_defaults) else None)
+                        if kwd is not None:
+                            args.append(self._emit_expr_value(kwd))
+                        else:
+                            raise CodeGenError(
+                                f"{name}() missing required keyword-only "
+                                f"argument: '{kw_name}'", node)
             # Coerce types and call
             coerced = []
             for val, param in zip(args, info.func.args):
@@ -20123,6 +20392,57 @@ class CodeGen:
                                       [dict_ptr, key, ir.Constant(i32, tag), data])
                 return self.builder.call(info.func, [dict_ptr])
             return self.builder.call(info.func, [list_ptr])
+
+        # Mixed vararg: positional + *rest + kwonly
+        if info.is_vararg and info.param_count > 1:
+            n_kwonly = info.n_kwonly
+            n_positional = info.param_count - 1 - n_kwonly
+            positional_args = node.args[:n_positional]
+            rest_args = node.args[n_positional:]
+            args = []
+            for arg_node in positional_args:
+                args.append(self._emit_expr_value(arg_node))
+            rest_list = self.builder.call(self.runtime["list_new"], [])
+            for arg_node in rest_args:
+                self._emit_list_append_expr(rest_list, arg_node)
+            args.append(rest_list)
+            if n_kwonly > 0:
+                fn_def = getattr(self, '_function_def_nodes', {}).get(name)
+                kwonly_names = (
+                    [a.arg for a in fn_def.args.kwonlyargs] if fn_def
+                    else info.param_names[n_positional + 1:])
+                kw_defaults = (
+                    fn_def.args.kw_defaults if fn_def
+                    else [None] * n_kwonly)
+                kw_values: dict[str, ir.Value] = {}
+                if node.keywords:
+                    for kw in node.keywords:
+                        if kw.arg is not None and kw.arg in kwonly_names:
+                            kw_values[kw.arg] = self._emit_expr_value(
+                                kw.value)
+                for ki, kw_name in enumerate(kwonly_names):
+                    if kw_name in kw_values:
+                        args.append(kw_values[kw_name])
+                    else:
+                        kwd = (kw_defaults[ki]
+                               if ki < len(kw_defaults) else None)
+                        if kwd is not None:
+                            args.append(self._emit_expr_value(kwd))
+                        else:
+                            raise CodeGenError(
+                                f"{name}() missing required keyword-only "
+                                f"argument: '{kw_name}'", node)
+            coerced = []
+            for val, param in zip(args, info.func.args):
+                if val.type != param.type:
+                    if (isinstance(param.type, ir.PointerType)
+                            and isinstance(val.type, ir.IntType)):
+                        val = self.builder.inttoptr(val, param.type)
+                    elif (isinstance(param.type, ir.IntType)
+                          and isinstance(val.type, ir.PointerType)):
+                        val = self.builder.ptrtoint(val, param.type)
+                coerced.append(val)
+            return self.builder.call(info.func, coerced)
 
         # Regular call: evaluate args, apply defaults, coerce
         args = []
@@ -21543,9 +21863,15 @@ class CodeGen:
                     and node.generators[0].iter.func.id == "range"):
                 return True
         if isinstance(node, ast.Dict) and node.keys:
+            # Filter out None keys (dict unpacking via **).
+            # Must use a concrete list so `all()` on an empty iterable
+            # (pure-unpack dicts like {**d}) doesn't falsely return True.
+            concrete_keys = [k for k in node.keys if k is not None]
+            if not concrete_keys:
+                return False
             return all(isinstance(k, ast.Constant) and isinstance(k.value, int)
                        and not isinstance(k.value, bool)
-                       for k in node.keys if k is not None)
+                       for k in concrete_keys)
         if isinstance(node, ast.Name):
             # Check via _csa_root_tree for the binding
             tree = getattr(self, "_csa_root_tree", None)
@@ -21594,6 +21920,16 @@ class CodeGen:
             if (isinstance(node.value, ast.Name)
                     and node.value.id in self._dict_var_dict_values):
                 return True
+            # Per-key type lookup: d["database"] where d has per-key type
+            # info and "database" maps to "dict" — the subscript yields a dict.
+            if (isinstance(node.value, ast.Name)
+                    and node.value.id in self._dict_var_key_types
+                    and isinstance(node.slice, ast.Constant)
+                    and isinstance(node.slice.value, str)):
+                kt = self._dict_var_key_types[node.value.id].get(
+                    node.slice.value)
+                if kt == "dict":
+                    return True
             # Recursive: d["a"]["b"] where d["a"] is itself a dict
             # Walk up the subscript chain to find the base Name variable.
             if isinstance(node.value, ast.Subscript):
@@ -22905,9 +23241,13 @@ class CodeGen:
                     and node.value.func.id == "type"
                     and len(node.value.args) == 1):
                 arg_node = node.value.args[0]
-                # Name arg: check metaclasses, user classes, FV variables
+                # Name arg: check exception vars, metaclasses, user classes, FV variables
                 if isinstance(arg_node, ast.Name):
                     target = arg_node.id
+                    # Exception variable: type(e).__name__ → class name
+                    if target in self._exc_vars:
+                        return self._make_string_constant(
+                            self._exc_vars[target])
                     metaclasses = getattr(self, '_class_metaclasses', {})
                     if target in metaclasses:
                         return self._make_string_constant(metaclasses[target])
@@ -23224,6 +23564,12 @@ class CodeGen:
                         return self.builder.call(
                             self.runtime["cpython_getattr"],
                             [types_mod, ft_name])
+                    # Exception variable: type(e) → <class 'ExceptionName'>
+                    if (isinstance(arg_node, ast.Name)
+                            and arg_node.id in self._exc_vars):
+                        cls_name = self._exc_vars[arg_node.id]
+                        return self._make_string_constant(
+                            f"<class '{cls_name}'>")
                     # For FV-backed variables, check runtime tag to determine
                     # the actual type (handles CPython bridge results correctly)
                     if (self._USE_FV_LOCALS
@@ -28129,6 +28475,18 @@ class CodeGen:
                 return "int"
         if isinstance(node, ast.JoinedStr):
             return "str"
+        if isinstance(node, (ast.Dict, ast.DictComp)):
+            return "dict"
+        if isinstance(node, (ast.List, ast.ListComp)):
+            return "list"
+        if isinstance(node, ast.Tuple):
+            return "list"  # tuples stored as lists in FpyValue
+        if isinstance(node, (ast.Set, ast.SetComp)):
+            return "set"
+        # Constructor calls for known user classes → obj
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id in self._user_classes):
+            return "obj"
         return None
 
     def _infer_list_of_dicts_key_types(
@@ -29164,9 +29522,94 @@ class CodeGen:
             return result_dict
         if not isinstance(gen.target, ast.Name):
             raise CodeGenError("Only simple variable targets in dict comprehensions", node)
-        if not (isinstance(gen.iter, ast.Call) and isinstance(gen.iter.func, ast.Name)
-                and gen.iter.func.id == "range"):
-            return self._bridge_fallback_expr(node, "dict comprehension with non-range iterator")
+
+        # ── List/tuple iteration path: {f(x): g(x) for x in some_list} ──
+        is_range = (isinstance(gen.iter, ast.Call)
+                    and isinstance(gen.iter.func, ast.Name)
+                    and gen.iter.func.id == "range")
+        if not is_range:
+            # Try native list/tuple/set/string iteration
+            iter_tv = self._emit_expr(gen.iter)
+            iter_kind = iter_tv.vtype.kind
+            if iter_kind not in (VKind.LIST, VKind.TUPLE, VKind.SET,
+                                 VKind.STR, VKind.DICT):
+                return self._bridge_fallback_expr(
+                    node, "dict comprehension with non-iterable")
+            list_ptr = iter_tv.as_ptr(self.builder)
+            if iter_kind == VKind.DICT:
+                # dict iteration yields keys — use dict_keys runtime
+                list_ptr = self.builder.call(
+                    self.runtime["dict_keys"], [list_ptr])
+            list_len = self._rt_call("list_length", [list_ptr])
+            var_name = gen.target.id
+            # Determine element type for the loop variable
+            if iter_kind == VKind.DICT:
+                # Dict iteration yields keys which are strings
+                var_tag = "str"
+            elif iter_kind == VKind.STR:
+                var_tag = "str"
+            else:
+                elem_type = self._get_list_elem_type(gen.iter)
+                if elem_type == "str":
+                    var_tag = "str"
+                elif elem_type == "obj":
+                    var_tag = "obj"
+                elif elem_type == "float":
+                    var_tag = "float"
+                elif elem_type.startswith("list"):
+                    var_tag = elem_type if ":" in elem_type else "list:int"
+                elif elem_type == "dict":
+                    var_tag = "dict"
+                else:
+                    var_tag = "int"
+            dict_ptr = self.builder.call(self.runtime["dict_new"], [])
+            idx_alloca = self._create_entry_alloca(i64, "dcl.idx")
+            self.builder.store(ir.Constant(i64, 0), idx_alloca)
+            cond_block = self._new_block("dcl.cond")
+            body_block = self._new_block("dcl.body")
+            incr_block = self._new_block("dcl.incr")
+            end_block = self._new_block("dcl.end")
+            self.builder.branch(cond_block)
+            self.builder.position_at_end(cond_block)
+            idx = self.builder.load(idx_alloca)
+            cond = self.builder.icmp_signed("<", idx, list_len)
+            self.builder.cbranch(cond, body_block, end_block)
+            self.builder.position_at_end(body_block)
+            idx = self.builder.load(idx_alloca)
+            self._fv_store_from_list(var_name, list_ptr, idx, var_tag)
+            # Handle filter conditions
+            for if_clause in gen.ifs:
+                cond_val = self._emit_condition(if_clause)
+                skip_block = self._new_block("dcl.skip")
+                add_block = self._new_block("dcl.add")
+                self.builder.cbranch(cond_val, add_block, skip_block)
+                self.builder.position_at_end(skip_block)
+                self.builder.branch(incr_block)
+                self.builder.position_at_end(add_block)
+            key = self._emit_expr_value(node.key)
+            val = self._emit_expr_value(node.value)
+            v_tag, v_data = self._bare_to_tag_data(val, node.value)
+            if isinstance(key.type, ir.PointerType):
+                self.builder.call(self.runtime["dict_set_fv"],
+                                  [dict_ptr, key,
+                                   ir.Constant(i32, v_tag), v_data])
+            elif isinstance(key.type, ir.IntType):
+                self.builder.call(self.runtime["dict_set_int_fv"],
+                                  [dict_ptr, key,
+                                   ir.Constant(i32, v_tag), v_data])
+            else:
+                self.builder.call(self.runtime["dict_set_fv"],
+                                  [dict_ptr,
+                                   self.builder.inttoptr(key, i8_ptr),
+                                   ir.Constant(i32, v_tag), v_data])
+            self.builder.branch(incr_block)
+            self.builder.position_at_end(incr_block)
+            next_idx = self.builder.add(
+                self.builder.load(idx_alloca), ir.Constant(i64, 1))
+            self.builder.store(next_idx, idx_alloca)
+            self.builder.branch(cond_block)
+            self.builder.position_at_end(end_block)
+            return dict_ptr
 
         dict_ptr = self.builder.call(self.runtime["dict_new"], [])
 
@@ -29346,24 +29789,40 @@ class CodeGen:
                 elif (isinstance(value.value, ast.Attribute)
                       and isinstance(value.value.value, ast.Name)
                       and self._is_obj_expr(value.value.value)):
-                    # self.attr in f-string — use obj_get_fv → fv_str
-                    obj = self._emit_expr_value(value.value.value)
-                    if isinstance(obj.type, ir.IntType) and obj.type.width == 64:
-                        obj = self.builder.inttoptr(obj, i8_ptr, name="obj.ptr")
-                    slot_idx = self._get_attr_slot(value.value)
-                    if slot_idx is not None:
-                        init_only = self._is_init_only_attr(value.value)
-                        tag, data = self._emit_slot_get_direct(
-                            obj, slot_idx, init_only=init_only)
+                    # obj.attr in f-string.
+                    # Property check: if the attr is a @property, call the
+                    # getter and format the result — not a slot read.
+                    _fstr_obj_cls = self._infer_object_class(value.value.value)
+                    _fstr_cls_info = self._user_classes.get(_fstr_obj_cls) if _fstr_obj_cls else None
+                    if (_fstr_cls_info and _fstr_cls_info.properties
+                            and value.value.attr in _fstr_cls_info.properties):
+                        # Dispatch to property getter, then format result
+                        val = self._emit_expr_value(value.value)
+                        if spec_str:
+                            str_val = self._apply_format_spec(val, spec_str, value.value, node)
+                        else:
+                            fv = self._load_or_wrap_fv(value.value)
+                            tag, data = self._fv_unpack(fv)
+                            str_val = self.builder.call(self.runtime["fv_str"], [tag, data])
                     else:
-                        tag_slot = self._create_entry_alloca(i32, "fattr.tag")
-                        data_slot = self._create_entry_alloca(i64, "fattr.data")
-                        attr_name = self._make_string_constant(value.value.attr)
-                        self.builder.call(self.runtime["obj_get_fv"],
-                                          [obj, attr_name, tag_slot, data_slot])
-                        tag = self.builder.load(tag_slot)
-                        data = self.builder.load(data_slot)
-                    str_val = self.builder.call(self.runtime["fv_str"], [tag, data])
+                        # Regular slot access — use obj_get_fv → fv_str
+                        obj = self._emit_expr_value(value.value.value)
+                        if isinstance(obj.type, ir.IntType) and obj.type.width == 64:
+                            obj = self.builder.inttoptr(obj, i8_ptr, name="obj.ptr")
+                        slot_idx = self._get_attr_slot(value.value)
+                        if slot_idx is not None:
+                            init_only = self._is_init_only_attr(value.value)
+                            tag, data = self._emit_slot_get_direct(
+                                obj, slot_idx, init_only=init_only)
+                        else:
+                            tag_slot = self._create_entry_alloca(i32, "fattr.tag")
+                            data_slot = self._create_entry_alloca(i64, "fattr.data")
+                            attr_name = self._make_string_constant(value.value.attr)
+                            self.builder.call(self.runtime["obj_get_fv"],
+                                              [obj, attr_name, tag_slot, data_slot])
+                            tag = self.builder.load(tag_slot)
+                            data = self.builder.load(data_slot)
+                        str_val = self.builder.call(self.runtime["fv_str"], [tag, data])
                 else:
                     if spec_str:
                         val = self._emit_expr_value(value.value)
