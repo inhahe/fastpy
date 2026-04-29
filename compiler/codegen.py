@@ -3273,6 +3273,30 @@ class CodeGen:
         for node in tree.body:
             if not isinstance(node, (ast.FunctionDef, ast.ClassDef)):
                 self._emit_stmt(node)
+                # Module-level exception check: if a runtime function raised
+                # an exception (e.g. TypeError from `list + int`) and we're
+                # NOT inside a try block, the exception flag is set but nobody
+                # checks it — execution just continues to the next statement.
+                # Fix: after each module-level statement, check exc_pending()
+                # and call exc_unhandled() (print traceback + exit) if set.
+                # Skip for try/with blocks (they handle their own exceptions)
+                # and skip if the block is already terminated (raise/return).
+                if (not self.builder.block.is_terminated
+                        and not isinstance(node, (ast.Try, ast.TryStar,
+                                                  ast.With))
+                        and not self._in_try_block
+                        and not self._current_fn_bare_abi):
+                    pending = self.builder.call(
+                        self.runtime["exc_pending"], [])
+                    is_exc = self.builder.icmp_signed(
+                        "!=", pending, ir.Constant(i32, 0))
+                    exc_blk = self._new_block("module.exc_unhandled")
+                    cont_blk = self._new_block("module.cont")
+                    self.builder.cbranch(is_exc, exc_blk, cont_blk)
+                    self.builder.position_at_end(exc_blk)
+                    self.builder.call(self.runtime["exc_unhandled"], [])
+                    self.builder.unreachable()
+                    self.builder.position_at_end(cont_blk)
 
         if not self.builder.block.is_terminated:
             if not self._current_fn_bare_abi:
@@ -23469,6 +23493,7 @@ class CodeGen:
                                   [lt_tag, lt_data, rt_tag, rt_data,
                                    ir.Constant(i32, _fv_ops[op]),
                                    out_tag, out_data])
+                self._emit_try_bail_if_exc()
                 return self._fv_build_from_slots(
                     self.builder.load(out_tag),
                     self.builder.load(out_data))
@@ -23526,6 +23551,7 @@ class CodeGen:
                                   [lt_tag, lt_data, rt_tag, rt_data,
                                    ir.Constant(i32, _fv_ops[op]),
                                    out_tag, out_data])
+                self._emit_try_bail_if_exc()
                 return self._fv_build_from_slots(
                     self.builder.load(out_tag),
                     self.builder.load(out_data))
@@ -23774,17 +23800,36 @@ class CodeGen:
         """If inside a try block, check exc_pending() and bail to the except
         handler immediately.  This prevents side-effectful code from executing
         after a call that raised (e.g. list.append running with a garbage
-        return value from a division that raised ZeroDivisionError)."""
-        if not self._in_try_block:
+        return value from a division that raised ZeroDivisionError).
+
+        At module level (fastpy_main, not in a try block), check exc_pending()
+        and call exc_unhandled() (print traceback + exit) — uncaught exceptions
+        must halt execution immediately, not let subsequent code run with
+        garbage values."""
+        if self._in_try_block:
+            target = getattr(self, '_try_except_target', None)
+            if target is None:
+                return
+            pending = self.builder.call(self.runtime["exc_pending"], [])
+            is_exc = self.builder.icmp_signed("!=", pending, ir.Constant(i32, 0))
+            cont = self._new_block("try.earlycheck")
+            self.builder.cbranch(is_exc, target, cont)
+            self.builder.position_at_end(cont)
             return
-        target = getattr(self, '_try_except_target', None)
-        if target is None:
-            return
-        pending = self.builder.call(self.runtime["exc_pending"], [])
-        is_exc = self.builder.icmp_signed("!=", pending, ir.Constant(i32, 0))
-        cont = self._new_block("try.earlycheck")
-        self.builder.cbranch(is_exc, target, cont)
-        self.builder.position_at_end(cont)
+        # Module-level (or top-level function not in try): bail to
+        # exc_unhandled on pending exception.
+        if (not self._current_fn_bare_abi
+                and self.function.name == "fastpy_main"):
+            pending = self.builder.call(self.runtime["exc_pending"], [])
+            is_exc = self.builder.icmp_signed(
+                "!=", pending, ir.Constant(i32, 0))
+            exc_blk = self._new_block("module.bail_exc")
+            cont = self._new_block("module.bail_cont")
+            self.builder.cbranch(is_exc, exc_blk, cont)
+            self.builder.position_at_end(exc_blk)
+            self.builder.call(self.runtime["exc_unhandled"], [])
+            self.builder.unreachable()
+            self.builder.position_at_end(cont)
 
     def _emit_python_floordiv(self, left: ir.Value, right: ir.Value) -> ir.Value:
         """

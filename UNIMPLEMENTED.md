@@ -147,6 +147,28 @@ These features work correctly but use the embedded CPython interpreter:
 - **Other stdlib modules** not implemented natively (e.g., collections,
   itertools, functools — except singledispatch which is native)
 
+## Bugs fixed (2026-04-28, module-level exception propagation)
+
+### 111. Module-level uncaught exceptions didn't halt execution (fixed)
+`total = []; print(total + 0); print(0.0)` printed `None` and `0.0` instead
+of crashing with TypeError. In CPython, uncaught exceptions immediately
+terminate the program. In fastpy, exceptions are flag-based (set by
+`fastpy_raise()`, polled by `fastpy_exc_pending()`). Inside try blocks,
+`_emit_try_bail_if_exc()` checks the flag and branches to the except handler.
+But at module level (outside try), the flag was never checked — execution
+continued with garbage return values from errored calls.
+Root causes: (a) `_emit_try_bail_if_exc()` returned immediately when
+`_in_try_block` was False. (b) No exception check existed between module-level
+statements. (c) `fv_binop` (handles container type errors like list+int) didn't
+call `_emit_try_bail_if_exc()` after the runtime call, so even within a single
+expression, subsequent operations ran with garbage values.
+Fix: (a) Extended `_emit_try_bail_if_exc()` to also work at module level
+(`fastpy_main`): when `_in_try_block` is False but the function is
+`fastpy_main`, emits an `exc_pending()` check that calls `exc_unhandled()`
+(print traceback + exit). (b) Added per-statement exception checks in the
+Pass 3 module-level statement loop. (c) Added `_emit_try_bail_if_exc()` after
+both `fv_binop` call sites (FpyValue dispatch and container guard paths).
+
 ## Bugs fixed (2026-04-28, *args tuple, MRO, funcdef in loops, lambda captures, mixed returns)
 
 ### 110. Mixed return types (float try + string except) produced garbage (fixed)
