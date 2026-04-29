@@ -695,6 +695,8 @@ extern FpyList* fastpy_tuple_new(void);
 extern void* fastpy_obj_new(int32_t);
 extern int32_t fastpy_register_class(const char*, int32_t);
 extern void fastpy_register_method(int32_t, const char*, void*, int32_t, int32_t);
+extern void fastpy_set_method_ret_tag(int32_t, const char*, int32_t);
+extern void fastpy_obj_call_method1_fv(void*, const char*, int64_t, int32_t*, int64_t*);
 extern void fastpy_obj_set_fv(void*, const char*, int32_t, int64_t);
 extern void fastpy_obj_get_fv(void*, const char*, int32_t*, int64_t*);
 extern const char* fastpy_str_concat(const char*, const char*);
@@ -846,6 +848,7 @@ static FpySymEntry fpy_jit_symbols[] = {
     SYM(fastpy_dict_equal), SYM(fastpy_set_equal),
     SYM(fastpy_tuple_new), SYM(fastpy_obj_new),
     SYM(fastpy_register_class), SYM(fastpy_register_method),
+    SYM(fastpy_set_method_ret_tag), SYM(fastpy_obj_call_method1_fv),
     SYM(fastpy_obj_set_fv), SYM(fastpy_obj_get_fv),
     SYM(fastpy_str_concat), SYM(fastpy_str_len), SYM(fastpy_str_lower),
     SYM(fastpy_str_upper), SYM(fastpy_str_strip), SYM(fastpy_str_replace),

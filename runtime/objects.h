@@ -110,6 +110,7 @@ typedef struct {
     void *func;          /* cast to appropriate signature */
     int arg_count;       /* number of args (excluding self) */
     int returns_value;   /* 1 if returns a value, 0 if void */
+    int return_tag;      /* FPY_TAG_* for the return value, -1 = unknown */
 } FpyMethodDef;
 
 /* Class definition */

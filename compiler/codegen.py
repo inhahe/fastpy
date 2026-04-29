@@ -2029,6 +2029,10 @@ class CodeGen:
         self.runtime["register_class"] = ir.Function(self.module, ft, name="fastpy_register_class")
         ft = ir.FunctionType(void, [i32, i8_ptr, i8_ptr, i32, i32])  # register_method(class_id, name, func, argc, returns)
         self.runtime["register_method"] = ir.Function(self.module, ft, name="fastpy_register_method")
+        ft = ir.FunctionType(void, [i32, i8_ptr, i32])  # set_method_ret_tag(class_id, name, return_tag)
+        self.runtime["set_method_ret_tag"] = ir.Function(self.module, ft, name="fastpy_set_method_ret_tag")
+        ft = ir.FunctionType(void, [i8_ptr, i8_ptr, i64, ir.PointerType(i32), ir.PointerType(i64)])
+        self.runtime["obj_call_method1_fv"] = ir.Function(self.module, ft, name="fastpy_obj_call_method1_fv")
         ft = ir.FunctionType(i8_ptr, [i32])  # obj_new(class_id) -> obj*
         self.runtime["obj_new"] = ir.Function(self.module, ft, name="fastpy_obj_new")
         # Tagged-value attribute access (post-refactor). The old typed
@@ -2083,6 +2087,7 @@ class CodeGen:
         self.runtime["isinstance"] = ir.Function(self.module, ft, name="fastpy_isinstance")
         ft = ir.FunctionType(i8_ptr, [i8_ptr])
         self.runtime["obj_to_str"] = ir.Function(self.module, ft, name="fastpy_obj_to_str")
+        self.runtime["obj_to_repr"] = ir.Function(self.module, ft, name="fastpy_obj_to_repr")
         ft = ir.FunctionType(double, [i8_ptr, i8_ptr])
         self.runtime["obj_call_method0_double"] = ir.Function(self.module, ft, name="fastpy_obj_call_method0_double")
         ft = ir.FunctionType(double, [i8_ptr, i8_ptr, i64])
@@ -5716,6 +5721,39 @@ class CodeGen:
                     # Also register under bare name for fallback
                     if "__setitem__" not in self._call_site_param_types:
                         self._call_site_param_types["__setitem__"] = types
+
+        # Register __getitem__ call-site types from `obj[key]` patterns.
+        # This lets the method body know the param types (str key, etc.)
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Subscript)
+                    and not isinstance(node.slice, ast.Slice)
+                    and isinstance(node.value, ast.Name)):
+                obj_name = node.value.id
+                if obj_name in obj_classes:
+                    cls_name = obj_classes[obj_name]
+                    key_type = self._infer_call_arg_type(node.slice)
+                    qkey = f"{cls_name}.__getitem__"
+                    types = [key_type]
+                    if qkey not in self._call_site_param_types:
+                        self._call_site_param_types[qkey] = types
+                    if "__getitem__" not in self._call_site_param_types:
+                        self._call_site_param_types["__getitem__"] = types
+
+        # Register __contains__ call-site types from `key in obj` patterns.
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Compare):
+                for op, comp in zip(node.ops, node.comparators):
+                    if isinstance(op, ast.In) and isinstance(comp, ast.Name):
+                        obj_name = comp.id
+                        if obj_name in obj_classes:
+                            cls_name = obj_classes[obj_name]
+                            elem_type = self._infer_call_arg_type(node.left)
+                            qkey = f"{cls_name}.__contains__"
+                            types = [elem_type]
+                            if qkey not in self._call_site_param_types:
+                                self._call_site_param_types[qkey] = types
+                            if "__contains__" not in self._call_site_param_types:
+                                self._call_site_param_types["__contains__"] = types
 
         # Trace sorted(list, key=func) / min/max(list, key=func) to populate
         # call-site types for the key function. The key function receives
@@ -11064,6 +11102,13 @@ class CodeGen:
                 ir.Constant(i32, n_args),
                 ir.Constant(i32, returns),
             ])
+            # Register return type tag so runtime can produce FpyValue results.
+            # Compute the tag from the method's LLVM return type and class analysis.
+            ret_tag = self._compute_method_return_tag(
+                cls_info.name, method_name, method_func)
+            if ret_tag >= 0:
+                self.builder.call(self.runtime["set_method_ret_tag"], [
+                    class_id, mname_ptr, ir.Constant(i32, ret_tag)])
             # Assign a vtable slot for O(1) polymorphic dispatch.
             # Same method name across classes shares the same slot index.
             if method_name not in self._vtable_indices:
@@ -12460,24 +12505,24 @@ class CodeGen:
             return
         # __setitem__ on user-class objects
         if self._is_obj_expr(target.value):
-            obj_cls = self._infer_object_class(target.value)
-            if obj_cls and self._class_has_method(obj_cls, "__setitem__"):
-                obj = self._emit_expr_value(target.value)
-                if isinstance(obj.type, ir.IntType):
-                    obj = self.builder.inttoptr(obj, i8_ptr)
-                key = self._emit_expr_value(target.slice)
-                if isinstance(key.type, ir.PointerType):
-                    key = self.builder.ptrtoint(key, i64)
-                elif isinstance(key.type, ir.IntType) and key.type.width != 64:
-                    key = self.builder.zext(key, i64)
-                if isinstance(value.type, ir.PointerType):
-                    value = self.builder.ptrtoint(value, i64)
-                elif isinstance(value.type, ir.IntType) and value.type.width != 64:
-                    value = self.builder.zext(value, i64)
-                name_ptr = self._make_string_constant("__setitem__")
-                self.builder.call(self.runtime["obj_call_method2"],
-                                  [obj, name_ptr, key, value])
-                return
+            obj = self._emit_expr_value(target.value)
+            if isinstance(obj.type, ir.IntType):
+                obj = self.builder.inttoptr(obj, i8_ptr)
+            key = self._emit_expr_value(target.slice)
+            if isinstance(key.type, ir.PointerType):
+                key = self.builder.ptrtoint(key, i64)
+            elif isinstance(key.type, ir.IntType) and key.type.width != 64:
+                key = self.builder.zext(key, i64)
+            if isinstance(value.type, ir.PointerType):
+                value = self.builder.ptrtoint(value, i64)
+            elif isinstance(value.type, ir.DoubleType):
+                value = self.builder.bitcast(value, i64)
+            elif isinstance(value.type, ir.IntType) and value.type.width != 64:
+                value = self.builder.zext(value, i64)
+            name_ptr = self._make_string_constant("__setitem__")
+            self.builder.call(self.runtime["obj_call_method2"],
+                              [obj, name_ptr, key, value])
+            return
         obj = self._emit_expr_value(target.value)
         if isinstance(obj.type, ir.IntType):
             obj = self.builder.inttoptr(obj, i8_ptr)
@@ -13365,6 +13410,15 @@ class CodeGen:
         # UnaryOp on complex produces complex
         if isinstance(node, ast.UnaryOp) and self._is_complex_expr(node.operand):
             return "complex"
+        # UnaryOp on OBJ produces OBJ (e.g. __neg__, __pos__, __invert__)
+        if (isinstance(node, ast.UnaryOp)
+                and isinstance(node.op, (ast.USub, ast.UAdd, ast.Invert))
+                and self._is_obj_expr(node.operand)):
+            return "obj"
+        # BinOp on OBJ produces OBJ (e.g. __add__, __sub__, __mul__, etc.)
+        if isinstance(node, ast.BinOp):
+            if self._is_obj_expr(node.left) or self._is_obj_expr(node.right):
+                return "obj"
         # Compare / not / isinstance / bool() / hasattr() produce booleans
         if isinstance(node, ast.Compare):
             return "bool"
@@ -18076,9 +18130,10 @@ class CodeGen:
                 # value is already an FpyValue from _load_or_wrap_fv above.
                 self.builder.ret(value)
             elif value.type != expected:
-                # FpyValue → i64 conversion: closures use i64 ABI externally
-                # but FV locals internally. Extract the data field and
-                # store the tag in fpy_ret_tag so the caller can recover it.
+                # FpyValue → i64 conversion: closures/methods use i64 ABI
+                # externally but FV locals internally. Extract the data
+                # field and store the tag in fpy_ret_tag so the caller
+                # can recover it.
                 if (isinstance(expected, ir.IntType)
                         and isinstance(value.type, ir.LiteralStructType)):
                     tag = self.builder.extract_value(value, 0)
@@ -18086,6 +18141,10 @@ class CodeGen:
                     self.builder.call(self.runtime["set_ret_tag"], [tag])
                     self.builder.ret(data)
                     return
+                # Save original value before type conversion so tag
+                # inference can see the pre-conversion type (e.g. pointer
+                # before ptrtoint).
+                pre_conv_value = value
                 # Type mismatch — try conversion
                 if isinstance(expected, ir.IntType) and isinstance(value.type, ir.IntType):
                     if expected.width > value.type.width:
@@ -18100,17 +18159,29 @@ class CodeGen:
                     value = self.builder.ptrtoint(value, expected)
                 elif isinstance(expected, ir.PointerType) and isinstance(value.type, ir.IntType):
                     value = self.builder.inttoptr(value, expected)
-                # For closure functions, store the tag before ret
-                if (isinstance(expected, ir.IntType)
-                        and self.function.name.startswith("fastpy.closure.")):
-                    tag = self._infer_ret_tag_for_value(value, node.value)
+                # For closure/method functions, store the tag before ret
+                # so callers using get_ret_tag() recover the correct type.
+                # Closures always return i64 (via wrapper), so check IntType.
+                # Methods may return i64, i8*, double, i32 — check all.
+                _is_closure = self.function.name.startswith("fastpy.closure.")
+                _is_method = self.function.name.startswith("fastpy.class.")
+                _needs_ret_tag = (
+                    (_is_closure and isinstance(expected, ir.IntType))
+                    or _is_method)
+                if _needs_ret_tag:
+                    tag = self._infer_ret_tag_for_value(
+                        pre_conv_value, node.value)
                     self.builder.call(self.runtime["set_ret_tag"],
                                       [ir.Constant(i32, tag)])
                 self.builder.ret(value)
             else:
-                # For closure functions, store the tag before ret
-                if (isinstance(expected, ir.IntType)
-                        and self.function.name.startswith("fastpy.closure.")):
+                # For closure/method functions, store the tag before ret
+                _is_closure = self.function.name.startswith("fastpy.closure.")
+                _is_method = self.function.name.startswith("fastpy.class.")
+                _needs_ret_tag = (
+                    (_is_closure and isinstance(expected, ir.IntType))
+                    or _is_method)
+                if _needs_ret_tag:
                     tag = self._infer_ret_tag_for_value(value, node.value)
                     self.builder.call(self.runtime["set_ret_tag"],
                                       [ir.Constant(i32, tag)])
@@ -18156,13 +18227,31 @@ class CodeGen:
     def _infer_ret_tag_for_value(self, value: ir.Value,
                                   node: ast.expr) -> int:
         """Infer the FpyValue tag for a bare LLVM value being returned.
-        Used by closures to store the runtime tag in fpy_ret_tag."""
+        Used by closures and methods to store the runtime tag in
+        fpy_ret_tag so callers using get_ret_tag() recover the type."""
         if isinstance(value.type, ir.IntType):
             if value.type.width == 1 or value.type.width == 32:
                 return FPY_TAG_BOOL  # comparisons, bool ops
             # Check AST for bool-typed expressions
             if self._is_bool_typed(node):
                 return FPY_TAG_BOOL
+            # AST-based checks: for methods returning i64, the value
+            # may actually be a pointer (list/dict/str/obj) encoded as
+            # i64.  Check the AST node to recover the true type.
+            if node is not None:
+                if self._is_list_expr(node):
+                    return FPY_TAG_LIST
+                if self._is_dict_expr(node):
+                    return FPY_TAG_DICT
+                if self._is_obj_expr(node):
+                    return FPY_TAG_OBJ
+                # String self-attribute access: return self.name where
+                # name is a known string attr
+                ttag = self._infer_type_tag(node, value)
+                if ttag == "str":
+                    return FPY_TAG_STR
+                if ttag == "none":
+                    return FPY_TAG_NONE
             return FPY_TAG_INT
         if isinstance(value.type, ir.DoubleType):
             return FPY_TAG_FLOAT
@@ -19802,6 +19891,30 @@ class CodeGen:
                 result_i1 = self.builder.not_(result_i1)
             return result_i1
 
+        # __contains__ on user-class objects — must come before the legacy
+        # string fallback because OBJ values are also pointers.
+        if c_kind == VKind.OBJ or self._is_obj_expr(container_node):
+            container = self._emit_expr_value(container_node)
+            if isinstance(container.type, ir.IntType):
+                container = self.builder.inttoptr(container, i8_ptr)
+            if isinstance(left_val.type, ir.PointerType):
+                arg = self.builder.ptrtoint(left_val, i64)
+            elif isinstance(left_val.type, ir.DoubleType):
+                arg = self.builder.bitcast(left_val, i64)
+            elif isinstance(left_val.type, ir.IntType) and left_val.type.width != 64:
+                arg = self.builder.zext(left_val, i64)
+            else:
+                arg = left_val
+            name_ptr = self._make_string_constant("__contains__")
+            result = self.builder.call(
+                self.runtime["obj_call_method1"],
+                [container, name_ptr, arg])
+            result_i1 = self.builder.icmp_signed(
+                "!=", result, ir.Constant(i64, 0))
+            if isinstance(op, ast.NotIn):
+                result_i1 = self.builder.not_(result_i1)
+            return result_i1
+
         # Legacy fallback: string 'in' for unknown pointer types
         container = self._emit_expr_value(container_node)
         if isinstance(container.type, ir.PointerType) and isinstance(left_val.type, ir.PointerType):
@@ -19810,31 +19923,6 @@ class CodeGen:
             if isinstance(op, ast.NotIn):
                 result_i1 = self.builder.not_(result_i1)
             return result_i1
-
-        # __contains__ on user-class objects
-        if c_kind == VKind.OBJ or self._is_obj_expr(container_node):
-            obj_cls = self._infer_object_class(container_node)
-            if obj_cls and self._class_has_method(obj_cls, "__contains__"):
-                container = self._emit_expr_value(container_node)
-                if isinstance(container.type, ir.IntType):
-                    container = self.builder.inttoptr(container, i8_ptr)
-                if isinstance(left_val.type, ir.PointerType):
-                    arg = self.builder.ptrtoint(left_val, i64)
-                elif isinstance(left_val.type, ir.DoubleType):
-                    arg = self.builder.bitcast(left_val, i64)
-                elif isinstance(left_val.type, ir.IntType) and left_val.type.width != 64:
-                    arg = self.builder.zext(left_val, i64)
-                else:
-                    arg = left_val
-                name_ptr = self._make_string_constant("__contains__")
-                result = self.builder.call(
-                    self.runtime["obj_call_method1"],
-                    [container, name_ptr, arg])
-                result_i1 = self.builder.icmp_signed(
-                    "!=", result, ir.Constant(i64, 0))
-                if isinstance(op, ast.NotIn):
-                    result_i1 = self.builder.not_(result_i1)
-                return result_i1
 
         # Fallback: use CPython __contains__ via bridge
         container = self._emit_expr_value(container_node)
@@ -22094,6 +22182,56 @@ class CodeGen:
 
     def _get_list_elem_type(self, node: ast.expr) -> str:
         """Get the element type of a list expression."""
+        # self.attr on the current class: resolve through __init__ AST
+        # to find the assignment `self.attr = [...]` and infer elem type
+        # from the literal.  Also walks parent classes.
+        if (isinstance(node, ast.Attribute)
+                and isinstance(node.value, ast.Name)
+                and node.value.id == "self"
+                and self._current_class):
+            cls_name: str | None = self._current_class
+            while cls_name:
+                ci = self._user_classes.get(cls_name)
+                if ci and ci.method_asts:
+                    init_ast = ci.method_asts.get("__init__")
+                    if init_ast:
+                        for stmt in ast.walk(init_ast):
+                            if (isinstance(stmt, ast.Assign)
+                                    and len(stmt.targets) == 1
+                                    and isinstance(stmt.targets[0],
+                                                   ast.Attribute)
+                                    and isinstance(stmt.targets[0].value,
+                                                   ast.Name)
+                                    and stmt.targets[0].value.id == "self"
+                                    and stmt.targets[0].attr == node.attr):
+                                et = self._infer_list_elem_type(stmt.value)
+                                if et != "int":
+                                    return et
+                                # "int" might be wrong default — keep looking
+                                # in parent, but remember we found something
+                cls_name = ci.parent_name if ci else None
+        # obj.attr where obj class is known: same __init__ lookup
+        if (isinstance(node, ast.Attribute)
+                and isinstance(node.value, ast.Name)
+                and node.value.id != "self"):
+            obj_cls = self._infer_object_class(node.value)
+            if obj_cls:
+                ci = self._user_classes.get(obj_cls)
+                if ci and ci.method_asts:
+                    init_ast = ci.method_asts.get("__init__")
+                    if init_ast:
+                        for stmt in ast.walk(init_ast):
+                            if (isinstance(stmt, ast.Assign)
+                                    and len(stmt.targets) == 1
+                                    and isinstance(stmt.targets[0],
+                                                   ast.Attribute)
+                                    and isinstance(stmt.targets[0].value,
+                                                   ast.Name)
+                                    and stmt.targets[0].value.id == "self"
+                                    and stmt.targets[0].attr == node.attr):
+                                et = self._infer_list_elem_type(stmt.value)
+                                if et != "int":
+                                    return et
         # Phase 3: read elem_type directly from ValueType when available.
         # Only use elem_type if it's explicitly set (not None) — bare "list"
         # variables without a known element type should fall through to the
@@ -24292,15 +24430,13 @@ class CodeGen:
         elif isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
             # __neg__ on user-class objects
             if self._is_obj_expr(node.operand):
-                obj_cls = self._infer_object_class(node.operand)
-                if obj_cls and self._class_has_method(obj_cls, "__neg__"):
-                    obj = self._emit_expr_value(node.operand)
-                    if isinstance(obj.type, ir.IntType):
-                        obj = self.builder.inttoptr(obj, i8_ptr)
-                    name_ptr = self._make_string_constant("__neg__")
-                    result = self.builder.call(
-                        self.runtime["obj_call_method0"], [obj, name_ptr])
-                    return self.builder.inttoptr(result, i8_ptr)
+                obj = self._emit_expr_value(node.operand)
+                if isinstance(obj.type, ir.IntType):
+                    obj = self.builder.inttoptr(obj, i8_ptr)
+                name_ptr = self._make_string_constant("__neg__")
+                result = self.builder.call(
+                    self.runtime["obj_call_method0"], [obj, name_ptr])
+                return self.builder.inttoptr(result, i8_ptr)
             # BigInt negation: if the operand is a bigint variable, call bigint_neg
             # and return the result tagged as BIGINT so print/assignment handle it correctly.
             if (isinstance(node.operand, ast.Name)
@@ -25327,15 +25463,14 @@ class CodeGen:
             if name == "str":
                 if len(node.args) == 1:
                     arg_node = node.args[0]
-                    # OBJ fast path: dispatch to __str__ dunder
+                    # OBJ fast path: use obj_to_str which handles
+                    # __str__ → __repr__ → default fallback safely
                     if self._is_obj_expr(arg_node):
                         obj = self._emit_expr_value(arg_node)
                         if isinstance(obj.type, ir.IntType):
                             obj = self.builder.inttoptr(obj, i8_ptr)
-                        name_ptr = self._make_string_constant("__str__")
                         result = self.builder.call(
-                            self.runtime["obj_call_method0"],
-                            [obj, name_ptr])
+                            self.runtime["obj_to_str"], [obj])
                         return self.builder.inttoptr(result, i8_ptr)
                     # Use FV dispatch so runtime tag drives the conversion
                     # (e.g. dict values whose compile-time tag is wrong).
@@ -25558,23 +25693,14 @@ class CodeGen:
             if name == "repr":
                 if len(node.args) == 1:
                     arg_node = node.args[0]
-                    # OBJ fast path: dispatch to __repr__ dunder
+                    # OBJ fast path: use obj_to_repr which handles
+                    # __repr__ → __str__ → default fallback safely
                     if self._is_obj_expr(arg_node):
                         obj = self._emit_expr_value(arg_node)
                         if isinstance(obj.type, ir.IntType):
                             obj = self.builder.inttoptr(obj, i8_ptr)
-                        obj_cls = self._infer_object_class(arg_node)
-                        if obj_cls and self._class_has_method(obj_cls, "__repr__"):
-                            name_ptr = self._make_string_constant("__repr__")
-                            result = self.builder.call(
-                                self.runtime["obj_call_method0"],
-                                [obj, name_ptr])
-                            return self.builder.inttoptr(result, i8_ptr)
-                        # No __repr__: try __str__, then default
-                        name_ptr = self._make_string_constant("__str__")
                         result = self.builder.call(
-                            self.runtime["obj_call_method0"],
-                            [obj, name_ptr])
+                            self.runtime["obj_to_repr"], [obj])
                         return self.builder.inttoptr(result, i8_ptr)
                     # Use FV dispatch so runtime tag drives the conversion.
                     fv = self._load_or_wrap_fv(node.args[0])
@@ -29637,6 +29763,88 @@ class CodeGen:
                 parent = parent_info.parent_name
         return None
 
+    def _compute_method_return_tag(self, class_name: str, method_name: str,
+                                     method_func: ir.Function) -> int:
+        """Compute the FPY_TAG_* constant for a method's return value.
+
+        Uses the LLVM return type and class attribute analysis to determine
+        the correct tag. Returns -1 if unknown.
+        """
+        ret_type = method_func.return_value.type
+        if ret_type == ir.VoidType():
+            return -1
+        if isinstance(ret_type, ir.IntType):
+            if ret_type.width == 32:
+                return FPY_TAG_BOOL
+            return FPY_TAG_INT
+        if isinstance(ret_type, ir.DoubleType):
+            return FPY_TAG_FLOAT
+        if isinstance(ret_type, ir.PointerType):
+            # Pointer return — need to determine if it's list/dict/str/obj.
+            # Check the method's AST for return expression patterns.
+            cls_info = self._user_classes.get(class_name)
+            if cls_info and cls_info.method_asts:
+                m_ast = cls_info.method_asts.get(method_name)
+                if m_ast:
+                    return self._infer_ptr_return_tag(class_name, m_ast)
+            # Default: if the class defines this method and it returns
+            # a pointer, assume it returns self (obj) for dunders like
+            # __add__, __sub__, etc.
+            if method_name.startswith("__") and method_name.endswith("__"):
+                return FPY_TAG_OBJ
+            return FPY_TAG_STR  # safe default for general methods
+        if isinstance(ret_type, ir.LiteralStructType):
+            return -1  # FpyValue struct — runtime determines tag
+        return -1
+
+    def _infer_ptr_return_tag(self, class_name: str, method_ast) -> int:
+        """Infer the FPY_TAG for a method that returns a pointer.
+
+        Checks the method's return statements for common patterns.
+        """
+        container_attrs = self._class_container_attrs.get(class_name, (set(), set()))
+        list_attrs, dict_attrs = container_attrs
+        obj_attr_types = self._class_obj_attr_types.get(class_name, {})
+
+        for node in ast.walk(method_ast):
+            if not (isinstance(node, ast.Return) and node.value is not None):
+                continue
+            ret = node.value
+            # return self.attr[idx] — subscript on self attribute
+            if (isinstance(ret, ast.Subscript)
+                    and isinstance(ret.value, ast.Attribute)
+                    and isinstance(ret.value.value, ast.Name)
+                    and ret.value.value.id == "self"):
+                attr = ret.value.attr
+                if attr in list_attrs:
+                    # Element of a list attr — could be any type.
+                    # Check if list holds nested lists/dicts/objects.
+                    return FPY_TAG_LIST  # default for list element subscript
+                if attr in dict_attrs:
+                    return -1  # dict value — unknown type
+            # return self.attr — direct attribute return
+            if (isinstance(ret, ast.Attribute)
+                    and isinstance(ret.value, ast.Name)
+                    and ret.value.id == "self"):
+                attr = ret.attr
+                if attr in list_attrs:
+                    return FPY_TAG_LIST
+                if attr in dict_attrs:
+                    return FPY_TAG_DICT
+                if attr in obj_attr_types:
+                    return FPY_TAG_OBJ
+                return FPY_TAG_STR  # default for attr return
+            # return ClassName(...) — constructor call
+            if (isinstance(ret, ast.Call)
+                    and isinstance(ret.func, ast.Name)
+                    and ret.func.id in self._user_classes):
+                return FPY_TAG_OBJ
+            # return self — returns the object itself
+            if isinstance(ret, ast.Name) and ret.id == "self":
+                return FPY_TAG_OBJ
+        # Default for pointer return with no recognizable pattern
+        return FPY_TAG_STR
+
     def _is_bool_typed(self, node: ast.expr) -> bool:
         """Check if an expression is boolean-typed at the AST level.
 
@@ -30196,23 +30404,26 @@ class CodeGen:
 
         # Check for __getitem__ on user-class objects
         if self._is_obj_expr(node.value):
-            obj_cls = self._infer_object_class(node.value)
-            if obj_cls and self._class_has_method(obj_cls, "__getitem__"):
-                obj = self._emit_expr_value(node.value)
-                if isinstance(obj.type, ir.IntType):
-                    obj = self.builder.inttoptr(obj, i8_ptr)
-                key = self._emit_expr_value(node.slice)
-                if isinstance(key.type, ir.PointerType):
-                    key = self.builder.ptrtoint(key, i64)
-                elif isinstance(key.type, ir.DoubleType):
-                    key = self.builder.bitcast(key, i64)
-                elif isinstance(key.type, ir.IntType) and key.type.width != 64:
-                    key = self.builder.zext(key, i64)
-                name_ptr = self._make_string_constant("__getitem__")
-                result = self.builder.call(
-                    self.runtime["obj_call_method1"],
-                    [obj, name_ptr, key])
-                return result
+            obj = self._emit_expr_value(node.value)
+            if isinstance(obj.type, ir.IntType):
+                obj = self.builder.inttoptr(obj, i8_ptr)
+            key = self._emit_expr_value(node.slice)
+            if isinstance(key.type, ir.PointerType):
+                key = self.builder.ptrtoint(key, i64)
+            elif isinstance(key.type, ir.DoubleType):
+                key = self.builder.bitcast(key, i64)
+            elif isinstance(key.type, ir.IntType) and key.type.width != 64:
+                key = self.builder.zext(key, i64)
+            name_ptr = self._make_string_constant("__getitem__")
+            result = self.builder.call(
+                self.runtime["obj_call_method1"],
+                [obj, name_ptr, key])
+            # Read the tag set by the method body via set_ret_tag
+            tag = self.builder.call(self.runtime["get_ret_tag"], [])
+            fv = ir.Constant(fpy_val, ir.Undefined)
+            fv = self.builder.insert_value(fv, tag, 0)
+            fv = self.builder.insert_value(fv, result, 1)
+            return fv
 
         obj = self._emit_expr_value(node.value)
 
@@ -31118,6 +31329,8 @@ class CodeGen:
                     if spec_str:
                         # f"{obj:spec}" → dispatch to __format__ if available
                         str_val = self._apply_format_spec(val, spec_str, value.value, node)
+                    elif conversion == 114:  # !r → use __repr__
+                        str_val = self.builder.call(self.runtime["obj_to_repr"], [val])
                     else:
                         str_val = self.builder.call(self.runtime["obj_to_str"], [val])
                 elif (isinstance(value.value, ast.Attribute)

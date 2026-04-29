@@ -5014,6 +5014,52 @@ void fastpy_register_method(int class_id, const char *name, void *func,
     m->func = func;
     m->arg_count = arg_count;
     m->returns_value = returns_value;
+    m->return_tag = -1;  /* unknown until set */
+}
+
+/* Set the return type tag for a method (called after register_method) */
+void fastpy_set_method_ret_tag(int class_id, const char *name, int return_tag) {
+    FpyClassDef *cls = &fpy_classes[class_id];
+    for (int i = 0; i < cls->method_count; i++) {
+        if (cls->methods[i].name == name
+                || strcmp(cls->methods[i].name, name) == 0) {
+            cls->methods[i].return_tag = return_tag;
+            return;
+        }
+    }
+}
+
+/* Call a method on an object, returning FpyValue (tag + data).
+ * Uses the method's registered return_tag to produce the correct tag.
+ * Falls back to INT if return_tag is unknown. */
+void fastpy_obj_call_method1_fv(FpyObj *obj, const char *name, int64_t a,
+                                 int32_t *out_tag, int64_t *out_data) {
+    FpyMethodDef *m = fastpy_find_method(obj->class_id, name);
+    if (!m) {
+        /* __ne__ fallback */
+        if (strcmp(name, "__ne__") == 0) {
+            m = fastpy_find_method(obj->class_id, "__eq__");
+            if (m) {
+                int64_t eq_result = ((FpyMethod1Func)m->func)(obj, a);
+                *out_tag = FPY_TAG_INT;
+                *out_data = !eq_result;
+                return;
+            }
+        }
+        snprintf(_err_buf, sizeof(_err_buf), "'%s' object has no method '%s'",
+                 fpy_classes[obj->class_id].name, name);
+        fastpy_raise(FPY_EXC_ATTRIBUTEERROR, _err_buf);
+        *out_tag = FPY_TAG_NONE;
+        *out_data = 0;
+        return;
+    }
+    int64_t result = ((FpyMethod1Func)m->func)(obj, a);
+    if (m->return_tag >= 0) {
+        *out_tag = m->return_tag;
+    } else {
+        *out_tag = FPY_TAG_INT;  /* fallback: raw i64 as int */
+    }
+    *out_data = result;
 }
 
 /* Native type.__new__ equivalent: create a class from a namespace dict.
@@ -5315,6 +5361,14 @@ int64_t fastpy_obj_call_method0(FpyObj *obj, const char *name) {
 int64_t fastpy_obj_call_method1(FpyObj *obj, const char *name, int64_t a) {
     FpyMethodDef *m = fastpy_find_method(obj->class_id, name);
     if (!m) {
+        /* Python auto-derives __ne__ from __eq__: return not self.__eq__(other) */
+        if (strcmp(name, "__ne__") == 0) {
+            m = fastpy_find_method(obj->class_id, "__eq__");
+            if (m) {
+                int64_t eq_result = ((FpyMethod1Func)m->func)(obj, a);
+                return !eq_result;
+            }
+        }
         snprintf(_err_buf, sizeof(_err_buf), "'%s' object has no method '%s'",
                  fpy_classes[obj->class_id].name, name);
         fastpy_raise(FPY_EXC_ATTRIBUTEERROR, _err_buf);

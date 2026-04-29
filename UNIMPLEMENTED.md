@@ -147,6 +147,57 @@ These features work correctly but use the embedded CPython interpreter:
 - **Other stdlib modules** not implemented natively (e.g., collections,
   itertools, functools — except singledispatch which is native)
 
+## Bugs fixed (2026-04-28, dunder dispatch & method return types)
+
+### 127. f-string `!r` conversion ignored (fixed)
+f-strings with `!r` conversion (e.g., `f"{x!r}"`) were not applying `repr()`
+to the value. The `_emit_fstring` handler now detects `conversion == ord('r')`
+and routes through `obj_to_repr` / `repr()` before formatting.
+
+### 128. `__ne__` not auto-derived from `__eq__` (fixed)
+Classes defining `__eq__` but not `__ne__` would crash with AttributeError
+when `!=` was used. The runtime `obj_call_method1` now falls back to
+`not __eq__(other)` when `__ne__` is not found, matching Python semantics.
+
+### 129. `repr()` / `str()` crash when object class unknown (fixed)
+`repr(obj)` and `str(obj)` on objects whose class couldn't be statically
+inferred would crash. Now uses `obj_to_repr` / `obj_to_str` runtime
+functions which handle `__repr__ -> __str__ -> default` fallback chains safely.
+
+### 130. `__neg__` fails when class not statically inferable (fixed)
+Unary negation `-obj` was guarded on `_infer_object_class` returning non-None.
+Removed the guard; now always dispatches through `obj_call_method0("__neg__")`
+for any OBJ-typed expression.
+
+### 131. `-obj` and `obj+obj` not typed as OBJ in type inference (fixed)
+`_infer_type_tag` didn't recognize UnaryOp/BinOp on OBJ as producing OBJ.
+Added rules: USub/UAdd/Invert on OBJ -> OBJ; BinOp with OBJ operand -> OBJ.
+
+### 132. `__getitem__`/`__setitem__`/`__contains__` dispatch improvements (fixed)
+Multiple issues with dunder subscript/membership dispatch on user classes:
+
+- **Removed `_infer_object_class` guards**: `__getitem__`, `__setitem__`,
+  and `__contains__` now dispatch via `obj_call_methodN` for any OBJ-typed
+  expression, not just those whose class can be statically inferred.
+
+- **Method return type tagging**: Methods now call `set_ret_tag()` before
+  returning so callers using `get_ret_tag()` (for `__getitem__` dispatch)
+  recover the correct type tag. This fixes `__getitem__` returning compound
+  types (lists, dicts, objects) — previously printed as raw pointer numbers.
+
+- **List element type for self.attr**: `_get_list_elem_type` now resolves
+  `self.attr` through the class's `__init__` AST to determine element types
+  (e.g., `self.data = [[1,2],[3,4]]` -> elem_type "list", not "int").
+
+- **Call-site type registration for `__getitem__`/`__contains__`**: Added
+  AST analysis to register parameter types from `obj[key]` and `key in obj`
+  patterns, matching the existing `__setitem__` registration.
+
+- **`__contains__` dispatch order fix**: The OBJ `__contains__` handler was
+  unreachable because a legacy string fallback matched first (both OBJ
+  pointers and string pointers are `ir.PointerType`). Moved OBJ handler
+  before the legacy fallback.
+
 ## Bugs fixed (2026-04-28, isinstance/None/bool/str*= multi-fix)
 
 ### 126. `bytes.split()` returned string items instead of bytes items (fixed)
