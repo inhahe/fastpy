@@ -14627,6 +14627,13 @@ class CodeGen:
             self._store_variable(target_name, result, "str")
             return
 
+        # STR *= n (string repetition)
+        if left_kind == VKind.STR and isinstance(node.op, ast.Mult):
+            result = self._rt_call("str_repeat",
+                                   [tv_current.as_ptr(self.builder), rhs])
+            self._store_variable(target_name, result, "str")
+            return
+
         # SET |=, &=, -=, ^= (set operations — delegated to binop)
         if left_kind == VKind.SET and isinstance(node.op, (ast.BitOr, ast.BitAnd,
                                                             ast.Sub, ast.BitXor)):
@@ -18877,14 +18884,10 @@ class CodeGen:
             val = bool(node.value)
             return ir.Constant(ir.IntType(1), 1 if val else 0)
         elif isinstance(node, ast.Name):
-            # Variable used as condition: truthy check (type-aware for lists/dicts/strings)
-            if node.id in self.variables:
-                _, tag = self.variables[node.id]
-                if tag.startswith("list") or tag in ("dict", "str", "set",
-                                                      "deque", "counter"):
-                    return self._truthiness_of_expr(node)
-            value = self._load_variable(node.id, node)
-            return self._truthiness(value)
+            # Variable used as condition: always use _truthiness_of_expr which
+            # handles FV-backed vars (fv_truthy), objects (__bool__/__len__),
+            # lists, dicts, strings, sets, etc. via type-aware dispatch.
+            return self._truthiness_of_expr(node)
         else:
             # General expression: evaluate and check truthiness
             return self._truthiness_of_expr(node)
@@ -18999,8 +19002,12 @@ class CodeGen:
                 name_ptr = self._make_string_constant("__bool__")
                 result = self.builder.call(
                     self.runtime["obj_call_method0"], [obj, name_ptr])
+                # __bool__ returns i32 but obj_call_method0 returns i64;
+                # upper 32 bits of RAX may contain garbage. Truncate to
+                # i32 before comparing to get the actual bool value.
+                result_i32 = self.builder.trunc(result, i32)
                 return self.builder.icmp_signed(
-                    "!=", result, ir.Constant(i64, 0))
+                    "!=", result_i32, ir.Constant(i32, 0))
         val = self._emit_expr_value(node)
         # FpyValue struct (from bridge method calls, etc.): use fv_truthy
         if (isinstance(val.type, ir.LiteralStructType)
@@ -19401,6 +19408,17 @@ class CodeGen:
                          ir.Constant(i32, _cmp_ops[type(op)])])
                     cmp = self.builder.icmp_signed(
                         "!=", cmp_result, ir.Constant(i32, 0))
+
+                # NONE equality: None == None is True; None == <anything_else> is False.
+                # Without this guard, None (stored as i64(0)) would compare equal
+                # to int 0, False, etc. via the int fallback path.
+                elif (left_kind == VKind.NONE or tv_right.vtype.kind == VKind.NONE):
+                    if left_kind == VKind.NONE and tv_right.vtype.kind == VKind.NONE:
+                        # None == None → True, None != None → False
+                        cmp = ir.Constant(ir.IntType(1), 1 if isinstance(op, ast.Eq) else 0)
+                    else:
+                        # None == <non-None> → False, None != <non-None> → True
+                        cmp = ir.Constant(ir.IntType(1), 1 if isinstance(op, ast.NotEq) else 0)
 
                 else:
                     cmp = self._emit_int_compare(op, cmp_left, cmp_right, node)
@@ -27831,7 +27849,8 @@ class CodeGen:
             # Use OR logic: emit isinstance for each type and combine
             arg = node.args[0]
             actual = self._static_type_of(arg)
-            builtin_types = ("int", "str", "float", "list", "dict", "bool", "tuple")
+            builtin_types = ("int", "str", "float", "list", "dict", "bool",
+                             "tuple", "set", "bytes", "frozenset", "complex")
             # Fast path: all builtin types
             if all(t in builtin_types for t in type_names):
                 # Runtime dispatch for FpyValue-backed variables
@@ -27845,6 +27864,9 @@ class CodeGen:
                             "float": FPY_TAG_FLOAT, "list": FPY_TAG_LIST,
                             "dict": FPY_TAG_DICT, "bool": FPY_TAG_BOOL,
                             "tuple": FPY_TAG_LIST,
+                            "set": FPY_TAG_SET, "frozenset": FPY_TAG_SET,
+                            "bytes": FPY_TAG_BYTES,
+                            "complex": FPY_TAG_COMPLEX,
                         }
                         result = None
                         for tname in type_names:
@@ -27886,7 +27908,10 @@ class CodeGen:
 
         # Handle built-in types by checking the AST-level type of the first argument.
         # This gives a compile-time constant answer since all variables have a known type tag.
-        if class_name in ("int", "str", "float", "list", "dict", "bool", "tuple"):
+        _isinstance_builtin_types = ("int", "str", "float", "list", "dict",
+                                      "bool", "tuple", "set", "bytes",
+                                      "frozenset", "complex")
+        if class_name in _isinstance_builtin_types:
             arg = node.args[0]
             actual = self._static_type_of(arg)
             # Runtime dispatch: if the arg is stored as FpyValue, check the
@@ -27903,6 +27928,9 @@ class CodeGen:
                         "float": FPY_TAG_FLOAT, "list": FPY_TAG_LIST,
                         "dict": FPY_TAG_DICT, "bool": FPY_TAG_BOOL,
                         "tuple": FPY_TAG_LIST,  # tuples are FpyList internally
+                        "set": FPY_TAG_SET, "frozenset": FPY_TAG_SET,
+                        "bytes": FPY_TAG_BYTES,
+                        "complex": FPY_TAG_COMPLEX,
                     }
                     expected_tag = _type_to_tag.get(class_name, -1)
                     result = self.builder.icmp_unsigned(
@@ -27921,8 +27949,8 @@ class CodeGen:
             return ir.Constant(i32, 0)
 
         # Additional built-in types not in the fast-path above
-        if class_name in ("bytes", "bytearray", "memoryview", "complex",
-                          "frozenset", "set", "range", "type", "object",
+        if class_name in ("bytearray", "memoryview",
+                          "range", "type", "object",
                           "Exception", "BaseException"):
             # For types we can't check at compile time, return True
             # (conservative — prevents false negatives in stdlib code)
@@ -27975,6 +28003,12 @@ class CodeGen:
                 return "float"
             if isinstance(node.value, str):
                 return "str"
+            if isinstance(node.value, bytes):
+                return "bytes"
+            if isinstance(node.value, complex):
+                return "complex"
+            if node.value is None:
+                return "none"
         if isinstance(node, (ast.List, ast.ListComp)):
             return "list"
         if isinstance(node, (ast.Dict, ast.DictComp)):
@@ -27990,7 +28024,7 @@ class CodeGen:
             if tag.startswith("list"):
                 return "list"
             if tag in ("int", "float", "str", "dict", "bool", "set", "tuple",
-                        "complex", "none"):
+                        "complex", "none", "bytes"):
                 return tag
         return "unknown"
 

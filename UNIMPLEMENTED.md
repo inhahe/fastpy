@@ -147,6 +147,40 @@ These features work correctly but use the embedded CPython interpreter:
 - **Other stdlib modules** not implemented natively (e.g., collections,
   itertools, functools — except singledispatch which is native)
 
+## Bugs fixed (2026-04-28, isinstance/None/bool/str*= multi-fix)
+
+### 118. `__bool__` dunder not called through fv_truthy for native objects (fixed)
+`bool(obj)` and `if obj:` always returned True for user-class objects that
+defined `__bool__`, because `fastpy_fv_truthy` in `objects.c` returned 1 for
+all native FpyObj regardless of `__bool__`/`__len__` methods. Additionally,
+`_emit_condition` for Name nodes only routed through `_truthiness_of_expr`
+for known types (list/dict/str/set), so OBJ-typed variables bypassed the
+`__bool__` dispatch entirely.
+Fix: (a) Runtime: `fv_truthy` now calls `fastpy_find_method` to look up
+`__bool__` and `__len__` on native FpyObj, invoking them if found.
+(b) Codegen: `_emit_condition` now always uses `_truthiness_of_expr` for
+Name nodes, ensuring FV-backed objects go through proper truthiness dispatch.
+(c) Added `result_i32 = trunc(result, i32)` to handle ABI mismatch where
+`__bool__` returns i32 but `obj_call_method0` returns i64.
+
+### 117. `str *= n` augmented multiply not handled (fixed)
+`x = 'ab'; x *= 3` produced empty string because there was no `STR *= n`
+handler in `_emit_aug_assign`. STR += (concatenation) existed but *= (repeat)
+was missing. Added handler that calls `str_repeat` for string augmented multiply.
+
+### 116. `None == 0` and `None == False` returned True instead of False (fixed)
+`None` is stored as i64(0) internally, so comparing `None == 0` fell through
+to `_emit_int_compare` which compared raw bit values (both 0) → True.
+Fix: Added NONE-aware guard in `_emit_compare` that returns constant False
+for `None == <non-None>` and True only for `None == None`.
+
+### 115. `isinstance(x, set)` always returned True (fixed)
+`isinstance(x, set)` (and bytes, frozenset, complex) used a conservative
+fallback that always returned True. Fix: Added proper FPY_TAG checks for
+set (FPY_TAG_SET), bytes (FPY_TAG_BYTES), complex (FPY_TAG_COMPLEX) in
+both single-type and tuple-of-types isinstance paths. Also added bytes,
+complex, None to `_static_type_of` for compile-time resolution.
+
 ## Bugs fixed (2026-04-28, str*bool/bool*str repeat, sequence*bool patterns)
 
 ### 113. `str * bool` and `bool * str` raised TypeError instead of repeating (fixed)

@@ -12,6 +12,7 @@
 void fastpy_tuple_write(FpyList *tuple);
 void fastpy_dict_write(FpyDict *dict);
 void fastpy_obj_write(FpyObj *obj);
+FpyMethodDef* fastpy_find_method(int class_id, const char *name);
 
 /* External exception-raising API (defined in runtime.c) */
 extern void fastpy_raise(int exc_type, const char *msg);
@@ -615,7 +616,20 @@ int32_t fastpy_fv_truthy(int32_t tag, int64_t data) {
                 extern int64_t fpy_cpython_bool(void*);
                 return (int32_t)fpy_cpython_bool((void*)(intptr_t)data);
             }
-            /* Native FpyObj — check __bool__ / __len__, default true */
+            /* Native FpyObj — call __bool__ if defined, then __len__, else true */
+            {
+                typedef int64_t (*FpyMethodFunc)(FpyObj*);
+                FpyMethodDef *m = fastpy_find_method(obj->class_id, "__bool__");
+                if (m) {
+                    int64_t r = ((FpyMethodFunc)m->func)(obj);
+                    return (int32_t)(r & 0xFFFFFFFF) != 0;
+                }
+                m = fastpy_find_method(obj->class_id, "__len__");
+                if (m) {
+                    int64_t r = ((FpyMethodFunc)m->func)(obj);
+                    return r != 0;
+                }
+            }
             return 1;
         }
         case FPY_TAG_SET: {
