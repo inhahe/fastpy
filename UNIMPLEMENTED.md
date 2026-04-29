@@ -14,9 +14,20 @@ get/set, __new__, __init_subclass__, __class_getitem__), decorators
 @singledispatch (native switch dispatch).
 
 ### Operator overloading (dunders)
-__add__, __sub__, __mul__, __neg__, __eq__, __lt__, __str__, __repr__,
-__getitem__, __setitem__, __delitem__, __len__, __bool__, __contains__,
-__iter__/__next__, __call__, __hash__.
+**Arithmetic**: __add__, __sub__, __mul__, __floordiv__, __truediv__,
+__mod__, __pow__, __matmul__, __neg__, __pos__.
+**Reverse**: __radd__, __rsub__, __rmul__, __rfloordiv__, __rtruediv__,
+__rmod__, __rpow__, __rmatmul__ (e.g. `10 + obj` dispatches __radd__).
+**Augmented**: __iadd__, __isub__, __imul__, __ifloordiv__, __itruediv__,
+__imod__, __ipow__, __imatmul__, __ior__, __iand__, __ixor__,
+__ilshift__, __irshift__.
+**Bitwise**: __and__, __or__, __xor__, __lshift__, __rshift__,
+__invert__, plus reverse variants (__rand__, __ror__, etc.).
+**Comparison**: __eq__, __ne__, __lt__, __le__, __gt__, __ge__.
+**Conversion**: __str__, __repr__, __int__, __float__, __bool__,
+__abs__, __format__.
+**Container**: __getitem__, __setitem__, __delitem__, __len__,
+__contains__, __iter__/__next__, __call__, __hash__.
 
 ### Containers
 list (literals, comprehensions, all methods incl. index with start/stop),
@@ -245,6 +256,42 @@ only worked with int values. Now dispatches to `list_index_str` /
 table (magic byte + 256-char mapping). `s.translate(table)` applies
 it. Table uses offset-1 indexing to avoid null-byte C string issues.
 Supports the 2-arg form of maketrans (from/to character mapping).
+
+### 64. Comprehensive operator overloading (new)
+Full dunder dispatch for user classes. Forward operators (__add__ etc.)
+dispatch via `obj_call_method1`. Reverse operators (__radd__ etc.)
+dispatch when the right operand is an object and the left is a scalar.
+Augmented assignment (__iadd__ etc.) dispatches in `_emit_aug_assign`.
+Bitwise operators (__and__, __or__, __xor__, __lshift__, __rshift__,
+__invert__) dispatch through the same mechanism. `int(obj)` → __int__,
+`float(obj)` → __float__ (uses double-returning ABI variant
+`obj_call_method0_double`). `f"{obj:spec}"` → __format__ with fallback
+to __str__ + format_spec_str.
+
+### 65. Context manager exception suppression (fixed)
+`with` statement now checks __exit__ return value. If __exit__ returns
+a truthy value and there is a pending exception, the exception is
+cleared (suppressed). Works for both native FpyObj and PyObject bridge
+context managers.
+
+### 66. `repr(obj)` and `str(obj)` dunder dispatch (new)
+`repr(obj)` now dispatches to `__repr__` (falls back to `__str__`,
+then `<ClassName object>`). `str(obj)` dispatches to `__str__`.
+Previously both used `__str__`. Runtime: `fastpy_obj_to_repr` for repr,
+`fastpy_obj_to_str` for str. Also fixed `fastpy_fv_str` OBJ case to
+call `__str__` directly (was routing through `fpy_value_repr` which
+now calls `__repr__`). CPython bridge PyObject* values use
+`PyObject_Repr` for repr.
+
+### 67. Mixed-type runtime comparison (`fastpy_fv_compare`) (new)
+Functions called with both int and str arguments at different call sites
+now compare correctly. Added `fastpy_fv_compare(tag1, data1, tag2, data2, op)`
+runtime function that dispatches based on runtime tags: STR uses strcmp,
+FLOAT uses double comparison, INT uses i64 comparison. Codegen detects
+"mixed"-tagged variables via `_is_mixed_var()` and re-loads the full
+FpyValue (with runtime tag) for comparison instead of using the raw i64
+data extracted by `_emit_expr_value`. Fixes the `test_bisect` grade
+example and similar patterns.
 
 ## Bugs fixed (2026-04-28, bridge dispatch & string methods)
 

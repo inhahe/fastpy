@@ -390,19 +390,21 @@ void fpy_value_repr(FpyValue val, char *buf, int bufsize) {
             } else if (first_word > 0 && first_word < 100000) {
                 FpyObj *obj = (FpyObj*)ptr;
                 if (obj->magic == FPY_OBJ_MAGIC) {
-                    extern const char* fastpy_obj_to_str(FpyObj*);
-                    const char *s = fastpy_obj_to_str(obj);
+                    extern const char* fastpy_obj_to_repr(FpyObj*);
+                    const char *s = fastpy_obj_to_repr(obj);
                     snprintf(buf, bufsize, "%s", s);
                 } else {
-                    /* CPython PyObject* — use PyObject_Str */
-                    extern const char* fpy_bridge_pyobj_str(void*);
-                    const char *s = fpy_bridge_pyobj_str(ptr);
-                    snprintf(buf, bufsize, "%s", s);
+                    /* CPython PyObject* — use PyObject_Repr */
+                    extern const char* fpy_bridge_pyobj_repr(void*);
+                    const char *s = fpy_bridge_pyobj_repr(ptr);
+                    if (s) snprintf(buf, bufsize, "%s", s);
+                    else snprintf(buf, bufsize, "<PyObject>");
                 }
             } else {
-                extern const char* fpy_bridge_pyobj_str(void*);
-                const char *s = fpy_bridge_pyobj_str(ptr);
-                snprintf(buf, bufsize, "%s", s);
+                extern const char* fpy_bridge_pyobj_repr(void*);
+                const char *s = fpy_bridge_pyobj_repr(ptr);
+                if (s) snprintf(buf, bufsize, "%s", s);
+                else snprintf(buf, bufsize, "<PyObject>");
             }
             break;
         }
@@ -495,13 +497,84 @@ const char* fastpy_fv_repr(int32_t tag, int64_t data) {
     return buf;
 }
 
+/* Forward declaration: defined later in this file */
+const char* fastpy_obj_to_str(FpyObj *obj);
+
 /* Return the str string (allocated) for an FpyValue — strings pass
- * through without quotes; other types use repr. */
+ * through without quotes; OBJ types use __str__; other types use repr. */
 const char* fastpy_fv_str(int32_t tag, int64_t data) {
     if (tag == FPY_TAG_STR) return (const char*)data;
+    /* OBJ: use __str__ (not __repr__) */
+    if (tag == FPY_TAG_OBJ && data != 0) {
+        void *ptr = (void*)(intptr_t)data;
+        int32_t first_word = *(int32_t*)ptr;
+        if (first_word > 0 && first_word < 100000) {
+            FpyObj *obj = (FpyObj*)ptr;
+            if (obj->magic == FPY_OBJ_MAGIC) {
+                return fastpy_obj_to_str(obj);
+            }
+        }
+        /* CPython PyObject* — use PyObject_Str */
+        extern const char* fpy_bridge_pyobj_str(void*);
+        return fpy_bridge_pyobj_str(ptr);
+    }
     char *buf = (char*)malloc(4096);
     fpy_value_repr(_pack_fv(tag, data), buf, 4096);
     return buf;
+}
+
+/* FpyValue comparison — op: 0=eq, 1=ne, 2=lt, 3=le, 4=gt, 5=ge.
+ * Returns 1 if the comparison is true, 0 otherwise. */
+int32_t fastpy_fv_compare(int32_t tag1, int64_t data1,
+                           int32_t tag2, int64_t data2, int32_t op) {
+    /* String comparison: both are STR → use strcmp */
+    if (tag1 == FPY_TAG_STR && tag2 == FPY_TAG_STR) {
+        const char *s1 = (const char*)(intptr_t)data1;
+        const char *s2 = (const char*)(intptr_t)data2;
+        if (!s1) s1 = "";
+        if (!s2) s2 = "";
+        int cmp = strcmp(s1, s2);
+        switch (op) {
+            case 0: return cmp == 0;
+            case 1: return cmp != 0;
+            case 2: return cmp < 0;
+            case 3: return cmp <= 0;
+            case 4: return cmp > 0;
+            case 5: return cmp >= 0;
+        }
+    }
+    /* Float comparison: at least one is FLOAT */
+    if (tag1 == FPY_TAG_FLOAT || tag2 == FPY_TAG_FLOAT) {
+        double d1, d2;
+        if (tag1 == FPY_TAG_FLOAT) {
+            union { int64_t i; double d; } u1; u1.i = data1; d1 = u1.d;
+        } else {
+            d1 = (double)data1;
+        }
+        if (tag2 == FPY_TAG_FLOAT) {
+            union { int64_t i; double d; } u2; u2.i = data2; d2 = u2.d;
+        } else {
+            d2 = (double)data2;
+        }
+        switch (op) {
+            case 0: return d1 == d2;
+            case 1: return d1 != d2;
+            case 2: return d1 < d2;
+            case 3: return d1 <= d2;
+            case 4: return d1 > d2;
+            case 5: return d1 >= d2;
+        }
+    }
+    /* Integer/bool comparison (default) */
+    switch (op) {
+        case 0: return data1 == data2;
+        case 1: return data1 != data2;
+        case 2: return data1 < data2;
+        case 3: return data1 <= data2;
+        case 4: return data1 > data2;
+        case 5: return data1 >= data2;
+    }
+    return 0;
 }
 
 /* Truthiness — returns i32 (0 or 1). */
@@ -5063,6 +5136,21 @@ const char* fastpy_obj_to_str(FpyObj *obj) {
     /* Try __str__ first, then __repr__ */
     FpyMethodDef *m = fastpy_find_method(obj->class_id, "__str__");
     if (!m) m = fastpy_find_method(obj->class_id, "__repr__");
+    if (m) {
+        int64_t result = ((FpyMethodFunc)m->func)(obj);
+        return (const char*)result;
+    }
+    /* Default: <ClassName object> */
+    char *buf = (char*)malloc(256);
+    snprintf(buf, 256, "<%s object>", fpy_classes[obj->class_id].name);
+    return buf;
+}
+
+/* Call __repr__ if it exists, otherwise __str__, otherwise default */
+const char* fastpy_obj_to_repr(FpyObj *obj) {
+    /* Try __repr__ first, then __str__ */
+    FpyMethodDef *m = fastpy_find_method(obj->class_id, "__repr__");
+    if (!m) m = fastpy_find_method(obj->class_id, "__str__");
     if (m) {
         int64_t result = ((FpyMethodFunc)m->func)(obj);
         return (const char*)result;

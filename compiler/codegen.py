@@ -1164,6 +1164,9 @@ class CodeGen:
         self.runtime["fv_str"] = ir.Function(self.module, ft, name="fastpy_fv_str")
         ft = ir.FunctionType(i32, [i32, i64])
         self.runtime["fv_truthy"] = ir.Function(self.module, ft, name="fastpy_fv_truthy")
+        # int32_t fastpy_fv_compare(i32 tag1, i64 data1, i32 tag2, i64 data2, i32 op)
+        ft = ir.FunctionType(i32, [i32, i64, i32, i64, i32])
+        self.runtime["fv_compare"] = ir.Function(self.module, ft, name="fastpy_fv_compare")
         # int64_t fastpy_fv_len(i32 tag, i64 data)
         ft = ir.FunctionType(i64, [i32, i64])
         self.runtime["fv_len"] = ir.Function(self.module, ft, name="fastpy_fv_len")
@@ -18482,6 +18485,48 @@ class CodeGen:
                     else:
                         cmp = self.builder.icmp_signed(">=", cmp_result, zero)
 
+                # FpyValue struct comparison: both operands are {i32, i64}
+                # with runtime type tags. Dispatch based on runtime tag.
+                elif (isinstance(cmp_left.type, ir.LiteralStructType)
+                        and cmp_left.type == fpy_val
+                        and isinstance(cmp_right.type, ir.LiteralStructType)
+                        and cmp_right.type == fpy_val
+                        and isinstance(op, (ast.Eq, ast.NotEq, ast.Lt,
+                                            ast.LtE, ast.Gt, ast.GtE))):
+                    _cmp_ops = {ast.Eq: 0, ast.NotEq: 1, ast.Lt: 2,
+                                ast.LtE: 3, ast.Gt: 4, ast.GtE: 5}
+                    l_tag = self.builder.extract_value(cmp_left, 0)
+                    l_data = self.builder.extract_value(cmp_left, 1)
+                    r_tag = self.builder.extract_value(cmp_right, 0)
+                    r_data = self.builder.extract_value(cmp_right, 1)
+                    cmp_result = self.builder.call(
+                        self.runtime["fv_compare"],
+                        [l_tag, l_data, r_tag, r_data,
+                         ir.Constant(i32, _cmp_ops[type(op)])])
+                    cmp = self.builder.icmp_signed(
+                        "!=", cmp_result, ir.Constant(i32, 0))
+
+                # Mixed-type variable comparison: one or both operands come
+                # from FV-backed variables with "mixed" type. The raw i64
+                # data was extracted by _emit_expr_value, losing the tag.
+                # Re-load the full FpyValue and use runtime comparison.
+                elif (isinstance(op, (ast.Eq, ast.NotEq, ast.Lt,
+                                      ast.LtE, ast.Gt, ast.GtE))
+                        and (self._is_mixed_var(node.left)
+                             or self._is_mixed_var(comparator_node))):
+                    _cmp_ops = {ast.Eq: 0, ast.NotEq: 1, ast.Lt: 2,
+                                ast.LtE: 3, ast.Gt: 4, ast.GtE: 5}
+                    l_fv = self._load_or_wrap_fv(node.left)
+                    r_fv = self._load_or_wrap_fv(comparator_node)
+                    l_tag, l_data = self._fv_unpack(l_fv)
+                    r_tag, r_data = self._fv_unpack(r_fv)
+                    cmp_result = self.builder.call(
+                        self.runtime["fv_compare"],
+                        [l_tag, l_data, r_tag, r_data,
+                         ir.Constant(i32, _cmp_ops[type(op)])])
+                    cmp = self.builder.icmp_signed(
+                        "!=", cmp_result, ir.Constant(i32, 0))
+
                 else:
                     cmp = self._emit_int_compare(op, cmp_left, cmp_right, node)
                 left = right
@@ -21599,6 +21644,15 @@ class CodeGen:
             return tag == "pyobj"
         return False
 
+    def _is_mixed_var(self, node: ast.expr) -> bool:
+        """Check if an expression is a variable with 'mixed' type tag
+        (could hold different types at runtime, e.g., function parameter
+        called with both int and str arguments at different call sites)."""
+        if isinstance(node, ast.Name) and node.id in self.variables:
+            _, tag = self.variables[node.id]
+            return tag == "mixed"
+        return False
+
     def _is_fv_float_var(self, node: ast.expr) -> bool:
         """Check if an expression is a variable backed by an FpyValue that
         might hold a float (e.g. result of CPython bridge call)."""
@@ -23676,6 +23730,17 @@ class CodeGen:
                 raise CodeGenError("float() takes exactly one argument", node)
             if name == "str":
                 if len(node.args) == 1:
+                    arg_node = node.args[0]
+                    # OBJ fast path: dispatch to __str__ dunder
+                    if self._is_obj_expr(arg_node):
+                        obj = self._emit_expr_value(arg_node)
+                        if isinstance(obj.type, ir.IntType):
+                            obj = self.builder.inttoptr(obj, i8_ptr)
+                        name_ptr = self._make_string_constant("__str__")
+                        result = self.builder.call(
+                            self.runtime["obj_call_method0"],
+                            [obj, name_ptr])
+                        return self.builder.inttoptr(result, i8_ptr)
                     # Use FV dispatch so runtime tag drives the conversion
                     # (e.g. dict values whose compile-time tag is wrong).
                     fv = self._load_or_wrap_fv(node.args[0])
@@ -23896,6 +23961,25 @@ class CodeGen:
                 raise CodeGenError("round() takes 1 or 2 arguments", node)
             if name == "repr":
                 if len(node.args) == 1:
+                    arg_node = node.args[0]
+                    # OBJ fast path: dispatch to __repr__ dunder
+                    if self._is_obj_expr(arg_node):
+                        obj = self._emit_expr_value(arg_node)
+                        if isinstance(obj.type, ir.IntType):
+                            obj = self.builder.inttoptr(obj, i8_ptr)
+                        obj_cls = self._infer_object_class(arg_node)
+                        if obj_cls and self._class_has_method(obj_cls, "__repr__"):
+                            name_ptr = self._make_string_constant("__repr__")
+                            result = self.builder.call(
+                                self.runtime["obj_call_method0"],
+                                [obj, name_ptr])
+                            return self.builder.inttoptr(result, i8_ptr)
+                        # No __repr__: try __str__, then default
+                        name_ptr = self._make_string_constant("__str__")
+                        result = self.builder.call(
+                            self.runtime["obj_call_method0"],
+                            [obj, name_ptr])
+                        return self.builder.inttoptr(result, i8_ptr)
                     # Use FV dispatch so runtime tag drives the conversion.
                     fv = self._load_or_wrap_fv(node.args[0])
                     return self._fv_call_repr(fv)

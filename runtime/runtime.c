@@ -625,6 +625,7 @@ extern void fastpy_fv_write(int32_t, int64_t);
 extern const char* fastpy_fv_repr(int32_t, int64_t);
 extern const char* fastpy_fv_str(int32_t, int64_t);
 extern int32_t fastpy_fv_truthy(int32_t, int64_t);
+extern int32_t fastpy_fv_compare(int32_t, int64_t, int32_t, int64_t, int32_t);
 extern int64_t fastpy_fv_len(int32_t, int64_t);
 extern void fastpy_fv_subscript(int32_t, int64_t, int32_t, int64_t, int32_t*, int64_t*);
 extern void fastpy_fv_binop(int32_t, int64_t, int32_t, int64_t, int32_t, int32_t*, int64_t*);
@@ -791,7 +792,7 @@ extern void fpy_cpython_concat(void*, void*, int32_t*, int64_t*);
 static FpySymEntry fpy_jit_symbols[] = {
     SYM(fastpy_print_newline),
     SYM(fastpy_fv_print), SYM(fastpy_fv_write),
-    SYM(fastpy_fv_repr), SYM(fastpy_fv_str), SYM(fastpy_fv_truthy),
+    SYM(fastpy_fv_repr), SYM(fastpy_fv_str), SYM(fastpy_fv_truthy), SYM(fastpy_fv_compare),
     SYM(fastpy_fv_len), SYM(fastpy_fv_subscript), SYM(fastpy_fv_binop),
     SYM(fastpy_raise), SYM(fastpy_exc_pending), SYM(fastpy_exc_clear),
     SYM(fastpy_exc_get_type), SYM(fastpy_exc_get_msg), SYM(fastpy_exc_name_to_id),
