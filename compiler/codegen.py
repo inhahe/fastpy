@@ -18171,13 +18171,26 @@ class CodeGen:
 
                 # --- VKind-based fast path dispatch ---
 
-                # OBJ comparison: dispatch to __eq__/__lt__ etc.
+                # OBJ comparison: dispatch to __eq__/__ne__/__lt__/__le__/__gt__/__ge__
                 if (left_kind == VKind.OBJ
-                        and isinstance(op, ast.Eq)
-                        and isinstance(cmp_left.type, ir.PointerType)
-                        and isinstance(cmp_right.type, ir.PointerType)):
-                    method_name = self._make_string_constant("__eq__")
-                    right_as_i64 = self.builder.ptrtoint(cmp_right, i64)
+                        and isinstance(op, (ast.Eq, ast.NotEq, ast.Lt,
+                                            ast.LtE, ast.Gt, ast.GtE))
+                        and isinstance(cmp_left.type, ir.PointerType)):
+                    _dunder_map = {
+                        ast.Eq: "__eq__", ast.NotEq: "__ne__",
+                        ast.Lt: "__lt__", ast.LtE: "__le__",
+                        ast.Gt: "__gt__", ast.GtE: "__ge__",
+                    }
+                    method_name = self._make_string_constant(
+                        _dunder_map[type(op)])
+                    if isinstance(cmp_right.type, ir.PointerType):
+                        right_as_i64 = self.builder.ptrtoint(cmp_right, i64)
+                    else:
+                        right_as_i64 = cmp_right
+                        if isinstance(right_as_i64.type, ir.IntType):
+                            if right_as_i64.type.width != 64:
+                                right_as_i64 = self.builder.zext(
+                                    right_as_i64, i64)
                     result_i64 = self.builder.call(
                         self.runtime["obj_call_method1"],
                         [cmp_left, method_name, right_as_i64])
@@ -23626,6 +23639,16 @@ class CodeGen:
                         ptr = self.builder.inttoptr(val, i8_ptr)
                         return self.builder.call(
                             self.runtime["complex_abs"], [ptr])
+                    # Object __abs__: dispatch to dunder (returns object)
+                    if self._is_obj_expr(arg_node):
+                        obj = self._emit_expr_value(arg_node)
+                        if isinstance(obj.type, ir.IntType):
+                            obj = self.builder.inttoptr(obj, i8_ptr)
+                        name_ptr = self._make_string_constant("__abs__")
+                        result_i64 = self.builder.call(
+                            self.runtime["obj_call_method0"],
+                            [obj, name_ptr])
+                        return self.builder.inttoptr(result_i64, i8_ptr)
                     val = self._emit_expr_value(arg_node)
                     if isinstance(val.type, ir.IntType):
                         neg = self.builder.neg(val)
@@ -27767,7 +27790,15 @@ class CodeGen:
                 and node.id in getattr(self, '_global_obj_classes', {})):
             return True
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
-            return node.func.id in self._user_classes
+            if node.func.id in self._user_classes:
+                return True
+            # abs(obj) returns obj if __abs__ returns an object
+            if (node.func.id == "abs" and len(node.args) == 1
+                    and self._is_obj_expr(node.args[0])):
+                ret_type = self._find_method_return_type(
+                    node.args[0], "__abs__")
+                return ret_type is None or isinstance(ret_type, ir.PointerType)
+            return False
         # Method calls that return an object (self or cls())
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
             if self._infer_object_class(node) is not None:
