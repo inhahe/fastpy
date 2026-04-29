@@ -147,6 +147,22 @@ These features work correctly but use the embedded CPython interpreter:
 - **Other stdlib modules** not implemented natively (e.g., collections,
   itertools, functools — except singledispatch which is native)
 
+## Bugs fixed (2026-04-28, str*bool/bool*str repeat, sequence*bool patterns)
+
+### 113. `str * bool` and `bool * str` raised TypeError instead of repeating (fixed)
+`"abc" * True` should produce `"abc"` (True == 1 repeat) and `"abc" * False`
+should produce `""` (0 repeats), since Python's bool is a subclass of int and
+sequence repeat operations accept any int-like value.
+Root causes: (a) Codegen `str * int` fast paths only checked `VKind.INT`, not
+`VKind.BOOL`, so `str * bool` missed the fast path and fell through to the
+container guard → `fv_binop`. (b) Runtime `fv_binop` str repeat checks only
+tested `FPY_TAG_INT`, not `FPY_TAG_BOOL`, so bool operands fell through to the
+TypeError guard. Same issue affected `bytes * bool`.
+Fix: (a) Codegen: changed `rk == VKind.INT` to `rk in (VKind.INT, VKind.BOOL)`
+for str*int, int*str, list*int, and int*list fast paths. (b) Runtime: changed
+`rt == FPY_TAG_INT` to `(rt == FPY_TAG_INT || rt == FPY_TAG_BOOL)` for str
+repeat and bytes repeat paths (list repeat already handled BOOL correctly).
+
 ## Bugs fixed (2026-04-28, str+int/float TypeError, test generator expansion)
 
 ### 112. `str + int` and `str + float` silently succeeded instead of TypeError (fixed)

@@ -756,14 +756,14 @@ void fastpy_fv_binop(int32_t lt, int64_t ld, int32_t rt, int64_t rd,
         *out_data = (int64_t)(intptr_t)result;
         return;
     }
-    /* String * Int or Int * String → repeat */
-    if (lt == FPY_TAG_STR && rt == FPY_TAG_INT && op == 2) {
+    /* String * Int/Bool or Int/Bool * String → repeat */
+    if (lt == FPY_TAG_STR && (rt == FPY_TAG_INT || rt == FPY_TAG_BOOL) && op == 2) {
         const char *result = fastpy_str_repeat((const char*)ld, rd);
         *out_tag = FPY_TAG_STR;
         *out_data = (int64_t)(intptr_t)result;
         return;
     }
-    if (lt == FPY_TAG_INT && rt == FPY_TAG_STR && op == 2) {
+    if ((lt == FPY_TAG_INT || lt == FPY_TAG_BOOL) && rt == FPY_TAG_STR && op == 2) {
         const char *result = fastpy_str_repeat((const char*)rd, ld);
         *out_tag = FPY_TAG_STR;
         *out_data = (int64_t)(intptr_t)result;
@@ -803,8 +803,8 @@ void fastpy_fv_binop(int32_t lt, int64_t ld, int32_t rt, int64_t rd,
         *out_data = (int64_t)(intptr_t)result;
         return;
     }
-    /* Bytes * Int or Int * Bytes → repeat */
-    if (lt == FPY_TAG_BYTES && rt == FPY_TAG_INT && op == 2) {
+    /* Bytes * Int/Bool or Int/Bool * Bytes → repeat */
+    if (lt == FPY_TAG_BYTES && (rt == FPY_TAG_INT || rt == FPY_TAG_BOOL) && op == 2) {
         const char *a = (const char*)(intptr_t)ld;
         size_t la = a ? strlen(a) : 0;
         int64_t n = rd > 0 ? rd : 0;

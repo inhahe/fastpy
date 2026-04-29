@@ -23350,9 +23350,9 @@ class CodeGen:
         # ── Fast path: str + str → concat ──────────────────────────────
         if lk == VKind.STR and rk == VKind.STR and op == ast.Add:
             return self._rt_call("str_concat", [ltv, rtv])
-        if lk == VKind.STR and rk == VKind.INT and op == ast.Mult:
+        if lk == VKind.STR and rk in (VKind.INT, VKind.BOOL) and op == ast.Mult:
             return self._rt_call("str_repeat", [ltv, rtv])
-        if lk == VKind.INT and rk == VKind.STR and op == ast.Mult:
+        if lk in (VKind.INT, VKind.BOOL) and rk == VKind.STR and op == ast.Mult:
             return self._rt_call("str_repeat", [rtv, ltv])
         # NOTE: str + int and int + str are NOT valid in Python (TypeError).
         # These fall through to the container guard → fv_binop → TypeError.
@@ -23360,9 +23360,9 @@ class CodeGen:
         # ── Fast path: list + list → concat, list * int → repeat ───────
         if lk == VKind.LIST and rk == VKind.LIST and op == ast.Add:
             return self._rt_call("list_concat", [ltv, rtv])
-        if lk == VKind.LIST and rk == VKind.INT and op == ast.Mult:
+        if lk == VKind.LIST and rk in (VKind.INT, VKind.BOOL) and op == ast.Mult:
             return self._rt_call("list_repeat", [ltv, rtv])
-        if lk == VKind.INT and rk == VKind.LIST and op == ast.Mult:
+        if lk in (VKind.INT, VKind.BOOL) and rk == VKind.LIST and op == ast.Mult:
             return self._rt_call("list_repeat", [rtv, ltv])
 
         # ── Fast path: dict | dict → merge ─────────────────────────────
