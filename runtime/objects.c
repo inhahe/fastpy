@@ -626,6 +626,21 @@ void fastpy_fv_subscript(int32_t c_tag, int64_t c_data,
             *out_data = (int64_t)(intptr_t)ch;
             return;
         }
+        case FPY_TAG_BYTES: {
+            const char *b = (const char*)(intptr_t)c_data;
+            int64_t idx = k_data;
+            int64_t len = (int64_t)strlen(b);
+            if (idx < 0) idx += len;
+            if (idx < 0 || idx >= len) {
+                fastpy_raise(FPY_EXC_INDEXERROR, "bytes index out of range");
+                *out_tag = FPY_TAG_NONE;
+                *out_data = 0;
+                return;
+            }
+            *out_tag = FPY_TAG_INT;
+            *out_data = (int64_t)(unsigned char)b[idx];
+            return;
+        }
         case FPY_TAG_OBJ: {
             /* CPython PyObject* — use bridge __getitem__ */
             FpyObj *obj = (FpyObj*)(intptr_t)c_data;

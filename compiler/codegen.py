@@ -1498,6 +1498,9 @@ class CodeGen:
         # bytes.decode()
         ft = ir.FunctionType(i8_ptr, [i8_ptr])
         self.runtime["bytes_decode"] = ir.Function(self.module, ft, name="fastpy_bytes_decode")
+        # bytes[i] → int (byte value)
+        ft = ir.FunctionType(i64, [i8_ptr, i64])
+        self.runtime["bytes_get"] = ir.Function(self.module, ft, name="fastpy_bytes_get")
         # dict.fromkeys(keys, value) and dict.fromkeys(keys)
         ft = ir.FunctionType(i8_ptr, [i8_ptr, i32, i64])
         self.runtime["dict_fromkeys"] = ir.Function(self.module, ft, name="fastpy_dict_fromkeys")
@@ -27702,10 +27705,20 @@ class CodeGen:
         if isinstance(node, ast.Attribute):
             if self._infer_object_class(node) is not None:
                 return True
-        # BinOp/UnaryOp on objects: result of __add__/__sub__/etc. is an object
+        # BinOp/UnaryOp on objects: result is obj ONLY if the dunder returns an object
         if isinstance(node, ast.BinOp):
             if self._is_obj_expr(node.left):
-                return True
+                _obj_binop_dunders = {
+                    ast.Add: "__add__", ast.Sub: "__sub__", ast.Mult: "__mul__",
+                    ast.FloorDiv: "__floordiv__", ast.Div: "__truediv__",
+                    ast.Mod: "__mod__", ast.Pow: "__pow__",
+                    ast.MatMult: "__matmul__"}
+                dunder = _obj_binop_dunders.get(type(node.op))
+                if dunder:
+                    ret_type = self._find_method_return_type(node.left, dunder)
+                    # Only obj if method returns a pointer (another object)
+                    return ret_type is None or isinstance(ret_type, ir.PointerType)
+                return True  # unknown op → assume obj
         if (isinstance(node, ast.UnaryOp)
                 and isinstance(node.op, ast.USub)
                 and self._is_obj_expr(node.operand)):
@@ -28165,6 +28178,11 @@ class CodeGen:
         obj = self._emit_expr_value(node.value)
 
         if isinstance(obj.type, ir.PointerType):
+            # Bytes subscript: b"hello"[0] → int (byte value), not char
+            val_tag = self._infer_type_tag(node.value, obj)
+            if val_tag == "bytes" and not isinstance(node.slice, ast.Slice):
+                index = self._emit_expr_value(node.slice)
+                return self._rt_call("bytes_get", [obj, index])
             # String indexing/slicing
             if isinstance(node.slice, ast.Slice):
                 return self._emit_string_slice(obj, node.slice, node)

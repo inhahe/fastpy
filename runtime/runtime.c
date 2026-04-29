@@ -150,6 +150,17 @@ const char* fastpy_str_index(const char *s, int64_t index) {
     return r->data;
 }
 
+/* bytes[i] → int (byte value, not character) */
+int64_t fastpy_bytes_get(const char *b, int64_t index) {
+    int64_t len = (int64_t)strlen(b);
+    if (index < 0) index += len;
+    if (index < 0 || index >= len) {
+        fprintf(stderr, "IndexError: bytes index out of range\n");
+        exit(1);
+    }
+    return (int64_t)(unsigned char)b[index];
+}
+
 const char* fastpy_str_slice(const char *s, int64_t start, int64_t stop, int64_t has_start, int64_t has_stop) {
     int64_t len = (int64_t)strlen(s);
     if (!has_start) start = 0;
@@ -725,6 +736,7 @@ extern int32_t fastpy_str_endswith_tuple(const char*, FpyList*);
 extern int64_t fastpy_list_index_range(FpyList*, int64_t, int64_t, int64_t);
 extern void fastpy_list_sort_key(FpyList*, void (*)(int32_t, int64_t, int32_t*, int64_t*));
 extern const char* fastpy_bytes_decode(const char*);
+extern int64_t fastpy_bytes_get(const char*, int64_t);
 extern FpyDict* fastpy_dict_fromkeys(FpyList*, int32_t, int64_t);
 extern FpyDict* fastpy_dict_fromkeys_none(FpyList*);
 extern FpyList* fastpy_float_as_integer_ratio(double);
@@ -827,6 +839,7 @@ static FpySymEntry fpy_jit_symbols[] = {
     SYM(fastpy_str_startswith_tuple), SYM(fastpy_str_endswith_tuple),
     SYM(fastpy_list_index_range), SYM(fastpy_list_sort_key),
     SYM(fastpy_bytes_decode),
+    SYM(fastpy_bytes_get),
     SYM(fastpy_dict_fromkeys), SYM(fastpy_dict_fromkeys_none),
     SYM(fastpy_str_rfind), SYM(fastpy_str_count),
     SYM(fastpy_str_startswith), SYM(fastpy_str_endswith),
