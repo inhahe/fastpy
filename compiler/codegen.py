@@ -23521,6 +23521,7 @@ class CodeGen:
                                        rtv.as_ptr(self.builder),
                                        ir.Constant(i32, _pyobj_ops[op]),
                                        out_tag, out_data])
+                self._emit_try_bail_if_exc()
                 return self._fv_build_from_slots(
                     self.builder.load(out_tag),
                     self.builder.load(out_data))
@@ -23567,6 +23568,7 @@ class CodeGen:
                            rtv.as_i64(self.builder),
                            ir.Constant(i32, op_code),
                            out_tag, out_data])
+        self._emit_try_bail_if_exc()
         return self._fv_build_from_slots(
             self.builder.load(out_tag),
             self.builder.load(out_data))
