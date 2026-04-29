@@ -150,6 +150,22 @@ const char* fastpy_str_index(const char *s, int64_t index) {
     return r->data;
 }
 
+/* bytes length — FpyBytes-aware (handles embedded null bytes) */
+int64_t fastpy_bytes_len(const char *b) {
+    return fpy_bytes_len(b);
+}
+
+/* bytes[i] → int (byte value, not character) */
+int64_t fastpy_bytes_get(const char *b, int64_t index) {
+    int64_t len = fpy_bytes_len(b);
+    if (index < 0) index += len;
+    if (index < 0 || index >= len) {
+        fprintf(stderr, "IndexError: bytes index out of range\n");
+        exit(1);
+    }
+    return (int64_t)(unsigned char)b[index];
+}
+
 const char* fastpy_str_slice(const char *s, int64_t start, int64_t stop, int64_t has_start, int64_t has_stop) {
     int64_t len = (int64_t)strlen(s);
     if (!has_start) start = 0;
@@ -232,13 +248,28 @@ const char* fastpy_str_lower(const char *s) {
 
 /* str.encode() — returns a copy of the string tagged as bytes.
  * For UTF-8 strings (the default encoding), the byte content is identical
- * to the string content, so we just strdup and let the caller tag as BYTES. */
+ * to the string content, so we just strdup and let the caller tag as BYTES.
+ * Uses FpyBytes to preserve length even if content contains null bytes. */
 const char* fastpy_str_encode(const char *s) {
     if (!s) return "";
     size_t len = strlen(s);
-    FpyString *result = fpy_str_alloc(len);
-    memcpy(result->data, s, len + 1);
-    return result->data;
+    char *result = fpy_bytes_alloc(len);
+    memcpy(result, s, len);
+    return result;
+}
+
+/* Convert bytes to a list of integers (byte values) */
+FpyList* fastpy_bytes_to_list(const char *b) {
+    if (!b) return fpy_list_new(0);
+    int64_t len = fpy_bytes_len(b);
+    FpyList *result = fpy_list_new(len > 0 ? (int64_t)len : 4);
+    for (size_t i = 0; i < len; i++) {
+        FpyValue val;
+        val.tag = 0;  /* INT */
+        val.data.i = (int64_t)(unsigned char)b[i];
+        fpy_list_append(result, val);
+    }
+    return result;
 }
 
 /* Convert int to string (for f-string formatting) */
@@ -614,6 +645,7 @@ extern void fastpy_fv_write(int32_t, int64_t);
 extern const char* fastpy_fv_repr(int32_t, int64_t);
 extern const char* fastpy_fv_str(int32_t, int64_t);
 extern int32_t fastpy_fv_truthy(int32_t, int64_t);
+extern int32_t fastpy_fv_compare(int32_t, int64_t, int32_t, int64_t, int32_t);
 extern int64_t fastpy_fv_len(int32_t, int64_t);
 extern void fastpy_fv_subscript(int32_t, int64_t, int32_t, int64_t, int32_t*, int64_t*);
 extern void fastpy_fv_binop(int32_t, int64_t, int32_t, int64_t, int32_t, int32_t*, int64_t*);
@@ -662,6 +694,78 @@ extern FpyList* fastpy_str_split(const char*);
 extern const char* fastpy_str_join(const char*, FpyList*);
 extern int64_t fastpy_str_compare(const char*, const char*);
 extern int64_t fastpy_str_find(const char*, const char*);
+extern int64_t fastpy_str_rfind(const char*, const char*);
+extern int64_t fastpy_str_count(const char*, const char*);
+extern int fastpy_str_startswith(const char*, const char*);
+extern int fastpy_str_endswith(const char*, const char*);
+extern int64_t fastpy_list_index(FpyList*, int64_t);
+extern int64_t fastpy_list_index_str(FpyList*, const char*);
+extern int64_t fastpy_list_count_str(FpyList*, const char*);
+extern void fastpy_dict_clear(FpyDict*);
+extern const char* fastpy_str_maketrans(const char*, const char*);
+extern const char* fastpy_str_translate(const char*, const char*);
+extern const char* fastpy_str_lstrip_chars(const char*, const char*);
+extern const char* fastpy_str_rstrip_chars(const char*, const char*);
+extern const char* fastpy_str_removeprefix(const char*, const char*);
+extern const char* fastpy_str_removesuffix(const char*, const char*);
+extern const char* fastpy_str_center_fill(const char*, int64_t, const char*);
+extern const char* fastpy_str_ljust_fill(const char*, int64_t, const char*);
+extern const char* fastpy_str_rjust_fill(const char*, int64_t, const char*);
+extern int fastpy_str_isupper(const char*);
+extern int fastpy_str_islower(const char*);
+extern int fastpy_str_istitle(const char*);
+extern int fastpy_str_isidentifier(const char*);
+extern int fastpy_str_isprintable(const char*);
+extern int fastpy_str_isdecimal(const char*);
+extern int fastpy_str_isnumeric(const char*);
+extern const char* fastpy_str_casefold(const char*);
+extern const char* fastpy_str_expandtabs(const char*, int64_t);
+extern FpyList* fastpy_str_partition(const char*, const char*);
+extern FpyList* fastpy_str_rpartition(const char*, const char*);
+extern void fastpy_dict_pop_fv(FpyDict*, const char*, int32_t, int64_t, int32_t*, int64_t*);
+extern FpyList* fastpy_str_rsplit(const char*, const char*, int64_t);
+extern FpyDict* fastpy_set_union(FpyDict*, FpyDict*);
+extern FpyDict* fastpy_set_intersection(FpyDict*, FpyDict*);
+extern FpyDict* fastpy_set_difference(FpyDict*, FpyDict*);
+extern FpyDict* fastpy_set_symmetric_diff(FpyDict*, FpyDict*);
+extern int32_t fastpy_set_contains_fv(FpyDict*, int32_t, int64_t);
+extern void fastpy_set_add_fv(FpyDict*, int32_t, int64_t);
+extern void fastpy_set_discard_fv(FpyDict*, int32_t, int64_t);
+extern FpyDict* fastpy_set_from_list(FpyList*);
+extern FpyList* fastpy_set_to_list(FpyDict*);
+extern int32_t fastpy_set_issubset(FpyDict*, FpyDict*);
+extern int32_t fastpy_set_issuperset(FpyDict*, FpyDict*);
+extern int32_t fastpy_set_isdisjoint(FpyDict*, FpyDict*);
+extern FpyDict* fastpy_set_copy(FpyDict*);
+extern void fastpy_set_clear(FpyDict*);
+extern void fastpy_set_pop_fv(FpyDict*, int32_t*, int64_t*);
+extern void fastpy_set_update(FpyDict*, FpyDict*);
+extern void fastpy_dict_popitem(FpyDict*, int32_t*, int64_t*, int32_t*, int64_t*);
+extern FpyDict* fastpy_dict_copy(FpyDict*);
+extern int64_t fastpy_str_index_sub(const char*, const char*);
+extern int64_t fastpy_str_rindex_sub(const char*, const char*);
+extern const char* fastpy_str_replace_count(const char*, const char*, const char*, int64_t);
+extern int64_t fastpy_str_find_range(const char*, const char*, int64_t, int64_t);
+extern int64_t fastpy_str_rfind_range(const char*, const char*, int64_t, int64_t);
+extern int64_t fastpy_str_index_sub_range(const char*, const char*, int64_t, int64_t);
+extern int64_t fastpy_str_rindex_sub_range(const char*, const char*, int64_t, int64_t);
+extern int64_t fastpy_str_count_range(const char*, const char*, int64_t, int64_t);
+extern int32_t fastpy_str_startswith_range(const char*, const char*, int64_t, int64_t);
+extern int32_t fastpy_str_endswith_range(const char*, const char*, int64_t, int64_t);
+extern int32_t fastpy_str_startswith_tuple(const char*, FpyList*);
+extern int32_t fastpy_str_endswith_tuple(const char*, FpyList*);
+extern int64_t fastpy_list_index_range(FpyList*, int64_t, int64_t, int64_t);
+extern void fastpy_list_sort_key(FpyList*, void (*)(int32_t, int64_t, int32_t*, int64_t*));
+extern const char* fastpy_bytes_decode(const char*);
+extern int64_t fastpy_bytes_get(const char*, int64_t);
+extern int64_t fastpy_bytes_len(const char*);
+extern FpyList* fastpy_bytes_to_list(const char*);
+extern void fastpy_list_mark_tuple(FpyList*);
+extern FpyDict* fastpy_dict_fromkeys(FpyList*, int32_t, int64_t);
+extern FpyDict* fastpy_dict_fromkeys_none(FpyList*);
+extern FpyList* fastpy_float_as_integer_ratio(double);
+extern const char* fastpy_int_to_bytes(int64_t, int64_t, const char*);
+extern int64_t fastpy_int_from_bytes(const char*, int64_t, const char*);
 extern const char* fastpy_int_to_str(int64_t);
 extern const char* fastpy_float_to_str(double);
 extern int64_t fastpy_pow_int(int64_t, int64_t);
@@ -711,7 +815,7 @@ extern void fpy_cpython_concat(void*, void*, int32_t*, int64_t*);
 static FpySymEntry fpy_jit_symbols[] = {
     SYM(fastpy_print_newline),
     SYM(fastpy_fv_print), SYM(fastpy_fv_write),
-    SYM(fastpy_fv_repr), SYM(fastpy_fv_str), SYM(fastpy_fv_truthy),
+    SYM(fastpy_fv_repr), SYM(fastpy_fv_str), SYM(fastpy_fv_truthy), SYM(fastpy_fv_compare),
     SYM(fastpy_fv_len), SYM(fastpy_fv_subscript), SYM(fastpy_fv_binop),
     SYM(fastpy_raise), SYM(fastpy_exc_pending), SYM(fastpy_exc_clear),
     SYM(fastpy_exc_get_type), SYM(fastpy_exc_get_msg), SYM(fastpy_exc_name_to_id),
@@ -732,6 +836,47 @@ static FpySymEntry fpy_jit_symbols[] = {
     SYM(fastpy_str_upper), SYM(fastpy_str_strip), SYM(fastpy_str_replace),
     SYM(fastpy_str_split), SYM(fastpy_str_join),
     SYM(fastpy_str_compare), SYM(fastpy_str_find),
+    SYM(fastpy_str_removeprefix), SYM(fastpy_str_removesuffix),
+    SYM(fastpy_str_center_fill), SYM(fastpy_str_ljust_fill),
+    SYM(fastpy_str_rjust_fill), SYM(fastpy_str_isupper),
+    SYM(fastpy_str_islower), SYM(fastpy_str_istitle),
+    SYM(fastpy_str_isidentifier), SYM(fastpy_str_isprintable),
+    SYM(fastpy_str_isdecimal), SYM(fastpy_str_isnumeric),
+    SYM(fastpy_str_casefold), SYM(fastpy_str_expandtabs),
+    SYM(fastpy_str_partition), SYM(fastpy_str_rpartition),
+    SYM(fastpy_dict_pop_fv), SYM(fastpy_str_rsplit),
+    SYM(fastpy_set_union), SYM(fastpy_set_intersection),
+    SYM(fastpy_set_difference), SYM(fastpy_set_symmetric_diff),
+    SYM(fastpy_set_contains_fv), SYM(fastpy_set_add_fv),
+    SYM(fastpy_set_discard_fv), SYM(fastpy_set_from_list),
+    SYM(fastpy_set_to_list),
+    SYM(fastpy_set_issubset), SYM(fastpy_set_issuperset),
+    SYM(fastpy_set_isdisjoint), SYM(fastpy_set_copy),
+    SYM(fastpy_set_clear), SYM(fastpy_set_pop_fv),
+    SYM(fastpy_set_update), SYM(fastpy_dict_popitem),
+    SYM(fastpy_dict_copy), SYM(fastpy_str_index_sub), SYM(fastpy_str_rindex_sub),
+    SYM(fastpy_str_replace_count),
+    SYM(fastpy_str_find_range), SYM(fastpy_str_rfind_range),
+    SYM(fastpy_str_index_sub_range), SYM(fastpy_str_rindex_sub_range),
+    SYM(fastpy_str_count_range),
+    SYM(fastpy_str_startswith_range), SYM(fastpy_str_endswith_range),
+    SYM(fastpy_str_startswith_tuple), SYM(fastpy_str_endswith_tuple),
+    SYM(fastpy_list_index_range), SYM(fastpy_list_sort_key),
+    SYM(fastpy_bytes_decode),
+    SYM(fastpy_bytes_get),
+    SYM(fastpy_bytes_len),
+    SYM(fastpy_bytes_to_list),
+    SYM(fastpy_list_mark_tuple),
+    SYM(fastpy_dict_fromkeys), SYM(fastpy_dict_fromkeys_none),
+    SYM(fastpy_str_rfind), SYM(fastpy_str_count),
+    SYM(fastpy_str_startswith), SYM(fastpy_str_endswith),
+    SYM(fastpy_list_index),
+    SYM(fastpy_float_as_integer_ratio),
+    SYM(fastpy_int_to_bytes), SYM(fastpy_int_from_bytes),
+    SYM(fastpy_str_lstrip_chars), SYM(fastpy_str_rstrip_chars),
+    SYM(fastpy_dict_clear), SYM(fastpy_list_index_str),
+    SYM(fastpy_list_count_str),
+    SYM(fastpy_str_maketrans), SYM(fastpy_str_translate),
     SYM(fastpy_int_to_str), SYM(fastpy_float_to_str),
     SYM(fastpy_pow_int), SYM(fastpy_pow_float), SYM(fastpy_round),
     SYM(fastpy_chr), SYM(fastpy_ord), SYM(fastpy_hex),
@@ -1227,7 +1372,8 @@ int64_t fastpy_struct_calcsize(const char *fmt) {
  * Using char* buffer (caller knows length via calcsize). */
 const char* fastpy_struct_pack(const char *fmt, FpyList *values) {
     int64_t size = fastpy_struct_calcsize(fmt);
-    char *buf = (char*)calloc(size, 1);
+    char *buf = fpy_bytes_alloc(size);
+    memset(buf, 0, size);
     const char *p = fmt;
     int big_endian = 0;
 

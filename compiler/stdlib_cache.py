@@ -65,9 +65,13 @@ def _is_c_extension_wrapper(source_path: Path) -> bool:
 def _expand_star_imports(source: str) -> str | None:
     """Try to expand star imports from C extension modules.
 
-    Replaces ``from _foo import *`` with explicit named imports by
-    importing the C extension module at compile time and enumerating
-    its ``__all__`` (or ``dir()`` for modules without ``__all__``).
+    Replaces ``from _foo import *`` with ``import _foo`` plus explicit
+    attribute assignments (``name = _foo.name``) for each public name.
+
+    We use ``import _foo`` + attribute access rather than
+    ``from _foo import name1, name2, ...`` because the codegen's CPython
+    bridge handles ``import mod; mod.func()`` correctly for C-extension
+    builtins, but ``from mod import func; func()`` crashes for them.
 
     Returns the expanded source string, or None if expansion fails
     (e.g. the C extension can't be imported).
@@ -95,12 +99,21 @@ def _expand_star_imports(source: str) -> str | None:
                     names = [n for n in dir(mod) if not n.startswith("_")]
                 if not names:
                     return None  # empty module — can't expand
-                # Replace star import with explicit named imports
-                new_names = [ast.alias(name=n) for n in sorted(names)]
-                new_node = ast.ImportFrom(
-                    module=node.module, names=new_names, level=0)
-                ast.copy_location(new_node, node)
-                new_body.append(new_node)
+                # Emit: import _foo
+                import_node = ast.Import(
+                    names=[ast.alias(name=node.module)])
+                ast.copy_location(import_node, node)
+                new_body.append(import_node)
+                # Emit: name = _foo.name  (for each exported name)
+                for name in sorted(names):
+                    assign = ast.Assign(
+                        targets=[ast.Name(id=name, ctx=ast.Store())],
+                        value=ast.Attribute(
+                            value=ast.Name(id=node.module, ctx=ast.Load()),
+                            attr=name, ctx=ast.Load()),
+                        lineno=node.lineno)
+                    ast.copy_location(assign, node)
+                    new_body.append(assign)
                 modified = True
             except (ImportError, ModuleNotFoundError):
                 return None  # can't import → can't expand
@@ -285,24 +298,12 @@ class StdlibResolver:
             candidate = self._stdlib_dir / rel
             if candidate.is_file():
                 if _is_c_extension_wrapper(candidate):
-                    source = candidate.read_text(encoding="utf-8")
-                    expanded = _expand_star_imports(source)
-                    if expanded is not None:
-                        key = str(candidate.resolve())
-                        self.expanded_sources[key] = expanded
-                        return candidate
-                    return None
+                    return None  # can't merge C-extension wrappers
                 return candidate
             rel = Path(*parts) / "__init__.py"
             candidate = self._stdlib_dir / rel
             if candidate.is_file():
                 if _is_c_extension_wrapper(candidate):
-                    source = candidate.read_text(encoding="utf-8")
-                    expanded = _expand_star_imports(source)
-                    if expanded is not None:
-                        key = str(candidate.resolve())
-                        self.expanded_sources[key] = expanded
-                        return candidate
                     return None
                 return candidate
             return None
@@ -314,31 +315,18 @@ class StdlibResolver:
         # Look for module_name.py in stdlib
         candidate = self._stdlib_dir / (module_name + ".py")
         if candidate.is_file():
-            # C-extension wrappers: try to expand star imports by
-            # importing the C extension at compile time and enumerating
-            # its exported names.  If expansion succeeds, the module can
-            # be merged with the expanded (explicit) imports.
+            # C-extension wrappers (from _foo import *) can't be merged:
+            # codegen can't call CPython bridge functions stored in variables.
+            # These stay on the CPython bridge import path.
             if _is_c_extension_wrapper(candidate):
-                source = candidate.read_text(encoding="utf-8")
-                expanded = _expand_star_imports(source)
-                if expanded is not None:
-                    key = str(candidate.resolve())
-                    self.expanded_sources[key] = expanded
-                    return candidate
-                return None  # can't expand → reject
+                return None
             return candidate
 
         # Look for package: module_name/__init__.py
         candidate = self._stdlib_dir / module_name / "__init__.py"
         if candidate.is_file():
-            # C-extension wrapper packages: try to expand star imports
             if _is_c_extension_wrapper(candidate):
-                source = candidate.read_text(encoding="utf-8")
-                expanded = _expand_star_imports(source)
-                if expanded is None:
-                    return None
-                key = str(candidate.resolve())
-                self.expanded_sources[key] = expanded
+                return None  # can't merge C-extension wrapper packages
             # Self-contained packages (no submodule imports): merge as
             # single file, treating __init__.py like a regular module.
             if _is_self_contained_package(candidate):

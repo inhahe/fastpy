@@ -10,23 +10,54 @@ defaults, *args, **kwargs, closures, nonlocal, global), classes (init,
 methods, inheritance, super, multiple inheritance, nested classes,
 full metaclass support, __slots__, staticmethod, classmethod, @property
 get/set, __new__, __init_subclass__, __class_getitem__), decorators
-(user decorators, decorators with args), @dataclass (native AST expansion),
+(user decorators, decorator chaining, decorators with args),
+@dataclass (native AST expansion),
 @singledispatch (native switch dispatch).
 
 ### Operator overloading (dunders)
-__add__, __sub__, __mul__, __neg__, __eq__, __lt__, __str__, __repr__,
-__getitem__, __setitem__, __delitem__, __len__, __bool__, __contains__,
-__iter__/__next__, __call__, __hash__.
+**Arithmetic**: __add__, __sub__, __mul__, __floordiv__, __truediv__,
+__mod__, __pow__, __matmul__, __neg__, __pos__.
+**Reverse**: __radd__, __rsub__, __rmul__, __rfloordiv__, __rtruediv__,
+__rmod__, __rpow__, __rmatmul__ (e.g. `10 + obj` dispatches __radd__).
+**Augmented**: __iadd__, __isub__, __imul__, __ifloordiv__, __itruediv__,
+__imod__, __ipow__, __imatmul__, __ior__, __iand__, __ixor__,
+__ilshift__, __irshift__.
+**Bitwise**: __and__, __or__, __xor__, __lshift__, __rshift__,
+__invert__, plus reverse variants (__rand__, __ror__, etc.).
+**Comparison**: __eq__, __ne__, __lt__, __le__, __gt__, __ge__.
+**Conversion**: __str__, __repr__, __int__, __float__, __bool__,
+__abs__, __format__.
+**Container**: __getitem__, __setitem__, __delitem__, __len__,
+__contains__, __iter__/__next__, __call__, __hash__.
 
 ### Containers
-list (literals, comprehensions, all methods), dict (literals, comprehensions,
-get, pop, setdefault, keys, values, items, update, | merge, {**a, **b}),
+list (literals, comprehensions, all methods incl. index with start/stop),
+dict (literals, comprehensions, get, pop, pop with default, popitem,
+setdefault, keys, values, items, update, copy, clear, fromkeys,
+| merge, {**a, **b}),
 tuple (literals, unpacking, *mid unpack, swap), set (literals, comprehensions,
-add, discard, remove, |, &, -, ^, in — O(1) hash table), frozenset.
+add, discard, remove, union, intersection, difference, symmetric_difference,
+issubset, issuperset, isdisjoint, copy, clear, pop, update,
+|, &, -, ^, in — O(1) hash table), frozenset.
 
 ### Strings
 f-strings (with =, !r, format specs), all common methods, % formatting,
 .format(), raw strings, string multiplication, slicing, `in` operator.
+Methods: lower, upper, strip/lstrip/rstrip, replace (with optional count),
+split, rsplit, join, find, rfind, count, index, rindex (all with optional
+start/end), startswith, endswith (with optional start/end and tuple support),
+removeprefix, removesuffix, center, ljust, rjust (with optional fill char),
+zfill, title, capitalize, swapcase, isdigit, isalpha, isalnum, isspace,
+isupper, islower, istitle, isidentifier, isprintable, isdecimal, isnumeric,
+casefold, encode, expandtabs, partition, rpartition, splitlines,
+maketrans (2-arg), translate.
+
+### Number methods
+int: bit_length, bit_count (LLVM inline — ctlz/ctpop intrinsics),
+to_bytes(length, byteorder).
+float: is_integer (LLVM inline — floor comparison),
+as_integer_ratio (C runtime — returns tuple).
+int.from_bytes(bytes, byteorder) — class method.
 
 ### Exceptions
 try/except/finally/else, raise, bare raise, raise from, multiple except
@@ -115,6 +146,484 @@ These features work correctly but use the embedded CPython interpreter:
 - **Dynamic eval()/exec()** with non-literal string arguments
 - **Other stdlib modules** not implemented natively (e.g., collections,
   itertools, functools — except singledispatch which is native)
+
+## Bugs fixed (2026-04-28, tuple repr, bytes length, dict comp filter, deque, struct, callable)
+
+### 94. Dict comprehension with tuple-unpacking target ignored if-clause filter (fixed)
+`{k: v for k, v in d.items() if v > 2}` included ALL items instead of only
+those matching the filter. The tuple-unpacking path in `_emit_dict_comprehension`
+had no filter handling — the `gen.ifs` list was completely ignored.
+Fix: Added filter handling (condition check → cbranch to skip/add blocks) in
+the tuple-unpacking dict comprehension path, matching the existing logic in
+the simple-variable path.
+
+### 93. `len()` on bytes with embedded null bytes returned 0 (fixed)
+`struct.pack(">I", 12345)` produces 4 bytes starting with `\x00\x00`. Calling
+`len()` on the result returned 0 because `fastpy_str_len` uses `strlen()` which
+stops at the first null byte.
+Root cause: Bytes were stored as raw `char*` with no length metadata. Binary
+data containing null bytes was truncated by all `strlen`-based operations.
+Fix: Added `FpyBytes` struct with explicit `length` field (alongside magic and
+refcount, like FpyString). `struct.pack` and `str.encode` now allocate via
+`fpy_bytes_alloc` which preserves the length. Added `fastpy_bytes_len` which
+checks for FpyBytes header and reads the stored length, falling back to
+`strlen` for plain strings. Updated `_emit_builtin_len` to route VKind.BYTES
+through `bytes_len` instead of `str_len`.
+
+### 92. `list(bytes_obj)` returned empty list (fixed)
+`list(b)` where `b = "hello".encode("utf-8")` returned `[]` instead of
+`[104, 101, 108, 108, 111]`. The `list()` constructor had no bytes-specific
+handler, so it fell through to the generic path which returned the bytes pointer
+as-is (not a list).
+Fix: Added `fastpy_bytes_to_list` runtime function that iterates byte values
+and builds an FpyList of ints. Added `list(bytes)` handler in codegen that
+checks the variable's type tag and dispatches to `bytes_to_list`.
+
+### 91. Tuple slicing and `tuple()` constructor returned lists (fixed)
+`t[1:4]` on a tuple printed `[20, 30, 40]` (list syntax) instead of
+`(20, 30, 40)` (tuple syntax). Similarly, `tuple(x**2 for x in range(5))`
+printed with square brackets. The `is_tuple` flag on FpyList was not
+propagated.
+Root cause: `fastpy_list_slice` and `fastpy_list_slice_step` created new
+`fpy_list_new()` results without copying `is_tuple` from the source. The
+`tuple()` constructor called `list_new` instead of `tuple_new` for empty
+tuples, and `tuple(iter)` didn't mark the result as tuple.
+Fix: (1) Propagate `is_tuple` in both slice functions; (2) `tuple()` uses
+`tuple_new`; (3) `tuple(iter)` calls `fastpy_list_mark_tuple` after building.
+
+### 90. struct module routed through CPython bridge instead of native handlers (fixed)
+`struct.pack("<HH", 1000, 2000)` followed by `struct.unpack("<HH", packed)`
+crashed with access violation (exit code 3221225477). Single-value pack/unpack
+worked but multi-value round-trips segfaulted.
+Root cause: `"struct"` was missing from the `_NATIVE_MODULES` set. The gate
+`if mod_name in self._NATIVE_MODULES` at the top of `_emit_native_module_call`
+exited early, so all struct operations fell through to the CPython bridge.
+The bridge returned `bytes` as a PyObject* which was then passed incorrectly
+to subsequent bridge calls, corrupting memory.
+Fix: Added `"struct"` to `_NATIVE_MODULES` so pack/unpack dispatch to the
+native `fastpy_struct_pack`/`fastpy_struct_unpack` runtime functions.
+Also added correct return type tags ("bytes" for pack, "tuple" for unpack)
+in `_infer_type_tag`.
+
+### 89. Deque len/for always returned 0 or empty due to VKind.LIST misdispatch (fixed)
+`len(d)` on a `collections.deque` always returned 0, and `for x in d` never
+iterated. Other deque operations (append, appendleft, popleft, extend) worked.
+Root cause: `ValueType.from_old_tag("deque")` maps to `VKind.LIST`, so both
+`_emit_builtin_len` and `_emit_for` dispatched to the list fast paths
+(`list_length` / `_emit_for_list`). But FpyDeque has a different struct layout
+than FpyList — `length` is at offset 4 (after head) in deque vs offset 2 in
+list — so `list_length` read the wrong field (always 0).
+Fix: Added explicit `_is_deque_expr()` / `tag == "deque"` checks BEFORE the
+`VKind.LIST` fast paths in both `_emit_builtin_len` and `_emit_for`, routing
+to `deque_length` and `_emit_for_deque` (which converts to list first via
+`deque_to_list`) respectively.
+
+### 88. Callable parameter monomorphization hardcoded first caller (fixed)
+`apply(func, x)` called with multiple different callables (named function,
+lambda, closure) always dispatched to the first function seen during
+call-site analysis. `apply(double, 5)` returned 10 (correct), but
+`apply(lambda x: x+1, 10)` also returned 20 (calling `double` instead of
+the lambda), and `apply(add5, 3)` segfaulted (calling `double` with a
+closure struct pointer).
+Root cause: `_param_func_map` recorded the first function name seen for
+each (func_name, param_index) pair and used it unconditionally as an alias,
+causing `_func_aliases` to map the parameter name to a single LLVM function.
+Fix: (1) call-site analysis now invalidates `_param_func_map[key] = None`
+when non-function arguments (closures, lambdas, non-Name variables) are
+passed at the same call site; (2) function body compilation tags ambiguous
+callable parameters (where `_param_func_map` is None) as `"closure"` kind
+in `self.variables`, causing them to dispatch through `call_ptr` (which
+auto-detects closure struct vs raw function pointer via `FPY_CLOSURE_MAGIC`)
+instead of being hardcoded to a single function.
+
+### 87. Multiple decorator chaining called wrong inner function (fixed)
+`@add_one @double_result def cube(x)` produced `x³*4` instead of `x³*2+1`.
+Two root causes:
+(a) Closure name collision: `_emit_nested_funcdef` found closures by suffix
+match (`full_name.endswith(".wrapper")`), so when both `double_result` and
+`add_one` defined inner functions called `wrapper`, the first match in
+`_closure_info` was always used. Fix: match by fully qualified name
+(`outer_func.inner_func`) using `_current_func_name` context.
+(b) Decorator application order: the decorator loop iterated forward
+(`[d1, d2]`) and always used the original function pointer for each
+decorator. Python semantics require bottom-up application: `@d1 @d2 def f`
+means `f = d1(d2(f))`. Fix: iterate `reversed(active_decos)` and chain
+results — each decorator receives the previous decorator's output as
+`func_ptr`, not the original function.
+
+### 86. Augmented assignment on attributes missing string/list/OBJ support (fixed)
+`self.name += " Smith"` printed a raw pointer value instead of the
+concatenated string. `self.items += [new]` and `self.vec += Vec(1,2)` also
+failed. Root cause: the attribute augmented assignment path only checked for
+`DoubleType` (float) vs everything-else (int), with no handlers for string
+concatenation, list operations, or OBJ dunder dispatch (`__iadd__` etc.).
+Fix: added string concat (pointer+pointer with Add → `str_concat`), list
+concat/repeat, and OBJ `__iadd__`/`__isub__`/etc. dispatch to the
+`ast.Attribute` target path in `_emit_aug_assign`, mirroring the existing
+`ast.Name` target dispatch.
+
+### 85. FpyValue struct in comparisons crashed with type mismatch (fixed)
+Comparisons where one operand was an FpyValue struct `{i32, i64}` (from
+tuple unpacking, `dict.get()`, etc.) and the other was a scalar (i64 or
+double) fell through to `_emit_int_compare` with mismatched types.
+Fix: expanded the FpyValue comparison handler from requiring BOTH operands
+to be FpyValue to requiring EITHER operand. The non-FpyValue side is
+converted to `(tag, data)` via `_to_tag_data_ir` and both sides are
+dispatched through `fv_compare` for runtime-tag-aware comparison.
+
+### 84. FpyValue struct in float/int binops crashed (fixed)
+`x + 0.5` where `x` came from tuple unpacking (UNKNOWN-typed) crashed
+with "Operands must be the same type, got (double, {i32, i64})". The
+FpyValue struct flowed into `_emit_float_binop` as a raw struct alongside
+a double operand. Fix: added FpyValue-to-double unwrapping at the top of
+`_emit_float_binop` (tag-aware: float→bitcast, int→sitofp), FpyValue-to-i64
+extraction in `_emit_int_binop`, and full tag-aware FpyValue handling in
+`_emit_aug_assign`. This fixed the bm_nbody benchmark compilation
+(305ms vs CPython 1058ms, ~3.5x faster).
+
+## Bugs fixed (2026-04-28, decorator application & UNKNOWN/FV arithmetic)
+
+### 83. Decorator application crashed or called original function (fixed)
+`@identity def greet(name)` crashed with access violation; `@double_result
+def square(x)` called the original function (returned 9 instead of 18).
+Three root causes:
+(a) Closure FpyValue tag: `VKind.CLOSURE.fpy_tag` returned 6 (OBJ), so
+`fpy_rc_incref` dereferred the function pointer as an FpyObj* struct.
+Fix: changed CLOSURE fpy_tag to 0 (INT) and added CLOSURE to the scalar
+fast path so refcount operations are skipped entirely.
+(b) ABI mismatch: `call_ptr1` calls functions with bare i64 ABI, but
+FV-ABI functions expect `{i32, i64}` (FpyValue) structs. When `@identity`
+returned the raw function pointer and `call_ptr1` called it, the i64
+argument was misinterpreted as a struct pointer.
+Fix: decorator application now creates an i64-ABI wrapper for FV-ABI
+functions (via `_get_or_emit_i64_wrapper`) so the function pointer stored
+in the closure variable is always i64-ABI-compatible.
+(c) Dispatch priority: `_load_or_wrap_fv` checked `self._user_functions`
+before `self.variables` for closure tag, so decorated functions were
+dispatched directly to the original LLVM function, bypassing the closure
+variable. Fix: moved closure variable check before user function check.
+Also fixed: `_emit_closure_call` now uses `call_ptr` (auto-detects closure
+vs raw pointer via magic number) instead of `closure_call` (assumes
+closure struct). The i64 wrapper now forwards the return tag via
+`set_ret_tag` for correct runtime type dispatch.
+
+### 81. dict.get() counter pattern produced float instead of int (fixed)
+`d[k] = d.get(k, 0) + 1` stored float values (printed as `5.0` instead of
+`5`). Root cause: `dict.get()` returns an FpyValue with VKind.UNKNOWN. The
+UNKNOWN BinOp path unconditionally promoted both operands to `double` via
+`sitofp`/`bitcast` and called `_emit_float_binop`, losing int-ness. Fix:
+added runtime-tag-aware branching in `_emit_binop` for UNKNOWN+INT and
+UNKNOWN+UNKNOWN operands. When the UNKNOWN tag is INT at runtime, integer
+arithmetic is used; when FLOAT, float arithmetic. The result is returned as
+an FpyValue with the correct runtime tag. Also fixed the Safety block
+fallback for FpyValue structs to use `select(is_float, bitcast, sitofp)`
+instead of always bitcasting.
+
+### 82. `int(float_param)` returned float in monomorphized functions (fixed)
+`def to_int(x): return int(x)` called with a float argument printed `3.0`
+instead of `3`. Root cause: the return-type analysis in
+`_declare_user_function` walked the entire return expression `int(x)` with
+`ast.walk`, found `x` in `float_params`, and set `ret_type = double`. It
+didn't understand that `int()` always returns an integer regardless of
+argument type. Fix: added a check for int-returning builtins (`int`, `len`,
+`ord`, `hash`, `id`, `abs`, `round`) — when the return expression is one
+of these calls, the float-parameter walk is skipped. Pre-existing bug.
+
+## Bugs fixed (2026-04-28, method returns, comprehensions & type inference)
+
+### 68. Property/method truediv return type (fixed)
+`return self._c * 9 / 5 + 32` in a property getter or method returned
+`212` (int) instead of `212.0` (float). Root cause: method return type
+analysis defaulted to `i64` and had no check for `ast.Div` (Python's `/`
+always returns float). The `double` result was silently truncated to `i64`
+via `fptosi` in `_emit_return`. Fix: added `ast.Div` detection in the
+return-expression `ast.walk` scan — any expression containing truediv
+now sets `ret_type = double`.
+
+### 69. Dict comprehension with non-range iterators (fixed)
+`{w: len(w) for w in words}` crashed when `words` was a list variable
+(not `range()`). Dict comprehensions only supported `range()` iterators,
+falling back to CPython bridge for everything else. Fix: added native
+list/tuple/set/dict/string iteration path in `_emit_dict_comprehension`.
+Properly tracks element types (string keys from string lists, dict key
+iteration yields strings). Supports filter conditions.
+
+### 70. Nested dict subscript access crashed (fixed)
+`config["database"]["host"]` crashed when `config` was a mixed-type dict
+literal (`{"database": {...}, "debug": True}`). Root cause: chained
+subscript `config["database"]["host"]` — `_is_dict_expr` didn't check
+per-key types from `_dict_var_key_types`, so the intermediate subscript
+wasn't recognized as a dict. Fix: (a) added per-key type lookup to
+`_is_dict_expr` for subscripts on dicts with per-key type info;
+(b) extended `_infer_constant_value_type` to recognize dict/list/tuple/set
+literals and user class constructors, so mixed-type dict per-key maps
+include container values.
+
+### 71. Keyword-only args after `*args` (fixed)
+`def f(*args, sep=", "):` — keyword-only parameters after `*args` were
+not included in the function signature, causing missing arguments at call
+sites. Fix: comprehensive update across declaration (both vararg-only and
+mixed-vararg paths), body (FV local storage with correct type inference),
+and call-site emission (keyword matching with default fallback). The
+`FuncInfo` dataclass gained `n_kwonly` to track kwonly parameter count.
+
+### 72. Mixed vararg positional param type inference (fixed)
+`def show(msg, *args):` where `msg` was a string — positional params in
+mixed-vararg functions defaulted to `i64` even when call-site analysis
+returned "str". Fix: added full type checking for positional params in
+the mixed-vararg declaration path (str/list/dict/obj → i8_ptr).
+
+### 73. Nested tuple unpacking (fixed)
+`(a, b), c = (1, 2), 3` and similar nested tuple targets crashed or
+silently failed. Fix: added recursive `_emit_tuple_unpack` calls for
+`ast.Tuple`/`ast.List` targets in both the direct-tuple and list-unpack
+paths. Supports arbitrary nesting depth.
+
+### 74. `super().__init__()` type propagation (fixed)
+`super().__init__("circle")` in a child class constructor — the parent's
+`name` parameter was typed as "int" because the heuristic child→parent
+propagation (`Circle(5)` → `Shape(5)`) ran first and wasn't overridden.
+Fix: added explicit super() call scanning that propagates argument types
+to parent class/method, with unconditional override (super() args are
+more accurate than the heuristic propagation).
+
+### 75. Dict `in` operator: string variable dispatch (fixed)
+`x = "hello"; print(x in cache)` inside a function printed `False` instead
+of `True`. Root cause: FV-backed string variables are loaded as i64 (data
+field of FpyValue), so `isinstance(left_val.type, ir.IntType)` was True,
+routing through `dict_has_int_key` (integer hash table) instead of
+`dict_has_key` (string hash table). Fix: pass `left_kind` (VKind from
+TypedValue) from `_emit_compare` into `_emit_in_compare`; when
+`left_kind == VKind.STR`, convert i64 → i8* via inttoptr and use
+`dict_has_key`.
+
+### 76. Global containers invisible inside functions (fixed)
+Global dicts, sets, tuples accessed inside functions were not recognized
+by `_infer_type_tag`, `_is_dict_expr`, `_is_set_expr`, `_is_tuple_expr`
+because these only checked `self.variables` (function-scoped, starts empty)
+and not `self._global_vars`. Fix: all four functions now check
+`_global_vars` as fallback when the variable is not in `self.variables`.
+Also fixed `_is_set_expr` fallback (was completely missing).
+
+### 77. Global set/tuple variables declared as i64 (fixed)
+`valid = {"a", "b", "c"}` at module level — when referenced from a
+function, the auto-created global variable was `i64` with tag "int"
+because `global_types` had no case for `ast.Set`/`ast.SetComp`/`ast.Tuple`.
+The pointer was stored via `ptrtoint` into i64, but type info was lost.
+Fix: added set/tuple detection to `global_types` dictionary, and added
+"set"/"tuple" to the pointer-type checks in both global creation blocks.
+
+### 78. `type(x) == int` always returned False (fixed)
+`type(x) == int`, `type(x) is str`, etc. always returned `False` because
+`type()` returned a CPython type object pointer that didn't compare equal
+to the builtin type name (also a CPython object). Fix: added
+`_try_fold_type_compare` that pattern-matches `type(arg) == <builtin>`
+and folds to a compile-time constant when the argument's VKind is known.
+Supports `==`, `!=`, `is`, `is not` with all builtin types (int, float,
+str, bool, list, dict, set, tuple, bytes, complex). For FV-backed
+variables with unknown compile-time type, emits a runtime FpyValue tag
+check.
+
+### 79. `int(string_param)` returned raw pointer (fixed)
+`int(s)` where `s` is an FV-backed string parameter returned the raw
+pointer value instead of parsing the string. Root cause: the FV-backed
+`int()` path only checked for `FPY_TAG_FLOAT` (float→int conversion) and
+fell through to returning `fv_data` as-is for all other tags. For string
+values, `fv_data` is `ptrtoint(str_ptr)`, not a parseable integer.
+Fix: added 3-way runtime branch — float tag → `fptosi`, string tag →
+`str_to_int(inttoptr(data))`, else → return data directly.
+
+### 80. `float(string_param)` returned raw pointer bits (fixed)
+Same pattern as bug #79 for `float()`. FV-backed string parameters hit
+the `isinstance(val.type, ir.IntType)` path which called `sitofp`,
+interpreting the raw pointer bits as an integer and converting to float.
+Fix: added 3-way FV runtime branch — str tag → `str_to_float`, float
+tag → bitcast, else (int/bool) → `sitofp`.
+
+## New methods (2026-04-28, method coverage expansion)
+
+### 43. `int.bit_length()` and `int.bit_count()` (new)
+Compiled inline using LLVM intrinsics `llvm.ctlz` (count leading zeros)
+and `llvm.ctpop` (population count). Both handle negative values via
+`abs()` before counting. Zero special-cased for `bit_length`.
+Note: `llvm.ctlz` requires explicit `fnty` parameter with 2-arg signature
+`(i64, i1)` — `declare_intrinsic` alone generates a 1-arg function.
+
+### 44. `float.is_integer()` (new)
+Compiled inline using `llvm.floor` intrinsic: `floor(x) == x`. Returns
+`i32` (not `i64`) so `_fv_wrap` correctly tags the result as BOOL
+(prints `True`/`False` not `1`/`0`).
+
+### 45. Seven new string methods (new)
+`str.rsplit(sep, maxsplit)`, `str.casefold()`, `str.istitle()`,
+`str.isidentifier()`, `str.isprintable()`, `str.isdecimal()`,
+`str.isnumeric()`. All with C runtime implementations and codegen dispatch.
+
+### 46. Full set method dispatch (new)
+`set.union()`, `set.intersection()`, `set.difference()`,
+`set.symmetric_difference()`, `set.issubset()`, `set.issuperset()`,
+`set.isdisjoint()`, `set.copy()`, `set.clear()`, `set.pop()`,
+`set.update()`. Runtime functions for issubset/issuperset/isdisjoint/
+copy/clear/pop/update are new. Union/intersection/difference/symmetric_diff
+existed in runtime but had no codegen dispatch.
+
+### 47. `dict.popitem()`, `dict.copy()` (new)
+`dict.popitem()` removes and returns the last (key, value) pair as a
+tuple. `dict.copy()` returns a shallow copy with correct "dict" type tag.
+Also fixed: `_infer_type_tag` and `_is_dict_expr` now recognize
+`dict.copy()` return type, and `_is_set_expr` recognizes set method
+return types.
+
+### 48. `dict.pop(key, default)` two-argument form (new)
+`d.pop("key", fallback)` returns the value if found, or the default.
+Uses `dict_pop_fv` with FpyValue-based default via out parameters.
+
+### 49. `str.index()`, `str.rindex()` (new)
+Like `str.find()`/`str.rfind()` but raise `ValueError` when substring
+is not found. Uses `fastpy_str_index_sub`/`fastpy_str_rindex_sub`
+C runtime functions (different names from `str_index` which is used
+for subscript indexing `s[i]`).
+
+### 50. `str.replace(old, new, count)` three-argument form (new)
+`s.replace("a", "x", 2)` replaces at most `count` occurrences.
+Uses `fastpy_str_replace_count` C runtime function.
+
+### 51. String methods with `start`/`end` parameters (new)
+`str.find(sub, start, end)`, `str.rfind(sub, start, end)`,
+`str.count(sub, start, end)`, `str.index(sub, start, end)`,
+`str.rindex(sub, start, end)`, `str.startswith(prefix, start, end)`,
+`str.endswith(suffix, start, end)`. All use `_range` C runtime
+variants with Python-style negative index clamping.
+
+### 52. `str.startswith(tuple)`, `str.endswith(tuple)` (new)
+`s.startswith(("http", "ftp"))` checks any prefix in the tuple.
+Uses `fastpy_str_startswith_tuple`/`fastpy_str_endswith_tuple` runtime
+functions that iterate an FpyList of prefixes/suffixes.
+
+### 53. `list.index(value, start, stop)` with range (new)
+`lst.index(20, 2)` and `lst.index(20, 2, 4)` search within a slice.
+Raises `ValueError` if not found (matching CPython behavior).
+
+### 54. `bytes.decode()` (new)
+`b"hello".decode()` returns a string. For ASCII/UTF-8 content, the
+bytes are the string (zero-copy for compatible encodings).
+
+### 55. `dict.fromkeys(keys)` and `dict.fromkeys(keys, value)` (new)
+Class method to create a dict from an iterable of keys. Default value
+is `None` when not specified.
+
+### 56. `float.as_integer_ratio()` (new)
+Returns the exact integer ratio as a `(numerator, denominator)` tuple.
+C runtime implementation using `frexp()` decomposition with GCD
+simplification. Handles 0.0, raises ValueError for NaN/Inf.
+
+### 57. `int.to_bytes(length, byteorder)` (new)
+Converts an integer to a bytes string of the given length. Supports
+`"big"` and `"little"` byteorder. Note: bytes with embedded `\x00`
+may truncate due to null-terminated char* representation.
+
+### 58. `int.from_bytes(bytes, byteorder)` (new)
+Class method to convert a bytes string to an integer. Supports
+`"big"` and `"little"` byteorder.
+
+### 59. `list.sort(key=...)` fix (fixed)
+Previously, `list.sort(key=len)` would silently ignore the `key=`
+parameter and sort by natural ordering. Now correctly detected and
+falls through to CPython bridge for correct key-based sorting.
+
+### 60. `str.lstrip(chars)`, `str.rstrip(chars)` (new)
+`str.lstrip("xy")` and `str.rstrip("xy")` with character set argument.
+Previously only the no-args (whitespace) versions were supported.
+
+### 61. `dict.clear()` (new)
+Resets dict length to 0 and clears the index table. Was listed as
+implemented in the Containers section but had no actual codegen
+dispatch or runtime function.
+
+### 62. `list.index(str)`, `list.count(str)` (new)
+String-value versions of `list.index` and `list.count`. Previously
+only worked with int values. Now dispatches to `list_index_str` /
+`list_count_str` when the argument is a pointer type (string).
+
+### 63. `str.maketrans()` and `str.translate()` (new)
+`str.maketrans("aeiou", "12345")` creates a 257-byte translation
+table (magic byte + 256-char mapping). `s.translate(table)` applies
+it. Table uses offset-1 indexing to avoid null-byte C string issues.
+Supports the 2-arg form of maketrans (from/to character mapping).
+
+### 64. Comprehensive operator overloading (new)
+Full dunder dispatch for user classes. Forward operators (__add__ etc.)
+dispatch via `obj_call_method1`. Reverse operators (__radd__ etc.)
+dispatch when the right operand is an object and the left is a scalar.
+Augmented assignment (__iadd__ etc.) dispatches in `_emit_aug_assign`.
+Bitwise operators (__and__, __or__, __xor__, __lshift__, __rshift__,
+__invert__) dispatch through the same mechanism. `int(obj)` → __int__,
+`float(obj)` → __float__ (uses double-returning ABI variant
+`obj_call_method0_double`). `f"{obj:spec}"` → __format__ with fallback
+to __str__ + format_spec_str.
+
+### 65. Context manager exception suppression (fixed)
+`with` statement now checks __exit__ return value. If __exit__ returns
+a truthy value and there is a pending exception, the exception is
+cleared (suppressed). Works for both native FpyObj and PyObject bridge
+context managers.
+
+### 66. `repr(obj)` and `str(obj)` dunder dispatch (new)
+`repr(obj)` now dispatches to `__repr__` (falls back to `__str__`,
+then `<ClassName object>`). `str(obj)` dispatches to `__str__`.
+Previously both used `__str__`. Runtime: `fastpy_obj_to_repr` for repr,
+`fastpy_obj_to_str` for str. Also fixed `fastpy_fv_str` OBJ case to
+call `__str__` directly (was routing through `fpy_value_repr` which
+now calls `__repr__`). CPython bridge PyObject* values use
+`PyObject_Repr` for repr.
+
+### 67. Mixed-type runtime comparison (`fastpy_fv_compare`) (new)
+Functions called with both int and str arguments at different call sites
+now compare correctly. Added `fastpy_fv_compare(tag1, data1, tag2, data2, op)`
+runtime function that dispatches based on runtime tags: STR uses strcmp,
+FLOAT uses double comparison, INT uses i64 comparison. Codegen detects
+"mixed"-tagged variables via `_is_mixed_var()` and re-loads the full
+FpyValue (with runtime tag) for comparison instead of using the raw i64
+data extracted by `_emit_expr_value`. Fixes the `test_bisect` grade
+example and similar patterns.
+
+## Bugs fixed (2026-04-28, bridge dispatch & string methods)
+
+### 39. `len()` on bytes literals crashed (fixed)
+`len(b"hello")` caused an access violation. `_emit_builtin_len` had no
+handler for `VKind.BYTES` — it fell through to `cpython_len` which
+expects a PyObject*, but bytes are stored as native `char*` pointers.
+Fix: Added `VKind.BYTES` alongside `VKind.STR` in the `str_len` fast path.
+
+### 40. Bridge call results crashed on `len()`, `print()`, and other builtins (fixed)
+`from _struct import pack; data = pack('i', 42); len(data)` crashed.
+Bridge calls return FpyValue structs (tag+data) stored in `{i32, i64}`
+allocas, but PYOBJ-tagged variables were treated as raw PyObject*
+pointers. `len()` passed the FpyValue data field (a native bytes
+pointer) to `cpython_len` (expects PyObject*). Same crash with `print()`.
+Fix: Extended `_emit_builtin_len`, `_emit_print_single`, and
+`_load_or_wrap_fv` to check `_load_fv_raw` before assuming a raw pointer.
+FpyValue-backed PYOBJ variables now route through `fv_len`/`fv_print`
+runtime dispatch, which correctly handles all native types.
+
+### 41. Missing string methods: removeprefix, removesuffix, and 8 others (fixed)
+`str.removeprefix()` and `str.removesuffix()` (Python 3.9+) crashed
+because no codegen handler existed. Also missing: `center`/`ljust`/
+`rjust` with fill character, `isupper`, `islower`, `expandtabs`,
+`partition`, `rpartition`.
+Fix: Added C runtime implementations for all 10 methods and codegen
+dispatch. Fill-character versions use separate `_fill` variants.
+`partition`/`rpartition` return 3-element tuples (FpyList with
+`is_tuple=1`).
+
+### 42. Source merger didn't prefix from-import names (fixed)
+`_prefix_module_defs` only prefixed FunctionDef, ClassDef, and Assign.
+Names introduced by `from X import Y` were not prefixed, so dotted
+access after merging (`module.func` → `module__func`) couldn't find
+the imported names.
+Fix: Added ImportFrom handling to `_prefix_module_defs` — each imported
+name is added to `top_names`, and the import statement is rewritten
+with `as` aliases (e.g. `from _foo import bar as prefix__bar`).
 
 ## Bugs fixed (2026-04-28, type dispatch & merger)
 
@@ -610,10 +1119,16 @@ Systematic comparison against the Python 3.14 PEG grammar (`Grammar/python.gram`
 
 - **C-extension wrapper modules rejected** — Stdlib modules whose public
   API comes from `from _foo import *` (e.g. `ast`, `collections`, `json`,
-  `operator`, `functools`) cannot be source-merged. The merger's name
-  prefixing (`ast__Constant`) fails because star-imported names are not
-  enumerable at compile time. Detected by `_is_c_extension_wrapper()` in
-  `stdlib_cache.py`.
+  `operator`, `functools`) cannot be source-merged. Star-imported names
+  ARE enumerable at compile time (via `__import__` + `__all__`/`dir()`),
+  and `_expand_star_imports()` in `stdlib_cache.py` can expand them to
+  explicit imports. However, the codegen can't call CPython bridge
+  functions stored in variables — `pack = _struct.pack; pack('i', 42)`
+  crashes because the codegen treats the variable as a native function
+  reference, not a PyObject* callable. Until `from X import Y` for C
+  extension builtins (or calling PyObject* through variables) is fixed
+  in codegen, these modules stay on the CPython bridge import path.
+  Detected by `_is_c_extension_wrapper()` in `stdlib_cache.py`.
 
 ### Self-hosting status (2026-04-28)
 

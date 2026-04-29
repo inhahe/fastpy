@@ -263,7 +263,7 @@ def test_django_template():
 # ---------------------------------------------------------------------------
 
 # Import the test dictionaries from test_all_stdlib
-from tests.test_all_stdlib import BRIDGE_TESTS, PYTHON_TESTS
+from tests.scripts.all_stdlib import BRIDGE_TESTS, PYTHON_TESTS
 
 _ALL_STDLIB_IMPORT_TESTS: dict[str, str] = {}
 _ALL_STDLIB_IMPORT_TESTS.update(BRIDGE_TESTS)

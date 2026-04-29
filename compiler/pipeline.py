@@ -311,13 +311,7 @@ def _resolve_and_merge(source: str, base_dir: Path,
 
         if mod_key not in _visited:
             _visited.add(mod_key)
-            # Use star-import-expanded source if the resolver produced one
-            if (_stdlib_resolver is not None
-                    and hasattr(_stdlib_resolver, 'expanded_sources')
-                    and mod_key in _stdlib_resolver.expanded_sources):
-                mod_source = _stdlib_resolver.expanded_sources[mod_key]
-            else:
-                mod_source = mod_path.read_text(encoding="utf-8")
+            mod_source = mod_path.read_text(encoding="utf-8")
             mod_base = mod_path.parent
             # Pass stdlib resolver through so transitive stdlib imports
             # can also be merged if they are cached as compilable.
@@ -409,6 +403,15 @@ def _prefix_module_defs(source: str, prefix: str) -> str:
         elif isinstance(node, ast.Assign) and len(node.targets) == 1:
             if isinstance(node.targets[0], ast.Name):
                 top_names[node.targets[0].id] = f"{prefix}__{node.targets[0].id}"
+        elif isinstance(node, ast.ImportFrom):
+            # Names imported from other modules (e.g. from _struct import pack)
+            # must also be prefixed so that user code referencing them via
+            # the module's dotted access (struct.pack → struct__pack) works.
+            for alias in node.names:
+                if alias.name == "*":
+                    continue  # star imports should have been expanded already
+                local = alias.asname if alias.asname else alias.name
+                top_names[local] = f"{prefix}__{local}"
 
     if not top_names:
         return source
@@ -428,6 +431,14 @@ def _prefix_module_defs(source: str, prefix: str) -> str:
             if node.name in top_names:
                 node.name = top_names[node.name]
             self.generic_visit(node)
+            return node
+        def visit_ImportFrom(self, node):
+            # Rewrite import aliases to use prefixed names:
+            # from _foo import bar → from _foo import bar as prefix__bar
+            for alias in node.names:
+                local = alias.asname if alias.asname else alias.name
+                if local in top_names:
+                    alias.asname = top_names[local]
             return node
 
     tree = NamePrefixer().visit(tree)
@@ -568,16 +579,9 @@ def _find_compilable_stdlib(module_name: str,
     if compilable is not None:
         return stdlib_path if compilable else None
 
-    # Cache miss — test-compile the module.
-    # If the resolver expanded star imports for this module, pass the
-    # expanded source so test_compilability uses it instead of the raw file.
+    # Cache miss — test-compile the module
     from compiler.stdlib_cache import test_compilability
-    expanded = None
-    key = str(stdlib_path.resolve())
-    if hasattr(resolver, 'expanded_sources') and key in resolver.expanded_sources:
-        expanded = resolver.expanded_sources[key]
-    ok, prefixed, error = test_compilability(module_name, stdlib_path,
-                                             expanded_source=expanded)
+    ok, prefixed, error = test_compilability(module_name, stdlib_path)
     cache.put(module_name, stdlib_path, ok,
               prefixed_source=prefixed, error=error)
     return stdlib_path if ok else None

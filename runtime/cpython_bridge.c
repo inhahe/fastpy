@@ -2227,6 +2227,21 @@ const char* fpy_bridge_pyobj_str(void *ptr) {
     return result;
 }
 
+/* Convert a CPython PyObject* to its repr() representation.
+ * Returns a newly allocated C string (caller must free). */
+const char* fpy_bridge_pyobj_repr(void *ptr) {
+    if (!ptr) return fpy_strdup("None");
+    PyObject *r = PyObject_Repr((PyObject*)ptr);
+    if (!r) {
+        PyErr_Clear();
+        return fpy_strdup("<object>");
+    }
+    const char *utf8 = PyUnicode_AsUTF8(r);
+    const char *result = fpy_strdup(utf8 ? utf8 : "<object>");
+    Py_DECREF(r);
+    return result;
+}
+
 /* ── PyObject* comparison ─────────────────────────────────────────
  * Compare two PyObject* values using Python's rich comparison.
  * op: 0=Eq, 1=NotEq, 2=Lt, 3=LtE, 4=Gt, 5=GtE

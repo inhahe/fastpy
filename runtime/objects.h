@@ -210,12 +210,21 @@ struct FpyList {
  * existing code sees a normal const char*. To check if a string is
  * owned, look for the magic 8 bytes before the char data. */
 #define FPY_STR_MAGIC 0x53545243  /* "STRC" */
+#define FPY_BYTES_MAGIC 0x42595445  /* "BYTE" */
 
 typedef struct {
     int32_t magic;      /* FPY_STR_MAGIC */
     int32_t refcount;
     char data[];        /* flexible array member — null-terminated UTF-8 */
 } FpyString;
+
+/* Binary bytes buffer with explicit length (can contain null bytes) */
+typedef struct {
+    int32_t magic;      /* FPY_BYTES_MAGIC */
+    int32_t refcount;
+    int64_t length;     /* number of data bytes */
+    char data[];        /* raw bytes (NOT null-terminated) */
+} FpyBytes;
 
 /* Allocate a refcounted string of `len` chars (+ null terminator). */
 FpyString* fpy_str_alloc(int64_t len);
@@ -232,6 +241,27 @@ static inline int fpy_str_decref(const char *s) {
     FpyString *h = fpy_str_header(s);
     if (!h || h->refcount == FPY_RC_IMMORTAL) return 0;
     return (--h->refcount == 0);  /* returns 1 if should be freed */
+}
+
+/* Allocate an FpyBytes buffer of `len` bytes. Returns pointer to data[]. */
+static inline char* fpy_bytes_alloc(int64_t len) {
+    FpyBytes *b = (FpyBytes*)malloc(sizeof(FpyBytes) + len + 1);
+    b->magic = FPY_BYTES_MAGIC;
+    b->refcount = 1;
+    b->length = len;
+    b->data[len] = '\0';  /* null-terminate for C compat */
+    return b->data;
+}
+/* Get the FpyBytes header from a char* data pointer. Returns NULL if not bytes. */
+static inline FpyBytes* fpy_bytes_header(const char *s) {
+    FpyBytes *h = (FpyBytes*)((char*)s - offsetof(FpyBytes, data));
+    return (h->magic == FPY_BYTES_MAGIC) ? h : NULL;
+}
+/* Get bytes length (FpyBytes-aware, falls back to strlen for plain strings) */
+static inline int64_t fpy_bytes_len(const char *s) {
+    FpyBytes *bh = fpy_bytes_header(s);
+    if (bh) return bh->length;
+    return (int64_t)strlen(s);  /* fallback for plain char* */
 }
 
 /* --- Value constructors --- */
