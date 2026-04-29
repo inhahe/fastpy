@@ -275,6 +275,9 @@ static inline FpyValue fpy_float(double v) {
 static inline FpyValue fpy_str(const char *v) {
     FpyValue val; val.tag = FPY_TAG_STR; val.data.s = v; return val;
 }
+static inline FpyValue fpy_bytes_val(const char *v) {
+    FpyValue val; val.tag = FPY_TAG_BYTES; val.data.s = v; return val;
+}
 static inline FpyValue fpy_bool(int v) {
     FpyValue val; val.tag = FPY_TAG_BOOL; val.data.b = v; return val;
 }

@@ -831,6 +831,19 @@ void fastpy_fv_binop(int32_t lt, int64_t ld, int32_t rt, int64_t rd,
         *out_data = (int64_t)(intptr_t)result;
         return;
     }
+    if ((lt == FPY_TAG_INT || lt == FPY_TAG_BOOL) && rt == FPY_TAG_BYTES && op == 2) {
+        const char *a = (const char*)(intptr_t)rd;
+        size_t la = a ? strlen(a) : 0;
+        int64_t n = ld > 0 ? ld : 0;
+        size_t total = la * (size_t)n;
+        char *result = (char*)malloc(total + 1);
+        for (int64_t i = 0; i < n; i++)
+            memcpy(result + i * la, a, la);
+        result[total] = '\0';
+        *out_tag = FPY_TAG_BYTES;
+        *out_data = (int64_t)(intptr_t)result;
+        return;
+    }
     /* OBJ + OBJ or OBJ + any → delegate to CPython PyNumber_* */
     if (lt == FPY_TAG_OBJ || rt == FPY_TAG_OBJ) {
         /* Use fpy_cpython_binop/rbinop via bridge */
@@ -1246,6 +1259,24 @@ FpyList* fastpy_str_split(const char *s) {
         memcpy(word, start, len);
         word[len] = '\0';
         fpy_list_append(result, fpy_str(word));
+    }
+    return result;
+}
+
+/* bytes.split() — same as str_split but tags results as BYTES */
+FpyList* fastpy_bytes_split(const char *s) {
+    FpyList *result = fpy_list_new(8);
+    const char *p = s;
+    while (*p) {
+        while (*p && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')) p++;
+        if (!*p) break;
+        const char *start = p;
+        while (*p && *p != ' ' && *p != '\t' && *p != '\n' && *p != '\r') p++;
+        int64_t len = p - start;
+        char *word = (char*)malloc(len + 1);
+        memcpy(word, start, len);
+        word[len] = '\0';
+        fpy_list_append(result, fpy_bytes_val(word));
     }
     return result;
 }
@@ -2891,6 +2922,12 @@ FpyList* fastpy_str_splitlines(const char *s) {
     return result;
 }
 
+/* str.rsplit() — split on whitespace (no args). Result is identical to
+   str.split() since without maxsplit, order is the same. */
+FpyList* fastpy_str_rsplit_ws(const char *s) {
+    return fastpy_str_split(s);
+}
+
 /* str.rsplit(sep, maxsplit) — split from the right */
 FpyList* fastpy_str_rsplit(const char *s, const char *sep, int64_t max_split) {
     size_t s_len = strlen(s);
@@ -3181,11 +3218,15 @@ int64_t fastpy_list_index_str(FpyList *list, const char *value) {
     return -1;
 }
 
-/* List count — count occurrences */
+/* List count — count occurrences.
+   Python semantics: True == 1 and False == 0, so list.count(True)
+   counts both True and 1, and list.count(1) counts both 1 and True. */
 int64_t fastpy_list_count(FpyList *list, int64_t value) {
     int64_t count = 0;
     for (int64_t i = 0; i < list->length; i++) {
-        if (list->items[i].tag == FPY_TAG_INT && list->items[i].data.i == value) {
+        int32_t t = list->items[i].tag;
+        if ((t == FPY_TAG_INT || t == FPY_TAG_BOOL)
+            && list->items[i].data.i == value) {
             count++;
         }
     }

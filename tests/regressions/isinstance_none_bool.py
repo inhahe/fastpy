@@ -20,11 +20,27 @@ assert isinstance(42, bytes) == False
 assert (None == 0) == False
 assert (None == False) == False
 assert (None == 1) == False
-# Note: None == "" still crashes (mixed None/STR comparison needs runtime dispatch)
 assert (None == None) == True
 assert (0 == None) == False
 assert (None != 0) == True
 assert (None != None) == False
+
+# Bug #119: None compared with pointer types crashed (null ptr deref)
+assert (None == "") == False
+assert (None == "hello") == False
+assert ("" == None) == False
+assert ("hello" == None) == False
+assert (None != "") == True
+assert (None == []) == False
+assert ([] == None) == False
+assert (None == ()) == False
+assert (() == None) == False
+assert (None == {1}) == False
+assert ({1} == None) == False
+assert (None == {}) == False
+assert ({} == None) == False
+assert (None == 0.0) == False
+assert (0.0 == None) == False
 
 # --- __bool__ dunder fix ---
 class Truthy:

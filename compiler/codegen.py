@@ -1306,6 +1306,8 @@ class CodeGen:
         ft = ir.FunctionType(i8_ptr, [i8_ptr, i8_ptr, i64])
         self.runtime["str_rsplit"] = ir.Function(self.module, ft, name="fastpy_str_rsplit")
         ft = ir.FunctionType(i8_ptr, [i8_ptr])
+        self.runtime["str_rsplit_ws"] = ir.Function(self.module, ft, name="fastpy_str_rsplit_ws")
+        self.runtime["bytes_split"] = ir.Function(self.module, ft, name="fastpy_bytes_split")
         self.runtime["str_strip"] = ir.Function(self.module, ft, name="fastpy_str_strip")
         self.runtime["str_lstrip"] = ir.Function(self.module, ft, name="fastpy_str_lstrip")
         self.runtime["str_rstrip"] = ir.Function(self.module, ft, name="fastpy_str_rstrip")
@@ -13391,6 +13393,12 @@ class CodeGen:
         if isinstance(node, ast.BoolOp):
             if all(self._is_bool_typed(v) for v in node.values):
                 return "bool"
+        # bool & bool, bool | bool, bool ^ bool → bool (Python semantics)
+        if (isinstance(node, ast.BinOp)
+                and isinstance(node.op, (ast.BitAnd, ast.BitOr, ast.BitXor))
+                and self._is_bool_typed(node.left)
+                and self._is_bool_typed(node.right)):
+            return "bool"
         # Attribute access: detect container (list/dict) and object attrs
         # so len(), print, and binops dispatch correctly.
         if isinstance(node, ast.Attribute):
@@ -13520,6 +13528,32 @@ class CodeGen:
         if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
                 and node.func.attr == "decode"):
             return "str"
+        # bytes.method() that returns bytes (upper, lower, strip, replace, etc.)
+        _bytes_to_bytes_methods = {"upper", "lower", "strip", "lstrip", "rstrip",
+                                   "replace", "split", "join", "find", "rfind",
+                                   "count", "startswith", "endswith"}
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr in _bytes_to_bytes_methods):
+            recv = node.func.value
+            if isinstance(recv, ast.Constant) and isinstance(recv.value, bytes):
+                # Direct method on bytes literal
+                if node.func.attr in ("split",):
+                    return "list:int"  # split returns list
+                if node.func.attr in ("find", "rfind", "count"):
+                    return "int"
+                if node.func.attr in ("startswith", "endswith"):
+                    return "bool"
+                return "bytes"
+            if isinstance(recv, ast.Name):
+                vk = self._var_kind(recv.id) if recv.id in self.variables else None
+                if vk == VKind.BYTES:
+                    if node.func.attr in ("split",):
+                        return "list:int"
+                    if node.func.attr in ("find", "rfind", "count"):
+                        return "int"
+                    if node.func.attr in ("startswith", "endswith"):
+                        return "bool"
+                    return "bytes"
         # Native module method calls: json.loads(...), os.getcwd(), etc.
         if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)):
@@ -13646,6 +13680,19 @@ class CodeGen:
         if (isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr)
                 and self._is_dict_expr(node.left) and self._is_dict_expr(node.right)):
             return "dict"
+        # bytes * int, int * bytes → bytes; bytes + bytes → bytes
+        if isinstance(node, ast.BinOp):
+            def _is_bytes(n):
+                if isinstance(n, ast.Constant) and isinstance(n.value, bytes):
+                    return True
+                if isinstance(n, ast.Name) and n.id in self.variables:
+                    return self._var_kind(n.id) == VKind.BYTES
+                return False
+            if isinstance(node.op, ast.Mult):
+                if _is_bytes(node.left) or _is_bytes(node.right):
+                    return "bytes"
+            if isinstance(node.op, ast.Add) and _is_bytes(node.left) and _is_bytes(node.right):
+                return "bytes"
         # Path / str → path
         if (isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div)
                 and self._is_path_expr(node.left)):
@@ -13662,6 +13709,19 @@ class CodeGen:
                 return False
             if _is_dec(node.left) or _is_dec(node.right):
                 return "decimal"
+        # Subscript on bytes: slice → bytes, index → int
+        if isinstance(node, ast.Subscript):
+            recv = node.value
+            is_bytes_recv = False
+            if isinstance(recv, ast.Constant) and isinstance(recv.value, bytes):
+                is_bytes_recv = True
+            elif (isinstance(recv, ast.Name) and recv.id in self.variables
+                    and self._var_kind(recv.id) == VKind.BYTES):
+                is_bytes_recv = True
+            if is_bytes_recv:
+                if isinstance(node.slice, ast.Slice):
+                    return "bytes"
+                return "int"  # single index returns byte value
         # Subscript on pyobj: result is also pyobj (chained bridge operations)
         if isinstance(node, ast.Subscript):
             if (isinstance(node.value, ast.Name)
@@ -19134,8 +19194,18 @@ class CodeGen:
 
                 # --- VKind-based fast path dispatch ---
 
+                # NONE comparison: None == None → True; None == <anything> → False.
+                # Must be the first check because None is i64(0) and would
+                # otherwise match type-specific handlers (STR, LIST, etc.)
+                # that dereference the None operand as a null pointer.
+                if (left_kind == VKind.NONE or tv_right.vtype.kind == VKind.NONE):
+                    if left_kind == VKind.NONE and tv_right.vtype.kind == VKind.NONE:
+                        cmp = ir.Constant(ir.IntType(1), 1 if isinstance(op, ast.Eq) else 0)
+                    else:
+                        cmp = ir.Constant(ir.IntType(1), 1 if isinstance(op, ast.NotEq) else 0)
+
                 # OBJ comparison: dispatch to __eq__/__ne__/__lt__/__le__/__gt__/__ge__
-                if (left_kind == VKind.OBJ
+                elif (left_kind == VKind.OBJ
                         and isinstance(op, (ast.Eq, ast.NotEq, ast.Lt,
                                             ast.LtE, ast.Gt, ast.GtE))
                         and isinstance(cmp_left.type, ir.PointerType)):
@@ -19259,6 +19329,17 @@ class CodeGen:
                         cmp = self.builder.icmp_signed(">", cmp_result, ir.Constant(i64, 0))
                     else:
                         cmp = self.builder.icmp_signed(">=", cmp_result, ir.Constant(i64, 0))
+
+                # BYTES comparison: same as STR since bytes are char* internally
+                elif ((left_kind == VKind.BYTES or tv_right.vtype.kind == VKind.BYTES)
+                        and isinstance(op, (ast.Eq, ast.NotEq))):
+                    cmp_result = self._rt_call("str_compare",
+                                               [tv_left.as_ptr(self.builder),
+                                                tv_right.as_ptr(self.builder)])
+                    if isinstance(op, ast.Eq):
+                        cmp = self.builder.icmp_signed("==", cmp_result, ir.Constant(i64, 0))
+                    else:
+                        cmp = self.builder.icmp_signed("!=", cmp_result, ir.Constant(i64, 0))
 
                 # PYOBJ comparison: dispatch to CPython rich comparison.
                 # When one side is PYOBJ and the other is native, convert
@@ -19408,17 +19489,6 @@ class CodeGen:
                          ir.Constant(i32, _cmp_ops[type(op)])])
                     cmp = self.builder.icmp_signed(
                         "!=", cmp_result, ir.Constant(i32, 0))
-
-                # NONE equality: None == None is True; None == <anything_else> is False.
-                # Without this guard, None (stored as i64(0)) would compare equal
-                # to int 0, False, etc. via the int fallback path.
-                elif (left_kind == VKind.NONE or tv_right.vtype.kind == VKind.NONE):
-                    if left_kind == VKind.NONE and tv_right.vtype.kind == VKind.NONE:
-                        # None == None → True, None != None → False
-                        cmp = ir.Constant(ir.IntType(1), 1 if isinstance(op, ast.Eq) else 0)
-                    else:
-                        # None == <non-None> → False, None != <non-None> → True
-                        cmp = ir.Constant(ir.IntType(1), 1 if isinstance(op, ast.NotEq) else 0)
 
                 else:
                     cmp = self._emit_int_compare(op, cmp_left, cmp_right, node)
@@ -21938,6 +22008,10 @@ class CodeGen:
 
         # Expression-level type inference (e.g. print(a + b), print(glob.glob(x)))
         inferred = self._infer_type_tag(node, value)
+        if inferred == "bool":
+            if isinstance(value.type, ir.IntType) and value.type.width != 32:
+                value = self.builder.trunc(value, i32)
+            return self._fv_from_bool(value)
         if inferred == "complex":
             return self._fv_build_from_slots(
                 ir.Constant(i32, FPY_TAG_COMPLEX), value)
@@ -29017,6 +29091,7 @@ class CodeGen:
                     sep = self._emit_expr_value(node.args[0])
                     return self._rt_call("str_rsplit",
                                           [obj, sep, ir.Constant(i64, -1)])
+                return self._rt_call("str_rsplit_ws", [obj])
             if method == "join":
                 if len(node.args) == 1:
                     lst = self._emit_expr_value(node.args[0])
@@ -29173,6 +29248,49 @@ class CodeGen:
             if method == "decode" and len(node.args) <= 1:
                 # bytes.decode() → str (same UTF-8 content)
                 return self._rt_call("bytes_decode", [obj])
+            if method == "upper" and len(node.args) == 0:
+                return self._rt_call("str_upper", [obj])
+            if method == "lower" and len(node.args) == 0:
+                return self._rt_call("str_lower", [obj])
+            if method == "strip" and len(node.args) == 0:
+                return self._rt_call("str_strip", [obj])
+            if method == "lstrip" and len(node.args) == 0:
+                return self._rt_call("str_lstrip", [obj])
+            if method == "rstrip" and len(node.args) == 0:
+                return self._rt_call("str_rstrip", [obj])
+            if method == "replace" and len(node.args) >= 2:
+                old = self._emit_expr_value(node.args[0])
+                new = self._emit_expr_value(node.args[1])
+                if len(node.args) == 3:
+                    cnt = self._emit_expr_value(node.args[2])
+                    return self._rt_call("str_replace3", [obj, old, new, cnt])
+                return self._rt_call("str_replace", [obj, old, new])
+            if method == "split" and len(node.args) <= 2:
+                if len(node.args) == 0:
+                    return self._rt_call("bytes_split", [obj])
+                sep = self._emit_expr_value(node.args[0])
+                if len(node.args) == 2:
+                    maxsplit = self._emit_expr_value(node.args[1])
+                    return self._rt_call("str_split_max", [obj, sep, maxsplit])
+                return self._rt_call("str_split_max", [obj, sep, ir.Constant(i64, -1)])
+            if method == "join" and len(node.args) == 1:
+                lst = self._emit_expr_value(node.args[0])
+                return self._rt_call("str_join", [obj, lst])
+            if method == "find" and len(node.args) >= 1:
+                sub = self._emit_expr_value(node.args[0])
+                return self._rt_call("str_find", [obj, sub])
+            if method == "rfind" and len(node.args) >= 1:
+                sub = self._emit_expr_value(node.args[0])
+                return self._rt_call("str_rfind", [obj, sub])
+            if method == "count" and len(node.args) >= 1:
+                sub = self._emit_expr_value(node.args[0])
+                return self._rt_call("str_count", [obj, sub])
+            if method == "startswith" and len(node.args) >= 1:
+                prefix = self._emit_expr_value(node.args[0])
+                return self._rt_call("str_startswith", [obj, prefix])
+            if method == "endswith" and len(node.args) >= 1:
+                suffix = self._emit_expr_value(node.args[0])
+                return self._rt_call("str_endswith", [obj, suffix])
         # int methods: bit_length, bit_count, to_bytes, etc.
         if obj_kind == VKind.INT:
             if method == "bit_length" and len(node.args) == 0:
@@ -29528,6 +29646,8 @@ class CodeGen:
             return True
         if isinstance(node, ast.Name) and node.id in self.variables:
             _, tag = self.variables[node.id]
+            if isinstance(tag, ValueType):
+                return tag.kind == VKind.BOOL
             return tag == "bool"
         if isinstance(node, ast.Compare):
             return True
@@ -30102,6 +30222,10 @@ class CodeGen:
             if val_tag == "bytes" and not isinstance(node.slice, ast.Slice):
                 index = self._emit_expr_value(node.slice)
                 return self._rt_call("bytes_get", [obj, index])
+            # Bytes slicing: b"hello"[1:3] → b'el' (same char* slice, but
+            # stored with BYTES type tag so print shows b'...' prefix)
+            if val_tag == "bytes" and isinstance(node.slice, ast.Slice):
+                return self._emit_string_slice(obj, node.slice, node)
             # String indexing/slicing
             if isinstance(node.slice, ast.Slice):
                 return self._emit_string_slice(obj, node.slice, node)
@@ -31061,6 +31185,14 @@ class CodeGen:
                                 val_type = "str"
                         elif isinstance(value.value, ast.JoinedStr):
                             val_type = "str"
+                        elif isinstance(value.value, ast.Attribute):
+                            # Object attribute: check if it's a known string attr
+                            obj_cls = (self._infer_object_class(value.value.value)
+                                       if isinstance(value.value.value, ast.Name) else None)
+                            if obj_cls:
+                                _str_attrs = self._per_class_string_attrs.get(obj_cls, set())
+                                if value.value.attr in _str_attrs:
+                                    val_type = "str"
                         if val_type == "str":
                             str_val = self._rt_call("str_repr", [str_val])
                 parts.append(str_val)

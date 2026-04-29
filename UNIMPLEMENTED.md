@@ -149,6 +149,59 @@ These features work correctly but use the embedded CPython interpreter:
 
 ## Bugs fixed (2026-04-28, isinstance/None/bool/str*= multi-fix)
 
+### 126. `bytes.split()` returned string items instead of bytes items (fixed)
+`b"hello world".split()` returned `['hello', 'world']` (STR-tagged items)
+instead of `[b'hello', b'world']` (BYTES-tagged items). The runtime `str_split`
+function creates STR-tagged FpyValues. Fix: Added `bytes_split` runtime function
+that creates BYTES-tagged items, and `fpy_bytes_val` helper in objects.h.
+Codegen now dispatches `bytes.split()` (no args) to `bytes_split`.
+
+### 125. `list.count(True)` returned 2 instead of 3 (fixed)
+In Python, `True == 1` and `False == 0`, so `[1, True, 0, False, 1].count(True)`
+should be 3 (matching 1, True, and 1). The runtime `fastpy_list_count` only
+checked `FPY_TAG_INT`, missing BOOL-tagged values. Fix: Check both
+`FPY_TAG_INT` and `FPY_TAG_BOOL` when counting numeric values.
+
+### 124. `bool & bool` printed as `int` instead of `bool` (fixed)
+`True & True` printed `1` instead of `True`. The LLVM bitwise AND produced an
+i64, and `_wrap_for_print` had no check for `inferred == "bool"` so it fell
+through to the default integer print path.
+Fix: (a) Added `inferred == "bool"` check in `_wrap_for_print` to wrap with
+`_fv_from_bool`. (b) Added `bool & bool → bool` inference in `_infer_type_tag`
+for BinOp with BitAnd/BitOr/BitXor when both operands are `_is_bool_typed`.
+(c) Fixed `_is_bool_typed` to handle ValueType objects (Phase 3) in addition
+to legacy string tags.
+
+### 123. Bytes slicing printed without `b'...'` prefix (fixed)
+`b"hello"[1:3]` printed `el` instead of `b'el'`. The slice result was tagged
+as STR because `_infer_type_tag` had no check for bytes subscript slicing.
+Fix: Added bytes subscript inference in `_infer_type_tag` — slice returns
+"bytes", single index returns "int".
+
+### 122. `bytes.upper()`/`lower()`/`strip()` and other methods crashed (fixed)
+Only `bytes.decode()` was handled in the bytes method dispatch. All other
+string-like methods (upper, lower, strip, lstrip, rstrip, replace, split,
+join, find, rfind, count, startswith, endswith) fell through to the generic
+method handler and crashed. Fix: Added dispatch for all common bytes methods
+by reusing the corresponding `str_*` runtime functions (bytes are `char*`
+internally, same as strings). Also added return type inference for bytes
+method calls.
+
+### 121. `int * bytes` produced TypeError (fixed)
+`3 * b'ab'` printed `None` followed by a TypeError because `fv_binop` only
+handled `bytes * int` (FPY_TAG_BYTES on the left), not `int * bytes`
+(FPY_TAG_BYTES on the right). Fix: Added reverse handler in `fv_binop` for
+`(INT|BOOL) * BYTES`. Also added type inference in `_infer_type_tag` for
+bytes multiplication and comparison handler in `_emit_compare` for
+VKind.BYTES operands.
+
+### 120. `rsplit()` without arguments crashed (fixed)
+`"hello world".rsplit()` (no separator argument) fell through the rsplit
+handler because only the 1-arg and 2-arg forms were handled. The 0-arg form
+(split on whitespace) was missing. Fix: Added `str_rsplit_ws` runtime
+function (delegates to `str_split` since without maxsplit, rsplit and split
+produce identical results) and added the 0-args case in codegen dispatch.
+
 ### 118. `__bool__` dunder not called through fv_truthy for native objects (fixed)
 `bool(obj)` and `if obj:` always returned True for user-class objects that
 defined `__bool__`, because `fastpy_fv_truthy` in `objects.c` returned 1 for
@@ -162,6 +215,19 @@ Fix: (a) Runtime: `fv_truthy` now calls `fastpy_find_method` to look up
 Name nodes, ensuring FV-backed objects go through proper truthiness dispatch.
 (c) Added `result_i32 = trunc(result, i32)` to handle ABI mismatch where
 `__bool__` returns i32 but `obj_call_method0` returns i64.
+
+### 119. `None == ""` (and None vs any pointer type) crashed at runtime (fixed)
+`None == ""`, `None == []`, `None == ()`, `None == {1}`, `None == {}`, and
+reverse forms like `"" == None` all crashed with a null pointer dereference.
+Root cause: the NONE comparison guard was placed too late in `_emit_compare`'s
+dispatch chain. None is stored as i64(0), and `""` is i8* (pointer), so the
+int/pointer mismatch handler fired first, calling `str_compare(inttoptr(0), "")`
+→ null pointer crash. Similarly, `"" == None` matched the STR comparison handler
+(`left_kind == VKind.STR`) which called `str_compare(left, tv_right.as_ptr())`
+where tv_right's None became a null pointer.
+Fix: moved the NONE guard to the very top of the VKind-based dispatch chain,
+before any type-specific handlers. None compared with anything non-None always
+returns False (for ==) or True (for !=), regardless of the other operand's type.
 
 ### 117. `str *= n` augmented multiply not handled (fixed)
 `x = 'ab'; x *= 3` produced empty string because there was no `STR *= n`
