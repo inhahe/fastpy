@@ -4240,65 +4240,254 @@ const char* fastpy_format_spec_float(double value, const char *spec) {
 }
 
 const char* fastpy_format_spec_int(int64_t value, const char *spec) {
-    char *buf = (char*)malloc(64);
-    /* Handle widthd, 0widthd */
+    /* Parse Python format spec:
+     *   [[fill]align][sign][#][0][width][,|_][type]
+     * Supported types: b d o x X c n (default 'd'). */
     int i = 0;
-    int zero_pad = 0;
-    int left_align = 0;
     char fill = ' ';
-    if (spec[i] == '<') { left_align = 1; i++; }
-    else if (spec[i] == '>') { i++; }
-    else if (spec[i] == '0') { zero_pad = 1; fill = '0'; i++; }
-    int width = 0;
-    while (spec[i] >= '0' && spec[i] <= '9') {
-        width = width * 10 + (spec[i] - '0');
+    char align = '>';  /* default right-align for numbers */
+
+    /* [fill]align — fill is any char if followed by <, >, ^, = */
+    if (spec[i] != '\0' && (spec[i+1] == '<' || spec[i+1] == '>'
+                             || spec[i+1] == '^' || spec[i+1] == '=')) {
+        fill = spec[i];
+        align = spec[i+1];
+        i += 2;
+    } else if (spec[i] == '<' || spec[i] == '>' || spec[i] == '^' || spec[i] == '=') {
+        align = spec[i];
         i++;
     }
-    char tmp[32];
-    snprintf(tmp, sizeof(tmp), "%lld", (long long)value);
-    int len = (int)strlen(tmp);
-    if (width <= len) {
-        strcpy(buf, tmp);
+
+    /* sign */
+    char sign = '\0';
+    if (spec[i] == '+' || spec[i] == '-' || spec[i] == ' ') {
+        sign = spec[i]; i++;
+    }
+
+    /* alternate form */
+    int alt = 0;
+    if (spec[i] == '#') { alt = 1; i++; }
+
+    /* zero-pad shorthand: '0' means fill='0', align='=' */
+    if (spec[i] == '0') {
+        if (fill == ' ') fill = '0';
+        if (align == '>') align = '=';
+        i++;
+    }
+
+    /* width */
+    int width = 0;
+    while (spec[i] >= '0' && spec[i] <= '9') {
+        width = width * 10 + (spec[i] - '0'); i++;
+    }
+
+    /* grouping */
+    char grouping = '\0';
+    if (spec[i] == ',' || spec[i] == '_') { grouping = spec[i]; i++; }
+
+    /* type */
+    char type = spec[i] ? spec[i] : 'd';
+
+    /* Decompose value into sign_char + unsigned magnitude */
+    int is_neg = 0;
+    uint64_t abs_val;
+    if (value < 0 && type != 'c') {
+        is_neg = 1;
+        abs_val = (uint64_t)(-(value + 1)) + 1; /* avoid UB on INT64_MIN */
+    } else {
+        abs_val = (uint64_t)value;
+    }
+
+    char sign_char = '\0';
+    if (is_neg) sign_char = '-';
+    else if (sign == '+') sign_char = '+';
+    else if (sign == ' ') sign_char = ' ';
+
+    /* Format digits based on type */
+    char digits[128];
+    int dlen = 0;
+    char prefix[4] = "";
+    int plen = 0;
+
+    switch (type) {
+    case 'b': {
+        if (abs_val == 0) {
+            digits[0] = '0'; dlen = 1;
+        } else {
+            char rev[65]; int ri = 0;
+            uint64_t v = abs_val;
+            while (v > 0) { rev[ri++] = '0' + (v & 1); v >>= 1; }
+            for (int j = ri - 1; j >= 0; j--) digits[dlen++] = rev[j];
+        }
+        if (alt) { prefix[0] = '0'; prefix[1] = 'b'; plen = 2; }
+        break;
+    }
+    case 'o': {
+        snprintf(digits, sizeof(digits), "%llo", (unsigned long long)abs_val);
+        dlen = (int)strlen(digits);
+        if (alt) { prefix[0] = '0'; prefix[1] = 'o'; plen = 2; }
+        break;
+    }
+    case 'x': {
+        snprintf(digits, sizeof(digits), "%llx", (unsigned long long)abs_val);
+        dlen = (int)strlen(digits);
+        if (alt) { prefix[0] = '0'; prefix[1] = 'x'; plen = 2; }
+        break;
+    }
+    case 'X': {
+        snprintf(digits, sizeof(digits), "%llX", (unsigned long long)abs_val);
+        dlen = (int)strlen(digits);
+        if (alt) { prefix[0] = '0'; prefix[1] = 'X'; plen = 2; }
+        break;
+    }
+    case 'c': {
+        digits[0] = (char)(value & 0xFF);
+        dlen = 1;
+        break;
+    }
+    default: /* 'd', 'n' */ {
+        snprintf(digits, sizeof(digits), "%llu", (unsigned long long)abs_val);
+        dlen = (int)strlen(digits);
+        break;
+    }
+    }
+    digits[dlen] = '\0';
+
+    /* Apply grouping (comma or underscore) */
+    char grouped[256];
+    int glen = 0;
+    if (grouping && type != 'c') {
+        int grp_size = (type == 'b' || type == 'o' || type == 'x' || type == 'X') ? 4 : 3;
+        int groups = (dlen > 0) ? (dlen - 1) / grp_size : 0;
+        int first = dlen - groups * grp_size;
+        memcpy(grouped, digits, first);
+        glen = first;
+        for (int g = 0; g < groups; g++) {
+            grouped[glen++] = grouping;
+            memcpy(grouped + glen, digits + first + g * grp_size, grp_size);
+            glen += grp_size;
+        }
+    } else {
+        memcpy(grouped, digits, dlen);
+        glen = dlen;
+    }
+    grouped[glen] = '\0';
+
+    /* Total content length: sign + prefix + grouped digits */
+    int sign_len = sign_char ? 1 : 0;
+    int tlen = sign_len + plen + glen;
+
+    int outsize = (width > tlen ? width : tlen) + 1;
+    char *buf = (char*)malloc(outsize);
+
+    /* No padding needed */
+    if (tlen >= width) {
+        int out = 0;
+        if (sign_char) buf[out++] = sign_char;
+        memcpy(buf + out, prefix, plen); out += plen;
+        memcpy(buf + out, grouped, glen); out += glen;
+        buf[out] = '\0';
         return buf;
     }
-    int pad = width - len;
-    if (left_align) {
-        strcpy(buf, tmp);
-        for (int p = 0; p < pad; p++) buf[len + p] = ' ';
-        buf[width] = '\0';
+
+    /* Pad to width according to alignment */
+    int pad = width - tlen;
+    int out = 0;
+
+    if (align == '<') {
+        if (sign_char) buf[out++] = sign_char;
+        memcpy(buf + out, prefix, plen); out += plen;
+        memcpy(buf + out, grouped, glen); out += glen;
+        for (int k = 0; k < pad; k++) buf[out++] = fill == '0' ? ' ' : fill;
+    } else if (align == '^') {
+        int left = pad / 2, right = pad - left;
+        for (int k = 0; k < left; k++) buf[out++] = fill;
+        if (sign_char) buf[out++] = sign_char;
+        memcpy(buf + out, prefix, plen); out += plen;
+        memcpy(buf + out, grouped, glen); out += glen;
+        for (int k = 0; k < right; k++) buf[out++] = fill;
+    } else if (align == '=') {
+        /* Pad between sign/prefix and digits */
+        if (sign_char) buf[out++] = sign_char;
+        memcpy(buf + out, prefix, plen); out += plen;
+        for (int k = 0; k < pad; k++) buf[out++] = fill;
+        memcpy(buf + out, grouped, glen); out += glen;
     } else {
-        for (int p = 0; p < pad; p++) buf[p] = fill;
-        strcpy(buf + pad, tmp);
+        /* '>' right-align (default) */
+        for (int k = 0; k < pad; k++) buf[out++] = fill;
+        if (sign_char) buf[out++] = sign_char;
+        memcpy(buf + out, prefix, plen); out += plen;
+        memcpy(buf + out, grouped, glen); out += glen;
     }
+    buf[out] = '\0';
     return buf;
 }
 
 const char* fastpy_format_spec_str(const char *value, const char *spec) {
-    char *buf = (char*)malloc(256);
+    /* Parse Python format spec: [[fill]align][width][.precision][type]
+     * Strings default to left-align (<). */
     int i = 0;
-    int left_align = 0;
     char fill = ' ';
-    if (spec[i] == '<') { left_align = 1; i++; }
-    else if (spec[i] == '>') { i++; }
+    char align = '<';  /* default left-align for strings */
+
+    /* [fill]align */
+    if (spec[i] != '\0' && (spec[i+1] == '<' || spec[i+1] == '>'
+                             || spec[i+1] == '^')) {
+        fill = spec[i];
+        align = spec[i+1];
+        i += 2;
+    } else if (spec[i] == '<' || spec[i] == '>' || spec[i] == '^') {
+        align = spec[i];
+        i++;
+    }
+
+    /* width */
     int width = 0;
     while (spec[i] >= '0' && spec[i] <= '9') {
         width = width * 10 + (spec[i] - '0');
         i++;
     }
+
+    /* .precision (truncate string) */
+    int precision = -1;
+    if (spec[i] == '.') {
+        i++;
+        precision = 0;
+        while (spec[i] >= '0' && spec[i] <= '9') {
+            precision = precision * 10 + (spec[i] - '0');
+            i++;
+        }
+    }
+
     int len = (int)strlen(value);
+    if (precision >= 0 && precision < len) len = precision;
+
+    int outsize = (width > len ? width : len) + 1;
+    char *buf = (char*)malloc(outsize);
+
     if (width <= len) {
-        strcpy(buf, value);
+        memcpy(buf, value, len);
+        buf[len] = '\0';
         return buf;
     }
+
     int pad = width - len;
-    if (left_align) {
-        strcpy(buf, value);
-        for (int p = 0; p < pad; p++) buf[len + p] = fill;
-        buf[width] = '\0';
+    int out = 0;
+
+    if (align == '<') {
+        memcpy(buf + out, value, len); out += len;
+        for (int k = 0; k < pad; k++) buf[out++] = fill;
+    } else if (align == '^') {
+        int left = pad / 2, right = pad - left;
+        for (int k = 0; k < left; k++) buf[out++] = fill;
+        memcpy(buf + out, value, len); out += len;
+        for (int k = 0; k < right; k++) buf[out++] = fill;
     } else {
-        for (int p = 0; p < pad; p++) buf[p] = fill;
-        strcpy(buf + pad, value);
+        /* '>' right-align */
+        for (int k = 0; k < pad; k++) buf[out++] = fill;
+        memcpy(buf + out, value, len); out += len;
     }
+    buf[out] = '\0';
     return buf;
 }
 

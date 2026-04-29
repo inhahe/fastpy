@@ -603,6 +603,19 @@ int64_t fastpy_safe_div(int64_t a, int64_t b) {
     return a / b;
 }
 
+/* Safe integer modulo — avoids hardware div-by-zero trap when b == 0.
+ * Used by floor-division and modulo codegen instead of raw LLVM srem,
+ * which is UB on zero divisor even inside a try/except block.
+ * Raises ZeroDivisionError if not already pending (standalone % 0). */
+int64_t fastpy_safe_mod(int64_t a, int64_t b) {
+    if (b == 0) {
+        if (!fastpy_exc_pending())
+            fastpy_raise(FPY_EXC_ZERODIVISION, "integer modulo by zero");
+        return 0;
+    }
+    return a % b;
+}
+
 double fastpy_safe_fdiv(double a, double b) {
     if (b == 0.0) {
         /* CPython 3.14+ uses "division by zero" for all cases (int/int,

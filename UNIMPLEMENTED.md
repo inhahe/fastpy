@@ -147,6 +147,142 @@ These features work correctly but use the embedded CPython interpreter:
 - **Other stdlib modules** not implemented natively (e.g., collections,
   itertools, functools — except singledispatch which is native)
 
+## Bugs fixed (2026-04-28, *args tuple, MRO, funcdef in loops, lambda captures)
+
+### 109. Lambda expressions inside functions didn't capture parent variables (fixed)
+`def make(n): return lambda: n` — calling `make(42)()` raised `NameError:
+name 'n' is not defined`. The inline lambda compilation path
+(`_emit_inline_lambda`) created a standalone function with no mechanism
+to pass values from the enclosing scope.
+Fix: Added free-variable detection to `_emit_inline_lambda`. When a lambda
+references variables from the enclosing scope (present in `self.variables`
+but not in `_global_vars` or lambda params), it is compiled as a closure
+with captured values passed as extra parameters. A `closure_new` object is
+created and capture values are set via `closure_set_capture`.
+
+### 108. Function definitions inside for/while/if/try blocks invisible (fixed)
+`for i in range(3): def greet(n): return n * 2; print(greet(i))` crashed
+with `AttributeError: module 'builtins' has no attribute 'greet'`. Function
+definitions inside control flow blocks at both module level and inside
+functions were not discovered by the compiler's pre-scan passes.
+Root causes: (a) Pass 0.5 `_scan_for_closures` only examined direct children
+of function bodies, not inside for/while/if/try/with blocks.
+(b) Module-level function defs inside loops were never declared or compiled.
+Fix: (a) Added `_collect_inner_funcdefs` generator that recursively walks
+control flow blocks. (b) Added Pass 0.55 to discover module-level loop
+functions, Pass 0.56 synthetic closure scan for module scope, Pass 1.1 to
+declare them, and Pass 2.05 to compile them. Set `_current_func_name =
+"fastpy_main"` in Pass 3 so closure lookup works.
+
+### 107. Multiple inheritance MRO ignored primary parent chain (fixed)
+`class D(B, C)` where both B and C define `method()` — `d.method()`
+returned "C" (secondary base) instead of "B" (primary base). Python's
+C3 MRO gives priority: D → B → C → A.
+Root cause: Secondary base method flattening only checked `if m_name not
+in methods` (the child class's own methods), but didn't check if the method
+existed in the primary parent chain (B and its ancestors).
+Fix: Before flattening secondary base methods, build the full set of method
+names available through the primary parent chain. Only add a secondary
+base method if it doesn't exist in the primary chain.
+
+### 106. `*args` printed as list instead of tuple (fixed)
+`def func(*args): print(args)` showed `[1, 2, 3]` instead of `(1, 2, 3)`.
+In Python, `*args` is always a tuple.
+Root cause: Call sites packed extra positional arguments into an FpyList
+via `list_new` but never called `list_mark_tuple` to set the `is_tuple`
+flag. All four call-site paths (single-param vararg, mixed vararg, single
+with FV return, mixed with FV return) had the same issue.
+Fix: Added `list_mark_tuple` call after packing *args in all four paths.
+
+### 105. `*args` and `**kwargs` together crashed (fixed)
+`def func(*args, **kwargs): print(args, kwargs)` called as
+`func(1, 2, a=10)` crashed with access violation.
+Root cause: Function declaration only added `*args` as a parameter,
+ignoring `**kwargs` entirely. Call sites either passed just the args list
+or just the kwargs dict (depending on presence of keywords), never both.
+Fix: (a) Added `**kwargs` as a second parameter in the declaration when
+both `has_vararg` and `has_kwarg` are true. (b) Added a dedicated call-site
+path for `is_vararg and is_kwarg and param_count == 2` that passes both
+the args tuple and kwargs dict. (c) Added guards on the mixed-vararg path
+to exclude the `*args + **kwargs` case.
+
+## Bugs fixed (2026-04-28, format specs, try/except, min/max, str format, split elem type)
+
+### 104. `_get_list_elem_type` returned "int" for `.split()` results (fixed)
+`for w in "hello world".split(): d[w] = 1` stored dict keys as raw pointer
+integers instead of strings, because `_get_list_elem_type` had no handler
+for `.split()` method calls on strings and fell through to the default "int".
+Fix: Added handler for string methods that return lists of strings (`.split()`,
+`.rsplit()`, `.splitlines()`) in `_get_list_elem_type`.
+
+### 103. `_list_get_as_bare` didn't handle "tuple" element type (fixed)
+Extracting tuple elements from a list (e.g. `list_of_tuples[i]`) returned
+raw i64 data instead of converting to a pointer. Only "str", "obj", "dict",
+and types starting with "list" were converted.
+Fix: Added "tuple", "set", "bytes", "deque" to the pointer-type set in
+`_list_get_as_bare`.
+
+### 102. `_get_list_elem_type` returned "str" for `dict.items()` (fixed)
+`max(scores.items(), key=lambda x: x[1])` crashed with "IndexError: string
+index out of range". `items()` returns tuples (FpyList with is_tuple=1), not
+strings. The `_get_list_elem_type` function returned "str" for all of
+`.values()`, `.items()`, `.keys()`.
+Fix: Return "list" for `.items()` (tuples stored as FpyList), keeping "str"
+only for `.keys()` and `.values()`.
+
+### 101. `min()`/`max()` on lists of tuples returned raw pointer (fixed)
+`max(data, key=lambda x: x[1])` where data is a list of tuples printed a raw
+pointer value instead of the tuple. Two root causes:
+(a) `_list_get_as_bare` didn't handle "tuple" element type — only "str", "obj",
+"dict", and "list" were converted to pointers. Tuples fell through to i64.
+(b) `_infer_type_tag` had no handler for `min`/`max` return types, so the
+result was tagged as "str" (default for pointers) instead of "list".
+Fix: Added "tuple", "set", "bytes", "deque" to pointer-type checks in both
+`_list_get_as_bare` and the min/max codegen. Added `_infer_type_tag` rule
+for min/max that propagates the list's element type.
+
+### 100. String format spec missing center (`^`) and fill character (fixed)
+`f"{'hello':^15}"` and `f"{'hello':*^15}"` produced unpadded output.
+`fastpy_format_spec_str` only handled `<` and `>` alignment, with no
+fill-character parsing and no `^` center support. Also lacked `.precision`.
+Fix: Rewrote `fastpy_format_spec_str` with full `[[fill]align][width][.prec]`
+parsing, matching the float/int format spec parsers.
+
+### 99. Integer format spec ignored `b`/`x`/`X`/`o` type chars (fixed)
+`f"{255:08b}"` showed `00000255` (decimal) instead of `11111111` (binary).
+`f"{255:#06x}"` showed `255` instead of `0x00ff`.
+`fastpy_format_spec_int` only handled decimal (`%lld`), ignoring the format
+type character entirely.
+Fix: Rewrote `fastpy_format_spec_int` with full Python format spec parsing:
+`[[fill]align][sign][#][0][width][,|_][type]`. Supports `b` (binary with
+manual bit extraction), `o` (octal), `x`/`X` (hex), `c` (char), `d`/`n`
+(decimal), `#` alternate form (0b/0o/0x prefixes), sign (+/-/space),
+fill+align (</>=/^), and `,`/`_` grouping.
+
+### 98. try/except failed to catch exceptions from expression statements (fixed)
+`try: 1/0; except ZeroDivisionError: ...` was silently ignored — the except
+handler never ran. `_emit_expr_stmt` skipped non-call expressions with `pass`
+("no side effect"), but inside a try block, expressions like `a / b` need to
+be evaluated to trigger potential exceptions.
+Fix: When `_in_try_block` is True, `_emit_expr_stmt` now evaluates the
+expression via `_emit_expr_value` instead of skipping it.
+
+### 97. Division/modulo by zero caused UB crash inside try/except (fixed)
+`results.append(10 // x)` inside a try/except block crashed when `x == 0`.
+Three root causes:
+(a) Raw LLVM `srem` instruction for floor-division adjustment — when the
+divisor is 0, `srem` is undefined behavior (hardware divide-by-zero trap on
+x86), even though `fastpy_safe_div` returned 0 and set the exception flag.
+(b) Exception flag set by `safe_div` wasn't checked until end of statement,
+so `list.append()` ran with a garbage value before the exception was detected.
+(c) Standalone `%` modulo used `safe_mod` which didn't raise (only returned 0).
+Fix: (a) Replaced all raw `srem` with `fastpy_safe_mod` runtime call that
+returns 0 when divisor is 0. (b) Added `_emit_try_bail_if_exc()` helper that
+checks `exc_pending()` immediately after any call that can raise (safe_div,
+safe_mod, safe_fdiv, safe_int_fdiv) when inside a try block, branching to the
+except handler before subsequent code runs. (c) `fastpy_safe_mod` now raises
+`ZeroDivisionError` if no exception is already pending.
+
 ## Bugs fixed (2026-04-28, closure defaults, nested closures, tuple repr, bytes, dict comp)
 
 ### 96. Closure default parameter values not applied (fixed)

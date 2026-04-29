@@ -2089,6 +2089,7 @@ class CodeGen:
         # Safe division (checks for zero, raises ZeroDivisionError)
         ft = ir.FunctionType(i64, [i64, i64])
         self.runtime["safe_div"] = ir.Function(self.module, ft, name="fastpy_safe_div")
+        self.runtime["safe_mod"] = ir.Function(self.module, ft, name="fastpy_safe_mod")
         ft = ir.FunctionType(double, [double, double])
         self.runtime["safe_fdiv"] = ir.Function(self.module, ft, name="fastpy_safe_fdiv")
         ft = ir.FunctionType(double, [i64, i64])
@@ -2461,6 +2462,66 @@ class CodeGen:
         for node in tree.body:
             if isinstance(node, ast.FunctionDef):
                 self._scan_for_closures(node)
+
+        # Pass 0.55: find function defs inside control flow (for/while/if/try)
+        # at module level. These are effectively module-level functions that
+        # need to be declared and compiled like top-level functions, but they
+        # appear inside loop/conditional bodies.
+        def _find_funcdefs_in_control_flow(stmts):
+            """Recursively find FunctionDef nodes inside control flow."""
+            for stmt in stmts:
+                if isinstance(stmt, ast.For):
+                    yield from _find_funcdefs_in_cf_body(stmt.body)
+                    yield from _find_funcdefs_in_cf_body(stmt.orelse)
+                elif isinstance(stmt, ast.While):
+                    yield from _find_funcdefs_in_cf_body(stmt.body)
+                    yield from _find_funcdefs_in_cf_body(stmt.orelse)
+                elif isinstance(stmt, ast.If):
+                    yield from _find_funcdefs_in_cf_body(stmt.body)
+                    yield from _find_funcdefs_in_cf_body(stmt.orelse)
+                elif isinstance(stmt, ast.Try):
+                    yield from _find_funcdefs_in_cf_body(stmt.body)
+                    for handler in stmt.handlers:
+                        yield from _find_funcdefs_in_cf_body(handler.body)
+                    yield from _find_funcdefs_in_cf_body(stmt.orelse)
+                    yield from _find_funcdefs_in_cf_body(stmt.finalbody)
+                elif isinstance(stmt, ast.With):
+                    yield from _find_funcdefs_in_cf_body(stmt.body)
+
+        def _find_funcdefs_in_cf_body(stmts):
+            for stmt in stmts:
+                if isinstance(stmt, ast.FunctionDef):
+                    yield stmt
+                else:
+                    yield from _find_funcdefs_in_control_flow([stmt])
+
+        self._module_level_loop_funcs: list[ast.FunctionDef] = []
+        for node in _find_funcdefs_in_control_flow(tree.body):
+            self._module_level_loop_funcs.append(node)
+
+        # Pass 0.56: scan module-level loop functions for closures.
+        # Create a synthetic wrapper that mirrors fastpy_main's scope so
+        # _scan_for_closures can detect captured variables from module scope.
+        if self._module_level_loop_funcs:
+            # Collect module-level variable names (assignments, for targets)
+            _mod_locals = set()
+            for stmt in tree.body:
+                for n in ast.walk(stmt):
+                    if isinstance(n, ast.Assign):
+                        for tgt in n.targets:
+                            if isinstance(tgt, ast.Name):
+                                _mod_locals.add(tgt.id)
+                    if isinstance(n, ast.For) and isinstance(n.target, ast.Name):
+                        _mod_locals.add(n.target.id)
+            # Create a synthetic FunctionDef with the loop functions as body
+            _synthetic = ast.FunctionDef(
+                name="fastpy_main",
+                args=ast.arguments(
+                    posonlyargs=[], args=[], vararg=None,
+                    kwonlyargs=[], kw_defaults=[], defaults=[]),
+                body=tree.body,
+                decorator_list=[], returns=None, lineno=0)
+            self._scan_for_closures(_synthetic)
 
         # Pass 0.7: scan for global variable declarations and create LLVM globals.
         # Infer the type from module-level assignments to the global name.
@@ -2859,6 +2920,16 @@ class CodeGen:
             variant_node.name = orig_name
             variant_node.decorator_list = orig_decos
 
+        # Pass 1.1: declare module-level functions found inside control flow
+        # Skip functions already detected as closures (they capture variables
+        # from module scope and are handled by _emit_nested_funcdef).
+        _closure_short_names = {n.rsplit(".", 1)[-1] for n in self._closure_info}
+        for node in self._module_level_loop_funcs:
+            if (node.name not in self._user_functions
+                    and node.name not in self._cpython_functions
+                    and node.name not in _closure_short_names):
+                self._declare_user_function(node)
+
         # Pass 1.05: track module-level variables that hold user class
         # instances (e.g. `taskWorkArea = TaskWorkArea()`).  This lets
         # _infer_object_class / _is_obj_expr resolve the receiver's class
@@ -2947,6 +3018,14 @@ class CodeGen:
             variant_node.name = orig_name
             variant_node.decorator_list = orig_decos
 
+        # Pass 2.05: compile module-level functions from inside control flow
+        # (skip closures — they're already compiled by _scan_for_closures)
+        for node in self._module_level_loop_funcs:
+            if (node.name in self._user_functions
+                    and node.name not in _closure_short_names
+                    and not self._user_functions[node.name].func.blocks):
+                self._emit_function_def(node)
+
         # Pass 2.1: emit bodies of hoisted inner functions
         for inner in getattr(self, "_hoist_inner_funcs", []):
             if inner.name in self._user_functions:
@@ -2962,6 +3041,7 @@ class CodeGen:
         self.function = main_fn
         self.builder = _SafeIRBuilder(entry)
         self.variables = {}
+        self._current_func_name = "fastpy_main"  # for closure lookup
         # Pre-populate module-level variables with globals so that
         # assignments like `data = []` at module level store to the
         # global variable (which functions access via `global data`).
@@ -3218,6 +3298,18 @@ class CodeGen:
                     for tgt in n.targets:
                         if isinstance(tgt, ast.Name):
                             outer_locals.add(tgt.id)
+                        elif isinstance(tgt, ast.Tuple):
+                            for elt in tgt.elts:
+                                if isinstance(elt, ast.Name):
+                                    outer_locals.add(elt.id)
+                # For-loop targets are also locals
+                if isinstance(n, ast.For):
+                    if isinstance(n.target, ast.Name):
+                        outer_locals.add(n.target.id)
+                    elif isinstance(n.target, ast.Tuple):
+                        for elt in n.target.elts:
+                            if isinstance(elt, ast.Name):
+                                outer_locals.add(elt.id)
                 # Inner function names are also locals
                 if isinstance(n, ast.FunctionDef):
                     outer_locals.add(n.name)
@@ -3229,7 +3321,31 @@ class CodeGen:
 
         prefix = _name_prefix if _name_prefix else outer_func.name
 
-        for node in outer_func.body:
+        # Collect FunctionDefs from body, including those inside
+        # for/while/if/try/with blocks (not just direct children).
+        def _collect_inner_funcdefs(stmts):
+            for stmt in stmts:
+                if isinstance(stmt, ast.FunctionDef):
+                    yield stmt
+                elif isinstance(stmt, ast.For):
+                    yield from _collect_inner_funcdefs(stmt.body)
+                    yield from _collect_inner_funcdefs(stmt.orelse)
+                elif isinstance(stmt, ast.While):
+                    yield from _collect_inner_funcdefs(stmt.body)
+                    yield from _collect_inner_funcdefs(stmt.orelse)
+                elif isinstance(stmt, ast.If):
+                    yield from _collect_inner_funcdefs(stmt.body)
+                    yield from _collect_inner_funcdefs(stmt.orelse)
+                elif isinstance(stmt, ast.Try):
+                    yield from _collect_inner_funcdefs(stmt.body)
+                    for handler in stmt.handlers:
+                        yield from _collect_inner_funcdefs(handler.body)
+                    yield from _collect_inner_funcdefs(stmt.orelse)
+                    yield from _collect_inner_funcdefs(stmt.finalbody)
+                elif isinstance(stmt, ast.With):
+                    yield from _collect_inner_funcdefs(stmt.body)
+
+        for node in _collect_inner_funcdefs(outer_func.body):
             if isinstance(node, ast.FunctionDef):
                 inner_name = node.name
                 inner_params = {arg.arg for arg in node.args.args}
@@ -3592,7 +3708,116 @@ class CodeGen:
         self._current_func_name = saved_func_name
 
     def _emit_inline_lambda(self, node: ast.Lambda) -> ir.Value:
-        """Compile an inline lambda and return function pointer as i64."""
+        """Compile an inline lambda and return function pointer as i64.
+        If the lambda captures variables from the enclosing scope,
+        creates a closure instead of a plain function pointer.
+        """
+        # Detect free variables: names used in the lambda body that are
+        # defined in the enclosing scope (self.variables) but not lambda params
+        lambda_params = {arg.arg for arg in node.args.args}
+        free_vars = []
+        for n in ast.walk(node.body):
+            if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load):
+                if (n.id not in lambda_params
+                        and n.id not in free_vars
+                        and n.id in self.variables
+                        and n.id not in self._global_vars
+                        and n.id not in dir(__builtins__)):
+                    free_vars.append(n.id)
+
+        if free_vars:
+            # Lambda captures variables — create a closure
+            self._lambda_counter += 1
+            name = f"__lambda_closure_{self._lambda_counter}"
+            param_names = [arg.arg for arg in node.args.args] + free_vars
+            param_types = [i64] * len(node.args.args)
+            for _ in free_vars:
+                param_types.append(i64)  # captured values
+
+            # Determine return type
+            ret_type = i64
+            for sub in ast.walk(node.body):
+                if isinstance(sub, ast.Constant) and isinstance(sub.value, float):
+                    ret_type = double
+                    break
+                if isinstance(sub, ast.Constant) and isinstance(sub.value, str):
+                    ret_type = i8_ptr
+                    break
+
+            func_type = ir.FunctionType(ret_type, param_types)
+            fn_name = f"fastpy.closure.{name}"
+            func = ir.Function(self.module, func_type, name=fn_name)
+            func.linkage = "internal"
+            func.attributes.add('inlinehint')
+            for param, pname in zip(func.args, param_names):
+                param.name = pname
+
+            ret_tag = ("float" if ret_type == double
+                       else ("str" if ret_type == i8_ptr else "int"))
+            self._user_functions[name] = FuncInfo(
+                func=func, ret_tag=ret_tag,
+                param_count=len(node.args.args),
+                defaults=node.args.defaults,
+                min_args=len(node.args.args) - len(node.args.defaults),
+                param_names=[a.arg for a in node.args.args],
+            )
+
+            # Emit body with captures as extra params
+            saved = (self.function, self.builder, self.variables,
+                     self._loop_stack, self._current_fn_bare_abi)
+            self.function = func
+            self._current_fn_bare_abi = False
+            entry = func.append_basic_block("entry")
+            self.builder = _SafeIRBuilder(entry)
+            self.variables = {}
+            self._loop_stack = []
+            for param, pname in zip(func.args, param_names):
+                alloca = self.builder.alloca(param.type, name=pname)
+                self.builder.store(param, alloca)
+                self.variables[pname] = (alloca, "int")
+            result = self._emit_expr_value(node.body)
+            expected_ret = func.return_value.type
+            if result.type != expected_ret:
+                if isinstance(expected_ret, ir.IntType) and isinstance(result.type, ir.DoubleType):
+                    result = self.builder.fptosi(result, expected_ret)
+                elif isinstance(expected_ret, ir.DoubleType) and isinstance(result.type, ir.IntType):
+                    result = self.builder.sitofp(result, expected_ret)
+            self.builder.ret(result)
+            (self.function, self.builder, self.variables,
+             self._loop_stack, self._current_fn_bare_abi) = saved
+
+            # Create closure, set captured values
+            func_ptr = self.builder.bitcast(func, i8_ptr)
+            n_params = len(node.args.args)
+            n_captures = len(free_vars)
+            closure = self.builder.call(self.runtime["closure_new"], [
+                func_ptr, ir.Constant(i32, n_params),
+                ir.Constant(i32, n_captures)])
+            for i, var_name in enumerate(free_vars):
+                val = self._load_variable(var_name, node)
+                if isinstance(val.type, ir.PointerType):
+                    val = self.builder.ptrtoint(val, i64)
+                elif isinstance(val.type, ir.IntType) and val.type.width != 64:
+                    val = self.builder.zext(val, i64)
+                self.builder.call(self.runtime["closure_set_capture"], [
+                    closure, ir.Constant(i32, i), val])
+
+            # Set default parameter values
+            if node.args.defaults:
+                n_defaults = len(node.args.defaults)
+                self.builder.call(self.runtime["closure_set_defaults"],
+                                  [closure, ir.Constant(i32, n_defaults)])
+                for di, def_node in enumerate(node.args.defaults):
+                    def_val = self._emit_expr_value(def_node)
+                    if isinstance(def_val.type, ir.PointerType):
+                        def_val = self.builder.ptrtoint(def_val, i64)
+                    self.builder.call(self.runtime["closure_set_default"],
+                                      [closure, ir.Constant(i32, di), def_val])
+
+            # Return closure pointer as i64
+            return self.builder.ptrtoint(closure, i64)
+
+        # No captures — simple inline lambda
         self._lambda_counter += 1
         name = f"__inline_lambda_{self._lambda_counter}"
         self._declare_lambda(name, node)
@@ -5954,6 +6179,10 @@ class CodeGen:
         if has_vararg and not node.args.args:
             param_names = [node.args.vararg.arg]
             param_types = [i8_ptr]
+            # Add **kwargs as a second parameter if present
+            if has_kwarg:
+                param_names.append(node.args.kwarg.arg)
+                param_types.append(i8_ptr)  # dict pointer
             # Add keyword-only params after *args (e.g. def f(*args, sep=", "):)
             if node.args.kwonlyargs:
                 _str_heuristic = self._detect_string_params(node)
@@ -7390,7 +7619,10 @@ class CodeGen:
                     else:
                         tag = "str"  # default pointer kwonly → str
                 elif param.name == _vararg_name:
-                    tag = "list:int"  # *args is always a list
+                    tag = "list:int"  # *args is always a list (tuple)
+                elif (has_kwarg and node.args.kwarg
+                      and param.name == node.args.kwarg.arg):
+                    tag = "dict"  # **kwargs is always a dict
                 elif has_kwarg and not has_vararg:
                     tag = "dict"
                 elif has_vararg and not has_kwarg:
@@ -9764,13 +9996,24 @@ class CodeGen:
         # class. The primary base is handled via the runtime parent_id
         # chain; secondary bases' methods must be registered directly on
         # this class so they're discoverable by fastpy_find_method.
+        # Build the set of methods available through the primary parent chain
+        # so we don't override them with secondary base methods (Python MRO
+        # gives priority to the primary parent chain).
+        _primary_chain_methods: set[str] = set(methods.keys())
+        _pn = parent_name
+        while _pn and _pn in self._user_classes:
+            _pi = self._user_classes[_pn]
+            if _pi.methods:
+                _primary_chain_methods |= set(_pi.methods.keys())
+            _pn = _pi.parent_name
         for sec_base in secondary_bases:
             sec_info = self._user_classes.get(sec_base)
             if sec_info is None:
                 continue
             for m_name, m_func in sec_info.methods.items():
-                if m_name not in methods:
+                if m_name not in _primary_chain_methods:
                     methods[m_name] = m_func
+                    _primary_chain_methods.add(m_name)
                     if sec_info.method_asts and m_name in sec_info.method_asts:
                         method_asts[m_name] = sec_info.method_asts[m_name]
             # Inherit container/float/string/bool attrs from secondary bases
@@ -11175,6 +11418,9 @@ class CodeGen:
         expr = node.value
         if isinstance(expr, ast.Call):
             self._emit_call(expr)
+        elif self._in_try_block:
+            # Inside try: must evaluate — expression may raise (e.g. 1/0)
+            self._emit_expr_value(expr)
         else:
             # Expression with no side effect — skip it
             pass
@@ -13076,6 +13322,18 @@ class CodeGen:
                 and node.func.id in ("hasattr", "isinstance", "issubclass",
                                      "callable", "bool", "any", "all")):
             return "bool"
+        # min/max return the same type as the list elements
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id in ("min", "max") and node.args):
+            et = self._get_list_elem_type(node.args[0])
+            if et in ("list", "tuple"):
+                return "list"  # tuples stored as FpyList
+            if et == "dict":
+                return "dict"
+            if et == "str":
+                return "str"
+            if et == "float":
+                return "float"
         # BoolOp (and/or) with all bool-typed operands → bool result; with
         # mixed types, the result is the left/right operand's type (we
         # conservatively return "int" for mixed since Python would too).
@@ -15343,7 +15601,9 @@ class CodeGen:
         indicated by elem_type ('int', 'str', 'list', 'dict', 'obj', 'float').
         """
         _tag, data = self._fv_list_get(lst, idx)
-        if (elem_type in ("str", "obj", "dict")
+        _ptr_types = ("str", "obj", "dict", "tuple", "set",
+                      "bytes", "deque")
+        if (elem_type in _ptr_types
                 or elem_type.startswith("list")):
             return self.builder.inttoptr(data, i8_ptr)
         if elem_type == "float":
@@ -20473,7 +20733,7 @@ class CodeGen:
         info = self._user_functions[name]
 
         # Check if this is a *args or **kwargs function
-        if info.is_vararg and info.param_count > 1:
+        if info.is_vararg and info.param_count > 1 and not info.is_kwarg:
             # Mixed: positional params + *rest list + optional kwonly params
             # param_names layout: [pos0, pos1, ..., *rest, kw0, kw1, ...]
             n_kwonly = info.n_kwonly
@@ -20484,10 +20744,12 @@ class CodeGen:
             args = []
             for arg_node in positional_args:
                 args.append(self._emit_expr_value(arg_node))
-            # Pack remaining positional call args into *rest list
+            # Pack remaining positional call args into *rest tuple
             rest_list = self.builder.call(self.runtime["list_new"], [])
             for arg_node in rest_args:
                 self._emit_list_append_expr(rest_list, arg_node)
+            # *args is a tuple in Python, mark it
+            self.builder.call(self.runtime["list_mark_tuple"], [rest_list])
             args.append(rest_list)
             # Handle keyword-only params: map keywords to kwonly slots,
             # fill defaults for missing ones.
@@ -20536,11 +20798,31 @@ class CodeGen:
             result = self.builder.call(info.func, coerced)
             return result if info.ret_tag != "void" else None
 
-        if (info.is_vararg or info.is_kwarg) and info.param_count == 1:
-            # Pack all provided args into a list
+        if info.is_vararg and info.is_kwarg and info.param_count == 2:
+            # *args + **kwargs: pack positional into tuple, keywords into dict
             list_ptr = self.builder.call(self.runtime["list_new"], [])
             for arg_node in node.args:
                 self._emit_list_append_expr(list_ptr, arg_node)
+            self.builder.call(self.runtime["list_mark_tuple"], [list_ptr])
+            dict_ptr = self.builder.call(self.runtime["dict_new"], [])
+            if node.keywords:
+                for kw in node.keywords:
+                    key = self._make_string_constant(kw.arg)
+                    val = self._emit_expr_value(kw.value)
+                    tag, data = self._bare_to_tag_data(val, kw.value)
+                    self.builder.call(self.runtime["dict_set_fv"],
+                                      [dict_ptr, key, ir.Constant(i32, tag), data])
+            result = self.builder.call(info.func, [list_ptr, dict_ptr])
+            return result if info.ret_tag != "void" else None
+
+        if (info.is_vararg or info.is_kwarg) and info.param_count == 1:
+            # Pack all provided args into a list (tuple for *args)
+            list_ptr = self.builder.call(self.runtime["list_new"], [])
+            for arg_node in node.args:
+                self._emit_list_append_expr(list_ptr, arg_node)
+            # *args is a tuple in Python
+            if info.is_vararg:
+                self.builder.call(self.runtime["list_mark_tuple"], [list_ptr])
             # For **kwargs, pack keyword args into a dict
             if node.keywords:
                 dict_ptr = self.builder.call(self.runtime["dict_new"], [])
@@ -20720,11 +21002,30 @@ class CodeGen:
         info = self._user_functions[name]
 
         # Same argument handling as _emit_user_call, just skip the unwrap.
-        # Handle *args/**kwargs functions
+        # Handle *args + **kwargs together (2 params)
+        if info.is_vararg and info.is_kwarg and info.param_count == 2:
+            list_ptr = self.builder.call(self.runtime["list_new"], [])
+            for arg_node in node.args:
+                self._emit_list_append_expr(list_ptr, arg_node)
+            self.builder.call(self.runtime["list_mark_tuple"], [list_ptr])
+            dict_ptr = self.builder.call(self.runtime["dict_new"], [])
+            if node.keywords:
+                for kw in node.keywords:
+                    key = self._make_string_constant(kw.arg)
+                    val = self._emit_expr_value(kw.value)
+                    tag, data = self._bare_to_tag_data(val, kw.value)
+                    self.builder.call(self.runtime["dict_set_fv"],
+                                      [dict_ptr, key, ir.Constant(i32, tag), data])
+            return self.builder.call(info.func, [list_ptr, dict_ptr])
+
+        # Handle *args or **kwargs (single param)
         if (info.is_vararg or info.is_kwarg) and info.param_count == 1:
             list_ptr = self.builder.call(self.runtime["list_new"], [])
             for arg_node in node.args:
                 self._emit_list_append_expr(list_ptr, arg_node)
+            # *args is a tuple in Python
+            if info.is_vararg:
+                self.builder.call(self.runtime["list_mark_tuple"], [list_ptr])
             if node.keywords:
                 dict_ptr = self.builder.call(self.runtime["dict_new"], [])
                 for kw in node.keywords:
@@ -20737,7 +21038,7 @@ class CodeGen:
             return self.builder.call(info.func, [list_ptr])
 
         # Mixed vararg: positional + *rest + kwonly
-        if info.is_vararg and info.param_count > 1:
+        if info.is_vararg and info.param_count > 1 and not info.is_kwarg:
             n_kwonly = info.n_kwonly
             n_positional = info.param_count - 1 - n_kwonly
             positional_args = node.args[:n_positional]
@@ -20748,6 +21049,8 @@ class CodeGen:
             rest_list = self.builder.call(self.runtime["list_new"], [])
             for arg_node in rest_args:
                 self._emit_list_append_expr(rest_list, arg_node)
+            # *args is a tuple in Python
+            self.builder.call(self.runtime["list_mark_tuple"], [rest_list])
             args.append(rest_list)
             if n_kwonly > 0:
                 fn_def = getattr(self, '_function_def_nodes', {}).get(name)
@@ -21156,6 +21459,7 @@ class CodeGen:
             self.builder.call(self.runtime["print_newline"], [])
             return
         fv = self._load_or_wrap_fv(node)
+        self._emit_try_bail_if_exc()
         tag, data = self._fv_unpack(fv)
         self.builder.call(self.runtime["fv_print"], [tag, data])
 
@@ -21664,13 +21968,21 @@ class CodeGen:
             if type_tag == "tuple" and node.id in self._tuple_elem_types:
                 return self._tuple_elem_types[node.id]
         # .values(), .items(), .keys() return lists of tagged values / strings.
-        # For int-keyed dicts, keys() returns ints, not strings.
+        # items() returns tuples (list with is_tuple=1).
+        # keys() returns strings (or ints for int-keyed dicts).
+        # values() returns mixed FpyValues (default "str" for compatibility).
         if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
                 and node.func.attr in ("values", "items", "keys")):
+            if node.func.attr == "items":
+                return "list"  # items() returns list of tuples (stored as FpyList)
             if (node.func.attr == "keys"
                     and isinstance(node.func.value, ast.Name)
                     and self._is_int_keyed_dict(node.func.value)):
                 return "int"
+            return "str"
+        # String methods that return lists of strings
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr in ("split", "rsplit", "splitlines")):
             return "str"
         # sorted(dict) or sorted(dict.keys()) returns list of keys
         if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
@@ -22334,6 +22646,7 @@ class CodeGen:
             self.builder.call(self.runtime["write_str"], [str_ptr])
             return
         fv = self._load_or_wrap_fv(node)
+        self._emit_try_bail_if_exc()
         tag, data = self._fv_unpack(fv)
         self.builder.call(self.runtime["fv_write"], [tag, data])
 
@@ -23414,7 +23727,9 @@ class CodeGen:
             # int-flavored safe division so the ZeroDivisionError message
             # matches CPython ("division by zero" for int/int, "float
             # division by zero" only when a float operand is involved).
-            return self.builder.call(self.runtime["safe_int_fdiv"], [left, right])
+            result = self.builder.call(self.runtime["safe_int_fdiv"], [left, right])
+            self._emit_try_bail_if_exc()
+            return result
         elif isinstance(op, ast.BitAnd):
             return self.builder.and_(left, right)
         elif isinstance(op, ast.BitOr):
@@ -23428,6 +23743,22 @@ class CodeGen:
         else:
             return self._bridge_fallback_expr(node, f"unsupported int operator: {type(op).__name__}")
 
+    def _emit_try_bail_if_exc(self) -> None:
+        """If inside a try block, check exc_pending() and bail to the except
+        handler immediately.  This prevents side-effectful code from executing
+        after a call that raised (e.g. list.append running with a garbage
+        return value from a division that raised ZeroDivisionError)."""
+        if not self._in_try_block:
+            return
+        target = getattr(self, '_try_except_target', None)
+        if target is None:
+            return
+        pending = self.builder.call(self.runtime["exc_pending"], [])
+        is_exc = self.builder.icmp_signed("!=", pending, ir.Constant(i32, 0))
+        cont = self._new_block("try.earlycheck")
+        self.builder.cbranch(is_exc, target, cont)
+        self.builder.position_at_end(cont)
+
     def _emit_python_floordiv(self, left: ir.Value, right: ir.Value) -> ir.Value:
         """
         Python-style floor division: rounds toward negative infinity.
@@ -23437,7 +23768,8 @@ class CodeGen:
           if r != 0 and (r ^ right) < 0: q -= 1
         """
         q = self.builder.call(self.runtime["safe_div"], [left, right])
-        r = self.builder.srem(left, right)  # srem is safe when sdiv doesn't crash
+        self._emit_try_bail_if_exc()
+        r = self.builder.call(self.runtime["safe_mod"], [left, right])
         zero = ir.Constant(i64, 0)
         one = ir.Constant(i64, 1)
 
@@ -23458,7 +23790,8 @@ class CodeGen:
           r = left % right (C-style)
           if r != 0 and (r ^ right) < 0: r += right
         """
-        r = self.builder.srem(left, right)
+        r = self.builder.call(self.runtime["safe_mod"], [left, right])
+        self._emit_try_bail_if_exc()
         zero = ir.Constant(i64, 0)
 
         r_nonzero = self.builder.icmp_signed("!=", r, zero)
@@ -23714,6 +24047,7 @@ class CodeGen:
             # Python's // on floats: divide (raising on /0) then floor
             result = self.builder.call(self.runtime["safe_fdiv"],
                                        [left, right])
+            self._emit_try_bail_if_exc()
             # Use intrinsic for floor
             floor_fn = self.module.declare_intrinsic("llvm.floor", [double])
             return self.builder.call(floor_fn, [result])
@@ -23729,8 +24063,10 @@ class CodeGen:
             adjusted = self.builder.fadd(rem, right)
             return self.builder.select(needs_adjust, adjusted, rem)
         elif isinstance(op, ast.Div):
-            return self.builder.call(self.runtime["safe_fdiv"],
+            result = self.builder.call(self.runtime["safe_fdiv"],
                                      [left, right])
+            self._emit_try_bail_if_exc()
+            return result
         elif isinstance(op, ast.Pow):
             return self.builder.call(self.runtime["pow_float"], [left, right])
         else:
@@ -25156,10 +25492,14 @@ class CodeGen:
                     length = self._rt_call("list_length", [lst])
                     elem_type = self._get_list_elem_type(node.args[0])
                     is_str = (elem_type == "str")
-                    result_type = i8_ptr if is_str else i64
+                    # Pointer-based element types: str, list, tuple, dict, etc.
+                    is_ptr = elem_type in ("str", "list", "tuple", "dict",
+                                            "set", "deque", "bytes", "obj")
+                    result_type = i8_ptr if is_ptr else i64
+                    bare_tag = elem_type if is_ptr else "int"
                     result_alloca = self._create_entry_alloca(result_type, f"{name}.result")
                     first = self._list_get_as_bare(
-                        lst, ir.Constant(i64, 0), "str" if is_str else "int")
+                        lst, ir.Constant(i64, 0), bare_tag)
                     self.builder.store(first, result_alloca)
 
                     def _apply_key(e):
@@ -25229,8 +25569,7 @@ class CodeGen:
                     idx = self.builder.load(idx_alloca)
                     current = self.builder.load(result_alloca)
                     if key_func_name is not None:
-                        elem = self._list_get_as_bare(
-                            lst, idx, "str" if is_str else "int")
+                        elem = self._list_get_as_bare(lst, idx, bare_tag)
                         elem_key = _apply_key(elem)
                         if elem_key.type != i64 and isinstance(elem_key.type, ir.IntType):
                             elem_key = self.builder.zext(elem_key, i64)
