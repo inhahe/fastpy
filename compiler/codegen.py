@@ -3518,6 +3518,16 @@ class CodeGen:
         """Generate code for a closure's body."""
         saved = (self.function, self.builder, self.variables, self._loop_stack,
                  self._current_fn_bare_abi)
+        saved_func_name = getattr(self, '_current_func_name', '')
+
+        # Determine the full closure name for this function so that
+        # nested inner defs can be looked up correctly.  The LLVM function
+        # name follows the pattern "fastpy.closure.<full_name>".
+        llvm_name = func.name  # e.g. "fastpy.closure.repeat.decorator"
+        if llvm_name.startswith("fastpy.closure."):
+            self._current_func_name = llvm_name[len("fastpy.closure."):]
+        else:
+            self._current_func_name = node.name
 
         self.function = func
         self._current_fn_bare_abi = False  # closures are never bare-ABI
@@ -3559,6 +3569,7 @@ class CodeGen:
 
         (self.function, self.builder, self.variables, self._loop_stack,
          self._current_fn_bare_abi) = saved
+        self._current_func_name = saved_func_name
 
     def _emit_inline_lambda(self, node: ast.Lambda) -> ir.Value:
         """Compile an inline lambda and return function pointer as i64."""
