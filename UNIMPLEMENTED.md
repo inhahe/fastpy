@@ -149,6 +149,13 @@ These features work correctly but use the embedded CPython interpreter:
 
 ## Bugs fixed (2026-04-28, type(obj), for-star-unpack, enumerate(str), sort(key=), print(sep=var), 3+ comprehensions)
 
+### 142. sorted() on user-class objects with __lt__ used pointer comparison (fixed)
+`sorted([Item(3), Item(1), Item(2)])` where `Item` defines `__lt__` produced
+wrong order because `fpy_value_compare` compared native FpyObj by pointer
+identity rather than dispatching to `__lt__`. Fix: In the FPY_TAG_OBJ case
+of `fpy_value_compare`, look up `__lt__` via `fastpy_find_method` and call
+it if found. Falls back to pointer comparison only when no `__lt__` exists.
+
 ### 141. Tuple methods and operations broken (fixed)
 `t.count(val)` and `t.index(val)` crashed because the list method dispatcher
 only checked `_is_list_expr`, missing tuple-typed expressions. Also,

@@ -1443,3 +1443,13 @@ class TestAdvanced:
 
     def test_tuple_repeat(self, assert_compiles):
         assert_compiles("print((1, 2) * 3)")
+
+    # --- Bug #142: sorted() with __lt__ on user classes ---
+    def test_sorted_with_lt(self, assert_compiles):
+        assert_compiles(
+            "class N:\n"
+            "    def __init__(self, v):\n        self.v = v\n"
+            "    def __lt__(self, o):\n        return self.v < o.v\n"
+            "    def __repr__(self):\n        return f'N({self.v})'\n"
+            "a = [N(5), N(2), N(8), N(1)]\nprint(sorted(a))"
+        )

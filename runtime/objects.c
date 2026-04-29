@@ -1209,7 +1209,20 @@ static int fpy_value_compare(const void *a, const void *b) {
                 if (fpy_cpython_compare(pa, pb, 4)) return 1;
                 return 0;
             }
-            /* Native FpyObj — compare by pointer identity */
+            /* Native FpyObj — use __lt__ if defined, else pointer identity */
+            FpyMethodDef *lt_m = fastpy_find_method(oa->class_id, "__lt__");
+            if (lt_m) {
+                int64_t r = ((int64_t(*)(void*,int64_t))lt_m->func)(pa, (int64_t)(intptr_t)pb);
+                if (r) return -1;
+                /* Check reverse: b < a */
+                FpyObj *ob = (FpyObj*)pb;
+                FpyMethodDef *lt_b = fastpy_find_method(ob->class_id, "__lt__");
+                if (lt_b) {
+                    int64_t r2 = ((int64_t(*)(void*,int64_t))lt_b->func)(pb, (int64_t)(intptr_t)pa);
+                    if (r2) return 1;
+                }
+                return 0;
+            }
             return (pa > pb) - (pa < pb);
         }
         default:
