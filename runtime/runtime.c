@@ -150,9 +150,14 @@ const char* fastpy_str_index(const char *s, int64_t index) {
     return r->data;
 }
 
+/* bytes length — FpyBytes-aware (handles embedded null bytes) */
+int64_t fastpy_bytes_len(const char *b) {
+    return fpy_bytes_len(b);
+}
+
 /* bytes[i] → int (byte value, not character) */
 int64_t fastpy_bytes_get(const char *b, int64_t index) {
-    int64_t len = (int64_t)strlen(b);
+    int64_t len = fpy_bytes_len(b);
     if (index < 0) index += len;
     if (index < 0 || index >= len) {
         fprintf(stderr, "IndexError: bytes index out of range\n");
@@ -243,13 +248,28 @@ const char* fastpy_str_lower(const char *s) {
 
 /* str.encode() — returns a copy of the string tagged as bytes.
  * For UTF-8 strings (the default encoding), the byte content is identical
- * to the string content, so we just strdup and let the caller tag as BYTES. */
+ * to the string content, so we just strdup and let the caller tag as BYTES.
+ * Uses FpyBytes to preserve length even if content contains null bytes. */
 const char* fastpy_str_encode(const char *s) {
     if (!s) return "";
     size_t len = strlen(s);
-    FpyString *result = fpy_str_alloc(len);
-    memcpy(result->data, s, len + 1);
-    return result->data;
+    char *result = fpy_bytes_alloc(len);
+    memcpy(result, s, len);
+    return result;
+}
+
+/* Convert bytes to a list of integers (byte values) */
+FpyList* fastpy_bytes_to_list(const char *b) {
+    if (!b) return fpy_list_new(0);
+    int64_t len = fpy_bytes_len(b);
+    FpyList *result = fpy_list_new(len > 0 ? (int64_t)len : 4);
+    for (size_t i = 0; i < len; i++) {
+        FpyValue val;
+        val.tag = 0;  /* INT */
+        val.data.i = (int64_t)(unsigned char)b[i];
+        fpy_list_append(result, val);
+    }
+    return result;
 }
 
 /* Convert int to string (for f-string formatting) */
@@ -738,6 +758,9 @@ extern int64_t fastpy_list_index_range(FpyList*, int64_t, int64_t, int64_t);
 extern void fastpy_list_sort_key(FpyList*, void (*)(int32_t, int64_t, int32_t*, int64_t*));
 extern const char* fastpy_bytes_decode(const char*);
 extern int64_t fastpy_bytes_get(const char*, int64_t);
+extern int64_t fastpy_bytes_len(const char*);
+extern FpyList* fastpy_bytes_to_list(const char*);
+extern void fastpy_list_mark_tuple(FpyList*);
 extern FpyDict* fastpy_dict_fromkeys(FpyList*, int32_t, int64_t);
 extern FpyDict* fastpy_dict_fromkeys_none(FpyList*);
 extern FpyList* fastpy_float_as_integer_ratio(double);
@@ -841,6 +864,9 @@ static FpySymEntry fpy_jit_symbols[] = {
     SYM(fastpy_list_index_range), SYM(fastpy_list_sort_key),
     SYM(fastpy_bytes_decode),
     SYM(fastpy_bytes_get),
+    SYM(fastpy_bytes_len),
+    SYM(fastpy_bytes_to_list),
+    SYM(fastpy_list_mark_tuple),
     SYM(fastpy_dict_fromkeys), SYM(fastpy_dict_fromkeys_none),
     SYM(fastpy_str_rfind), SYM(fastpy_str_count),
     SYM(fastpy_str_startswith), SYM(fastpy_str_endswith),
@@ -1346,7 +1372,8 @@ int64_t fastpy_struct_calcsize(const char *fmt) {
  * Using char* buffer (caller knows length via calcsize). */
 const char* fastpy_struct_pack(const char *fmt, FpyList *values) {
     int64_t size = fastpy_struct_calcsize(fmt);
-    char *buf = (char*)calloc(size, 1);
+    char *buf = fpy_bytes_alloc(size);
+    memset(buf, 0, size);
     const char *p = fmt;
     int big_endian = 0;
 

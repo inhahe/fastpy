@@ -265,6 +265,11 @@ FpyList* fastpy_tuple_new(void) {
     return t;
 }
 
+/* Mark an existing FpyList as a tuple (used by tuple() constructor) */
+void fastpy_list_mark_tuple(FpyList *list) {
+    if (list) list->is_tuple = 1;
+}
+
 /* Unlocked append — caller must hold list->lock if needed */
 static void fpy_list_append_unlocked(FpyList *list, FpyValue value) {
     if (list->length >= list->capacity) {
@@ -649,7 +654,7 @@ int64_t fastpy_fv_len(int32_t tag, int64_t data) {
         }
         case FPY_TAG_BYTES: {
             const char *s = (const char*)(intptr_t)data;
-            return s ? (int64_t)strlen(s) : 0;
+            return s ? fpy_bytes_len(s) : 0;
         }
     }
     return 0;
@@ -1065,9 +1070,14 @@ FpyList* fastpy_list_slice(FpyList *list, int64_t start, int64_t stop,
     if (stop < 0) stop += len;
     if (start < 0) start = 0;
     if (stop > len) stop = len;
-    if (start >= stop) return fpy_list_new(0);
+    if (start >= stop) {
+        FpyList *empty = fpy_list_new(0);
+        empty->is_tuple = list->is_tuple;
+        return empty;
+    }
     int64_t rlen = stop - start;
     FpyList *result = fpy_list_new(rlen);
+    result->is_tuple = list->is_tuple;
     if (rlen > 0) {
         memcpy(result->items, list->items + start, rlen * sizeof(FpyValue));
         result->length = rlen;
@@ -1101,6 +1111,7 @@ FpyList* fastpy_list_slice_step(FpyList *list, int64_t start, int64_t stop,
     if (stop > len) stop = len;
 
     FpyList *result = fpy_list_new(8);
+    result->is_tuple = list->is_tuple;
     if (step > 0) {
         for (int64_t i = start; i < stop; i += step)
             fpy_list_append(result, list->items[i]);

@@ -147,7 +147,49 @@ These features work correctly but use the embedded CPython interpreter:
 - **Other stdlib modules** not implemented natively (e.g., collections,
   itertools, functools — except singledispatch which is native)
 
-## Bugs fixed (2026-04-28, deque misdispatch, struct bridge, callable monomorph, decorator chaining)
+## Bugs fixed (2026-04-28, tuple repr, bytes length, dict comp filter, deque, struct, callable)
+
+### 94. Dict comprehension with tuple-unpacking target ignored if-clause filter (fixed)
+`{k: v for k, v in d.items() if v > 2}` included ALL items instead of only
+those matching the filter. The tuple-unpacking path in `_emit_dict_comprehension`
+had no filter handling — the `gen.ifs` list was completely ignored.
+Fix: Added filter handling (condition check → cbranch to skip/add blocks) in
+the tuple-unpacking dict comprehension path, matching the existing logic in
+the simple-variable path.
+
+### 93. `len()` on bytes with embedded null bytes returned 0 (fixed)
+`struct.pack(">I", 12345)` produces 4 bytes starting with `\x00\x00`. Calling
+`len()` on the result returned 0 because `fastpy_str_len` uses `strlen()` which
+stops at the first null byte.
+Root cause: Bytes were stored as raw `char*` with no length metadata. Binary
+data containing null bytes was truncated by all `strlen`-based operations.
+Fix: Added `FpyBytes` struct with explicit `length` field (alongside magic and
+refcount, like FpyString). `struct.pack` and `str.encode` now allocate via
+`fpy_bytes_alloc` which preserves the length. Added `fastpy_bytes_len` which
+checks for FpyBytes header and reads the stored length, falling back to
+`strlen` for plain strings. Updated `_emit_builtin_len` to route VKind.BYTES
+through `bytes_len` instead of `str_len`.
+
+### 92. `list(bytes_obj)` returned empty list (fixed)
+`list(b)` where `b = "hello".encode("utf-8")` returned `[]` instead of
+`[104, 101, 108, 108, 111]`. The `list()` constructor had no bytes-specific
+handler, so it fell through to the generic path which returned the bytes pointer
+as-is (not a list).
+Fix: Added `fastpy_bytes_to_list` runtime function that iterates byte values
+and builds an FpyList of ints. Added `list(bytes)` handler in codegen that
+checks the variable's type tag and dispatches to `bytes_to_list`.
+
+### 91. Tuple slicing and `tuple()` constructor returned lists (fixed)
+`t[1:4]` on a tuple printed `[20, 30, 40]` (list syntax) instead of
+`(20, 30, 40)` (tuple syntax). Similarly, `tuple(x**2 for x in range(5))`
+printed with square brackets. The `is_tuple` flag on FpyList was not
+propagated.
+Root cause: `fastpy_list_slice` and `fastpy_list_slice_step` created new
+`fpy_list_new()` results without copying `is_tuple` from the source. The
+`tuple()` constructor called `list_new` instead of `tuple_new` for empty
+tuples, and `tuple(iter)` didn't mark the result as tuple.
+Fix: (1) Propagate `is_tuple` in both slice functions; (2) `tuple()` uses
+`tuple_new`; (3) `tuple(iter)` calls `fastpy_list_mark_tuple` after building.
 
 ### 90. struct module routed through CPython bridge instead of native handlers (fixed)
 `struct.pack("<HH", 1000, 2000)` followed by `struct.unpack("<HH", packed)`

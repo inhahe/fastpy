@@ -1512,6 +1512,12 @@ class CodeGen:
         # bytes[i] → int (byte value)
         ft = ir.FunctionType(i64, [i8_ptr, i64])
         self.runtime["bytes_get"] = ir.Function(self.module, ft, name="fastpy_bytes_get")
+        # bytes → list of int (byte values)
+        ft = ir.FunctionType(i8_ptr, [i8_ptr])
+        self.runtime["bytes_to_list"] = ir.Function(self.module, ft, name="fastpy_bytes_to_list")
+        # bytes length (FpyBytes-aware, handles embedded null bytes)
+        ft = ir.FunctionType(i64, [i8_ptr])
+        self.runtime["bytes_len"] = ir.Function(self.module, ft, name="fastpy_bytes_len")
         # dict.fromkeys(keys, value) and dict.fromkeys(keys)
         ft = ir.FunctionType(i8_ptr, [i8_ptr, i32, i64])
         self.runtime["dict_fromkeys"] = ir.Function(self.module, ft, name="fastpy_dict_fromkeys")
@@ -1538,6 +1544,8 @@ class CodeGen:
         self.runtime["set_equal"] = ir.Function(self.module, ft, name="fastpy_set_equal")
         ft = ir.FunctionType(i8_ptr, [])
         self.runtime["tuple_new"] = ir.Function(self.module, ft, name="fastpy_tuple_new")
+        ft = ir.FunctionType(ir.VoidType(), [i8_ptr])
+        self.runtime["list_mark_tuple"] = ir.Function(self.module, ft, name="fastpy_list_mark_tuple")
         ft = ir.FunctionType(i8_ptr, [i8_ptr, i8_ptr, i8_ptr])
         self.runtime["zip3"] = ir.Function(self.module, ft, name="fastpy_zip3")
         ft = ir.FunctionType(i8_ptr, [i8_ptr, i8_ptr])
@@ -24336,6 +24344,19 @@ class CodeGen:
                     if isinstance(dq.type, ir.IntType):
                         dq = self.builder.inttoptr(dq, i8_ptr)
                     return self.builder.call(self.runtime["deque_to_list"], [dq])
+                # list(bytes) → list of byte values (ints)
+                if len(node.args) == 1:
+                    arg = node.args[0]
+                    # Check if argument is a bytes-typed variable
+                    is_bytes = False
+                    if isinstance(arg, ast.Name) and arg.id in self.variables:
+                        _, vtag = self.variables[arg.id]
+                        is_bytes = (vtag == "bytes")
+                    if is_bytes:
+                        b = self._emit_expr_value(arg)
+                        if isinstance(b.type, ir.IntType):
+                            b = self.builder.inttoptr(b, i8_ptr)
+                        return self.builder.call(self.runtime["bytes_to_list"], [b])
                 # list(x) — for now, just return the arg (shallow copy would be better)
                 if len(node.args) == 1:
                     return self._emit_expr_value(node.args[0])
@@ -24365,11 +24386,18 @@ class CodeGen:
                         return d
                     return self._bridge_fallback_expr(node, "dict() with non-literal argument")
             if name == "tuple":
-                # tuple(iter) — for our purposes, same as list()
+                # tuple(iter) — build list, then mark as tuple for correct repr
                 if len(node.args) == 1:
-                    return self._emit_expr_value(node.args[0])
+                    result = self._emit_expr_value(node.args[0])
+                    # Ensure the result is a list pointer, then mark as tuple
+                    if isinstance(result.type, ir.PointerType) or result.type == i8_ptr:
+                        self.builder.call(self.runtime["list_mark_tuple"], [result])
+                    else:
+                        ptr = self.builder.inttoptr(result, i8_ptr)
+                        self.builder.call(self.runtime["list_mark_tuple"], [ptr])
+                    return result
                 if len(node.args) == 0:
-                    return self.builder.call(self.runtime["list_new"], [])
+                    return self.builder.call(self.runtime["tuple_new"], [])
                 raise CodeGenError("tuple() with wrong number of args", node)
             if name == "complex":
                 # complex(real, imag) or complex(real)
@@ -27016,8 +27044,10 @@ class CodeGen:
             return self._rt_call("list_length", [tv.as_ptr(self.builder)])
         if kind in (VKind.DICT, VKind.SET):
             return self._rt_call("dict_length", [tv.as_ptr(self.builder)])
-        if kind in (VKind.STR, VKind.BYTES):
+        if kind == VKind.STR:
             return self._rt_call("str_len", [tv.as_ptr(self.builder)])
+        if kind == VKind.BYTES:
+            return self._rt_call("bytes_len", [tv.as_ptr(self.builder)])
 
         # OBJ with __len__: native dispatch
         if kind == VKind.OBJ and tv.vtype.class_name:
@@ -30197,12 +30227,24 @@ class CodeGen:
                     d2 = self._create_entry_alloca(i64, f"dc.d{ti}")
                     self._rt_call("list_get_fv", [elem_ptr, ir.Constant(i64, ti), t2, d2])
                     self._store_variable(tgt.id, self.builder.load(d2), "int")
+            # Handle filter conditions (if clauses)
+            incr_block = self._new_block("dc.incr")
+            for if_clause in gen.ifs:
+                cond_val = self._emit_condition(if_clause)
+                skip_block = self._new_block("dc.skip")
+                add_block = self._new_block("dc.add")
+                self.builder.cbranch(cond_val, add_block, skip_block)
+                self.builder.position_at_end(skip_block)
+                self.builder.branch(incr_block)
+                self.builder.position_at_end(add_block)
             # Evaluate key and value expressions
             key_val = self._emit_expr_value(node.key)
             val_val = self._emit_expr_value(node.value)
             k_tag, k_data = self._bare_to_tag_data(key_val, node.key)
             v_tag, v_data = self._bare_to_tag_data(val_val, node.value)
             self._rt_call("dict_set_fv", [result_dict, key_val, ir.Constant(i32, v_tag), v_data])
+            self.builder.branch(incr_block)
+            self.builder.position_at_end(incr_block)
             next_idx = self.builder.add(idx, ir.Constant(i64, 1))
             self.builder.store(next_idx, idx_alloca)
             self.builder.branch(cond_block)
