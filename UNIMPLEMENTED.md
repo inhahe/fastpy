@@ -19,9 +19,10 @@ __getitem__, __setitem__, __delitem__, __len__, __bool__, __contains__,
 __iter__/__next__, __call__, __hash__.
 
 ### Containers
-list (literals, comprehensions, all methods), dict (literals, comprehensions,
-get, pop, pop with default, popitem, setdefault, keys, values, items, update,
-copy, clear, | merge, {**a, **b}),
+list (literals, comprehensions, all methods incl. index with start/stop),
+dict (literals, comprehensions, get, pop, pop with default, popitem,
+setdefault, keys, values, items, update, copy, clear, fromkeys,
+| merge, {**a, **b}),
 tuple (literals, unpacking, *mid unpack, swap), set (literals, comprehensions,
 add, discard, remove, union, intersection, difference, symmetric_difference,
 issubset, issuperset, isdisjoint, copy, clear, pop, update,
@@ -30,16 +31,21 @@ issubset, issuperset, isdisjoint, copy, clear, pop, update,
 ### Strings
 f-strings (with =, !r, format specs), all common methods, % formatting,
 .format(), raw strings, string multiplication, slicing, `in` operator.
-Methods: lower, upper, strip/lstrip/rstrip, replace, split, rsplit, join,
-find, rfind, count, startswith, endswith, removeprefix, removesuffix, center,
-ljust, rjust (with optional fill char), zfill, title, capitalize, swapcase,
-isdigit, isalpha, isalnum, isspace, isupper, islower, istitle, isidentifier,
-isprintable, isdecimal, isnumeric, casefold, encode, expandtabs, partition,
-rpartition, splitlines.
+Methods: lower, upper, strip/lstrip/rstrip, replace (with optional count),
+split, rsplit, join, find, rfind, count, index, rindex (all with optional
+start/end), startswith, endswith (with optional start/end and tuple support),
+removeprefix, removesuffix, center, ljust, rjust (with optional fill char),
+zfill, title, capitalize, swapcase, isdigit, isalpha, isalnum, isspace,
+isupper, islower, istitle, isidentifier, isprintable, isdecimal, isnumeric,
+casefold, encode, expandtabs, partition, rpartition, splitlines,
+maketrans (2-arg), translate.
 
 ### Number methods
-int: bit_length, bit_count (LLVM inline — ctlz/ctpop intrinsics).
-float: is_integer (LLVM inline — floor comparison).
+int: bit_length, bit_count (LLVM inline — ctlz/ctpop intrinsics),
+to_bytes(length, byteorder).
+float: is_integer (LLVM inline — floor comparison),
+as_integer_ratio (C runtime — returns tuple).
+int.from_bytes(bytes, byteorder) — class method.
 
 ### Exceptions
 try/except/finally/else, raise, bare raise, raise from, multiple except
@@ -176,6 +182,69 @@ for subscript indexing `s[i]`).
 ### 50. `str.replace(old, new, count)` three-argument form (new)
 `s.replace("a", "x", 2)` replaces at most `count` occurrences.
 Uses `fastpy_str_replace_count` C runtime function.
+
+### 51. String methods with `start`/`end` parameters (new)
+`str.find(sub, start, end)`, `str.rfind(sub, start, end)`,
+`str.count(sub, start, end)`, `str.index(sub, start, end)`,
+`str.rindex(sub, start, end)`, `str.startswith(prefix, start, end)`,
+`str.endswith(suffix, start, end)`. All use `_range` C runtime
+variants with Python-style negative index clamping.
+
+### 52. `str.startswith(tuple)`, `str.endswith(tuple)` (new)
+`s.startswith(("http", "ftp"))` checks any prefix in the tuple.
+Uses `fastpy_str_startswith_tuple`/`fastpy_str_endswith_tuple` runtime
+functions that iterate an FpyList of prefixes/suffixes.
+
+### 53. `list.index(value, start, stop)` with range (new)
+`lst.index(20, 2)` and `lst.index(20, 2, 4)` search within a slice.
+Raises `ValueError` if not found (matching CPython behavior).
+
+### 54. `bytes.decode()` (new)
+`b"hello".decode()` returns a string. For ASCII/UTF-8 content, the
+bytes are the string (zero-copy for compatible encodings).
+
+### 55. `dict.fromkeys(keys)` and `dict.fromkeys(keys, value)` (new)
+Class method to create a dict from an iterable of keys. Default value
+is `None` when not specified.
+
+### 56. `float.as_integer_ratio()` (new)
+Returns the exact integer ratio as a `(numerator, denominator)` tuple.
+C runtime implementation using `frexp()` decomposition with GCD
+simplification. Handles 0.0, raises ValueError for NaN/Inf.
+
+### 57. `int.to_bytes(length, byteorder)` (new)
+Converts an integer to a bytes string of the given length. Supports
+`"big"` and `"little"` byteorder. Note: bytes with embedded `\x00`
+may truncate due to null-terminated char* representation.
+
+### 58. `int.from_bytes(bytes, byteorder)` (new)
+Class method to convert a bytes string to an integer. Supports
+`"big"` and `"little"` byteorder.
+
+### 59. `list.sort(key=...)` fix (fixed)
+Previously, `list.sort(key=len)` would silently ignore the `key=`
+parameter and sort by natural ordering. Now correctly detected and
+falls through to CPython bridge for correct key-based sorting.
+
+### 60. `str.lstrip(chars)`, `str.rstrip(chars)` (new)
+`str.lstrip("xy")` and `str.rstrip("xy")` with character set argument.
+Previously only the no-args (whitespace) versions were supported.
+
+### 61. `dict.clear()` (new)
+Resets dict length to 0 and clears the index table. Was listed as
+implemented in the Containers section but had no actual codegen
+dispatch or runtime function.
+
+### 62. `list.index(str)`, `list.count(str)` (new)
+String-value versions of `list.index` and `list.count`. Previously
+only worked with int values. Now dispatches to `list_index_str` /
+`list_count_str` when the argument is a pointer type (string).
+
+### 63. `str.maketrans()` and `str.translate()` (new)
+`str.maketrans("aeiou", "12345")` creates a 257-byte translation
+table (magic byte + 256-char mapping). `s.translate(table)` applies
+it. Table uses offset-1 indexing to avoid null-byte C string issues.
+Supports the 2-arg form of maketrans (from/to character mapping).
 
 ## Bugs fixed (2026-04-28, bridge dispatch & string methods)
 

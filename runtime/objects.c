@@ -1650,6 +1650,13 @@ FpyDict* fastpy_dict_copy(FpyDict *dict) {
     return result;
 }
 
+void fastpy_dict_clear(FpyDict *dict) {
+    FPY_LOCK(dict);
+    dict->length = 0;
+    memset(dict->indices, 0xFF, dict->table_size * sizeof(int64_t));
+    FPY_UNLOCK(dict);
+}
+
 /* Dict methods returning lists */
 FpyList* fastpy_dict_keys(FpyDict *dict) {
     FpyList *result = fpy_list_new(dict->length);
@@ -3013,11 +3020,33 @@ int64_t fastpy_list_index(FpyList *list, int64_t value) {
     return -1;
 }
 
+/* List index for string values */
+int64_t fastpy_list_index_str(FpyList *list, const char *value) {
+    for (int64_t i = 0; i < list->length; i++) {
+        if (list->items[i].tag == FPY_TAG_STR
+            && strcmp(list->items[i].data.s, value) == 0) {
+            return i;
+        }
+    }
+    return -1;
+}
+
 /* List count — count occurrences */
 int64_t fastpy_list_count(FpyList *list, int64_t value) {
     int64_t count = 0;
     for (int64_t i = 0; i < list->length; i++) {
         if (list->items[i].tag == FPY_TAG_INT && list->items[i].data.i == value) {
+            count++;
+        }
+    }
+    return count;
+}
+
+int64_t fastpy_list_count_str(FpyList *list, const char *value) {
+    int64_t count = 0;
+    for (int64_t i = 0; i < list->length; i++) {
+        if (list->items[i].tag == FPY_TAG_STR
+            && strcmp(list->items[i].data.s, value) == 0) {
             count++;
         }
     }
@@ -3062,6 +3091,24 @@ const char* fastpy_str_strip_chars(const char *s, const char *chars) {
     size_t len = end - start + 1;
     char *result = (char*)malloc(len + 1);
     memcpy(result, start, len);
+    result[len] = '\0';
+    return result;
+}
+
+const char* fastpy_str_lstrip_chars(const char *s, const char *chars) {
+    const char *start = s;
+    while (*start && strchr(chars, *start)) start++;
+    return fpy_strdup(start);
+}
+
+const char* fastpy_str_rstrip_chars(const char *s, const char *chars) {
+    size_t slen = strlen(s);
+    if (slen == 0) return fpy_strdup(s);
+    const char *end = s + slen - 1;
+    while (end >= s && strchr(chars, *end)) end--;
+    size_t len = end - s + 1;
+    char *result = (char*)malloc(len + 1);
+    memcpy(result, s, len);
     result[len] = '\0';
     return result;
 }
@@ -3523,6 +3570,338 @@ int64_t fastpy_str_count(const char *s, const char *sub) {
         p += sub_len;
     }
     return count;
+}
+
+/* str.find(sub, start) and str.find(sub, start, end) — search within slice */
+int64_t fastpy_str_find_range(const char *s, const char *sub,
+                               int64_t start, int64_t end) {
+    int64_t s_len = (int64_t)strlen(s);
+    /* Clamp start/end like Python */
+    if (start < 0) { start += s_len; if (start < 0) start = 0; }
+    if (end < 0) { end += s_len; if (end < 0) end = 0; }
+    if (end > s_len) end = s_len;
+    if (start > end) return -1;
+    size_t sub_len = strlen(sub);
+    if (sub_len == 0) return start;
+    if ((int64_t)sub_len > end - start) return -1;
+    for (int64_t i = start; i <= end - (int64_t)sub_len; i++) {
+        if (memcmp(s + i, sub, sub_len) == 0) return i;
+    }
+    return -1;
+}
+
+/* str.rfind(sub, start, end) — reverse search within slice */
+int64_t fastpy_str_rfind_range(const char *s, const char *sub,
+                                int64_t start, int64_t end) {
+    int64_t s_len = (int64_t)strlen(s);
+    if (start < 0) { start += s_len; if (start < 0) start = 0; }
+    if (end < 0) { end += s_len; if (end < 0) end = 0; }
+    if (end > s_len) end = s_len;
+    if (start > end) return -1;
+    size_t sub_len = strlen(sub);
+    if (sub_len == 0) return end;
+    if ((int64_t)sub_len > end - start) return -1;
+    for (int64_t i = end - (int64_t)sub_len; i >= start; i--) {
+        if (memcmp(s + i, sub, sub_len) == 0) return i;
+    }
+    return -1;
+}
+
+/* str.index(sub, start, end) — like find_range but raises ValueError */
+int64_t fastpy_str_index_sub_range(const char *s, const char *sub,
+                                    int64_t start, int64_t end) {
+    int64_t pos = fastpy_str_find_range(s, sub, start, end);
+    if (pos < 0) fastpy_raise(FPY_EXC_VALUEERROR, "substring not found");
+    return pos;
+}
+
+/* str.rindex(sub, start, end) — like rfind_range but raises ValueError */
+int64_t fastpy_str_rindex_sub_range(const char *s, const char *sub,
+                                     int64_t start, int64_t end) {
+    int64_t pos = fastpy_str_rfind_range(s, sub, start, end);
+    if (pos < 0) fastpy_raise(FPY_EXC_VALUEERROR, "substring not found");
+    return pos;
+}
+
+/* str.count(sub, start, end) — count occurrences within slice */
+int64_t fastpy_str_count_range(const char *s, const char *sub,
+                                int64_t start, int64_t end) {
+    int64_t s_len = (int64_t)strlen(s);
+    if (start < 0) { start += s_len; if (start < 0) start = 0; }
+    if (end < 0) { end += s_len; if (end < 0) end = 0; }
+    if (end > s_len) end = s_len;
+    if (start > end) return 0;
+    size_t sub_len = strlen(sub);
+    if (sub_len == 0) return end - start + 1;
+    int64_t count = 0;
+    for (int64_t i = start; i <= end - (int64_t)sub_len; i++) {
+        if (memcmp(s + i, sub, sub_len) == 0) {
+            count++;
+            i += sub_len - 1; /* non-overlapping */
+        }
+    }
+    return count;
+}
+
+/* str.startswith(prefix, start, end) — check prefix within slice */
+int32_t fastpy_str_startswith_range(const char *s, const char *prefix,
+                                     int64_t start, int64_t end) {
+    int64_t s_len = (int64_t)strlen(s);
+    if (start < 0) { start += s_len; if (start < 0) start = 0; }
+    if (end < 0) { end += s_len; if (end < 0) end = 0; }
+    if (end > s_len) end = s_len;
+    if (start > end) return 0;
+    size_t plen = strlen(prefix);
+    if ((int64_t)plen > end - start) return 0;
+    return memcmp(s + start, prefix, plen) == 0;
+}
+
+/* str.endswith(suffix, start, end) — check suffix within slice */
+int32_t fastpy_str_endswith_range(const char *s, const char *suffix,
+                                   int64_t start, int64_t end) {
+    int64_t s_len = (int64_t)strlen(s);
+    if (start < 0) { start += s_len; if (start < 0) start = 0; }
+    if (end < 0) { end += s_len; if (end < 0) end = 0; }
+    if (end > s_len) end = s_len;
+    if (start > end) return 0;
+    size_t slen = strlen(suffix);
+    int64_t slice_len = end - start;
+    if ((int64_t)slen > slice_len) return 0;
+    return memcmp(s + end - slen, suffix, slen) == 0;
+}
+
+/* str.startswith(tuple_of_prefixes) — check any prefix matches */
+int32_t fastpy_str_startswith_tuple(const char *s, FpyList *prefixes) {
+    for (int64_t i = 0; i < prefixes->length; i++) {
+        if (prefixes->items[i].tag == FPY_TAG_STR) {
+            const char *prefix = prefixes->items[i].data.s;
+            if (strncmp(s, prefix, strlen(prefix)) == 0) return 1;
+        }
+    }
+    return 0;
+}
+
+/* str.endswith(tuple_of_suffixes) — check any suffix matches */
+int32_t fastpy_str_endswith_tuple(const char *s, FpyList *suffixes) {
+    size_t s_len = strlen(s);
+    for (int64_t i = 0; i < suffixes->length; i++) {
+        if (suffixes->items[i].tag == FPY_TAG_STR) {
+            const char *suffix = suffixes->items[i].data.s;
+            size_t suf_len = strlen(suffix);
+            if (suf_len <= s_len && strcmp(s + s_len - suf_len, suffix) == 0)
+                return 1;
+        }
+    }
+    return 0;
+}
+
+/* list.index(value, start, stop) — search in range, raise ValueError if not found */
+int64_t fastpy_list_index_range(FpyList *list, int64_t value,
+                                 int64_t start, int64_t stop) {
+    if (start < 0) { start += list->length; if (start < 0) start = 0; }
+    if (stop < 0) { stop += list->length; if (stop < 0) stop = 0; }
+    if (stop > list->length) stop = list->length;
+    for (int64_t i = start; i < stop; i++) {
+        if (list->items[i].tag == FPY_TAG_INT && list->items[i].data.i == value) {
+            return i;
+        }
+    }
+    fastpy_raise(FPY_EXC_VALUEERROR, "value is not in list");
+    return -1;
+}
+
+/* list.sort(key=func) — sort using a key function pointer.
+ * key_func is a compiled function that takes an FpyValue (tag+data) and returns an FpyValue.
+ * We build a temporary key array, sort indices by key, then rearrange. */
+typedef struct {
+    FpyValue key;
+    int64_t index;
+} KeyIndexPair;
+
+static int key_index_compare(const void *a, const void *b) {
+    const KeyIndexPair *ka = (const KeyIndexPair*)a;
+    const KeyIndexPair *kb = (const KeyIndexPair*)b;
+    return fpy_value_compare(&ka->key, &kb->key);
+}
+
+void fastpy_list_sort_key(FpyList *list,
+                           void (*key_func)(int32_t, int64_t, int32_t*, int64_t*)) {
+    if (list->length <= 1) return;
+    FPY_LOCK(list);
+    KeyIndexPair *pairs = (KeyIndexPair*)malloc(list->length * sizeof(KeyIndexPair));
+    for (int64_t i = 0; i < list->length; i++) {
+        int32_t out_tag; int64_t out_data;
+        key_func(list->items[i].tag, list->items[i].data.i, &out_tag, &out_data);
+        pairs[i].key.tag = out_tag;
+        pairs[i].key.data.i = out_data;
+        pairs[i].index = i;
+    }
+    qsort(pairs, list->length, sizeof(KeyIndexPair), key_index_compare);
+    /* Rearrange items in-place using the sorted indices */
+    FpyValue *temp = (FpyValue*)malloc(list->length * sizeof(FpyValue));
+    for (int64_t i = 0; i < list->length; i++) {
+        temp[i] = list->items[pairs[i].index];
+    }
+    memcpy(list->items, temp, list->length * sizeof(FpyValue));
+    free(temp);
+    free(pairs);
+    FPY_UNLOCK(list);
+}
+
+/* bytes.decode() — for ASCII/UTF-8, the bytes *are* the string */
+const char* fastpy_bytes_decode(const char *bytes) {
+    size_t len = strlen(bytes);
+    char *result = (char*)malloc(len + 1);
+    memcpy(result, bytes, len + 1);
+    return result;
+}
+
+/* dict.fromkeys(keys, value) — create dict from iterable of keys */
+FpyDict* fastpy_dict_fromkeys(FpyList *keys, int32_t val_tag, int64_t val_data) {
+    int64_t cap = keys->length > 4 ? keys->length * 2 : 4;
+    FpyDict *d = fpy_dict_new(cap);
+    FpyValue val;
+    val.tag = val_tag;
+    val.data.i = val_data;
+    for (int64_t i = 0; i < keys->length; i++) {
+        FpyValue key_fv = keys->items[i];
+        fpy_dict_set(d, key_fv, val);
+    }
+    return d;
+}
+
+/* dict.fromkeys(keys) — create dict with None values */
+FpyDict* fastpy_dict_fromkeys_none(FpyList *keys) {
+    return fastpy_dict_fromkeys(keys, FPY_TAG_NONE, 0);
+}
+
+/* float.as_integer_ratio() — return (numerator, denominator) as FpyList tuple */
+FpyList* fastpy_float_as_integer_ratio(double x) {
+    /* Handle special cases */
+    if (x != x) { /* NaN */
+        fastpy_raise(FPY_EXC_VALUEERROR, "cannot convert NaN to integer ratio");
+        return NULL;
+    }
+    if (x == HUGE_VAL || x == -HUGE_VAL) { /* Inf */
+        fastpy_raise(FPY_EXC_VALUEERROR, "cannot convert Infinity to integer ratio");
+        return NULL;
+    }
+    if (x == 0.0) {
+        FpyList *result = fpy_list_new(2);
+        result->items[0].tag = FPY_TAG_INT;
+        result->items[0].data.i = 0;
+        result->items[1].tag = FPY_TAG_INT;
+        result->items[1].data.i = 1;
+        result->length = 2;
+        result->is_tuple = 1;
+        return result;
+    }
+    /* Decompose: x = mantissa * 2^exponent */
+    int exponent;
+    double mantissa = frexp(x, &exponent);
+    /* mantissa is in [0.5, 1.0), multiply by 2^53 to get integer */
+    /* CPython uses 300 iterations of the "exact" algorithm, but for
+     * double precision, 53 bits of mantissa suffice. */
+    int64_t numerator = (int64_t)(mantissa * (double)(1LL << 53));
+    int64_t denominator = 1;
+    exponent -= 53;
+    if (exponent > 0) {
+        /* numerator * 2^exponent — shift numerator up */
+        /* For large exponents, this overflows i64. Cap at reasonable values. */
+        if (exponent <= 10) {
+            numerator <<= exponent;
+        } else {
+            /* Fall back: multiply step by step */
+            for (int i = 0; i < exponent && i < 62; i++) {
+                numerator *= 2;
+            }
+        }
+    } else if (exponent < 0) {
+        /* denominator = 2^(-exponent) */
+        int neg_exp = -exponent;
+        if (neg_exp <= 62) {
+            denominator = 1LL << neg_exp;
+        } else {
+            denominator = 1LL << 62; /* cap */
+        }
+    }
+    /* Simplify by GCD */
+    int64_t a = numerator < 0 ? -numerator : numerator;
+    int64_t b = denominator;
+    while (b) { int64_t t = b; b = a % b; a = t; }
+    if (a > 1) { numerator /= a; denominator /= a; }
+
+    FpyList *result = fpy_list_new(2);
+    result->items[0].tag = FPY_TAG_INT;
+    result->items[0].data.i = numerator;
+    result->items[1].tag = FPY_TAG_INT;
+    result->items[1].data.i = denominator;
+    result->length = 2;
+    result->is_tuple = 1;
+    return result;
+}
+
+/* int.to_bytes(length, byteorder) — convert int to bytes */
+const char* fastpy_int_to_bytes(int64_t value, int64_t length,
+                                 const char *byteorder) {
+    char *result = (char*)malloc(length + 1);
+    int big = (strcmp(byteorder, "big") == 0);
+    uint64_t uval = (uint64_t)value;
+    for (int64_t i = 0; i < length; i++) {
+        int64_t idx = big ? (length - 1 - i) : i;
+        result[idx] = (char)(uval & 0xFF);
+        uval >>= 8;
+    }
+    result[length] = '\0';
+    return result;
+}
+
+/* int.from_bytes(bytes, byteorder) — convert bytes to int */
+int64_t fastpy_int_from_bytes(const char *bytes, int64_t length,
+                               const char *byteorder) {
+    int big = (strcmp(byteorder, "big") == 0);
+    uint64_t result = 0;
+    for (int64_t i = 0; i < length; i++) {
+        int64_t idx = big ? i : (length - 1 - i);
+        result = (result << 8) | ((uint8_t)bytes[idx]);
+    }
+    return (int64_t)result;
+}
+
+/* str.maketrans(from, to) — create a 257-byte translation table.
+ * Byte 0 is a magic marker 'T' (0x54), bytes 1-256 are the mapping for
+ * chars 0-255. Default = identity (char maps to itself).
+ * This avoids null-byte issues with C string representation. */
+const char* fastpy_str_maketrans(const char *from_chars, const char *to_chars) {
+    char *table = (char*)malloc(258);
+    table[0] = 'T'; /* magic marker */
+    for (int i = 0; i < 256; i++) table[i + 1] = (char)i;
+    table[257] = '\0';
+    size_t len = strlen(from_chars);
+    size_t to_len = strlen(to_chars);
+    for (size_t i = 0; i < len && i < to_len; i++) {
+        table[(unsigned char)from_chars[i] + 1] = to_chars[i];
+    }
+    return table;
+}
+
+/* str.translate(table) — apply a translation table created by maketrans.
+ * Table format: byte 0 = 'T' (magic), bytes 1-256 = char mapping. */
+const char* fastpy_str_translate(const char *s, const char *table) {
+    size_t slen = strlen(s);
+    if (table[0] != 'T') {
+        /* Not a valid translation table, return copy */
+        char *copy = (char*)malloc(slen + 1);
+        memcpy(copy, s, slen + 1);
+        return copy;
+    }
+    char *result = (char*)malloc(slen + 1);
+    for (size_t i = 0; i < slen; i++) {
+        unsigned char c = (unsigned char)s[i];
+        result[i] = table[c + 1];
+    }
+    result[slen] = '\0';
+    return result;
 }
 
 /* Check if all elements are scalar (int/float/bool/none) — no refcounting needed */

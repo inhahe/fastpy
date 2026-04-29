@@ -1300,6 +1300,10 @@ class CodeGen:
         self.runtime["str_rstrip"] = ir.Function(self.module, ft, name="fastpy_str_rstrip")
         ft = ir.FunctionType(i8_ptr, [i8_ptr, i8_ptr])
         self.runtime["str_strip_chars"] = ir.Function(self.module, ft, name="fastpy_str_strip_chars")
+        self.runtime["str_lstrip_chars"] = ir.Function(self.module, ft, name="fastpy_str_lstrip_chars")
+        self.runtime["str_rstrip_chars"] = ir.Function(self.module, ft, name="fastpy_str_rstrip_chars")
+        self.runtime["str_maketrans"] = ir.Function(self.module, ft, name="fastpy_str_maketrans")
+        self.runtime["str_translate"] = ir.Function(self.module, ft, name="fastpy_str_translate")
         ft = ir.FunctionType(i32, [i8_ptr])
         self.runtime["str_isdigit"] = ir.Function(self.module, ft, name="fastpy_str_isdigit")
         self.runtime["str_isalpha"] = ir.Function(self.module, ft, name="fastpy_str_isalpha")
@@ -1428,6 +1432,8 @@ class CodeGen:
         self.runtime["dict_popitem"] = ir.Function(self.module, ft, name="fastpy_dict_popitem")
         ft = ir.FunctionType(i8_ptr, [i8_ptr])
         self.runtime["dict_copy"] = ir.Function(self.module, ft, name="fastpy_dict_copy")
+        ft = ir.FunctionType(void, [i8_ptr])
+        self.runtime["dict_clear"] = ir.Function(self.module, ft, name="fastpy_dict_clear")
         ft = ir.FunctionType(void, [i8_ptr, i8_ptr, i8_ptr])
         self.runtime["dict_setdefault_list"] = ir.Function(self.module, ft, name="fastpy_dict_setdefault_list")
         ft = ir.FunctionType(void, [i8_ptr, i8_ptr, i64])
@@ -1442,8 +1448,12 @@ class CodeGen:
         self.runtime["list_pop_at"] = ir.Function(self.module, ft, name="fastpy_list_pop_at")
         ft = ir.FunctionType(i64, [i8_ptr, i64])
         self.runtime["list_index"] = ir.Function(self.module, ft, name="fastpy_list_index")
+        ft = ir.FunctionType(i64, [i8_ptr, i8_ptr])
+        self.runtime["list_index_str"] = ir.Function(self.module, ft, name="fastpy_list_index_str")
         ft = ir.FunctionType(i64, [i8_ptr, i64])
         self.runtime["list_count"] = ir.Function(self.module, ft, name="fastpy_list_count")
+        ft = ir.FunctionType(i64, [i8_ptr, i8_ptr])
+        self.runtime["list_count_str"] = ir.Function(self.module, ft, name="fastpy_list_count_str")
         ft = ir.FunctionType(i8_ptr, [i8_ptr, i8_ptr, i8_ptr])
         self.runtime["dict_get_default"] = ir.Function(self.module, ft, name="fastpy_dict_get_default")
         ft = ir.FunctionType(i32, [i8_ptr, i8_ptr])
@@ -1463,6 +1473,45 @@ class CodeGen:
         self.runtime["str_rindex_sub"] = ir.Function(self.module, ft, name="fastpy_str_rindex_sub")
         ft = ir.FunctionType(i64, [i8_ptr, i8_ptr])
         self.runtime["str_count"] = ir.Function(self.module, ft, name="fastpy_str_count")
+        # str.find/rfind/count/index/rindex with start/end range params
+        ft = ir.FunctionType(i64, [i8_ptr, i8_ptr, i64, i64])
+        self.runtime["str_find_range"] = ir.Function(self.module, ft, name="fastpy_str_find_range")
+        self.runtime["str_rfind_range"] = ir.Function(self.module, ft, name="fastpy_str_rfind_range")
+        self.runtime["str_index_sub_range"] = ir.Function(self.module, ft, name="fastpy_str_index_sub_range")
+        self.runtime["str_rindex_sub_range"] = ir.Function(self.module, ft, name="fastpy_str_rindex_sub_range")
+        self.runtime["str_count_range"] = ir.Function(self.module, ft, name="fastpy_str_count_range")
+        # str.startswith/endswith with start/end range params (return i32 bool)
+        ft = ir.FunctionType(i32, [i8_ptr, i8_ptr, i64, i64])
+        self.runtime["str_startswith_range"] = ir.Function(self.module, ft, name="fastpy_str_startswith_range")
+        self.runtime["str_endswith_range"] = ir.Function(self.module, ft, name="fastpy_str_endswith_range")
+        # str.startswith/endswith with tuple arg (return i32 bool)
+        ft = ir.FunctionType(i32, [i8_ptr, i8_ptr])
+        self.runtime["str_startswith_tuple"] = ir.Function(self.module, ft, name="fastpy_str_startswith_tuple")
+        self.runtime["str_endswith_tuple"] = ir.Function(self.module, ft, name="fastpy_str_endswith_tuple")
+        # list.index(value, start, stop)
+        ft = ir.FunctionType(i64, [i8_ptr, i64, i64, i64])
+        self.runtime["list_index_range"] = ir.Function(self.module, ft, name="fastpy_list_index_range")
+        # list.sort(key=func) — key_func is void(*)(i32, i64, i32*, i64*)
+        key_fn_ty = ir.FunctionType(ir.VoidType(), [i32, i64, i32.as_pointer(), i64.as_pointer()])
+        ft = ir.FunctionType(ir.VoidType(), [i8_ptr, key_fn_ty.as_pointer()])
+        self.runtime["list_sort_key"] = ir.Function(self.module, ft, name="fastpy_list_sort_key")
+        # bytes.decode()
+        ft = ir.FunctionType(i8_ptr, [i8_ptr])
+        self.runtime["bytes_decode"] = ir.Function(self.module, ft, name="fastpy_bytes_decode")
+        # dict.fromkeys(keys, value) and dict.fromkeys(keys)
+        ft = ir.FunctionType(i8_ptr, [i8_ptr, i32, i64])
+        self.runtime["dict_fromkeys"] = ir.Function(self.module, ft, name="fastpy_dict_fromkeys")
+        ft = ir.FunctionType(i8_ptr, [i8_ptr])
+        self.runtime["dict_fromkeys_none"] = ir.Function(self.module, ft, name="fastpy_dict_fromkeys_none")
+        # float.as_integer_ratio() → FpyList* (tuple)
+        ft = ir.FunctionType(i8_ptr, [double])
+        self.runtime["float_as_integer_ratio"] = ir.Function(self.module, ft, name="fastpy_float_as_integer_ratio")
+        # int.to_bytes(length, byteorder) → char*
+        ft = ir.FunctionType(i8_ptr, [i64, i64, i8_ptr])
+        self.runtime["int_to_bytes"] = ir.Function(self.module, ft, name="fastpy_int_to_bytes")
+        # int.from_bytes(bytes, length, byteorder) → i64
+        ft = ir.FunctionType(i64, [i8_ptr, i64, i8_ptr])
+        self.runtime["int_from_bytes"] = ir.Function(self.module, ft, name="fastpy_int_from_bytes")
         ft = ir.FunctionType(i8_ptr, [i8_ptr, i8_ptr])
         self.runtime["list_concat"] = ir.Function(self.module, ft, name="fastpy_list_concat")
         ft = ir.FunctionType(i32, [i8_ptr, i8_ptr])
@@ -12778,16 +12827,21 @@ class CodeGen:
                 if fn in ("exists", "isfile", "isdir",
                            "path_exists", "path_isfile", "path_isdir"):
                     return "bool"
-        # str.encode() returns bytes
+        # str.encode() / int.to_bytes() returns bytes, bytes.decode() returns str
         if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-                and node.func.attr == "encode"):
+                and node.func.attr in ("encode", "to_bytes")):
             return "bytes"
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "decode"):
+            return "str"
         # Native module method calls: json.loads(...), os.getcwd(), etc.
         if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)):
             mod = node.func.value.id
             fn = node.func.attr
             if mod == "json" and fn == "loads":
+                return "dict"
+            if mod == "dict" and fn == "fromkeys":
                 return "dict"
             if mod == "json" and fn == "dumps":
                 return "str"
@@ -12983,6 +13037,8 @@ class CodeGen:
             if method in ("keys", "values", "items"):
                 return "list:str"
             if method == "popitem" and self._is_dict_expr(node.func.value):
+                return "tuple"
+            if method == "as_integer_ratio":
                 return "tuple"
             if method == "copy":
                 if self._is_list_expr(node.func.value):
@@ -21270,6 +21326,9 @@ class CodeGen:
             if (node.func.attr == "popitem"
                     and self._is_dict_expr(node.func.value)):
                 return True
+            # float.as_integer_ratio() returns a tuple
+            if node.func.attr == "as_integer_ratio":
+                return True
         return False
 
     def _is_int_keyed_dict(self, node: ast.expr) -> bool:
@@ -21350,6 +21409,11 @@ class CodeGen:
             # Built-in dict.copy() returns a dict
             if (node.func.attr == "copy"
                     and self._is_dict_expr(node.func.value)):
+                return True
+            # dict.fromkeys(...) returns a dict
+            if (node.func.attr == "fromkeys"
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "dict"):
                 return True
         # Dict merge: dict | dict → new dict
         if (isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr)
@@ -22742,6 +22806,38 @@ class CodeGen:
         _bm_rewrite = self._rewrite_bound_method(node)
         if _bm_rewrite is not None:
             node = _bm_rewrite
+        # str.maketrans(from, to) — static method on str class
+        if (isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "str"
+                and node.func.attr == "maketrans"
+                and len(node.args) == 2):
+            from_chars = self._emit_expr_value(node.args[0])
+            to_chars = self._emit_expr_value(node.args[1])
+            return self._rt_call("str_maketrans", [from_chars, to_chars])
+        # int.from_bytes(bytes, byteorder)
+        if (isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "int"
+                and node.func.attr == "from_bytes"
+                and len(node.args) >= 2):
+            b = self._emit_expr_value(node.args[0])
+            byteorder = self._emit_expr_value(node.args[1])
+            blen = self._rt_call("str_len", [b])
+            return self._rt_call("int_from_bytes", [b, blen, byteorder])
+        # dict.fromkeys(keys) / dict.fromkeys(keys, value)
+        if (isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "dict"
+                and node.func.attr == "fromkeys"):
+            if len(node.args) == 1:
+                keys = self._emit_expr_value(node.args[0])
+                return self._rt_call("dict_fromkeys_none", [keys])
+            if len(node.args) == 2:
+                keys = self._emit_expr_value(node.args[0])
+                val = self._emit_expr_value(node.args[1])
+                tag_ir, data_ir = self._to_tag_data_ir(val, node.args[1])
+                return self._rt_call("dict_fromkeys", [keys, tag_ir, data_ir])
         # Native module method call: asyncio.run(), json.loads(), etc.
         if (isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)):
@@ -26437,26 +26533,54 @@ class CodeGen:
             if method == "pop" and len(node.args) == 1:
                 idx = self._emit_expr_value(node.args[0])
                 return self._rt_call("list_pop_at", [obj, idx])
-            if method == "index" and len(node.args) == 1:
-                val = self._emit_expr_value(node.args[0])
-                return self._rt_call("list_index", [obj, val])
+            if method == "index":
+                if len(node.args) == 1:
+                    val = self._emit_expr_value(node.args[0])
+                    if isinstance(val.type, ir.PointerType):
+                        return self._rt_call("list_index_str", [obj, val])
+                    return self._rt_call("list_index", [obj, val])
+                if len(node.args) == 2:
+                    val = self._emit_expr_value(node.args[0])
+                    start = self._emit_expr_value(node.args[1])
+                    length = self._rt_call("list_length", [obj])
+                    return self._rt_call("list_index_range",
+                                         [obj, val, start, length])
+                if len(node.args) == 3:
+                    val = self._emit_expr_value(node.args[0])
+                    start = self._emit_expr_value(node.args[1])
+                    stop = self._emit_expr_value(node.args[2])
+                    return self._rt_call("list_index_range",
+                                         [obj, val, start, stop])
             if method == "count" and len(node.args) == 1:
                 val = self._emit_expr_value(node.args[0])
+                if isinstance(val.type, ir.PointerType):
+                    return self._rt_call("list_count_str", [obj, val])
                 return self._rt_call("list_count", [obj, val])
             if method == "extend" and len(node.args) == 1:
                 other = self._emit_expr_value(node.args[0])
                 self._rt_call("list_extend", [obj, other])
                 return obj
             if method == "sort" and len(node.args) == 0:
-                self._rt_call("list_sort", [obj])
-                # Handle reverse=True keyword
+                # Check for key= keyword argument
+                has_key = False
+                has_reverse = False
                 for kw in node.keywords:
+                    if kw.arg == "key" and kw.value is not None:
+                        if not (isinstance(kw.value, ast.Constant)
+                                and kw.value.value is None):
+                            has_key = True
                     if kw.arg == "reverse":
                         if (isinstance(kw.value, ast.Constant)
                                 and kw.value.value is True):
-                            self.builder.call(
-                                self.runtime["list_reverse_inplace"], [obj])
-                return obj
+                            has_reverse = True
+                if has_key:
+                    pass  # fall through to bridge for key= support
+                else:
+                    self._rt_call("list_sort", [obj])
+                    if has_reverse:
+                        self.builder.call(
+                            self.runtime["list_reverse_inplace"], [obj])
+                    return obj
             if method == "reverse" and len(node.args) == 0:
                 self._rt_call("list_reverse_inplace", [obj])
                 return obj
@@ -26675,6 +26799,9 @@ class CodeGen:
                 return tup
             if method == "copy" and len(node.args) == 0:
                 return self._rt_call("dict_copy", [obj])
+            if method == "clear" and len(node.args) == 0:
+                self._rt_call("dict_clear", [obj])
+                return obj
             # Phase 4: fall through to runtime dispatch below
 
         # Check if object is a known user-class instance
@@ -26904,8 +27031,14 @@ class CodeGen:
                     return self._rt_call("str_strip_chars", [obj, chars])
                 return self._rt_call("str_strip", [obj])
             if method == "lstrip":
+                if len(node.args) == 1:
+                    chars = self._emit_expr_value(node.args[0])
+                    return self._rt_call("str_lstrip_chars", [obj, chars])
                 return self._rt_call("str_lstrip", [obj])
             if method == "rstrip":
+                if len(node.args) == 1:
+                    chars = self._emit_expr_value(node.args[0])
+                    return self._rt_call("str_rstrip_chars", [obj, chars])
                 return self._rt_call("str_rstrip", [obj])
             if method == "isdigit":
                 return self._rt_call("str_isdigit", [obj])
@@ -27025,12 +27158,43 @@ class CodeGen:
                     return self._rt_call("str_replace", [obj, old, new])
             if method == "startswith":
                 if len(node.args) == 1:
+                    arg = node.args[0]
+                    val = self._emit_expr_value(arg)
+                    # Check if arg is a tuple → tuple version
+                    if self._is_tuple_expr(arg) or self._is_list_expr(arg):
+                        return self._rt_call("str_startswith_tuple", [obj, val])
+                    return self._rt_call("str_startswith", [obj, val])
+                if len(node.args) == 2:
                     prefix = self._emit_expr_value(node.args[0])
-                    return self._rt_call("str_startswith", [obj, prefix])
+                    start = self._emit_expr_value(node.args[1])
+                    slen = self._rt_call("str_len", [obj])
+                    return self._rt_call("str_startswith_range",
+                                         [obj, prefix, start, slen])
+                if len(node.args) == 3:
+                    prefix = self._emit_expr_value(node.args[0])
+                    start = self._emit_expr_value(node.args[1])
+                    end = self._emit_expr_value(node.args[2])
+                    return self._rt_call("str_startswith_range",
+                                         [obj, prefix, start, end])
             if method == "endswith":
                 if len(node.args) == 1:
+                    arg = node.args[0]
+                    val = self._emit_expr_value(arg)
+                    if self._is_tuple_expr(arg) or self._is_list_expr(arg):
+                        return self._rt_call("str_endswith_tuple", [obj, val])
+                    return self._rt_call("str_endswith", [obj, val])
+                if len(node.args) == 2:
                     suffix = self._emit_expr_value(node.args[0])
-                    return self._rt_call("str_endswith", [obj, suffix])
+                    start = self._emit_expr_value(node.args[1])
+                    slen = self._rt_call("str_len", [obj])
+                    return self._rt_call("str_endswith_range",
+                                         [obj, suffix, start, slen])
+                if len(node.args) == 3:
+                    suffix = self._emit_expr_value(node.args[0])
+                    start = self._emit_expr_value(node.args[1])
+                    end = self._emit_expr_value(node.args[2])
+                    return self._rt_call("str_endswith_range",
+                                         [obj, suffix, start, end])
             if method == "removeprefix":
                 if len(node.args) == 1:
                     prefix = self._emit_expr_value(node.args[0])
@@ -27043,27 +27207,96 @@ class CodeGen:
                 if len(node.args) == 1:
                     sub = self._emit_expr_value(node.args[0])
                     return self._rt_call("str_find", [obj, sub])
+                if len(node.args) == 2:
+                    sub = self._emit_expr_value(node.args[0])
+                    start = self._emit_expr_value(node.args[1])
+                    slen = self._rt_call("str_len", [obj])
+                    return self._rt_call("str_find_range",
+                                         [obj, sub, start, slen])
+                if len(node.args) == 3:
+                    sub = self._emit_expr_value(node.args[0])
+                    start = self._emit_expr_value(node.args[1])
+                    end = self._emit_expr_value(node.args[2])
+                    return self._rt_call("str_find_range",
+                                         [obj, sub, start, end])
             if method == "rfind":
                 if len(node.args) == 1:
                     sub = self._emit_expr_value(node.args[0])
                     return self._rt_call("str_rfind", [obj, sub])
+                if len(node.args) == 2:
+                    sub = self._emit_expr_value(node.args[0])
+                    start = self._emit_expr_value(node.args[1])
+                    slen = self._rt_call("str_len", [obj])
+                    return self._rt_call("str_rfind_range",
+                                         [obj, sub, start, slen])
+                if len(node.args) == 3:
+                    sub = self._emit_expr_value(node.args[0])
+                    start = self._emit_expr_value(node.args[1])
+                    end = self._emit_expr_value(node.args[2])
+                    return self._rt_call("str_rfind_range",
+                                         [obj, sub, start, end])
             if method == "index":
                 if len(node.args) == 1:
                     sub = self._emit_expr_value(node.args[0])
                     return self._rt_call("str_index_sub", [obj, sub])
+                if len(node.args) == 2:
+                    sub = self._emit_expr_value(node.args[0])
+                    start = self._emit_expr_value(node.args[1])
+                    slen = self._rt_call("str_len", [obj])
+                    return self._rt_call("str_index_sub_range",
+                                         [obj, sub, start, slen])
+                if len(node.args) == 3:
+                    sub = self._emit_expr_value(node.args[0])
+                    start = self._emit_expr_value(node.args[1])
+                    end = self._emit_expr_value(node.args[2])
+                    return self._rt_call("str_index_sub_range",
+                                         [obj, sub, start, end])
             if method == "rindex":
                 if len(node.args) == 1:
                     sub = self._emit_expr_value(node.args[0])
                     return self._rt_call("str_rindex_sub", [obj, sub])
+                if len(node.args) == 2:
+                    sub = self._emit_expr_value(node.args[0])
+                    start = self._emit_expr_value(node.args[1])
+                    slen = self._rt_call("str_len", [obj])
+                    return self._rt_call("str_rindex_sub_range",
+                                         [obj, sub, start, slen])
+                if len(node.args) == 3:
+                    sub = self._emit_expr_value(node.args[0])
+                    start = self._emit_expr_value(node.args[1])
+                    end = self._emit_expr_value(node.args[2])
+                    return self._rt_call("str_rindex_sub_range",
+                                         [obj, sub, start, end])
             if method == "count":
                 if len(node.args) == 1:
                     sub = self._emit_expr_value(node.args[0])
                     return self._rt_call("str_count", [obj, sub])
+                if len(node.args) == 2:
+                    sub = self._emit_expr_value(node.args[0])
+                    start = self._emit_expr_value(node.args[1])
+                    slen = self._rt_call("str_len", [obj])
+                    return self._rt_call("str_count_range",
+                                         [obj, sub, start, slen])
+                if len(node.args) == 3:
+                    sub = self._emit_expr_value(node.args[0])
+                    start = self._emit_expr_value(node.args[1])
+                    end = self._emit_expr_value(node.args[2])
+                    return self._rt_call("str_count_range",
+                                         [obj, sub, start, end])
             if method == "format":
                 return self._emit_str_format(node, obj)
+            if method == "translate":
+                if len(node.args) == 1:
+                    table = self._emit_expr_value(node.args[0])
+                    return self._rt_call("str_translate", [obj, table])
             if method == "encode":
                 # str.encode() → bytes (same UTF-8 content, tagged as BYTES)
                 return self._rt_call("str_encode", [obj])
+        # bytes methods
+        if obj_kind == VKind.BYTES:
+            if method == "decode" and len(node.args) <= 1:
+                # bytes.decode() → str (same UTF-8 content)
+                return self._rt_call("bytes_decode", [obj])
         # int methods: bit_length, bit_count, to_bytes, etc.
         if obj_kind == VKind.INT:
             if method == "bit_length" and len(node.args) == 0:
@@ -27102,6 +27335,12 @@ class CodeGen:
                 ctpop = self.module.declare_intrinsic(
                     "llvm.ctpop", [i64], ctpop_fnty)
                 return self.builder.call(ctpop, [val])
+            if method == "to_bytes" and len(node.args) >= 2:
+                val = obj if isinstance(obj.type, ir.IntType) else \
+                    self.builder.ptrtoint(obj, i64)
+                length = self._emit_expr_value(node.args[0])
+                byteorder = self._emit_expr_value(node.args[1])
+                return self._rt_call("int_to_bytes", [val, length, byteorder])
 
         # float methods: is_integer, conjugate, etc.
         if obj_kind == VKind.FLOAT:
@@ -27115,6 +27354,10 @@ class CodeGen:
                 floored = self.builder.call(floor_fn, [fval])
                 is_int = self.builder.fcmp_ordered("==", fval, floored)
                 return self.builder.zext(is_int, i32)
+            if method == "as_integer_ratio" and len(node.args) == 0:
+                fval = obj if isinstance(obj.type, ir.DoubleType) else \
+                    self.builder.bitcast(obj, double)
+                return self._rt_call("float_as_integer_ratio", [fval])
 
         # Fallback: method dispatch for unknown objects.
         # Two paths:

@@ -662,6 +662,18 @@ extern FpyList* fastpy_str_split(const char*);
 extern const char* fastpy_str_join(const char*, FpyList*);
 extern int64_t fastpy_str_compare(const char*, const char*);
 extern int64_t fastpy_str_find(const char*, const char*);
+extern int64_t fastpy_str_rfind(const char*, const char*);
+extern int64_t fastpy_str_count(const char*, const char*);
+extern int fastpy_str_startswith(const char*, const char*);
+extern int fastpy_str_endswith(const char*, const char*);
+extern int64_t fastpy_list_index(FpyList*, int64_t);
+extern int64_t fastpy_list_index_str(FpyList*, const char*);
+extern int64_t fastpy_list_count_str(FpyList*, const char*);
+extern void fastpy_dict_clear(FpyDict*);
+extern const char* fastpy_str_maketrans(const char*, const char*);
+extern const char* fastpy_str_translate(const char*, const char*);
+extern const char* fastpy_str_lstrip_chars(const char*, const char*);
+extern const char* fastpy_str_rstrip_chars(const char*, const char*);
 extern const char* fastpy_str_removeprefix(const char*, const char*);
 extern const char* fastpy_str_removesuffix(const char*, const char*);
 extern const char* fastpy_str_center_fill(const char*, int64_t, const char*);
@@ -701,6 +713,23 @@ extern FpyDict* fastpy_dict_copy(FpyDict*);
 extern int64_t fastpy_str_index_sub(const char*, const char*);
 extern int64_t fastpy_str_rindex_sub(const char*, const char*);
 extern const char* fastpy_str_replace_count(const char*, const char*, const char*, int64_t);
+extern int64_t fastpy_str_find_range(const char*, const char*, int64_t, int64_t);
+extern int64_t fastpy_str_rfind_range(const char*, const char*, int64_t, int64_t);
+extern int64_t fastpy_str_index_sub_range(const char*, const char*, int64_t, int64_t);
+extern int64_t fastpy_str_rindex_sub_range(const char*, const char*, int64_t, int64_t);
+extern int64_t fastpy_str_count_range(const char*, const char*, int64_t, int64_t);
+extern int32_t fastpy_str_startswith_range(const char*, const char*, int64_t, int64_t);
+extern int32_t fastpy_str_endswith_range(const char*, const char*, int64_t, int64_t);
+extern int32_t fastpy_str_startswith_tuple(const char*, FpyList*);
+extern int32_t fastpy_str_endswith_tuple(const char*, FpyList*);
+extern int64_t fastpy_list_index_range(FpyList*, int64_t, int64_t, int64_t);
+extern void fastpy_list_sort_key(FpyList*, void (*)(int32_t, int64_t, int32_t*, int64_t*));
+extern const char* fastpy_bytes_decode(const char*);
+extern FpyDict* fastpy_dict_fromkeys(FpyList*, int32_t, int64_t);
+extern FpyDict* fastpy_dict_fromkeys_none(FpyList*);
+extern FpyList* fastpy_float_as_integer_ratio(double);
+extern const char* fastpy_int_to_bytes(int64_t, int64_t, const char*);
+extern int64_t fastpy_int_from_bytes(const char*, int64_t, const char*);
 extern const char* fastpy_int_to_str(int64_t);
 extern const char* fastpy_float_to_str(double);
 extern int64_t fastpy_pow_int(int64_t, int64_t);
@@ -791,6 +820,23 @@ static FpySymEntry fpy_jit_symbols[] = {
     SYM(fastpy_set_update), SYM(fastpy_dict_popitem),
     SYM(fastpy_dict_copy), SYM(fastpy_str_index_sub), SYM(fastpy_str_rindex_sub),
     SYM(fastpy_str_replace_count),
+    SYM(fastpy_str_find_range), SYM(fastpy_str_rfind_range),
+    SYM(fastpy_str_index_sub_range), SYM(fastpy_str_rindex_sub_range),
+    SYM(fastpy_str_count_range),
+    SYM(fastpy_str_startswith_range), SYM(fastpy_str_endswith_range),
+    SYM(fastpy_str_startswith_tuple), SYM(fastpy_str_endswith_tuple),
+    SYM(fastpy_list_index_range), SYM(fastpy_list_sort_key),
+    SYM(fastpy_bytes_decode),
+    SYM(fastpy_dict_fromkeys), SYM(fastpy_dict_fromkeys_none),
+    SYM(fastpy_str_rfind), SYM(fastpy_str_count),
+    SYM(fastpy_str_startswith), SYM(fastpy_str_endswith),
+    SYM(fastpy_list_index),
+    SYM(fastpy_float_as_integer_ratio),
+    SYM(fastpy_int_to_bytes), SYM(fastpy_int_from_bytes),
+    SYM(fastpy_str_lstrip_chars), SYM(fastpy_str_rstrip_chars),
+    SYM(fastpy_dict_clear), SYM(fastpy_list_index_str),
+    SYM(fastpy_list_count_str),
+    SYM(fastpy_str_maketrans), SYM(fastpy_str_translate),
     SYM(fastpy_int_to_str), SYM(fastpy_float_to_str),
     SYM(fastpy_pow_int), SYM(fastpy_pow_float), SYM(fastpy_round),
     SYM(fastpy_chr), SYM(fastpy_ord), SYM(fastpy_hex),
