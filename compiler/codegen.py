@@ -28539,6 +28539,1228 @@ class CodeGen:
                               [callable_ptr, t_ir, d_ir, out_tag, out_data])
         return
 
+    def _emit_method_call_path(self, node):
+        """Emit pathlib.Path method calls. Always returns."""
+        attr = node.func
+        method = node.func.attr
+        obj = self._emit_expr_value(attr.value)
+        obj = self._ensure_ptr(obj)
+        # Attribute access (properties): .name, .parent, .suffix, .stem
+        _path_props = {
+            "name": "path_name", "parent": "path_parent",
+            "suffix": "path_suffix", "stem": "path_stem",
+        }
+        if method in _path_props and len(node.args) == 0:
+            return self.builder.call(self.runtime[_path_props[method]], [obj])
+        # Method calls
+        if method == "exists" and len(node.args) == 0:
+            return self.builder.call(self.runtime["path_exists"], [obj])
+        if method == "is_file" and len(node.args) == 0:
+            return self.builder.call(self.runtime["path_is_file"], [obj])
+        if method == "is_dir" and len(node.args) == 0:
+            return self.builder.call(self.runtime["path_is_dir"], [obj])
+        if method == "resolve" and len(node.args) == 0:
+            return self.builder.call(self.runtime["path_resolve"], [obj])
+        if method == "read_text" and len(node.args) == 0:
+            return self.builder.call(self.runtime["path_read_text"], [obj])
+        if method == "write_text" and len(node.args) == 1:
+            content = self._emit_expr_value(node.args[0])
+            content = self._ensure_ptr(content)
+            self.builder.call(self.runtime["path_write_text"], [obj, content])
+            return ir.Constant(i64, 0)
+        if method == "iterdir" and len(node.args) == 0:
+            return self.builder.call(self.runtime["path_iterdir"], [obj])
+        if method == "with_suffix" and len(node.args) == 1:
+            suffix = self._emit_expr_value(node.args[0])
+            suffix = self._ensure_ptr(suffix)
+            return self.builder.call(self.runtime["path_with_suffix"],
+                                      [obj, suffix])
+        if method == "joinpath" and len(node.args) >= 1:
+            result = obj
+            for arg_node in node.args:
+                other = self._emit_expr_value(arg_node)
+                other = self._ensure_ptr(other)
+                result = self.builder.call(self.runtime["path_join"],
+                                           [result, other])
+            return result
+        # __str__ / as_posix
+        if method in ("__str__", "as_posix", "__fspath__"):
+            return self.builder.call(self.runtime["path_str"], [obj])
+        # Unrecognized path method: fall through to CPython bridge
+        return self._emit_cpython_method_call(node)
+
+        # --- pyobj method calls (bridge objects: Django models, etc.) ---
+        # Route through CPython bridge if the receiver is a pyobj in any form.
+
+    def _emit_method_call_logger(self, node):
+        """Emit logging method calls. Returns None if not recognized."""
+        attr = node.func
+        method = node.func.attr
+        logger_id = self._emit_expr_value(attr.value)
+        if isinstance(logger_id.type, ir.PointerType):
+            logger_id = self.builder.ptrtoint(logger_id, i32)
+        elif isinstance(logger_id.type, ir.IntType) and logger_id.type.width != 32:
+            logger_id = self.builder.trunc(logger_id, i32) \
+                if logger_id.type.width > 32 \
+                else self.builder.zext(logger_id, i32)
+        _logger_levels = {
+            "debug": 10, "info": 20, "warning": 30, "warn": 30,
+            "error": 40, "critical": 50, "fatal": 50,
+        }
+        if method in _logger_levels and len(node.args) >= 1:
+            msg = self._emit_logging_msg(node)
+            self.builder.call(self.runtime["logging_logger_log"],
+                              [logger_id,
+                               ir.Constant(i32, _logger_levels[method]),
+                               msg])
+            return ir.Constant(i64, 0)
+        if method == "setLevel" and len(node.args) == 1:
+            level = self._emit_expr_value(node.args[0])
+            if isinstance(level.type, ir.IntType) and level.type.width != 32:
+                level = self.builder.trunc(level, i32) \
+                    if level.type.width > 32 \
+                    else self.builder.zext(level, i32)
+            self.builder.call(self.runtime["logging_setLevel"],
+                              [logger_id, level])
+            return ir.Constant(i64, 0)
+        if method == "log" and len(node.args) >= 2:
+            level = self._emit_expr_value(node.args[0])
+            if isinstance(level.type, ir.IntType) and level.type.width != 32:
+                level = self.builder.trunc(level, i32) \
+                    if level.type.width > 32 \
+                    else self.builder.zext(level, i32)
+            msg = self._emit_logging_msg_from(node, start_idx=1)
+            self.builder.call(self.runtime["logging_logger_log"],
+                              [logger_id, level, msg])
+            return ir.Constant(i64, 0)
+        # Phase 4: fall through to runtime dispatch below
+
+        # --- Collections module method calls ---
+
+        # Check if object is a deque
+        return None
+
+    def _emit_method_call_deque(self, node):
+        """Emit deque method calls. Returns None if not recognized."""
+        attr = node.func
+        method = node.func.attr
+        obj = self._emit_expr_value(attr.value)
+        obj = self._ensure_ptr(obj)
+        if method == "append" and len(node.args) == 1:
+            val = self._emit_expr_value(node.args[0])
+            tag, data = self._bare_to_tag_data(val, node.args[0])
+            self.builder.call(self.runtime["deque_append"],
+                              [obj, ir.Constant(i32, tag), data])
+            return obj
+        if method == "appendleft" and len(node.args) == 1:
+            val = self._emit_expr_value(node.args[0])
+            tag, data = self._bare_to_tag_data(val, node.args[0])
+            self.builder.call(self.runtime["deque_appendleft"],
+                              [obj, ir.Constant(i32, tag), data])
+            return obj
+        if method == "pop" and len(node.args) == 0:
+            out_tag = self._create_entry_alloca(i32, "dq.pop.tag")
+            out_data = self._create_entry_alloca(i64, "dq.pop.data")
+            self.builder.call(self.runtime["deque_pop"],
+                              [obj, out_tag, out_data])
+            return self.builder.load(out_data)
+        if method == "popleft" and len(node.args) == 0:
+            out_tag = self._create_entry_alloca(i32, "dq.popleft.tag")
+            out_data = self._create_entry_alloca(i64, "dq.popleft.data")
+            self.builder.call(self.runtime["deque_popleft"],
+                              [obj, out_tag, out_data])
+            return self.builder.load(out_data)
+        if method == "rotate":
+            n = ir.Constant(i64, 1)
+            if len(node.args) == 1:
+                n = self._emit_expr_value(node.args[0])
+            self.builder.call(self.runtime["deque_rotate"], [obj, n])
+            return obj
+        if method == "clear" and len(node.args) == 0:
+            self.builder.call(self.runtime["deque_clear"], [obj])
+            return obj
+        if method == "extend" and len(node.args) == 1:
+            other = self._emit_expr_value(node.args[0])
+            other = self._ensure_ptr(other)
+            self.builder.call(self.runtime["deque_extend"], [obj, other])
+            return obj
+        if method == "extendleft" and len(node.args) == 1:
+            other = self._emit_expr_value(node.args[0])
+            other = self._ensure_ptr(other)
+            self.builder.call(self.runtime["deque_extendleft"], [obj, other])
+            return obj
+        # Phase 4: fall through to runtime dispatch below
+
+        # Check if object is a Counter
+        return None
+
+    def _emit_method_call_counter(self, node):
+        """Emit Counter method calls. Returns None if not recognized."""
+        attr = node.func
+        method = node.func.attr
+        obj = self._emit_expr_value(attr.value)
+        obj = self._ensure_ptr(obj)
+        if method == "most_common":
+            n = ir.Constant(i64, -1)  # all elements
+            if len(node.args) == 1:
+                n = self._emit_expr_value(node.args[0])
+            return self.builder.call(self.runtime["counter_most_common"],
+                                      [obj, n])
+        if method == "elements" and len(node.args) == 0:
+            return self.builder.call(self.runtime["counter_elements"], [obj])
+        if method == "update" and len(node.args) == 1:
+            other = self._emit_expr_value(node.args[0])
+            other = self._ensure_ptr(other)
+            self.builder.call(self.runtime["counter_update_list"],
+                              [obj, other])
+            return obj
+        # Counter also supports dict methods (keys, values, items, get, etc.)
+        if method == "keys":
+            return self._rt_call("dict_keys", [obj])
+        if method == "values":
+            return self._rt_call("dict_values", [obj])
+        if method == "items":
+            return self._rt_call("dict_items", [obj])
+        # Phase 4: fall through to runtime dispatch below
+
+        # Check if object is a defaultdict — method calls go to regular dict methods
+        return None
+
+    def _emit_method_call_defaultdict(self, node):
+        """Emit defaultdict method calls. Returns None if not recognized."""
+        attr = node.func
+        method = node.func.attr
+        obj = self._emit_expr_value(attr.value)
+        obj = self._ensure_ptr(obj)
+        if method == "keys":
+            return self._rt_call("dict_keys", [obj])
+        if method == "values":
+            return self._rt_call("dict_values", [obj])
+        if method == "items":
+            return self._rt_call("dict_items", [obj])
+        # Phase 4: fall through to runtime dispatch below
+
+        # Check if object is a list (or tuple — same FpyList struct)
+        return None
+
+    def _emit_method_call_list(self, node):
+        """Emit list/tuple method calls. Returns None if not recognized."""
+        attr = node.func
+        method = node.func.attr
+        obj = self._emit_expr_value(attr.value)
+        if method == "append" and len(node.args) == 1:
+            self._emit_list_append_expr(obj, node.args[0])
+            return obj
+        if method == "pop" and len(node.args) == 0:
+            return self._rt_call("list_pop_int", [obj])
+        if method == "pop" and len(node.args) == 1:
+            idx = self._emit_expr_value(node.args[0])
+            return self._rt_call("list_pop_at", [obj, idx])
+        if method == "index":
+            if len(node.args) == 1:
+                val = self._emit_expr_value(node.args[0])
+                if isinstance(val.type, ir.PointerType):
+                    return self._rt_call("list_index_str", [obj, val])
+                return self._rt_call("list_index", [obj, val])
+            if len(node.args) == 2:
+                val = self._emit_expr_value(node.args[0])
+                start = self._emit_expr_value(node.args[1])
+                length = self._rt_call("list_length", [obj])
+                return self._rt_call("list_index_range",
+                                     [obj, val, start, length])
+            if len(node.args) == 3:
+                val = self._emit_expr_value(node.args[0])
+                start = self._emit_expr_value(node.args[1])
+                stop = self._emit_expr_value(node.args[2])
+                return self._rt_call("list_index_range",
+                                     [obj, val, start, stop])
+        if method == "count" and len(node.args) == 1:
+            val = self._emit_expr_value(node.args[0])
+            if isinstance(val.type, ir.PointerType):
+                return self._rt_call("list_count_str", [obj, val])
+            return self._rt_call("list_count", [obj, val])
+        if method == "extend" and len(node.args) == 1:
+            other = self._emit_expr_value(node.args[0])
+            self._rt_call("list_extend", [obj, other])
+            return obj
+        if method == "sort" and len(node.args) == 0:
+            # Check for key= keyword argument
+            has_key = False
+            has_reverse = False
+            for kw in node.keywords:
+                if kw.arg == "key" and kw.value is not None:
+                    if not (isinstance(kw.value, ast.Constant)
+                            and kw.value.value is None):
+                        has_key = True
+                if kw.arg == "reverse":
+                    if (isinstance(kw.value, ast.Constant)
+                            and kw.value.value is True):
+                        has_reverse = True
+            if has_key:
+                # Native list.sort(key=func) — get key function pointer
+                key_node = None
+                for kw in node.keywords:
+                    if kw.arg == "key":
+                        key_node = kw.value
+                        break
+                fn_ptr = self._get_unary_func_ptr(key_node, node)
+                rev_flag = ir.Constant(i32, 1 if has_reverse else 0)
+                self.builder.call(self.runtime["list_sort_by_key_int"],
+                                  [obj, fn_ptr, rev_flag])
+                return obj
+            else:
+                self._rt_call("list_sort", [obj])
+                if has_reverse:
+                    self.builder.call(
+                        self.runtime["list_reverse_inplace"], [obj])
+                return obj
+        if method == "reverse" and len(node.args) == 0:
+            self._rt_call("list_reverse_inplace", [obj])
+            return obj
+        if method == "remove" and len(node.args) == 1:
+            val = self._emit_expr_value(node.args[0])
+            if isinstance(val.type, ir.PointerType):
+                self._rt_call("list_remove_str", [obj, val])
+            else:
+                self._rt_call("list_remove", [obj, val])
+            return obj
+        if method == "insert" and len(node.args) == 2:
+            idx = self._emit_expr_value(node.args[0])
+            val = self._emit_expr_value(node.args[1])
+            if isinstance(val.type, ir.PointerType):
+                self._rt_call("list_insert_str", [obj, idx, val])
+            else:
+                self._rt_call("list_insert_int", [obj, idx, val])
+            return obj
+        if method == "copy" and len(node.args) == 0:
+            return self._rt_call("list_copy", [obj])
+        if method == "clear" and len(node.args) == 0:
+            self._rt_call("list_clear", [obj])
+            return obj
+        if method == "discard" and len(node.args) == 1:
+            val = self._emit_expr_value(node.args[0])
+            if isinstance(val.type, ir.PointerType):
+                val = self.builder.ptrtoint(val, i64)
+            self.builder.call(self.runtime["set_discard"], [obj, val])
+            return obj
+        # Phase 4: fall through to runtime dispatch below
+
+        # Check if object is a set (dict-backed)
+        return None
+
+    def _emit_method_call_set(self, node):
+        """Emit set method calls. Returns None if not recognized."""
+        attr = node.func
+        method = node.func.attr
+        obj = self._emit_expr_value(attr.value)
+        obj = self._ensure_ptr(obj)
+        if method == "add" and len(node.args) == 1:
+            val = self._emit_expr_value(node.args[0])
+            tag, data = self._bare_to_tag_data(val, node.args[0])
+            self.builder.call(self.runtime["set_add_fv"],
+                              [obj, ir.Constant(i32, tag), data])
+            return obj
+        if method == "discard" and len(node.args) == 1:
+            val = self._emit_expr_value(node.args[0])
+            tag, data = self._bare_to_tag_data(val, node.args[0])
+            self.builder.call(self.runtime["set_discard_fv"],
+                              [obj, ir.Constant(i32, tag), data])
+            return obj
+        if method == "remove" and len(node.args) == 1:
+            val = self._emit_expr_value(node.args[0])
+            tag, data = self._bare_to_tag_data(val, node.args[0])
+            self.builder.call(self.runtime["set_discard_fv"],
+                              [obj, ir.Constant(i32, tag), data])
+            return obj
+        if method == "union" and len(node.args) == 1:
+            other = self._emit_expr_value(node.args[0])
+            other = self._ensure_ptr(other)
+            return self._rt_call("set_union", [obj, other])
+        if method == "intersection" and len(node.args) == 1:
+            other = self._emit_expr_value(node.args[0])
+            other = self._ensure_ptr(other)
+            return self._rt_call("set_intersection", [obj, other])
+        if method == "difference" and len(node.args) == 1:
+            other = self._emit_expr_value(node.args[0])
+            other = self._ensure_ptr(other)
+            return self._rt_call("set_difference", [obj, other])
+        if method == "symmetric_difference" and len(node.args) == 1:
+            other = self._emit_expr_value(node.args[0])
+            other = self._ensure_ptr(other)
+            return self._rt_call("set_symmetric_diff", [obj, other])
+        if method == "issubset" and len(node.args) == 1:
+            other = self._emit_expr_value(node.args[0])
+            other = self._ensure_ptr(other)
+            return self._rt_call("set_issubset", [obj, other])
+        if method == "issuperset" and len(node.args) == 1:
+            other = self._emit_expr_value(node.args[0])
+            other = self._ensure_ptr(other)
+            return self._rt_call("set_issuperset", [obj, other])
+        if method == "isdisjoint" and len(node.args) == 1:
+            other = self._emit_expr_value(node.args[0])
+            other = self._ensure_ptr(other)
+            return self._rt_call("set_isdisjoint", [obj, other])
+        if method == "copy" and len(node.args) == 0:
+            return self._rt_call("set_copy", [obj])
+        if method == "clear" and len(node.args) == 0:
+            self._rt_call("set_clear", [obj])
+            return obj
+        if method == "pop" and len(node.args) == 0:
+            tag_slot = self._create_entry_alloca(i32, "spop.tag")
+            data_slot = self._create_entry_alloca(i64, "spop.data")
+            self.builder.call(self.runtime["set_pop_fv"],
+                              [obj, tag_slot, data_slot])
+            return self._fv_build_from_slots(
+                self.builder.load(tag_slot), self.builder.load(data_slot))
+        if method == "update" and len(node.args) == 1:
+            other = self._emit_expr_value(node.args[0])
+            other = self._ensure_ptr(other)
+            self._rt_call("set_update", [obj, other])
+            return obj
+        # Phase 4: fall through to runtime dispatch below
+
+        # Check if object is a dict
+        return None
+
+    def _emit_method_call_dict(self, node):
+        """Emit dict method calls. Returns None if not recognized."""
+        attr = node.func
+        method = node.func.attr
+        obj = self._emit_expr_value(attr.value)
+        if method == "keys":
+            return self._rt_call("dict_keys", [obj])
+        if method == "values":
+            return self._rt_call("dict_values", [obj])
+        if method == "items":
+            return self._rt_call("dict_items", [obj])
+        if method == "get":
+            if len(node.args) >= 1:
+                key = self._emit_expr_value(node.args[0])
+                # Use FV-ABI: return full FpyValue so runtime tag drives dispatch.
+                # This handles mixed-type dicts (kwargs pattern) correctly.
+                if isinstance(key.type, ir.PointerType):
+                    has = self._rt_call("dict_has_key", [obj, key])
+                    has_bool = self.builder.icmp_unsigned("!=", has, ir.Constant(i32, 0))
+                    tag_slot = self._create_entry_alloca(i32, "dget.tag")
+                    data_slot = self._create_entry_alloca(i64, "dget.data")
+                    found_block = self._new_block("dget.found")
+                    default_block = self._new_block("dget.default")
+                    merge_block = self._new_block("dget.merge")
+                    self.builder.cbranch(has_bool, found_block, default_block)
+                    # Found path: load the FpyValue from dict
+                    self.builder.position_at_end(found_block)
+                    self.builder.call(self.runtime["dict_get_fv"],
+                                      [obj, key, tag_slot, data_slot])
+                    found_tag = self.builder.load(tag_slot)
+                    found_data = self.builder.load(data_slot)
+                    found_fv = self._fv_build_from_slots(found_tag, found_data)
+                    self.builder.branch(merge_block)
+                    found_end = self.builder.block
+                    # Default path: wrap the default value as FpyValue
+                    self.builder.position_at_end(default_block)
+                    if len(node.args) >= 2:
+                        default = self._emit_expr_value(node.args[1])
+                        if isinstance(default.type, ir.LiteralStructType):
+                            default_fv = default
+                        else:
+                            default_tag = self._infer_type_tag(node.args[1], default)
+                            default_fv = self._wrap_bare_to_fv(default, default_tag)
+                    else:
+                        default_fv = self._fv_none()
+                    self.builder.branch(merge_block)
+                    default_end = self.builder.block
+                    # Merge: phi on FpyValue
+                    self.builder.position_at_end(merge_block)
+                    phi = self.builder.phi(fpy_val, "dget.fv")
+                    phi.add_incoming(found_fv, found_end)
+                    phi.add_incoming(default_fv, default_end)
+                    return phi
+                # Int key fallback: use string conversion path
+                if len(node.args) >= 2:
+                    default = self._emit_expr_value(node.args[1])
+                    if not isinstance(default.type, ir.PointerType):
+                        default = self.builder.call(self.runtime["int_to_str"], [default])
+                else:
+                    default = self._make_string_constant("None")
+                return self._rt_call("dict_get_default", [obj, key, default])
+        if method == "update":
+            if len(node.args) == 1:
+                other = self._emit_expr_value(node.args[0])
+                self._rt_call("dict_update", [obj, other])
+                return obj
+        if method == "pop":
+            if len(node.args) == 1:
+                key = self._emit_expr_value(node.args[0])
+                # Heuristic: use int pop if we can't tell; returning str by default
+                return self._rt_call("dict_pop_int", [obj, key])
+            if len(node.args) == 2:
+                key = self._emit_expr_value(node.args[0])
+                default_val = self._emit_expr_value(node.args[1])
+                def_tag, def_data = self._to_tag_data_ir(
+                    default_val, node.args[1])
+                out_tag = self._create_entry_alloca(i32, "dpop.tag")
+                out_data = self._create_entry_alloca(i64, "dpop.data")
+                self.builder.call(self.runtime["dict_pop_fv"],
+                                  [obj, key, def_tag, def_data,
+                                   out_tag, out_data])
+                return self._fv_build_from_slots(
+                    self.builder.load(out_tag),
+                    self.builder.load(out_data))
+        if method == "setdefault":
+            if len(node.args) == 2:
+                key = self._emit_expr_value(node.args[0])
+                default = self._emit_expr_value(node.args[1])
+                if isinstance(default.type, ir.PointerType):
+                    self._rt_call("dict_setdefault_list", [obj, key, default])
+                else:
+                    self._rt_call("dict_setdefault_int", [obj, key, default])
+                return obj
+        if method == "popitem" and len(node.args) == 0:
+            kt = self._create_entry_alloca(i32, "pi.kt")
+            kd = self._create_entry_alloca(i64, "pi.kd")
+            vt = self._create_entry_alloca(i32, "pi.vt")
+            vd = self._create_entry_alloca(i64, "pi.vd")
+            self.builder.call(self.runtime["dict_popitem"],
+                              [obj, kt, kd, vt, vd])
+            # Return as a 2-element tuple (key, value)
+            tup = self._rt_call("tuple_new", [])
+            self.builder.call(self.runtime["list_append_fv"],
+                              [tup, self.builder.load(kt),
+                               self.builder.load(kd)])
+            self.builder.call(self.runtime["list_append_fv"],
+                              [tup, self.builder.load(vt),
+                               self.builder.load(vd)])
+            return tup
+        if method == "copy" and len(node.args) == 0:
+            return self._rt_call("dict_copy", [obj])
+        if method == "clear" and len(node.args) == 0:
+            self._rt_call("dict_clear", [obj])
+            return obj
+        # Phase 4: fall through to runtime dispatch below
+
+        # Check if object is a known user-class instance
+        return None
+
+    def _emit_method_call_userobj(self, node):
+        """Emit user-class instance method calls (with direct dispatch optimization)."""
+        attr = node.func
+        method = node.func.attr
+        obj = self._emit_expr_value(attr.value)
+        if (isinstance(obj.type, ir.LiteralStructType)
+                and obj.type == fpy_val):
+            # FpyValue struct: extract data and convert to pointer
+            obj = self.builder.inttoptr(
+                self.builder.extract_value(obj, 1), i8_ptr, name="obj.ptr")
+        elif isinstance(obj.type, ir.IntType) and obj.type.width == 64:
+            obj = self.builder.inttoptr(obj, i8_ptr, name="obj.ptr")
+        method_name_ptr = self._make_string_constant(method)
+        n_args = len(node.args)
+        # Check which params are mixed for this method
+        obj_cls = self._infer_object_class(attr.value)
+        method_mixed = set()
+        if obj_cls:
+            mkey = f"{obj_cls}.{method}"
+            method_mixed = getattr(self, '_mixed_param_methods', {}).get(mkey, set())
+        # Resolve keyword arguments → positional by consulting method AST
+        resolved_arg_nodes = list(node.args)
+        if node.keywords and obj_cls:
+            # Find the method's AST to get param names and defaults
+            m_ast = None
+            cn = obj_cls
+            while cn and cn in self._user_classes:
+                ci = self._user_classes[cn]
+                if ci.method_asts and method in ci.method_asts:
+                    m_ast = ci.method_asts[method]
+                    break
+                cn = ci.parent_name
+            if m_ast is not None:
+                m_params = [a.arg for a in m_ast.args.args[1:]]  # skip self
+                m_defaults = m_ast.args.defaults
+                kw_nodes: dict[int, ast.expr] = {}
+                for kw in node.keywords:
+                    if kw.arg is None:
+                        continue
+                    if kw.arg not in m_params:
+                        continue  # Phase 4: unknown kwarg → skip
+                    idx = m_params.index(kw.arg)
+                    if idx < len(resolved_arg_nodes):
+                        continue  # Phase 4: duplicate kwarg → skip
+                    kw_nodes[idx] = kw.value
+                while len(resolved_arg_nodes) < len(m_params):
+                    idx = len(resolved_arg_nodes)
+                    if idx in kw_nodes:
+                        resolved_arg_nodes.append(kw_nodes[idx])
+                    else:
+                        default_idx = idx - (len(m_params) - len(m_defaults))
+                        if default_idx >= 0 and default_idx < len(m_defaults):
+                            resolved_arg_nodes.append(m_defaults[default_idx])
+                        else:
+                            raise CodeGenError(
+                                f".{method}() missing argument at position {idx}",
+                                node,
+                            )
+        # For non-kwarg calls, also fill in defaults for missing positional args
+        elif obj_cls and not node.keywords:
+            m_ast = None
+            cn = obj_cls
+            while cn and cn in self._user_classes:
+                ci = self._user_classes[cn]
+                if ci.method_asts and method in ci.method_asts:
+                    m_ast = ci.method_asts[method]
+                    break
+                cn = ci.parent_name
+            if m_ast is not None:
+                m_params = [a.arg for a in m_ast.args.args[1:]]
+                m_defaults = m_ast.args.defaults
+                while len(resolved_arg_nodes) < len(m_params):
+                    idx = len(resolved_arg_nodes)
+                    default_idx = idx - (len(m_params) - len(m_defaults))
+                    if default_idx >= 0 and default_idx < len(m_defaults):
+                        resolved_arg_nodes.append(m_defaults[default_idx])
+                    else:
+                        break
+        n_args = len(resolved_arg_nodes)
+
+        # Evaluate and coerce args to i64 (runtime dispatch expects i64).
+        # For "mixed" params, pass (tag_i64, data_i64) as two separate args.
+        call_args = []
+        for arg_idx, arg_node in enumerate(resolved_arg_nodes):
+            param_idx = arg_idx + 1  # +1 for self
+            v = self._emit_expr_value(arg_node)
+            if param_idx in method_mixed:
+                # Mixed param: pass tag and data as two separate i64 args
+                tag_int, data_val = self._bare_to_tag_data(v, value_node=arg_node)
+                call_args.append(ir.Constant(i64, tag_int))
+                call_args.append(data_val)
+            else:
+                if (isinstance(v.type, ir.LiteralStructType)
+                        and v.type == fpy_val):
+                    # FpyValue struct: extract the data part (i64)
+                    v = self.builder.extract_value(v, 1)
+                elif isinstance(v.type, ir.PointerType):
+                    v = self.builder.ptrtoint(v, i64)
+                elif isinstance(v.type, ir.DoubleType):
+                    v = self.builder.bitcast(v, i64)
+                elif isinstance(v.type, ir.IntType) and v.type.width != 64:
+                    v = self.builder.zext(v, i64)
+                call_args.append(v)
+
+        # Determine if method returns double
+        method_ret_type = self._find_method_return_type(attr.value, method)
+        is_double_ret = method_ret_type and isinstance(method_ret_type, ir.DoubleType)
+
+        # Direct dispatch optimization: when the object's class is known
+        # statically and there are no mixed params, call the method
+        # function directly instead of going through obj_call_methodN.
+        # This skips string comparison and enables LLVM inlining.
+        if obj_cls and not method_mixed:
+            # Walk class chain to find the actual method (handles inheritance)
+            direct_func = None
+            cn = obj_cls
+            while cn and cn in self._user_classes:
+                ci = self._user_classes[cn]
+                if method in ci.methods:
+                    direct_func = ci.methods[method]
+                    break
+                cn = ci.parent_name
+            # Virtual dispatch: if the receiver's concrete class isn't
+            # pinned (e.g., `self` inside a class method — could be any
+            # subclass) and some subclass of obj_cls overrides this
+            # method, we can't statically bind.
+            _overridden = self._method_overridden_in_subclass(obj_cls, method) if direct_func is not None else False
+            _may_sub = self._receiver_may_be_subclass(attr.value) if direct_func is not None else False
+            if (direct_func is not None
+                    and _overridden
+                    and _may_sub):
+                direct_func = None
+            if direct_func is not None:
+                # Coerce args to match the method's LLVM signature
+                direct_args = [obj]  # self
+                for i, val in enumerate(call_args):
+                    if 1 + i >= len(direct_func.args):
+                        break
+                    expected = direct_func.args[1 + i].type
+                    if val.type != expected:
+                        if (isinstance(expected, ir.IntType)
+                                and isinstance(val.type, ir.IntType)
+                                and expected.width != val.type.width):
+                            if expected.width > val.type.width:
+                                val = self.builder.zext(val, expected)
+                            else:
+                                val = self.builder.trunc(val, expected)
+                        elif (isinstance(expected, ir.IntType)
+                                and isinstance(val.type, ir.PointerType)):
+                            val = self.builder.ptrtoint(val, expected)
+                        elif (isinstance(expected, ir.PointerType)
+                                and isinstance(val.type, ir.IntType)):
+                            val = self.builder.inttoptr(val, expected)
+                        elif (isinstance(expected, ir.DoubleType)
+                                and isinstance(val.type, ir.IntType)):
+                            val = self.builder.bitcast(val, expected)
+                        elif (isinstance(expected, ir.IntType)
+                                and isinstance(val.type, ir.DoubleType)):
+                            val = self.builder.bitcast(val, expected)
+                    direct_args.append(val)
+                # Call the method function directly
+                result = self.builder.call(direct_func, direct_args)
+                # Post-process result based on actual return type
+                ret_type = direct_func.return_value.type
+                if isinstance(ret_type, ir.VoidType):
+                    return ir.Constant(i64, 0)  # void methods — return placeholder
+                # Cast the return to the form the caller expects
+                # (runtime dispatch returns i64, but direct returns native type)
+                # Keep as-is; downstream code expects the native type.
+                return result
+
+        # Use actual dispatch arg count (mixed params expand to 2 args each)
+        n_dispatch_args = len(call_args)
+        if n_dispatch_args == 0:
+            if is_double_ret:
+                result = self.builder.call(
+                    self.runtime["obj_call_method0_double"], [obj, method_name_ptr])
+            else:
+                result = self.builder.call(
+                    self.runtime["obj_call_method0"], [obj, method_name_ptr])
+        elif n_dispatch_args == 1:
+            if is_double_ret:
+                result = self.builder.call(
+                    self.runtime["obj_call_method1_double"], [obj, method_name_ptr, call_args[0]])
+            else:
+                result = self.builder.call(
+                    self.runtime["obj_call_method1"], [obj, method_name_ptr, call_args[0]])
+        elif n_dispatch_args == 2:
+            result = self.builder.call(
+                self.runtime["obj_call_method2"], [obj, method_name_ptr, call_args[0], call_args[1]])
+        elif n_dispatch_args == 3:
+            result = self.builder.call(
+                self.runtime["obj_call_method3"],
+                [obj, method_name_ptr, call_args[0], call_args[1], call_args[2]])
+        elif n_dispatch_args == 4:
+            result = self.builder.call(
+                self.runtime["obj_call_method4"],
+                [obj, method_name_ptr, call_args[0], call_args[1], call_args[2], call_args[3]])
+        else:
+            return self._bridge_fallback_expr(node, f"method call with {n_dispatch_args} args (max 4)")
+
+        # Check if the method returns a string or bool — cast from i64
+        if not is_double_ret:
+            ret_type = self._find_method_return_type(attr.value, method)
+            if ret_type and isinstance(ret_type, ir.PointerType):
+                result = self.builder.inttoptr(result, i8_ptr)
+            elif ret_type and isinstance(ret_type, ir.IntType) and ret_type.width == 32:
+                result = self.builder.trunc(result, i32)
+        return result
+
+
+    def _emit_method_call_str(self, node, obj):
+        """Emit string method calls. Returns None if not recognized."""
+        method = node.func.attr
+        # String methods
+        if method == "lower":
+            return self._rt_call("str_lower", [obj])
+        elif method == "upper":
+            return self._rt_call("str_upper", [obj])
+        elif method == "strip":
+            if len(node.args) == 1:
+                chars = self._emit_expr_value(node.args[0])
+                return self._rt_call("str_strip_chars", [obj, chars])
+            return self._rt_call("str_strip", [obj])
+        elif method == "lstrip":
+            if len(node.args) == 1:
+                chars = self._emit_expr_value(node.args[0])
+                return self._rt_call("str_lstrip_chars", [obj, chars])
+            return self._rt_call("str_lstrip", [obj])
+        elif method == "rstrip":
+            if len(node.args) == 1:
+                chars = self._emit_expr_value(node.args[0])
+                return self._rt_call("str_rstrip_chars", [obj, chars])
+            return self._rt_call("str_rstrip", [obj])
+        elif method == "isdigit":
+            return self._rt_call("str_isdigit", [obj])
+        elif method == "isalpha":
+            return self._rt_call("str_isalpha", [obj])
+        elif method == "isalnum":
+            return self._rt_call("str_isalnum", [obj])
+        elif method == "isspace":
+            return self._rt_call("str_isspace", [obj])
+        elif method == "capitalize":
+            return self._rt_call("str_capitalize", [obj])
+        elif method == "title":
+            return self._rt_call("str_title", [obj])
+        elif method == "swapcase":
+            return self._rt_call("str_swapcase", [obj])
+        elif method == "center":
+            if len(node.args) == 1:
+                w = self._emit_expr_value(node.args[0])
+                return self._rt_call("str_center", [obj, w])
+            if len(node.args) == 2:
+                w = self._emit_expr_value(node.args[0])
+                fill = self._emit_expr_value(node.args[1])
+                return self._rt_call("str_center_fill", [obj, w, fill])
+        elif method == "ljust":
+            if len(node.args) == 1:
+                w = self._emit_expr_value(node.args[0])
+                return self._rt_call("str_ljust", [obj, w])
+            if len(node.args) == 2:
+                w = self._emit_expr_value(node.args[0])
+                fill = self._emit_expr_value(node.args[1])
+                return self._rt_call("str_ljust_fill", [obj, w, fill])
+        elif method == "rjust":
+            if len(node.args) == 1:
+                w = self._emit_expr_value(node.args[0])
+                return self._rt_call("str_rjust", [obj, w])
+            if len(node.args) == 2:
+                w = self._emit_expr_value(node.args[0])
+                fill = self._emit_expr_value(node.args[1])
+                return self._rt_call("str_rjust_fill", [obj, w, fill])
+        elif method == "isupper":
+            if len(node.args) == 0:
+                return self._rt_call("str_isupper", [obj])
+        elif method == "islower":
+            if len(node.args) == 0:
+                return self._rt_call("str_islower", [obj])
+        elif method == "istitle":
+            if len(node.args) == 0:
+                return self._rt_call("str_istitle", [obj])
+        elif method == "isidentifier":
+            if len(node.args) == 0:
+                return self._rt_call("str_isidentifier", [obj])
+        elif method == "isprintable":
+            if len(node.args) == 0:
+                return self._rt_call("str_isprintable", [obj])
+        elif method == "isdecimal":
+            if len(node.args) == 0:
+                return self._rt_call("str_isdecimal", [obj])
+        elif method == "isnumeric":
+            if len(node.args) == 0:
+                return self._rt_call("str_isnumeric", [obj])
+        elif method == "casefold":
+            if len(node.args) == 0:
+                return self._rt_call("str_casefold", [obj])
+        elif method == "expandtabs":
+            if len(node.args) == 0:
+                return self._rt_call("str_expandtabs",
+                                      [obj, ir.Constant(i64, 8)])
+            if len(node.args) == 1:
+                ts = self._emit_expr_value(node.args[0])
+                return self._rt_call("str_expandtabs", [obj, ts])
+        elif method == "partition":
+            if len(node.args) == 1:
+                sep = self._emit_expr_value(node.args[0])
+                return self._rt_call("str_partition", [obj, sep])
+        elif method == "rpartition":
+            if len(node.args) == 1:
+                sep = self._emit_expr_value(node.args[0])
+                return self._rt_call("str_rpartition", [obj, sep])
+        elif method == "zfill":
+            if len(node.args) == 1:
+                w = self._emit_expr_value(node.args[0])
+                return self._rt_call("str_zfill", [obj, w])
+        elif method == "splitlines":
+            return self._rt_call("str_splitlines", [obj])
+        elif method == "split":
+            if len(node.args) == 2:
+                sep = self._emit_expr_value(node.args[0])
+                maxsplit = self._emit_expr_value(node.args[1])
+                return self._rt_call("str_split_max", [obj, sep, maxsplit])
+            if len(node.args) == 1:
+                sep = self._emit_expr_value(node.args[0])
+                return self._rt_call("str_split_max", [obj, sep, ir.Constant(i64, -1)])
+            return self._rt_call("str_split", [obj])
+        elif method == "rsplit":
+            if len(node.args) == 2:
+                sep = self._emit_expr_value(node.args[0])
+                maxsplit = self._emit_expr_value(node.args[1])
+                return self._rt_call("str_rsplit", [obj, sep, maxsplit])
+            if len(node.args) == 1:
+                sep = self._emit_expr_value(node.args[0])
+                return self._rt_call("str_rsplit",
+                                      [obj, sep, ir.Constant(i64, -1)])
+            return self._rt_call("str_rsplit_ws", [obj])
+        elif method == "join":
+            if len(node.args) == 1:
+                lst = self._emit_expr_value(node.args[0])
+                return self._rt_call("str_join", [obj, lst])
+        elif method == "replace":
+            if len(node.args) == 3:
+                old = self._emit_expr_value(node.args[0])
+                new = self._emit_expr_value(node.args[1])
+                count = self._emit_expr_value(node.args[2])
+                return self._rt_call("str_replace_count",
+                                      [obj, old, new, count])
+            if len(node.args) == 2:
+                old = self._emit_expr_value(node.args[0])
+                new = self._emit_expr_value(node.args[1])
+                return self._rt_call("str_replace", [obj, old, new])
+        elif method == "startswith":
+            if len(node.args) == 1:
+                arg = node.args[0]
+                val = self._emit_expr_value(arg)
+                # Check if arg is a tuple → tuple version
+                if self._is_tuple_expr(arg) or self._is_list_expr(arg):
+                    return self._rt_call("str_startswith_tuple", [obj, val])
+                return self._rt_call("str_startswith", [obj, val])
+            if len(node.args) == 2:
+                prefix = self._emit_expr_value(node.args[0])
+                start = self._emit_expr_value(node.args[1])
+                slen = self._rt_call("str_len", [obj])
+                return self._rt_call("str_startswith_range",
+                                     [obj, prefix, start, slen])
+            if len(node.args) == 3:
+                prefix = self._emit_expr_value(node.args[0])
+                start = self._emit_expr_value(node.args[1])
+                end = self._emit_expr_value(node.args[2])
+                return self._rt_call("str_startswith_range",
+                                     [obj, prefix, start, end])
+        elif method == "endswith":
+            if len(node.args) == 1:
+                arg = node.args[0]
+                val = self._emit_expr_value(arg)
+                if self._is_tuple_expr(arg) or self._is_list_expr(arg):
+                    return self._rt_call("str_endswith_tuple", [obj, val])
+                return self._rt_call("str_endswith", [obj, val])
+            if len(node.args) == 2:
+                suffix = self._emit_expr_value(node.args[0])
+                start = self._emit_expr_value(node.args[1])
+                slen = self._rt_call("str_len", [obj])
+                return self._rt_call("str_endswith_range",
+                                     [obj, suffix, start, slen])
+            if len(node.args) == 3:
+                suffix = self._emit_expr_value(node.args[0])
+                start = self._emit_expr_value(node.args[1])
+                end = self._emit_expr_value(node.args[2])
+                return self._rt_call("str_endswith_range",
+                                     [obj, suffix, start, end])
+        elif method == "removeprefix":
+            if len(node.args) == 1:
+                prefix = self._emit_expr_value(node.args[0])
+                return self._rt_call("str_removeprefix", [obj, prefix])
+        elif method == "removesuffix":
+            if len(node.args) == 1:
+                suffix = self._emit_expr_value(node.args[0])
+                return self._rt_call("str_removesuffix", [obj, suffix])
+        elif method == "find":
+            if len(node.args) == 1:
+                sub = self._emit_expr_value(node.args[0])
+                return self._rt_call("str_find", [obj, sub])
+            if len(node.args) == 2:
+                sub = self._emit_expr_value(node.args[0])
+                start = self._emit_expr_value(node.args[1])
+                slen = self._rt_call("str_len", [obj])
+                return self._rt_call("str_find_range",
+                                     [obj, sub, start, slen])
+            if len(node.args) == 3:
+                sub = self._emit_expr_value(node.args[0])
+                start = self._emit_expr_value(node.args[1])
+                end = self._emit_expr_value(node.args[2])
+                return self._rt_call("str_find_range",
+                                     [obj, sub, start, end])
+        elif method == "rfind":
+            if len(node.args) == 1:
+                sub = self._emit_expr_value(node.args[0])
+                return self._rt_call("str_rfind", [obj, sub])
+            if len(node.args) == 2:
+                sub = self._emit_expr_value(node.args[0])
+                start = self._emit_expr_value(node.args[1])
+                slen = self._rt_call("str_len", [obj])
+                return self._rt_call("str_rfind_range",
+                                     [obj, sub, start, slen])
+            if len(node.args) == 3:
+                sub = self._emit_expr_value(node.args[0])
+                start = self._emit_expr_value(node.args[1])
+                end = self._emit_expr_value(node.args[2])
+                return self._rt_call("str_rfind_range",
+                                     [obj, sub, start, end])
+        elif method == "index":
+            if len(node.args) == 1:
+                sub = self._emit_expr_value(node.args[0])
+                return self._rt_call("str_index_sub", [obj, sub])
+            if len(node.args) == 2:
+                sub = self._emit_expr_value(node.args[0])
+                start = self._emit_expr_value(node.args[1])
+                slen = self._rt_call("str_len", [obj])
+                return self._rt_call("str_index_sub_range",
+                                     [obj, sub, start, slen])
+            if len(node.args) == 3:
+                sub = self._emit_expr_value(node.args[0])
+                start = self._emit_expr_value(node.args[1])
+                end = self._emit_expr_value(node.args[2])
+                return self._rt_call("str_index_sub_range",
+                                     [obj, sub, start, end])
+        elif method == "rindex":
+            if len(node.args) == 1:
+                sub = self._emit_expr_value(node.args[0])
+                return self._rt_call("str_rindex_sub", [obj, sub])
+            if len(node.args) == 2:
+                sub = self._emit_expr_value(node.args[0])
+                start = self._emit_expr_value(node.args[1])
+                slen = self._rt_call("str_len", [obj])
+                return self._rt_call("str_rindex_sub_range",
+                                     [obj, sub, start, slen])
+            if len(node.args) == 3:
+                sub = self._emit_expr_value(node.args[0])
+                start = self._emit_expr_value(node.args[1])
+                end = self._emit_expr_value(node.args[2])
+                return self._rt_call("str_rindex_sub_range",
+                                     [obj, sub, start, end])
+        elif method == "count":
+            if len(node.args) == 1:
+                sub = self._emit_expr_value(node.args[0])
+                return self._rt_call("str_count", [obj, sub])
+            if len(node.args) == 2:
+                sub = self._emit_expr_value(node.args[0])
+                start = self._emit_expr_value(node.args[1])
+                slen = self._rt_call("str_len", [obj])
+                return self._rt_call("str_count_range",
+                                     [obj, sub, start, slen])
+            if len(node.args) == 3:
+                sub = self._emit_expr_value(node.args[0])
+                start = self._emit_expr_value(node.args[1])
+                end = self._emit_expr_value(node.args[2])
+                return self._rt_call("str_count_range",
+                                     [obj, sub, start, end])
+        elif method == "format":
+            return self._emit_str_format(node, obj)
+        elif method == "translate":
+            if len(node.args) == 1:
+                table = self._emit_expr_value(node.args[0])
+                return self._rt_call("str_translate", [obj, table])
+        elif method == "encode":
+            # str.encode() → bytes (same UTF-8 content, tagged as BYTES)
+            return self._rt_call("str_encode", [obj])
+        # bytes methods
+        return None
+
+    def _emit_method_call_bytes(self, node, obj):
+        """Emit bytes method calls. Returns None if not recognized."""
+        method = node.func.attr
+        if method == "decode" and len(node.args) <= 1:
+            # bytes.decode() → str (same UTF-8 content)
+            return self._rt_call("bytes_decode", [obj])
+        elif method == "upper" and len(node.args) == 0:
+            return self._rt_call("str_upper", [obj])
+        elif method == "lower" and len(node.args) == 0:
+            return self._rt_call("str_lower", [obj])
+        elif method == "strip" and len(node.args) == 0:
+            return self._rt_call("str_strip", [obj])
+        elif method == "lstrip" and len(node.args) == 0:
+            return self._rt_call("str_lstrip", [obj])
+        elif method == "rstrip" and len(node.args) == 0:
+            return self._rt_call("str_rstrip", [obj])
+        elif method == "replace" and len(node.args) >= 2:
+            old = self._emit_expr_value(node.args[0])
+            new = self._emit_expr_value(node.args[1])
+            if len(node.args) == 3:
+                cnt = self._emit_expr_value(node.args[2])
+                return self._rt_call("str_replace3", [obj, old, new, cnt])
+            return self._rt_call("str_replace", [obj, old, new])
+        elif method == "split" and len(node.args) <= 2:
+            if len(node.args) == 0:
+                return self._rt_call("bytes_split", [obj])
+            sep = self._emit_expr_value(node.args[0])
+            if len(node.args) == 2:
+                maxsplit = self._emit_expr_value(node.args[1])
+                return self._rt_call("str_split_max", [obj, sep, maxsplit])
+            return self._rt_call("str_split_max", [obj, sep, ir.Constant(i64, -1)])
+        elif method == "join" and len(node.args) == 1:
+            lst = self._emit_expr_value(node.args[0])
+            return self._rt_call("str_join", [obj, lst])
+        elif method == "find" and len(node.args) >= 1:
+            sub = self._emit_expr_value(node.args[0])
+            return self._rt_call("str_find", [obj, sub])
+        elif method == "rfind" and len(node.args) >= 1:
+            sub = self._emit_expr_value(node.args[0])
+            return self._rt_call("str_rfind", [obj, sub])
+        elif method == "count" and len(node.args) >= 1:
+            sub = self._emit_expr_value(node.args[0])
+            return self._rt_call("str_count", [obj, sub])
+        elif method == "startswith" and len(node.args) >= 1:
+            prefix = self._emit_expr_value(node.args[0])
+            return self._rt_call("str_startswith", [obj, prefix])
+        elif method == "endswith" and len(node.args) >= 1:
+            suffix = self._emit_expr_value(node.args[0])
+            return self._rt_call("str_endswith", [obj, suffix])
+        # int methods: bit_length, bit_count, to_bytes, etc.
+        return None
+
+    def _emit_method_call_int(self, node, obj):
+        """Emit int method calls. Returns None if not recognized."""
+        method = node.func.attr
+        if method == "bit_length" and len(node.args) == 0:
+            # int.bit_length() — count significant bits
+            # Equivalent to (x.bit_length()) in Python
+            val = obj if isinstance(obj.type, ir.IntType) else \
+                self.builder.ptrtoint(obj, i64)
+            # abs(val) for negative numbers
+            is_neg = self.builder.icmp_signed("<", val, ir.Constant(i64, 0))
+            abs_val = self.builder.sub(ir.Constant(i64, 0), val)
+            val = self.builder.select(is_neg, abs_val, val)
+            # Count bits: 64 - ctlz(val)
+            # llvm.ctlz.i64 takes (i64, i1) — must pass explicit fnty
+            ctlz_fnty = ir.FunctionType(i64, [i64, ir.IntType(1)])
+            ctlz = self.module.declare_intrinsic(
+                "llvm.ctlz", [i64], ctlz_fnty)
+            leading_zeros = self.builder.call(
+                ctlz, [val, ir.Constant(ir.IntType(1), 1)])
+            result = self.builder.sub(ir.Constant(i64, 64), leading_zeros)
+            # Special case: bit_length(0) == 0
+            is_zero = self.builder.icmp_signed(
+                "==", obj if isinstance(obj.type, ir.IntType) else
+                self.builder.ptrtoint(obj, i64), ir.Constant(i64, 0))
+            return self.builder.select(is_zero, ir.Constant(i64, 0), result)
+        elif method == "bit_count" and len(node.args) == 0:
+            # int.bit_count() — count number of set bits (popcount)
+            val = obj if isinstance(obj.type, ir.IntType) else \
+                self.builder.ptrtoint(obj, i64)
+            # abs(val) — bit_count(-5) == bit_count(5) in Python
+            # (two's complement bit count differs, but Python counts
+            #  the bits of the absolute value)
+            is_neg = self.builder.icmp_signed("<", val, ir.Constant(i64, 0))
+            abs_val = self.builder.sub(ir.Constant(i64, 0), val)
+            val = self.builder.select(is_neg, abs_val, val)
+            ctpop_fnty = ir.FunctionType(i64, [i64])
+            ctpop = self.module.declare_intrinsic(
+                "llvm.ctpop", [i64], ctpop_fnty)
+            return self.builder.call(ctpop, [val])
+        elif method == "to_bytes" and len(node.args) >= 2:
+            val = obj if isinstance(obj.type, ir.IntType) else \
+                self.builder.ptrtoint(obj, i64)
+            length = self._emit_expr_value(node.args[0])
+            byteorder = self._emit_expr_value(node.args[1])
+            return self._rt_call("int_to_bytes", [val, length, byteorder])
+
+        # float methods: is_integer, conjugate, etc.
+        return None
+
+    def _emit_method_call_float(self, node, obj):
+        """Emit float method calls. Returns None if not recognized."""
+        method = node.func.attr
+        if method == "is_integer" and len(node.args) == 0:
+            # float.is_integer() — True if the float has no fractional part
+            fval = obj if isinstance(obj.type, ir.DoubleType) else \
+                self.builder.bitcast(obj, double)
+            # floor(x) == x
+            floor_fn = self.module.declare_intrinsic(
+                "llvm.floor", [double])
+            floored = self.builder.call(floor_fn, [fval])
+            is_int = self.builder.fcmp_ordered("==", fval, floored)
+            return self.builder.zext(is_int, i32)
+        elif method == "as_integer_ratio" and len(node.args) == 0:
+            fval = obj if isinstance(obj.type, ir.DoubleType) else \
+                self.builder.bitcast(obj, double)
+            return self._rt_call("float_as_integer_ratio", [fval])
+
+        # Fallback: method dispatch for unknown objects.
+        # Two paths:
+        # (a) Path/pyobj-tagged variables: use fpy_fv_call_method which
+        #     converts to PyObject* safely (handles Path, Django models, etc.)
+        # (b) All other variables (obj, unknown): use obj_call_method which
+        #     assumes FpyObj* (the common case for polymorphic class objects)
+        #
+        # IMPORTANT: We condition on the compile-time tag, NOT on whether the
+        # variable is FV-backed. FpyObj* values stored in fpy_val allocas have
+        # unreliable runtime tags (often INT instead of OBJ), so _load_fv_raw
+        # would misroute them through FV dispatch → AttributeError.
+        return None
+
+    def _emit_method_call_fallback(self, node):
+        """Fallback method dispatch for unknown objects (FV or bare pointer)."""
+        method = node.func.attr
+        # Fallback: method dispatch for unknown objects.
+        # Two paths:
+        # (a) Path/pyobj-tagged variables: use fpy_fv_call_method which
+        #     converts to PyObject* safely (handles Path, Django models, etc.)
+        # (b) All other variables (obj, unknown): use obj_call_method which
+        #     assumes FpyObj* (the common case for polymorphic class objects)
+        #
+        # IMPORTANT: We condition on the compile-time tag, NOT on whether the
+        # variable is FV-backed. FpyObj* values stored in fpy_val allocas have
+        # unreliable runtime tags (often INT instead of OBJ), so _load_fv_raw
+        # would misroute them through FV dispatch → AttributeError.
+        _use_fv_dispatch = False
+        if isinstance(node.func.value, ast.Name) and node.func.value.id in self.variables:
+            _, _rcv_tag = self.variables[node.func.value.id]
+            _rcv_tag_str = str(_rcv_tag)
+            if _rcv_tag_str in ("path", "pyobj"):
+                _use_fv_dispatch = True
+
+        if _use_fv_dispatch:
+            fv_raw = self._load_fv_raw(node.func.value.id)
+            if fv_raw is None:
+                # Not FV-backed despite path/pyobj tag — use CPython bridge
+                return self._emit_cpython_method_call(node)
+            # Path (a): FpyValue-backed — use safe FV dispatch
+            rcv_tag = self._fv_tag(fv_raw)
+            rcv_data = self._fv_data_i64(fv_raw)
+            name_ptr = self._make_string_constant(method)
+            out_tag = self._create_entry_alloca(i32, "fvcall.tag")
+            out_data = self._create_entry_alloca(i64, "fvcall.data")
+            n_args = len(node.args)
+            if n_args == 0:
+                self.builder.call(self.runtime["fv_call_method0"],
+                                  [rcv_tag, rcv_data, name_ptr,
+                                   out_tag, out_data])
+            elif n_args == 1:
+                a1t, a1d = self._expr_to_tag_data(node.args[0])
+                self.builder.call(self.runtime["fv_call_method1"],
+                                  [rcv_tag, rcv_data, name_ptr,
+                                   a1t, a1d, out_tag, out_data])
+            elif n_args == 2:
+                a1t, a1d = self._expr_to_tag_data(node.args[0])
+                a2t, a2d = self._expr_to_tag_data(node.args[1])
+                self.builder.call(self.runtime["fv_call_method2"],
+                                  [rcv_tag, rcv_data, name_ptr,
+                                   a1t, a1d, a2t, a2d, out_tag, out_data])
+            elif n_args == 3:
+                a1t, a1d = self._expr_to_tag_data(node.args[0])
+                a2t, a2d = self._expr_to_tag_data(node.args[1])
+                a3t, a3d = self._expr_to_tag_data(node.args[2])
+                self.builder.call(self.runtime["fv_call_method3"],
+                                  [rcv_tag, rcv_data, name_ptr,
+                                   a1t, a1d, a2t, a2d, a3t, a3d,
+                                   out_tag, out_data])
+            else:
+                return self._emit_cpython_method_call(node)
+            result_tag = self.builder.load(out_tag)
+            result_data = self.builder.load(out_data)
+            return self._fv_build_from_slots(result_tag, result_data)
+
+        # Path (b): bare pointer — assume FpyObj* (class instance)
+        obj = self._emit_expr_value(node.func.value)
+        obj = self._ensure_ptr(obj)
+        name_ptr = self._make_string_constant(method)
+        n_args = len(node.args)
+        if n_args == 0:
+            return self.builder.call(
+                self.runtime["obj_call_method0"], [obj, name_ptr])
+        elif n_args == 1:
+            arg = self._emit_expr_value(node.args[0])
+            if isinstance(arg.type, ir.PointerType):
+                arg = self.builder.ptrtoint(arg, i64)
+            elif isinstance(arg.type, ir.DoubleType):
+                arg = self.builder.bitcast(arg, i64)
+            elif isinstance(arg.type, ir.IntType) and arg.type.width != 64:
+                arg = self.builder.zext(arg, i64)
+            return self.builder.call(
+                self.runtime["obj_call_method1"], [obj, name_ptr, arg])
+        elif n_args == 2:
+            a1 = self._emit_expr_value(node.args[0])
+            a2 = self._emit_expr_value(node.args[1])
+            for v in [a1, a2]:
+                if isinstance(v.type, ir.PointerType):
+                    v = self.builder.ptrtoint(v, i64)
+            return self.builder.call(
+                self.runtime["obj_call_method2"],
+                [obj, name_ptr,
+                 a1 if isinstance(a1.type, ir.IntType) and a1.type.width == 64
+                 else self.builder.ptrtoint(a1, i64) if isinstance(a1.type, ir.PointerType)
+                 else self.builder.zext(a1, i64),
+                 a2 if isinstance(a2.type, ir.IntType) and a2.type.width == 64
+                 else self.builder.ptrtoint(a2, i64) if isinstance(a2.type, ir.PointerType)
+                 else self.builder.zext(a2, i64)])
+        # Fallback: route through CPython bridge
+        return self._emit_cpython_method_call(node)
+
     def _emit_method_call(self, node: ast.Call) -> ir.Value:
         """Emit a method call like s.lower(), lst.append(), ClassName.static()."""
         attr = node.func
@@ -28644,1169 +29866,86 @@ class CodeGen:
                             val = self.builder.bitcast(val, param.type)
                     coerced.append(val)
                 return self.builder.call(func, coerced)
-
         # --- pathlib.Path method calls ---
-        # Must come BEFORE the generic pyobj receiver check because
-        # Path is VKind.PYOBJ but has optimized native handlers.
         if self._is_path_expr(attr.value):
-            obj = self._emit_expr_value(attr.value)
-            obj = self._ensure_ptr(obj)
-            # Attribute access (properties): .name, .parent, .suffix, .stem
-            _path_props = {
-                "name": "path_name", "parent": "path_parent",
-                "suffix": "path_suffix", "stem": "path_stem",
-            }
-            if method in _path_props and len(node.args) == 0:
-                return self.builder.call(self.runtime[_path_props[method]], [obj])
-            # Method calls
-            if method == "exists" and len(node.args) == 0:
-                return self.builder.call(self.runtime["path_exists"], [obj])
-            if method == "is_file" and len(node.args) == 0:
-                return self.builder.call(self.runtime["path_is_file"], [obj])
-            if method == "is_dir" and len(node.args) == 0:
-                return self.builder.call(self.runtime["path_is_dir"], [obj])
-            if method == "resolve" and len(node.args) == 0:
-                return self.builder.call(self.runtime["path_resolve"], [obj])
-            if method == "read_text" and len(node.args) == 0:
-                return self.builder.call(self.runtime["path_read_text"], [obj])
-            if method == "write_text" and len(node.args) == 1:
-                content = self._emit_expr_value(node.args[0])
-                content = self._ensure_ptr(content)
-                self.builder.call(self.runtime["path_write_text"], [obj, content])
-                return ir.Constant(i64, 0)
-            if method == "iterdir" and len(node.args) == 0:
-                return self.builder.call(self.runtime["path_iterdir"], [obj])
-            if method == "with_suffix" and len(node.args) == 1:
-                suffix = self._emit_expr_value(node.args[0])
-                suffix = self._ensure_ptr(suffix)
-                return self.builder.call(self.runtime["path_with_suffix"],
-                                          [obj, suffix])
-            if method == "joinpath" and len(node.args) >= 1:
-                result = obj
-                for arg_node in node.args:
-                    other = self._emit_expr_value(arg_node)
-                    other = self._ensure_ptr(other)
-                    result = self.builder.call(self.runtime["path_join"],
-                                               [result, other])
-                return result
-            # __str__ / as_posix
-            if method in ("__str__", "as_posix", "__fspath__"):
-                return self.builder.call(self.runtime["path_str"], [obj])
-            # Unrecognized path method: fall through to CPython bridge
-            return self._emit_cpython_method_call(node)
+            return self._emit_method_call_path(node)
 
-        # --- pyobj method calls (bridge objects: Django models, etc.) ---
-        # Route through CPython bridge if the receiver is a pyobj in any form.
+        # --- pyobj method calls ---
         if self._is_pyobj_receiver(attr.value):
             return self._emit_cpython_method_call(node)
 
-        # --- Logging module: logger method calls ---
+        # --- Logger method calls ---
         if self._is_logger_expr(attr.value):
-            logger_id = self._emit_expr_value(attr.value)
-            if isinstance(logger_id.type, ir.PointerType):
-                logger_id = self.builder.ptrtoint(logger_id, i32)
-            elif isinstance(logger_id.type, ir.IntType) and logger_id.type.width != 32:
-                logger_id = self.builder.trunc(logger_id, i32) \
-                    if logger_id.type.width > 32 \
-                    else self.builder.zext(logger_id, i32)
-            _logger_levels = {
-                "debug": 10, "info": 20, "warning": 30, "warn": 30,
-                "error": 40, "critical": 50, "fatal": 50,
-            }
-            if method in _logger_levels and len(node.args) >= 1:
-                msg = self._emit_logging_msg(node)
-                self.builder.call(self.runtime["logging_logger_log"],
-                                  [logger_id,
-                                   ir.Constant(i32, _logger_levels[method]),
-                                   msg])
-                return ir.Constant(i64, 0)
-            if method == "setLevel" and len(node.args) == 1:
-                level = self._emit_expr_value(node.args[0])
-                if isinstance(level.type, ir.IntType) and level.type.width != 32:
-                    level = self.builder.trunc(level, i32) \
-                        if level.type.width > 32 \
-                        else self.builder.zext(level, i32)
-                self.builder.call(self.runtime["logging_setLevel"],
-                                  [logger_id, level])
-                return ir.Constant(i64, 0)
-            if method == "log" and len(node.args) >= 2:
-                level = self._emit_expr_value(node.args[0])
-                if isinstance(level.type, ir.IntType) and level.type.width != 32:
-                    level = self.builder.trunc(level, i32) \
-                        if level.type.width > 32 \
-                        else self.builder.zext(level, i32)
-                msg = self._emit_logging_msg_from(node, start_idx=1)
-                self.builder.call(self.runtime["logging_logger_log"],
-                                  [logger_id, level, msg])
-                return ir.Constant(i64, 0)
-            # Phase 4: fall through to runtime dispatch below
+            result = self._emit_method_call_logger(node)
+            if result is not None:
+                return result
 
         # --- Collections module method calls ---
-
-        # Check if object is a deque
         if self._is_deque_expr(attr.value):
-            obj = self._emit_expr_value(attr.value)
-            obj = self._ensure_ptr(obj)
-            if method == "append" and len(node.args) == 1:
-                val = self._emit_expr_value(node.args[0])
-                tag, data = self._bare_to_tag_data(val, node.args[0])
-                self.builder.call(self.runtime["deque_append"],
-                                  [obj, ir.Constant(i32, tag), data])
-                return obj
-            if method == "appendleft" and len(node.args) == 1:
-                val = self._emit_expr_value(node.args[0])
-                tag, data = self._bare_to_tag_data(val, node.args[0])
-                self.builder.call(self.runtime["deque_appendleft"],
-                                  [obj, ir.Constant(i32, tag), data])
-                return obj
-            if method == "pop" and len(node.args) == 0:
-                out_tag = self._create_entry_alloca(i32, "dq.pop.tag")
-                out_data = self._create_entry_alloca(i64, "dq.pop.data")
-                self.builder.call(self.runtime["deque_pop"],
-                                  [obj, out_tag, out_data])
-                return self.builder.load(out_data)
-            if method == "popleft" and len(node.args) == 0:
-                out_tag = self._create_entry_alloca(i32, "dq.popleft.tag")
-                out_data = self._create_entry_alloca(i64, "dq.popleft.data")
-                self.builder.call(self.runtime["deque_popleft"],
-                                  [obj, out_tag, out_data])
-                return self.builder.load(out_data)
-            if method == "rotate":
-                n = ir.Constant(i64, 1)
-                if len(node.args) == 1:
-                    n = self._emit_expr_value(node.args[0])
-                self.builder.call(self.runtime["deque_rotate"], [obj, n])
-                return obj
-            if method == "clear" and len(node.args) == 0:
-                self.builder.call(self.runtime["deque_clear"], [obj])
-                return obj
-            if method == "extend" and len(node.args) == 1:
-                other = self._emit_expr_value(node.args[0])
-                other = self._ensure_ptr(other)
-                self.builder.call(self.runtime["deque_extend"], [obj, other])
-                return obj
-            if method == "extendleft" and len(node.args) == 1:
-                other = self._emit_expr_value(node.args[0])
-                other = self._ensure_ptr(other)
-                self.builder.call(self.runtime["deque_extendleft"], [obj, other])
-                return obj
-            # Phase 4: fall through to runtime dispatch below
+            result = self._emit_method_call_deque(node)
+            if result is not None:
+                return result
 
-        # Check if object is a Counter
         if self._is_counter_expr(attr.value):
-            obj = self._emit_expr_value(attr.value)
-            obj = self._ensure_ptr(obj)
-            if method == "most_common":
-                n = ir.Constant(i64, -1)  # all elements
-                if len(node.args) == 1:
-                    n = self._emit_expr_value(node.args[0])
-                return self.builder.call(self.runtime["counter_most_common"],
-                                          [obj, n])
-            if method == "elements" and len(node.args) == 0:
-                return self.builder.call(self.runtime["counter_elements"], [obj])
-            if method == "update" and len(node.args) == 1:
-                other = self._emit_expr_value(node.args[0])
-                other = self._ensure_ptr(other)
-                self.builder.call(self.runtime["counter_update_list"],
-                                  [obj, other])
-                return obj
-            # Counter also supports dict methods (keys, values, items, get, etc.)
-            if method == "keys":
-                return self._rt_call("dict_keys", [obj])
-            if method == "values":
-                return self._rt_call("dict_values", [obj])
-            if method == "items":
-                return self._rt_call("dict_items", [obj])
-            # Phase 4: fall through to runtime dispatch below
+            result = self._emit_method_call_counter(node)
+            if result is not None:
+                return result
 
-        # Check if object is a defaultdict — method calls go to regular dict methods
         if self._is_defaultdict_expr(attr.value):
-            obj = self._emit_expr_value(attr.value)
-            obj = self._ensure_ptr(obj)
-            if method == "keys":
-                return self._rt_call("dict_keys", [obj])
-            if method == "values":
-                return self._rt_call("dict_values", [obj])
-            if method == "items":
-                return self._rt_call("dict_items", [obj])
-            # Phase 4: fall through to runtime dispatch below
+            result = self._emit_method_call_defaultdict(node)
+            if result is not None:
+                return result
 
-        # Check if object is a list (or tuple — same FpyList struct)
+        # --- List/tuple method calls ---
         if self._is_list_expr(attr.value) or self._is_tuple_expr(attr.value):
-            obj = self._emit_expr_value(attr.value)
-            if method == "append" and len(node.args) == 1:
-                self._emit_list_append_expr(obj, node.args[0])
-                return obj
-            if method == "pop" and len(node.args) == 0:
-                return self._rt_call("list_pop_int", [obj])
-            if method == "pop" and len(node.args) == 1:
-                idx = self._emit_expr_value(node.args[0])
-                return self._rt_call("list_pop_at", [obj, idx])
-            if method == "index":
-                if len(node.args) == 1:
-                    val = self._emit_expr_value(node.args[0])
-                    if isinstance(val.type, ir.PointerType):
-                        return self._rt_call("list_index_str", [obj, val])
-                    return self._rt_call("list_index", [obj, val])
-                if len(node.args) == 2:
-                    val = self._emit_expr_value(node.args[0])
-                    start = self._emit_expr_value(node.args[1])
-                    length = self._rt_call("list_length", [obj])
-                    return self._rt_call("list_index_range",
-                                         [obj, val, start, length])
-                if len(node.args) == 3:
-                    val = self._emit_expr_value(node.args[0])
-                    start = self._emit_expr_value(node.args[1])
-                    stop = self._emit_expr_value(node.args[2])
-                    return self._rt_call("list_index_range",
-                                         [obj, val, start, stop])
-            if method == "count" and len(node.args) == 1:
-                val = self._emit_expr_value(node.args[0])
-                if isinstance(val.type, ir.PointerType):
-                    return self._rt_call("list_count_str", [obj, val])
-                return self._rt_call("list_count", [obj, val])
-            if method == "extend" and len(node.args) == 1:
-                other = self._emit_expr_value(node.args[0])
-                self._rt_call("list_extend", [obj, other])
-                return obj
-            if method == "sort" and len(node.args) == 0:
-                # Check for key= keyword argument
-                has_key = False
-                has_reverse = False
-                for kw in node.keywords:
-                    if kw.arg == "key" and kw.value is not None:
-                        if not (isinstance(kw.value, ast.Constant)
-                                and kw.value.value is None):
-                            has_key = True
-                    if kw.arg == "reverse":
-                        if (isinstance(kw.value, ast.Constant)
-                                and kw.value.value is True):
-                            has_reverse = True
-                if has_key:
-                    # Native list.sort(key=func) — get key function pointer
-                    key_node = None
-                    for kw in node.keywords:
-                        if kw.arg == "key":
-                            key_node = kw.value
-                            break
-                    fn_ptr = self._get_unary_func_ptr(key_node, node)
-                    rev_flag = ir.Constant(i32, 1 if has_reverse else 0)
-                    self.builder.call(self.runtime["list_sort_by_key_int"],
-                                      [obj, fn_ptr, rev_flag])
-                    return obj
-                else:
-                    self._rt_call("list_sort", [obj])
-                    if has_reverse:
-                        self.builder.call(
-                            self.runtime["list_reverse_inplace"], [obj])
-                    return obj
-            if method == "reverse" and len(node.args) == 0:
-                self._rt_call("list_reverse_inplace", [obj])
-                return obj
-            if method == "remove" and len(node.args) == 1:
-                val = self._emit_expr_value(node.args[0])
-                if isinstance(val.type, ir.PointerType):
-                    self._rt_call("list_remove_str", [obj, val])
-                else:
-                    self._rt_call("list_remove", [obj, val])
-                return obj
-            if method == "insert" and len(node.args) == 2:
-                idx = self._emit_expr_value(node.args[0])
-                val = self._emit_expr_value(node.args[1])
-                if isinstance(val.type, ir.PointerType):
-                    self._rt_call("list_insert_str", [obj, idx, val])
-                else:
-                    self._rt_call("list_insert_int", [obj, idx, val])
-                return obj
-            if method == "copy" and len(node.args) == 0:
-                return self._rt_call("list_copy", [obj])
-            if method == "clear" and len(node.args) == 0:
-                self._rt_call("list_clear", [obj])
-                return obj
-            if method == "discard" and len(node.args) == 1:
-                val = self._emit_expr_value(node.args[0])
-                if isinstance(val.type, ir.PointerType):
-                    val = self.builder.ptrtoint(val, i64)
-                self.builder.call(self.runtime["set_discard"], [obj, val])
-                return obj
-            # Phase 4: fall through to runtime dispatch below
+            result = self._emit_method_call_list(node)
+            if result is not None:
+                return result
 
-        # Check if object is a set (dict-backed)
+        # --- Set method calls ---
         if self._is_set_expr(attr.value):
-            obj = self._emit_expr_value(attr.value)
-            obj = self._ensure_ptr(obj)
-            if method == "add" and len(node.args) == 1:
-                val = self._emit_expr_value(node.args[0])
-                tag, data = self._bare_to_tag_data(val, node.args[0])
-                self.builder.call(self.runtime["set_add_fv"],
-                                  [obj, ir.Constant(i32, tag), data])
-                return obj
-            if method == "discard" and len(node.args) == 1:
-                val = self._emit_expr_value(node.args[0])
-                tag, data = self._bare_to_tag_data(val, node.args[0])
-                self.builder.call(self.runtime["set_discard_fv"],
-                                  [obj, ir.Constant(i32, tag), data])
-                return obj
-            if method == "remove" and len(node.args) == 1:
-                val = self._emit_expr_value(node.args[0])
-                tag, data = self._bare_to_tag_data(val, node.args[0])
-                self.builder.call(self.runtime["set_discard_fv"],
-                                  [obj, ir.Constant(i32, tag), data])
-                return obj
-            if method == "union" and len(node.args) == 1:
-                other = self._emit_expr_value(node.args[0])
-                other = self._ensure_ptr(other)
-                return self._rt_call("set_union", [obj, other])
-            if method == "intersection" and len(node.args) == 1:
-                other = self._emit_expr_value(node.args[0])
-                other = self._ensure_ptr(other)
-                return self._rt_call("set_intersection", [obj, other])
-            if method == "difference" and len(node.args) == 1:
-                other = self._emit_expr_value(node.args[0])
-                other = self._ensure_ptr(other)
-                return self._rt_call("set_difference", [obj, other])
-            if method == "symmetric_difference" and len(node.args) == 1:
-                other = self._emit_expr_value(node.args[0])
-                other = self._ensure_ptr(other)
-                return self._rt_call("set_symmetric_diff", [obj, other])
-            if method == "issubset" and len(node.args) == 1:
-                other = self._emit_expr_value(node.args[0])
-                other = self._ensure_ptr(other)
-                return self._rt_call("set_issubset", [obj, other])
-            if method == "issuperset" and len(node.args) == 1:
-                other = self._emit_expr_value(node.args[0])
-                other = self._ensure_ptr(other)
-                return self._rt_call("set_issuperset", [obj, other])
-            if method == "isdisjoint" and len(node.args) == 1:
-                other = self._emit_expr_value(node.args[0])
-                other = self._ensure_ptr(other)
-                return self._rt_call("set_isdisjoint", [obj, other])
-            if method == "copy" and len(node.args) == 0:
-                return self._rt_call("set_copy", [obj])
-            if method == "clear" and len(node.args) == 0:
-                self._rt_call("set_clear", [obj])
-                return obj
-            if method == "pop" and len(node.args) == 0:
-                tag_slot = self._create_entry_alloca(i32, "spop.tag")
-                data_slot = self._create_entry_alloca(i64, "spop.data")
-                self.builder.call(self.runtime["set_pop_fv"],
-                                  [obj, tag_slot, data_slot])
-                return self._fv_build_from_slots(
-                    self.builder.load(tag_slot), self.builder.load(data_slot))
-            if method == "update" and len(node.args) == 1:
-                other = self._emit_expr_value(node.args[0])
-                other = self._ensure_ptr(other)
-                self._rt_call("set_update", [obj, other])
-                return obj
-            # Phase 4: fall through to runtime dispatch below
+            result = self._emit_method_call_set(node)
+            if result is not None:
+                return result
 
-        # Check if object is a dict
+        # --- Dict method calls ---
         if self._is_dict_expr(attr.value):
-            obj = self._emit_expr_value(attr.value)
-            if method == "keys":
-                return self._rt_call("dict_keys", [obj])
-            if method == "values":
-                return self._rt_call("dict_values", [obj])
-            if method == "items":
-                return self._rt_call("dict_items", [obj])
-            if method == "get":
-                if len(node.args) >= 1:
-                    key = self._emit_expr_value(node.args[0])
-                    # Use FV-ABI: return full FpyValue so runtime tag drives dispatch.
-                    # This handles mixed-type dicts (kwargs pattern) correctly.
-                    if isinstance(key.type, ir.PointerType):
-                        has = self._rt_call("dict_has_key", [obj, key])
-                        has_bool = self.builder.icmp_unsigned("!=", has, ir.Constant(i32, 0))
-                        tag_slot = self._create_entry_alloca(i32, "dget.tag")
-                        data_slot = self._create_entry_alloca(i64, "dget.data")
-                        found_block = self._new_block("dget.found")
-                        default_block = self._new_block("dget.default")
-                        merge_block = self._new_block("dget.merge")
-                        self.builder.cbranch(has_bool, found_block, default_block)
-                        # Found path: load the FpyValue from dict
-                        self.builder.position_at_end(found_block)
-                        self.builder.call(self.runtime["dict_get_fv"],
-                                          [obj, key, tag_slot, data_slot])
-                        found_tag = self.builder.load(tag_slot)
-                        found_data = self.builder.load(data_slot)
-                        found_fv = self._fv_build_from_slots(found_tag, found_data)
-                        self.builder.branch(merge_block)
-                        found_end = self.builder.block
-                        # Default path: wrap the default value as FpyValue
-                        self.builder.position_at_end(default_block)
-                        if len(node.args) >= 2:
-                            default = self._emit_expr_value(node.args[1])
-                            if isinstance(default.type, ir.LiteralStructType):
-                                default_fv = default
-                            else:
-                                default_tag = self._infer_type_tag(node.args[1], default)
-                                default_fv = self._wrap_bare_to_fv(default, default_tag)
-                        else:
-                            default_fv = self._fv_none()
-                        self.builder.branch(merge_block)
-                        default_end = self.builder.block
-                        # Merge: phi on FpyValue
-                        self.builder.position_at_end(merge_block)
-                        phi = self.builder.phi(fpy_val, "dget.fv")
-                        phi.add_incoming(found_fv, found_end)
-                        phi.add_incoming(default_fv, default_end)
-                        return phi
-                    # Int key fallback: use string conversion path
-                    if len(node.args) >= 2:
-                        default = self._emit_expr_value(node.args[1])
-                        if not isinstance(default.type, ir.PointerType):
-                            default = self.builder.call(self.runtime["int_to_str"], [default])
-                    else:
-                        default = self._make_string_constant("None")
-                    return self._rt_call("dict_get_default", [obj, key, default])
-            if method == "update":
-                if len(node.args) == 1:
-                    other = self._emit_expr_value(node.args[0])
-                    self._rt_call("dict_update", [obj, other])
-                    return obj
-            if method == "pop":
-                if len(node.args) == 1:
-                    key = self._emit_expr_value(node.args[0])
-                    # Heuristic: use int pop if we can't tell; returning str by default
-                    return self._rt_call("dict_pop_int", [obj, key])
-                if len(node.args) == 2:
-                    key = self._emit_expr_value(node.args[0])
-                    default_val = self._emit_expr_value(node.args[1])
-                    def_tag, def_data = self._to_tag_data_ir(
-                        default_val, node.args[1])
-                    out_tag = self._create_entry_alloca(i32, "dpop.tag")
-                    out_data = self._create_entry_alloca(i64, "dpop.data")
-                    self.builder.call(self.runtime["dict_pop_fv"],
-                                      [obj, key, def_tag, def_data,
-                                       out_tag, out_data])
-                    return self._fv_build_from_slots(
-                        self.builder.load(out_tag),
-                        self.builder.load(out_data))
-            if method == "setdefault":
-                if len(node.args) == 2:
-                    key = self._emit_expr_value(node.args[0])
-                    default = self._emit_expr_value(node.args[1])
-                    if isinstance(default.type, ir.PointerType):
-                        self._rt_call("dict_setdefault_list", [obj, key, default])
-                    else:
-                        self._rt_call("dict_setdefault_int", [obj, key, default])
-                    return obj
-            if method == "popitem" and len(node.args) == 0:
-                kt = self._create_entry_alloca(i32, "pi.kt")
-                kd = self._create_entry_alloca(i64, "pi.kd")
-                vt = self._create_entry_alloca(i32, "pi.vt")
-                vd = self._create_entry_alloca(i64, "pi.vd")
-                self.builder.call(self.runtime["dict_popitem"],
-                                  [obj, kt, kd, vt, vd])
-                # Return as a 2-element tuple (key, value)
-                tup = self._rt_call("tuple_new", [])
-                self.builder.call(self.runtime["list_append_fv"],
-                                  [tup, self.builder.load(kt),
-                                   self.builder.load(kd)])
-                self.builder.call(self.runtime["list_append_fv"],
-                                  [tup, self.builder.load(vt),
-                                   self.builder.load(vd)])
-                return tup
-            if method == "copy" and len(node.args) == 0:
-                return self._rt_call("dict_copy", [obj])
-            if method == "clear" and len(node.args) == 0:
-                self._rt_call("dict_clear", [obj])
-                return obj
-            # Phase 4: fall through to runtime dispatch below
+            result = self._emit_method_call_dict(node)
+            if result is not None:
+                return result
 
-        # Check if object is a known user-class instance
+        # --- User-class instance method calls ---
         if self._is_obj_expr(attr.value):
-            obj = self._emit_expr_value(attr.value)
-            if (isinstance(obj.type, ir.LiteralStructType)
-                    and obj.type == fpy_val):
-                # FpyValue struct: extract data and convert to pointer
-                obj = self.builder.inttoptr(
-                    self.builder.extract_value(obj, 1), i8_ptr, name="obj.ptr")
-            elif isinstance(obj.type, ir.IntType) and obj.type.width == 64:
-                obj = self.builder.inttoptr(obj, i8_ptr, name="obj.ptr")
-            method_name_ptr = self._make_string_constant(method)
-            n_args = len(node.args)
-            # Check which params are mixed for this method
-            obj_cls = self._infer_object_class(attr.value)
-            method_mixed = set()
-            if obj_cls:
-                mkey = f"{obj_cls}.{method}"
-                method_mixed = getattr(self, '_mixed_param_methods', {}).get(mkey, set())
-            # Resolve keyword arguments → positional by consulting method AST
-            resolved_arg_nodes = list(node.args)
-            if node.keywords and obj_cls:
-                # Find the method's AST to get param names and defaults
-                m_ast = None
-                cn = obj_cls
-                while cn and cn in self._user_classes:
-                    ci = self._user_classes[cn]
-                    if ci.method_asts and method in ci.method_asts:
-                        m_ast = ci.method_asts[method]
-                        break
-                    cn = ci.parent_name
-                if m_ast is not None:
-                    m_params = [a.arg for a in m_ast.args.args[1:]]  # skip self
-                    m_defaults = m_ast.args.defaults
-                    kw_nodes: dict[int, ast.expr] = {}
-                    for kw in node.keywords:
-                        if kw.arg is None:
-                            continue
-                        if kw.arg not in m_params:
-                            continue  # Phase 4: unknown kwarg → skip
-                        idx = m_params.index(kw.arg)
-                        if idx < len(resolved_arg_nodes):
-                            continue  # Phase 4: duplicate kwarg → skip
-                        kw_nodes[idx] = kw.value
-                    while len(resolved_arg_nodes) < len(m_params):
-                        idx = len(resolved_arg_nodes)
-                        if idx in kw_nodes:
-                            resolved_arg_nodes.append(kw_nodes[idx])
-                        else:
-                            default_idx = idx - (len(m_params) - len(m_defaults))
-                            if default_idx >= 0 and default_idx < len(m_defaults):
-                                resolved_arg_nodes.append(m_defaults[default_idx])
-                            else:
-                                raise CodeGenError(
-                                    f".{method}() missing argument at position {idx}",
-                                    node,
-                                )
-            # For non-kwarg calls, also fill in defaults for missing positional args
-            elif obj_cls and not node.keywords:
-                m_ast = None
-                cn = obj_cls
-                while cn and cn in self._user_classes:
-                    ci = self._user_classes[cn]
-                    if ci.method_asts and method in ci.method_asts:
-                        m_ast = ci.method_asts[method]
-                        break
-                    cn = ci.parent_name
-                if m_ast is not None:
-                    m_params = [a.arg for a in m_ast.args.args[1:]]
-                    m_defaults = m_ast.args.defaults
-                    while len(resolved_arg_nodes) < len(m_params):
-                        idx = len(resolved_arg_nodes)
-                        default_idx = idx - (len(m_params) - len(m_defaults))
-                        if default_idx >= 0 and default_idx < len(m_defaults):
-                            resolved_arg_nodes.append(m_defaults[default_idx])
-                        else:
-                            break
-            n_args = len(resolved_arg_nodes)
-
-            # Evaluate and coerce args to i64 (runtime dispatch expects i64).
-            # For "mixed" params, pass (tag_i64, data_i64) as two separate args.
-            call_args = []
-            for arg_idx, arg_node in enumerate(resolved_arg_nodes):
-                param_idx = arg_idx + 1  # +1 for self
-                v = self._emit_expr_value(arg_node)
-                if param_idx in method_mixed:
-                    # Mixed param: pass tag and data as two separate i64 args
-                    tag_int, data_val = self._bare_to_tag_data(v, value_node=arg_node)
-                    call_args.append(ir.Constant(i64, tag_int))
-                    call_args.append(data_val)
-                else:
-                    if (isinstance(v.type, ir.LiteralStructType)
-                            and v.type == fpy_val):
-                        # FpyValue struct: extract the data part (i64)
-                        v = self.builder.extract_value(v, 1)
-                    elif isinstance(v.type, ir.PointerType):
-                        v = self.builder.ptrtoint(v, i64)
-                    elif isinstance(v.type, ir.DoubleType):
-                        v = self.builder.bitcast(v, i64)
-                    elif isinstance(v.type, ir.IntType) and v.type.width != 64:
-                        v = self.builder.zext(v, i64)
-                    call_args.append(v)
-
-            # Determine if method returns double
-            method_ret_type = self._find_method_return_type(attr.value, method)
-            is_double_ret = method_ret_type and isinstance(method_ret_type, ir.DoubleType)
-
-            # Direct dispatch optimization: when the object's class is known
-            # statically and there are no mixed params, call the method
-            # function directly instead of going through obj_call_methodN.
-            # This skips string comparison and enables LLVM inlining.
-            if obj_cls and not method_mixed:
-                # Walk class chain to find the actual method (handles inheritance)
-                direct_func = None
-                cn = obj_cls
-                while cn and cn in self._user_classes:
-                    ci = self._user_classes[cn]
-                    if method in ci.methods:
-                        direct_func = ci.methods[method]
-                        break
-                    cn = ci.parent_name
-                # Virtual dispatch: if the receiver's concrete class isn't
-                # pinned (e.g., `self` inside a class method — could be any
-                # subclass) and some subclass of obj_cls overrides this
-                # method, we can't statically bind.
-                _overridden = self._method_overridden_in_subclass(obj_cls, method) if direct_func is not None else False
-                _may_sub = self._receiver_may_be_subclass(attr.value) if direct_func is not None else False
-                if (direct_func is not None
-                        and _overridden
-                        and _may_sub):
-                    direct_func = None
-                if direct_func is not None:
-                    # Coerce args to match the method's LLVM signature
-                    direct_args = [obj]  # self
-                    for i, val in enumerate(call_args):
-                        if 1 + i >= len(direct_func.args):
-                            break
-                        expected = direct_func.args[1 + i].type
-                        if val.type != expected:
-                            if (isinstance(expected, ir.IntType)
-                                    and isinstance(val.type, ir.IntType)
-                                    and expected.width != val.type.width):
-                                if expected.width > val.type.width:
-                                    val = self.builder.zext(val, expected)
-                                else:
-                                    val = self.builder.trunc(val, expected)
-                            elif (isinstance(expected, ir.IntType)
-                                    and isinstance(val.type, ir.PointerType)):
-                                val = self.builder.ptrtoint(val, expected)
-                            elif (isinstance(expected, ir.PointerType)
-                                    and isinstance(val.type, ir.IntType)):
-                                val = self.builder.inttoptr(val, expected)
-                            elif (isinstance(expected, ir.DoubleType)
-                                    and isinstance(val.type, ir.IntType)):
-                                val = self.builder.bitcast(val, expected)
-                            elif (isinstance(expected, ir.IntType)
-                                    and isinstance(val.type, ir.DoubleType)):
-                                val = self.builder.bitcast(val, expected)
-                        direct_args.append(val)
-                    # Call the method function directly
-                    result = self.builder.call(direct_func, direct_args)
-                    # Post-process result based on actual return type
-                    ret_type = direct_func.return_value.type
-                    if isinstance(ret_type, ir.VoidType):
-                        return ir.Constant(i64, 0)  # void methods — return placeholder
-                    # Cast the return to the form the caller expects
-                    # (runtime dispatch returns i64, but direct returns native type)
-                    # Keep as-is; downstream code expects the native type.
-                    return result
-
-            # Use actual dispatch arg count (mixed params expand to 2 args each)
-            n_dispatch_args = len(call_args)
-            if n_dispatch_args == 0:
-                if is_double_ret:
-                    result = self.builder.call(
-                        self.runtime["obj_call_method0_double"], [obj, method_name_ptr])
-                else:
-                    result = self.builder.call(
-                        self.runtime["obj_call_method0"], [obj, method_name_ptr])
-            elif n_dispatch_args == 1:
-                if is_double_ret:
-                    result = self.builder.call(
-                        self.runtime["obj_call_method1_double"], [obj, method_name_ptr, call_args[0]])
-                else:
-                    result = self.builder.call(
-                        self.runtime["obj_call_method1"], [obj, method_name_ptr, call_args[0]])
-            elif n_dispatch_args == 2:
-                result = self.builder.call(
-                    self.runtime["obj_call_method2"], [obj, method_name_ptr, call_args[0], call_args[1]])
-            elif n_dispatch_args == 3:
-                result = self.builder.call(
-                    self.runtime["obj_call_method3"],
-                    [obj, method_name_ptr, call_args[0], call_args[1], call_args[2]])
-            elif n_dispatch_args == 4:
-                result = self.builder.call(
-                    self.runtime["obj_call_method4"],
-                    [obj, method_name_ptr, call_args[0], call_args[1], call_args[2], call_args[3]])
-            else:
-                return self._bridge_fallback_expr(node, f"method call with {n_dispatch_args} args (max 4)")
-
-            # Check if the method returns a string or bool — cast from i64
-            if not is_double_ret:
-                ret_type = self._find_method_return_type(attr.value, method)
-                if ret_type and isinstance(ret_type, ir.PointerType):
-                    result = self.builder.inttoptr(result, i8_ptr)
-                elif ret_type and isinstance(ret_type, ir.IntType) and ret_type.width == 32:
-                    result = self.builder.trunc(result, i32)
-            return result
+            return self._emit_method_call_userobj(node)
 
         obj = self._emit_expr_value(attr.value)
 
-        # Phase 2: only dispatch to string methods when we KNOW this is
-        # a string (via type tag), not just because it's a pointer. Sets,
-        # dicts, bigints, etc. are also pointers and would be mishandled.
+        # Phase 2: dispatch by type tag
         obj_tag = self._infer_type_tag(attr.value, obj)
         obj_kind = ValueType.from_old_tag(obj_tag).kind
+
         if isinstance(obj.type, ir.PointerType) and obj_kind in (VKind.STR, VKind.UNKNOWN):
-            # String methods
-            if method == "lower":
-                return self._rt_call("str_lower", [obj])
-            elif method == "upper":
-                return self._rt_call("str_upper", [obj])
-            elif method == "strip":
-                if len(node.args) == 1:
-                    chars = self._emit_expr_value(node.args[0])
-                    return self._rt_call("str_strip_chars", [obj, chars])
-                return self._rt_call("str_strip", [obj])
-            elif method == "lstrip":
-                if len(node.args) == 1:
-                    chars = self._emit_expr_value(node.args[0])
-                    return self._rt_call("str_lstrip_chars", [obj, chars])
-                return self._rt_call("str_lstrip", [obj])
-            elif method == "rstrip":
-                if len(node.args) == 1:
-                    chars = self._emit_expr_value(node.args[0])
-                    return self._rt_call("str_rstrip_chars", [obj, chars])
-                return self._rt_call("str_rstrip", [obj])
-            elif method == "isdigit":
-                return self._rt_call("str_isdigit", [obj])
-            elif method == "isalpha":
-                return self._rt_call("str_isalpha", [obj])
-            elif method == "isalnum":
-                return self._rt_call("str_isalnum", [obj])
-            elif method == "isspace":
-                return self._rt_call("str_isspace", [obj])
-            elif method == "capitalize":
-                return self._rt_call("str_capitalize", [obj])
-            elif method == "title":
-                return self._rt_call("str_title", [obj])
-            elif method == "swapcase":
-                return self._rt_call("str_swapcase", [obj])
-            elif method == "center":
-                if len(node.args) == 1:
-                    w = self._emit_expr_value(node.args[0])
-                    return self._rt_call("str_center", [obj, w])
-                if len(node.args) == 2:
-                    w = self._emit_expr_value(node.args[0])
-                    fill = self._emit_expr_value(node.args[1])
-                    return self._rt_call("str_center_fill", [obj, w, fill])
-            elif method == "ljust":
-                if len(node.args) == 1:
-                    w = self._emit_expr_value(node.args[0])
-                    return self._rt_call("str_ljust", [obj, w])
-                if len(node.args) == 2:
-                    w = self._emit_expr_value(node.args[0])
-                    fill = self._emit_expr_value(node.args[1])
-                    return self._rt_call("str_ljust_fill", [obj, w, fill])
-            elif method == "rjust":
-                if len(node.args) == 1:
-                    w = self._emit_expr_value(node.args[0])
-                    return self._rt_call("str_rjust", [obj, w])
-                if len(node.args) == 2:
-                    w = self._emit_expr_value(node.args[0])
-                    fill = self._emit_expr_value(node.args[1])
-                    return self._rt_call("str_rjust_fill", [obj, w, fill])
-            elif method == "isupper":
-                if len(node.args) == 0:
-                    return self._rt_call("str_isupper", [obj])
-            elif method == "islower":
-                if len(node.args) == 0:
-                    return self._rt_call("str_islower", [obj])
-            elif method == "istitle":
-                if len(node.args) == 0:
-                    return self._rt_call("str_istitle", [obj])
-            elif method == "isidentifier":
-                if len(node.args) == 0:
-                    return self._rt_call("str_isidentifier", [obj])
-            elif method == "isprintable":
-                if len(node.args) == 0:
-                    return self._rt_call("str_isprintable", [obj])
-            elif method == "isdecimal":
-                if len(node.args) == 0:
-                    return self._rt_call("str_isdecimal", [obj])
-            elif method == "isnumeric":
-                if len(node.args) == 0:
-                    return self._rt_call("str_isnumeric", [obj])
-            elif method == "casefold":
-                if len(node.args) == 0:
-                    return self._rt_call("str_casefold", [obj])
-            elif method == "expandtabs":
-                if len(node.args) == 0:
-                    return self._rt_call("str_expandtabs",
-                                          [obj, ir.Constant(i64, 8)])
-                if len(node.args) == 1:
-                    ts = self._emit_expr_value(node.args[0])
-                    return self._rt_call("str_expandtabs", [obj, ts])
-            elif method == "partition":
-                if len(node.args) == 1:
-                    sep = self._emit_expr_value(node.args[0])
-                    return self._rt_call("str_partition", [obj, sep])
-            elif method == "rpartition":
-                if len(node.args) == 1:
-                    sep = self._emit_expr_value(node.args[0])
-                    return self._rt_call("str_rpartition", [obj, sep])
-            elif method == "zfill":
-                if len(node.args) == 1:
-                    w = self._emit_expr_value(node.args[0])
-                    return self._rt_call("str_zfill", [obj, w])
-            elif method == "splitlines":
-                return self._rt_call("str_splitlines", [obj])
-            elif method == "split":
-                if len(node.args) == 2:
-                    sep = self._emit_expr_value(node.args[0])
-                    maxsplit = self._emit_expr_value(node.args[1])
-                    return self._rt_call("str_split_max", [obj, sep, maxsplit])
-                if len(node.args) == 1:
-                    sep = self._emit_expr_value(node.args[0])
-                    return self._rt_call("str_split_max", [obj, sep, ir.Constant(i64, -1)])
-                return self._rt_call("str_split", [obj])
-            elif method == "rsplit":
-                if len(node.args) == 2:
-                    sep = self._emit_expr_value(node.args[0])
-                    maxsplit = self._emit_expr_value(node.args[1])
-                    return self._rt_call("str_rsplit", [obj, sep, maxsplit])
-                if len(node.args) == 1:
-                    sep = self._emit_expr_value(node.args[0])
-                    return self._rt_call("str_rsplit",
-                                          [obj, sep, ir.Constant(i64, -1)])
-                return self._rt_call("str_rsplit_ws", [obj])
-            elif method == "join":
-                if len(node.args) == 1:
-                    lst = self._emit_expr_value(node.args[0])
-                    return self._rt_call("str_join", [obj, lst])
-            elif method == "replace":
-                if len(node.args) == 3:
-                    old = self._emit_expr_value(node.args[0])
-                    new = self._emit_expr_value(node.args[1])
-                    count = self._emit_expr_value(node.args[2])
-                    return self._rt_call("str_replace_count",
-                                          [obj, old, new, count])
-                if len(node.args) == 2:
-                    old = self._emit_expr_value(node.args[0])
-                    new = self._emit_expr_value(node.args[1])
-                    return self._rt_call("str_replace", [obj, old, new])
-            elif method == "startswith":
-                if len(node.args) == 1:
-                    arg = node.args[0]
-                    val = self._emit_expr_value(arg)
-                    # Check if arg is a tuple → tuple version
-                    if self._is_tuple_expr(arg) or self._is_list_expr(arg):
-                        return self._rt_call("str_startswith_tuple", [obj, val])
-                    return self._rt_call("str_startswith", [obj, val])
-                if len(node.args) == 2:
-                    prefix = self._emit_expr_value(node.args[0])
-                    start = self._emit_expr_value(node.args[1])
-                    slen = self._rt_call("str_len", [obj])
-                    return self._rt_call("str_startswith_range",
-                                         [obj, prefix, start, slen])
-                if len(node.args) == 3:
-                    prefix = self._emit_expr_value(node.args[0])
-                    start = self._emit_expr_value(node.args[1])
-                    end = self._emit_expr_value(node.args[2])
-                    return self._rt_call("str_startswith_range",
-                                         [obj, prefix, start, end])
-            elif method == "endswith":
-                if len(node.args) == 1:
-                    arg = node.args[0]
-                    val = self._emit_expr_value(arg)
-                    if self._is_tuple_expr(arg) or self._is_list_expr(arg):
-                        return self._rt_call("str_endswith_tuple", [obj, val])
-                    return self._rt_call("str_endswith", [obj, val])
-                if len(node.args) == 2:
-                    suffix = self._emit_expr_value(node.args[0])
-                    start = self._emit_expr_value(node.args[1])
-                    slen = self._rt_call("str_len", [obj])
-                    return self._rt_call("str_endswith_range",
-                                         [obj, suffix, start, slen])
-                if len(node.args) == 3:
-                    suffix = self._emit_expr_value(node.args[0])
-                    start = self._emit_expr_value(node.args[1])
-                    end = self._emit_expr_value(node.args[2])
-                    return self._rt_call("str_endswith_range",
-                                         [obj, suffix, start, end])
-            elif method == "removeprefix":
-                if len(node.args) == 1:
-                    prefix = self._emit_expr_value(node.args[0])
-                    return self._rt_call("str_removeprefix", [obj, prefix])
-            elif method == "removesuffix":
-                if len(node.args) == 1:
-                    suffix = self._emit_expr_value(node.args[0])
-                    return self._rt_call("str_removesuffix", [obj, suffix])
-            elif method == "find":
-                if len(node.args) == 1:
-                    sub = self._emit_expr_value(node.args[0])
-                    return self._rt_call("str_find", [obj, sub])
-                if len(node.args) == 2:
-                    sub = self._emit_expr_value(node.args[0])
-                    start = self._emit_expr_value(node.args[1])
-                    slen = self._rt_call("str_len", [obj])
-                    return self._rt_call("str_find_range",
-                                         [obj, sub, start, slen])
-                if len(node.args) == 3:
-                    sub = self._emit_expr_value(node.args[0])
-                    start = self._emit_expr_value(node.args[1])
-                    end = self._emit_expr_value(node.args[2])
-                    return self._rt_call("str_find_range",
-                                         [obj, sub, start, end])
-            elif method == "rfind":
-                if len(node.args) == 1:
-                    sub = self._emit_expr_value(node.args[0])
-                    return self._rt_call("str_rfind", [obj, sub])
-                if len(node.args) == 2:
-                    sub = self._emit_expr_value(node.args[0])
-                    start = self._emit_expr_value(node.args[1])
-                    slen = self._rt_call("str_len", [obj])
-                    return self._rt_call("str_rfind_range",
-                                         [obj, sub, start, slen])
-                if len(node.args) == 3:
-                    sub = self._emit_expr_value(node.args[0])
-                    start = self._emit_expr_value(node.args[1])
-                    end = self._emit_expr_value(node.args[2])
-                    return self._rt_call("str_rfind_range",
-                                         [obj, sub, start, end])
-            elif method == "index":
-                if len(node.args) == 1:
-                    sub = self._emit_expr_value(node.args[0])
-                    return self._rt_call("str_index_sub", [obj, sub])
-                if len(node.args) == 2:
-                    sub = self._emit_expr_value(node.args[0])
-                    start = self._emit_expr_value(node.args[1])
-                    slen = self._rt_call("str_len", [obj])
-                    return self._rt_call("str_index_sub_range",
-                                         [obj, sub, start, slen])
-                if len(node.args) == 3:
-                    sub = self._emit_expr_value(node.args[0])
-                    start = self._emit_expr_value(node.args[1])
-                    end = self._emit_expr_value(node.args[2])
-                    return self._rt_call("str_index_sub_range",
-                                         [obj, sub, start, end])
-            elif method == "rindex":
-                if len(node.args) == 1:
-                    sub = self._emit_expr_value(node.args[0])
-                    return self._rt_call("str_rindex_sub", [obj, sub])
-                if len(node.args) == 2:
-                    sub = self._emit_expr_value(node.args[0])
-                    start = self._emit_expr_value(node.args[1])
-                    slen = self._rt_call("str_len", [obj])
-                    return self._rt_call("str_rindex_sub_range",
-                                         [obj, sub, start, slen])
-                if len(node.args) == 3:
-                    sub = self._emit_expr_value(node.args[0])
-                    start = self._emit_expr_value(node.args[1])
-                    end = self._emit_expr_value(node.args[2])
-                    return self._rt_call("str_rindex_sub_range",
-                                         [obj, sub, start, end])
-            elif method == "count":
-                if len(node.args) == 1:
-                    sub = self._emit_expr_value(node.args[0])
-                    return self._rt_call("str_count", [obj, sub])
-                if len(node.args) == 2:
-                    sub = self._emit_expr_value(node.args[0])
-                    start = self._emit_expr_value(node.args[1])
-                    slen = self._rt_call("str_len", [obj])
-                    return self._rt_call("str_count_range",
-                                         [obj, sub, start, slen])
-                if len(node.args) == 3:
-                    sub = self._emit_expr_value(node.args[0])
-                    start = self._emit_expr_value(node.args[1])
-                    end = self._emit_expr_value(node.args[2])
-                    return self._rt_call("str_count_range",
-                                         [obj, sub, start, end])
-            elif method == "format":
-                return self._emit_str_format(node, obj)
-            elif method == "translate":
-                if len(node.args) == 1:
-                    table = self._emit_expr_value(node.args[0])
-                    return self._rt_call("str_translate", [obj, table])
-            elif method == "encode":
-                # str.encode() → bytes (same UTF-8 content, tagged as BYTES)
-                return self._rt_call("str_encode", [obj])
-        # bytes methods
+            result = self._emit_method_call_str(node, obj)
+            if result is not None:
+                return result
+
         if obj_kind == VKind.BYTES:
-            if method == "decode" and len(node.args) <= 1:
-                # bytes.decode() → str (same UTF-8 content)
-                return self._rt_call("bytes_decode", [obj])
-            elif method == "upper" and len(node.args) == 0:
-                return self._rt_call("str_upper", [obj])
-            elif method == "lower" and len(node.args) == 0:
-                return self._rt_call("str_lower", [obj])
-            elif method == "strip" and len(node.args) == 0:
-                return self._rt_call("str_strip", [obj])
-            elif method == "lstrip" and len(node.args) == 0:
-                return self._rt_call("str_lstrip", [obj])
-            elif method == "rstrip" and len(node.args) == 0:
-                return self._rt_call("str_rstrip", [obj])
-            elif method == "replace" and len(node.args) >= 2:
-                old = self._emit_expr_value(node.args[0])
-                new = self._emit_expr_value(node.args[1])
-                if len(node.args) == 3:
-                    cnt = self._emit_expr_value(node.args[2])
-                    return self._rt_call("str_replace3", [obj, old, new, cnt])
-                return self._rt_call("str_replace", [obj, old, new])
-            elif method == "split" and len(node.args) <= 2:
-                if len(node.args) == 0:
-                    return self._rt_call("bytes_split", [obj])
-                sep = self._emit_expr_value(node.args[0])
-                if len(node.args) == 2:
-                    maxsplit = self._emit_expr_value(node.args[1])
-                    return self._rt_call("str_split_max", [obj, sep, maxsplit])
-                return self._rt_call("str_split_max", [obj, sep, ir.Constant(i64, -1)])
-            elif method == "join" and len(node.args) == 1:
-                lst = self._emit_expr_value(node.args[0])
-                return self._rt_call("str_join", [obj, lst])
-            elif method == "find" and len(node.args) >= 1:
-                sub = self._emit_expr_value(node.args[0])
-                return self._rt_call("str_find", [obj, sub])
-            elif method == "rfind" and len(node.args) >= 1:
-                sub = self._emit_expr_value(node.args[0])
-                return self._rt_call("str_rfind", [obj, sub])
-            elif method == "count" and len(node.args) >= 1:
-                sub = self._emit_expr_value(node.args[0])
-                return self._rt_call("str_count", [obj, sub])
-            elif method == "startswith" and len(node.args) >= 1:
-                prefix = self._emit_expr_value(node.args[0])
-                return self._rt_call("str_startswith", [obj, prefix])
-            elif method == "endswith" and len(node.args) >= 1:
-                suffix = self._emit_expr_value(node.args[0])
-                return self._rt_call("str_endswith", [obj, suffix])
-        # int methods: bit_length, bit_count, to_bytes, etc.
+            result = self._emit_method_call_bytes(node, obj)
+            if result is not None:
+                return result
+
         if obj_kind == VKind.INT:
-            if method == "bit_length" and len(node.args) == 0:
-                # int.bit_length() — count significant bits
-                # Equivalent to (x.bit_length()) in Python
-                val = obj if isinstance(obj.type, ir.IntType) else \
-                    self.builder.ptrtoint(obj, i64)
-                # abs(val) for negative numbers
-                is_neg = self.builder.icmp_signed("<", val, ir.Constant(i64, 0))
-                abs_val = self.builder.sub(ir.Constant(i64, 0), val)
-                val = self.builder.select(is_neg, abs_val, val)
-                # Count bits: 64 - ctlz(val)
-                # llvm.ctlz.i64 takes (i64, i1) — must pass explicit fnty
-                ctlz_fnty = ir.FunctionType(i64, [i64, ir.IntType(1)])
-                ctlz = self.module.declare_intrinsic(
-                    "llvm.ctlz", [i64], ctlz_fnty)
-                leading_zeros = self.builder.call(
-                    ctlz, [val, ir.Constant(ir.IntType(1), 1)])
-                result = self.builder.sub(ir.Constant(i64, 64), leading_zeros)
-                # Special case: bit_length(0) == 0
-                is_zero = self.builder.icmp_signed(
-                    "==", obj if isinstance(obj.type, ir.IntType) else
-                    self.builder.ptrtoint(obj, i64), ir.Constant(i64, 0))
-                return self.builder.select(is_zero, ir.Constant(i64, 0), result)
-            elif method == "bit_count" and len(node.args) == 0:
-                # int.bit_count() — count number of set bits (popcount)
-                val = obj if isinstance(obj.type, ir.IntType) else \
-                    self.builder.ptrtoint(obj, i64)
-                # abs(val) — bit_count(-5) == bit_count(5) in Python
-                # (two's complement bit count differs, but Python counts
-                #  the bits of the absolute value)
-                is_neg = self.builder.icmp_signed("<", val, ir.Constant(i64, 0))
-                abs_val = self.builder.sub(ir.Constant(i64, 0), val)
-                val = self.builder.select(is_neg, abs_val, val)
-                ctpop_fnty = ir.FunctionType(i64, [i64])
-                ctpop = self.module.declare_intrinsic(
-                    "llvm.ctpop", [i64], ctpop_fnty)
-                return self.builder.call(ctpop, [val])
-            elif method == "to_bytes" and len(node.args) >= 2:
-                val = obj if isinstance(obj.type, ir.IntType) else \
-                    self.builder.ptrtoint(obj, i64)
-                length = self._emit_expr_value(node.args[0])
-                byteorder = self._emit_expr_value(node.args[1])
-                return self._rt_call("int_to_bytes", [val, length, byteorder])
+            result = self._emit_method_call_int(node, obj)
+            if result is not None:
+                return result
 
-        # float methods: is_integer, conjugate, etc.
         if obj_kind == VKind.FLOAT:
-            if method == "is_integer" and len(node.args) == 0:
-                # float.is_integer() — True if the float has no fractional part
-                fval = obj if isinstance(obj.type, ir.DoubleType) else \
-                    self.builder.bitcast(obj, double)
-                # floor(x) == x
-                floor_fn = self.module.declare_intrinsic(
-                    "llvm.floor", [double])
-                floored = self.builder.call(floor_fn, [fval])
-                is_int = self.builder.fcmp_ordered("==", fval, floored)
-                return self.builder.zext(is_int, i32)
-            elif method == "as_integer_ratio" and len(node.args) == 0:
-                fval = obj if isinstance(obj.type, ir.DoubleType) else \
-                    self.builder.bitcast(obj, double)
-                return self._rt_call("float_as_integer_ratio", [fval])
+            result = self._emit_method_call_float(node, obj)
+            if result is not None:
+                return result
 
-        # Fallback: method dispatch for unknown objects.
-        # Two paths:
-        # (a) Path/pyobj-tagged variables: use fpy_fv_call_method which
-        #     converts to PyObject* safely (handles Path, Django models, etc.)
-        # (b) All other variables (obj, unknown): use obj_call_method which
-        #     assumes FpyObj* (the common case for polymorphic class objects)
-        #
-        # IMPORTANT: We condition on the compile-time tag, NOT on whether the
-        # variable is FV-backed. FpyObj* values stored in fpy_val allocas have
-        # unreliable runtime tags (often INT instead of OBJ), so _load_fv_raw
-        # would misroute them through FV dispatch → AttributeError.
-        _use_fv_dispatch = False
-        if isinstance(node.func.value, ast.Name) and node.func.value.id in self.variables:
-            _, _rcv_tag = self.variables[node.func.value.id]
-            _rcv_tag_str = str(_rcv_tag)
-            if _rcv_tag_str in ("path", "pyobj"):
-                _use_fv_dispatch = True
+        return self._emit_method_call_fallback(node)
 
-        if _use_fv_dispatch:
-            fv_raw = self._load_fv_raw(node.func.value.id)
-            if fv_raw is None:
-                # Not FV-backed despite path/pyobj tag — use CPython bridge
-                return self._emit_cpython_method_call(node)
-            # Path (a): FpyValue-backed — use safe FV dispatch
-            rcv_tag = self._fv_tag(fv_raw)
-            rcv_data = self._fv_data_i64(fv_raw)
-            name_ptr = self._make_string_constant(method)
-            out_tag = self._create_entry_alloca(i32, "fvcall.tag")
-            out_data = self._create_entry_alloca(i64, "fvcall.data")
-            n_args = len(node.args)
-            if n_args == 0:
-                self.builder.call(self.runtime["fv_call_method0"],
-                                  [rcv_tag, rcv_data, name_ptr,
-                                   out_tag, out_data])
-            elif n_args == 1:
-                a1t, a1d = self._expr_to_tag_data(node.args[0])
-                self.builder.call(self.runtime["fv_call_method1"],
-                                  [rcv_tag, rcv_data, name_ptr,
-                                   a1t, a1d, out_tag, out_data])
-            elif n_args == 2:
-                a1t, a1d = self._expr_to_tag_data(node.args[0])
-                a2t, a2d = self._expr_to_tag_data(node.args[1])
-                self.builder.call(self.runtime["fv_call_method2"],
-                                  [rcv_tag, rcv_data, name_ptr,
-                                   a1t, a1d, a2t, a2d, out_tag, out_data])
-            elif n_args == 3:
-                a1t, a1d = self._expr_to_tag_data(node.args[0])
-                a2t, a2d = self._expr_to_tag_data(node.args[1])
-                a3t, a3d = self._expr_to_tag_data(node.args[2])
-                self.builder.call(self.runtime["fv_call_method3"],
-                                  [rcv_tag, rcv_data, name_ptr,
-                                   a1t, a1d, a2t, a2d, a3t, a3d,
-                                   out_tag, out_data])
-            else:
-                return self._emit_cpython_method_call(node)
-            result_tag = self.builder.load(out_tag)
-            result_data = self.builder.load(out_data)
-            return self._fv_build_from_slots(result_tag, result_data)
-
-        # Path (b): bare pointer — assume FpyObj* (class instance)
-        obj = self._emit_expr_value(node.func.value)
-        obj = self._ensure_ptr(obj)
-        name_ptr = self._make_string_constant(method)
-        n_args = len(node.args)
-        if n_args == 0:
-            return self.builder.call(
-                self.runtime["obj_call_method0"], [obj, name_ptr])
-        elif n_args == 1:
-            arg = self._emit_expr_value(node.args[0])
-            if isinstance(arg.type, ir.PointerType):
-                arg = self.builder.ptrtoint(arg, i64)
-            elif isinstance(arg.type, ir.DoubleType):
-                arg = self.builder.bitcast(arg, i64)
-            elif isinstance(arg.type, ir.IntType) and arg.type.width != 64:
-                arg = self.builder.zext(arg, i64)
-            return self.builder.call(
-                self.runtime["obj_call_method1"], [obj, name_ptr, arg])
-        elif n_args == 2:
-            a1 = self._emit_expr_value(node.args[0])
-            a2 = self._emit_expr_value(node.args[1])
-            for v in [a1, a2]:
-                if isinstance(v.type, ir.PointerType):
-                    v = self.builder.ptrtoint(v, i64)
-            return self.builder.call(
-                self.runtime["obj_call_method2"],
-                [obj, name_ptr,
-                 a1 if isinstance(a1.type, ir.IntType) and a1.type.width == 64
-                 else self.builder.ptrtoint(a1, i64) if isinstance(a1.type, ir.PointerType)
-                 else self.builder.zext(a1, i64),
-                 a2 if isinstance(a2.type, ir.IntType) and a2.type.width == 64
-                 else self.builder.ptrtoint(a2, i64) if isinstance(a2.type, ir.PointerType)
-                 else self.builder.zext(a2, i64)])
-        # Fallback: route through CPython bridge
-        return self._emit_cpython_method_call(node)
 
     def _method_overridden_in_subclass(self, base_class: str,
                                          method_name: str) -> bool:
