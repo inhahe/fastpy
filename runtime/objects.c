@@ -3218,7 +3218,7 @@ FpyList* fastpy_str_split_max(const char *s, const char *sep, int64_t max_split)
     const char *p = s;
     const char *end = s + s_len;
     int64_t splits = 0;
-    while (p < end) {
+    while (p <= end) {
         if (max_split >= 0 && splits >= max_split) {
             size_t rest_len = end - p;
             char *seg = (char*)malloc(rest_len + 1);
@@ -3227,8 +3227,11 @@ FpyList* fastpy_str_split_max(const char *s, const char *sep, int64_t max_split)
             fpy_list_append(result, fpy_str(seg));
             break;
         }
-        const char *q = strstr(p, sep);
+        const char *q = (p <= end) ? strstr(p, sep) : NULL;
         if (!q) {
+            /* No more separators — add the rest of the string (may be empty
+               if the string ended with the separator, which is correct:
+               "a ".split(" ") → ["a", ""]). */
             size_t rest_len = end - p;
             char *seg = (char*)malloc(rest_len + 1);
             memcpy(seg, p, rest_len);
