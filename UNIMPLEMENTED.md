@@ -147,7 +147,507 @@ These features work correctly but use the embedded CPython interpreter:
 - **Other stdlib modules** not implemented natively (e.g., collections,
   itertools, functools — except singledispatch which is native)
 
-## Bugs fixed (2026-04-28, tuple repr, bytes length, dict comp filter, deque, struct, callable)
+## Bugs fixed (2026-04-28, list(iter), closure *args, diamond MRO, dict comp fixes, enumerate(str))
+
+### 148. list(iterator_object) crashed (fixed)
+`list(Range(1, 5))` where `Range` implements `__iter__`/`__next__` crashed with ACCESS_VIOLATION because the `list()` builtin just returned the raw object pointer without iterating. Fix: Added `fastpy_list_from_obj_iter` runtime function that calls `__iter__()` then repeatedly calls `__next__()` until `StopIteration`, building an FpyList from the results. Codegen detects OBJ-typed arguments to `list()` and routes through this function. Works with both user-defined iterator classes and generator objects.
+
+### 147. Closure with *args crashed or returned 0 (fixed)
+`def make(): def inner(*args): return args[0]; return inner; f = make(); f(5)` crashed with ACCESS_VIOLATION. Root cause: two separate issues. (1) For closures with captures: the runtime `closure_callN` didn't know the target function expects a packed args list, so it passed raw i64 values instead of a list pointer. Fix: Added `has_vararg` flag to FpyClosure struct and `fastpy_closure_set_vararg()`. When set, `closure_call0/1/2/call_list` pack call-site arguments into an FpyList and pass it as the first parameter. (2) For hoisted non-closure *args functions: the function returns FpyValue `{i32, i64}` (not plain i64), but the closure call mechanism casts to `int64_t(*)()` — ABI mismatch on Windows x64 where structs >8 bytes use sret. Fix: Generate a thin LLVM wrapper (`__vararg_wrap`) that calls the real function and extracts the data field from the FpyValue return. Both fixes work together: codegen sets `has_vararg` on the closure and uses the wrapper for correct ABI.
+
+### 146. Diamond inheritance MRO resolution wrong (fixed)
+`class A: def greet(self): return "A"` / `class B(A): pass` / `class C(A): def greet(self): return "C"` / `class D(B, C): pass` — `D().greet()` returned "A" instead of "C". Python's C3 MRO for D is [D, B, C, A], so C.greet should win over A.greet. Fix: Added compile-time C3 linearization (`_compute_c3_mro`) and MRO-aware method flattening. When walking the MRO, secondary base methods override primary-chain ancestor methods only when the secondary base appears earlier in MRO. Methods from classes in the primary parent chain (accessible via runtime `parent_id` walk) are tracked by MRO position so a secondary base can override deep ancestors while respecting earlier primary-chain definitions. Added `own_method_names` tracking to distinguish methods directly defined in a class body from inherited ones.
+
+### 145. Dict comprehension over enumerate(string) crashed (fixed)
+`{c: i for i, c in enumerate('hello')}` segfaulted because `fastpy_enumerate()` takes an `FpyList*` but received a `const char*` string pointer. The runtime tried to read `list->length` from the string, causing ACCESS_VIOLATION. Fix: Added `fastpy_enumerate_str(const char*, int64_t)` runtime function that iterates over string characters, allocating single-char FpyString values for each. Codegen detects string-typed enumerate arguments (string literals and string-typed variables) and dispatches to `enumerate_str` instead of `enumerate`.
+
+### 144. Dict comprehension with enumerate tuple-unpack used wrong key type (fixed)
+`{i: v for i, v in enumerate(items)}` crashed because the dict comprehension always called `dict_set_fv` (string-key setter) even when the key was an integer from enumerate. Fix: Added type dispatch — uses `dict_set_int_fv` for integer keys and `dict_set_fv` for pointer/string keys. Also added per-position type inference for tuple unpacking in dict comps: enumerate() → (int, elem_type), literal tuples → infer from first element.
+
+## Bugs fixed (2026-04-28, type(obj), for-star-unpack, enumerate(str), sort(key=), print(sep=var), 3+ comprehensions)
+
+### 143. min/max on list of objects with __lt__ returned garbage (fixed)
+`min([N(5), N(2), N(8)])` and `max(...)` where `N` defines `__lt__` returned
+raw boolean values (`\x01`) instead of the actual min/max objects. Three
+issues: (1) No OBJ branch in the min/max codegen loop — fell through to
+integer comparison. (2) `_infer_type_tag` for min/max didn't handle
+`elem_type == "obj"`, so the result was tagged as "str". (3) `_is_obj_expr`
+didn't recognize `min()`/`max()` calls as potentially returning objects,
+so `repr(min(items))` used string repr instead of OBJ repr. Fix: Added
+`fastpy_list_min_fv`/`fastpy_list_max_fv` runtime functions that iterate
+using `fpy_value_compare` and return the raw data (i64). Codegen calls
+these before the loop when `elem_type == "obj"`. Added OBJ case to
+`_infer_type_tag` and `_is_obj_expr`.
+
+### 142. sorted() on user-class objects with __lt__ used pointer comparison (fixed)
+`sorted([Item(3), Item(1), Item(2)])` where `Item` defines `__lt__` produced
+wrong order because `fpy_value_compare` compared native FpyObj by pointer
+identity rather than dispatching to `__lt__`. Fix: In the FPY_TAG_OBJ case
+of `fpy_value_compare`, look up `__lt__` via `fastpy_find_method` and call
+it if found. Falls back to pointer comparison only when no `__lt__` exists.
+
+### 141. Tuple methods and operations broken (fixed)
+`t.count(val)` and `t.index(val)` crashed because the list method dispatcher
+only checked `_is_list_expr`, missing tuple-typed expressions. Also,
+`(1,2) + (3,4)` printed as `[1,2,3,4]` (list brackets) instead of
+`(1,2,3,4)` (tuple parens), and `(1,2)*3` similarly lost the tuple format.
+Fix: (a) Extended list method dispatcher to also match `_is_tuple_expr`,
+since tuples use the same FpyList struct. (b) `fastpy_list_concat` now
+preserves the `is_tuple` flag when both inputs are tuples. (c)
+`fastpy_list_repeat` now preserves `is_tuple` from the source list.
+
+### 140. Mixed float/int return types printed as float (fixed)
+`def f(x): try: return 1/x; except: return -1` — calling `f(0)` printed
+`-1.0` instead of `-1`. The `1/x` true division forced the function's
+return type to `double`, so the except's `return -1` was promoted to
+`-1.0`. Fix: Extended the mixed-return-type detection to also check for
+float+int conflicts (not just float+pointer). When both float and plain
+integer returns exist, downgrade `ret_type` from `double` to `i64` so
+FpyValue ABI preserves the distinction.
+
+### 139. `with CM() as v` crashed when `__enter__` returns non-self (fixed)
+`with CM() as v` where `__enter__` returns an integer (e.g., 42) crashed
+with ACCESS_VIOLATION. The codegen assumed `__enter__` always returns self
+(an object pointer) and did `inttoptr(42)` → invalid pointer dereference.
+Fix: Added AST analysis of the `__enter__` method body to check if it
+returns `self`. If it returns a non-self value, uses `get_ret_tag` to
+determine the actual return type at runtime and stores the value as an
+FpyValue.
+
+### 138. List comprehensions with 3+ generators rejected at compile time (fixed)
+`[x+y+z for x in range(2) for y in range(2) for z in range(2)]` raised
+CodeGenError "Only 1-2 generator list comprehensions supported". The existing
+2-generator handler was manually inlined. Fix: Added recursive
+`_emit_list_comprehension_multi` that handles any number of generators by
+recursively nesting for-loops. Supports range() and list iterables, with
+per-generator if-conditions.
+
+## Bugs fixed (2026-04-28, type(obj), for-star-unpack, enumerate(str), sort(key=), print(sep=var))
+
+### 137. `print(sep=variable)` and `print(end=variable)` rejected at compile time (fixed)
+`print(1, 2, 3, sep=sep_char)` where `sep_char` is a variable raised a
+CodeGenError requiring `sep=` and `end=` to be literal strings. Now accepts
+any string expression — the value is evaluated at runtime and passed to the
+write_str runtime function. `sep=None` and `end=None` are handled as defaults.
+
+### 136. `list.sort(key=func)` fell through to CPython bridge (fixed)
+`a.sort(key=len)`, `a.sort(key=abs)`, and `a.sort(key=lambda s: len(s))`
+all fell through to the CPython bridge because the `.sort(key=...)` handler
+had no native implementation. Also, `sort(key=lambda)` on string lists
+crashed because the lambda parameter type was inferred as int instead of
+str when the key function was a keyword argument (no positional list arg).
+Fix: (a) Added `fastpy_list_sort_by_key_int` runtime function for in-place
+stable sort by key with a reverse flag for proper stable descending sort.
+(b) Added method-call context to `_emit_inline_unary_lambda` so `.sort(key=)`
+infers element types from the receiver object. (c) Integrated with existing
+`_get_unary_func_ptr` for builtin (len, abs) and lambda key functions.
+
+### 135. `enumerate("string")` crashed at runtime (fixed)
+`for i, c in enumerate("abc")` crashed with ACCESS_VIOLATION because the
+inline enumerate optimization called `list_length` on a string pointer.
+Strings aren't FpyList structs — `list_length` reads invalid memory.
+Fix: Added string detection in `_emit_for_enumerate_inline`. When the
+enumerate argument is a string, uses `str_len` for length and `str_index`
+for character extraction instead of list operations.
+
+### 134. `for a, *rest in list_of_lists` didn't unpack starred targets (fixed)
+`for first, *rest in [[1,2,3],[4,5,6]]` raised NameError because
+`_emit_for_tuple_unpack` had no handler for `ast.Starred` targets.
+Fix: Added starred target handling that computes inner list length, assigns
+fixed-position elements by index, and creates a sub-list slice for the
+starred variable.
+
+### 133. `type(obj).__name__` and `type(obj)` crashed for native user-class objects (fixed)
+`type(x).__name__` and `print(type(x))` on user-class instances crashed
+because the codegen called `cpython_typeof` / `cpython_type_repr` which
+interpret the pointer as a PyObject*. Native FpyObj has a completely
+different layout. Fix: Added `fastpy_obj_classname` and
+`fastpy_obj_type_repr` runtime functions that read the class name from the
+native class registry. `type(x).__name__` returns the bare class name;
+`type(x)` returns `"<class '__main__.ClassName'>"` matching Python output.
+
+## Bugs fixed (2026-04-28, dunder dispatch & method return types)
+
+### 127. f-string `!r` conversion ignored (fixed)
+f-strings with `!r` conversion (e.g., `f"{x!r}"`) were not applying `repr()`
+to the value. The `_emit_fstring` handler now detects `conversion == ord('r')`
+and routes through `obj_to_repr` / `repr()` before formatting.
+
+### 128. `__ne__` not auto-derived from `__eq__` (fixed)
+Classes defining `__eq__` but not `__ne__` would crash with AttributeError
+when `!=` was used. The runtime `obj_call_method1` now falls back to
+`not __eq__(other)` when `__ne__` is not found, matching Python semantics.
+
+### 129. `repr()` / `str()` crash when object class unknown (fixed)
+`repr(obj)` and `str(obj)` on objects whose class couldn't be statically
+inferred would crash. Now uses `obj_to_repr` / `obj_to_str` runtime
+functions which handle `__repr__ -> __str__ -> default` fallback chains safely.
+
+### 130. `__neg__` fails when class not statically inferable (fixed)
+Unary negation `-obj` was guarded on `_infer_object_class` returning non-None.
+Removed the guard; now always dispatches through `obj_call_method0("__neg__")`
+for any OBJ-typed expression.
+
+### 131. `-obj` and `obj+obj` not typed as OBJ in type inference (fixed)
+`_infer_type_tag` didn't recognize UnaryOp/BinOp on OBJ as producing OBJ.
+Added rules: USub/UAdd/Invert on OBJ -> OBJ; BinOp with OBJ operand -> OBJ.
+
+### 132. `__getitem__`/`__setitem__`/`__contains__` dispatch improvements (fixed)
+Multiple issues with dunder subscript/membership dispatch on user classes:
+
+- **Removed `_infer_object_class` guards**: `__getitem__`, `__setitem__`,
+  and `__contains__` now dispatch via `obj_call_methodN` for any OBJ-typed
+  expression, not just those whose class can be statically inferred.
+
+- **Method return type tagging**: Methods now call `set_ret_tag()` before
+  returning so callers using `get_ret_tag()` (for `__getitem__` dispatch)
+  recover the correct type tag. This fixes `__getitem__` returning compound
+  types (lists, dicts, objects) — previously printed as raw pointer numbers.
+
+- **List element type for self.attr**: `_get_list_elem_type` now resolves
+  `self.attr` through the class's `__init__` AST to determine element types
+  (e.g., `self.data = [[1,2],[3,4]]` -> elem_type "list", not "int").
+
+- **Call-site type registration for `__getitem__`/`__contains__`**: Added
+  AST analysis to register parameter types from `obj[key]` and `key in obj`
+  patterns, matching the existing `__setitem__` registration.
+
+- **`__contains__` dispatch order fix**: The OBJ `__contains__` handler was
+  unreachable because a legacy string fallback matched first (both OBJ
+  pointers and string pointers are `ir.PointerType`). Moved OBJ handler
+  before the legacy fallback.
+
+## Bugs fixed (2026-04-28, isinstance/None/bool/str*= multi-fix)
+
+### 126. `bytes.split()` returned string items instead of bytes items (fixed)
+`b"hello world".split()` returned `['hello', 'world']` (STR-tagged items)
+instead of `[b'hello', b'world']` (BYTES-tagged items). The runtime `str_split`
+function creates STR-tagged FpyValues. Fix: Added `bytes_split` runtime function
+that creates BYTES-tagged items, and `fpy_bytes_val` helper in objects.h.
+Codegen now dispatches `bytes.split()` (no args) to `bytes_split`.
+
+### 125. `list.count(True)` returned 2 instead of 3 (fixed)
+In Python, `True == 1` and `False == 0`, so `[1, True, 0, False, 1].count(True)`
+should be 3 (matching 1, True, and 1). The runtime `fastpy_list_count` only
+checked `FPY_TAG_INT`, missing BOOL-tagged values. Fix: Check both
+`FPY_TAG_INT` and `FPY_TAG_BOOL` when counting numeric values.
+
+### 124. `bool & bool` printed as `int` instead of `bool` (fixed)
+`True & True` printed `1` instead of `True`. The LLVM bitwise AND produced an
+i64, and `_wrap_for_print` had no check for `inferred == "bool"` so it fell
+through to the default integer print path.
+Fix: (a) Added `inferred == "bool"` check in `_wrap_for_print` to wrap with
+`_fv_from_bool`. (b) Added `bool & bool → bool` inference in `_infer_type_tag`
+for BinOp with BitAnd/BitOr/BitXor when both operands are `_is_bool_typed`.
+(c) Fixed `_is_bool_typed` to handle ValueType objects (Phase 3) in addition
+to legacy string tags.
+
+### 123. Bytes slicing printed without `b'...'` prefix (fixed)
+`b"hello"[1:3]` printed `el` instead of `b'el'`. The slice result was tagged
+as STR because `_infer_type_tag` had no check for bytes subscript slicing.
+Fix: Added bytes subscript inference in `_infer_type_tag` — slice returns
+"bytes", single index returns "int".
+
+### 122. `bytes.upper()`/`lower()`/`strip()` and other methods crashed (fixed)
+Only `bytes.decode()` was handled in the bytes method dispatch. All other
+string-like methods (upper, lower, strip, lstrip, rstrip, replace, split,
+join, find, rfind, count, startswith, endswith) fell through to the generic
+method handler and crashed. Fix: Added dispatch for all common bytes methods
+by reusing the corresponding `str_*` runtime functions (bytes are `char*`
+internally, same as strings). Also added return type inference for bytes
+method calls.
+
+### 121. `int * bytes` produced TypeError (fixed)
+`3 * b'ab'` printed `None` followed by a TypeError because `fv_binop` only
+handled `bytes * int` (FPY_TAG_BYTES on the left), not `int * bytes`
+(FPY_TAG_BYTES on the right). Fix: Added reverse handler in `fv_binop` for
+`(INT|BOOL) * BYTES`. Also added type inference in `_infer_type_tag` for
+bytes multiplication and comparison handler in `_emit_compare` for
+VKind.BYTES operands.
+
+### 120. `rsplit()` without arguments crashed (fixed)
+`"hello world".rsplit()` (no separator argument) fell through the rsplit
+handler because only the 1-arg and 2-arg forms were handled. The 0-arg form
+(split on whitespace) was missing. Fix: Added `str_rsplit_ws` runtime
+function (delegates to `str_split` since without maxsplit, rsplit and split
+produce identical results) and added the 0-args case in codegen dispatch.
+
+### 118. `__bool__` dunder not called through fv_truthy for native objects (fixed)
+`bool(obj)` and `if obj:` always returned True for user-class objects that
+defined `__bool__`, because `fastpy_fv_truthy` in `objects.c` returned 1 for
+all native FpyObj regardless of `__bool__`/`__len__` methods. Additionally,
+`_emit_condition` for Name nodes only routed through `_truthiness_of_expr`
+for known types (list/dict/str/set), so OBJ-typed variables bypassed the
+`__bool__` dispatch entirely.
+Fix: (a) Runtime: `fv_truthy` now calls `fastpy_find_method` to look up
+`__bool__` and `__len__` on native FpyObj, invoking them if found.
+(b) Codegen: `_emit_condition` now always uses `_truthiness_of_expr` for
+Name nodes, ensuring FV-backed objects go through proper truthiness dispatch.
+(c) Added `result_i32 = trunc(result, i32)` to handle ABI mismatch where
+`__bool__` returns i32 but `obj_call_method0` returns i64.
+
+### 119. `None == ""` (and None vs any pointer type) crashed at runtime (fixed)
+`None == ""`, `None == []`, `None == ()`, `None == {1}`, `None == {}`, and
+reverse forms like `"" == None` all crashed with a null pointer dereference.
+Root cause: the NONE comparison guard was placed too late in `_emit_compare`'s
+dispatch chain. None is stored as i64(0), and `""` is i8* (pointer), so the
+int/pointer mismatch handler fired first, calling `str_compare(inttoptr(0), "")`
+→ null pointer crash. Similarly, `"" == None` matched the STR comparison handler
+(`left_kind == VKind.STR`) which called `str_compare(left, tv_right.as_ptr())`
+where tv_right's None became a null pointer.
+Fix: moved the NONE guard to the very top of the VKind-based dispatch chain,
+before any type-specific handlers. None compared with anything non-None always
+returns False (for ==) or True (for !=), regardless of the other operand's type.
+
+### 117. `str *= n` augmented multiply not handled (fixed)
+`x = 'ab'; x *= 3` produced empty string because there was no `STR *= n`
+handler in `_emit_aug_assign`. STR += (concatenation) existed but *= (repeat)
+was missing. Added handler that calls `str_repeat` for string augmented multiply.
+
+### 116. `None == 0` and `None == False` returned True instead of False (fixed)
+`None` is stored as i64(0) internally, so comparing `None == 0` fell through
+to `_emit_int_compare` which compared raw bit values (both 0) → True.
+Fix: Added NONE-aware guard in `_emit_compare` that returns constant False
+for `None == <non-None>` and True only for `None == None`.
+
+### 115. `isinstance(x, set)` always returned True (fixed)
+`isinstance(x, set)` (and bytes, frozenset, complex) used a conservative
+fallback that always returned True. Fix: Added proper FPY_TAG checks for
+set (FPY_TAG_SET), bytes (FPY_TAG_BYTES), complex (FPY_TAG_COMPLEX) in
+both single-type and tuple-of-types isinstance paths. Also added bytes,
+complex, None to `_static_type_of` for compile-time resolution.
+
+## Bugs fixed (2026-04-28, str*bool/bool*str repeat, sequence*bool patterns)
+
+### 113. `str * bool` and `bool * str` raised TypeError instead of repeating (fixed)
+`"abc" * True` should produce `"abc"` (True == 1 repeat) and `"abc" * False`
+should produce `""` (0 repeats), since Python's bool is a subclass of int and
+sequence repeat operations accept any int-like value.
+Root causes: (a) Codegen `str * int` fast paths only checked `VKind.INT`, not
+`VKind.BOOL`, so `str * bool` missed the fast path and fell through to the
+container guard → `fv_binop`. (b) Runtime `fv_binop` str repeat checks only
+tested `FPY_TAG_INT`, not `FPY_TAG_BOOL`, so bool operands fell through to the
+TypeError guard. Same issue affected `bytes * bool`.
+Fix: (a) Codegen: changed `rk == VKind.INT` to `rk in (VKind.INT, VKind.BOOL)`
+for str*int, int*str, list*int, and int*list fast paths. (b) Runtime: changed
+`rt == FPY_TAG_INT` to `(rt == FPY_TAG_INT || rt == FPY_TAG_BOOL)` for str
+repeat and bytes repeat paths (list repeat already handled BOOL correctly).
+
+## Bugs fixed (2026-04-28, str+int/float TypeError, test generator expansion)
+
+### 112. `str + int` and `str + float` silently succeeded instead of TypeError (fixed)
+`"hello" + 5` produced `"hello5"` (auto-converted int to string) instead of
+raising TypeError. `"hello" + 1.5` silently computed float arithmetic on the
+string pointer, producing garbage. `"hello" * 1.5` similarly failed.
+Root causes: (a) Codegen had explicit `str + int → int_to_str + str_concat`
+and `int + str → int_to_str + str_concat` fast paths that auto-converted.
+Python never auto-converts types for `+` — only `str + str` is valid.
+(b) The codegen float fast path `if lk == VKind.FLOAT or rk == VKind.FLOAT`
+didn't guard against container types, so `str + float` promoted the string
+pointer to double and did float arithmetic.
+(c) The runtime `fastpy_fv_binop` float path `if (lt == FPY_TAG_FLOAT || rt
+== FPY_TAG_FLOAT)` also lacked a numeric-type guard, so str+float at runtime
+did float arithmetic on the string's pointer value.
+Fix: (a) Removed the str+int and int+str auto-conversion fast paths.
+(b) Added `_float_incompatible` guard to the codegen float fast path — only
+enters float arithmetic when the other operand is numeric (INT/BOOL/FLOAT).
+(c) Added numeric-type guard to runtime fv_binop float path — both operands
+must be FLOAT/INT/BOOL to enter float arithmetic. Also added FPY_TAG_BYTES
+to the TypeError guard. Invalid combinations now fall through to the TypeError
+guard which calls `fastpy_raise(FPY_EXC_TYPEERROR, ...)`.
+
+## Bugs fixed (2026-04-28, module-level exception propagation)
+
+### 111. Module-level uncaught exceptions didn't halt execution (fixed)
+`total = []; print(total + 0); print(0.0)` printed `None` and `0.0` instead
+of crashing with TypeError. In CPython, uncaught exceptions immediately
+terminate the program. In fastpy, exceptions are flag-based (set by
+`fastpy_raise()`, polled by `fastpy_exc_pending()`). Inside try blocks,
+`_emit_try_bail_if_exc()` checks the flag and branches to the except handler.
+But at module level (outside try), the flag was never checked — execution
+continued with garbage return values from errored calls.
+Root causes: (a) `_emit_try_bail_if_exc()` returned immediately when
+`_in_try_block` was False. (b) No exception check existed between module-level
+statements. (c) `fv_binop` (handles container type errors like list+int) didn't
+call `_emit_try_bail_if_exc()` after the runtime call, so even within a single
+expression, subsequent operations ran with garbage values.
+Fix: (a) Extended `_emit_try_bail_if_exc()` to also work at module level
+(`fastpy_main`): when `_in_try_block` is False but the function is
+`fastpy_main`, emits an `exc_pending()` check that calls `exc_unhandled()`
+(print traceback + exit). (b) Added per-statement exception checks in the
+Pass 3 module-level statement loop. (c) Added `_emit_try_bail_if_exc()` after
+both `fv_binop` call sites (FpyValue dispatch and container guard paths).
+
+## Bugs fixed (2026-04-28, *args tuple, MRO, funcdef in loops, lambda captures, mixed returns)
+
+### 110. Mixed return types (float try + string except) produced garbage (fixed)
+`def classify(x): try: return 100/x; except: return f"error: {e}"` returned
+a garbage float (e.g. `1.27e-311`) for the string return path. The return
+type analysis set `ret_type = double` on seeing `ast.Div` in any return
+expression, then all returns were compiled as double — string pointers were
+bitcast to double.
+Fix: Added a post-analysis conflict check. After the return type is
+determined, re-scan all returns for pointer-type returns (f-strings, string
+literals, string variables, containers). If both float and pointer returns
+exist, downgrade `ret_type` from `double` to `i64` so the FpyValue ABI
+handles runtime type dispatch.
+
+### 109. Lambda expressions inside functions didn't capture parent variables (fixed)
+`def make(n): return lambda: n` — calling `make(42)()` raised `NameError:
+name 'n' is not defined`. The inline lambda compilation path
+(`_emit_inline_lambda`) created a standalone function with no mechanism
+to pass values from the enclosing scope.
+Fix: Added free-variable detection to `_emit_inline_lambda`. When a lambda
+references variables from the enclosing scope (present in `self.variables`
+but not in `_global_vars` or lambda params), it is compiled as a closure
+with captured values passed as extra parameters. A `closure_new` object is
+created and capture values are set via `closure_set_capture`.
+
+### 108. Function definitions inside for/while/if/try blocks invisible (fixed)
+`for i in range(3): def greet(n): return n * 2; print(greet(i))` crashed
+with `AttributeError: module 'builtins' has no attribute 'greet'`. Function
+definitions inside control flow blocks at both module level and inside
+functions were not discovered by the compiler's pre-scan passes.
+Root causes: (a) Pass 0.5 `_scan_for_closures` only examined direct children
+of function bodies, not inside for/while/if/try/with blocks.
+(b) Module-level function defs inside loops were never declared or compiled.
+Fix: (a) Added `_collect_inner_funcdefs` generator that recursively walks
+control flow blocks. (b) Added Pass 0.55 to discover module-level loop
+functions, Pass 0.56 synthetic closure scan for module scope, Pass 1.1 to
+declare them, and Pass 2.05 to compile them. Set `_current_func_name =
+"fastpy_main"` in Pass 3 so closure lookup works.
+
+### 107. Multiple inheritance MRO ignored primary parent chain (fixed)
+`class D(B, C)` where both B and C define `method()` — `d.method()`
+returned "C" (secondary base) instead of "B" (primary base). Python's
+C3 MRO gives priority: D → B → C → A.
+Root cause: Secondary base method flattening only checked `if m_name not
+in methods` (the child class's own methods), but didn't check if the method
+existed in the primary parent chain (B and its ancestors).
+Fix: Before flattening secondary base methods, build the full set of method
+names available through the primary parent chain. Only add a secondary
+base method if it doesn't exist in the primary chain.
+
+### 106. `*args` printed as list instead of tuple (fixed)
+`def func(*args): print(args)` showed `[1, 2, 3]` instead of `(1, 2, 3)`.
+In Python, `*args` is always a tuple.
+Root cause: Call sites packed extra positional arguments into an FpyList
+via `list_new` but never called `list_mark_tuple` to set the `is_tuple`
+flag. All four call-site paths (single-param vararg, mixed vararg, single
+with FV return, mixed with FV return) had the same issue.
+Fix: Added `list_mark_tuple` call after packing *args in all four paths.
+
+### 105. `*args` and `**kwargs` together crashed (fixed)
+`def func(*args, **kwargs): print(args, kwargs)` called as
+`func(1, 2, a=10)` crashed with access violation.
+Root cause: Function declaration only added `*args` as a parameter,
+ignoring `**kwargs` entirely. Call sites either passed just the args list
+or just the kwargs dict (depending on presence of keywords), never both.
+Fix: (a) Added `**kwargs` as a second parameter in the declaration when
+both `has_vararg` and `has_kwarg` are true. (b) Added a dedicated call-site
+path for `is_vararg and is_kwarg and param_count == 2` that passes both
+the args tuple and kwargs dict. (c) Added guards on the mixed-vararg path
+to exclude the `*args + **kwargs` case.
+
+## Bugs fixed (2026-04-28, format specs, try/except, min/max, str format, split elem type)
+
+### 104. `_get_list_elem_type` returned "int" for `.split()` results (fixed)
+`for w in "hello world".split(): d[w] = 1` stored dict keys as raw pointer
+integers instead of strings, because `_get_list_elem_type` had no handler
+for `.split()` method calls on strings and fell through to the default "int".
+Fix: Added handler for string methods that return lists of strings (`.split()`,
+`.rsplit()`, `.splitlines()`) in `_get_list_elem_type`.
+
+### 103. `_list_get_as_bare` didn't handle "tuple" element type (fixed)
+Extracting tuple elements from a list (e.g. `list_of_tuples[i]`) returned
+raw i64 data instead of converting to a pointer. Only "str", "obj", "dict",
+and types starting with "list" were converted.
+Fix: Added "tuple", "set", "bytes", "deque" to the pointer-type set in
+`_list_get_as_bare`.
+
+### 102. `_get_list_elem_type` returned "str" for `dict.items()` (fixed)
+`max(scores.items(), key=lambda x: x[1])` crashed with "IndexError: string
+index out of range". `items()` returns tuples (FpyList with is_tuple=1), not
+strings. The `_get_list_elem_type` function returned "str" for all of
+`.values()`, `.items()`, `.keys()`.
+Fix: Return "list" for `.items()` (tuples stored as FpyList), keeping "str"
+only for `.keys()` and `.values()`.
+
+### 101. `min()`/`max()` on lists of tuples returned raw pointer (fixed)
+`max(data, key=lambda x: x[1])` where data is a list of tuples printed a raw
+pointer value instead of the tuple. Two root causes:
+(a) `_list_get_as_bare` didn't handle "tuple" element type — only "str", "obj",
+"dict", and "list" were converted to pointers. Tuples fell through to i64.
+(b) `_infer_type_tag` had no handler for `min`/`max` return types, so the
+result was tagged as "str" (default for pointers) instead of "list".
+Fix: Added "tuple", "set", "bytes", "deque" to pointer-type checks in both
+`_list_get_as_bare` and the min/max codegen. Added `_infer_type_tag` rule
+for min/max that propagates the list's element type.
+
+### 100. String format spec missing center (`^`) and fill character (fixed)
+`f"{'hello':^15}"` and `f"{'hello':*^15}"` produced unpadded output.
+`fastpy_format_spec_str` only handled `<` and `>` alignment, with no
+fill-character parsing and no `^` center support. Also lacked `.precision`.
+Fix: Rewrote `fastpy_format_spec_str` with full `[[fill]align][width][.prec]`
+parsing, matching the float/int format spec parsers.
+
+### 99. Integer format spec ignored `b`/`x`/`X`/`o` type chars (fixed)
+`f"{255:08b}"` showed `00000255` (decimal) instead of `11111111` (binary).
+`f"{255:#06x}"` showed `255` instead of `0x00ff`.
+`fastpy_format_spec_int` only handled decimal (`%lld`), ignoring the format
+type character entirely.
+Fix: Rewrote `fastpy_format_spec_int` with full Python format spec parsing:
+`[[fill]align][sign][#][0][width][,|_][type]`. Supports `b` (binary with
+manual bit extraction), `o` (octal), `x`/`X` (hex), `c` (char), `d`/`n`
+(decimal), `#` alternate form (0b/0o/0x prefixes), sign (+/-/space),
+fill+align (</>=/^), and `,`/`_` grouping.
+
+### 98. try/except failed to catch exceptions from expression statements (fixed)
+`try: 1/0; except ZeroDivisionError: ...` was silently ignored — the except
+handler never ran. `_emit_expr_stmt` skipped non-call expressions with `pass`
+("no side effect"), but inside a try block, expressions like `a / b` need to
+be evaluated to trigger potential exceptions.
+Fix: When `_in_try_block` is True, `_emit_expr_stmt` now evaluates the
+expression via `_emit_expr_value` instead of skipping it.
+
+### 97. Division/modulo by zero caused UB crash inside try/except (fixed)
+`results.append(10 // x)` inside a try/except block crashed when `x == 0`.
+Three root causes:
+(a) Raw LLVM `srem` instruction for floor-division adjustment — when the
+divisor is 0, `srem` is undefined behavior (hardware divide-by-zero trap on
+x86), even though `fastpy_safe_div` returned 0 and set the exception flag.
+(b) Exception flag set by `safe_div` wasn't checked until end of statement,
+so `list.append()` ran with a garbage value before the exception was detected.
+(c) Standalone `%` modulo used `safe_mod` which didn't raise (only returned 0).
+Fix: (a) Replaced all raw `srem` with `fastpy_safe_mod` runtime call that
+returns 0 when divisor is 0. (b) Added `_emit_try_bail_if_exc()` helper that
+checks `exc_pending()` immediately after any call that can raise (safe_div,
+safe_mod, safe_fdiv, safe_int_fdiv) when inside a try block, branching to the
+except handler before subsequent code runs. (c) `fastpy_safe_mod` now raises
+`ZeroDivisionError` if no exception is already pending.
+
+## Bugs fixed (2026-04-28, closure defaults, nested closures, tuple repr, bytes, dict comp)
+
+### 96. Closure default parameter values not applied (fixed)
+`def inner(y=20)` inside `def outer(x)` — calling `outer(10)()` returned
+`10` instead of `30` (= 10+20). The default `y=20` was ignored.
+Root cause: FpyClosure struct had no default value storage. `closure_call0`
+called the function with only captures, never filling in parameter defaults.
+Fix: Added `n_defaults` and `defaults[8]` to FpyClosure. Codegen emits
+`closure_set_defaults`/`closure_set_default` after closure creation.
+`closure_call0` fills in defaults when all params have defaults;
+`closure_call1` fills in the 2nd param's default when `n_params == 2`.
+
+### 95. Decorator-with-arguments failed: triple-nested closure name lookup (fixed)
+`@repeat(3) def f(x)` — decorator factories that return a decorator that
+returns a wrapper (three levels of nesting) failed with "NameError: name
+'wrapper' is not defined". The inner `wrapper` function was compiled but
+couldn't be found when `decorator`'s body tried to create its closure.
+Root cause: `_emit_closure_body` didn't set `_current_func_name`, so when
+`decorator`'s body compiled `def wrapper(x)`, `_emit_nested_funcdef` looked
+for `repeat.wrapper` instead of `repeat.decorator.wrapper`.
+Fix: Save/restore `_current_func_name` in `_emit_closure_body`, deriving
+the full name from the LLVM function name.
 
 ### 94. Dict comprehension with tuple-unpacking target ignored if-clause filter (fixed)
 `{k: v for k, v in d.items() if v > 2}` included ALL items instead of only

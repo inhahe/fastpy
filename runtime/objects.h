@@ -110,13 +110,14 @@ typedef struct {
     void *func;          /* cast to appropriate signature */
     int arg_count;       /* number of args (excluding self) */
     int returns_value;   /* 1 if returns a value, 0 if void */
+    int return_tag;      /* FPY_TAG_* for the return value, -1 = unknown */
 } FpyMethodDef;
 
 /* Class definition */
 typedef struct {
     int class_id;
     const char *name;
-    int parent_id;          /* -1 if no parent */
+    int parent_id;          /* -1 if no parent (single-inheritance fast path) */
     FpyMethodDef *methods;
     int method_count;
     int slot_count;         /* number of pre-declared attribute slots */
@@ -274,6 +275,9 @@ static inline FpyValue fpy_float(double v) {
 }
 static inline FpyValue fpy_str(const char *v) {
     FpyValue val; val.tag = FPY_TAG_STR; val.data.s = v; return val;
+}
+static inline FpyValue fpy_bytes_val(const char *v) {
+    FpyValue val; val.tag = FPY_TAG_BYTES; val.data.s = v; return val;
 }
 static inline FpyValue fpy_bool(int v) {
     FpyValue val; val.tag = FPY_TAG_BOOL; val.data.b = v; return val;

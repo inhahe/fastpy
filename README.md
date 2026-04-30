@@ -21,28 +21,63 @@ Benchmarked against C++ (`/O2`) and CPython 3.14 on x64 Windows:
 
 fastpy is typically **10-250x faster than CPython** and **within 1-2x of C++** on equivalent code. LLVM's optimizer enables constant folding, inlining, and autovectorization that sometimes beats hand-written C++.
 
-## Quick start
+## Getting started
+
+### Prerequisites
+
+- **Python 3.11+** (3.12–3.14 recommended)
+- **llvmlite**: `pip install llvmlite`
+- **Windows:** [MSVC Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/) (install "Desktop development with C++")
+- **Linux/macOS:** `gcc` or `clang`, plus Python headers (`sudo apt install python3-dev` on Debian/Ubuntu, `sudo dnf install python3-devel` on Fedora)
+
+### Build & run
 
 ```bash
-# Windows
-python -m compiler hello.py -o hello.exe
-./hello.exe
+# 1. Clone
+git clone https://github.com/user/fastpy.git
+cd fastpy
 
-# Linux / macOS
-python -m compiler hello.py -o hello
-./hello
+# 2. Install llvmlite
+pip install llvmlite
 
-# Or compile in Python
-from compiler.pipeline import compile_source
-result = compile_source('print("hello world")')
+# 3. Build the C runtime (one-time)
+# Linux/macOS:
+bash runtime/build_runtime.sh
+# Windows (from a Developer Command Prompt or VS x64 Native Tools prompt):
+runtime\build_runtime.bat
+
+# 4. Compile a Python file
+python -m compiler hello.py -o hello        # Linux/macOS
+python -m compiler hello.py -o hello.exe    # Windows
+
+# 5. Run
+./hello          # Linux/macOS
+hello.exe        # Windows
 ```
 
-### Requirements
+Example `hello.py`:
 
-- Python 3.11+ with llvmlite (`pip install llvmlite`)
-- **Windows:** MSVC Build Tools (for linking)
-- **Linux/macOS:** gcc or clang (for linking), Python headers (`python3-dev`)
-- CPython headers/libs for the target Python version (for .pyd/.so module import support)
+```python
+def greet(name):
+    print(f"Hello, {name}!")
+
+greet("world")
+```
+
+### Compiler flags
+
+| Flag | Effect |
+|------|--------|
+| `-o PATH` | Output executable path |
+| `-t` / `--free-threaded` | Free-threaded mode (true parallelism, no GIL) |
+| `--threading MODE` | Threading: `none` (default), `gil`, `free` |
+| `-T` / `--typed` | Use type annotations for native code gen |
+| `--int64` | Checked i64 integers — overflow raises `OverflowError` instead of promoting to BigInt |
+| `--python-version VER` | Target a specific Python version (e.g. `3.12`) |
+| `--list-pythons` | Show all detected Python installations |
+| `--repl` | Interactive REPL (compile-and-run each input) |
+| `--analyze` | Optimization analysis report |
+| `-v` / `--verbose` | Detailed compilation info |
 
 ### Multi-Python version targeting
 
@@ -54,6 +89,13 @@ python -m compiler hello.py --python-version 3.14
 ```
 
 An ABI version check at startup verifies the compiled-against Python version matches the runtime Python version.
+
+### Using from Python
+
+```python
+from compiler.pipeline import compile_source
+result = compile_source('print("hello world")')
+```
 
 ## What's supported
 

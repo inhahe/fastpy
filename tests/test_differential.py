@@ -1043,6 +1043,67 @@ class TestAdvanced:
             "    print(f'{key}: {d[key]}')"
         )
 
+    def test_ne_auto_derive(self, assert_compiles):
+        """__ne__ auto-derived from __eq__."""
+        assert_compiles(
+            "class Pt:\n"
+            "    def __init__(self, x):\n        self.x = x\n"
+            "    def __eq__(self, other):\n        return self.x == other.x\n"
+            "a, b, c = Pt(1), Pt(1), Pt(2)\n"
+            "print(a == b)\nprint(a != b)\nprint(a != c)"
+        )
+
+    def test_neg_dunder(self, assert_compiles):
+        """__neg__ on user objects."""
+        assert_compiles(
+            "class N:\n"
+            "    def __init__(self, v):\n        self.v = v\n"
+            "    def __neg__(self):\n        return N(-self.v)\n"
+            "    def __repr__(self):\n        return f'N({self.v})'\n"
+            "x = N(5)\ny = -x\nprint(repr(y))"
+        )
+
+    def test_getitem_int(self, assert_compiles):
+        """__getitem__ returning int."""
+        assert_compiles(
+            "class M:\n"
+            "    def __init__(self):\n        self.data = [10, 20, 30]\n"
+            "    def __getitem__(self, i):\n        return self.data[i]\n"
+            "m = M()\nprint(m[1])"
+        )
+
+    def test_getitem_list(self, assert_compiles):
+        """__getitem__ returning sublist from list-of-lists."""
+        assert_compiles(
+            "class M:\n"
+            "    def __init__(self):\n"
+            "        self.data = [[1, 2, 3], [4, 5, 6]]\n"
+            "    def __getitem__(self, i):\n        return self.data[i]\n"
+            "m = M()\nprint(m[0])\nprint(m[1])"
+        )
+
+    def test_getitem_str(self, assert_compiles):
+        """__getitem__ returning string."""
+        assert_compiles(
+            "class Named:\n"
+            "    def __init__(self, name):\n        self.name = name\n"
+            "    def __getitem__(self, i):\n        return self.name\n"
+            "n = Named('hello')\nprint(n[0])"
+        )
+
+    def test_setitem_getitem_contains(self, assert_compiles):
+        """__setitem__, __getitem__, __contains__ on user class."""
+        assert_compiles(
+            "class D:\n"
+            "    def __init__(self):\n        self.store = {}\n"
+            "    def __setitem__(self, k, v):\n        self.store[k] = v\n"
+            "    def __getitem__(self, k):\n        return self.store[k]\n"
+            "    def __contains__(self, k):\n        return k in self.store\n"
+            "d = D()\nd['a'] = 1\nd['b'] = 2\n"
+            "print(d['a'])\nprint(d['b'])\n"
+            "print('a' in d)\nprint('c' in d)"
+        )
+
     def test_starred_unpack(self, assert_compiles):
         assert_compiles(
             "first, *rest = [10, 20, 30, 40]\n"
@@ -1268,4 +1329,234 @@ class TestAdvanced:
             "        b *= b\n        e = e // 2\n"
             "    return r\n"
             "print(power(2, 10))"
+        )
+
+    # --- Bug #133: type(obj).__name__ for user-class objects ---
+    def test_type_name_user_class(self, assert_compiles):
+        assert_compiles(
+            "class Foo:\n    pass\n"
+            "x = Foo()\nprint(type(x).__name__)"
+        )
+
+    def test_type_repr_user_class(self, assert_compiles):
+        assert_compiles(
+            "class Cat:\n    def __init__(self, n):\n        self.n = n\n"
+            "c = Cat('mimi')\nprint(type(c))"
+        )
+
+    # --- Bug #134: starred targets in for-loop ---
+    def test_for_star_unpack(self, assert_compiles):
+        assert_compiles(
+            "for a, *b in [[1, 2, 3], [4, 5, 6]]:\n    print(a, b)"
+        )
+
+    def test_for_star_unpack_prefix(self, assert_compiles):
+        assert_compiles(
+            "for *init, last in [[1,2,3],[4,5]]:\n    print(init, last)"
+        )
+
+    # --- Bug #135: enumerate on strings ---
+    def test_enumerate_string(self, assert_compiles):
+        assert_compiles(
+            "for i, c in enumerate('abc'):\n    print(i, c)"
+        )
+
+    def test_enumerate_string_start(self, assert_compiles):
+        assert_compiles(
+            "for i, c in enumerate('xy', start=10):\n    print(i, c)"
+        )
+
+    # --- Bug #136: list.sort(key=func) ---
+    def test_sort_key_len(self, assert_compiles):
+        assert_compiles(
+            "a = ['cc', 'a', 'bbb']\na.sort(key=len)\nprint(a)"
+        )
+
+    def test_sort_key_abs(self, assert_compiles):
+        assert_compiles(
+            "a = [3, -1, 2, -5]\na.sort(key=abs)\nprint(a)"
+        )
+
+    def test_sort_key_lambda(self, assert_compiles):
+        assert_compiles(
+            "a = ['bbb', 'a', 'cc']\n"
+            "a.sort(key=lambda s: len(s))\nprint(a)"
+        )
+
+    def test_sort_key_reverse(self, assert_compiles):
+        assert_compiles(
+            "a = ['banana', 'apple', 'cherry']\n"
+            "a.sort(key=len, reverse=True)\nprint(a)"
+        )
+
+    # --- Bug #137: print(sep=variable) ---
+    def test_print_sep_variable(self, assert_compiles):
+        assert_compiles(
+            "sep_char = ', '\nprint(1, 2, 3, sep=sep_char)"
+        )
+
+    def test_print_end_variable(self, assert_compiles):
+        assert_compiles(
+            "s = '!'\nprint('hello', end=s)\nprint(' world')"
+        )
+
+    # --- Bug #138: triple+ nested comprehensions ---
+    def test_triple_comprehension(self, assert_compiles):
+        assert_compiles(
+            "result = [x + y + z for x in range(2) for y in range(2) for z in range(2)]\n"
+            "print(result)"
+        )
+
+    def test_quad_comprehension(self, assert_compiles):
+        assert_compiles(
+            "r = [a+b+c+d for a in range(2) for b in range(2) "
+            "for c in range(2) for d in range(2)]\nprint(r)"
+        )
+
+    # --- Bug #139: with/as when __enter__ returns non-self ---
+    def test_with_as_int(self, assert_compiles):
+        assert_compiles(
+            "class CM:\n"
+            "    def __enter__(self):\n        return 42\n"
+            "    def __exit__(self, *a):\n        print('exit')\n"
+            "with CM() as v:\n    print(v)"
+        )
+
+    # --- Bug #140: mixed float/int return types ---
+    def test_mixed_float_int_return(self, assert_compiles):
+        assert_compiles(
+            "def f(x):\n"
+            "    try:\n        return 1/x\n"
+            "    except ZeroDivisionError:\n        return -1\n"
+            "print(f(0))\nprint(f(2))"
+        )
+
+    # --- Bug #141: tuple methods and operations ---
+    def test_tuple_count(self, assert_compiles):
+        assert_compiles("t = (1, 2, 3, 2, 1)\nprint(t.count(2))")
+
+    def test_tuple_index(self, assert_compiles):
+        assert_compiles("t = (1, 2, 3)\nprint(t.index(2))")
+
+    def test_tuple_concat(self, assert_compiles):
+        assert_compiles("print((1, 2) + (3, 4))")
+
+    def test_tuple_repeat(self, assert_compiles):
+        assert_compiles("print((1, 2) * 3)")
+
+    # --- Bug #142: sorted() with __lt__ on user classes ---
+    def test_sorted_with_lt(self, assert_compiles):
+        assert_compiles(
+            "class N:\n"
+            "    def __init__(self, v):\n        self.v = v\n"
+            "    def __lt__(self, o):\n        return self.v < o.v\n"
+            "    def __repr__(self):\n        return f'N({self.v})'\n"
+            "a = [N(5), N(2), N(8), N(1)]\nprint(sorted(a))"
+        )
+
+    def test_min_max_obj_lt(self, assert_compiles):
+        """Bug #143: min/max on list of objects with __lt__."""
+        assert_compiles(
+            "class N:\n"
+            "    def __init__(self, v):\n        self.v = v\n"
+            "    def __lt__(self, o):\n        return self.v < o.v\n"
+            "    def __repr__(self):\n"
+            "        return 'N(' + str(self.v) + ')'\n"
+            "items = [N(5), N(2), N(8), N(1), N(3)]\n"
+            "print(repr(min(items)))\n"
+            "print(repr(max(items)))\n"
+            "x = min(items)\nprint(x.v)\n"
+            "y = max(items)\nprint(y.v)"
+        )
+
+    # --- Bug #144: dict comp tuple-unpack key type dispatch ---
+    def test_dict_comp_enumerate_key(self, assert_compiles):
+        """Bug #144: dict comp with enumerate uses int keys → dict_set_int_fv."""
+        assert_compiles(
+            "items = ['a', 'b', 'c']\n"
+            "d = {i: v for i, v in enumerate(items)}\n"
+            "print(d)"
+        )
+
+    # --- Bug #145: dict comp over string iteration ---
+    def test_dict_comp_string_iter(self, assert_compiles):
+        """Bug #145: dict comp iterating over string characters."""
+        assert_compiles(
+            "d = {c: i for i, c in enumerate('hello')}\n"
+            "print(d)"
+        )
+
+    # --- Bug #146: diamond MRO resolution ---
+    def test_diamond_mro(self, assert_compiles):
+        """Bug #146: diamond inheritance — D(B,C) with C overriding A.greet."""
+        assert_compiles(
+            "class A:\n"
+            "    def greet(self):\n        return 'A'\n"
+            "class B(A):\n    pass\n"
+            "class C(A):\n"
+            "    def greet(self):\n        return 'C'\n"
+            "class D(B, C):\n    pass\n"
+            "d = D()\nprint(d.greet())"
+        )
+
+    def test_diamond_mro_deeper(self, assert_compiles):
+        """Diamond MRO with method defined at intermediate level."""
+        assert_compiles(
+            "class A:\n"
+            "    def who(self):\n        return 'A'\n"
+            "class B(A):\n"
+            "    def who(self):\n        return 'B'\n"
+            "class C(A):\n"
+            "    def who(self):\n        return 'C'\n"
+            "class D(B, C):\n    pass\n"
+            "print(D().who())"
+        )
+
+    # --- Bug #147: closure with *args crashed or returned 0 ---
+    def test_closure_varargs_return(self, assert_compiles):
+        """Bug #147: closure with *args returning args[0] or len(args)."""
+        assert_compiles(
+            "def make():\n"
+            "    def inner(*args):\n"
+            "        return len(args)\n"
+            "    return inner\n"
+            "f = make()\nprint(f(1, 2, 3))"
+        )
+
+    def test_closure_varargs_capture(self, assert_compiles):
+        """Closure with *args and captured variable."""
+        assert_compiles(
+            "def make_adder(n):\n"
+            "    def adder(*args):\n"
+            "        return n + sum(args)\n"
+            "    return adder\n"
+            "f = make_adder(10)\nprint(f(1, 2, 3))"
+        )
+
+    def test_closure_varargs_subscript(self, assert_compiles):
+        """Closure with *args accessing args[0]."""
+        assert_compiles(
+            "def make():\n"
+            "    def inner(*args):\n"
+            "        return args[0]\n"
+            "    return inner\n"
+            "f = make()\nprint(f(42))"
+        )
+
+    # --- Bug #148: list(obj) with __iter__/__next__ ---
+    def test_list_from_iterator(self, assert_compiles):
+        """Bug #148: list(obj) on objects implementing __iter__/__next__."""
+        assert_compiles(
+            "class R:\n"
+            "    def __init__(self, n):\n"
+            "        self.n = n\n"
+            "    def __iter__(self):\n"
+            "        self.i = 0\n"
+            "        return self\n"
+            "    def __next__(self):\n"
+            "        if self.i >= self.n:\n"
+            "            raise StopIteration\n"
+            "        self.i = self.i + 1\n"
+            "        return self.i\n"
+            "print(list(R(5)))"
         )

@@ -603,6 +603,19 @@ int64_t fastpy_safe_div(int64_t a, int64_t b) {
     return a / b;
 }
 
+/* Safe integer modulo — avoids hardware div-by-zero trap when b == 0.
+ * Used by floor-division and modulo codegen instead of raw LLVM srem,
+ * which is UB on zero divisor even inside a try/except block.
+ * Raises ZeroDivisionError if not already pending (standalone % 0). */
+int64_t fastpy_safe_mod(int64_t a, int64_t b) {
+    if (b == 0) {
+        if (!fastpy_exc_pending())
+            fastpy_raise(FPY_EXC_ZERODIVISION, "integer modulo by zero");
+        return 0;
+    }
+    return a % b;
+}
+
 double fastpy_safe_fdiv(double a, double b) {
     if (b == 0.0) {
         /* CPython 3.14+ uses "division by zero" for all cases (int/int,
@@ -661,6 +674,7 @@ extern void fastpy_list_get_fv(FpyList*, int64_t, int32_t*, int64_t*);
 extern void fastpy_list_set_fv(FpyList*, int64_t, int32_t, int64_t);
 extern int64_t fastpy_list_length(FpyList*);
 extern FpyList* fastpy_list_sorted(FpyList*);
+extern FpyList* fastpy_list_from_obj_iter(void*);
 extern FpyList* fastpy_list_reversed(FpyList*);
 extern void fastpy_list_reverse_prefix(FpyList*, int64_t);
 extern FpyList* fastpy_list_copy(FpyList*);
@@ -682,6 +696,8 @@ extern FpyList* fastpy_tuple_new(void);
 extern void* fastpy_obj_new(int32_t);
 extern int32_t fastpy_register_class(const char*, int32_t);
 extern void fastpy_register_method(int32_t, const char*, void*, int32_t, int32_t);
+extern void fastpy_set_method_ret_tag(int32_t, const char*, int32_t);
+extern void fastpy_obj_call_method1_fv(void*, const char*, int64_t, int32_t*, int64_t*);
 extern void fastpy_obj_set_fv(void*, const char*, int32_t, int64_t);
 extern void fastpy_obj_get_fv(void*, const char*, int32_t*, int64_t*);
 extern const char* fastpy_str_concat(const char*, const char*);
@@ -775,10 +791,14 @@ extern const char* fastpy_chr(int64_t);
 extern int64_t fastpy_ord(const char*);
 extern const char* fastpy_hex(int64_t);
 extern FpyList* fastpy_enumerate(FpyList*, int64_t);
+extern FpyList* fastpy_enumerate_str(const char*, int64_t);
 extern FpyList* fastpy_zip(FpyList*, FpyList*);
 extern FpyList* fastpy_range(int64_t, int64_t, int64_t);
 extern void* fastpy_closure_new(void*, int32_t, int32_t);
 extern void fastpy_closure_set_capture(void*, int32_t, int64_t);
+extern void fastpy_closure_set_vararg(void*);
+extern void fastpy_closure_set_defaults(void*, int32_t);
+extern void fastpy_closure_set_default(void*, int32_t, int64_t);
 extern int64_t fastpy_closure_call0(void*);
 extern int64_t fastpy_closure_call1(void*, int64_t);
 extern int64_t fastpy_closure_call2(void*, int64_t, int64_t);
@@ -821,7 +841,7 @@ static FpySymEntry fpy_jit_symbols[] = {
     SYM(fastpy_exc_get_type), SYM(fastpy_exc_get_msg), SYM(fastpy_exc_name_to_id),
     SYM(fastpy_list_new), SYM(fastpy_list_append_fv),
     SYM(fastpy_list_get_fv), SYM(fastpy_list_set_fv),
-    SYM(fastpy_list_length), SYM(fastpy_list_sorted), SYM(fastpy_list_reversed),
+    SYM(fastpy_list_length), SYM(fastpy_list_sorted), SYM(fastpy_list_from_obj_iter), SYM(fastpy_list_reversed),
     SYM(fastpy_list_reverse_prefix),
     SYM(fastpy_list_copy), SYM(fastpy_list_clear),
     SYM(fastpy_list_extend), SYM(fastpy_list_sort), SYM(fastpy_list_concat),
@@ -831,6 +851,7 @@ static FpySymEntry fpy_jit_symbols[] = {
     SYM(fastpy_dict_equal), SYM(fastpy_set_equal),
     SYM(fastpy_tuple_new), SYM(fastpy_obj_new),
     SYM(fastpy_register_class), SYM(fastpy_register_method),
+    SYM(fastpy_set_method_ret_tag), SYM(fastpy_obj_call_method1_fv),
     SYM(fastpy_obj_set_fv), SYM(fastpy_obj_get_fv),
     SYM(fastpy_str_concat), SYM(fastpy_str_len), SYM(fastpy_str_lower),
     SYM(fastpy_str_upper), SYM(fastpy_str_strip), SYM(fastpy_str_replace),
@@ -880,8 +901,9 @@ static FpySymEntry fpy_jit_symbols[] = {
     SYM(fastpy_int_to_str), SYM(fastpy_float_to_str),
     SYM(fastpy_pow_int), SYM(fastpy_pow_float), SYM(fastpy_round),
     SYM(fastpy_chr), SYM(fastpy_ord), SYM(fastpy_hex),
-    SYM(fastpy_enumerate), SYM(fastpy_zip), SYM(fastpy_range),
-    SYM(fastpy_closure_new), SYM(fastpy_closure_set_capture),
+    SYM(fastpy_enumerate), SYM(fastpy_enumerate_str), SYM(fastpy_zip), SYM(fastpy_range),
+    SYM(fastpy_closure_new), SYM(fastpy_closure_set_capture), SYM(fastpy_closure_set_vararg),
+    SYM(fastpy_closure_set_defaults), SYM(fastpy_closure_set_default),
     SYM(fastpy_closure_call0), SYM(fastpy_closure_call1), SYM(fastpy_closure_call2),
     SYM(fastpy_cell_new), SYM(fastpy_cell_set), SYM(fastpy_cell_get),
     SYM(fpy_cpython_import), SYM(fpy_cpython_getattr),
