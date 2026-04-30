@@ -15958,17 +15958,16 @@ class CodeGen:
         return self.builder.load(tag_slot), self.builder.load(data_slot)
 
     def _list_get_as_bare(self, lst: ir.Value, idx: ir.Value,
-                           elem_type: str) -> ir.Value:
+                           elem_type: 'str | ValueType') -> ir.Value:
         """Get an element via list_get_fv and unwrap to the bare type
         indicated by elem_type ('int', 'str', 'list', 'dict', 'obj', 'float').
         """
         _tag, data = self._fv_list_get(lst, idx)
-        _ptr_types = ("str", "obj", "dict", "tuple", "set",
-                      "bytes", "deque")
-        if (elem_type in _ptr_types
-                or elem_type.startswith("list")):
+        _vt = (elem_type if isinstance(elem_type, ValueType)
+               else ValueType.from_old_tag(elem_type))
+        if _vt.kind.is_ptr:
             return self.builder.inttoptr(data, i8_ptr)
-        if elem_type == "float":
+        if _vt.kind == VKind.FLOAT:
             return self.builder.bitcast(data, double)
         return data  # int (default)
 
@@ -20158,7 +20157,7 @@ class CodeGen:
             if not left_is_str and left_kind is None:
                 # Fallback: check AST for string literals / string variables
                 l_tag = self._infer_type_tag(node.left, None)
-                if l_tag == "str":
+                if l_tag == "str" or (isinstance(l_tag, ValueType) and l_tag.kind == VKind.STR):
                     left_is_str = True
 
             if left_is_str:
@@ -22763,9 +22762,8 @@ class CodeGen:
                 _entry = self._global_vars[node.id]
             if _entry is not None:
                 _, type_tag = _entry
-                if isinstance(type_tag, ValueType):
-                    return type_tag.kind == VKind.SET
-                return type_tag == "set"
+                return (type_tag.kind == VKind.SET if isinstance(type_tag, ValueType)
+                        else type_tag == "set")
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
             if node.func.id == "set":
                 return True
@@ -23169,9 +23167,8 @@ class CodeGen:
                 _entry = self._global_vars[node.id]
             if _entry is not None:
                 _, type_tag = _entry
-                if isinstance(type_tag, ValueType):
-                    return type_tag.kind == VKind.TUPLE
-                return type_tag == "tuple"
+                return (type_tag.kind == VKind.TUPLE if isinstance(type_tag, ValueType)
+                        else type_tag == "tuple")
         # Function calls that return tuples
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
             name = node.func.id
@@ -31317,7 +31314,7 @@ class CodeGen:
             # If iterating over a list of dicts whose values are all ints
             # (or all lists / dicts), propagate to the loop var so
             # `p["key"]` uses the int-value path.
-            if lc_elem_type == "dict":
+            if lc_elem_type.kind == VKind.DICT:
                 iter_node = gen.iter
 
                 def _list_of_all_int_dicts(n):
@@ -31678,8 +31675,8 @@ class CodeGen:
                     elif (isinstance(gen.iter.args[0], ast.Name)
                           and gen.iter.args[0].id in self.variables):
                         _, _vt = self.variables[gen.iter.args[0].id]
-                        if _vt == "str" or (isinstance(_vt, ValueType)
-                                             and _vt.kind == VKind.STR):
+                        if (isinstance(_vt, ValueType) and _vt.kind == VKind.STR
+                                or _vt == "str"):
                             pos_tags[1] = "str"
             # zip(a, b): infer element types from each arg's list element type
             elif (isinstance(gen.iter, ast.Call)
@@ -31711,7 +31708,9 @@ class CodeGen:
                     d2 = self._create_entry_alloca(i64, f"dc.d{ti}")
                     self._rt_call("list_get_fv", [elem_ptr, ir.Constant(i64, ti), t2, d2])
                     _var_tag = pos_tags[ti] if ti < len(pos_tags) else "int"
-                    if _var_tag in ("str", "list", "tuple", "dict", "obj"):
+                    _vt_tag = (_var_tag if isinstance(_var_tag, ValueType)
+                               else ValueType.from_old_tag(_var_tag))
+                    if _vt_tag.kind.is_ptr:
                         # Pointer types: convert i64 data to pointer
                         self._store_variable(
                             tgt.id,
