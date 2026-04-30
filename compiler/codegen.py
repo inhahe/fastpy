@@ -25038,6 +25038,1204 @@ class CodeGen:
                 f"Unsupported expression: {type(node).__name__}", node
             )
 
+
+    _BUILTIN_DISPATCH = {
+
+        "abs": "_emit_builtin_abs",
+
+        "all": "_emit_builtin_all",
+
+        "any": "_emit_builtin_any",
+
+        "bin": "_emit_builtin_bin",
+
+        "bool": "_emit_builtin_bool",
+
+        "chr": "_emit_builtin_chr",
+
+        "complex": "_emit_builtin_complex",
+
+        "dict": "_emit_builtin_dict",
+
+        "divmod": "_emit_builtin_divmod",
+
+        "enumerate": "_emit_builtin_enumerate",
+
+        "eval": "_emit_builtin_eval",
+
+        "exec": "_emit_builtin_exec",
+
+        "filter": "_emit_builtin_filter",
+
+        "float": "_emit_builtin_float",
+
+        "getattr": "_emit_builtin_getattr",
+
+        "globals": "_emit_builtin_globals",
+
+        "hasattr": "_emit_builtin_hasattr",
+
+        "hash": "_emit_builtin_hash",
+
+        "hex": "_emit_builtin_hex",
+
+        "int": "_emit_builtin_int",
+
+        "isinstance": "_emit_builtin_isinstance",
+
+        "iter": "_emit_builtin_iter",
+
+        "len": "_emit_builtin_len",
+
+        "list": "_emit_builtin_list",
+
+        "locals": "_emit_builtin_locals",
+
+        "map": "_emit_builtin_map",
+
+        "min": "_emit_builtin_min",
+
+        "max": "_emit_builtin_min",
+
+        "next": "_emit_builtin_next",
+
+        "oct": "_emit_builtin_oct",
+
+        "ord": "_emit_builtin_ord",
+
+        "pow": "_emit_builtin_pow",
+
+        "range": "_emit_builtin_range",
+
+        "repr": "_emit_builtin_repr",
+
+        "reversed": "_emit_builtin_reversed",
+
+        "round": "_emit_builtin_round",
+
+        "set": "_emit_builtin_set",
+
+        "setattr": "_emit_builtin_setattr",
+
+        "sorted": "_emit_builtin_sorted",
+
+        "str": "_emit_builtin_str",
+
+        "sum": "_emit_builtin_sum",
+
+        "tuple": "_emit_builtin_tuple",
+
+        "type": "_emit_builtin_type",
+
+        "zip": "_emit_builtin_zip",
+
+    }
+
+
+    def _emit_builtin_type(self, node):
+        if len(node.args) == 1:
+            arg_node = node.args[0]
+            # User-defined functions are native code pointers, not
+            # Python function objects. type(f) should return the
+            # CPython types.FunctionType object so that comparisons
+            # like `type(f) == types.FunctionType` work correctly.
+            if (isinstance(arg_node, ast.Name)
+                    and arg_node.id in self._user_functions):
+                types_name = self._make_string_constant("types")
+                types_mod = self.builder.call(
+                    self.runtime["cpython_import"], [types_name])
+                ft_name = self._make_string_constant("FunctionType")
+                return self.builder.call(
+                    self.runtime["cpython_getattr"],
+                    [types_mod, ft_name])
+            # Exception variable: type(e) → <class 'ExceptionName'>
+            if (isinstance(arg_node, ast.Name)
+                    and arg_node.id in self._exc_vars):
+                cls_name = self._exc_vars[arg_node.id]
+                return self._make_string_constant(
+                    f"<class '{cls_name}'>")
+            # For FV-backed variables, check runtime tag to determine
+            # the actual type (handles CPython bridge results correctly)
+            if (self._USE_FV_LOCALS
+                    and isinstance(arg_node, ast.Name)
+                    and arg_node.id in self.variables):
+                alloca, tag = self.variables[arg_node.id]
+                if (isinstance(alloca.type, ir.PointerType)
+                        and alloca.type.pointee is fpy_val):
+                    fv = self.builder.load(alloca)
+                    fv_tag = self.builder.extract_value(fv, 0)
+                    fv_data = self.builder.extract_value(fv, 1)
+                    # Build a runtime switch on tag
+                    type_strs = {
+                        FPY_TAG_INT: "<class 'int'>",
+                        FPY_TAG_FLOAT: "<class 'float'>",
+                        FPY_TAG_STR: "<class 'str'>",
+                        FPY_TAG_BOOL: "<class 'bool'>",
+                        FPY_TAG_NONE: "<class 'NoneType'>",
+                        FPY_TAG_LIST: "<class 'list'>",
+                        FPY_TAG_DICT: "<class 'dict'>",
+                        FPY_TAG_SET: "<class 'set'>",
+                        FPY_TAG_BIGINT: "<class 'int'>",
+                        FPY_TAG_COMPLEX: "<class 'complex'>",
+                        FPY_TAG_BYTES: "<class 'bytes'>",
+                        FPY_TAG_DECIMAL: "<class 'Decimal'>",
+                    }
+                    result_alloca = self._create_entry_alloca(
+                        i8_ptr, "type.result")
+                    default_str = self._make_string_constant(
+                        "<class 'object'>")
+                    self.builder.store(default_str, result_alloca)
+                    # For OBJ tag, use native obj_type_repr (NOT
+                    # cpython_type_repr — native FpyObj isn't PyObject*)
+                    is_obj = self.builder.icmp_signed(
+                        "==", fv_tag, ir.Constant(i32, FPY_TAG_OBJ))
+                    obj_block = self._new_block("type.obj")
+                    merge_block = self._new_block("type.merge")
+                    self.builder.cbranch(is_obj, obj_block, merge_block)
+                    self.builder.position_at_end(obj_block)
+                    obj_ptr = self.builder.inttoptr(fv_data, i8_ptr)
+                    runtime_type = self.builder.call(
+                        self.runtime["obj_type_repr"], [obj_ptr])
+                    self.builder.store(runtime_type, result_alloca)
+                    self.builder.branch(merge_block)
+                    self.builder.position_at_end(merge_block)
+                    for tag_val, type_str in type_strs.items():
+                        is_match = self.builder.icmp_signed(
+                            "==", fv_tag, ir.Constant(i32, tag_val))
+                        str_ptr = self._make_string_constant(type_str)
+                        current = self.builder.load(result_alloca)
+                        selected = self.builder.select(
+                            is_match, str_ptr, current)
+                        self.builder.store(selected, result_alloca)
+                    return self.builder.load(result_alloca)
+            # Try runtime tag dispatch via _load_or_wrap_fv for
+            # expression args (bridge calls, native module calls, etc.)
+            try:
+                fv = self._load_or_wrap_fv(arg_node)
+                if (isinstance(fv.type, ir.LiteralStructType)
+                        and fv.type == fpy_val):
+                    fv_tag = self.builder.extract_value(fv, 0)
+                    fv_data = self.builder.extract_value(fv, 1)
+                    type_strs = {
+                        FPY_TAG_INT: "<class 'int'>",
+                        FPY_TAG_FLOAT: "<class 'float'>",
+                        FPY_TAG_STR: "<class 'str'>",
+                        FPY_TAG_BOOL: "<class 'bool'>",
+                        FPY_TAG_NONE: "<class 'NoneType'>",
+                        FPY_TAG_LIST: "<class 'list'>",
+                        FPY_TAG_DICT: "<class 'dict'>",
+                        FPY_TAG_SET: "<class 'set'>",
+                        FPY_TAG_BIGINT: "<class 'int'>",
+                        FPY_TAG_COMPLEX: "<class 'complex'>",
+                        FPY_TAG_BYTES: "<class 'bytes'>",
+                        FPY_TAG_DECIMAL: "<class 'Decimal'>",
+                    }
+                    result_alloca = self._create_entry_alloca(
+                        i8_ptr, "type.result")
+                    default_str = self._make_string_constant(
+                        "<class 'object'>")
+                    self.builder.store(default_str, result_alloca)
+                    # For OBJ tag, use native obj_type_repr
+                    is_obj = self.builder.icmp_signed(
+                        "==", fv_tag, ir.Constant(i32, FPY_TAG_OBJ))
+                    obj_block = self._new_block("type.expr.obj")
+                    merge_block = self._new_block("type.expr.merge")
+                    self.builder.cbranch(is_obj, obj_block, merge_block)
+                    self.builder.position_at_end(obj_block)
+                    obj_ptr = self.builder.inttoptr(fv_data, i8_ptr)
+                    runtime_type = self.builder.call(
+                        self.runtime["obj_type_repr"], [obj_ptr])
+                    self.builder.store(runtime_type, result_alloca)
+                    self.builder.branch(merge_block)
+                    self.builder.position_at_end(merge_block)
+                    for tag_val, type_str in type_strs.items():
+                        is_match = self.builder.icmp_signed(
+                            "==", fv_tag, ir.Constant(i32, tag_val))
+                        str_ptr = self._make_string_constant(type_str)
+                        current = self.builder.load(result_alloca)
+                        selected = self.builder.select(
+                            is_match, str_ptr, current)
+                        self.builder.store(selected, result_alloca)
+                    return self.builder.load(result_alloca)
+            except Exception:
+                pass
+            # Static type analysis fallback
+            actual = self._static_type_of(node.args[0])
+            # Also check for list/dict via type tags
+            if actual == "unknown":
+                if self._is_list_expr(node.args[0]):
+                    actual = "list"
+                elif self._is_dict_expr(node.args[0]):
+                    actual = "dict"
+            if actual == "unknown":
+                # Default: Python prints class name or type object
+                actual = "object"
+            type_name_map = {
+                "int": "int", "bool": "bool", "float": "float",
+                "str": "str", "list": "list", "dict": "dict",
+                "tuple": "tuple", "object": "object",
+            }
+            display = type_name_map.get(actual, actual)
+            return self._make_string_constant(f"<class '{display}'>")
+        return self._bridge_fallback_expr(node, "type() with multiple args")
+
+    def _emit_builtin_range(self, node):
+        # range(stop) / range(start, stop) / range(start, stop, step) -> list
+        if len(node.args) == 1:
+            start = ir.Constant(i64, 0)
+            stop = self._emit_expr_value(node.args[0])
+            step = ir.Constant(i64, 1)
+        elif len(node.args) == 2:
+            start = self._emit_expr_value(node.args[0])
+            stop = self._emit_expr_value(node.args[1])
+            step = ir.Constant(i64, 1)
+        elif len(node.args) == 3:
+            start = self._emit_expr_value(node.args[0])
+            stop = self._emit_expr_value(node.args[1])
+            step = self._emit_expr_value(node.args[2])
+        else:
+            raise CodeGenError("range() takes 1-3 arguments", node)
+        return self.builder.call(self.runtime["range"], [start, stop, step])
+
+    def _emit_builtin_list(self, node):
+        # list(dict) → list of keys
+        if len(node.args) == 1 and self._is_dict_expr(node.args[0]):
+            d = self._emit_expr_value(node.args[0])
+            return self._rt_call("dict_keys", [d])
+        # list(deque) → deque_to_list conversion
+        if len(node.args) == 1 and self._is_deque_expr(node.args[0]):
+            dq = self._emit_expr_value(node.args[0])
+            dq = self._ensure_ptr(dq)
+            return self.builder.call(self.runtime["deque_to_list"], [dq])
+        # list(bytes) → list of byte values (ints)
+        if len(node.args) == 1:
+            arg = node.args[0]
+            # Check if argument is a bytes-typed variable
+            is_bytes = False
+            if isinstance(arg, ast.Name) and arg.id in self.variables:
+                _, vtag = self.variables[arg.id]
+                is_bytes = (vtag == "bytes")
+            if is_bytes:
+                b = self._emit_expr_value(arg)
+                b = self._ensure_ptr(b)
+                return self.builder.call(self.runtime["bytes_to_list"], [b])
+        # list(obj) — iterate via __iter__/__next__ protocol
+        if len(node.args) == 1 and self._is_obj_expr(node.args[0]):
+            obj = self._emit_expr_value(node.args[0])
+            obj = self._ensure_ptr(obj)
+            return self._rt_call("list_from_obj_iter", [obj])
+        # list(x) — for now, just return the arg (shallow copy would be better)
+        if len(node.args) == 1:
+            return self._emit_expr_value(node.args[0])
+        if len(node.args) == 0:
+            return self.builder.call(self.runtime["list_new"], [])
+        raise CodeGenError("list() with wrong number of args", node)
+
+    def _emit_builtin_dict(self, node):
+        # dict() or dict([(k, v), ...])
+        if len(node.args) == 0:
+            return self.builder.call(self.runtime["dict_new"], [])
+        if len(node.args) == 1:
+            # dict([(k, v), ...]) — build dict by iterating
+            arg_node = node.args[0]
+            if isinstance(arg_node, ast.List):
+                # Build a dict from literal list of tuples at compile time
+                d = self.builder.call(self.runtime["dict_new"], [])
+                for elt in arg_node.elts:
+                    if isinstance(elt, ast.Tuple) and len(elt.elts) == 2:
+                        k_node, v_node = elt.elts
+                        k_val = self._emit_expr_value(k_node)
+                        v_val = self._emit_expr_value(v_node)
+                        if not isinstance(k_val.type, ir.PointerType):
+                            raise CodeGenError("dict() key must be string", node)
+                        tag, data = self._bare_to_tag_data(v_val, v_node)
+                        self.builder.call(self.runtime["dict_set_fv"],
+                                          [d, k_val, ir.Constant(i32, tag), data])
+                return d
+            return self._bridge_fallback_expr(node, "dict() with non-literal argument")
+
+    def _emit_builtin_tuple(self, node):
+        # tuple(iter) — build list, then mark as tuple for correct repr
+        if len(node.args) == 1:
+            result = self._emit_expr_value(node.args[0])
+            # Ensure the result is a list pointer, then mark as tuple
+            if isinstance(result.type, ir.PointerType) or result.type == i8_ptr:
+                self.builder.call(self.runtime["list_mark_tuple"], [result])
+            else:
+                ptr = self.builder.inttoptr(result, i8_ptr)
+                self.builder.call(self.runtime["list_mark_tuple"], [ptr])
+            return result
+        if len(node.args) == 0:
+            return self.builder.call(self.runtime["tuple_new"], [])
+        raise CodeGenError("tuple() with wrong number of args", node)
+
+    def _emit_builtin_complex(self, node):
+        # complex(real, imag) or complex(real)
+        if len(node.args) == 0:
+            real = ir.Constant(double, 0.0)
+            imag = ir.Constant(double, 0.0)
+        elif len(node.args) == 1:
+            real = self._emit_expr_value(node.args[0])
+            if isinstance(real.type, ir.IntType):
+                real = self.builder.sitofp(real, double)
+            imag = ir.Constant(double, 0.0)
+        elif len(node.args) == 2:
+            real = self._emit_expr_value(node.args[0])
+            imag = self._emit_expr_value(node.args[1])
+            if isinstance(real.type, ir.IntType):
+                real = self.builder.sitofp(real, double)
+            if isinstance(imag.type, ir.IntType):
+                imag = self.builder.sitofp(imag, double)
+        else:
+            raise CodeGenError("complex() takes 0-2 args", node)
+        ptr = self.builder.call(self.runtime["complex_new"],
+                                [real, imag])
+        return self.builder.ptrtoint(ptr, i64)
+
+    def _emit_builtin_reversed(self, node):
+        if len(node.args) == 1:
+            arg = self._emit_expr_value(node.args[0])
+            return self._rt_call("list_reversed", [arg])
+        raise CodeGenError("reversed() takes exactly one argument", node)
+
+    def _emit_builtin_int(self, node):
+        if len(node.args) == 1:
+            arg_node = node.args[0]
+            # User object with __int__: dispatch to dunder
+            if self._is_obj_expr(arg_node):
+                obj = self._emit_expr_value(arg_node)
+                obj = self._ensure_ptr(obj)
+                name_ptr = self._make_string_constant("__int__")
+                return self.builder.call(
+                    self.runtime["obj_call_method0"],
+                    [obj, name_ptr])
+            # pyobj variable or CPython call expression:
+            # call Python's int() via bridge
+            is_pyobj_arg = self._is_pyobj_var(arg_node)
+            if not is_pyobj_arg and isinstance(arg_node, ast.Call):
+                # Check if it's a CPython method call: mod.func(...)
+                if isinstance(arg_node.func, ast.Attribute):
+                    recv = arg_node.func.value
+                    if (isinstance(recv, ast.Name)
+                            and recv.id in self.variables
+                            and self._var_kind(recv.id) == VKind.PYOBJ):
+                        is_pyobj_arg = True
+            if is_pyobj_arg:
+                # Get the PyObject* result
+                if isinstance(arg_node, ast.Name):
+                    ptr = self._load_variable(arg_node.id, arg_node)
+                    ptr = self._ensure_ptr(ptr)
+                else:
+                    ptr = self._emit_cpython_call_raw(arg_node)
+                # Call builtins.int(pyobj) through the bridge
+                blt = self._make_string_constant("builtins")
+                blt_mod = self.builder.call(
+                    self.runtime["cpython_import"], [blt])
+                int_name = self._make_string_constant("int")
+                int_fn = self.builder.call(
+                    self.runtime["cpython_getattr"], [blt_mod, int_name])
+                out_tag = self._create_entry_alloca(i32, "int.tag")
+                out_data = self._create_entry_alloca(i64, "int.data")
+                self.builder.call(self.runtime["cpython_call1"],
+                                  [int_fn,
+                                   ir.Constant(i32, FPY_TAG_OBJ),
+                                   self.builder.ptrtoint(ptr, i64),
+                                   out_tag, out_data])
+                return self.builder.load(out_data)
+            # FV-backed variables: dispatch by runtime tag
+            # to handle int, float, and str arguments.
+            if (self._USE_FV_LOCALS
+                    and isinstance(arg_node, ast.Name)
+                    and arg_node.id in self.variables):
+                alloca, tag = self.variables[arg_node.id]
+                if (isinstance(alloca.type, ir.PointerType)
+                        and alloca.type.pointee is fpy_val):
+                    fv = self.builder.load(alloca)
+                    fv_tag = self.builder.extract_value(fv, 0)
+                    fv_data = self.builder.extract_value(fv, 1)
+                    # 3-way branch: float → fptosi, str → str_to_int, else → data
+                    is_float = self.builder.icmp_unsigned(
+                        "==", fv_tag, ir.Constant(i32, FPY_TAG_FLOAT))
+                    result_alloca = self._create_entry_alloca(i64, "int.res")
+                    float_bb = self._new_block("int.float")
+                    check_str_bb = self._new_block("int.chkstr")
+                    str_bb = self._new_block("int.str")
+                    else_bb = self._new_block("int.else")
+                    merge_bb = self._new_block("int.merge")
+                    self.builder.cbranch(is_float, float_bb, check_str_bb)
+                    # Float path
+                    self.builder.position_at_end(float_bb)
+                    float_val = self.builder.bitcast(fv_data, double)
+                    int_from_float = self.builder.fptosi(float_val, i64)
+                    self.builder.store(int_from_float, result_alloca)
+                    self.builder.branch(merge_bb)
+                    # Check string tag
+                    self.builder.position_at_end(check_str_bb)
+                    is_str = self.builder.icmp_unsigned(
+                        "==", fv_tag, ir.Constant(i32, FPY_TAG_STR))
+                    self.builder.cbranch(is_str, str_bb, else_bb)
+                    # String path
+                    self.builder.position_at_end(str_bb)
+                    str_ptr = self.builder.inttoptr(fv_data, i8_ptr)
+                    int_from_str = self._rt_call("str_to_int", [str_ptr])
+                    self.builder.store(int_from_str, result_alloca)
+                    self.builder.branch(merge_bb)
+                    # Else path (already int/bool)
+                    self.builder.position_at_end(else_bb)
+                    self.builder.store(fv_data, result_alloca)
+                    self.builder.branch(merge_bb)
+                    # Merge
+                    self.builder.position_at_end(merge_bb)
+                    return self.builder.load(result_alloca)
+            val = self._emit_expr_value(arg_node)
+            if isinstance(val.type, ir.DoubleType):
+                return self.builder.fptosi(val, i64)
+            if isinstance(val.type, ir.IntType) and val.type.width < 64:
+                return self.builder.zext(val, i64)
+            if isinstance(val.type, ir.PointerType):
+                # Might be pyobj or string
+                if (isinstance(arg_node, ast.Name)
+                        and arg_node.id in self.variables
+                        and self._var_kind(arg_node.id) == VKind.PYOBJ):
+                    tag_a = self._create_entry_alloca(i32, "int.tag")
+                    data_a = self._create_entry_alloca(i64, "int.data")
+                    self.builder.call(self.runtime["cpython_to_fv"],
+                                      [val, tag_a, data_a])
+                    return self.builder.load(data_a)
+                return self._rt_call("str_to_int", [val])
+            return val
+        if len(node.args) == 2:
+            # int(str, base) — convert string with base
+            val = self._emit_expr_value(node.args[0])
+            base = self._emit_expr_value(node.args[1])
+            val = self._ensure_ptr(val)
+            return self.builder.call(
+                self.runtime["str_to_int_base"], [val, base])
+        raise CodeGenError("int() with wrong number of args", node)
+
+    def _emit_builtin_locals(self, node):
+        return self._emit_locals_dict()
+
+    def _emit_builtin_globals(self, node):
+        # Build a dict from all global variables
+        d = self.builder.call(self.runtime["dict_new"], [])
+        for gname, (gvar, gtag) in self._global_vars.items():
+            key = self._make_string_constant(gname)
+            val = self.builder.load(gvar, name=f"g.{gname}")
+            t, data = self._bare_to_tag_data(val, None)
+            self.builder.call(self.runtime["dict_set_fv"],
+                              [d, key, ir.Constant(i32, t), data])
+        return d
+
+    def _emit_builtin_eval(self, node):
+        if len(node.args) < 1:
+            raise CodeGenError("eval() requires at least 1 argument", node)
+        # Compile-time eval: literal string → parse and compile inline
+        if isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str):
+            return self._compile_eval_literal(node.args[0].value, node)
+        # Dynamic eval: route through CPython bridge with locals dict
+        locals_dict = self._emit_locals_dict()
+        arg = self._emit_expr_value(node.args[0])
+        if isinstance(arg.type, ir.PointerType):
+            expr_ptr = arg
+        elif isinstance(arg.type, ir.IntType):
+            expr_ptr = self.builder.inttoptr(arg, i8_ptr)
+        else:
+            expr_ptr = self.builder.inttoptr(
+                self.builder.bitcast(arg, i64), i8_ptr)
+        out_tag = self._create_entry_alloca(i32, "eval.tag")
+        out_data = self._create_entry_alloca(i64, "eval.data")
+        self.builder.call(self.runtime["cpython_eval_locals"],
+                          [expr_ptr, locals_dict, out_tag, out_data])
+        tag_val = self.builder.load(out_tag)
+        data_val = self.builder.load(out_data)
+        fv = ir.Constant(fpy_val, ir.Undefined)
+        fv = self.builder.insert_value(fv, tag_val, 0)
+        fv = self.builder.insert_value(fv, data_val, 1)
+        return fv
+
+    def _emit_builtin_exec(self, node):
+        if len(node.args) < 1:
+            raise CodeGenError("exec() requires at least 1 argument", node)
+        # Compile-time exec: literal string → parse and compile inline
+        if isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str):
+            self._compile_exec_literal(node.args[0].value, node)
+            return ir.Constant(i64, 0)
+        # Dynamic exec: try JIT native compilation, fall back to CPython
+        arg = self._emit_expr_value(node.args[0])
+        if isinstance(arg.type, ir.PointerType):
+            code_ptr = arg
+        elif isinstance(arg.type, ir.IntType):
+            code_ptr = self.builder.inttoptr(arg, i8_ptr)
+        else:
+            code_ptr = self.builder.inttoptr(
+                self.builder.bitcast(arg, i64), i8_ptr)
+        # jit_exec tries native compilation first, falls back to CPython
+        self.builder.call(self.runtime["jit_exec"], [code_ptr])
+        return ir.Constant(i64, 0)
+
+    def _emit_builtin_enumerate(self, node):
+        if len(node.args) >= 1:
+            lst = self._emit_expr_value(node.args[0])
+            start = None
+            if len(node.args) > 1:
+                start = self._emit_expr_value(node.args[1])
+            else:
+                # Accept start= kwarg
+                for kw in node.keywords:
+                    if kw.arg == "start":
+                        start = self._emit_expr_value(kw.value)
+                        break
+            if start is None:
+                start = ir.Constant(i64, 0)
+            # Detect string argument → use enumerate_str
+            _arg_is_str = False
+            _arg0 = node.args[0]
+            if isinstance(_arg0, ast.Constant) and isinstance(_arg0.value, str):
+                _arg_is_str = True
+            elif isinstance(_arg0, ast.Name) and _arg0.id in self.variables:
+                _, _tag = self.variables[_arg0.id]
+                if (isinstance(_tag, ValueType) and _tag.kind == VKind.STR) or _tag == "str":
+                    _arg_is_str = True
+            if _arg_is_str:
+                return self._rt_call("enumerate_str", [lst, start])
+            return self._rt_call("enumerate", [lst, start])
+        raise CodeGenError("enumerate() requires at least one argument", node)
+
+    def _emit_builtin_zip(self, node):
+        if len(node.args) == 2:
+            a = self._emit_expr_value(node.args[0])
+            b = self._emit_expr_value(node.args[1])
+            return self._rt_call("zip", [a, b])
+        if len(node.args) == 3:
+            a = self._emit_expr_value(node.args[0])
+            b = self._emit_expr_value(node.args[1])
+            c = self._emit_expr_value(node.args[2])
+            return self._rt_call("zip3", [a, b, c])
+        return self._bridge_fallback_expr(node, "zip() with 1 or >3 args")
+
+    def _emit_builtin_any(self, node):
+        if len(node.args) == 1 and self._is_list_expr(node.args[0]):
+            lst = self._emit_expr_value(node.args[0])
+            length = self._rt_call("list_length", [lst])
+            result_alloca = self._create_entry_alloca(ir.IntType(1), "any.result")
+            self.builder.store(ir.Constant(ir.IntType(1), 0), result_alloca)
+            idx_alloca = self._create_entry_alloca(i64, "any.idx")
+            self.builder.store(ir.Constant(i64, 0), idx_alloca)
+            cond_b = self._new_block("any.cond")
+            body_b = self._new_block("any.body")
+            end_b = self._new_block("any.end")
+            self.builder.branch(cond_b)
+            self.builder.position_at_end(cond_b)
+            idx = self.builder.load(idx_alloca)
+            self.builder.cbranch(self.builder.icmp_signed("<", idx, length), body_b, end_b)
+            self.builder.position_at_end(body_b)
+            idx = self.builder.load(idx_alloca)
+            elem = self._list_get_as_bare(lst, idx, "int")
+            is_true = self.builder.icmp_signed("!=", elem, ir.Constant(i64, 0))
+            found_b = self._new_block("any.found")
+            next_b = self._new_block("any.next")
+            self.builder.cbranch(is_true, found_b, next_b)
+            self.builder.position_at_end(found_b)
+            self.builder.store(ir.Constant(ir.IntType(1), 1), result_alloca)
+            self.builder.branch(end_b)
+            self.builder.position_at_end(next_b)
+            self.builder.store(self.builder.add(self.builder.load(idx_alloca), ir.Constant(i64, 1)), idx_alloca)
+            self.builder.branch(cond_b)
+            self.builder.position_at_end(end_b)
+            return self.builder.zext(self.builder.load(result_alloca), i32)
+        return self._bridge_fallback_expr(node, "any() with non-list argument")
+
+    def _emit_builtin_all(self, node):
+        if len(node.args) == 1 and self._is_list_expr(node.args[0]):
+            lst = self._emit_expr_value(node.args[0])
+            length = self._rt_call("list_length", [lst])
+            result_alloca = self._create_entry_alloca(ir.IntType(1), "all.result")
+            self.builder.store(ir.Constant(ir.IntType(1), 1), result_alloca)
+            idx_alloca = self._create_entry_alloca(i64, "all.idx")
+            self.builder.store(ir.Constant(i64, 0), idx_alloca)
+            cond_b = self._new_block("all.cond")
+            body_b = self._new_block("all.body")
+            end_b = self._new_block("all.end")
+            self.builder.branch(cond_b)
+            self.builder.position_at_end(cond_b)
+            idx = self.builder.load(idx_alloca)
+            self.builder.cbranch(self.builder.icmp_signed("<", idx, length), body_b, end_b)
+            self.builder.position_at_end(body_b)
+            idx = self.builder.load(idx_alloca)
+            elem = self._list_get_as_bare(lst, idx, "int")
+            is_false = self.builder.icmp_signed("==", elem, ir.Constant(i64, 0))
+            fail_b = self._new_block("all.fail")
+            next_b = self._new_block("all.next")
+            self.builder.cbranch(is_false, fail_b, next_b)
+            self.builder.position_at_end(fail_b)
+            self.builder.store(ir.Constant(ir.IntType(1), 0), result_alloca)
+            self.builder.branch(end_b)
+            self.builder.position_at_end(next_b)
+            self.builder.store(self.builder.add(self.builder.load(idx_alloca), ir.Constant(i64, 1)), idx_alloca)
+            self.builder.branch(cond_b)
+            self.builder.position_at_end(end_b)
+            return self.builder.zext(self.builder.load(result_alloca), i32)
+        return self._bridge_fallback_expr(node, "all() with non-list argument")
+
+    def _emit_builtin_bool(self, node):
+        if len(node.args) == 1:
+            return self.builder.zext(self._truthiness_of_expr(node.args[0]), i32)
+        raise CodeGenError("bool() takes exactly one argument", node)
+
+    def _emit_builtin_float(self, node):
+        if len(node.args) == 1:
+            arg_node = node.args[0]
+            # User object with __float__: dispatch to dunder
+            if self._is_obj_expr(arg_node):
+                obj = self._emit_expr_value(arg_node)
+                obj = self._ensure_ptr(obj)
+                name_ptr = self._make_string_constant("__float__")
+                # Must use the double-returning variant because __float__
+                # returns in XMM0, not RAX — calling through int64 ABI
+                # would read RAX (garbage/zero).
+                return self.builder.call(
+                    self.runtime["obj_call_method0_double"],
+                    [obj, name_ptr])
+            # pyobj: call Python's float() via bridge
+            if self._is_pyobj_var(arg_node):
+                ptr = self._load_variable(arg_node.id, arg_node)
+                ptr = self._ensure_ptr(ptr)
+                blt = self._make_string_constant("builtins")
+                blt_mod = self.builder.call(
+                    self.runtime["cpython_import"], [blt])
+                float_name = self._make_string_constant("float")
+                float_fn = self.builder.call(
+                    self.runtime["cpython_getattr"],
+                    [blt_mod, float_name])
+                out_tag = self._create_entry_alloca(i32, "float.tag")
+                out_data = self._create_entry_alloca(i64, "float.data")
+                self.builder.call(self.runtime["cpython_call1"],
+                                  [float_fn,
+                                   ir.Constant(i32, FPY_TAG_OBJ),
+                                   self.builder.ptrtoint(ptr, i64),
+                                   out_tag, out_data])
+                data = self.builder.load(out_data)
+                return self.builder.bitcast(data, double)
+            # FV-backed variables: dispatch by runtime tag
+            # to handle int, float, str, and bool arguments.
+            if (self._USE_FV_LOCALS
+                    and isinstance(arg_node, ast.Name)
+                    and arg_node.id in self.variables):
+                alloca, _ftag = self.variables[arg_node.id]
+                if (isinstance(alloca.type, ir.PointerType)
+                        and alloca.type.pointee is fpy_val):
+                    fv = self.builder.load(alloca)
+                    fv_tag = self.builder.extract_value(fv, 0)
+                    fv_data = self.builder.extract_value(fv, 1)
+                    is_str = self.builder.icmp_unsigned(
+                        "==", fv_tag, ir.Constant(i32, FPY_TAG_STR))
+                    is_float = self.builder.icmp_unsigned(
+                        "==", fv_tag, ir.Constant(i32, FPY_TAG_FLOAT))
+                    result_alloca = self._create_entry_alloca(
+                        double, "float.res")
+                    str_bb = self._new_block("float.str")
+                    check_float_bb = self._new_block("float.chkflt")
+                    float_bb = self._new_block("float.flt")
+                    else_bb = self._new_block("float.else")
+                    merge_bb = self._new_block("float.merge")
+                    self.builder.cbranch(is_str, str_bb, check_float_bb)
+                    # String path
+                    self.builder.position_at_end(str_bb)
+                    str_ptr = self.builder.inttoptr(fv_data, i8_ptr)
+                    f_from_str = self._rt_call("str_to_float", [str_ptr])
+                    self.builder.store(f_from_str, result_alloca)
+                    self.builder.branch(merge_bb)
+                    # Check float
+                    self.builder.position_at_end(check_float_bb)
+                    self.builder.cbranch(is_float, float_bb, else_bb)
+                    # Float path (already float)
+                    self.builder.position_at_end(float_bb)
+                    already_f = self.builder.bitcast(fv_data, double)
+                    self.builder.store(already_f, result_alloca)
+                    self.builder.branch(merge_bb)
+                    # Else (int/bool → sitofp)
+                    self.builder.position_at_end(else_bb)
+                    f_from_int = self.builder.sitofp(fv_data, double)
+                    self.builder.store(f_from_int, result_alloca)
+                    self.builder.branch(merge_bb)
+                    # Merge
+                    self.builder.position_at_end(merge_bb)
+                    return self.builder.load(result_alloca)
+            val = self._emit_expr_value(arg_node)
+            if isinstance(val.type, ir.IntType):
+                return self.builder.sitofp(val, double)
+            if isinstance(val.type, ir.PointerType):
+                return self._rt_call("str_to_float", [val])
+            return val
+        raise CodeGenError("float() takes exactly one argument", node)
+
+    def _emit_builtin_str(self, node):
+        if len(node.args) == 1:
+            arg_node = node.args[0]
+            # OBJ fast path: use obj_to_str which handles
+            # __str__ → __repr__ → default fallback safely
+            if self._is_obj_expr(arg_node):
+                obj = self._emit_expr_value(arg_node)
+                obj = self._ensure_ptr(obj)
+                result = self.builder.call(
+                    self.runtime["obj_to_str"], [obj])
+                return self.builder.inttoptr(result, i8_ptr)
+            # Use FV dispatch so runtime tag drives the conversion
+            # (e.g. dict values whose compile-time tag is wrong).
+            fv = self._load_or_wrap_fv(node.args[0])
+            return self._fv_call_str(fv)
+        # str(bytes, encoding) → just return the first arg as string
+        if len(node.args) >= 1:
+            return self._emit_expr_value(node.args[0])
+        return self._make_string_constant("")
+
+    def _emit_builtin_getattr(self, node):
+        obj = self._emit_expr_value(node.args[0])
+        obj = self._ensure_ptr(obj)
+        attr_name = self._emit_expr_value(node.args[1])
+        attr_name = self._ensure_ptr(attr_name)
+        tag_slot = self._create_entry_alloca(i32, "ga.tag")
+        data_slot = self._create_entry_alloca(i64, "ga.data")
+        self.builder.call(self.runtime["obj_get_fv"],
+                          [obj, attr_name, tag_slot, data_slot])
+        return self.builder.load(data_slot)
+
+
+    def _emit_builtin_hasattr(self, node):
+        # Check if the object is a PYOBJ before evaluating args
+        obj_kind = VKind.UNKNOWN
+        if (isinstance(node.args[0], ast.Name)
+                and node.args[0].id in self.variables):
+            obj_kind = self._var_kind(node.args[0].id)
+        # For PYOBJ (bridge objects), call CPython's hasattr
+        if obj_kind == VKind.PYOBJ:
+            obj = self._emit_expr_value(node.args[0])
+            obj = self._ensure_ptr(obj)
+            attr_name = self._emit_expr_value(node.args[1])
+            attr_name = self._ensure_ptr(attr_name)
+            result = self.builder.call(
+                self.runtime["cpython_hasattr"], [obj, attr_name])
+            return self.builder.zext(result, i64)
+        # For native objects with known slots, always return True
+        # (our slot system pre-allocates all used attrs).
+        # Don't evaluate args — avoids potential side effects from
+        # _emit_expr_value on non-PYOBJ objects.
+        return ir.Constant(i64, 1)  # True
+
+
+    def _emit_builtin_setattr(self, node):
+        obj = self._emit_expr_value(node.args[0])
+        obj = self._ensure_ptr(obj)
+        attr_name = self._emit_expr_value(node.args[1])
+        attr_name = self._ensure_ptr(attr_name)
+        val = self._emit_expr_value(node.args[2])
+        tag, data = self._bare_to_tag_data(val, node.args[2])
+        self.builder.call(self.runtime["obj_set_fv"],
+                          [obj, attr_name, ir.Constant(i32, tag), data])
+        return ir.Constant(i64, 0)
+
+
+    def _emit_builtin_hash(self, node):
+        if len(node.args) == 1:
+            arg_node = node.args[0]
+            if self._is_obj_expr(arg_node):
+                obj_cls = self._infer_object_class(arg_node)
+                if obj_cls and self._class_has_method(obj_cls, "__hash__"):
+                    obj = self._emit_expr_value(arg_node)
+                    obj = self._ensure_ptr(obj)
+                    name_ptr = self._make_string_constant("__hash__")
+                    return self.builder.call(
+                        self.runtime["obj_call_method0"],
+                        [obj, name_ptr])
+            # Default: return id-like hash
+            val = self._emit_expr_value(arg_node)
+            return val
+        raise CodeGenError("hash() takes exactly one argument", node)
+
+    def _emit_builtin_next(self, node):
+        if len(node.args) >= 1:
+            arg_node = node.args[0]
+            obj = self._emit_expr_value(arg_node)
+            obj = self._ensure_ptr(obj)
+            name_ptr = self._make_string_constant("__next__")
+            return self.builder.call(
+                self.runtime["obj_call_method0"],
+                [obj, name_ptr])
+        raise CodeGenError("next() takes exactly one argument", node)
+
+    def _emit_builtin_iter(self, node):
+        if len(node.args) == 1:
+            arg_node = node.args[0]
+            if self._is_obj_expr(arg_node):
+                obj = self._emit_expr_value(arg_node)
+                obj = self._ensure_ptr(obj)
+                name_ptr = self._make_string_constant("__iter__")
+                return self.builder.call(
+                    self.runtime["obj_call_method0"],
+                    [obj, name_ptr])
+            return self._emit_expr_value(arg_node)
+        return self._bridge_fallback_expr(node, "iter() with sentinel form")
+
+    def _emit_builtin_abs(self, node):
+        if len(node.args) == 1:
+            # Complex abs: |a+bi| = sqrt(a^2 + b^2)
+            arg_node = node.args[0]
+            if self._is_complex_expr(arg_node):
+                val = self._emit_expr_value(arg_node)
+                ptr = self.builder.inttoptr(val, i8_ptr)
+                return self.builder.call(
+                    self.runtime["complex_abs"], [ptr])
+            if (isinstance(arg_node, ast.Call)
+                    and isinstance(arg_node.func, ast.Name)
+                    and arg_node.func.id == "complex"):
+                val = self._emit_expr_value(arg_node)
+                ptr = self.builder.inttoptr(val, i8_ptr)
+                return self.builder.call(
+                    self.runtime["complex_abs"], [ptr])
+            # Object __abs__: dispatch to dunder (returns object)
+            if self._is_obj_expr(arg_node):
+                obj = self._emit_expr_value(arg_node)
+                obj = self._ensure_ptr(obj)
+                name_ptr = self._make_string_constant("__abs__")
+                result_i64 = self.builder.call(
+                    self.runtime["obj_call_method0"],
+                    [obj, name_ptr])
+                return self.builder.inttoptr(result_i64, i8_ptr)
+            val = self._emit_expr_value(arg_node)
+            if isinstance(val.type, ir.IntType):
+                neg = self.builder.neg(val)
+                is_neg = self.builder.icmp_signed("<", val, ir.Constant(i64, 0))
+                return self.builder.select(is_neg, neg, val)
+            elif isinstance(val.type, ir.DoubleType):
+                fabs_fn = self.module.declare_intrinsic("llvm.fabs", [double])
+                return self.builder.call(fabs_fn, [val])
+        return self._bridge_fallback_expr(node, "abs() with wrong args")
+
+    def _emit_builtin_divmod(self, node):
+        if len(node.args) == 2:
+            a = self._emit_expr_value(node.args[0])
+            b = self._emit_expr_value(node.args[1])
+            q_alloca = self._create_entry_alloca(i64, "dm.q")
+            r_alloca = self._create_entry_alloca(i64, "dm.r")
+            self.builder.call(self.runtime["divmod"], [a, b, q_alloca, r_alloca])
+            q_val = self.builder.load(q_alloca)
+            r_val = self.builder.load(r_alloca)
+            # Build a 2-tuple for the result (via FV-ABI append)
+            tup = self.builder.call(self.runtime["tuple_new"], [])
+            int_tag = ir.Constant(i32, FPY_TAG_INT)
+            self._rt_call("list_append_fv", [tup, int_tag, q_val])
+            self._rt_call("list_append_fv", [tup, int_tag, r_val])
+            return tup
+        raise CodeGenError("divmod() takes exactly 2 arguments", node)
+
+    def _emit_builtin_pow(self, node):
+        if len(node.args) == 2:
+            b = self._emit_expr_value(node.args[0])
+            e = self._emit_expr_value(node.args[1])
+            if isinstance(b.type, ir.DoubleType) or isinstance(e.type, ir.DoubleType):
+                if isinstance(b.type, ir.IntType):
+                    b = self.builder.sitofp(b, double)
+                if isinstance(e.type, ir.IntType):
+                    e = self.builder.sitofp(e, double)
+                return self.builder.call(self.runtime["pow_float"], [b, e])
+            return self.builder.call(self.runtime["pow_int"], [b, e])
+        if len(node.args) == 3:
+            b = self._emit_expr_value(node.args[0])
+            e = self._emit_expr_value(node.args[1])
+            m = self._emit_expr_value(node.args[2])
+            return self.builder.call(self.runtime["pow_mod"], [b, e, m])
+        raise CodeGenError("pow() takes 2 or 3 arguments", node)
+
+    def _emit_builtin_chr(self, node):
+        if len(node.args) == 1:
+            val = self._emit_expr_value(node.args[0])
+            return self.builder.call(self.runtime["chr"], [val])
+        raise CodeGenError("chr() takes exactly one argument", node)
+
+    def _emit_builtin_ord(self, node):
+        if len(node.args) == 1:
+            val = self._emit_expr_value(node.args[0])
+            return self._rt_call("ord", [val])
+        raise CodeGenError("ord() takes exactly one argument", node)
+
+    def _emit_builtin_hex(self, node):
+        if len(node.args) == 1:
+            val = self._emit_expr_value(node.args[0])
+            return self.builder.call(self.runtime["hex"], [val])
+        raise CodeGenError("hex() takes exactly one argument", node)
+
+    def _emit_builtin_oct(self, node):
+        if len(node.args) == 1:
+            val = self._emit_expr_value(node.args[0])
+            return self.builder.call(self.runtime["oct"], [val])
+        raise CodeGenError("oct() takes exactly one argument", node)
+
+    def _emit_builtin_bin(self, node):
+        if len(node.args) == 1:
+            val = self._emit_expr_value(node.args[0])
+            return self.builder.call(self.runtime["bin"], [val])
+        raise CodeGenError("bin() takes exactly one argument", node)
+
+    def _emit_builtin_round(self, node):
+        if len(node.args) == 1:
+            # Use FV dispatch to handle bridge float values stored as i64
+            fv = self._load_or_wrap_fv(node.args[0])
+            tag = self.builder.extract_value(fv, 0)
+            data = self.builder.extract_value(fv, 1)
+            is_float = self.builder.icmp_signed(
+                "==", tag, ir.Constant(i32, FPY_TAG_FLOAT))
+            as_float = self.builder.bitcast(data, double)
+            as_int_float = self.builder.sitofp(data, double)
+            val = self.builder.select(is_float, as_float, as_int_float)
+            # round(int) should return int; round(float) uses runtime
+            # For simplicity, always go through round() runtime
+            return self.builder.call(self.runtime["round"], [val])
+        if len(node.args) == 2:
+            # Use FV dispatch for runtime-tag-aware float detection
+            fv = self._load_or_wrap_fv(node.args[0])
+            tag = self.builder.extract_value(fv, 0)
+            data = self.builder.extract_value(fv, 1)
+            ndigits = self._emit_expr_value(node.args[1])
+            is_float = self.builder.icmp_signed(
+                "==", tag, ir.Constant(i32, FPY_TAG_FLOAT))
+            as_float = self.builder.bitcast(data, double)
+            as_int_float = self.builder.sitofp(data, double)
+            val = self.builder.select(is_float, as_float, as_int_float)
+            return self.builder.call(self.runtime["round_ndigits"], [val, ndigits])
+        raise CodeGenError("round() takes 1 or 2 arguments", node)
+
+    def _emit_builtin_repr(self, node):
+        if len(node.args) == 1:
+            arg_node = node.args[0]
+            # OBJ fast path: use obj_to_repr which handles
+            # __repr__ → __str__ → default fallback safely
+            if self._is_obj_expr(arg_node):
+                obj = self._emit_expr_value(arg_node)
+                obj = self._ensure_ptr(obj)
+                result = self.builder.call(
+                    self.runtime["obj_to_repr"], [obj])
+                return self.builder.inttoptr(result, i8_ptr)
+            # Use FV dispatch so runtime tag drives the conversion.
+            fv = self._load_or_wrap_fv(node.args[0])
+            return self._fv_call_repr(fv)
+        raise CodeGenError("repr() takes exactly one argument", node)
+
+    def _emit_builtin_sum(self, node):
+        # Phase 2: use TypedValue to accept lists, tuples, and sets
+        tv_sum = self._emit_expr(node.args[0]) if node.args else None
+        sum_kind = tv_sum.vtype.kind if tv_sum else VKind.UNKNOWN
+        is_iterable = (sum_kind in (VKind.LIST, VKind.TUPLE, VKind.SET)
+                       or self._is_list_expr(node.args[0]) if node.args else False)
+        if len(node.args) >= 1 and is_iterable:
+            # Convert set to list first
+            if sum_kind == VKind.SET:
+                lst = self._rt_call("set_to_list",
+                                    [tv_sum.as_ptr(self.builder)])
+            else:
+                lst = tv_sum.as_ptr(self.builder)
+            length = self._rt_call("list_length", [lst])
+            sum_alloca = self._create_entry_alloca(i64, "sum.acc")
+            # Optional start value
+            if len(node.args) >= 2:
+                start_val = self._emit_expr_value(node.args[1])
+                self.builder.store(start_val, sum_alloca)
+            else:
+                self.builder.store(ir.Constant(i64, 0), sum_alloca)
+            idx_alloca = self._create_entry_alloca(i64, "sum.idx")
+            self.builder.store(ir.Constant(i64, 0), idx_alloca)
+
+            cond_block = self._new_block("sum.cond")
+            body_block = self._new_block("sum.body")
+            end_block = self._new_block("sum.end")
+
+            self.builder.branch(cond_block)
+            self.builder.position_at_end(cond_block)
+            idx = self.builder.load(idx_alloca)
+            cond = self.builder.icmp_signed("<", idx, length)
+            self.builder.cbranch(cond, body_block, end_block)
+
+            self.builder.position_at_end(body_block)
+            idx = self.builder.load(idx_alloca)
+            elem = self._list_get_as_bare(lst, idx, "int")
+            acc = self.builder.load(sum_alloca)
+            self.builder.store(self.builder.add(acc, elem), sum_alloca)
+            self.builder.store(self.builder.add(idx, ir.Constant(i64, 1)), idx_alloca)
+            self.builder.branch(cond_block)
+
+            self.builder.position_at_end(end_block)
+            return self.builder.load(sum_alloca)
+        raise CodeGenError("sum() requires a list argument", node)
+
+    def _emit_builtin_set(self, node):
+        if len(node.args) == 1:
+            arg = self._emit_expr_value(node.args[0])
+            return self._rt_call("set_from_list", [arg])
+        if len(node.args) == 0:
+            return self.builder.call(self.runtime["dict_new"], [])
+        raise CodeGenError(f"{name}() takes 0 or 1 arguments", node)
+
+    def _emit_builtin_min(self, node):
+        # Resolve which builtin (min or max) from the call node
+        name = node.func.id if isinstance(node.func, ast.Name) else "min"
+        # Extract key= kwarg if provided. Supports `key=len` (for
+        # strings) and `key=<user_function>` that returns int.
+        key_func_name: str | None = None
+        key_func_ptr = None  # for lambda/closure keys
+        for kw in node.keywords:
+            if kw.arg == "key":
+                if isinstance(kw.value, ast.Name):
+                    key_func_name = kw.value.id
+                elif isinstance(kw.value, ast.Lambda):
+                    # Compile lambda as i64(i64) function pointer
+                    key_func_ptr = self._get_unary_func_ptr(kw.value, node)
+                    key_func_name = "__lambda__"
+        # Phase 2: use TypedValue to also accept tuples and sets
+        tv_mm = self._emit_expr(node.args[0]) if len(node.args) == 1 else None
+        mm_kind = tv_mm.vtype.kind if tv_mm else VKind.UNKNOWN
+        mm_ok = (mm_kind in (VKind.LIST, VKind.TUPLE, VKind.SET)
+                 or (len(node.args) == 1 and self._is_list_expr(node.args[0])))
+        if len(node.args) == 1 and mm_ok:
+            if mm_kind == VKind.SET:
+                lst = self._rt_call("set_to_list",
+                                    [tv_mm.as_ptr(self.builder)])
+            else:
+                lst = tv_mm.as_ptr(self.builder) if tv_mm else \
+                      self._emit_expr_value(node.args[0])
+            length = self._rt_call("list_length", [lst])
+            elem_type = self._get_list_elem_type(node.args[0])
+            is_str = (elem_type == "str")
+            # Pointer-based element types: str, list, tuple, dict, etc.
+            is_ptr = elem_type in ("str", "list", "tuple", "dict",
+                                    "set", "deque", "bytes", "obj")
+            result_type = i8_ptr if is_ptr else i64
+            bare_tag = elem_type if is_ptr else "int"
+
+            # OBJ elements: use runtime min/max that dispatches
+            # to __lt__ — no need for our own loop
+            if elem_type == "obj":
+                rt_name = "list_min_fv" if name == "min" else "list_max_fv"
+                data_i64 = self.builder.call(self.runtime[rt_name], [lst])
+                return self.builder.inttoptr(data_i64, i8_ptr)
+
+            result_alloca = self._create_entry_alloca(result_type, f"{name}.result")
+            first = self._list_get_as_bare(
+                lst, ir.Constant(i64, 0), bare_tag)
+            self.builder.store(first, result_alloca)
+
+            def _apply_key(e):
+                """Apply the key function to an element, returning i64."""
+                if key_func_name is None:
+                    return e
+                if key_func_name == "__lambda__":
+                    # Call through function pointer
+                    fn_typed = self.builder.bitcast(
+                        key_func_ptr,
+                        ir.PointerType(ir.FunctionType(i64, [i64])))
+                    arg = e
+                    if isinstance(e.type, ir.PointerType):
+                        arg = self.builder.ptrtoint(e, i64)
+                    return self.builder.call(fn_typed, [arg])
+                if key_func_name == "len":
+                    # len on strings returns int64
+                    if isinstance(e.type, ir.PointerType):
+                        return self.builder.call(
+                            self.runtime["str_len"], [e])
+                    if isinstance(e.type, ir.IntType):
+                        return self.builder.call(
+                            self.runtime["list_length"], [
+                                self.builder.inttoptr(e, i8_ptr)])
+                    return ir.Constant(i64, 0)
+                if key_func_name == "abs":
+                    neg = self.builder.neg(e)
+                    is_neg = self.builder.icmp_signed(
+                        "<", e, ir.Constant(i64, 0))
+                    return self.builder.select(is_neg, neg, e)
+                # User function call
+                if key_func_name in self._user_functions:
+                    info = self._user_functions[key_func_name]
+                    fv = self._wrap_arg_value(e, None)
+                    ret = self.builder.call(info.func, [fv])
+                    if info.uses_fv_abi:
+                        return self._unwrap_return_value(ret, info)
+                    return ret
+                return e
+
+            # Track the best *key value*, but return the original
+            # element. Store both key-of-best and best-element.
+            # Only create key_alloca when a key= was specified.
+            key_alloca = None
+            if key_func_name is not None:
+                key_alloca = self._create_entry_alloca(
+                    i64, f"{name}.keybest")
+                first_key = _apply_key(first)
+                if first_key.type != i64:
+                    if isinstance(first_key.type, ir.IntType):
+                        first_key = self.builder.zext(first_key, i64)
+                self.builder.store(first_key, key_alloca)
+            idx_alloca = self._create_entry_alloca(i64, f"{name}.idx")
+            self.builder.store(ir.Constant(i64, 1), idx_alloca)
+
+            cond_block = self._new_block(f"{name}.cond")
+            body_block = self._new_block(f"{name}.body")
+            end_block = self._new_block(f"{name}.end")
+
+            self.builder.branch(cond_block)
+            self.builder.position_at_end(cond_block)
+            idx = self.builder.load(idx_alloca)
+            cond = self.builder.icmp_signed("<", idx, length)
+            self.builder.cbranch(cond, body_block, end_block)
+
+            self.builder.position_at_end(body_block)
+            idx = self.builder.load(idx_alloca)
+            current = self.builder.load(result_alloca)
+            if key_func_name is not None:
+                elem = self._list_get_as_bare(lst, idx, bare_tag)
+                elem_key = _apply_key(elem)
+                if elem_key.type != i64 and isinstance(elem_key.type, ir.IntType):
+                    elem_key = self.builder.zext(elem_key, i64)
+                best_key = self.builder.load(key_alloca)
+                op = "<" if name == "min" else ">"
+                is_better = self.builder.icmp_signed(op, elem_key, best_key)
+                # Update best key and element
+                new_key = self.builder.select(is_better, elem_key, best_key)
+                self.builder.store(new_key, key_alloca)
+                new_elem = self.builder.select(is_better, elem, current)
+                self.builder.store(new_elem, result_alloca)
+            elif is_str:
+                elem = self._list_get_as_bare(lst, idx, "str")
+                cmp_result = self._rt_call("str_compare", [elem, current])
+                op = "<" if name == "min" else ">"
+                is_better = self.builder.icmp_signed(op, cmp_result, ir.Constant(i64, 0))
+                new_val = self.builder.select(is_better, elem, current)
+                self.builder.store(new_val, result_alloca)
+            else:
+                elem = self._list_get_as_bare(lst, idx, "int")
+                op = "<" if name == "min" else ">"
+                is_better = self.builder.icmp_signed(op, elem, current)
+                new_val = self.builder.select(is_better, elem, current)
+                self.builder.store(new_val, result_alloca)
+            self.builder.store(self.builder.add(idx, ir.Constant(i64, 1)), idx_alloca)
+            self.builder.branch(cond_block)
+
+            self.builder.position_at_end(end_block)
+            return self.builder.load(result_alloca)
+        if len(node.args) >= 2:
+            # min/max with multiple inline args: min(a, b, c, ...)
+            result = self._emit_expr_value(node.args[0])
+            op = "<" if name == "min" else ">"
+            for arg_node in node.args[1:]:
+                other = self._emit_expr_value(arg_node)
+                # Use fcmp for floats, icmp for ints
+                if isinstance(result.type, ir.DoubleType):
+                    is_better = self.builder.fcmp_ordered(op, other, result)
+                else:
+                    is_better = self.builder.icmp_signed(op, other, result)
+                result = self.builder.select(is_better, other, result)
+            return result
+        return self._bridge_fallback_expr(node, f"{name}() with unsupported args")
+
+
     def _emit_call_expr(self, node: ast.Call) -> ir.Value:
         """Emit a function call as an expression (return value is used)."""
         # Rewrite bound-method aliases: f = lst.pop → f(0) becomes lst.pop(0)
@@ -25192,1083 +26390,11 @@ class CodeGen:
                 return result
             elif name in self._user_classes:
                 return self._emit_constructor(node)
-            elif name == "len":
-                return self._emit_builtin_len(node)
-            elif name == "isinstance":
-                return self._emit_builtin_isinstance(node)
-            elif name == "type":
-                if len(node.args) == 1:
-                    arg_node = node.args[0]
-                    # User-defined functions are native code pointers, not
-                    # Python function objects. type(f) should return the
-                    # CPython types.FunctionType object so that comparisons
-                    # like `type(f) == types.FunctionType` work correctly.
-                    if (isinstance(arg_node, ast.Name)
-                            and arg_node.id in self._user_functions):
-                        types_name = self._make_string_constant("types")
-                        types_mod = self.builder.call(
-                            self.runtime["cpython_import"], [types_name])
-                        ft_name = self._make_string_constant("FunctionType")
-                        return self.builder.call(
-                            self.runtime["cpython_getattr"],
-                            [types_mod, ft_name])
-                    # Exception variable: type(e) → <class 'ExceptionName'>
-                    if (isinstance(arg_node, ast.Name)
-                            and arg_node.id in self._exc_vars):
-                        cls_name = self._exc_vars[arg_node.id]
-                        return self._make_string_constant(
-                            f"<class '{cls_name}'>")
-                    # For FV-backed variables, check runtime tag to determine
-                    # the actual type (handles CPython bridge results correctly)
-                    if (self._USE_FV_LOCALS
-                            and isinstance(arg_node, ast.Name)
-                            and arg_node.id in self.variables):
-                        alloca, tag = self.variables[arg_node.id]
-                        if (isinstance(alloca.type, ir.PointerType)
-                                and alloca.type.pointee is fpy_val):
-                            fv = self.builder.load(alloca)
-                            fv_tag = self.builder.extract_value(fv, 0)
-                            fv_data = self.builder.extract_value(fv, 1)
-                            # Build a runtime switch on tag
-                            type_strs = {
-                                FPY_TAG_INT: "<class 'int'>",
-                                FPY_TAG_FLOAT: "<class 'float'>",
-                                FPY_TAG_STR: "<class 'str'>",
-                                FPY_TAG_BOOL: "<class 'bool'>",
-                                FPY_TAG_NONE: "<class 'NoneType'>",
-                                FPY_TAG_LIST: "<class 'list'>",
-                                FPY_TAG_DICT: "<class 'dict'>",
-                                FPY_TAG_SET: "<class 'set'>",
-                                FPY_TAG_BIGINT: "<class 'int'>",
-                                FPY_TAG_COMPLEX: "<class 'complex'>",
-                                FPY_TAG_BYTES: "<class 'bytes'>",
-                                FPY_TAG_DECIMAL: "<class 'Decimal'>",
-                            }
-                            result_alloca = self._create_entry_alloca(
-                                i8_ptr, "type.result")
-                            default_str = self._make_string_constant(
-                                "<class 'object'>")
-                            self.builder.store(default_str, result_alloca)
-                            # For OBJ tag, use native obj_type_repr (NOT
-                            # cpython_type_repr — native FpyObj isn't PyObject*)
-                            is_obj = self.builder.icmp_signed(
-                                "==", fv_tag, ir.Constant(i32, FPY_TAG_OBJ))
-                            obj_block = self._new_block("type.obj")
-                            merge_block = self._new_block("type.merge")
-                            self.builder.cbranch(is_obj, obj_block, merge_block)
-                            self.builder.position_at_end(obj_block)
-                            obj_ptr = self.builder.inttoptr(fv_data, i8_ptr)
-                            runtime_type = self.builder.call(
-                                self.runtime["obj_type_repr"], [obj_ptr])
-                            self.builder.store(runtime_type, result_alloca)
-                            self.builder.branch(merge_block)
-                            self.builder.position_at_end(merge_block)
-                            for tag_val, type_str in type_strs.items():
-                                is_match = self.builder.icmp_signed(
-                                    "==", fv_tag, ir.Constant(i32, tag_val))
-                                str_ptr = self._make_string_constant(type_str)
-                                current = self.builder.load(result_alloca)
-                                selected = self.builder.select(
-                                    is_match, str_ptr, current)
-                                self.builder.store(selected, result_alloca)
-                            return self.builder.load(result_alloca)
-                    # Try runtime tag dispatch via _load_or_wrap_fv for
-                    # expression args (bridge calls, native module calls, etc.)
-                    try:
-                        fv = self._load_or_wrap_fv(arg_node)
-                        if (isinstance(fv.type, ir.LiteralStructType)
-                                and fv.type == fpy_val):
-                            fv_tag = self.builder.extract_value(fv, 0)
-                            fv_data = self.builder.extract_value(fv, 1)
-                            type_strs = {
-                                FPY_TAG_INT: "<class 'int'>",
-                                FPY_TAG_FLOAT: "<class 'float'>",
-                                FPY_TAG_STR: "<class 'str'>",
-                                FPY_TAG_BOOL: "<class 'bool'>",
-                                FPY_TAG_NONE: "<class 'NoneType'>",
-                                FPY_TAG_LIST: "<class 'list'>",
-                                FPY_TAG_DICT: "<class 'dict'>",
-                                FPY_TAG_SET: "<class 'set'>",
-                                FPY_TAG_BIGINT: "<class 'int'>",
-                                FPY_TAG_COMPLEX: "<class 'complex'>",
-                                FPY_TAG_BYTES: "<class 'bytes'>",
-                                FPY_TAG_DECIMAL: "<class 'Decimal'>",
-                            }
-                            result_alloca = self._create_entry_alloca(
-                                i8_ptr, "type.result")
-                            default_str = self._make_string_constant(
-                                "<class 'object'>")
-                            self.builder.store(default_str, result_alloca)
-                            # For OBJ tag, use native obj_type_repr
-                            is_obj = self.builder.icmp_signed(
-                                "==", fv_tag, ir.Constant(i32, FPY_TAG_OBJ))
-                            obj_block = self._new_block("type.expr.obj")
-                            merge_block = self._new_block("type.expr.merge")
-                            self.builder.cbranch(is_obj, obj_block, merge_block)
-                            self.builder.position_at_end(obj_block)
-                            obj_ptr = self.builder.inttoptr(fv_data, i8_ptr)
-                            runtime_type = self.builder.call(
-                                self.runtime["obj_type_repr"], [obj_ptr])
-                            self.builder.store(runtime_type, result_alloca)
-                            self.builder.branch(merge_block)
-                            self.builder.position_at_end(merge_block)
-                            for tag_val, type_str in type_strs.items():
-                                is_match = self.builder.icmp_signed(
-                                    "==", fv_tag, ir.Constant(i32, tag_val))
-                                str_ptr = self._make_string_constant(type_str)
-                                current = self.builder.load(result_alloca)
-                                selected = self.builder.select(
-                                    is_match, str_ptr, current)
-                                self.builder.store(selected, result_alloca)
-                            return self.builder.load(result_alloca)
-                    except Exception:
-                        pass
-                    # Static type analysis fallback
-                    actual = self._static_type_of(node.args[0])
-                    # Also check for list/dict via type tags
-                    if actual == "unknown":
-                        if self._is_list_expr(node.args[0]):
-                            actual = "list"
-                        elif self._is_dict_expr(node.args[0]):
-                            actual = "dict"
-                    if actual == "unknown":
-                        # Default: Python prints class name or type object
-                        actual = "object"
-                    type_name_map = {
-                        "int": "int", "bool": "bool", "float": "float",
-                        "str": "str", "list": "list", "dict": "dict",
-                        "tuple": "tuple", "object": "object",
-                    }
-                    display = type_name_map.get(actual, actual)
-                    return self._make_string_constant(f"<class '{display}'>")
-                return self._bridge_fallback_expr(node, "type() with multiple args")
-            elif name == "sorted":
-                return self._emit_builtin_sorted(node)
-            elif name == "range":
-                # range(stop) / range(start, stop) / range(start, stop, step) -> list
-                if len(node.args) == 1:
-                    start = ir.Constant(i64, 0)
-                    stop = self._emit_expr_value(node.args[0])
-                    step = ir.Constant(i64, 1)
-                elif len(node.args) == 2:
-                    start = self._emit_expr_value(node.args[0])
-                    stop = self._emit_expr_value(node.args[1])
-                    step = ir.Constant(i64, 1)
-                elif len(node.args) == 3:
-                    start = self._emit_expr_value(node.args[0])
-                    stop = self._emit_expr_value(node.args[1])
-                    step = self._emit_expr_value(node.args[2])
-                else:
-                    raise CodeGenError("range() takes 1-3 arguments", node)
-                return self.builder.call(self.runtime["range"], [start, stop, step])
-            elif name == "list":
-                # list(dict) → list of keys
-                if len(node.args) == 1 and self._is_dict_expr(node.args[0]):
-                    d = self._emit_expr_value(node.args[0])
-                    return self._rt_call("dict_keys", [d])
-                # list(deque) → deque_to_list conversion
-                if len(node.args) == 1 and self._is_deque_expr(node.args[0]):
-                    dq = self._emit_expr_value(node.args[0])
-                    dq = self._ensure_ptr(dq)
-                    return self.builder.call(self.runtime["deque_to_list"], [dq])
-                # list(bytes) → list of byte values (ints)
-                if len(node.args) == 1:
-                    arg = node.args[0]
-                    # Check if argument is a bytes-typed variable
-                    is_bytes = False
-                    if isinstance(arg, ast.Name) and arg.id in self.variables:
-                        _, vtag = self.variables[arg.id]
-                        is_bytes = (vtag == "bytes")
-                    if is_bytes:
-                        b = self._emit_expr_value(arg)
-                        b = self._ensure_ptr(b)
-                        return self.builder.call(self.runtime["bytes_to_list"], [b])
-                # list(obj) — iterate via __iter__/__next__ protocol
-                if len(node.args) == 1 and self._is_obj_expr(node.args[0]):
-                    obj = self._emit_expr_value(node.args[0])
-                    obj = self._ensure_ptr(obj)
-                    return self._rt_call("list_from_obj_iter", [obj])
-                # list(x) — for now, just return the arg (shallow copy would be better)
-                if len(node.args) == 1:
-                    return self._emit_expr_value(node.args[0])
-                if len(node.args) == 0:
-                    return self.builder.call(self.runtime["list_new"], [])
-                raise CodeGenError("list() with wrong number of args", node)
-            if name == "dict":
-                # dict() or dict([(k, v), ...])
-                if len(node.args) == 0:
-                    return self.builder.call(self.runtime["dict_new"], [])
-                if len(node.args) == 1:
-                    # dict([(k, v), ...]) — build dict by iterating
-                    arg_node = node.args[0]
-                    if isinstance(arg_node, ast.List):
-                        # Build a dict from literal list of tuples at compile time
-                        d = self.builder.call(self.runtime["dict_new"], [])
-                        for elt in arg_node.elts:
-                            if isinstance(elt, ast.Tuple) and len(elt.elts) == 2:
-                                k_node, v_node = elt.elts
-                                k_val = self._emit_expr_value(k_node)
-                                v_val = self._emit_expr_value(v_node)
-                                if not isinstance(k_val.type, ir.PointerType):
-                                    raise CodeGenError("dict() key must be string", node)
-                                tag, data = self._bare_to_tag_data(v_val, v_node)
-                                self.builder.call(self.runtime["dict_set_fv"],
-                                                  [d, k_val, ir.Constant(i32, tag), data])
-                        return d
-                    return self._bridge_fallback_expr(node, "dict() with non-literal argument")
-            elif name == "tuple":
-                # tuple(iter) — build list, then mark as tuple for correct repr
-                if len(node.args) == 1:
-                    result = self._emit_expr_value(node.args[0])
-                    # Ensure the result is a list pointer, then mark as tuple
-                    if isinstance(result.type, ir.PointerType) or result.type == i8_ptr:
-                        self.builder.call(self.runtime["list_mark_tuple"], [result])
-                    else:
-                        ptr = self.builder.inttoptr(result, i8_ptr)
-                        self.builder.call(self.runtime["list_mark_tuple"], [ptr])
-                    return result
-                if len(node.args) == 0:
-                    return self.builder.call(self.runtime["tuple_new"], [])
-                raise CodeGenError("tuple() with wrong number of args", node)
-            elif name == "complex":
-                # complex(real, imag) or complex(real)
-                if len(node.args) == 0:
-                    real = ir.Constant(double, 0.0)
-                    imag = ir.Constant(double, 0.0)
-                elif len(node.args) == 1:
-                    real = self._emit_expr_value(node.args[0])
-                    if isinstance(real.type, ir.IntType):
-                        real = self.builder.sitofp(real, double)
-                    imag = ir.Constant(double, 0.0)
-                elif len(node.args) == 2:
-                    real = self._emit_expr_value(node.args[0])
-                    imag = self._emit_expr_value(node.args[1])
-                    if isinstance(real.type, ir.IntType):
-                        real = self.builder.sitofp(real, double)
-                    if isinstance(imag.type, ir.IntType):
-                        imag = self.builder.sitofp(imag, double)
-                else:
-                    raise CodeGenError("complex() takes 0-2 args", node)
-                ptr = self.builder.call(self.runtime["complex_new"],
-                                        [real, imag])
-                return self.builder.ptrtoint(ptr, i64)
-            elif name == "reversed":
-                if len(node.args) == 1:
-                    arg = self._emit_expr_value(node.args[0])
-                    return self._rt_call("list_reversed", [arg])
-                raise CodeGenError("reversed() takes exactly one argument", node)
-            elif name == "int":
-                if len(node.args) == 1:
-                    arg_node = node.args[0]
-                    # User object with __int__: dispatch to dunder
-                    if self._is_obj_expr(arg_node):
-                        obj = self._emit_expr_value(arg_node)
-                        obj = self._ensure_ptr(obj)
-                        name_ptr = self._make_string_constant("__int__")
-                        return self.builder.call(
-                            self.runtime["obj_call_method0"],
-                            [obj, name_ptr])
-                    # pyobj variable or CPython call expression:
-                    # call Python's int() via bridge
-                    is_pyobj_arg = self._is_pyobj_var(arg_node)
-                    if not is_pyobj_arg and isinstance(arg_node, ast.Call):
-                        # Check if it's a CPython method call: mod.func(...)
-                        if isinstance(arg_node.func, ast.Attribute):
-                            recv = arg_node.func.value
-                            if (isinstance(recv, ast.Name)
-                                    and recv.id in self.variables
-                                    and self._var_kind(recv.id) == VKind.PYOBJ):
-                                is_pyobj_arg = True
-                    if is_pyobj_arg:
-                        # Get the PyObject* result
-                        if isinstance(arg_node, ast.Name):
-                            ptr = self._load_variable(arg_node.id, arg_node)
-                            ptr = self._ensure_ptr(ptr)
-                        else:
-                            ptr = self._emit_cpython_call_raw(arg_node)
-                        # Call builtins.int(pyobj) through the bridge
-                        blt = self._make_string_constant("builtins")
-                        blt_mod = self.builder.call(
-                            self.runtime["cpython_import"], [blt])
-                        int_name = self._make_string_constant("int")
-                        int_fn = self.builder.call(
-                            self.runtime["cpython_getattr"], [blt_mod, int_name])
-                        out_tag = self._create_entry_alloca(i32, "int.tag")
-                        out_data = self._create_entry_alloca(i64, "int.data")
-                        self.builder.call(self.runtime["cpython_call1"],
-                                          [int_fn,
-                                           ir.Constant(i32, FPY_TAG_OBJ),
-                                           self.builder.ptrtoint(ptr, i64),
-                                           out_tag, out_data])
-                        return self.builder.load(out_data)
-                    # FV-backed variables: dispatch by runtime tag
-                    # to handle int, float, and str arguments.
-                    if (self._USE_FV_LOCALS
-                            and isinstance(arg_node, ast.Name)
-                            and arg_node.id in self.variables):
-                        alloca, tag = self.variables[arg_node.id]
-                        if (isinstance(alloca.type, ir.PointerType)
-                                and alloca.type.pointee is fpy_val):
-                            fv = self.builder.load(alloca)
-                            fv_tag = self.builder.extract_value(fv, 0)
-                            fv_data = self.builder.extract_value(fv, 1)
-                            # 3-way branch: float → fptosi, str → str_to_int, else → data
-                            is_float = self.builder.icmp_unsigned(
-                                "==", fv_tag, ir.Constant(i32, FPY_TAG_FLOAT))
-                            result_alloca = self._create_entry_alloca(i64, "int.res")
-                            float_bb = self._new_block("int.float")
-                            check_str_bb = self._new_block("int.chkstr")
-                            str_bb = self._new_block("int.str")
-                            else_bb = self._new_block("int.else")
-                            merge_bb = self._new_block("int.merge")
-                            self.builder.cbranch(is_float, float_bb, check_str_bb)
-                            # Float path
-                            self.builder.position_at_end(float_bb)
-                            float_val = self.builder.bitcast(fv_data, double)
-                            int_from_float = self.builder.fptosi(float_val, i64)
-                            self.builder.store(int_from_float, result_alloca)
-                            self.builder.branch(merge_bb)
-                            # Check string tag
-                            self.builder.position_at_end(check_str_bb)
-                            is_str = self.builder.icmp_unsigned(
-                                "==", fv_tag, ir.Constant(i32, FPY_TAG_STR))
-                            self.builder.cbranch(is_str, str_bb, else_bb)
-                            # String path
-                            self.builder.position_at_end(str_bb)
-                            str_ptr = self.builder.inttoptr(fv_data, i8_ptr)
-                            int_from_str = self._rt_call("str_to_int", [str_ptr])
-                            self.builder.store(int_from_str, result_alloca)
-                            self.builder.branch(merge_bb)
-                            # Else path (already int/bool)
-                            self.builder.position_at_end(else_bb)
-                            self.builder.store(fv_data, result_alloca)
-                            self.builder.branch(merge_bb)
-                            # Merge
-                            self.builder.position_at_end(merge_bb)
-                            return self.builder.load(result_alloca)
-                    val = self._emit_expr_value(arg_node)
-                    if isinstance(val.type, ir.DoubleType):
-                        return self.builder.fptosi(val, i64)
-                    if isinstance(val.type, ir.IntType) and val.type.width < 64:
-                        return self.builder.zext(val, i64)
-                    if isinstance(val.type, ir.PointerType):
-                        # Might be pyobj or string
-                        if (isinstance(arg_node, ast.Name)
-                                and arg_node.id in self.variables
-                                and self._var_kind(arg_node.id) == VKind.PYOBJ):
-                            tag_a = self._create_entry_alloca(i32, "int.tag")
-                            data_a = self._create_entry_alloca(i64, "int.data")
-                            self.builder.call(self.runtime["cpython_to_fv"],
-                                              [val, tag_a, data_a])
-                            return self.builder.load(data_a)
-                        return self._rt_call("str_to_int", [val])
-                    return val
-                if len(node.args) == 2:
-                    # int(str, base) — convert string with base
-                    val = self._emit_expr_value(node.args[0])
-                    base = self._emit_expr_value(node.args[1])
-                    val = self._ensure_ptr(val)
-                    return self.builder.call(
-                        self.runtime["str_to_int_base"], [val, base])
-                raise CodeGenError("int() with wrong number of args", node)
-            elif name == "locals":
-                return self._emit_locals_dict()
-            elif name == "globals":
-                # Build a dict from all global variables
-                d = self.builder.call(self.runtime["dict_new"], [])
-                for gname, (gvar, gtag) in self._global_vars.items():
-                    key = self._make_string_constant(gname)
-                    val = self.builder.load(gvar, name=f"g.{gname}")
-                    t, data = self._bare_to_tag_data(val, None)
-                    self.builder.call(self.runtime["dict_set_fv"],
-                                      [d, key, ir.Constant(i32, t), data])
-                return d
-            elif name == "map":
-                if len(node.args) == 2:
-                    return self._emit_builtin_map(node)
-                raise CodeGenError("map() takes 2 arguments (function, iterable)", node)
-            elif name == "filter":
-                if len(node.args) == 2:
-                    return self._emit_builtin_filter(node)
-                return self._bridge_fallback_expr(node, "filter() with wrong args")
-            elif name == "eval":
-                if len(node.args) < 1:
-                    raise CodeGenError("eval() requires at least 1 argument", node)
-                # Compile-time eval: literal string → parse and compile inline
-                if isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str):
-                    return self._compile_eval_literal(node.args[0].value, node)
-                # Dynamic eval: route through CPython bridge with locals dict
-                locals_dict = self._emit_locals_dict()
-                arg = self._emit_expr_value(node.args[0])
-                if isinstance(arg.type, ir.PointerType):
-                    expr_ptr = arg
-                elif isinstance(arg.type, ir.IntType):
-                    expr_ptr = self.builder.inttoptr(arg, i8_ptr)
-                else:
-                    expr_ptr = self.builder.inttoptr(
-                        self.builder.bitcast(arg, i64), i8_ptr)
-                out_tag = self._create_entry_alloca(i32, "eval.tag")
-                out_data = self._create_entry_alloca(i64, "eval.data")
-                self.builder.call(self.runtime["cpython_eval_locals"],
-                                  [expr_ptr, locals_dict, out_tag, out_data])
-                tag_val = self.builder.load(out_tag)
-                data_val = self.builder.load(out_data)
-                fv = ir.Constant(fpy_val, ir.Undefined)
-                fv = self.builder.insert_value(fv, tag_val, 0)
-                fv = self.builder.insert_value(fv, data_val, 1)
-                return fv
-            elif name == "exec":
-                if len(node.args) < 1:
-                    raise CodeGenError("exec() requires at least 1 argument", node)
-                # Compile-time exec: literal string → parse and compile inline
-                if isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str):
-                    self._compile_exec_literal(node.args[0].value, node)
-                    return ir.Constant(i64, 0)
-                # Dynamic exec: try JIT native compilation, fall back to CPython
-                arg = self._emit_expr_value(node.args[0])
-                if isinstance(arg.type, ir.PointerType):
-                    code_ptr = arg
-                elif isinstance(arg.type, ir.IntType):
-                    code_ptr = self.builder.inttoptr(arg, i8_ptr)
-                else:
-                    code_ptr = self.builder.inttoptr(
-                        self.builder.bitcast(arg, i64), i8_ptr)
-                # jit_exec tries native compilation first, falls back to CPython
-                self.builder.call(self.runtime["jit_exec"], [code_ptr])
-                return ir.Constant(i64, 0)
-            elif name == "enumerate":
-                if len(node.args) >= 1:
-                    lst = self._emit_expr_value(node.args[0])
-                    start = None
-                    if len(node.args) > 1:
-                        start = self._emit_expr_value(node.args[1])
-                    else:
-                        # Accept start= kwarg
-                        for kw in node.keywords:
-                            if kw.arg == "start":
-                                start = self._emit_expr_value(kw.value)
-                                break
-                    if start is None:
-                        start = ir.Constant(i64, 0)
-                    # Detect string argument → use enumerate_str
-                    _arg_is_str = False
-                    _arg0 = node.args[0]
-                    if isinstance(_arg0, ast.Constant) and isinstance(_arg0.value, str):
-                        _arg_is_str = True
-                    elif isinstance(_arg0, ast.Name) and _arg0.id in self.variables:
-                        _, _tag = self.variables[_arg0.id]
-                        if (isinstance(_tag, ValueType) and _tag.kind == VKind.STR) or _tag == "str":
-                            _arg_is_str = True
-                    if _arg_is_str:
-                        return self._rt_call("enumerate_str", [lst, start])
-                    return self._rt_call("enumerate", [lst, start])
-                raise CodeGenError("enumerate() requires at least one argument", node)
-            elif name == "zip":
-                if len(node.args) == 2:
-                    a = self._emit_expr_value(node.args[0])
-                    b = self._emit_expr_value(node.args[1])
-                    return self._rt_call("zip", [a, b])
-                if len(node.args) == 3:
-                    a = self._emit_expr_value(node.args[0])
-                    b = self._emit_expr_value(node.args[1])
-                    c = self._emit_expr_value(node.args[2])
-                    return self._rt_call("zip3", [a, b, c])
-                return self._bridge_fallback_expr(node, "zip() with 1 or >3 args")
-            elif name == "any":
-                if len(node.args) == 1 and self._is_list_expr(node.args[0]):
-                    lst = self._emit_expr_value(node.args[0])
-                    length = self._rt_call("list_length", [lst])
-                    result_alloca = self._create_entry_alloca(ir.IntType(1), "any.result")
-                    self.builder.store(ir.Constant(ir.IntType(1), 0), result_alloca)
-                    idx_alloca = self._create_entry_alloca(i64, "any.idx")
-                    self.builder.store(ir.Constant(i64, 0), idx_alloca)
-                    cond_b = self._new_block("any.cond")
-                    body_b = self._new_block("any.body")
-                    end_b = self._new_block("any.end")
-                    self.builder.branch(cond_b)
-                    self.builder.position_at_end(cond_b)
-                    idx = self.builder.load(idx_alloca)
-                    self.builder.cbranch(self.builder.icmp_signed("<", idx, length), body_b, end_b)
-                    self.builder.position_at_end(body_b)
-                    idx = self.builder.load(idx_alloca)
-                    elem = self._list_get_as_bare(lst, idx, "int")
-                    is_true = self.builder.icmp_signed("!=", elem, ir.Constant(i64, 0))
-                    found_b = self._new_block("any.found")
-                    next_b = self._new_block("any.next")
-                    self.builder.cbranch(is_true, found_b, next_b)
-                    self.builder.position_at_end(found_b)
-                    self.builder.store(ir.Constant(ir.IntType(1), 1), result_alloca)
-                    self.builder.branch(end_b)
-                    self.builder.position_at_end(next_b)
-                    self.builder.store(self.builder.add(self.builder.load(idx_alloca), ir.Constant(i64, 1)), idx_alloca)
-                    self.builder.branch(cond_b)
-                    self.builder.position_at_end(end_b)
-                    return self.builder.zext(self.builder.load(result_alloca), i32)
-                return self._bridge_fallback_expr(node, "any() with non-list argument")
-            elif name == "all":
-                if len(node.args) == 1 and self._is_list_expr(node.args[0]):
-                    lst = self._emit_expr_value(node.args[0])
-                    length = self._rt_call("list_length", [lst])
-                    result_alloca = self._create_entry_alloca(ir.IntType(1), "all.result")
-                    self.builder.store(ir.Constant(ir.IntType(1), 1), result_alloca)
-                    idx_alloca = self._create_entry_alloca(i64, "all.idx")
-                    self.builder.store(ir.Constant(i64, 0), idx_alloca)
-                    cond_b = self._new_block("all.cond")
-                    body_b = self._new_block("all.body")
-                    end_b = self._new_block("all.end")
-                    self.builder.branch(cond_b)
-                    self.builder.position_at_end(cond_b)
-                    idx = self.builder.load(idx_alloca)
-                    self.builder.cbranch(self.builder.icmp_signed("<", idx, length), body_b, end_b)
-                    self.builder.position_at_end(body_b)
-                    idx = self.builder.load(idx_alloca)
-                    elem = self._list_get_as_bare(lst, idx, "int")
-                    is_false = self.builder.icmp_signed("==", elem, ir.Constant(i64, 0))
-                    fail_b = self._new_block("all.fail")
-                    next_b = self._new_block("all.next")
-                    self.builder.cbranch(is_false, fail_b, next_b)
-                    self.builder.position_at_end(fail_b)
-                    self.builder.store(ir.Constant(ir.IntType(1), 0), result_alloca)
-                    self.builder.branch(end_b)
-                    self.builder.position_at_end(next_b)
-                    self.builder.store(self.builder.add(self.builder.load(idx_alloca), ir.Constant(i64, 1)), idx_alloca)
-                    self.builder.branch(cond_b)
-                    self.builder.position_at_end(end_b)
-                    return self.builder.zext(self.builder.load(result_alloca), i32)
-                return self._bridge_fallback_expr(node, "all() with non-list argument")
-            elif name == "bool":
-                if len(node.args) == 1:
-                    return self.builder.zext(self._truthiness_of_expr(node.args[0]), i32)
-                raise CodeGenError("bool() takes exactly one argument", node)
-            elif name == "float":
-                if len(node.args) == 1:
-                    arg_node = node.args[0]
-                    # User object with __float__: dispatch to dunder
-                    if self._is_obj_expr(arg_node):
-                        obj = self._emit_expr_value(arg_node)
-                        obj = self._ensure_ptr(obj)
-                        name_ptr = self._make_string_constant("__float__")
-                        # Must use the double-returning variant because __float__
-                        # returns in XMM0, not RAX — calling through int64 ABI
-                        # would read RAX (garbage/zero).
-                        return self.builder.call(
-                            self.runtime["obj_call_method0_double"],
-                            [obj, name_ptr])
-                    # pyobj: call Python's float() via bridge
-                    if self._is_pyobj_var(arg_node):
-                        ptr = self._load_variable(arg_node.id, arg_node)
-                        ptr = self._ensure_ptr(ptr)
-                        blt = self._make_string_constant("builtins")
-                        blt_mod = self.builder.call(
-                            self.runtime["cpython_import"], [blt])
-                        float_name = self._make_string_constant("float")
-                        float_fn = self.builder.call(
-                            self.runtime["cpython_getattr"],
-                            [blt_mod, float_name])
-                        out_tag = self._create_entry_alloca(i32, "float.tag")
-                        out_data = self._create_entry_alloca(i64, "float.data")
-                        self.builder.call(self.runtime["cpython_call1"],
-                                          [float_fn,
-                                           ir.Constant(i32, FPY_TAG_OBJ),
-                                           self.builder.ptrtoint(ptr, i64),
-                                           out_tag, out_data])
-                        data = self.builder.load(out_data)
-                        return self.builder.bitcast(data, double)
-                    # FV-backed variables: dispatch by runtime tag
-                    # to handle int, float, str, and bool arguments.
-                    if (self._USE_FV_LOCALS
-                            and isinstance(arg_node, ast.Name)
-                            and arg_node.id in self.variables):
-                        alloca, _ftag = self.variables[arg_node.id]
-                        if (isinstance(alloca.type, ir.PointerType)
-                                and alloca.type.pointee is fpy_val):
-                            fv = self.builder.load(alloca)
-                            fv_tag = self.builder.extract_value(fv, 0)
-                            fv_data = self.builder.extract_value(fv, 1)
-                            is_str = self.builder.icmp_unsigned(
-                                "==", fv_tag, ir.Constant(i32, FPY_TAG_STR))
-                            is_float = self.builder.icmp_unsigned(
-                                "==", fv_tag, ir.Constant(i32, FPY_TAG_FLOAT))
-                            result_alloca = self._create_entry_alloca(
-                                double, "float.res")
-                            str_bb = self._new_block("float.str")
-                            check_float_bb = self._new_block("float.chkflt")
-                            float_bb = self._new_block("float.flt")
-                            else_bb = self._new_block("float.else")
-                            merge_bb = self._new_block("float.merge")
-                            self.builder.cbranch(is_str, str_bb, check_float_bb)
-                            # String path
-                            self.builder.position_at_end(str_bb)
-                            str_ptr = self.builder.inttoptr(fv_data, i8_ptr)
-                            f_from_str = self._rt_call("str_to_float", [str_ptr])
-                            self.builder.store(f_from_str, result_alloca)
-                            self.builder.branch(merge_bb)
-                            # Check float
-                            self.builder.position_at_end(check_float_bb)
-                            self.builder.cbranch(is_float, float_bb, else_bb)
-                            # Float path (already float)
-                            self.builder.position_at_end(float_bb)
-                            already_f = self.builder.bitcast(fv_data, double)
-                            self.builder.store(already_f, result_alloca)
-                            self.builder.branch(merge_bb)
-                            # Else (int/bool → sitofp)
-                            self.builder.position_at_end(else_bb)
-                            f_from_int = self.builder.sitofp(fv_data, double)
-                            self.builder.store(f_from_int, result_alloca)
-                            self.builder.branch(merge_bb)
-                            # Merge
-                            self.builder.position_at_end(merge_bb)
-                            return self.builder.load(result_alloca)
-                    val = self._emit_expr_value(arg_node)
-                    if isinstance(val.type, ir.IntType):
-                        return self.builder.sitofp(val, double)
-                    if isinstance(val.type, ir.PointerType):
-                        return self._rt_call("str_to_float", [val])
-                    return val
-                raise CodeGenError("float() takes exactly one argument", node)
-            elif name == "str":
-                if len(node.args) == 1:
-                    arg_node = node.args[0]
-                    # OBJ fast path: use obj_to_str which handles
-                    # __str__ → __repr__ → default fallback safely
-                    if self._is_obj_expr(arg_node):
-                        obj = self._emit_expr_value(arg_node)
-                        obj = self._ensure_ptr(obj)
-                        result = self.builder.call(
-                            self.runtime["obj_to_str"], [obj])
-                        return self.builder.inttoptr(result, i8_ptr)
-                    # Use FV dispatch so runtime tag drives the conversion
-                    # (e.g. dict values whose compile-time tag is wrong).
-                    fv = self._load_or_wrap_fv(node.args[0])
-                    return self._fv_call_str(fv)
-                # str(bytes, encoding) → just return the first arg as string
-                if len(node.args) >= 1:
-                    return self._emit_expr_value(node.args[0])
-                return self._make_string_constant("")
-            elif name == "getattr" and len(node.args) >= 2:
-                obj = self._emit_expr_value(node.args[0])
-                obj = self._ensure_ptr(obj)
-                attr_name = self._emit_expr_value(node.args[1])
-                attr_name = self._ensure_ptr(attr_name)
-                tag_slot = self._create_entry_alloca(i32, "ga.tag")
-                data_slot = self._create_entry_alloca(i64, "ga.data")
-                self.builder.call(self.runtime["obj_get_fv"],
-                                  [obj, attr_name, tag_slot, data_slot])
-                return self.builder.load(data_slot)
+            # Builtin dispatch via registry
+            handler_name = self._BUILTIN_DISPATCH.get(name)
+            if handler_name:
+                return getattr(self, handler_name)(node)
 
-            elif name == "hasattr" and len(node.args) >= 2:
-                # Check if the object is a PYOBJ before evaluating args
-                obj_kind = VKind.UNKNOWN
-                if (isinstance(node.args[0], ast.Name)
-                        and node.args[0].id in self.variables):
-                    obj_kind = self._var_kind(node.args[0].id)
-                # For PYOBJ (bridge objects), call CPython's hasattr
-                if obj_kind == VKind.PYOBJ:
-                    obj = self._emit_expr_value(node.args[0])
-                    obj = self._ensure_ptr(obj)
-                    attr_name = self._emit_expr_value(node.args[1])
-                    attr_name = self._ensure_ptr(attr_name)
-                    result = self.builder.call(
-                        self.runtime["cpython_hasattr"], [obj, attr_name])
-                    return self.builder.zext(result, i64)
-                # For native objects with known slots, always return True
-                # (our slot system pre-allocates all used attrs).
-                # Don't evaluate args — avoids potential side effects from
-                # _emit_expr_value on non-PYOBJ objects.
-                return ir.Constant(i64, 1)  # True
-
-            elif name == "setattr" and len(node.args) >= 3:
-                obj = self._emit_expr_value(node.args[0])
-                obj = self._ensure_ptr(obj)
-                attr_name = self._emit_expr_value(node.args[1])
-                attr_name = self._ensure_ptr(attr_name)
-                val = self._emit_expr_value(node.args[2])
-                tag, data = self._bare_to_tag_data(val, node.args[2])
-                self.builder.call(self.runtime["obj_set_fv"],
-                                  [obj, attr_name, ir.Constant(i32, tag), data])
-                return ir.Constant(i64, 0)
-
-            elif name == "hash":
-                if len(node.args) == 1:
-                    arg_node = node.args[0]
-                    if self._is_obj_expr(arg_node):
-                        obj_cls = self._infer_object_class(arg_node)
-                        if obj_cls and self._class_has_method(obj_cls, "__hash__"):
-                            obj = self._emit_expr_value(arg_node)
-                            obj = self._ensure_ptr(obj)
-                            name_ptr = self._make_string_constant("__hash__")
-                            return self.builder.call(
-                                self.runtime["obj_call_method0"],
-                                [obj, name_ptr])
-                    # Default: return id-like hash
-                    val = self._emit_expr_value(arg_node)
-                    return val
-                raise CodeGenError("hash() takes exactly one argument", node)
-            elif name == "next":
-                if len(node.args) >= 1:
-                    arg_node = node.args[0]
-                    obj = self._emit_expr_value(arg_node)
-                    obj = self._ensure_ptr(obj)
-                    name_ptr = self._make_string_constant("__next__")
-                    return self.builder.call(
-                        self.runtime["obj_call_method0"],
-                        [obj, name_ptr])
-                raise CodeGenError("next() takes exactly one argument", node)
-            elif name == "iter":
-                if len(node.args) == 1:
-                    arg_node = node.args[0]
-                    if self._is_obj_expr(arg_node):
-                        obj = self._emit_expr_value(arg_node)
-                        obj = self._ensure_ptr(obj)
-                        name_ptr = self._make_string_constant("__iter__")
-                        return self.builder.call(
-                            self.runtime["obj_call_method0"],
-                            [obj, name_ptr])
-                    return self._emit_expr_value(arg_node)
-                return self._bridge_fallback_expr(node, "iter() with sentinel form")
-            elif name == "abs":
-                if len(node.args) == 1:
-                    # Complex abs: |a+bi| = sqrt(a^2 + b^2)
-                    arg_node = node.args[0]
-                    if self._is_complex_expr(arg_node):
-                        val = self._emit_expr_value(arg_node)
-                        ptr = self.builder.inttoptr(val, i8_ptr)
-                        return self.builder.call(
-                            self.runtime["complex_abs"], [ptr])
-                    if (isinstance(arg_node, ast.Call)
-                            and isinstance(arg_node.func, ast.Name)
-                            and arg_node.func.id == "complex"):
-                        val = self._emit_expr_value(arg_node)
-                        ptr = self.builder.inttoptr(val, i8_ptr)
-                        return self.builder.call(
-                            self.runtime["complex_abs"], [ptr])
-                    # Object __abs__: dispatch to dunder (returns object)
-                    if self._is_obj_expr(arg_node):
-                        obj = self._emit_expr_value(arg_node)
-                        obj = self._ensure_ptr(obj)
-                        name_ptr = self._make_string_constant("__abs__")
-                        result_i64 = self.builder.call(
-                            self.runtime["obj_call_method0"],
-                            [obj, name_ptr])
-                        return self.builder.inttoptr(result_i64, i8_ptr)
-                    val = self._emit_expr_value(arg_node)
-                    if isinstance(val.type, ir.IntType):
-                        neg = self.builder.neg(val)
-                        is_neg = self.builder.icmp_signed("<", val, ir.Constant(i64, 0))
-                        return self.builder.select(is_neg, neg, val)
-                    elif isinstance(val.type, ir.DoubleType):
-                        fabs_fn = self.module.declare_intrinsic("llvm.fabs", [double])
-                        return self.builder.call(fabs_fn, [val])
-                return self._bridge_fallback_expr(node, "abs() with wrong args")
-            elif name == "divmod":
-                if len(node.args) == 2:
-                    a = self._emit_expr_value(node.args[0])
-                    b = self._emit_expr_value(node.args[1])
-                    q_alloca = self._create_entry_alloca(i64, "dm.q")
-                    r_alloca = self._create_entry_alloca(i64, "dm.r")
-                    self.builder.call(self.runtime["divmod"], [a, b, q_alloca, r_alloca])
-                    q_val = self.builder.load(q_alloca)
-                    r_val = self.builder.load(r_alloca)
-                    # Build a 2-tuple for the result (via FV-ABI append)
-                    tup = self.builder.call(self.runtime["tuple_new"], [])
-                    int_tag = ir.Constant(i32, FPY_TAG_INT)
-                    self._rt_call("list_append_fv", [tup, int_tag, q_val])
-                    self._rt_call("list_append_fv", [tup, int_tag, r_val])
-                    return tup
-                raise CodeGenError("divmod() takes exactly 2 arguments", node)
-            elif name == "pow":
-                if len(node.args) == 2:
-                    b = self._emit_expr_value(node.args[0])
-                    e = self._emit_expr_value(node.args[1])
-                    if isinstance(b.type, ir.DoubleType) or isinstance(e.type, ir.DoubleType):
-                        if isinstance(b.type, ir.IntType):
-                            b = self.builder.sitofp(b, double)
-                        if isinstance(e.type, ir.IntType):
-                            e = self.builder.sitofp(e, double)
-                        return self.builder.call(self.runtime["pow_float"], [b, e])
-                    return self.builder.call(self.runtime["pow_int"], [b, e])
-                if len(node.args) == 3:
-                    b = self._emit_expr_value(node.args[0])
-                    e = self._emit_expr_value(node.args[1])
-                    m = self._emit_expr_value(node.args[2])
-                    return self.builder.call(self.runtime["pow_mod"], [b, e, m])
-                raise CodeGenError("pow() takes 2 or 3 arguments", node)
-            elif name == "chr":
-                if len(node.args) == 1:
-                    val = self._emit_expr_value(node.args[0])
-                    return self.builder.call(self.runtime["chr"], [val])
-                raise CodeGenError("chr() takes exactly one argument", node)
-            elif name == "ord":
-                if len(node.args) == 1:
-                    val = self._emit_expr_value(node.args[0])
-                    return self._rt_call("ord", [val])
-                raise CodeGenError("ord() takes exactly one argument", node)
-            elif name == "hex":
-                if len(node.args) == 1:
-                    val = self._emit_expr_value(node.args[0])
-                    return self.builder.call(self.runtime["hex"], [val])
-                raise CodeGenError("hex() takes exactly one argument", node)
-            elif name == "oct":
-                if len(node.args) == 1:
-                    val = self._emit_expr_value(node.args[0])
-                    return self.builder.call(self.runtime["oct"], [val])
-                raise CodeGenError("oct() takes exactly one argument", node)
-            elif name == "bin":
-                if len(node.args) == 1:
-                    val = self._emit_expr_value(node.args[0])
-                    return self.builder.call(self.runtime["bin"], [val])
-                raise CodeGenError("bin() takes exactly one argument", node)
-            elif name == "round":
-                if len(node.args) == 1:
-                    # Use FV dispatch to handle bridge float values stored as i64
-                    fv = self._load_or_wrap_fv(node.args[0])
-                    tag = self.builder.extract_value(fv, 0)
-                    data = self.builder.extract_value(fv, 1)
-                    is_float = self.builder.icmp_signed(
-                        "==", tag, ir.Constant(i32, FPY_TAG_FLOAT))
-                    as_float = self.builder.bitcast(data, double)
-                    as_int_float = self.builder.sitofp(data, double)
-                    val = self.builder.select(is_float, as_float, as_int_float)
-                    # round(int) should return int; round(float) uses runtime
-                    # For simplicity, always go through round() runtime
-                    return self.builder.call(self.runtime["round"], [val])
-                if len(node.args) == 2:
-                    # Use FV dispatch for runtime-tag-aware float detection
-                    fv = self._load_or_wrap_fv(node.args[0])
-                    tag = self.builder.extract_value(fv, 0)
-                    data = self.builder.extract_value(fv, 1)
-                    ndigits = self._emit_expr_value(node.args[1])
-                    is_float = self.builder.icmp_signed(
-                        "==", tag, ir.Constant(i32, FPY_TAG_FLOAT))
-                    as_float = self.builder.bitcast(data, double)
-                    as_int_float = self.builder.sitofp(data, double)
-                    val = self.builder.select(is_float, as_float, as_int_float)
-                    return self.builder.call(self.runtime["round_ndigits"], [val, ndigits])
-                raise CodeGenError("round() takes 1 or 2 arguments", node)
-            elif name == "repr":
-                if len(node.args) == 1:
-                    arg_node = node.args[0]
-                    # OBJ fast path: use obj_to_repr which handles
-                    # __repr__ → __str__ → default fallback safely
-                    if self._is_obj_expr(arg_node):
-                        obj = self._emit_expr_value(arg_node)
-                        obj = self._ensure_ptr(obj)
-                        result = self.builder.call(
-                            self.runtime["obj_to_repr"], [obj])
-                        return self.builder.inttoptr(result, i8_ptr)
-                    # Use FV dispatch so runtime tag drives the conversion.
-                    fv = self._load_or_wrap_fv(node.args[0])
-                    return self._fv_call_repr(fv)
-                raise CodeGenError("repr() takes exactly one argument", node)
-            elif name == "sum":
-                # Phase 2: use TypedValue to accept lists, tuples, and sets
-                tv_sum = self._emit_expr(node.args[0]) if node.args else None
-                sum_kind = tv_sum.vtype.kind if tv_sum else VKind.UNKNOWN
-                is_iterable = (sum_kind in (VKind.LIST, VKind.TUPLE, VKind.SET)
-                               or self._is_list_expr(node.args[0]) if node.args else False)
-                if len(node.args) >= 1 and is_iterable:
-                    # Convert set to list first
-                    if sum_kind == VKind.SET:
-                        lst = self._rt_call("set_to_list",
-                                            [tv_sum.as_ptr(self.builder)])
-                    else:
-                        lst = tv_sum.as_ptr(self.builder)
-                    length = self._rt_call("list_length", [lst])
-                    sum_alloca = self._create_entry_alloca(i64, "sum.acc")
-                    # Optional start value
-                    if len(node.args) >= 2:
-                        start_val = self._emit_expr_value(node.args[1])
-                        self.builder.store(start_val, sum_alloca)
-                    else:
-                        self.builder.store(ir.Constant(i64, 0), sum_alloca)
-                    idx_alloca = self._create_entry_alloca(i64, "sum.idx")
-                    self.builder.store(ir.Constant(i64, 0), idx_alloca)
-
-                    cond_block = self._new_block("sum.cond")
-                    body_block = self._new_block("sum.body")
-                    end_block = self._new_block("sum.end")
-
-                    self.builder.branch(cond_block)
-                    self.builder.position_at_end(cond_block)
-                    idx = self.builder.load(idx_alloca)
-                    cond = self.builder.icmp_signed("<", idx, length)
-                    self.builder.cbranch(cond, body_block, end_block)
-
-                    self.builder.position_at_end(body_block)
-                    idx = self.builder.load(idx_alloca)
-                    elem = self._list_get_as_bare(lst, idx, "int")
-                    acc = self.builder.load(sum_alloca)
-                    self.builder.store(self.builder.add(acc, elem), sum_alloca)
-                    self.builder.store(self.builder.add(idx, ir.Constant(i64, 1)), idx_alloca)
-                    self.builder.branch(cond_block)
-
-                    self.builder.position_at_end(end_block)
-                    return self.builder.load(sum_alloca)
-                raise CodeGenError("sum() requires a list argument", node)
-            elif name in ("set", "frozenset"):
-                if len(node.args) == 1:
-                    arg = self._emit_expr_value(node.args[0])
-                    return self._rt_call("set_from_list", [arg])
-                if len(node.args) == 0:
-                    return self.builder.call(self.runtime["dict_new"], [])
-                raise CodeGenError(f"{name}() takes 0 or 1 arguments", node)
-            elif name == "min" or name == "max":
-                # Extract key= kwarg if provided. Supports `key=len` (for
-                # strings) and `key=<user_function>` that returns int.
-                key_func_name: str | None = None
-                key_func_ptr = None  # for lambda/closure keys
-                for kw in node.keywords:
-                    if kw.arg == "key":
-                        if isinstance(kw.value, ast.Name):
-                            key_func_name = kw.value.id
-                        elif isinstance(kw.value, ast.Lambda):
-                            # Compile lambda as i64(i64) function pointer
-                            key_func_ptr = self._get_unary_func_ptr(kw.value, node)
-                            key_func_name = "__lambda__"
-                # Phase 2: use TypedValue to also accept tuples and sets
-                tv_mm = self._emit_expr(node.args[0]) if len(node.args) == 1 else None
-                mm_kind = tv_mm.vtype.kind if tv_mm else VKind.UNKNOWN
-                mm_ok = (mm_kind in (VKind.LIST, VKind.TUPLE, VKind.SET)
-                         or (len(node.args) == 1 and self._is_list_expr(node.args[0])))
-                if len(node.args) == 1 and mm_ok:
-                    if mm_kind == VKind.SET:
-                        lst = self._rt_call("set_to_list",
-                                            [tv_mm.as_ptr(self.builder)])
-                    else:
-                        lst = tv_mm.as_ptr(self.builder) if tv_mm else \
-                              self._emit_expr_value(node.args[0])
-                    length = self._rt_call("list_length", [lst])
-                    elem_type = self._get_list_elem_type(node.args[0])
-                    is_str = (elem_type == "str")
-                    # Pointer-based element types: str, list, tuple, dict, etc.
-                    is_ptr = elem_type in ("str", "list", "tuple", "dict",
-                                            "set", "deque", "bytes", "obj")
-                    result_type = i8_ptr if is_ptr else i64
-                    bare_tag = elem_type if is_ptr else "int"
-
-                    # OBJ elements: use runtime min/max that dispatches
-                    # to __lt__ — no need for our own loop
-                    if elem_type == "obj":
-                        rt_name = "list_min_fv" if name == "min" else "list_max_fv"
-                        data_i64 = self.builder.call(self.runtime[rt_name], [lst])
-                        return self.builder.inttoptr(data_i64, i8_ptr)
-
-                    result_alloca = self._create_entry_alloca(result_type, f"{name}.result")
-                    first = self._list_get_as_bare(
-                        lst, ir.Constant(i64, 0), bare_tag)
-                    self.builder.store(first, result_alloca)
-
-                    def _apply_key(e):
-                        """Apply the key function to an element, returning i64."""
-                        if key_func_name is None:
-                            return e
-                        if key_func_name == "__lambda__":
-                            # Call through function pointer
-                            fn_typed = self.builder.bitcast(
-                                key_func_ptr,
-                                ir.PointerType(ir.FunctionType(i64, [i64])))
-                            arg = e
-                            if isinstance(e.type, ir.PointerType):
-                                arg = self.builder.ptrtoint(e, i64)
-                            return self.builder.call(fn_typed, [arg])
-                        if key_func_name == "len":
-                            # len on strings returns int64
-                            if isinstance(e.type, ir.PointerType):
-                                return self.builder.call(
-                                    self.runtime["str_len"], [e])
-                            if isinstance(e.type, ir.IntType):
-                                return self.builder.call(
-                                    self.runtime["list_length"], [
-                                        self.builder.inttoptr(e, i8_ptr)])
-                            return ir.Constant(i64, 0)
-                        if key_func_name == "abs":
-                            neg = self.builder.neg(e)
-                            is_neg = self.builder.icmp_signed(
-                                "<", e, ir.Constant(i64, 0))
-                            return self.builder.select(is_neg, neg, e)
-                        # User function call
-                        if key_func_name in self._user_functions:
-                            info = self._user_functions[key_func_name]
-                            fv = self._wrap_arg_value(e, None)
-                            ret = self.builder.call(info.func, [fv])
-                            if info.uses_fv_abi:
-                                return self._unwrap_return_value(ret, info)
-                            return ret
-                        return e
-
-                    # Track the best *key value*, but return the original
-                    # element. Store both key-of-best and best-element.
-                    # Only create key_alloca when a key= was specified.
-                    key_alloca = None
-                    if key_func_name is not None:
-                        key_alloca = self._create_entry_alloca(
-                            i64, f"{name}.keybest")
-                        first_key = _apply_key(first)
-                        if first_key.type != i64:
-                            if isinstance(first_key.type, ir.IntType):
-                                first_key = self.builder.zext(first_key, i64)
-                        self.builder.store(first_key, key_alloca)
-                    idx_alloca = self._create_entry_alloca(i64, f"{name}.idx")
-                    self.builder.store(ir.Constant(i64, 1), idx_alloca)
-
-                    cond_block = self._new_block(f"{name}.cond")
-                    body_block = self._new_block(f"{name}.body")
-                    end_block = self._new_block(f"{name}.end")
-
-                    self.builder.branch(cond_block)
-                    self.builder.position_at_end(cond_block)
-                    idx = self.builder.load(idx_alloca)
-                    cond = self.builder.icmp_signed("<", idx, length)
-                    self.builder.cbranch(cond, body_block, end_block)
-
-                    self.builder.position_at_end(body_block)
-                    idx = self.builder.load(idx_alloca)
-                    current = self.builder.load(result_alloca)
-                    if key_func_name is not None:
-                        elem = self._list_get_as_bare(lst, idx, bare_tag)
-                        elem_key = _apply_key(elem)
-                        if elem_key.type != i64 and isinstance(elem_key.type, ir.IntType):
-                            elem_key = self.builder.zext(elem_key, i64)
-                        best_key = self.builder.load(key_alloca)
-                        op = "<" if name == "min" else ">"
-                        is_better = self.builder.icmp_signed(op, elem_key, best_key)
-                        # Update best key and element
-                        new_key = self.builder.select(is_better, elem_key, best_key)
-                        self.builder.store(new_key, key_alloca)
-                        new_elem = self.builder.select(is_better, elem, current)
-                        self.builder.store(new_elem, result_alloca)
-                    elif is_str:
-                        elem = self._list_get_as_bare(lst, idx, "str")
-                        cmp_result = self._rt_call("str_compare", [elem, current])
-                        op = "<" if name == "min" else ">"
-                        is_better = self.builder.icmp_signed(op, cmp_result, ir.Constant(i64, 0))
-                        new_val = self.builder.select(is_better, elem, current)
-                        self.builder.store(new_val, result_alloca)
-                    else:
-                        elem = self._list_get_as_bare(lst, idx, "int")
-                        op = "<" if name == "min" else ">"
-                        is_better = self.builder.icmp_signed(op, elem, current)
-                        new_val = self.builder.select(is_better, elem, current)
-                        self.builder.store(new_val, result_alloca)
-                    self.builder.store(self.builder.add(idx, ir.Constant(i64, 1)), idx_alloca)
-                    self.builder.branch(cond_block)
-
-                    self.builder.position_at_end(end_block)
-                    return self.builder.load(result_alloca)
-                if len(node.args) >= 2:
-                    # min/max with multiple inline args: min(a, b, c, ...)
-                    result = self._emit_expr_value(node.args[0])
-                    op = "<" if name == "min" else ">"
-                    for arg_node in node.args[1:]:
-                        other = self._emit_expr_value(arg_node)
-                        # Use fcmp for floats, icmp for ints
-                        if isinstance(result.type, ir.DoubleType):
-                            is_better = self.builder.fcmp_ordered(op, other, result)
-                        else:
-                            is_better = self.builder.icmp_signed(op, other, result)
-                        result = self.builder.select(is_better, other, result)
-                    return result
-                return self._bridge_fallback_expr(node, f"{name}() with unsupported args")
         # Unknown builtins: route through CPython bridge
         # This handles bytearray(), frozenset(), slice(), complex(), etc.
         # Only for names that aren't local variables, user functions, or classes.
