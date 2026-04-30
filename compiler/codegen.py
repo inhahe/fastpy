@@ -26564,460 +26564,421 @@ class CodeGen:
         self.builder.position_at_end(end_block)
         return result
 
+
+    # ── Module dispatch handlers (Phase B1 extraction) ──────────────────
+
+    def _emit_json_call(self, func_name, node):
+        """json.dumps / json.loads"""
+        if func_name == "dumps" and len(node.args) == 1 and not node.keywords:
+            val = self._emit_expr_value(node.args[0])
+            tag, data = self._bare_to_tag_data(val, node.args[0])
+            return self.builder.call(self.runtime["json_dumps"],
+                                     [ir.Constant(i32, tag), data])
+        if func_name == "loads" and len(node.args) == 1:
+            arg = self._emit_expr_value(node.args[0])
+            arg = self._ensure_ptr(arg)
+            out_tag = self._create_entry_alloca(i32, "json.tag")
+            out_data = self._create_entry_alloca(i64, "json.data")
+            self.builder.call(self.runtime["json_loads"],
+                              [arg, out_tag, out_data])
+            data_val = self.builder.load(out_data)
+            return self.builder.inttoptr(data_val, i8_ptr)
+        return None
+
+    def _emit_os_call(self, func_name, node):
+        """os.getcwd / os.listdir / os.getenv + os.path functions"""
+        if func_name == "getcwd" and len(node.args) == 0:
+            return self.builder.call(self.runtime["os_getcwd"], [])
+        if func_name == "listdir" and len(node.args) == 1:
+            v = self._emit_expr_value(node.args[0])
+            v = self._ensure_ptr(v)
+            return self.builder.call(self.runtime["os_listdir"], [v])
+        if func_name == "getenv" and len(node.args) == 1:
+            v = self._emit_expr_value(node.args[0])
+            v = self._ensure_ptr(v)
+            result = self.builder.call(self.runtime["os_getenv"], [v])
+            is_null = self.builder.icmp_unsigned(
+                "==", result, ir.Constant(i8_ptr, None))
+            return self.builder.select(
+                is_null, ir.Constant(i8_ptr, None), result)
+        # os.path functions
+        _os_path_fns = {
+            "exists": ("os_path_exists", 1),
+            "isfile": ("os_path_isfile", 1),
+            "isdir": ("os_path_isdir", 1),
+            "join": ("os_path_join", 2),
+            "basename": ("os_path_basename", 1),
+            "dirname": ("os_path_dirname", 1),
+        }
+        if func_name in _os_path_fns:
+            rt_key, n_args = _os_path_fns[func_name]
+            if len(node.args) == n_args:
+                args = [self._ensure_ptr(self._emit_expr_value(node.args[i]))
+                        for i in range(n_args)]
+                return self.builder.call(self.runtime[rt_key], args)
+        return None
+
+    def _emit_asyncio_call(self, func_name, node):
+        """asyncio.run / asyncio.gather / asyncio.sleep (AOT: synchronous)"""
+        if func_name == "run" and len(node.args) == 1:
+            arg = node.args[0]
+            if (isinstance(arg, ast.Call)
+                    and isinstance(arg.func, ast.Name)
+                    and arg.func.id in self._user_functions
+                    and self._user_functions[arg.func.id].ret_tag == "void"):
+                self._emit_user_call(arg)
+                return ir.Constant(i64, 0)
+            return self._emit_expr_value(arg)
+        if func_name == "gather":
+            lst = self.builder.call(self.runtime["list_new"], [])
+            for arg_node in node.args:
+                val = self._emit_expr_value(arg_node)
+                tag, data = self._bare_to_tag_data(val, arg_node)
+                self.builder.call(self.runtime["list_append_fv"],
+                                  [lst, ir.Constant(i32, tag), data])
+            return lst
+        if func_name == "sleep":
+            if len(node.args) == 1:
+                val = self._emit_expr_value(node.args[0])
+                if isinstance(val.type, ir.IntType):
+                    val = self.builder.sitofp(val, double)
+            return ir.Constant(i64, 0)
+        return None
+
+    def _emit_typing_call(self, func_name, node):
+        """typing.cast / typing.TypeVar (no-ops at runtime)"""
+        if func_name == "cast" and len(node.args) == 2:
+            return self._emit_expr_value(node.args[1])
+        if func_name == "TypeVar":
+            return ir.Constant(i64, 0)
+        return None
+
+    def _emit_copy_call(self, func_name, node):
+        """copy.copy / copy.deepcopy"""
+        if func_name in ("copy", "deepcopy") and len(node.args) == 1:
+            val = self._emit_expr_value(node.args[0])
+            tag, data = self._bare_to_tag_data(val, node.args[0])
+            out_tag = self._create_entry_alloca(i32, "copy.tag")
+            out_data = self._create_entry_alloca(i64, "copy.data")
+            rt_key = "copy_copy" if func_name == "copy" else "copy_deepcopy"
+            self.builder.call(self.runtime[rt_key],
+                              [ir.Constant(i32, tag), data, out_tag, out_data])
+            result = self.builder.load(out_data)
+            inferred = self._infer_type_tag(node.args[0], val)
+            if inferred not in ("int", "float", "bool", "none", "unknown"):
+                result = self.builder.inttoptr(result, i8_ptr)
+            return result
+        return None
+
+    def _emit_operator_call(self, func_name, node):
+        """operator.add/sub/mul/neg/abs/itemgetter/attrgetter"""
+        _op_funcs = {
+            "add": "operator_add", "sub": "operator_sub",
+            "mul": "operator_mul",
+        }
+        if func_name in _op_funcs and len(node.args) == 2:
+            a = self._emit_expr_value(node.args[0])
+            b = self._emit_expr_value(node.args[1])
+            return self.builder.call(
+                self.runtime[_op_funcs[func_name]], [a, b])
+        if func_name in ("itemgetter", "attrgetter"):
+            return ir.Constant(i64, 0)
+        if func_name == "neg" and len(node.args) == 1:
+            a = self._emit_expr_value(node.args[0])
+            return self.builder.neg(a)
+        if func_name == "abs" and len(node.args) == 1:
+            return self._emit_expr_value(
+                ast.Call(func=ast.Name(id="abs", ctx=ast.Load()),
+                         args=node.args, keywords=[]))
+        return None
+
+    def _emit_textwrap_call(self, func_name, node):
+        """textwrap.dedent / textwrap.indent"""
+        if func_name == "dedent" and len(node.args) == 1:
+            arg = self._emit_expr_value(node.args[0])
+            arg = self._ensure_ptr(arg)
+            return self.builder.call(self.runtime["textwrap_dedent"], [arg])
+        if func_name == "indent" and len(node.args) == 2:
+            text = self._emit_expr_value(node.args[0])
+            prefix = self._emit_expr_value(node.args[1])
+            text = self._ensure_ptr(text)
+            prefix = self._ensure_ptr(prefix)
+            return self.builder.call(self.runtime["textwrap_indent"],
+                                      [text, prefix])
+        return None
+
+    def _emit_shutil_call(self, func_name, node):
+        """shutil.copy/copy2/copyfile/rmtree"""
+        if func_name in ("copy", "copy2", "copyfile") and len(node.args) == 2:
+            src = self._emit_expr_value(node.args[0])
+            dst = self._emit_expr_value(node.args[1])
+            src = self._ensure_ptr(src)
+            dst = self._ensure_ptr(dst)
+            self.builder.call(self.runtime["shutil_copy"], [src, dst])
+            return ir.Constant(i64, 0)
+        if func_name == "rmtree" and len(node.args) == 1:
+            path = self._emit_expr_value(node.args[0])
+            path = self._ensure_ptr(path)
+            self.builder.call(self.runtime["shutil_rmtree"], [path])
+            return ir.Constant(i64, 0)
+        return None
+
+    def _emit_glob_call(self, func_name, node):
+        """glob.glob"""
+        if func_name == "glob" and len(node.args) == 1:
+            pattern = self._emit_expr_value(node.args[0])
+            pattern = self._ensure_ptr(pattern)
+            return self.builder.call(self.runtime["glob_glob"], [pattern])
+        return None
+
+    def _emit_tempfile_call(self, func_name, node):
+        """tempfile.gettempdir / tempfile.mkdtemp"""
+        if func_name == "gettempdir" and len(node.args) == 0:
+            return self.builder.call(self.runtime["tempfile_gettempdir"], [])
+        if func_name == "mkdtemp" and len(node.args) == 0:
+            return self.builder.call(self.runtime["tempfile_mkdtemp"], [])
+        return None
+
+    def _emit_heapq_call(self, func_name, node):
+        """heapq.heapify/heappush/heappop/nsmallest"""
+        if func_name == "heapify" and len(node.args) == 1:
+            lst = self._emit_expr_value(node.args[0])
+            lst = self._ensure_ptr(lst)
+            self.builder.call(self.runtime["heapq_heapify"], [lst])
+            return ir.Constant(i64, 0)
+        if func_name == "heappush" and len(node.args) == 2:
+            lst = self._emit_expr_value(node.args[0])
+            lst = self._ensure_ptr(lst)
+            val = self._emit_expr_value(node.args[1])
+            tag, data = self._bare_to_tag_data(val, node.args[1])
+            self.builder.call(self.runtime["heapq_heappush"],
+                              [lst, ir.Constant(i32, tag), data])
+            return ir.Constant(i64, 0)
+        if func_name == "heappop" and len(node.args) == 1:
+            lst = self._emit_expr_value(node.args[0])
+            lst = self._ensure_ptr(lst)
+            return self.builder.call(self.runtime["heapq_heappop"], [lst])
+        if func_name == "nsmallest" and len(node.args) == 2:
+            n = self._emit_expr_value(node.args[0])
+            lst = self._emit_expr_value(node.args[1])
+            lst = self._ensure_ptr(lst)
+            return self.builder.call(self.runtime["heapq_nsmallest"], [n, lst])
+        return None
+
+    def _emit_bisect_call(self, func_name, node):
+        """bisect.bisect_left/bisect_right/insort"""
+        if func_name in ("bisect_left", "bisect") and len(node.args) == 2:
+            lst = self._emit_expr_value(node.args[0])
+            lst = self._ensure_ptr(lst)
+            x = self._emit_expr_value(node.args[1])
+            return self.builder.call(self.runtime["bisect_left"], [lst, x])
+        if func_name == "bisect_right" and len(node.args) == 2:
+            lst = self._emit_expr_value(node.args[0])
+            lst = self._ensure_ptr(lst)
+            x = self._emit_expr_value(node.args[1])
+            return self.builder.call(self.runtime["bisect_right"], [lst, x])
+        if func_name == "insort" and len(node.args) == 2:
+            lst = self._emit_expr_value(node.args[0])
+            lst = self._ensure_ptr(lst)
+            x = self._emit_expr_value(node.args[1])
+            self.builder.call(self.runtime["bisect_insort"], [lst, x])
+            return ir.Constant(i64, 0)
+        return None
+
+    def _emit_decimal_call(self, func_name, node):
+        """decimal.Decimal constructor"""
+        if func_name == "Decimal":
+            if len(node.args) == 0:
+                return self.builder.call(self.runtime["decimal_from_int"],
+                                          [ir.Constant(i64, 0)])
+            arg = self._emit_expr_value(node.args[0])
+            if isinstance(arg.type, ir.PointerType):
+                return self.builder.call(self.runtime["decimal_from_str"], [arg])
+            if isinstance(arg.type, ir.IntType):
+                if (isinstance(node.args[0], ast.Constant)
+                        and isinstance(node.args[0].value, str)):
+                    s = self._make_string_constant(node.args[0].value)
+                    return self.builder.call(self.runtime["decimal_from_str"], [s])
+                return self.builder.call(self.runtime["decimal_from_int"], [arg])
+            return self.builder.call(self.runtime["decimal_from_int"],
+                                      [ir.Constant(i64, 0)])
+        return None
+
+    def _emit_platform_call(self, func_name, node):
+        """platform.python_version"""
+        if func_name == "python_version":
+            return self._make_string_constant("3.14.0")
+        return None
+
+    def _emit_weakref_call(self, func_name, node):
+        """weakref.ref"""
+        if func_name == "ref" and len(node.args) >= 1:
+            arg = self._emit_expr_value(node.args[0])
+            arg = self._ensure_ptr(arg)
+            wr = self.builder.call(self.runtime["weakref_new"], [arg])
+            return self.builder.ptrtoint(wr, i64)
+        return None
+
+    def _emit_base64_call(self, func_name, node):
+        """base64.b64encode / base64.b64decode"""
+        if func_name == "b64encode" and len(node.args) == 1:
+            arg = self._emit_expr_value(node.args[0])
+            arg = self._ensure_ptr(arg)
+            return self.builder.call(self.runtime["base64_b64encode"], [arg])
+        if func_name == "b64decode" and len(node.args) == 1:
+            arg = self._emit_expr_value(node.args[0])
+            arg = self._ensure_ptr(arg)
+            return self.builder.call(self.runtime["base64_b64decode"], [arg])
+        return None
+
+    def _emit_sys_call(self, func_name, node):
+        """sys.exit"""
+        if func_name == "exit":
+            code = ir.Constant(i64, 0)
+            if len(node.args) >= 1:
+                code = self._emit_expr_value(node.args[0])
+                if isinstance(code.type, ir.DoubleType):
+                    code = self.builder.fptosi(code, i64)
+            self.builder.call(self.runtime["sys_exit"], [code])
+            return ir.Constant(i64, 0)
+        return None
+
+    def _emit_time_call(self, func_name, node):
+        """time.time/time_ns/perf_counter/perf_counter_ns/monotonic/sleep"""
+        if func_name == "time" and len(node.args) == 0:
+            return self.builder.call(self.runtime["time_time"], [])
+        if func_name == "time_ns" and len(node.args) == 0:
+            return self.builder.call(self.runtime["time_time_ns"], [])
+        if func_name == "perf_counter" and len(node.args) == 0:
+            return self.builder.call(self.runtime["time_perf_counter"], [])
+        if func_name == "perf_counter_ns" and len(node.args) == 0:
+            t = self.builder.call(self.runtime["time_perf_counter"], [])
+            ns = self.builder.fmul(t, ir.Constant(double, 1e9))
+            return self.builder.fptosi(ns, i64)
+        if func_name == "monotonic" and len(node.args) == 0:
+            return self.builder.call(self.runtime["time_monotonic"], [])
+        if func_name == "sleep" and len(node.args) == 1:
+            val = self._emit_expr_value(node.args[0])
+            if isinstance(val.type, ir.IntType):
+                val = self.builder.sitofp(val, double)
+            self.builder.call(self.runtime["time_sleep"], [val])
+            return ir.Constant(i64, 0)
+        return None
+
+    def _emit_contextlib_call(self, func_name, node):
+        """contextlib.contextmanager/suppress/closing"""
+        if func_name == "contextmanager":
+            if len(node.args) == 1:
+                return self._emit_expr_value(node.args[0])
+            return ir.Constant(i64, 0)
+        if func_name == "suppress":
+            return ir.Constant(i64, 0)
+        if func_name == "closing":
+            if len(node.args) == 1:
+                return self._emit_expr_value(node.args[0])
+            return ir.Constant(i64, 0)
+        return None
+
+    # Modules that have no native implementation — always fall through to
+    # CPython bridge.  Checked before the dispatch table to avoid lookups.
+    _BRIDGE_ONLY_MODULES = frozenset({
+        "secrets", "uuid", "hashlib", "string", "io", "warnings",
+        "enum", "dataclasses",
+        "traceback", "pprint", "unittest", "argparse",
+        "datetime", "statistics", "array",
+        "threading", "subprocess", "pickle", "csv",
+        "signal", "atexit", "gc", "inspect", "types",
+        "numbers", "fractions",
+    })
+
+    # Module name → handler method name.
+    # Each handler has signature (self, func_name, node) -> ir.Value | None.
+    _MODULE_DISPATCH = {
+        "json": "_emit_json_call",
+        "os": "_emit_os_call",
+        "os.path": "_emit_os_call",
+        "asyncio": "_emit_asyncio_call",
+        "collections": "_emit_collections_call",
+        "_collections": "_emit_collections_call",
+        "typing": "_emit_typing_call",
+        "functools": "_emit_functools_call",
+        "_functools": "_emit_functools_call",
+        "logging": "_emit_logging_call",
+        "pathlib": "_emit_pathlib_call",
+        "random": "_emit_random_call",
+        "copy": "_emit_copy_call",
+        "operator": "_emit_operator_call",
+        "textwrap": "_emit_textwrap_call",
+        "shutil": "_emit_shutil_call",
+        "glob": "_emit_glob_call",
+        "tempfile": "_emit_tempfile_call",
+        "heapq": "_emit_heapq_call",
+        "bisect": "_emit_bisect_call",
+        "decimal": "_emit_decimal_call",
+        "platform": "_emit_platform_call",
+        "weakref": "_emit_weakref_call",
+        "_weakref": "_emit_weakref_call",
+        "base64": "_emit_base64_call",
+        "struct": "_emit_struct_call",
+        "itertools": "_emit_itertools_call",
+        "sys": "_emit_sys_call",
+        "time": "_emit_time_call",
+        "contextlib": "_emit_contextlib_call",
+    }
+
     def _emit_native_module_call(self, mod_name: str, func_name: str,
-                                  node: ast.Call) -> ir.Value | None:
+                                  node: ast.Call) -> 'ir.Value | None':
         """Emit a native module function call (e.g. math.sqrt(x)).
         Returns the result value, or None if the function isn't natively supported."""
-        if mod_name in self._NATIVE_MODULES:
-            # math module
-            if func_name in self._MATH_FUNCTIONS:
-                rt_key, n_expected = self._MATH_FUNCTIONS[func_name]
-                if len(node.args) == n_expected:
-                    args = []
-                    for arg_node in node.args:
-                        val = self._emit_expr_value(arg_node)
-                        # Convert to double if needed
-                        if isinstance(val.type, ir.IntType):
-                            val = self.builder.sitofp(val, double)
-                        elif isinstance(val.type, ir.PointerType):
-                            # pyobj — convert through bridge
-                            val = self._convert_pyobj_to_numeric(val, arg_node)
-                            if val is None:
-                                return None
-                        args.append(val)
-                    result = self.builder.call(self.runtime[rt_key], args)
-                    # floor() and ceil() return int in Python (not float)
-                    if func_name in ("floor", "ceil"):
-                        return self.builder.fptosi(result, i64)
-                    return result
-                # Special case: math.log(x, base) — 2-arg log
-                if func_name == "log" and len(node.args) == 2:
-                    x = self._emit_expr_value(node.args[0])
-                    base = self._emit_expr_value(node.args[1])
-                    if isinstance(x.type, ir.IntType):
-                        x = self.builder.sitofp(x, double)
-                    if isinstance(base.type, ir.IntType):
-                        base = self.builder.sitofp(base, double)
-                    log_x = self.builder.call(self.runtime["math_log"], [x])
-                    log_base = self.builder.call(self.runtime["math_log"], [base])
-                    return self.builder.fdiv(log_x, log_base)
-            # json module
-            if mod_name == "json":
-                if func_name == "dumps" and len(node.args) == 1 and not node.keywords:
-                    val = self._emit_expr_value(node.args[0])
-                    tag, data = self._bare_to_tag_data(val, node.args[0])
-                    return self.builder.call(self.runtime["json_dumps"],
-                                             [ir.Constant(i32, tag), data])
-                if func_name == "loads" and len(node.args) == 1:
-                    arg = self._emit_expr_value(node.args[0])
-                    arg = self._ensure_ptr(arg)
-                    out_tag = self._create_entry_alloca(i32, "json.tag")
-                    out_data = self._create_entry_alloca(i64, "json.data")
-                    self.builder.call(self.runtime["json_loads"],
-                                      [arg, out_tag, out_data])
-                    # Return the data as a pointer (most JSON is dict/list)
-                    data_val = self.builder.load(out_data)
-                    return self.builder.inttoptr(data_val, i8_ptr)
-            # os module
-            elif mod_name in ("os", "os.path"):
-                def _str_arg(idx=0):
-                    v = self._emit_expr_value(node.args[idx])
-                    if isinstance(v.type, ir.IntType):
-                        return self.builder.inttoptr(v, i8_ptr)
-                    return v
-                if func_name == "getcwd" and len(node.args) == 0:
-                    return self.builder.call(self.runtime["os_getcwd"], [])
-                if func_name == "listdir" and len(node.args) == 1:
-                    return self.builder.call(self.runtime["os_listdir"],
-                                             [_str_arg()])
-                if func_name == "getenv" and len(node.args) == 1:
-                    result = self.builder.call(self.runtime["os_getenv"],
-                                               [_str_arg()])
-                    # Returns NULL for missing env var → None
-                    is_null = self.builder.icmp_unsigned(
-                        "==", result, ir.Constant(i8_ptr, None))
-                    return self.builder.select(
-                        is_null,
-                        ir.Constant(i8_ptr, None),
-                        result)
-            # os.path functions (accessed as os.path.func via chained attr)
-            # Also support from-import: from os.path import exists
-            _os_path_fns = {
-                "exists": ("os_path_exists", 1, "bool"),
-                "isfile": ("os_path_isfile", 1, "bool"),
-                "isdir": ("os_path_isdir", 1, "bool"),
-                "join": ("os_path_join", 2, "str"),
-                "basename": ("os_path_basename", 1, "str"),
-                "dirname": ("os_path_dirname", 1, "str"),
-            }
-            # asyncio module — since async functions compile synchronously,
-            # asyncio.run() is a no-op wrapper and asyncio.gather() collects results.
-            if mod_name == "asyncio":
-                if func_name == "run" and len(node.args) == 1:
-                    # The coroutine already executed (await → direct call).
-                    # asyncio.run(result) just returns the result.
-                    arg = node.args[0]
-                    # If the arg is a void function call, call it as statement
-                    if (isinstance(arg, ast.Call)
-                            and isinstance(arg.func, ast.Name)
-                            and arg.func.id in self._user_functions
-                            and self._user_functions[arg.func.id].ret_tag == "void"):
-                        self._emit_user_call(arg)
-                        return ir.Constant(i64, 0)
-                    return self._emit_expr_value(arg)
-                if func_name == "gather":
-                    # Each arg is an already-computed coroutine result.
-                    # Collect into a list.
-                    lst = self.builder.call(self.runtime["list_new"], [])
-                    for arg_node in node.args:
-                        val = self._emit_expr_value(arg_node)
-                        tag, data = self._bare_to_tag_data(val, arg_node)
-                        self.builder.call(self.runtime["list_append_fv"],
-                                          [lst, ir.Constant(i32, tag), data])
-                    return lst
-                if func_name == "sleep":
-                    # asyncio.sleep(n) — in AOT, just sleep for real
-                    if len(node.args) == 1:
-                        val = self._emit_expr_value(node.args[0])
-                        # Convert to milliseconds for the runtime
-                        if isinstance(val.type, ir.IntType):
-                            val = self.builder.sitofp(val, double)
-                        # For now, just return None (sleep is a no-op in AOT)
-                        return ir.Constant(i64, 0)
-                    return ir.Constant(i64, 0)
-            if func_name in _os_path_fns:
-                rt_key, n_args, _ret = _os_path_fns[func_name]
-                if len(node.args) == n_args:
-                    args = []
-                    for i in range(n_args):
-                        v = self._emit_expr_value(node.args[i])
-                        v = self._ensure_ptr(v)
-                        args.append(v)
-                    return self.builder.call(self.runtime[rt_key], args)
+        if mod_name not in self._NATIVE_MODULES:
+            return None
 
-            # --- collections module ---
-            elif mod_name in ("collections", "_collections"):
-                return self._emit_collections_call(func_name, node)
+        # Bridge-only modules: no native handler, fall through to CPython
+        if mod_name in self._BRIDGE_ONLY_MODULES:
+            return None
 
-            # --- typing module ---
-            # All typing constructs are no-ops at runtime. They just pass
-            # through their arguments or return identity.
-            elif mod_name == "typing":
-                # cast(Type, value) → just return the value
-                if func_name == "cast" and len(node.args) == 2:
-                    return self._emit_expr_value(node.args[1])
-                # TypeVar("T") → dummy, never used at runtime
-                if func_name == "TypeVar":
-                    return ir.Constant(i64, 0)
-                # Generic type aliases: Optional[X], List[X], etc.
-                # When called as functions, they're identity
-                return None
+        # math module: table-driven dispatch via _MATH_FUNCTIONS
+        if func_name in self._MATH_FUNCTIONS:
+            return self._emit_math_function(func_name, node)
 
-            # --- functools module ---
-            elif mod_name in ("functools", "_functools"):
-                return self._emit_functools_call(func_name, node)
-
-            # --- logging module ---
-            elif mod_name == "logging":
-                return self._emit_logging_call(func_name, node)
-
-            # --- pathlib module ---
-            elif mod_name == "pathlib":
-                return self._emit_pathlib_call(func_name, node)
-
-            # --- random module ---
-            elif mod_name == "random":
-                return self._emit_random_call(func_name, node)
-
-            # --- copy module ---
-            elif mod_name == "copy":
-                if func_name in ("copy", "deepcopy") and len(node.args) == 1:
-                    val = self._emit_expr_value(node.args[0])
-                    tag, data = self._bare_to_tag_data(val, node.args[0])
-                    out_tag = self._create_entry_alloca(i32, "copy.tag")
-                    out_data = self._create_entry_alloca(i64, "copy.data")
-                    rt_key = "copy_copy" if func_name == "copy" else "copy_deepcopy"
-                    self.builder.call(self.runtime[rt_key],
-                                      [ir.Constant(i32, tag), data, out_tag, out_data])
-                    result = self.builder.load(out_data)
-                    # The result data holds a pointer (list/dict/obj/str) as i64.
-                    # Convert to i8* so downstream handlers recognise it.
-                    inferred = self._infer_type_tag(node.args[0], val)
-                    if inferred not in ("int", "float", "bool", "none", "unknown"):
-                        result = self.builder.inttoptr(result, i8_ptr)
-                    return result
-                return None
-
-            # --- operator module ---
-            elif mod_name == "operator":
-                _op_funcs = {
-                    "add": "operator_add", "sub": "operator_sub",
-                    "mul": "operator_mul",
-                }
-                if func_name in _op_funcs and len(node.args) == 2:
-                    a = self._emit_expr_value(node.args[0])
-                    b = self._emit_expr_value(node.args[1])
-                    return self.builder.call(
-                        self.runtime[_op_funcs[func_name]], [a, b])
-                # For operator.itemgetter, operator.attrgetter etc. used as
-                # key functions — return function pointer for call_ptr dispatch
-                if func_name in ("itemgetter", "attrgetter"):
-                    # Return a sentinel — these are typically used as sort keys
-                    # which the compiler handles specially
-                    return ir.Constant(i64, 0)
-                # Unary operators
-                if func_name == "neg" and len(node.args) == 1:
-                    a = self._emit_expr_value(node.args[0])
-                    return self.builder.neg(a)
-                if func_name == "abs" and len(node.args) == 1:
-                    return self._emit_expr_value(
-                        ast.Call(func=ast.Name(id="abs", ctx=ast.Load()),
-                                 args=node.args, keywords=[]))
-                return None
-
-            # --- textwrap module ---
-            elif mod_name == "textwrap":
-                if func_name == "dedent" and len(node.args) == 1:
-                    arg = self._emit_expr_value(node.args[0])
-                    arg = self._ensure_ptr(arg)
-                    return self.builder.call(self.runtime["textwrap_dedent"], [arg])
-                if func_name == "indent" and len(node.args) == 2:
-                    text = self._emit_expr_value(node.args[0])
-                    prefix = self._emit_expr_value(node.args[1])
-                    text = self._ensure_ptr(text)
-                    prefix = self._ensure_ptr(prefix)
-                    return self.builder.call(self.runtime["textwrap_indent"],
-                                              [text, prefix])
-                return None
-
-            # --- shutil module ---
-            elif mod_name == "shutil":
-                if func_name in ("copy", "copy2", "copyfile") and len(node.args) == 2:
-                    src = self._emit_expr_value(node.args[0])
-                    dst = self._emit_expr_value(node.args[1])
-                    src = self._ensure_ptr(src)
-                    dst = self._ensure_ptr(dst)
-                    self.builder.call(self.runtime["shutil_copy"], [src, dst])
-                    return ir.Constant(i64, 0)
-                if func_name == "rmtree" and len(node.args) == 1:
-                    path = self._emit_expr_value(node.args[0])
-                    path = self._ensure_ptr(path)
-                    self.builder.call(self.runtime["shutil_rmtree"], [path])
-                    return ir.Constant(i64, 0)
-                return None
-
-            # --- glob module ---
-            elif mod_name == "glob":
-                if func_name == "glob" and len(node.args) == 1:
-                    pattern = self._emit_expr_value(node.args[0])
-                    pattern = self._ensure_ptr(pattern)
-                    return self.builder.call(self.runtime["glob_glob"], [pattern])
-                return None
-
-            # --- tempfile module ---
-            elif mod_name == "tempfile":
-                if func_name == "gettempdir" and len(node.args) == 0:
-                    return self.builder.call(self.runtime["tempfile_gettempdir"], [])
-                if func_name == "mkdtemp" and len(node.args) == 0:
-                    return self.builder.call(self.runtime["tempfile_mkdtemp"], [])
-                return None
-
-            # --- heapq module ---
-            elif mod_name == "heapq":
-                if func_name == "heapify" and len(node.args) == 1:
-                    lst = self._emit_expr_value(node.args[0])
-                    lst = self._ensure_ptr(lst)
-                    self.builder.call(self.runtime["heapq_heapify"], [lst])
-                    return ir.Constant(i64, 0)
-                if func_name == "heappush" and len(node.args) == 2:
-                    lst = self._emit_expr_value(node.args[0])
-                    lst = self._ensure_ptr(lst)
-                    val = self._emit_expr_value(node.args[1])
-                    tag, data = self._bare_to_tag_data(val, node.args[1])
-                    self.builder.call(self.runtime["heapq_heappush"],
-                                      [lst, ir.Constant(i32, tag), data])
-                    return ir.Constant(i64, 0)
-                if func_name == "heappop" and len(node.args) == 1:
-                    lst = self._emit_expr_value(node.args[0])
-                    lst = self._ensure_ptr(lst)
-                    return self.builder.call(self.runtime["heapq_heappop"], [lst])
-                if func_name == "nsmallest" and len(node.args) == 2:
-                    n = self._emit_expr_value(node.args[0])
-                    lst = self._emit_expr_value(node.args[1])
-                    lst = self._ensure_ptr(lst)
-                    return self.builder.call(self.runtime["heapq_nsmallest"],
-                                              [n, lst])
-                return None
-
-            # --- bisect module ---
-            elif mod_name == "bisect":
-                if func_name in ("bisect_left", "bisect") and len(node.args) == 2:
-                    lst = self._emit_expr_value(node.args[0])
-                    lst = self._ensure_ptr(lst)
-                    x = self._emit_expr_value(node.args[1])
-                    return self.builder.call(self.runtime["bisect_left"], [lst, x])
-                if func_name == "bisect_right" and len(node.args) == 2:
-                    lst = self._emit_expr_value(node.args[0])
-                    lst = self._ensure_ptr(lst)
-                    x = self._emit_expr_value(node.args[1])
-                    return self.builder.call(self.runtime["bisect_right"], [lst, x])
-                if func_name == "insort" and len(node.args) == 2:
-                    lst = self._emit_expr_value(node.args[0])
-                    lst = self._ensure_ptr(lst)
-                    x = self._emit_expr_value(node.args[1])
-                    self.builder.call(self.runtime["bisect_insort"], [lst, x])
-                    return ir.Constant(i64, 0)
-                return None
-
-            # --- decimal module ---
-            elif mod_name == "decimal":
-                if func_name == "Decimal":
-                    if len(node.args) == 0:
-                        return self.builder.call(self.runtime["decimal_from_int"],
-                                                  [ir.Constant(i64, 0)])
-                    arg = self._emit_expr_value(node.args[0])
-                    if isinstance(arg.type, ir.PointerType):
-                        return self.builder.call(self.runtime["decimal_from_str"], [arg])
-                    if isinstance(arg.type, ir.IntType):
-                        if (isinstance(node.args[0], ast.Constant)
-                                and isinstance(node.args[0].value, str)):
-                            s = self._make_string_constant(node.args[0].value)
-                            return self.builder.call(self.runtime["decimal_from_str"], [s])
-                        return self.builder.call(self.runtime["decimal_from_int"], [arg])
-                    return self.builder.call(self.runtime["decimal_from_int"],
-                                              [ir.Constant(i64, 0)])
-                return None
-
-            # --- platform module ---
-            elif mod_name == "platform":
-                # platform.system() returns "Windows"/"Linux"/"Darwin" (not
-                # sys.platform which is "win32"/"linux"/"darwin"). Fall through
-                # to CPython bridge for correct value.
-                if func_name == "python_version":
-                    return self._make_string_constant("3.14.0")
-                return None
-
-            # --- secrets module ---
-            elif mod_name == "secrets":
-                # secrets.token_hex / secrets.randbelow require proper CPython
-                # implementations (token_hex is NOT uuid4, randbelow is NOT
-                # random.randrange). Fall through to bridge for correct behavior.
-                return None
-
-            # --- no-op imports (use CPython bridge if actually called) ---
-            # Return None so the caller falls through to CPython bridge dispatch
-            elif mod_name in ("traceback", "pprint", "unittest", "argparse",
-                            "datetime", "statistics", "array",
-                            "threading", "subprocess", "pickle", "csv",
-                            "signal", "atexit", "gc", "inspect", "types",
-                            "numbers", "fractions"):
-                return None
-
-            # --- weakref / _weakref module ---
-            elif mod_name in ("weakref", "_weakref"):
-                if func_name == "ref" and len(node.args) >= 1:
-                    # weakref.ref(obj) → fpy_weakref_new(obj_ptr) → weakref ptr as i64
-                    arg = self._emit_expr_value(node.args[0])
-                    arg = self._ensure_ptr(arg)
-                    wr = self.builder.call(self.runtime["weakref_new"], [arg])
-                    return self.builder.ptrtoint(wr, i64)
-                return None
-
-            # --- base64 module ---
-            elif mod_name == "base64":
-                if func_name == "b64encode" and len(node.args) == 1:
-                    arg = self._emit_expr_value(node.args[0])
-                    arg = self._ensure_ptr(arg)
-                    return self.builder.call(self.runtime["base64_b64encode"], [arg])
-                if func_name == "b64decode" and len(node.args) == 1:
-                    arg = self._emit_expr_value(node.args[0])
-                    arg = self._ensure_ptr(arg)
-                    return self.builder.call(self.runtime["base64_b64decode"], [arg])
-                return None
-
-            # --- uuid module ---
-            elif mod_name == "uuid":
-                # All uuid calls go through CPython bridge so they return
-                # real uuid.UUID objects (not plain strings).  This makes
-                # type(u).__name__ == "UUID" and preserves UUID semantics.
-                return None
-
-            # --- struct module ---
-            elif mod_name == "struct":
-                return self._emit_struct_call(func_name, node)
-
-            # --- io / warnings / hashlib / string ---
-            # No native implementations; fall through to CPython bridge
-            elif mod_name in ("hashlib", "string", "io", "warnings"):
-                return None
-
-            # --- itertools module ---
-            elif mod_name == "itertools":
-                return self._emit_itertools_call(func_name, node)
-
-            # --- enum / dataclasses modules ---
-            elif mod_name in ("enum", "dataclasses"):
-                # Enum and dataclasses decorators are handled by
-                # the class system. Fall through to bridge for
-                # any actual function calls.
-                return None
-
-            # --- sys module ---
-            elif mod_name == "sys":
-                if func_name == "exit":
-                    code = ir.Constant(i64, 0)
-                    if len(node.args) >= 1:
-                        code = self._emit_expr_value(node.args[0])
-                        if isinstance(code.type, ir.DoubleType):
-                            code = self.builder.fptosi(code, i64)
-                    self.builder.call(self.runtime["sys_exit"], [code])
-                    return ir.Constant(i64, 0)
-                return None
-
-            # --- time module ---
-            elif mod_name == "time":
-                if func_name == "time" and len(node.args) == 0:
-                    return self.builder.call(self.runtime["time_time"], [])
-                elif func_name == "time_ns" and len(node.args) == 0:
-                    return self.builder.call(self.runtime["time_time_ns"], [])
-                elif func_name == "perf_counter" and len(node.args) == 0:
-                    return self.builder.call(self.runtime["time_perf_counter"], [])
-                elif func_name == "perf_counter_ns" and len(node.args) == 0:
-                    # Return as nanoseconds (int)
-                    t = self.builder.call(self.runtime["time_perf_counter"], [])
-                    ns = self.builder.fmul(t, ir.Constant(double, 1e9))
-                    return self.builder.fptosi(ns, i64)
-                elif func_name == "monotonic" and len(node.args) == 0:
-                    return self.builder.call(self.runtime["time_monotonic"], [])
-                elif func_name == "sleep" and len(node.args) == 1:
-                    val = self._emit_expr_value(node.args[0])
-                    if isinstance(val.type, ir.IntType):
-                        val = self.builder.sitofp(val, double)
-                    self.builder.call(self.runtime["time_sleep"], [val])
-                    return ir.Constant(i64, 0)
-                return None
-
-            # --- contextlib module ---
-            elif mod_name == "contextlib":
-                # contextmanager is a decorator — it's a no-op at compile time.
-                # The generator function is already compiled with yield support.
-                # suppress(*exceptions) — currently a no-op (exceptions ignored)
-                if func_name == "contextmanager":
-                    # Return the decorated function unchanged
-                    if len(node.args) == 1:
-                        return self._emit_expr_value(node.args[0])
-                    return ir.Constant(i64, 0)
-                elif func_name == "suppress":
-                    # Returns a dummy context manager (no-op)
-                    return ir.Constant(i64, 0)
-                elif func_name == "closing":
-                    # closing(thing) → just return the thing
-                    if len(node.args) == 1:
-                        return self._emit_expr_value(node.args[0])
-                    return ir.Constant(i64, 0)
-                return None
+        # Dispatch table lookup
+        handler_name = self._MODULE_DISPATCH.get(mod_name)
+        if handler_name:
+            return getattr(self, handler_name)(func_name, node)
 
         return None
+
+    def _emit_math_function(self, func_name, node):
+        """Emit a math module function call via the _MATH_FUNCTIONS table."""
+        rt_key, n_expected = self._MATH_FUNCTIONS[func_name]
+        if len(node.args) == n_expected:
+            args = []
+            for arg_node in node.args:
+                val = self._emit_expr_value(arg_node)
+                if isinstance(val.type, ir.IntType):
+                    val = self.builder.sitofp(val, double)
+                elif isinstance(val.type, ir.PointerType):
+                    val = self._convert_pyobj_to_numeric(val, arg_node)
+                    if val is None:
+                        return None
+                args.append(val)
+            result = self.builder.call(self.runtime[rt_key], args)
+            if func_name in ("floor", "ceil"):
+                return self.builder.fptosi(result, i64)
+            return result
+        # Special case: math.log(x, base) — 2-arg log
+        if func_name == "log" and len(node.args) == 2:
+            x = self._emit_expr_value(node.args[0])
+            base = self._emit_expr_value(node.args[1])
+            if isinstance(x.type, ir.IntType):
+                x = self.builder.sitofp(x, double)
+            if isinstance(base.type, ir.IntType):
+                base = self.builder.sitofp(base, double)
+            log_x = self.builder.call(self.runtime["math_log"], [x])
+            log_base = self.builder.call(self.runtime["math_log"], [base])
+            return self.builder.fdiv(log_x, log_base)
+        return None
+
 
     # --- Factory tag mapping for defaultdict ---
     _DEFAULTDICT_FACTORY = {
