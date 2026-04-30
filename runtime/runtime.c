@@ -777,6 +777,7 @@ extern int64_t fastpy_bytes_get(const char*, int64_t);
 extern int64_t fastpy_bytes_len(const char*);
 extern FpyList* fastpy_bytes_to_list(const char*);
 extern void fastpy_list_mark_tuple(FpyList*);
+extern void fastpy_list_mark_list(FpyList*);
 extern FpyDict* fastpy_dict_fromkeys(FpyList*, int32_t, int64_t);
 extern FpyDict* fastpy_dict_fromkeys_none(FpyList*);
 extern FpyList* fastpy_float_as_integer_ratio(double);
@@ -888,6 +889,7 @@ static FpySymEntry fpy_jit_symbols[] = {
     SYM(fastpy_bytes_len),
     SYM(fastpy_bytes_to_list),
     SYM(fastpy_list_mark_tuple),
+    SYM(fastpy_list_mark_list),
     SYM(fastpy_dict_fromkeys), SYM(fastpy_dict_fromkeys_none),
     SYM(fastpy_str_rfind), SYM(fastpy_str_count),
     SYM(fastpy_str_startswith), SYM(fastpy_str_endswith),

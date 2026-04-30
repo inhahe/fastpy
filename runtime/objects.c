@@ -274,6 +274,12 @@ void fastpy_list_mark_tuple(FpyList *list) {
     if (list) list->is_tuple = 1;
 }
 
+/* Mark an existing FpyList as a list (clear tuple flag).
+   Used by star unpack: first, *rest = tuple → rest must be a list. */
+void fastpy_list_mark_list(FpyList *list) {
+    if (list) list->is_tuple = 0;
+}
+
 /* Unlocked append — caller must hold list->lock if needed */
 static void fpy_list_append_unlocked(FpyList *list, FpyValue value) {
     if (list->length >= list->capacity) {

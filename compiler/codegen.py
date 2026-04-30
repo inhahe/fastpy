@@ -1553,6 +1553,7 @@ class CodeGen:
         self.runtime["tuple_new"] = ir.Function(self.module, ft, name="fastpy_tuple_new")
         ft = ir.FunctionType(ir.VoidType(), [i8_ptr])
         self.runtime["list_mark_tuple"] = ir.Function(self.module, ft, name="fastpy_list_mark_tuple")
+        self.runtime["list_mark_list"] = ir.Function(self.module, ft, name="fastpy_list_mark_list")
         ft = ir.FunctionType(i8_ptr, [i8_ptr, i8_ptr, i8_ptr])
         self.runtime["zip3"] = ir.Function(self.module, ft, name="fastpy_zip3")
         ft = ir.FunctionType(i8_ptr, [i8_ptr, i8_ptr])
@@ -14678,6 +14679,10 @@ class CodeGen:
                         stop = self.builder.sub(list_len, ir.Constant(i64, n_after))
                         rest = self._rt_call("list_slice", [
                             val, start, stop, ir.Constant(i64, 1), ir.Constant(i64, 1)])
+                        # Star unpack always produces a list, even when
+                        # unpacking a tuple.  list_slice copies the source
+                        # is_tuple flag, so clear it explicitly.
+                        self.builder.call(self.runtime["list_mark_list"], [rest])
                         self._store_variable(name, rest, "list:int")
                     elif isinstance(tgt, ast.Name):
                         if i < star_idx:
@@ -16653,8 +16658,13 @@ class CodeGen:
         if isinstance(pattern, ast.MatchValue):
             val = self._emit_expr_value(pattern.value)
             if isinstance(val.type, ir.IntType) and val.type.width == 64:
-                tag_ok = self.builder.icmp_signed(
+                # Python: bool is a subclass of int, so True==1 and False==0.
+                # Accept both INT and BOOL tags for integer pattern matching.
+                is_int = self.builder.icmp_signed(
                     "==", subject_tag, ir.Constant(i32, FPY_TAG_INT))
+                is_bool = self.builder.icmp_signed(
+                    "==", subject_tag, ir.Constant(i32, FPY_TAG_BOOL))
+                tag_ok = self.builder.or_(is_int, is_bool)
                 val_ok = self.builder.icmp_signed("==", subject_data, val)
                 return self.builder.and_(tag_ok, val_ok)
             elif isinstance(val.type, ir.PointerType):
@@ -28984,8 +28994,16 @@ class CodeGen:
                 key = self._emit_expr_value(node.args[0])
                 # Use FV-ABI: return full FpyValue so runtime tag drives dispatch.
                 # This handles mixed-type dicts (kwargs pattern) correctly.
-                if isinstance(key.type, ir.PointerType):
-                    has = self._rt_call("dict_has_key", [obj, key])
+                is_str_key = isinstance(key.type, ir.PointerType)
+                is_int_key = (isinstance(key.type, ir.IntType)
+                              and key.type.width == 64)
+
+                if is_str_key or is_int_key:
+                    # Check if key exists
+                    if is_str_key:
+                        has = self._rt_call("dict_has_key", [obj, key])
+                    else:
+                        has = self._rt_call("dict_has_int_key", [obj, key])
                     has_bool = self.builder.icmp_unsigned("!=", has, ir.Constant(i32, 0))
                     tag_slot = self._create_entry_alloca(i32, "dget.tag")
                     data_slot = self._create_entry_alloca(i64, "dget.data")
@@ -28995,8 +29013,12 @@ class CodeGen:
                     self.builder.cbranch(has_bool, found_block, default_block)
                     # Found path: load the FpyValue from dict
                     self.builder.position_at_end(found_block)
-                    self.builder.call(self.runtime["dict_get_fv"],
-                                      [obj, key, tag_slot, data_slot])
+                    if is_str_key:
+                        self.builder.call(self.runtime["dict_get_fv"],
+                                          [obj, key, tag_slot, data_slot])
+                    else:
+                        self.builder.call(self.runtime["dict_get_int_fv"],
+                                          [obj, key, tag_slot, data_slot])
                     found_tag = self.builder.load(tag_slot)
                     found_data = self.builder.load(data_slot)
                     found_fv = self._fv_build_from_slots(found_tag, found_data)
@@ -29021,7 +29043,7 @@ class CodeGen:
                     phi.add_incoming(found_fv, found_end)
                     phi.add_incoming(default_fv, default_end)
                     return phi
-                # Int key fallback: use string conversion path
+                # Unknown key type fallback: use string conversion path
                 if len(node.args) >= 2:
                     default = self._emit_expr_value(node.args[1])
                     if not isinstance(default.type, ir.PointerType):
@@ -31792,11 +31814,20 @@ class CodeGen:
         if isinstance(else_val.type, ir.LiteralStructType) and else_val.type == fpy_val:
             else_val = self.builder.extract_value(else_val, 1)
 
-        # Only normalize to i64 when types MISMATCH. When both branches
+        # Only normalize when types MISMATCH. When both branches
         # produce the same type (common case), keep the original type.
         if then_val.type != else_val.type:
-            # Types differ — normalize both to i64 in their own blocks.
-            # We need to go back to then_block to insert coercion there.
+            # Types differ — coerce both to a common type in their blocks.
+            # If either branch is double and the other is int, promote to
+            # double (not bitcast, which reinterprets bits and corrupts
+            # the value).
+            then_is_double = isinstance(then_val.type, ir.DoubleType)
+            else_is_double = isinstance(else_val.type, ir.DoubleType)
+            promote_to_double = (
+                (then_is_double and isinstance(else_val.type, ir.IntType))
+                or (else_is_double and isinstance(then_val.type, ir.IntType))
+            )
+
             else_block_cur = self.builder.block
 
             # Re-enter then_block_end to normalize then_val
@@ -31804,7 +31835,10 @@ class CodeGen:
             term = then_block_end.instructions[-1]
             then_block_end.instructions.remove(term)
             self.builder.position_at_end(then_block_end)
-            if isinstance(then_val.type, ir.PointerType):
+            if promote_to_double:
+                if isinstance(then_val.type, ir.IntType):
+                    then_val = self.builder.sitofp(then_val, double)
+            elif isinstance(then_val.type, ir.PointerType):
                 then_val = self.builder.ptrtoint(then_val, i64)
             elif isinstance(then_val.type, ir.DoubleType):
                 then_val = self.builder.bitcast(then_val, i64)
@@ -31814,7 +31848,10 @@ class CodeGen:
 
             # Back to else_block to normalize else_val
             self.builder.position_at_end(else_block_cur)
-            if isinstance(else_val.type, ir.PointerType):
+            if promote_to_double:
+                if isinstance(else_val.type, ir.IntType):
+                    else_val = self.builder.sitofp(else_val, double)
+            elif isinstance(else_val.type, ir.PointerType):
                 else_val = self.builder.ptrtoint(else_val, i64)
             elif isinstance(else_val.type, ir.DoubleType):
                 else_val = self.builder.bitcast(else_val, i64)
