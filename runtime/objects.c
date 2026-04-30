@@ -2294,8 +2294,32 @@ int64_t fastpy_closure_call2(FpyClosure *c, int64_t a, int64_t b) {
  * dispatches to the underlying function pointer. Supports up to
  * 4 total args (explicit + captures). */
 int64_t fastpy_closure_call_list(void *closure, void *args_list) {
-    FpyClosure *c = (FpyClosure *)closure;
     FpyList *args = (FpyList *)args_list;
+
+    /* Raw function pointer (not a closure): unpack args and call directly.
+     * This happens when func(*args) is called where func is a captured
+     * raw function pointer (e.g. the original function in a decorator). */
+    if (!fpy_is_closure(closure)) {
+        int64_t n = args ? args->length : 0;
+        int64_t a[8] = {0};
+        for (int64_t i = 0; i < n && i < 8; i++)
+            a[i] = args->items[i].data.i;
+        typedef int64_t (*fn0_t)(void);
+        typedef int64_t (*fn1_t)(int64_t);
+        typedef int64_t (*fn2_t)(int64_t, int64_t);
+        typedef int64_t (*fn3_t)(int64_t, int64_t, int64_t);
+        typedef int64_t (*fn4_t)(int64_t, int64_t, int64_t, int64_t);
+        switch (n) {
+            case 0: return ((fn0_t)closure)();
+            case 1: return ((fn1_t)closure)(a[0]);
+            case 2: return ((fn2_t)closure)(a[0], a[1]);
+            case 3: return ((fn3_t)closure)(a[0], a[1], a[2]);
+            case 4: return ((fn4_t)closure)(a[0], a[1], a[2], a[3]);
+            default: return 0;
+        }
+    }
+
+    FpyClosure *c = (FpyClosure *)closure;
 
     /* *args closure: pass the list directly as the first parameter */
     if (c->has_vararg) {

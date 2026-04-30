@@ -3536,10 +3536,32 @@ class CodeGen:
         wrapper = ir.Function(self.module, wrapper_type, name=wrapper_name)
         block = wrapper.append_basic_block("entry")
         b = _SafeIRBuilder(block)
-        # Wrap each i64 arg as FpyValue(INT)
+        # Determine correct FpyValue tag for each parameter using
+        # call-site type analysis.  Without this, all args are tagged
+        # INT and string/float/bool args lose their type identity when
+        # forwarded through decorator *args patterns.
+        # LLVM name is e.g. "fastpy.user.greet" or "fastpy.greet"
+        # but _call_site_param_types uses the bare Python name "greet".
+        func_name = info.func.name.rsplit(".", 1)[-1]
+        call_types = self._call_site_param_types.get(func_name, [])
+        _TAG_MAP = {
+            "str": FPY_TAG_STR, "float": FPY_TAG_FLOAT,
+            "bool": FPY_TAG_BOOL, "list": FPY_TAG_LIST,
+            "dict": FPY_TAG_DICT, "obj": FPY_TAG_OBJ,
+            "none": FPY_TAG_NONE,
+        }
         fv_args = []
-        for param in wrapper.args:
-            tag = ir.Constant(i32, FPY_TAG_INT)
+        for i, param in enumerate(wrapper.args):
+            ct = call_types[i] if i < len(call_types) else None
+            tag_val = _TAG_MAP.get(ct, FPY_TAG_INT) if ct else FPY_TAG_INT
+            # Pointer types (str, list, dict, obj) should also check
+            # for tags that start with the prefix (e.g. "list:int")
+            if ct and tag_val == FPY_TAG_INT:
+                for prefix, tv in _TAG_MAP.items():
+                    if ct.startswith(prefix):
+                        tag_val = tv
+                        break
+            tag = ir.Constant(i32, tag_val)
             fv = b.insert_value(ir.Constant(fpy_val, ir.Undefined), tag, 0)
             fv = b.insert_value(fv, param, 1)
             fv_args.append(fv)
@@ -12021,7 +12043,12 @@ class CodeGen:
                 and isinstance(node.targets[0], ast.Name)
                 and isinstance(node.value, ast.Call)
                 and isinstance(node.value.func, ast.Name)
-                and node.value.func.id in self._user_functions):
+                and node.value.func.id in self._user_functions
+                # Skip when the called function was reassigned (decorator
+                # pattern): greet = wrap(greet); result = greet('world')
+                # must call through the closure, not the original function.
+                and not (node.value.func.id in self.variables
+                         and self.variables[node.value.func.id][1] == "closure")):
             # Resolve specialization for correct ret_tag (int vs float etc.)
             lookup_name = node.value.func.id
             if lookup_name in self._monomorphized:
@@ -12037,7 +12064,15 @@ class CodeGen:
                     type_tag = "list:int"
                 elif type_tag == "ptr:list":
                     type_tag = "list:list"
-                self._store_variable(node.targets[0].id, fv, type_tag)
+                # Decorator pattern: target = deco(target) where target is
+                # a known user function.  The result is a callable (closure
+                # or wrapper) that must be called indirectly via call_ptr,
+                # not directly via the original function's LLVM symbol.
+                # Tag as "closure" so _emit_closure_call is used.
+                target_name = node.targets[0].id
+                if target_name in self._user_functions:
+                    type_tag = "closure"
+                self._store_variable(target_name, fv, type_tag)
                 return
 
         # Fast path for Attribute RHS on an object receiver: use
@@ -12311,6 +12346,13 @@ class CodeGen:
                 if class_name in self._monomorphized_classes:
                     class_name = self._resolve_class_specialization(
                         class_name, node.value.args, node.value.keywords)
+        # Nested class constructor: Outer.Inner(args)
+        elif (isinstance(node.value, ast.Call)
+              and isinstance(node.value.func, ast.Attribute)
+              and isinstance(node.value.func.value, ast.Name)
+              and node.value.func.value.id in self._user_classes
+              and node.value.func.attr in self._user_classes):
+            class_name = node.value.func.attr
         elif isinstance(node.value, ast.Call):
             class_name = self._infer_object_class(node.value)
         elif isinstance(node.value, ast.Name):
@@ -13900,6 +13942,13 @@ class CodeGen:
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
             if node.func.id in self._user_classes:
                 return "obj"
+        # Nested class constructor: Outer.Inner() where Inner is a user class
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id in self._user_classes
+                and node.func.attr in self._user_classes):
+            return "obj"
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
             # Check if the called function contains closures (returns a closure)
             for full_name in self._closure_info:
                 if full_name.startswith(f"{node.func.id}."):
@@ -14662,10 +14711,19 @@ class CodeGen:
                 # Determine element type (default "int"; "float" for
                 # tuple-of-floats from user functions like colorsys).
                 elem_type = self._get_list_elem_type(value_node)
+                # Per-position type map for heterogeneous tuples.
+                # dict.popitem() → (str_key, value), dict.items() elem → (str_key, value).
+                _pos_types = {}
+                if (isinstance(value_node, ast.Call)
+                        and isinstance(value_node.func, ast.Attribute)
+                        and value_node.func.attr == "popitem"
+                        and self._is_dict_expr(value_node.func.value)):
+                    _pos_types[0] = "str"  # key is always a string
                 for i, tgt in enumerate(target.elts):
+                    _et = _pos_types.get(i, elem_type)
                     if isinstance(tgt, ast.Name):
-                        elem = self._list_get_as_bare(val, ir.Constant(i64, i), elem_type)
-                        self._store_variable(tgt.id, elem, elem_type)
+                        elem = self._list_get_as_bare(val, ir.Constant(i64, i), _et)
+                        self._store_variable(tgt.id, elem, _et)
                     elif isinstance(tgt, (ast.Tuple, ast.List)):
                         # Nested unpack from list: a, (b, c) = [1, [2, 3]]
                         # Get sub-list as pointer and recursively unpack
@@ -20522,6 +20580,15 @@ class CodeGen:
                 self._emit_constructor(node)
                 return
         if isinstance(node.func, ast.Attribute):
+            # Nested class constructor: Outer.Inner(args)
+            if (isinstance(node.func.value, ast.Name)
+                    and node.func.value.id in self._user_classes
+                    and node.func.attr in self._user_classes):
+                synth = ast.Call(
+                    func=ast.Name(id=node.func.attr, ctx=ast.Load()),
+                    args=node.args, keywords=node.keywords)
+                self._emit_constructor(synth)
+                return
             # Native module call (asyncio.run, json.dumps, etc.)
             if isinstance(node.func.value, ast.Name):
                 _nm = node.func.value.id
@@ -23759,6 +23826,68 @@ class CodeGen:
                     _uu_dphi.add_incoming(_ufdata, _uu_flt_end)
                     return self._fv_build_from_slots(_uu_tphi, _uu_dphi)
 
+            # ── UNKNOWN with extractable tags: fv_binop dispatch ─────
+            # The tag-preserving fast paths above skip ast.Div (division
+            # always returns float so int-preservation is moot) and only
+            # handle INT/FLOAT branches — non-numeric types (str, list,
+            # etc.) cause garbage double conversions.  Route through the
+            # C fv_binop which handles ALL type combinations correctly
+            # (str concat, repeat, TypeError for invalid combos, and
+            # proper INT→FLOAT promotion for truediv).
+            _fv_op_map = {ast.Add: 0, ast.Sub: 1, ast.Mult: 2, ast.Div: 3,
+                          ast.FloorDiv: 4, ast.Mod: 5}
+            _gf_opc = _fv_op_map.get(op)
+            if _gf_opc is not None:
+                _gf_lt = _gf_ld = _gf_rt = _gf_rd = None
+                # Extract left tag + data
+                if lk == VKind.UNKNOWN:
+                    if (isinstance(ltv.val.type, ir.LiteralStructType)
+                            and ltv.val.type == fpy_val):
+                        _gf_lt = self.builder.extract_value(ltv.val, 0)
+                        _gf_ld = self.builder.extract_value(ltv.val, 1)
+                    elif isinstance(node.left, ast.Name):
+                        _al = self.variables.get(node.left.id)
+                        if _al:
+                            _a, _ = _al
+                            if (isinstance(_a.type, ir.PointerType)
+                                    and _a.type.pointee is fpy_val):
+                                _fv = self.builder.load(_a)
+                                _gf_lt = self.builder.extract_value(_fv, 0)
+                                _gf_ld = self.builder.extract_value(_fv, 1)
+                else:
+                    _gf_lt = ir.Constant(i32, ltv.vtype.kind.fpy_tag)
+                    _gf_ld = ltv.as_i64(self.builder)
+                # Extract right tag + data
+                if rk == VKind.UNKNOWN:
+                    if (isinstance(rtv.val.type, ir.LiteralStructType)
+                            and rtv.val.type == fpy_val):
+                        _gf_rt = self.builder.extract_value(rtv.val, 0)
+                        _gf_rd = self.builder.extract_value(rtv.val, 1)
+                    elif isinstance(node.right, ast.Name):
+                        _ar = self.variables.get(node.right.id)
+                        if _ar:
+                            _a, _ = _ar
+                            if (isinstance(_a.type, ir.PointerType)
+                                    and _a.type.pointee is fpy_val):
+                                _fv = self.builder.load(_a)
+                                _gf_rt = self.builder.extract_value(_fv, 0)
+                                _gf_rd = self.builder.extract_value(_fv, 1)
+                else:
+                    _gf_rt = ir.Constant(i32, rtv.vtype.kind.fpy_tag)
+                    _gf_rd = rtv.as_i64(self.builder)
+                if (_gf_lt is not None and _gf_ld is not None
+                        and _gf_rt is not None and _gf_rd is not None):
+                    _ot = self._create_entry_alloca(i32, "ugf.tag")
+                    _od = self._create_entry_alloca(i64, "ugf.data")
+                    self.builder.call(self.runtime["fv_binop"],
+                                      [_gf_lt, _gf_ld, _gf_rt, _gf_rd,
+                                       ir.Constant(i32, _gf_opc),
+                                       _ot, _od])
+                    self._emit_try_bail_if_exc()
+                    return self._fv_build_from_slots(
+                        self.builder.load(_ot),
+                        self.builder.load(_od))
+
             # ── Generic UNKNOWN fallback: promote both to double ──────
             # This path handles cases where runtime tags couldn't be
             # extracted (non-Name, non-struct operands).
@@ -24972,6 +25101,16 @@ class CodeGen:
         _bm_rewrite = self._rewrite_bound_method(node)
         if _bm_rewrite is not None:
             node = _bm_rewrite
+        # Nested class constructor: Outer.Inner(args) where Inner is a
+        # known user class.  Rewrite to a plain constructor call.
+        if (isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id in self._user_classes
+                and node.func.attr in self._user_classes):
+            synth = ast.Call(
+                func=ast.Name(id=node.func.attr, ctx=ast.Load()),
+                args=node.args, keywords=node.keywords)
+            return self._emit_constructor(synth)
         # str.maketrans(from, to) — static method on str class
         if (isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
