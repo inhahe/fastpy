@@ -3155,16 +3155,14 @@ class CodeGen:
                           and deco.id in self.variables
                           and self._var_kind(deco.id) == VKind.CLOSURE):
                         deco_val = self._emit_expr_value(deco)
-                        if isinstance(deco_val.type, ir.IntType):
-                            deco_val = self.builder.inttoptr(deco_val, i8_ptr)
+                        deco_val = self._ensure_ptr(deco_val)
                         func_ptr = self.builder.call(
                             self.runtime["call_ptr1"], [deco_val, func_ptr])
 
                     # @deco(args) — decorator with args: func_ptr = deco(args)(func_ptr)
                     elif isinstance(deco, ast.Call):
                         actual_deco = self._emit_expr_value(deco)
-                        if isinstance(actual_deco.type, ir.IntType):
-                            actual_deco = self.builder.inttoptr(actual_deco, i8_ptr)
+                        actual_deco = self._ensure_ptr(actual_deco)
                         func_ptr = self.builder.call(
                             self.runtime["call_ptr1"],
                             [actual_deco, func_ptr])
@@ -11388,8 +11386,7 @@ class CodeGen:
             if meta_name in self.variables:
                 # Metaclass is a pyobj variable — call it through bridge
                 meta_obj = self._load_variable(meta_name, None)
-                if isinstance(meta_obj.type, ir.IntType):
-                    meta_obj = self.builder.inttoptr(meta_obj, i8_ptr)
+                meta_obj = self._ensure_ptr(meta_obj)
                 # Call Meta(name, bases, namespace) through bridge
                 name_tag, name_data = self._bare_to_tag_data(
                     name_ptr, None)
@@ -11654,8 +11651,7 @@ class CodeGen:
             elif self._is_obj_expr(target.value):
                 obj_cls = self._infer_object_class(target.value)
                 if obj_cls and self._class_has_method(obj_cls, "__delitem__"):
-                    if isinstance(container.type, ir.IntType):
-                        container = self.builder.inttoptr(container, i8_ptr)
+                    container = self._ensure_ptr(container)
                     if isinstance(key.type, ir.PointerType):
                         key = self.builder.ptrtoint(key, i64)
                     elif isinstance(key.type, ir.IntType) and key.type.width != 64:
@@ -11916,8 +11912,7 @@ class CodeGen:
                     # Direct call: g() where g is a CPython function.
                     # Store result as pyobj for method calls on the result.
                     val = self._emit_expr_value(rhs)
-                    if isinstance(val.type, ir.IntType):
-                        val = self.builder.inttoptr(val, i8_ptr)
+                    val = self._ensure_ptr(val)
                     self._store_variable(node.targets[0].id, val, "pyobj")
                     return
                 # Method call (math.sqrt()) or attribute (math.pi):
@@ -11929,16 +11924,14 @@ class CodeGen:
                 elif is_pyobj_attr_chain:
                     # Chained attribute: evaluate receiver, then getattr
                     obj = self._emit_expr_value(rhs.value)
-                    if isinstance(obj.type, ir.IntType):
-                        obj = self.builder.inttoptr(obj, i8_ptr)
+                    obj = self._ensure_ptr(obj)
                     attr_name = self._make_string_constant(rhs.attr)
                     pyobj_ptr = self.builder.call(
                         self.runtime["cpython_getattr"], [obj, attr_name])
                 else:
                     # Attribute access: get the raw PyObject*
                     obj = self._load_variable(rhs.value.id, rhs)
-                    if isinstance(obj.type, ir.IntType):
-                        obj = self.builder.inttoptr(obj, i8_ptr)
+                    obj = self._ensure_ptr(obj)
                     attr_name = self._make_string_constant(rhs.attr)
                     pyobj_ptr = self.builder.call(
                         self.runtime["cpython_getattr"], [obj, attr_name])
@@ -11963,10 +11956,8 @@ class CodeGen:
                 # (pyobj, pyobj) and returns {tag, data}
                 left = self._emit_expr_value(node.value.left)
                 right = self._emit_expr_value(node.value.right)
-                if isinstance(left.type, ir.IntType):
-                    left = self.builder.inttoptr(left, i8_ptr)
-                if isinstance(right.type, ir.IntType):
-                    right = self.builder.inttoptr(right, i8_ptr)
+                left = self._ensure_ptr(left)
+                right = self._ensure_ptr(right)
                 out_tag = self._create_entry_alloca(i32, "pybin.tag")
                 out_data = self._create_entry_alloca(i64, "pybin.data")
                 _pyobj_ops = {ast.Add: 0, ast.Sub: 1, ast.Mult: 2,
@@ -12268,8 +12259,7 @@ class CodeGen:
                 if rev is not None:
                     list_name, count_node = rev
                     obj = self._emit_expr_value(target.value)
-                    if isinstance(obj.type, ir.IntType):
-                        obj = self.builder.inttoptr(obj, i8_ptr)
+                    obj = self._ensure_ptr(obj)
                     count = self._emit_expr_value(count_node)
                     self.builder.call(self.runtime["list_reverse_prefix"],
                                       [obj, count])
@@ -12553,8 +12543,7 @@ class CodeGen:
             cls_info = self._user_classes.get(obj_cls)
             if cls_info and cls_info.properties and node.attr in cls_info.properties:
                 obj = self._emit_expr_value(node.value)
-                if isinstance(obj.type, ir.IntType):
-                    obj = self.builder.inttoptr(obj, i8_ptr)
+                obj = self._ensure_ptr(obj)
                 method_func = cls_info.methods.get(node.attr)
                 if method_func:
                     # Direct dispatch to property getter
@@ -12567,8 +12556,7 @@ class CodeGen:
         # --- pathlib.Path property access: .name, .parent, .suffix, .stem ---
         if self._is_path_expr(node.value):
             obj = self._emit_expr_value(node.value)
-            if isinstance(obj.type, ir.IntType):
-                obj = self.builder.inttoptr(obj, i8_ptr)
+            obj = self._ensure_ptr(obj)
             _path_props = {
                 "name": "path_name", "parent": "path_parent",
                 "suffix": "path_suffix", "stem": "path_stem",
@@ -12586,8 +12574,7 @@ class CodeGen:
                 and node.value.id in self.variables
                 and self._var_kind(node.value.id) == VKind.PYOBJ):
             obj = self._emit_expr_value(node.value)
-            if isinstance(obj.type, ir.IntType):
-                obj = self.builder.inttoptr(obj, i8_ptr)
+            obj = self._ensure_ptr(obj)
             attr_name = self._make_string_constant(node.attr)
             return self.builder.call(
                 self.runtime["cpython_getattr"], [obj, attr_name])
@@ -12680,8 +12667,7 @@ class CodeGen:
                 and target.value.id in self.variables
                 and self._var_kind(target.value.id) == VKind.PYOBJ):
             obj = self._load_variable(target.value.id, target)
-            if isinstance(obj.type, ir.IntType):
-                obj = self.builder.inttoptr(obj, i8_ptr)
+            obj = self._ensure_ptr(obj)
             key = self._emit_expr_value(target.slice)
             key_tag, key_data = self._bare_to_tag_data(key, target.slice)
             val_tag, val_data = self._bare_to_tag_data(value, value_node)
@@ -12705,16 +12691,14 @@ class CodeGen:
             if rev is not None:
                 list_name, count_node = rev
                 obj = self._emit_expr_value(target.value)
-                if isinstance(obj.type, ir.IntType):
-                    obj = self.builder.inttoptr(obj, i8_ptr)
+                obj = self._ensure_ptr(obj)
                 count = self._emit_expr_value(count_node)
                 self.builder.call(self.runtime["list_reverse_prefix"],
                                   [obj, count])
                 return
 
             obj = self._emit_expr_value(target.value)
-            if isinstance(obj.type, ir.IntType):
-                obj = self.builder.inttoptr(obj, i8_ptr)
+            obj = self._ensure_ptr(obj)
             slc = target.slice
             if slc.lower is not None:
                 start = self._emit_expr_value(slc.lower)
@@ -12725,16 +12709,14 @@ class CodeGen:
             else:
                 length = self._rt_call("list_length", [obj])
                 stop = length
-            if isinstance(value.type, ir.IntType):
-                value = self.builder.inttoptr(value, i8_ptr)
+            value = self._ensure_ptr(value)
             self.builder.call(self.runtime["list_slice_assign"],
                               [obj, start, stop, value])
             return
         # __setitem__ on user-class objects
         if self._is_obj_expr(target.value):
             obj = self._emit_expr_value(target.value)
-            if isinstance(obj.type, ir.IntType):
-                obj = self.builder.inttoptr(obj, i8_ptr)
+            obj = self._ensure_ptr(obj)
             key = self._emit_expr_value(target.slice)
             if isinstance(key.type, ir.PointerType):
                 key = self.builder.ptrtoint(key, i64)
@@ -12751,8 +12733,7 @@ class CodeGen:
                               [obj, name_ptr, key, value])
             return
         obj = self._emit_expr_value(target.value)
-        if isinstance(obj.type, ir.IntType):
-            obj = self.builder.inttoptr(obj, i8_ptr)
+        obj = self._ensure_ptr(obj)
         index = self._emit_expr_value(target.slice)
         tag, data = self._bare_to_tag_data(value, value_node=value_node)
         if (self._is_dict_expr(target.value)
@@ -13334,8 +13315,7 @@ class CodeGen:
             _is_pyobj_target = True
         if _is_pyobj_target:
             obj = self._emit_expr_value(target.value)
-            if isinstance(obj.type, ir.IntType):
-                obj = self.builder.inttoptr(obj, i8_ptr)
+            obj = self._ensure_ptr(obj)
             attr_name = self._make_string_constant(target.attr)
             tag_ir, data_ir = self._to_tag_data_ir(value, value_node)
             self.builder.call(self.runtime["cpython_setattr"],
@@ -13386,8 +13366,7 @@ class CodeGen:
                 setter_func = cls_info.methods.get(setter_name)
                 if setter_func:
                     obj = self._emit_expr_value(target.value)
-                    if isinstance(obj.type, ir.IntType):
-                        obj = self.builder.inttoptr(obj, i8_ptr)
+                    obj = self._ensure_ptr(obj)
                     # Coerce value to match setter param type
                     if isinstance(value.type, ir.PointerType):
                         val_i64 = self.builder.ptrtoint(value, i64)
@@ -15137,12 +15116,7 @@ class CodeGen:
             gvar_type = gvar.type.pointee  # the type the global holds
             if gvar_type == i8_ptr:
                 # Pointer global (list, dict, str)
-                if isinstance(value.type, ir.IntType):
-                    value = self.builder.inttoptr(value, i8_ptr)
-                elif isinstance(value.type, ir.LiteralStructType):
-                    # FpyValue — extract data and convert to pointer
-                    data = self.builder.extract_value(value, 1)
-                    value = self.builder.inttoptr(data, i8_ptr)
+                value = self._ensure_ptr(value)
             elif gvar_type == double:
                 # Float global
                 if isinstance(value.type, ir.IntType):
@@ -16416,8 +16390,7 @@ class CodeGen:
                 mgr = self._emit_cpython_call_raw(ctx_expr) \
                     if isinstance(ctx_expr, ast.Call) \
                     else self._emit_expr_value(ctx_expr)
-                if isinstance(mgr.type, ir.IntType):
-                    mgr = self.builder.inttoptr(mgr, i8_ptr)
+                mgr = self._ensure_ptr(mgr)
                 # __enter__: get method then call it
                 enter_attr = self._make_string_constant("__enter__")
                 enter_method = self.builder.call(
@@ -16472,8 +16445,7 @@ class CodeGen:
             # Use a local alloca so it survives across basic blocks.
             mgr_alloca = self._create_entry_alloca(i8_ptr, "with.mgr.save")
             _pyobj_mgr_flag = self._create_entry_alloca(i32, "with.pyobj")
-            if isinstance(mgr.type, ir.IntType):
-                mgr = self.builder.inttoptr(mgr, i8_ptr)
+            mgr = self._ensure_ptr(mgr)
             self.builder.store(mgr, mgr_alloca)
             self.builder.store(
                 ir.Constant(i32, 1 if _is_pyobj_ctx else 0),
@@ -17804,8 +17776,7 @@ class CodeGen:
             return self.builder.call(
                 self.runtime["cpython_exec_get"], [code_ptr, name_ptr])
         obj = self._emit_expr_value(attr.value)
-        if isinstance(obj.type, ir.IntType):
-            obj = self.builder.inttoptr(obj, i8_ptr)
+        obj = self._ensure_ptr(obj)
         attr_name = self._make_string_constant(attr.attr)
         callable_ptr = self.builder.call(
             self.runtime["cpython_getattr"], [obj, attr_name])
@@ -17982,8 +17953,7 @@ class CodeGen:
         Returns an FpyValue struct."""
         name = node.func.id
         callable_ptr = self._load_variable(name, node)
-        if isinstance(callable_ptr.type, ir.IntType):
-            callable_ptr = self.builder.inttoptr(callable_ptr, i8_ptr)
+        callable_ptr = self._ensure_ptr(callable_ptr)
 
         out_tag = self._create_entry_alloca(i32, "pycall.tag")
         out_data = self._create_entry_alloca(i64, "pycall.data")
@@ -18554,8 +18524,7 @@ class CodeGen:
                 if info.ret_tag == "dict":
                     return self._fv_from_list(value)  # dicts stored as FpyList*
             # Default: treat as string
-            if isinstance(value.type, ir.IntType):
-                value = self.builder.inttoptr(value, i8_ptr)
+            value = self._ensure_ptr(value)
             return self._fv_from_str(value)
         # Fallback: infer from LLVM type
         if isinstance(value.type, ir.IntType):
@@ -18977,8 +18946,7 @@ class CodeGen:
 
         # Get the iterable and call __iter__()
         obj = self._emit_expr_value(node.iter)
-        if isinstance(obj.type, ir.IntType):
-            obj = self.builder.inttoptr(obj, i8_ptr)
+        obj = self._ensure_ptr(obj)
         iter_name = self._make_string_constant("__iter__")
         iterator = self.builder.call(
             self.runtime["obj_call_method0"], [obj, iter_name])
@@ -19044,8 +19012,7 @@ class CodeGen:
                 and isinstance(node.iter.func, ast.Attribute)
                 and self._is_pyobj_receiver(node.iter.func.value)):
             obj = self._emit_cpython_call_raw(node.iter)
-            if isinstance(obj.type, ir.IntType):
-                obj = self.builder.inttoptr(obj, i8_ptr)
+            obj = self._ensure_ptr(obj)
         else:
             iter_tv = self._emit_expr(node.iter)
             obj = iter_tv.as_ptr(self.builder)
@@ -19458,8 +19425,7 @@ class CodeGen:
             obj_cls = self._infer_object_class(node)
             if obj_cls and self._class_has_method(obj_cls, "__bool__"):
                 obj = self._emit_expr_value(node)
-                if isinstance(obj.type, ir.IntType):
-                    obj = self.builder.inttoptr(obj, i8_ptr)
+                obj = self._ensure_ptr(obj)
                 name_ptr = self._make_string_constant("__bool__")
                 result = self.builder.call(
                     self.runtime["obj_call_method0"], [obj, name_ptr])
@@ -20059,8 +20025,7 @@ class CodeGen:
         # For sets: O(1) hash lookup via dict-backed set
         if c_kind == VKind.SET or self._is_set_expr(container_node):
             container = self._emit_expr_value(container_node)
-            if isinstance(container.type, ir.IntType):
-                container = self.builder.inttoptr(container, i8_ptr)
+            container = self._ensure_ptr(container)
             tag, data = self._bare_to_tag_data(left_val, None)
             result = self.builder.call(
                 self.runtime["set_contains_fv"],
@@ -20135,8 +20100,7 @@ class CodeGen:
         if c_kind == VKind.DICT or self._is_dict_expr(container_node):
             container = self._emit_expr_value(container_node)
             # Ensure container is i8* (global dicts may be stored as i64)
-            if isinstance(container.type, ir.IntType):
-                container = self.builder.inttoptr(container, i8_ptr)
+            container = self._ensure_ptr(container)
             # Determine whether the left value is actually a string.
             # FV-backed string variables are loaded as i64 (IntType), but
             # they must be routed through dict_has_key (string hash table),
@@ -20151,8 +20115,7 @@ class CodeGen:
 
             if left_is_str:
                 # String key — convert i64 → i8* if needed
-                if isinstance(left_val.type, ir.IntType):
-                    left_val = self.builder.inttoptr(left_val, i8_ptr)
+                left_val = self._ensure_ptr(left_val)
                 result = self.builder.call(
                     self.runtime["dict_has_key"], [container, left_val])
             elif isinstance(left_val.type, ir.IntType):
@@ -20184,8 +20147,7 @@ class CodeGen:
                 and container_node.id in self.variables
                 and self._var_kind(container_node.id) == VKind.PYOBJ):
             container = self._load_variable(container_node.id, container_node)
-            if isinstance(container.type, ir.IntType):
-                container = self.builder.inttoptr(container, i8_ptr)
+            container = self._ensure_ptr(container)
             # Use CPython's __contains__ via bridge
             contains_name = self._make_string_constant("__contains__")
             method = self.builder.call(
@@ -20207,8 +20169,7 @@ class CodeGen:
         # string fallback because OBJ values are also pointers.
         if c_kind == VKind.OBJ or self._is_obj_expr(container_node):
             container = self._emit_expr_value(container_node)
-            if isinstance(container.type, ir.IntType):
-                container = self.builder.inttoptr(container, i8_ptr)
+            container = self._ensure_ptr(container)
             if isinstance(left_val.type, ir.PointerType):
                 arg = self.builder.ptrtoint(left_val, i64)
             elif isinstance(left_val.type, ir.DoubleType):
@@ -20964,8 +20925,7 @@ class CodeGen:
         has_starred = any(isinstance(a, ast.Starred) for a in node.args)
         if has_starred and n_args == 1 and isinstance(node.args[0], ast.Starred):
             args_list = self._emit_expr_value(node.args[0].value)
-            if isinstance(args_list.type, ir.IntType):
-                args_list = self.builder.inttoptr(args_list, i8_ptr)
+            args_list = self._ensure_ptr(args_list)
             ptr = self.builder.inttoptr(val, i8_ptr) if isinstance(val.type, ir.IntType) else val
             return self.builder.call(
                 self.runtime["closure_call_list"], [ptr, args_list])
@@ -21040,8 +21000,7 @@ class CodeGen:
                 coerced_new.append(val)
             obj = self.builder.call(new_fn, coerced_new)
             # __new__ returns an i8* object pointer
-            if isinstance(obj.type, ir.IntType):
-                obj = self.builder.inttoptr(obj, i8_ptr)
+            obj = self._ensure_ptr(obj)
         else:
             obj = self.builder.call(self.runtime["obj_new"], [class_id])
 
@@ -21854,8 +21813,7 @@ class CodeGen:
                 else:
                     # Non-literal sep: evaluate as string expression
                     sep_ir = self._emit_expr_value(kw.value)
-                    if isinstance(sep_ir.type, ir.IntType):
-                        sep_ir = self.builder.inttoptr(sep_ir, i8_ptr)
+                    sep_ir = self._ensure_ptr(sep_ir)
                     sep = None  # signal to use sep_ir
             elif kw.arg == "end":
                 if isinstance(kw.value, ast.Constant) and isinstance(kw.value.value, str):
@@ -21864,8 +21822,7 @@ class CodeGen:
                     end = "\n"  # end=None → default end
                 else:
                     end_ir = self._emit_expr_value(kw.value)
-                    if isinstance(end_ir.type, ir.IntType):
-                        end_ir = self.builder.inttoptr(end_ir, i8_ptr)
+                    end_ir = self._ensure_ptr(end_ir)
                     end = None  # signal to use end_ir
             else:
                 pass  # ignore unknown print kwargs (file=, flush=, etc.)
@@ -21991,8 +21948,7 @@ class CodeGen:
                          and node.func.value.id in getattr(
                              self, '_native_modules', set()))):
             ptr = self._emit_cpython_call_raw(node)
-            if isinstance(ptr.type, ir.IntType):
-                ptr = self.builder.inttoptr(ptr, i8_ptr)
+            ptr = self._ensure_ptr(ptr)
             self.builder.call(self.runtime["cpython_print_obj"], [ptr])
             self.builder.call(self.runtime["print_newline"], [])
             return
@@ -22010,8 +21966,7 @@ class CodeGen:
                 self.builder.call(self.runtime["fv_print"], [tag, data])
                 return
             ptr = self._load_variable(node.id, node)
-            if isinstance(ptr.type, ir.IntType):
-                ptr = self.builder.inttoptr(ptr, i8_ptr)
+            ptr = self._ensure_ptr(ptr)
             self.builder.call(self.runtime["cpython_print_obj"], [ptr])
             self.builder.call(self.runtime["print_newline"], [])
             return
@@ -22056,8 +22011,7 @@ class CodeGen:
             if fv is not None:
                 return fv  # already an FpyValue with correct runtime tag
             ptr = self._load_variable(node.id, node)
-            if isinstance(ptr.type, ir.IntType):
-                ptr = self.builder.inttoptr(ptr, i8_ptr)
+            ptr = self._ensure_ptr(ptr)
             tag_slot = self._create_entry_alloca(i32, "pyvar.tag")
             data_slot = self._create_entry_alloca(i64, "pyvar.data")
             self.builder.call(self.runtime["cpython_to_fv"],
@@ -22107,8 +22061,7 @@ class CodeGen:
                 ptr = self._emit_cpython_call_raw(node)
             else:
                 ptr = self._emit_expr_value(node)
-            if isinstance(ptr.type, ir.IntType):
-                ptr = self.builder.inttoptr(ptr, i8_ptr)
+            ptr = self._ensure_ptr(ptr)
             tag_slot = self._create_entry_alloca(i32, "pysub.cvt.tag")
             data_slot = self._create_entry_alloca(i64, "pysub.cvt.data")
             self.builder.call(self.runtime["cpython_to_fv"],
@@ -22129,8 +22082,7 @@ class CodeGen:
                 and self._is_defaultdict_expr(node.value)
                 and not isinstance(node.slice, ast.Slice)):
             obj = self._emit_expr_value(node.value)
-            if isinstance(obj.type, ir.IntType):
-                obj = self.builder.inttoptr(obj, i8_ptr)
+            obj = self._ensure_ptr(obj)
             key = self._emit_expr_value(node.slice)
             tag_slot = self._create_entry_alloca(i32, "dd.fv.tag")
             data_slot = self._create_entry_alloca(i64, "dd.fv.data")
@@ -22153,8 +22105,7 @@ class CodeGen:
                      or self._is_counter_expr(node.value))
                 and not isinstance(node.slice, ast.Slice)):
             obj = self._emit_expr_value(node.value)
-            if isinstance(obj.type, ir.IntType):
-                obj = self.builder.inttoptr(obj, i8_ptr)
+            obj = self._ensure_ptr(obj)
             key = self._emit_expr_value(node.slice)
             if isinstance(key.type, ir.PointerType):
                 tag_slot = self._create_entry_alloca(i32, "dget.tag")
@@ -22234,8 +22185,7 @@ class CodeGen:
                 and node.value.id in self.variables
                 and self._var_kind(node.value.id) == VKind.PYOBJ):
             obj = self._load_variable(node.value.id, node)
-            if isinstance(obj.type, ir.IntType):
-                obj = self.builder.inttoptr(obj, i8_ptr)
+            obj = self._ensure_ptr(obj)
             attr_name = self._make_string_constant(node.attr)
             pyobj = self.builder.call(
                 self.runtime["cpython_getattr"], [obj, attr_name])
@@ -22275,8 +22225,7 @@ class CodeGen:
                 if (prop_info and prop_info.properties
                         and node.attr in prop_info.properties):
                     obj = self._emit_expr_value(node.value)
-                    if isinstance(obj.type, ir.IntType):
-                        obj = self.builder.inttoptr(obj, i8_ptr)
+                    obj = self._ensure_ptr(obj)
                     method_func = prop_info.methods.get(node.attr)
                     if method_func:
                         result = self.builder.call(method_func, [obj])
@@ -24834,8 +24783,7 @@ class CodeGen:
             # __neg__ on user-class objects
             if self._is_obj_expr(node.operand):
                 obj = self._emit_expr_value(node.operand)
-                if isinstance(obj.type, ir.IntType):
-                    obj = self.builder.inttoptr(obj, i8_ptr)
+                obj = self._ensure_ptr(obj)
                 name_ptr = self._make_string_constant("__neg__")
                 result = self.builder.call(
                     self.runtime["obj_call_method0"], [obj, name_ptr])
@@ -24872,8 +24820,7 @@ class CodeGen:
                 obj_cls = self._infer_object_class(node.operand)
                 if obj_cls and self._class_has_method(obj_cls, "__pos__"):
                     obj = self._emit_expr_value(node.operand)
-                    if isinstance(obj.type, ir.IntType):
-                        obj = self.builder.inttoptr(obj, i8_ptr)
+                    obj = self._ensure_ptr(obj)
                     name_ptr = self._make_string_constant("__pos__")
                     result = self.builder.call(
                         self.runtime["obj_call_method0"], [obj, name_ptr])
@@ -24885,8 +24832,7 @@ class CodeGen:
                 obj_cls = self._infer_object_class(node.operand)
                 if obj_cls and self._class_has_method(obj_cls, "__invert__"):
                     obj = self._emit_expr_value(node.operand)
-                    if isinstance(obj.type, ir.IntType):
-                        obj = self.builder.inttoptr(obj, i8_ptr)
+                    obj = self._ensure_ptr(obj)
                     name_ptr = self._make_string_constant("__invert__")
                     result = self.builder.call(
                         self.runtime["obj_call_method0"], [obj, name_ptr])
@@ -25010,8 +24956,7 @@ class CodeGen:
             # pathlib.Path attribute access: p.name, p.parent, p.suffix, p.stem
             if self._is_path_expr(node.value):
                 obj = self._emit_expr_value(node.value)
-                if isinstance(obj.type, ir.IntType):
-                    obj = self.builder.inttoptr(obj, i8_ptr)
+                obj = self._ensure_ptr(obj)
                 _path_attrs = {
                     "name": "path_name", "parent": "path_parent",
                     "suffix": "path_suffix", "stem": "path_stem",
@@ -25047,16 +24992,14 @@ class CodeGen:
                     obj = self.builder.load(self._cpython_modules[node.value.id])
                 else:
                     obj = self._load_variable(node.value.id, node)
-                if isinstance(obj.type, ir.IntType):
-                    obj = self.builder.inttoptr(obj, i8_ptr)
+                obj = self._ensure_ptr(obj)
                 attr_name = self._make_string_constant(node.attr)
                 return self.builder.call(
                     self.runtime["cpython_getattr"], [obj, attr_name])
             # Chained pyobj attribute: foo.bar.baz where foo is pyobj
             if self._is_pyobj_receiver(node.value):
                 obj = self._emit_expr_value(node.value)
-                if isinstance(obj.type, ir.IntType):
-                    obj = self.builder.inttoptr(obj, i8_ptr)
+                obj = self._ensure_ptr(obj)
                 attr_name = self._make_string_constant(node.attr)
                 return self.builder.call(
                     self.runtime["cpython_getattr"], [obj, attr_name])
@@ -25184,10 +25127,10 @@ class CodeGen:
                 if result is not None:
                     return result
             # Check for weakref dereference: r() where r = weakref.ref(obj)
-            if name in getattr(self, '_weakref_vars', set()):
+            elif name in getattr(self, '_weakref_vars', set()):
                 return self._emit_weakref_deref(node)
             # Check for closure variable
-            if name in self.variables:
+            elif name in self.variables:
                 _, tag = self.variables[name]
                 if tag == "closure":
                     return self._emit_closure_call(node)
@@ -25235,25 +25178,25 @@ class CodeGen:
                     [mod_ptr, self._make_string_constant(attr)])
                 return self._emit_cpython_call_with_ptr(func_ptr, node)
             # Singledispatch: emit a switch on the first arg's runtime tag
-            if name in self._singledispatch and node.args:
+            elif name in self._singledispatch and node.args:
                 return self._emit_singledispatch_call(node, name)
             # lru_cache: wrap user function call with cache lookup
             lru_funcs = getattr(self, '_lru_cached_functions', {})
             if name in lru_funcs and name in self._user_functions:
                 return self._emit_lru_cached_call(node, name)
-            if name in self._user_functions:
+            elif name in self._user_functions:
                 result = self._emit_user_call(node)
                 if result is None:
                     # Phase 4: None-returning function used as expression → 0
                     return ir.Constant(i64, 0)
                 return result
-            if name in self._user_classes:
+            elif name in self._user_classes:
                 return self._emit_constructor(node)
-            if name == "len":
+            elif name == "len":
                 return self._emit_builtin_len(node)
-            if name == "isinstance":
+            elif name == "isinstance":
                 return self._emit_builtin_isinstance(node)
-            if name == "type":
+            elif name == "type":
                 if len(node.args) == 1:
                     arg_node = node.args[0]
                     # User-defined functions are native code pointers, not
@@ -25399,9 +25342,9 @@ class CodeGen:
                     display = type_name_map.get(actual, actual)
                     return self._make_string_constant(f"<class '{display}'>")
                 return self._bridge_fallback_expr(node, "type() with multiple args")
-            if name == "sorted":
+            elif name == "sorted":
                 return self._emit_builtin_sorted(node)
-            if name == "range":
+            elif name == "range":
                 # range(stop) / range(start, stop) / range(start, stop, step) -> list
                 if len(node.args) == 1:
                     start = ir.Constant(i64, 0)
@@ -25418,7 +25361,7 @@ class CodeGen:
                 else:
                     raise CodeGenError("range() takes 1-3 arguments", node)
                 return self.builder.call(self.runtime["range"], [start, stop, step])
-            if name == "list":
+            elif name == "list":
                 # list(dict) → list of keys
                 if len(node.args) == 1 and self._is_dict_expr(node.args[0]):
                     d = self._emit_expr_value(node.args[0])
@@ -25426,8 +25369,7 @@ class CodeGen:
                 # list(deque) → deque_to_list conversion
                 if len(node.args) == 1 and self._is_deque_expr(node.args[0]):
                     dq = self._emit_expr_value(node.args[0])
-                    if isinstance(dq.type, ir.IntType):
-                        dq = self.builder.inttoptr(dq, i8_ptr)
+                    dq = self._ensure_ptr(dq)
                     return self.builder.call(self.runtime["deque_to_list"], [dq])
                 # list(bytes) → list of byte values (ints)
                 if len(node.args) == 1:
@@ -25439,14 +25381,12 @@ class CodeGen:
                         is_bytes = (vtag == "bytes")
                     if is_bytes:
                         b = self._emit_expr_value(arg)
-                        if isinstance(b.type, ir.IntType):
-                            b = self.builder.inttoptr(b, i8_ptr)
+                        b = self._ensure_ptr(b)
                         return self.builder.call(self.runtime["bytes_to_list"], [b])
                 # list(obj) — iterate via __iter__/__next__ protocol
                 if len(node.args) == 1 and self._is_obj_expr(node.args[0]):
                     obj = self._emit_expr_value(node.args[0])
-                    if isinstance(obj.type, ir.IntType):
-                        obj = self.builder.inttoptr(obj, i8_ptr)
+                    obj = self._ensure_ptr(obj)
                     return self._rt_call("list_from_obj_iter", [obj])
                 # list(x) — for now, just return the arg (shallow copy would be better)
                 if len(node.args) == 1:
@@ -25476,7 +25416,7 @@ class CodeGen:
                                                   [d, k_val, ir.Constant(i32, tag), data])
                         return d
                     return self._bridge_fallback_expr(node, "dict() with non-literal argument")
-            if name == "tuple":
+            elif name == "tuple":
                 # tuple(iter) — build list, then mark as tuple for correct repr
                 if len(node.args) == 1:
                     result = self._emit_expr_value(node.args[0])
@@ -25490,7 +25430,7 @@ class CodeGen:
                 if len(node.args) == 0:
                     return self.builder.call(self.runtime["tuple_new"], [])
                 raise CodeGenError("tuple() with wrong number of args", node)
-            if name == "complex":
+            elif name == "complex":
                 # complex(real, imag) or complex(real)
                 if len(node.args) == 0:
                     real = ir.Constant(double, 0.0)
@@ -25512,19 +25452,18 @@ class CodeGen:
                 ptr = self.builder.call(self.runtime["complex_new"],
                                         [real, imag])
                 return self.builder.ptrtoint(ptr, i64)
-            if name == "reversed":
+            elif name == "reversed":
                 if len(node.args) == 1:
                     arg = self._emit_expr_value(node.args[0])
                     return self._rt_call("list_reversed", [arg])
                 raise CodeGenError("reversed() takes exactly one argument", node)
-            if name == "int":
+            elif name == "int":
                 if len(node.args) == 1:
                     arg_node = node.args[0]
                     # User object with __int__: dispatch to dunder
                     if self._is_obj_expr(arg_node):
                         obj = self._emit_expr_value(arg_node)
-                        if isinstance(obj.type, ir.IntType):
-                            obj = self.builder.inttoptr(obj, i8_ptr)
+                        obj = self._ensure_ptr(obj)
                         name_ptr = self._make_string_constant("__int__")
                         return self.builder.call(
                             self.runtime["obj_call_method0"],
@@ -25544,8 +25483,7 @@ class CodeGen:
                         # Get the PyObject* result
                         if isinstance(arg_node, ast.Name):
                             ptr = self._load_variable(arg_node.id, arg_node)
-                            if isinstance(ptr.type, ir.IntType):
-                                ptr = self.builder.inttoptr(ptr, i8_ptr)
+                            ptr = self._ensure_ptr(ptr)
                         else:
                             ptr = self._emit_cpython_call_raw(arg_node)
                         # Call builtins.int(pyobj) through the bridge
@@ -25629,14 +25567,13 @@ class CodeGen:
                     # int(str, base) — convert string with base
                     val = self._emit_expr_value(node.args[0])
                     base = self._emit_expr_value(node.args[1])
-                    if isinstance(val.type, ir.IntType):
-                        val = self.builder.inttoptr(val, i8_ptr)
+                    val = self._ensure_ptr(val)
                     return self.builder.call(
                         self.runtime["str_to_int_base"], [val, base])
                 raise CodeGenError("int() with wrong number of args", node)
-            if name == "locals":
+            elif name == "locals":
                 return self._emit_locals_dict()
-            if name == "globals":
+            elif name == "globals":
                 # Build a dict from all global variables
                 d = self.builder.call(self.runtime["dict_new"], [])
                 for gname, (gvar, gtag) in self._global_vars.items():
@@ -25646,15 +25583,15 @@ class CodeGen:
                     self.builder.call(self.runtime["dict_set_fv"],
                                       [d, key, ir.Constant(i32, t), data])
                 return d
-            if name == "map":
+            elif name == "map":
                 if len(node.args) == 2:
                     return self._emit_builtin_map(node)
                 raise CodeGenError("map() takes 2 arguments (function, iterable)", node)
-            if name == "filter":
+            elif name == "filter":
                 if len(node.args) == 2:
                     return self._emit_builtin_filter(node)
                 return self._bridge_fallback_expr(node, "filter() with wrong args")
-            if name == "eval":
+            elif name == "eval":
                 if len(node.args) < 1:
                     raise CodeGenError("eval() requires at least 1 argument", node)
                 # Compile-time eval: literal string → parse and compile inline
@@ -25680,7 +25617,7 @@ class CodeGen:
                 fv = self.builder.insert_value(fv, tag_val, 0)
                 fv = self.builder.insert_value(fv, data_val, 1)
                 return fv
-            if name == "exec":
+            elif name == "exec":
                 if len(node.args) < 1:
                     raise CodeGenError("exec() requires at least 1 argument", node)
                 # Compile-time exec: literal string → parse and compile inline
@@ -25699,7 +25636,7 @@ class CodeGen:
                 # jit_exec tries native compilation first, falls back to CPython
                 self.builder.call(self.runtime["jit_exec"], [code_ptr])
                 return ir.Constant(i64, 0)
-            if name == "enumerate":
+            elif name == "enumerate":
                 if len(node.args) >= 1:
                     lst = self._emit_expr_value(node.args[0])
                     start = None
@@ -25726,7 +25663,7 @@ class CodeGen:
                         return self._rt_call("enumerate_str", [lst, start])
                     return self._rt_call("enumerate", [lst, start])
                 raise CodeGenError("enumerate() requires at least one argument", node)
-            if name == "zip":
+            elif name == "zip":
                 if len(node.args) == 2:
                     a = self._emit_expr_value(node.args[0])
                     b = self._emit_expr_value(node.args[1])
@@ -25737,7 +25674,7 @@ class CodeGen:
                     c = self._emit_expr_value(node.args[2])
                     return self._rt_call("zip3", [a, b, c])
                 return self._bridge_fallback_expr(node, "zip() with 1 or >3 args")
-            if name == "any":
+            elif name == "any":
                 if len(node.args) == 1 and self._is_list_expr(node.args[0]):
                     lst = self._emit_expr_value(node.args[0])
                     length = self._rt_call("list_length", [lst])
@@ -25768,7 +25705,7 @@ class CodeGen:
                     self.builder.position_at_end(end_b)
                     return self.builder.zext(self.builder.load(result_alloca), i32)
                 return self._bridge_fallback_expr(node, "any() with non-list argument")
-            if name == "all":
+            elif name == "all":
                 if len(node.args) == 1 and self._is_list_expr(node.args[0]):
                     lst = self._emit_expr_value(node.args[0])
                     length = self._rt_call("list_length", [lst])
@@ -25799,18 +25736,17 @@ class CodeGen:
                     self.builder.position_at_end(end_b)
                     return self.builder.zext(self.builder.load(result_alloca), i32)
                 return self._bridge_fallback_expr(node, "all() with non-list argument")
-            if name == "bool":
+            elif name == "bool":
                 if len(node.args) == 1:
                     return self.builder.zext(self._truthiness_of_expr(node.args[0]), i32)
                 raise CodeGenError("bool() takes exactly one argument", node)
-            if name == "float":
+            elif name == "float":
                 if len(node.args) == 1:
                     arg_node = node.args[0]
                     # User object with __float__: dispatch to dunder
                     if self._is_obj_expr(arg_node):
                         obj = self._emit_expr_value(arg_node)
-                        if isinstance(obj.type, ir.IntType):
-                            obj = self.builder.inttoptr(obj, i8_ptr)
+                        obj = self._ensure_ptr(obj)
                         name_ptr = self._make_string_constant("__float__")
                         # Must use the double-returning variant because __float__
                         # returns in XMM0, not RAX — calling through int64 ABI
@@ -25821,8 +25757,7 @@ class CodeGen:
                     # pyobj: call Python's float() via bridge
                     if self._is_pyobj_var(arg_node):
                         ptr = self._load_variable(arg_node.id, arg_node)
-                        if isinstance(ptr.type, ir.IntType):
-                            ptr = self.builder.inttoptr(ptr, i8_ptr)
+                        ptr = self._ensure_ptr(ptr)
                         blt = self._make_string_constant("builtins")
                         blt_mod = self.builder.call(
                             self.runtime["cpython_import"], [blt])
@@ -25891,15 +25826,14 @@ class CodeGen:
                         return self._rt_call("str_to_float", [val])
                     return val
                 raise CodeGenError("float() takes exactly one argument", node)
-            if name == "str":
+            elif name == "str":
                 if len(node.args) == 1:
                     arg_node = node.args[0]
                     # OBJ fast path: use obj_to_str which handles
                     # __str__ → __repr__ → default fallback safely
                     if self._is_obj_expr(arg_node):
                         obj = self._emit_expr_value(arg_node)
-                        if isinstance(obj.type, ir.IntType):
-                            obj = self.builder.inttoptr(obj, i8_ptr)
+                        obj = self._ensure_ptr(obj)
                         result = self.builder.call(
                             self.runtime["obj_to_str"], [obj])
                         return self.builder.inttoptr(result, i8_ptr)
@@ -25911,20 +25845,18 @@ class CodeGen:
                 if len(node.args) >= 1:
                     return self._emit_expr_value(node.args[0])
                 return self._make_string_constant("")
-            if name == "getattr" and len(node.args) >= 2:
+            elif name == "getattr" and len(node.args) >= 2:
                 obj = self._emit_expr_value(node.args[0])
-                if isinstance(obj.type, ir.IntType):
-                    obj = self.builder.inttoptr(obj, i8_ptr)
+                obj = self._ensure_ptr(obj)
                 attr_name = self._emit_expr_value(node.args[1])
-                if isinstance(attr_name.type, ir.IntType):
-                    attr_name = self.builder.inttoptr(attr_name, i8_ptr)
+                attr_name = self._ensure_ptr(attr_name)
                 tag_slot = self._create_entry_alloca(i32, "ga.tag")
                 data_slot = self._create_entry_alloca(i64, "ga.data")
                 self.builder.call(self.runtime["obj_get_fv"],
                                   [obj, attr_name, tag_slot, data_slot])
                 return self.builder.load(data_slot)
 
-            if name == "hasattr" and len(node.args) >= 2:
+            elif name == "hasattr" and len(node.args) >= 2:
                 # Check if the object is a PYOBJ before evaluating args
                 obj_kind = VKind.UNKNOWN
                 if (isinstance(node.args[0], ast.Name)
@@ -25933,11 +25865,9 @@ class CodeGen:
                 # For PYOBJ (bridge objects), call CPython's hasattr
                 if obj_kind == VKind.PYOBJ:
                     obj = self._emit_expr_value(node.args[0])
-                    if isinstance(obj.type, ir.IntType):
-                        obj = self.builder.inttoptr(obj, i8_ptr)
+                    obj = self._ensure_ptr(obj)
                     attr_name = self._emit_expr_value(node.args[1])
-                    if isinstance(attr_name.type, ir.IntType):
-                        attr_name = self.builder.inttoptr(attr_name, i8_ptr)
+                    attr_name = self._ensure_ptr(attr_name)
                     result = self.builder.call(
                         self.runtime["cpython_hasattr"], [obj, attr_name])
                     return self.builder.zext(result, i64)
@@ -25947,28 +25877,25 @@ class CodeGen:
                 # _emit_expr_value on non-PYOBJ objects.
                 return ir.Constant(i64, 1)  # True
 
-            if name == "setattr" and len(node.args) >= 3:
+            elif name == "setattr" and len(node.args) >= 3:
                 obj = self._emit_expr_value(node.args[0])
-                if isinstance(obj.type, ir.IntType):
-                    obj = self.builder.inttoptr(obj, i8_ptr)
+                obj = self._ensure_ptr(obj)
                 attr_name = self._emit_expr_value(node.args[1])
-                if isinstance(attr_name.type, ir.IntType):
-                    attr_name = self.builder.inttoptr(attr_name, i8_ptr)
+                attr_name = self._ensure_ptr(attr_name)
                 val = self._emit_expr_value(node.args[2])
                 tag, data = self._bare_to_tag_data(val, node.args[2])
                 self.builder.call(self.runtime["obj_set_fv"],
                                   [obj, attr_name, ir.Constant(i32, tag), data])
                 return ir.Constant(i64, 0)
 
-            if name == "hash":
+            elif name == "hash":
                 if len(node.args) == 1:
                     arg_node = node.args[0]
                     if self._is_obj_expr(arg_node):
                         obj_cls = self._infer_object_class(arg_node)
                         if obj_cls and self._class_has_method(obj_cls, "__hash__"):
                             obj = self._emit_expr_value(arg_node)
-                            if isinstance(obj.type, ir.IntType):
-                                obj = self.builder.inttoptr(obj, i8_ptr)
+                            obj = self._ensure_ptr(obj)
                             name_ptr = self._make_string_constant("__hash__")
                             return self.builder.call(
                                 self.runtime["obj_call_method0"],
@@ -25977,31 +25904,29 @@ class CodeGen:
                     val = self._emit_expr_value(arg_node)
                     return val
                 raise CodeGenError("hash() takes exactly one argument", node)
-            if name == "next":
+            elif name == "next":
                 if len(node.args) >= 1:
                     arg_node = node.args[0]
                     obj = self._emit_expr_value(arg_node)
-                    if isinstance(obj.type, ir.IntType):
-                        obj = self.builder.inttoptr(obj, i8_ptr)
+                    obj = self._ensure_ptr(obj)
                     name_ptr = self._make_string_constant("__next__")
                     return self.builder.call(
                         self.runtime["obj_call_method0"],
                         [obj, name_ptr])
                 raise CodeGenError("next() takes exactly one argument", node)
-            if name == "iter":
+            elif name == "iter":
                 if len(node.args) == 1:
                     arg_node = node.args[0]
                     if self._is_obj_expr(arg_node):
                         obj = self._emit_expr_value(arg_node)
-                        if isinstance(obj.type, ir.IntType):
-                            obj = self.builder.inttoptr(obj, i8_ptr)
+                        obj = self._ensure_ptr(obj)
                         name_ptr = self._make_string_constant("__iter__")
                         return self.builder.call(
                             self.runtime["obj_call_method0"],
                             [obj, name_ptr])
                     return self._emit_expr_value(arg_node)
                 return self._bridge_fallback_expr(node, "iter() with sentinel form")
-            if name == "abs":
+            elif name == "abs":
                 if len(node.args) == 1:
                     # Complex abs: |a+bi| = sqrt(a^2 + b^2)
                     arg_node = node.args[0]
@@ -26020,8 +25945,7 @@ class CodeGen:
                     # Object __abs__: dispatch to dunder (returns object)
                     if self._is_obj_expr(arg_node):
                         obj = self._emit_expr_value(arg_node)
-                        if isinstance(obj.type, ir.IntType):
-                            obj = self.builder.inttoptr(obj, i8_ptr)
+                        obj = self._ensure_ptr(obj)
                         name_ptr = self._make_string_constant("__abs__")
                         result_i64 = self.builder.call(
                             self.runtime["obj_call_method0"],
@@ -26036,7 +25960,7 @@ class CodeGen:
                         fabs_fn = self.module.declare_intrinsic("llvm.fabs", [double])
                         return self.builder.call(fabs_fn, [val])
                 return self._bridge_fallback_expr(node, "abs() with wrong args")
-            if name == "divmod":
+            elif name == "divmod":
                 if len(node.args) == 2:
                     a = self._emit_expr_value(node.args[0])
                     b = self._emit_expr_value(node.args[1])
@@ -26052,7 +25976,7 @@ class CodeGen:
                     self._rt_call("list_append_fv", [tup, int_tag, r_val])
                     return tup
                 raise CodeGenError("divmod() takes exactly 2 arguments", node)
-            if name == "pow":
+            elif name == "pow":
                 if len(node.args) == 2:
                     b = self._emit_expr_value(node.args[0])
                     e = self._emit_expr_value(node.args[1])
@@ -26069,32 +25993,32 @@ class CodeGen:
                     m = self._emit_expr_value(node.args[2])
                     return self.builder.call(self.runtime["pow_mod"], [b, e, m])
                 raise CodeGenError("pow() takes 2 or 3 arguments", node)
-            if name == "chr":
+            elif name == "chr":
                 if len(node.args) == 1:
                     val = self._emit_expr_value(node.args[0])
                     return self.builder.call(self.runtime["chr"], [val])
                 raise CodeGenError("chr() takes exactly one argument", node)
-            if name == "ord":
+            elif name == "ord":
                 if len(node.args) == 1:
                     val = self._emit_expr_value(node.args[0])
                     return self._rt_call("ord", [val])
                 raise CodeGenError("ord() takes exactly one argument", node)
-            if name == "hex":
+            elif name == "hex":
                 if len(node.args) == 1:
                     val = self._emit_expr_value(node.args[0])
                     return self.builder.call(self.runtime["hex"], [val])
                 raise CodeGenError("hex() takes exactly one argument", node)
-            if name == "oct":
+            elif name == "oct":
                 if len(node.args) == 1:
                     val = self._emit_expr_value(node.args[0])
                     return self.builder.call(self.runtime["oct"], [val])
                 raise CodeGenError("oct() takes exactly one argument", node)
-            if name == "bin":
+            elif name == "bin":
                 if len(node.args) == 1:
                     val = self._emit_expr_value(node.args[0])
                     return self.builder.call(self.runtime["bin"], [val])
                 raise CodeGenError("bin() takes exactly one argument", node)
-            if name == "round":
+            elif name == "round":
                 if len(node.args) == 1:
                     # Use FV dispatch to handle bridge float values stored as i64
                     fv = self._load_or_wrap_fv(node.args[0])
@@ -26121,15 +26045,14 @@ class CodeGen:
                     val = self.builder.select(is_float, as_float, as_int_float)
                     return self.builder.call(self.runtime["round_ndigits"], [val, ndigits])
                 raise CodeGenError("round() takes 1 or 2 arguments", node)
-            if name == "repr":
+            elif name == "repr":
                 if len(node.args) == 1:
                     arg_node = node.args[0]
                     # OBJ fast path: use obj_to_repr which handles
                     # __repr__ → __str__ → default fallback safely
                     if self._is_obj_expr(arg_node):
                         obj = self._emit_expr_value(arg_node)
-                        if isinstance(obj.type, ir.IntType):
-                            obj = self.builder.inttoptr(obj, i8_ptr)
+                        obj = self._ensure_ptr(obj)
                         result = self.builder.call(
                             self.runtime["obj_to_repr"], [obj])
                         return self.builder.inttoptr(result, i8_ptr)
@@ -26137,7 +26060,7 @@ class CodeGen:
                     fv = self._load_or_wrap_fv(node.args[0])
                     return self._fv_call_repr(fv)
                 raise CodeGenError("repr() takes exactly one argument", node)
-            if name == "sum":
+            elif name == "sum":
                 # Phase 2: use TypedValue to accept lists, tuples, and sets
                 tv_sum = self._emit_expr(node.args[0]) if node.args else None
                 sum_kind = tv_sum.vtype.kind if tv_sum else VKind.UNKNOWN
@@ -26182,14 +26105,14 @@ class CodeGen:
                     self.builder.position_at_end(end_block)
                     return self.builder.load(sum_alloca)
                 raise CodeGenError("sum() requires a list argument", node)
-            if name in ("set", "frozenset"):
+            elif name in ("set", "frozenset"):
                 if len(node.args) == 1:
                     arg = self._emit_expr_value(node.args[0])
                     return self._rt_call("set_from_list", [arg])
                 if len(node.args) == 0:
                     return self.builder.call(self.runtime["dict_new"], [])
                 raise CodeGenError(f"{name}() takes 0 or 1 arguments", node)
-            if name == "min" or name == "max":
+            elif name == "min" or name == "max":
                 # Extract key= kwarg if provided. Supports `key=len` (for
                 # strings) and `key=<user_function>` that returns int.
                 key_func_name: str | None = None
@@ -26469,8 +26392,7 @@ class CodeGen:
                 if obj_cls and self._class_has_method(obj_cls, "__call__"):
                     # Direct dispatch to __call__
                     obj = self._load_variable(node.func.id, node)
-                    if isinstance(obj.type, ir.IntType):
-                        obj = self.builder.inttoptr(obj, i8_ptr)
+                    obj = self._ensure_ptr(obj)
                     call_func = None
                     cn = obj_cls
                     while cn and cn in self._user_classes:
@@ -26491,8 +26413,7 @@ class CodeGen:
         # for the common case; fall back to obj_call_method for __call__.
         if isinstance(node.func, ast.Call):
             callee = self._emit_expr_value(node.func)
-            if isinstance(callee.type, ir.IntType):
-                callee = self.builder.inttoptr(callee, i8_ptr)
+            callee = self._ensure_ptr(callee)
             if isinstance(callee.type, ir.PointerType):
                 # Check if the inner call returns a closure
                 inner_returns_closure = False
@@ -26689,8 +26610,7 @@ class CodeGen:
                                              [ir.Constant(i32, tag), data])
                 if func_name == "loads" and len(node.args) == 1:
                     arg = self._emit_expr_value(node.args[0])
-                    if isinstance(arg.type, ir.IntType):
-                        arg = self.builder.inttoptr(arg, i8_ptr)
+                    arg = self._ensure_ptr(arg)
                     out_tag = self._create_entry_alloca(i32, "json.tag")
                     out_data = self._create_entry_alloca(i64, "json.data")
                     self.builder.call(self.runtime["json_loads"],
@@ -26699,7 +26619,7 @@ class CodeGen:
                     data_val = self.builder.load(out_data)
                     return self.builder.inttoptr(data_val, i8_ptr)
             # os module
-            if mod_name in ("os", "os.path"):
+            elif mod_name in ("os", "os.path"):
                 def _str_arg(idx=0):
                     v = self._emit_expr_value(node.args[idx])
                     if isinstance(v.type, ir.IntType):
@@ -26771,19 +26691,18 @@ class CodeGen:
                     args = []
                     for i in range(n_args):
                         v = self._emit_expr_value(node.args[i])
-                        if isinstance(v.type, ir.IntType):
-                            v = self.builder.inttoptr(v, i8_ptr)
+                        v = self._ensure_ptr(v)
                         args.append(v)
                     return self.builder.call(self.runtime[rt_key], args)
 
             # --- collections module ---
-            if mod_name in ("collections", "_collections"):
+            elif mod_name in ("collections", "_collections"):
                 return self._emit_collections_call(func_name, node)
 
             # --- typing module ---
             # All typing constructs are no-ops at runtime. They just pass
             # through their arguments or return identity.
-            if mod_name == "typing":
+            elif mod_name == "typing":
                 # cast(Type, value) → just return the value
                 if func_name == "cast" and len(node.args) == 2:
                     return self._emit_expr_value(node.args[1])
@@ -26795,23 +26714,23 @@ class CodeGen:
                 return None
 
             # --- functools module ---
-            if mod_name in ("functools", "_functools"):
+            elif mod_name in ("functools", "_functools"):
                 return self._emit_functools_call(func_name, node)
 
             # --- logging module ---
-            if mod_name == "logging":
+            elif mod_name == "logging":
                 return self._emit_logging_call(func_name, node)
 
             # --- pathlib module ---
-            if mod_name == "pathlib":
+            elif mod_name == "pathlib":
                 return self._emit_pathlib_call(func_name, node)
 
             # --- random module ---
-            if mod_name == "random":
+            elif mod_name == "random":
                 return self._emit_random_call(func_name, node)
 
             # --- copy module ---
-            if mod_name == "copy":
+            elif mod_name == "copy":
                 if func_name in ("copy", "deepcopy") and len(node.args) == 1:
                     val = self._emit_expr_value(node.args[0])
                     tag, data = self._bare_to_tag_data(val, node.args[0])
@@ -26830,7 +26749,7 @@ class CodeGen:
                 return None
 
             # --- operator module ---
-            if mod_name == "operator":
+            elif mod_name == "operator":
                 _op_funcs = {
                     "add": "operator_add", "sub": "operator_sub",
                     "mul": "operator_mul",
@@ -26857,53 +26776,46 @@ class CodeGen:
                 return None
 
             # --- textwrap module ---
-            if mod_name == "textwrap":
+            elif mod_name == "textwrap":
                 if func_name == "dedent" and len(node.args) == 1:
                     arg = self._emit_expr_value(node.args[0])
-                    if isinstance(arg.type, ir.IntType):
-                        arg = self.builder.inttoptr(arg, i8_ptr)
+                    arg = self._ensure_ptr(arg)
                     return self.builder.call(self.runtime["textwrap_dedent"], [arg])
                 if func_name == "indent" and len(node.args) == 2:
                     text = self._emit_expr_value(node.args[0])
                     prefix = self._emit_expr_value(node.args[1])
-                    if isinstance(text.type, ir.IntType):
-                        text = self.builder.inttoptr(text, i8_ptr)
-                    if isinstance(prefix.type, ir.IntType):
-                        prefix = self.builder.inttoptr(prefix, i8_ptr)
+                    text = self._ensure_ptr(text)
+                    prefix = self._ensure_ptr(prefix)
                     return self.builder.call(self.runtime["textwrap_indent"],
                                               [text, prefix])
                 return None
 
             # --- shutil module ---
-            if mod_name == "shutil":
-                if func_name == "copy" and len(node.args) == 2:
+            elif mod_name == "shutil":
+                if func_name in ("copy", "copy2", "copyfile") and len(node.args) == 2:
                     src = self._emit_expr_value(node.args[0])
                     dst = self._emit_expr_value(node.args[1])
-                    if isinstance(src.type, ir.IntType):
-                        src = self.builder.inttoptr(src, i8_ptr)
-                    if isinstance(dst.type, ir.IntType):
-                        dst = self.builder.inttoptr(dst, i8_ptr)
+                    src = self._ensure_ptr(src)
+                    dst = self._ensure_ptr(dst)
                     self.builder.call(self.runtime["shutil_copy"], [src, dst])
                     return ir.Constant(i64, 0)
                 if func_name == "rmtree" and len(node.args) == 1:
                     path = self._emit_expr_value(node.args[0])
-                    if isinstance(path.type, ir.IntType):
-                        path = self.builder.inttoptr(path, i8_ptr)
+                    path = self._ensure_ptr(path)
                     self.builder.call(self.runtime["shutil_rmtree"], [path])
                     return ir.Constant(i64, 0)
                 return None
 
             # --- glob module ---
-            if mod_name == "glob":
+            elif mod_name == "glob":
                 if func_name == "glob" and len(node.args) == 1:
                     pattern = self._emit_expr_value(node.args[0])
-                    if isinstance(pattern.type, ir.IntType):
-                        pattern = self.builder.inttoptr(pattern, i8_ptr)
+                    pattern = self._ensure_ptr(pattern)
                     return self.builder.call(self.runtime["glob_glob"], [pattern])
                 return None
 
             # --- tempfile module ---
-            if mod_name == "tempfile":
+            elif mod_name == "tempfile":
                 if func_name == "gettempdir" and len(node.args) == 0:
                     return self.builder.call(self.runtime["tempfile_gettempdir"], [])
                 if func_name == "mkdtemp" and len(node.args) == 0:
@@ -26911,17 +26823,15 @@ class CodeGen:
                 return None
 
             # --- heapq module ---
-            if mod_name == "heapq":
+            elif mod_name == "heapq":
                 if func_name == "heapify" and len(node.args) == 1:
                     lst = self._emit_expr_value(node.args[0])
-                    if isinstance(lst.type, ir.IntType):
-                        lst = self.builder.inttoptr(lst, i8_ptr)
+                    lst = self._ensure_ptr(lst)
                     self.builder.call(self.runtime["heapq_heapify"], [lst])
                     return ir.Constant(i64, 0)
                 if func_name == "heappush" and len(node.args) == 2:
                     lst = self._emit_expr_value(node.args[0])
-                    if isinstance(lst.type, ir.IntType):
-                        lst = self.builder.inttoptr(lst, i8_ptr)
+                    lst = self._ensure_ptr(lst)
                     val = self._emit_expr_value(node.args[1])
                     tag, data = self._bare_to_tag_data(val, node.args[1])
                     self.builder.call(self.runtime["heapq_heappush"],
@@ -26929,43 +26839,38 @@ class CodeGen:
                     return ir.Constant(i64, 0)
                 if func_name == "heappop" and len(node.args) == 1:
                     lst = self._emit_expr_value(node.args[0])
-                    if isinstance(lst.type, ir.IntType):
-                        lst = self.builder.inttoptr(lst, i8_ptr)
+                    lst = self._ensure_ptr(lst)
                     return self.builder.call(self.runtime["heapq_heappop"], [lst])
                 if func_name == "nsmallest" and len(node.args) == 2:
                     n = self._emit_expr_value(node.args[0])
                     lst = self._emit_expr_value(node.args[1])
-                    if isinstance(lst.type, ir.IntType):
-                        lst = self.builder.inttoptr(lst, i8_ptr)
+                    lst = self._ensure_ptr(lst)
                     return self.builder.call(self.runtime["heapq_nsmallest"],
                                               [n, lst])
                 return None
 
             # --- bisect module ---
-            if mod_name == "bisect":
+            elif mod_name == "bisect":
                 if func_name in ("bisect_left", "bisect") and len(node.args) == 2:
                     lst = self._emit_expr_value(node.args[0])
-                    if isinstance(lst.type, ir.IntType):
-                        lst = self.builder.inttoptr(lst, i8_ptr)
+                    lst = self._ensure_ptr(lst)
                     x = self._emit_expr_value(node.args[1])
                     return self.builder.call(self.runtime["bisect_left"], [lst, x])
                 if func_name == "bisect_right" and len(node.args) == 2:
                     lst = self._emit_expr_value(node.args[0])
-                    if isinstance(lst.type, ir.IntType):
-                        lst = self.builder.inttoptr(lst, i8_ptr)
+                    lst = self._ensure_ptr(lst)
                     x = self._emit_expr_value(node.args[1])
                     return self.builder.call(self.runtime["bisect_right"], [lst, x])
                 if func_name == "insort" and len(node.args) == 2:
                     lst = self._emit_expr_value(node.args[0])
-                    if isinstance(lst.type, ir.IntType):
-                        lst = self.builder.inttoptr(lst, i8_ptr)
+                    lst = self._ensure_ptr(lst)
                     x = self._emit_expr_value(node.args[1])
                     self.builder.call(self.runtime["bisect_insort"], [lst, x])
                     return ir.Constant(i64, 0)
                 return None
 
             # --- decimal module ---
-            if mod_name == "decimal":
+            elif mod_name == "decimal":
                 if func_name == "Decimal":
                     if len(node.args) == 0:
                         return self.builder.call(self.runtime["decimal_from_int"],
@@ -26984,7 +26889,7 @@ class CodeGen:
                 return None
 
             # --- platform module ---
-            if mod_name == "platform":
+            elif mod_name == "platform":
                 # platform.system() returns "Windows"/"Linux"/"Darwin" (not
                 # sys.platform which is "win32"/"linux"/"darwin"). Fall through
                 # to CPython bridge for correct value.
@@ -26993,7 +26898,7 @@ class CodeGen:
                 return None
 
             # --- secrets module ---
-            if mod_name == "secrets":
+            elif mod_name == "secrets":
                 # secrets.token_hex / secrets.randbelow require proper CPython
                 # implementations (token_hex is NOT uuid4, randbelow is NOT
                 # random.randrange). Fall through to bridge for correct behavior.
@@ -27001,7 +26906,7 @@ class CodeGen:
 
             # --- no-op imports (use CPython bridge if actually called) ---
             # Return None so the caller falls through to CPython bridge dispatch
-            if mod_name in ("traceback", "pprint", "unittest", "argparse",
+            elif mod_name in ("traceback", "pprint", "unittest", "argparse",
                             "datetime", "statistics", "array",
                             "threading", "subprocess", "pickle", "csv",
                             "signal", "atexit", "gc", "inspect", "types",
@@ -27009,226 +26914,56 @@ class CodeGen:
                 return None
 
             # --- weakref / _weakref module ---
-            if mod_name in ("weakref", "_weakref"):
+            elif mod_name in ("weakref", "_weakref"):
                 if func_name == "ref" and len(node.args) >= 1:
                     # weakref.ref(obj) → fpy_weakref_new(obj_ptr) → weakref ptr as i64
                     arg = self._emit_expr_value(node.args[0])
-                    if isinstance(arg.type, ir.IntType):
-                        arg = self.builder.inttoptr(arg, i8_ptr)
+                    arg = self._ensure_ptr(arg)
                     wr = self.builder.call(self.runtime["weakref_new"], [arg])
                     return self.builder.ptrtoint(wr, i64)
                 return None
 
             # --- base64 module ---
-            if mod_name == "base64":
+            elif mod_name == "base64":
                 if func_name == "b64encode" and len(node.args) == 1:
                     arg = self._emit_expr_value(node.args[0])
-                    if isinstance(arg.type, ir.IntType):
-                        arg = self.builder.inttoptr(arg, i8_ptr)
+                    arg = self._ensure_ptr(arg)
                     return self.builder.call(self.runtime["base64_b64encode"], [arg])
                 if func_name == "b64decode" and len(node.args) == 1:
                     arg = self._emit_expr_value(node.args[0])
-                    if isinstance(arg.type, ir.IntType):
-                        arg = self.builder.inttoptr(arg, i8_ptr)
+                    arg = self._ensure_ptr(arg)
                     return self.builder.call(self.runtime["base64_b64decode"], [arg])
                 return None
 
             # --- uuid module ---
-            if mod_name == "uuid":
+            elif mod_name == "uuid":
                 # All uuid calls go through CPython bridge so they return
                 # real uuid.UUID objects (not plain strings).  This makes
                 # type(u).__name__ == "UUID" and preserves UUID semantics.
                 return None
 
             # --- struct module ---
-            if mod_name == "struct":
+            elif mod_name == "struct":
                 return self._emit_struct_call(func_name, node)
-
-            # --- textwrap module ---
-            if mod_name == "textwrap":
-                if func_name == "dedent" and len(node.args) == 1:
-                    arg = self._emit_expr_value(node.args[0])
-                    if isinstance(arg.type, ir.IntType):
-                        arg = self.builder.inttoptr(arg, i8_ptr)
-                    return self.builder.call(self.runtime["textwrap_dedent"], [arg])
-                if func_name == "indent" and len(node.args) == 2:
-                    text = self._emit_expr_value(node.args[0])
-                    prefix = self._emit_expr_value(node.args[1])
-                    if isinstance(text.type, ir.IntType):
-                        text = self.builder.inttoptr(text, i8_ptr)
-                    if isinstance(prefix.type, ir.IntType):
-                        prefix = self.builder.inttoptr(prefix, i8_ptr)
-                    return self.builder.call(self.runtime["textwrap_indent"],
-                                              [text, prefix])
-                return None
-
-            # --- shutil module ---
-            if mod_name == "shutil":
-                if func_name in ("copy", "copy2", "copyfile") and len(node.args) == 2:
-                    src = self._emit_expr_value(node.args[0])
-                    dst = self._emit_expr_value(node.args[1])
-                    if isinstance(src.type, ir.IntType):
-                        src = self.builder.inttoptr(src, i8_ptr)
-                    if isinstance(dst.type, ir.IntType):
-                        dst = self.builder.inttoptr(dst, i8_ptr)
-                    self.builder.call(self.runtime["shutil_copy"], [src, dst])
-                    return ir.Constant(i64, 0)
-                if func_name == "rmtree" and len(node.args) == 1:
-                    path = self._emit_expr_value(node.args[0])
-                    if isinstance(path.type, ir.IntType):
-                        path = self.builder.inttoptr(path, i8_ptr)
-                    self.builder.call(self.runtime["shutil_rmtree"], [path])
-                    return ir.Constant(i64, 0)
-                return None
-
-            # --- glob module ---
-            if mod_name == "glob":
-                if func_name == "glob" and len(node.args) == 1:
-                    pattern = self._emit_expr_value(node.args[0])
-                    if isinstance(pattern.type, ir.IntType):
-                        pattern = self.builder.inttoptr(pattern, i8_ptr)
-                    return self.builder.call(self.runtime["glob_glob"], [pattern])
-                return None
-
-            # --- tempfile module ---
-            if mod_name == "tempfile":
-                if func_name == "gettempdir" and len(node.args) == 0:
-                    return self.builder.call(
-                        self.runtime["tempfile_gettempdir"], [])
-                if func_name == "mkdtemp":
-                    return self.builder.call(
-                        self.runtime["tempfile_mkdtemp"], [])
-                return None
-
-            # --- heapq module ---
-            if mod_name == "heapq":
-                if func_name == "heapify" and len(node.args) == 1:
-                    lst = self._emit_expr_value(node.args[0])
-                    if isinstance(lst.type, ir.IntType):
-                        lst = self.builder.inttoptr(lst, i8_ptr)
-                    self.builder.call(self.runtime["heapq_heapify"], [lst])
-                    return ir.Constant(i64, 0)
-                if func_name == "heappush" and len(node.args) == 2:
-                    lst = self._emit_expr_value(node.args[0])
-                    if isinstance(lst.type, ir.IntType):
-                        lst = self.builder.inttoptr(lst, i8_ptr)
-                    val = self._emit_expr_value(node.args[1])
-                    tag, data = self._bare_to_tag_data(val, node.args[1])
-                    self.builder.call(self.runtime["heapq_heappush"],
-                                      [lst, ir.Constant(i32, tag), data])
-                    return ir.Constant(i64, 0)
-                if func_name == "heappop" and len(node.args) == 1:
-                    lst = self._emit_expr_value(node.args[0])
-                    if isinstance(lst.type, ir.IntType):
-                        lst = self.builder.inttoptr(lst, i8_ptr)
-                    return self.builder.call(self.runtime["heapq_heappop"], [lst])
-                if func_name == "nsmallest" and len(node.args) == 2:
-                    n = self._emit_expr_value(node.args[0])
-                    lst = self._emit_expr_value(node.args[1])
-                    if isinstance(lst.type, ir.IntType):
-                        lst = self.builder.inttoptr(lst, i8_ptr)
-                    return self.builder.call(
-                        self.runtime["heapq_nsmallest"], [n, lst])
-                return None
-
-            # --- bisect module ---
-            if mod_name == "bisect":
-                if func_name in ("bisect_left", "bisect") and len(node.args) == 2:
-                    lst = self._emit_expr_value(node.args[0])
-                    if isinstance(lst.type, ir.IntType):
-                        lst = self.builder.inttoptr(lst, i8_ptr)
-                    x = self._emit_expr_value(node.args[1])
-                    return self.builder.call(
-                        self.runtime["bisect_left"], [lst, x])
-                if func_name == "bisect_right" and len(node.args) == 2:
-                    lst = self._emit_expr_value(node.args[0])
-                    if isinstance(lst.type, ir.IntType):
-                        lst = self.builder.inttoptr(lst, i8_ptr)
-                    x = self._emit_expr_value(node.args[1])
-                    return self.builder.call(
-                        self.runtime["bisect_right"], [lst, x])
-                if func_name == "insort" and len(node.args) == 2:
-                    lst = self._emit_expr_value(node.args[0])
-                    if isinstance(lst.type, ir.IntType):
-                        lst = self.builder.inttoptr(lst, i8_ptr)
-                    x = self._emit_expr_value(node.args[1])
-                    self.builder.call(self.runtime["bisect_insort"], [lst, x])
-                    return ir.Constant(i64, 0)
-                return ir.Constant(i64, 0)
-
-            # --- decimal module ---
-            if mod_name == "decimal":
-                if func_name == "Decimal":
-                    if len(node.args) == 0:
-                        return self.builder.call(self.runtime["decimal_from_int"],
-                                                  [ir.Constant(i64, 0)])
-                    arg = self._emit_expr_value(node.args[0])
-                    if isinstance(arg.type, ir.PointerType):
-                        return self.builder.call(self.runtime["decimal_from_str"], [arg])
-                    if isinstance(arg.type, ir.IntType):
-                        if (isinstance(node.args[0], ast.Constant)
-                                and isinstance(node.args[0].value, str)):
-                            s = self._make_string_constant(node.args[0].value)
-                            return self.builder.call(self.runtime["decimal_from_str"], [s])
-                        return self.builder.call(self.runtime["decimal_from_int"], [arg])
-                    return self.builder.call(self.runtime["decimal_from_int"],
-                                              [ir.Constant(i64, 0)])
-                return None
-
-            # --- platform module ---
-            if mod_name == "platform":
-                # platform.system() returns "Windows"/"Linux"/"Darwin" (not
-                # sys.platform which is "win32"/"linux"/"darwin"). Fall through
-                # to CPython bridge for correct value.
-                if func_name == "python_version":
-                    return self._make_string_constant("3.14.0")
-                return None
-
-            # --- secrets module ---
-            if mod_name == "secrets":
-                # secrets.token_hex / secrets.randbelow require proper CPython
-                # implementations (token_hex is NOT uuid4, randbelow is NOT
-                # random.randrange). Fall through to bridge for correct behavior.
-                return None
-
-            # --- no-op imports (use CPython bridge if actually called) ---
-            # Return None so the caller falls through to CPython bridge dispatch
-            if mod_name in ("traceback", "pprint", "unittest", "argparse",
-                            "datetime", "statistics", "array",
-                            "threading", "subprocess", "pickle", "csv",
-                            "signal", "atexit", "gc", "inspect", "types",
-                            "numbers", "fractions"):
-                return None
-
-            # --- weakref / _weakref module ---
-            if mod_name in ("weakref", "_weakref"):
-                if func_name == "ref" and len(node.args) >= 1:
-                    # weakref.ref(obj) → fpy_weakref_new(obj_ptr) → weakref ptr as i64
-                    arg = self._emit_expr_value(node.args[0])
-                    if isinstance(arg.type, ir.IntType):
-                        arg = self.builder.inttoptr(arg, i8_ptr)
-                    wr = self.builder.call(self.runtime["weakref_new"], [arg])
-                    return self.builder.ptrtoint(wr, i64)
-                return None
 
             # --- io / warnings / hashlib / string ---
             # No native implementations; fall through to CPython bridge
-            if mod_name in ("hashlib", "string", "io", "warnings"):
+            elif mod_name in ("hashlib", "string", "io", "warnings"):
                 return None
 
             # --- itertools module ---
-            if mod_name == "itertools":
+            elif mod_name == "itertools":
                 return self._emit_itertools_call(func_name, node)
 
             # --- enum / dataclasses modules ---
-            if mod_name in ("enum", "dataclasses"):
+            elif mod_name in ("enum", "dataclasses"):
                 # Enum and dataclasses decorators are handled by
                 # the class system. Fall through to bridge for
                 # any actual function calls.
                 return None
 
             # --- sys module ---
-            if mod_name == "sys":
+            elif mod_name == "sys":
                 if func_name == "exit":
                     code = ir.Constant(i64, 0)
                     if len(node.args) >= 1:
@@ -27240,21 +26975,21 @@ class CodeGen:
                 return None
 
             # --- time module ---
-            if mod_name == "time":
+            elif mod_name == "time":
                 if func_name == "time" and len(node.args) == 0:
                     return self.builder.call(self.runtime["time_time"], [])
-                if func_name == "time_ns" and len(node.args) == 0:
+                elif func_name == "time_ns" and len(node.args) == 0:
                     return self.builder.call(self.runtime["time_time_ns"], [])
-                if func_name == "perf_counter" and len(node.args) == 0:
+                elif func_name == "perf_counter" and len(node.args) == 0:
                     return self.builder.call(self.runtime["time_perf_counter"], [])
-                if func_name == "perf_counter_ns" and len(node.args) == 0:
+                elif func_name == "perf_counter_ns" and len(node.args) == 0:
                     # Return as nanoseconds (int)
                     t = self.builder.call(self.runtime["time_perf_counter"], [])
                     ns = self.builder.fmul(t, ir.Constant(double, 1e9))
                     return self.builder.fptosi(ns, i64)
-                if func_name == "monotonic" and len(node.args) == 0:
+                elif func_name == "monotonic" and len(node.args) == 0:
                     return self.builder.call(self.runtime["time_monotonic"], [])
-                if func_name == "sleep" and len(node.args) == 1:
+                elif func_name == "sleep" and len(node.args) == 1:
                     val = self._emit_expr_value(node.args[0])
                     if isinstance(val.type, ir.IntType):
                         val = self.builder.sitofp(val, double)
@@ -27263,7 +26998,7 @@ class CodeGen:
                 return None
 
             # --- contextlib module ---
-            if mod_name == "contextlib":
+            elif mod_name == "contextlib":
                 # contextmanager is a decorator — it's a no-op at compile time.
                 # The generator function is already compiled with yield support.
                 # suppress(*exceptions) — currently a no-op (exceptions ignored)
@@ -27272,10 +27007,10 @@ class CodeGen:
                     if len(node.args) == 1:
                         return self._emit_expr_value(node.args[0])
                     return ir.Constant(i64, 0)
-                if func_name == "suppress":
+                elif func_name == "suppress":
                     # Returns a dummy context manager (no-op)
                     return ir.Constant(i64, 0)
-                if func_name == "closing":
+                elif func_name == "closing":
                     # closing(thing) → just return the thing
                     if len(node.args) == 1:
                         return self._emit_expr_value(node.args[0])
@@ -27302,12 +27037,10 @@ class CodeGen:
                         or (isinstance(node.args[0], ast.Constant)
                             and isinstance(node.args[0].value, str))):
                     arg = self._emit_expr_value(node.args[0])
-                    if isinstance(arg.type, ir.IntType):
-                        arg = self.builder.inttoptr(arg, i8_ptr)
+                    arg = self._ensure_ptr(arg)
                     return self.builder.call(self.runtime["counter_from_string"], [arg])
                 arg = self._emit_expr_value(node.args[0])
-                if isinstance(arg.type, ir.IntType):
-                    arg = self.builder.inttoptr(arg, i8_ptr)
+                arg = self._ensure_ptr(arg)
                 return self.builder.call(self.runtime["counter_from_list"], [arg])
 
         # --- defaultdict ---
@@ -27345,8 +27078,7 @@ class CodeGen:
                 result = self.builder.call(self.runtime["deque_new"], [maxlen])
             else:
                 arg = self._emit_expr_value(node.args[0])
-                if isinstance(arg.type, ir.IntType):
-                    arg = self.builder.inttoptr(arg, i8_ptr)
+                arg = self._ensure_ptr(arg)
                 result = self.builder.call(
                     self.runtime["deque_from_list"], [arg, maxlen])
             self._last_collections_type = "deque"
@@ -27673,8 +27405,7 @@ class CodeGen:
         else:
             # Fallback: call via function pointer (closure or unknown)
             fn_ptr = self._emit_expr_value(fn_node)
-            if isinstance(fn_ptr.type, ir.IntType):
-                fn_ptr = self.builder.inttoptr(fn_ptr, i8_ptr)
+            fn_ptr = self._ensure_ptr(fn_ptr)
             fn_type = ir.FunctionType(i64, [i64, i64])
             fn_typed = self.builder.bitcast(fn_ptr, ir.PointerType(fn_type))
             result = self.builder.call(fn_typed, [accum, elem])
@@ -27698,14 +27429,12 @@ class CodeGen:
         """Emit struct module function calls."""
         if func_name == "calcsize" and len(node.args) == 1:
             fmt = self._emit_expr_value(node.args[0])
-            if isinstance(fmt.type, ir.IntType):
-                fmt = self.builder.inttoptr(fmt, i8_ptr)
+            fmt = self._ensure_ptr(fmt)
             return self.builder.call(self.runtime["struct_calcsize"], [fmt])
 
         if func_name == "pack" and len(node.args) >= 1:
             fmt = self._emit_expr_value(node.args[0])
-            if isinstance(fmt.type, ir.IntType):
-                fmt = self.builder.inttoptr(fmt, i8_ptr)
+            fmt = self._ensure_ptr(fmt)
             # Build a list of the values to pack
             vals_list = self.builder.call(self.runtime["list_new"], [])
             for arg_node in node.args[1:]:
@@ -27717,11 +27446,9 @@ class CodeGen:
 
         if func_name == "unpack" and len(node.args) == 2:
             fmt = self._emit_expr_value(node.args[0])
-            if isinstance(fmt.type, ir.IntType):
-                fmt = self.builder.inttoptr(fmt, i8_ptr)
+            fmt = self._ensure_ptr(fmt)
             buf = self._emit_expr_value(node.args[1])
-            if isinstance(buf.type, ir.IntType):
-                buf = self.builder.inttoptr(buf, i8_ptr)
+            buf = self._ensure_ptr(buf)
             return self.builder.call(self.runtime["struct_unpack"], [fmt, buf])
 
         return None
@@ -27733,14 +27460,12 @@ class CodeGen:
                 arg = self._make_string_constant(".")
             else:
                 arg = self._emit_expr_value(node.args[0])
-                if isinstance(arg.type, ir.IntType):
-                    arg = self.builder.inttoptr(arg, i8_ptr)
+                arg = self._ensure_ptr(arg)
             # If multiple args, join them: Path("a", "b", "c") → a/b/c
             result = self.builder.call(self.runtime["path_new"], [arg])
             for extra in node.args[1:]:
                 other = self._emit_expr_value(extra)
-                if isinstance(other.type, ir.IntType):
-                    other = self.builder.inttoptr(other, i8_ptr)
+                other = self._ensure_ptr(other)
                 result = self.builder.call(self.runtime["path_join"],
                                             [result, other])
             self._last_collections_type = "path"
@@ -27777,8 +27502,7 @@ class CodeGen:
 
         if func_name == "choice" and len(node.args) == 1:
             lst = self._emit_expr_value(node.args[0])
-            if isinstance(lst.type, ir.IntType):
-                lst = self.builder.inttoptr(lst, i8_ptr)
+            lst = self._ensure_ptr(lst)
             out_tag = self._create_entry_alloca(i32, "rch.tag")
             out_data = self._create_entry_alloca(i64, "rch.data")
             self.builder.call(self.runtime["random_choice"],
@@ -27787,15 +27511,13 @@ class CodeGen:
 
         if func_name == "shuffle" and len(node.args) == 1:
             lst = self._emit_expr_value(node.args[0])
-            if isinstance(lst.type, ir.IntType):
-                lst = self.builder.inttoptr(lst, i8_ptr)
+            lst = self._ensure_ptr(lst)
             self.builder.call(self.runtime["random_shuffle"], [lst])
             return ir.Constant(i64, 0)
 
         if func_name == "sample" and len(node.args) == 2:
             lst = self._emit_expr_value(node.args[0])
-            if isinstance(lst.type, ir.IntType):
-                lst = self.builder.inttoptr(lst, i8_ptr)
+            lst = self._ensure_ptr(lst)
             k = self._emit_expr_value(node.args[1])
             return self.builder.call(self.runtime["random_sample"], [lst, k])
 
@@ -27845,20 +27567,16 @@ class CodeGen:
         if func_name == "product" and len(node.args) == 2:
             a = self._emit_expr_value(node.args[0])
             b = self._emit_expr_value(node.args[1])
-            if isinstance(a.type, ir.IntType):
-                a = self.builder.inttoptr(a, i8_ptr)
-            if isinstance(b.type, ir.IntType):
-                b = self.builder.inttoptr(b, i8_ptr)
+            a = self._ensure_ptr(a)
+            b = self._ensure_ptr(b)
             return self.builder.call(self.runtime["itertools_product2"], [a, b])
 
         # zip_longest(a, b, fillvalue=None)
         if func_name == "zip_longest" and len(node.args) >= 2:
             a = self._emit_expr_value(node.args[0])
             b = self._emit_expr_value(node.args[1])
-            if isinstance(a.type, ir.IntType):
-                a = self.builder.inttoptr(a, i8_ptr)
-            if isinstance(b.type, ir.IntType):
-                b = self.builder.inttoptr(b, i8_ptr)
+            a = self._ensure_ptr(a)
+            b = self._ensure_ptr(b)
             # Check for fillvalue keyword
             fill_tag = ir.Constant(i32, FPY_TAG_NONE)
             fill_data = ir.Constant(i64, 0)
@@ -27874,8 +27592,7 @@ class CodeGen:
         # islice(iterable, stop) or islice(iterable, start, stop)
         if func_name == "islice" and len(node.args) >= 2:
             lst = self._emit_expr_value(node.args[0])
-            if isinstance(lst.type, ir.IntType):
-                lst = self.builder.inttoptr(lst, i8_ptr)
+            lst = self._ensure_ptr(lst)
             if len(node.args) == 2:
                 start = ir.Constant(i64, 0)
                 stop = self._emit_expr_value(node.args[1])
@@ -27888,8 +27605,7 @@ class CodeGen:
         # accumulate(iterable[, func]) — running totals
         if func_name == "accumulate" and len(node.args) >= 1:
             lst = self._emit_expr_value(node.args[0])
-            if isinstance(lst.type, ir.IntType):
-                lst = self.builder.inttoptr(lst, i8_ptr)
+            lst = self._ensure_ptr(lst)
             # func_tag: 0=add(default), 1=mul, 2=max, 3=min
             func_tag = 0
             if len(node.args) >= 2:
@@ -27908,8 +27624,7 @@ class CodeGen:
         # combinations(iterable, r)
         if func_name == "combinations" and len(node.args) == 2:
             lst = self._emit_expr_value(node.args[0])
-            if isinstance(lst.type, ir.IntType):
-                lst = self.builder.inttoptr(lst, i8_ptr)
+            lst = self._ensure_ptr(lst)
             r = self._emit_expr_value(node.args[1])
             if isinstance(r.type, ir.IntType) and r.type.width != 32:
                 r = self.builder.trunc(r, i32)
@@ -27919,8 +27634,7 @@ class CodeGen:
         # permutations(iterable, r)
         if func_name == "permutations" and len(node.args) >= 1:
             lst = self._emit_expr_value(node.args[0])
-            if isinstance(lst.type, ir.IntType):
-                lst = self.builder.inttoptr(lst, i8_ptr)
+            lst = self._ensure_ptr(lst)
             if len(node.args) >= 2:
                 r = self._emit_expr_value(node.args[1])
                 if isinstance(r.type, ir.IntType) and r.type.width != 32:
@@ -27955,12 +27669,10 @@ class CodeGen:
                     level = lv
                 elif kw.arg == "format":
                     fmt = self._emit_expr_value(kw.value)
-                    if isinstance(fmt.type, ir.IntType):
-                        fmt = self.builder.inttoptr(fmt, i8_ptr)
+                    fmt = self._ensure_ptr(fmt)
                 elif kw.arg == "filename":
                     filename = self._emit_expr_value(kw.value)
-                    if isinstance(filename.type, ir.IntType):
-                        filename = self.builder.inttoptr(filename, i8_ptr)
+                    filename = self._ensure_ptr(filename)
             self.builder.call(self.runtime["logging_basicConfig"],
                               [level, fmt, filename])
             return ir.Constant(i64, 0)
@@ -27996,8 +27708,7 @@ class CodeGen:
         if func_name == "getLogger":
             if len(node.args) >= 1:
                 name = self._emit_expr_value(node.args[0])
-                if isinstance(name.type, ir.IntType):
-                    name = self.builder.inttoptr(name, i8_ptr)
+                name = self._ensure_ptr(name)
             else:
                 name = self._make_string_constant("root")
             result = self.builder.call(self.runtime["logging_getLogger"], [name])
@@ -28015,8 +27726,7 @@ class CodeGen:
         """Build message string starting from args[start_idx]."""
         fmt_node = node.args[start_idx]
         fmt = self._emit_expr_value(fmt_node)
-        if isinstance(fmt.type, ir.IntType):
-            fmt = self.builder.inttoptr(fmt, i8_ptr)
+        fmt = self._ensure_ptr(fmt)
 
         # If there are additional args, use format_msg to interpolate
         if len(node.args) > start_idx + 1:
@@ -28291,8 +28001,7 @@ class CodeGen:
             # Variable holding a closure/function
             if fn_node.id in self.variables:
                 val = self._load_variable(fn_node.id, node)
-                if isinstance(val.type, ir.IntType):
-                    val = self.builder.inttoptr(val, i8_ptr)
+                val = self._ensure_ptr(val)
                 return val
         if isinstance(fn_node, ast.Lambda):
             # Emit an inline lambda as a standalone i64(i64) function
@@ -28305,8 +28014,7 @@ class CodeGen:
         # the result as a function pointer.
         if isinstance(fn_node, ast.Call):
             val = self._emit_expr_value(fn_node)
-            if isinstance(val.type, ir.IntType):
-                val = self.builder.inttoptr(val, i8_ptr)
+            val = self._ensure_ptr(val)
             return val
         return self._bridge_fallback_expr(node, "key/map/filter function must be a named function or lambda")
 
@@ -28694,8 +28402,7 @@ class CodeGen:
         sub_node = attr.value  # the Subscript node
 
         list_ptr = self._emit_expr_value(sub_node.value)
-        if isinstance(list_ptr.type, ir.IntType):
-            list_ptr = self.builder.inttoptr(list_ptr, i8_ptr)
+        list_ptr = self._ensure_ptr(list_ptr)
         index = self._emit_expr_value(sub_node.slice)
 
         tag_slot = self._create_entry_alloca(i32, "mx.tag")
@@ -28856,8 +28563,7 @@ class CodeGen:
         # Path is VKind.PYOBJ but has optimized native handlers.
         if self._is_path_expr(attr.value):
             obj = self._emit_expr_value(attr.value)
-            if isinstance(obj.type, ir.IntType):
-                obj = self.builder.inttoptr(obj, i8_ptr)
+            obj = self._ensure_ptr(obj)
             # Attribute access (properties): .name, .parent, .suffix, .stem
             _path_props = {
                 "name": "path_name", "parent": "path_parent",
@@ -28878,24 +28584,21 @@ class CodeGen:
                 return self.builder.call(self.runtime["path_read_text"], [obj])
             if method == "write_text" and len(node.args) == 1:
                 content = self._emit_expr_value(node.args[0])
-                if isinstance(content.type, ir.IntType):
-                    content = self.builder.inttoptr(content, i8_ptr)
+                content = self._ensure_ptr(content)
                 self.builder.call(self.runtime["path_write_text"], [obj, content])
                 return ir.Constant(i64, 0)
             if method == "iterdir" and len(node.args) == 0:
                 return self.builder.call(self.runtime["path_iterdir"], [obj])
             if method == "with_suffix" and len(node.args) == 1:
                 suffix = self._emit_expr_value(node.args[0])
-                if isinstance(suffix.type, ir.IntType):
-                    suffix = self.builder.inttoptr(suffix, i8_ptr)
+                suffix = self._ensure_ptr(suffix)
                 return self.builder.call(self.runtime["path_with_suffix"],
                                           [obj, suffix])
             if method == "joinpath" and len(node.args) >= 1:
                 result = obj
                 for arg_node in node.args:
                     other = self._emit_expr_value(arg_node)
-                    if isinstance(other.type, ir.IntType):
-                        other = self.builder.inttoptr(other, i8_ptr)
+                    other = self._ensure_ptr(other)
                     result = self.builder.call(self.runtime["path_join"],
                                                [result, other])
                 return result
@@ -28956,8 +28659,7 @@ class CodeGen:
         # Check if object is a deque
         if self._is_deque_expr(attr.value):
             obj = self._emit_expr_value(attr.value)
-            if isinstance(obj.type, ir.IntType):
-                obj = self.builder.inttoptr(obj, i8_ptr)
+            obj = self._ensure_ptr(obj)
             if method == "append" and len(node.args) == 1:
                 val = self._emit_expr_value(node.args[0])
                 tag, data = self._bare_to_tag_data(val, node.args[0])
@@ -28993,14 +28695,12 @@ class CodeGen:
                 return obj
             if method == "extend" and len(node.args) == 1:
                 other = self._emit_expr_value(node.args[0])
-                if isinstance(other.type, ir.IntType):
-                    other = self.builder.inttoptr(other, i8_ptr)
+                other = self._ensure_ptr(other)
                 self.builder.call(self.runtime["deque_extend"], [obj, other])
                 return obj
             if method == "extendleft" and len(node.args) == 1:
                 other = self._emit_expr_value(node.args[0])
-                if isinstance(other.type, ir.IntType):
-                    other = self.builder.inttoptr(other, i8_ptr)
+                other = self._ensure_ptr(other)
                 self.builder.call(self.runtime["deque_extendleft"], [obj, other])
                 return obj
             # Phase 4: fall through to runtime dispatch below
@@ -29008,8 +28708,7 @@ class CodeGen:
         # Check if object is a Counter
         if self._is_counter_expr(attr.value):
             obj = self._emit_expr_value(attr.value)
-            if isinstance(obj.type, ir.IntType):
-                obj = self.builder.inttoptr(obj, i8_ptr)
+            obj = self._ensure_ptr(obj)
             if method == "most_common":
                 n = ir.Constant(i64, -1)  # all elements
                 if len(node.args) == 1:
@@ -29020,8 +28719,7 @@ class CodeGen:
                 return self.builder.call(self.runtime["counter_elements"], [obj])
             if method == "update" and len(node.args) == 1:
                 other = self._emit_expr_value(node.args[0])
-                if isinstance(other.type, ir.IntType):
-                    other = self.builder.inttoptr(other, i8_ptr)
+                other = self._ensure_ptr(other)
                 self.builder.call(self.runtime["counter_update_list"],
                                   [obj, other])
                 return obj
@@ -29037,8 +28735,7 @@ class CodeGen:
         # Check if object is a defaultdict — method calls go to regular dict methods
         if self._is_defaultdict_expr(attr.value):
             obj = self._emit_expr_value(attr.value)
-            if isinstance(obj.type, ir.IntType):
-                obj = self.builder.inttoptr(obj, i8_ptr)
+            obj = self._ensure_ptr(obj)
             if method == "keys":
                 return self._rt_call("dict_keys", [obj])
             if method == "values":
@@ -29150,8 +28847,7 @@ class CodeGen:
         # Check if object is a set (dict-backed)
         if self._is_set_expr(attr.value):
             obj = self._emit_expr_value(attr.value)
-            if isinstance(obj.type, ir.IntType):
-                obj = self.builder.inttoptr(obj, i8_ptr)
+            obj = self._ensure_ptr(obj)
             if method == "add" and len(node.args) == 1:
                 val = self._emit_expr_value(node.args[0])
                 tag, data = self._bare_to_tag_data(val, node.args[0])
@@ -29172,38 +28868,31 @@ class CodeGen:
                 return obj
             if method == "union" and len(node.args) == 1:
                 other = self._emit_expr_value(node.args[0])
-                if isinstance(other.type, ir.IntType):
-                    other = self.builder.inttoptr(other, i8_ptr)
+                other = self._ensure_ptr(other)
                 return self._rt_call("set_union", [obj, other])
             if method == "intersection" and len(node.args) == 1:
                 other = self._emit_expr_value(node.args[0])
-                if isinstance(other.type, ir.IntType):
-                    other = self.builder.inttoptr(other, i8_ptr)
+                other = self._ensure_ptr(other)
                 return self._rt_call("set_intersection", [obj, other])
             if method == "difference" and len(node.args) == 1:
                 other = self._emit_expr_value(node.args[0])
-                if isinstance(other.type, ir.IntType):
-                    other = self.builder.inttoptr(other, i8_ptr)
+                other = self._ensure_ptr(other)
                 return self._rt_call("set_difference", [obj, other])
             if method == "symmetric_difference" and len(node.args) == 1:
                 other = self._emit_expr_value(node.args[0])
-                if isinstance(other.type, ir.IntType):
-                    other = self.builder.inttoptr(other, i8_ptr)
+                other = self._ensure_ptr(other)
                 return self._rt_call("set_symmetric_diff", [obj, other])
             if method == "issubset" and len(node.args) == 1:
                 other = self._emit_expr_value(node.args[0])
-                if isinstance(other.type, ir.IntType):
-                    other = self.builder.inttoptr(other, i8_ptr)
+                other = self._ensure_ptr(other)
                 return self._rt_call("set_issubset", [obj, other])
             if method == "issuperset" and len(node.args) == 1:
                 other = self._emit_expr_value(node.args[0])
-                if isinstance(other.type, ir.IntType):
-                    other = self.builder.inttoptr(other, i8_ptr)
+                other = self._ensure_ptr(other)
                 return self._rt_call("set_issuperset", [obj, other])
             if method == "isdisjoint" and len(node.args) == 1:
                 other = self._emit_expr_value(node.args[0])
-                if isinstance(other.type, ir.IntType):
-                    other = self.builder.inttoptr(other, i8_ptr)
+                other = self._ensure_ptr(other)
                 return self._rt_call("set_isdisjoint", [obj, other])
             if method == "copy" and len(node.args) == 0:
                 return self._rt_call("set_copy", [obj])
@@ -29219,8 +28908,7 @@ class CodeGen:
                     self.builder.load(tag_slot), self.builder.load(data_slot))
             if method == "update" and len(node.args) == 1:
                 other = self._emit_expr_value(node.args[0])
-                if isinstance(other.type, ir.IntType):
-                    other = self.builder.inttoptr(other, i8_ptr)
+                other = self._ensure_ptr(other)
                 self._rt_call("set_update", [obj, other])
                 return obj
             # Phase 4: fall through to runtime dispatch below
@@ -29558,38 +29246,38 @@ class CodeGen:
             # String methods
             if method == "lower":
                 return self._rt_call("str_lower", [obj])
-            if method == "upper":
+            elif method == "upper":
                 return self._rt_call("str_upper", [obj])
-            if method == "strip":
+            elif method == "strip":
                 if len(node.args) == 1:
                     chars = self._emit_expr_value(node.args[0])
                     return self._rt_call("str_strip_chars", [obj, chars])
                 return self._rt_call("str_strip", [obj])
-            if method == "lstrip":
+            elif method == "lstrip":
                 if len(node.args) == 1:
                     chars = self._emit_expr_value(node.args[0])
                     return self._rt_call("str_lstrip_chars", [obj, chars])
                 return self._rt_call("str_lstrip", [obj])
-            if method == "rstrip":
+            elif method == "rstrip":
                 if len(node.args) == 1:
                     chars = self._emit_expr_value(node.args[0])
                     return self._rt_call("str_rstrip_chars", [obj, chars])
                 return self._rt_call("str_rstrip", [obj])
-            if method == "isdigit":
+            elif method == "isdigit":
                 return self._rt_call("str_isdigit", [obj])
-            if method == "isalpha":
+            elif method == "isalpha":
                 return self._rt_call("str_isalpha", [obj])
-            if method == "isalnum":
+            elif method == "isalnum":
                 return self._rt_call("str_isalnum", [obj])
-            if method == "isspace":
+            elif method == "isspace":
                 return self._rt_call("str_isspace", [obj])
-            if method == "capitalize":
+            elif method == "capitalize":
                 return self._rt_call("str_capitalize", [obj])
-            if method == "title":
+            elif method == "title":
                 return self._rt_call("str_title", [obj])
-            if method == "swapcase":
+            elif method == "swapcase":
                 return self._rt_call("str_swapcase", [obj])
-            if method == "center":
+            elif method == "center":
                 if len(node.args) == 1:
                     w = self._emit_expr_value(node.args[0])
                     return self._rt_call("str_center", [obj, w])
@@ -29597,7 +29285,7 @@ class CodeGen:
                     w = self._emit_expr_value(node.args[0])
                     fill = self._emit_expr_value(node.args[1])
                     return self._rt_call("str_center_fill", [obj, w, fill])
-            if method == "ljust":
+            elif method == "ljust":
                 if len(node.args) == 1:
                     w = self._emit_expr_value(node.args[0])
                     return self._rt_call("str_ljust", [obj, w])
@@ -29605,7 +29293,7 @@ class CodeGen:
                     w = self._emit_expr_value(node.args[0])
                     fill = self._emit_expr_value(node.args[1])
                     return self._rt_call("str_ljust_fill", [obj, w, fill])
-            if method == "rjust":
+            elif method == "rjust":
                 if len(node.args) == 1:
                     w = self._emit_expr_value(node.args[0])
                     return self._rt_call("str_rjust", [obj, w])
@@ -29613,52 +29301,52 @@ class CodeGen:
                     w = self._emit_expr_value(node.args[0])
                     fill = self._emit_expr_value(node.args[1])
                     return self._rt_call("str_rjust_fill", [obj, w, fill])
-            if method == "isupper":
+            elif method == "isupper":
                 if len(node.args) == 0:
                     return self._rt_call("str_isupper", [obj])
-            if method == "islower":
+            elif method == "islower":
                 if len(node.args) == 0:
                     return self._rt_call("str_islower", [obj])
-            if method == "istitle":
+            elif method == "istitle":
                 if len(node.args) == 0:
                     return self._rt_call("str_istitle", [obj])
-            if method == "isidentifier":
+            elif method == "isidentifier":
                 if len(node.args) == 0:
                     return self._rt_call("str_isidentifier", [obj])
-            if method == "isprintable":
+            elif method == "isprintable":
                 if len(node.args) == 0:
                     return self._rt_call("str_isprintable", [obj])
-            if method == "isdecimal":
+            elif method == "isdecimal":
                 if len(node.args) == 0:
                     return self._rt_call("str_isdecimal", [obj])
-            if method == "isnumeric":
+            elif method == "isnumeric":
                 if len(node.args) == 0:
                     return self._rt_call("str_isnumeric", [obj])
-            if method == "casefold":
+            elif method == "casefold":
                 if len(node.args) == 0:
                     return self._rt_call("str_casefold", [obj])
-            if method == "expandtabs":
+            elif method == "expandtabs":
                 if len(node.args) == 0:
                     return self._rt_call("str_expandtabs",
                                           [obj, ir.Constant(i64, 8)])
                 if len(node.args) == 1:
                     ts = self._emit_expr_value(node.args[0])
                     return self._rt_call("str_expandtabs", [obj, ts])
-            if method == "partition":
+            elif method == "partition":
                 if len(node.args) == 1:
                     sep = self._emit_expr_value(node.args[0])
                     return self._rt_call("str_partition", [obj, sep])
-            if method == "rpartition":
+            elif method == "rpartition":
                 if len(node.args) == 1:
                     sep = self._emit_expr_value(node.args[0])
                     return self._rt_call("str_rpartition", [obj, sep])
-            if method == "zfill":
+            elif method == "zfill":
                 if len(node.args) == 1:
                     w = self._emit_expr_value(node.args[0])
                     return self._rt_call("str_zfill", [obj, w])
-            if method == "splitlines":
+            elif method == "splitlines":
                 return self._rt_call("str_splitlines", [obj])
-            if method == "split":
+            elif method == "split":
                 if len(node.args) == 2:
                     sep = self._emit_expr_value(node.args[0])
                     maxsplit = self._emit_expr_value(node.args[1])
@@ -29667,7 +29355,7 @@ class CodeGen:
                     sep = self._emit_expr_value(node.args[0])
                     return self._rt_call("str_split_max", [obj, sep, ir.Constant(i64, -1)])
                 return self._rt_call("str_split", [obj])
-            if method == "rsplit":
+            elif method == "rsplit":
                 if len(node.args) == 2:
                     sep = self._emit_expr_value(node.args[0])
                     maxsplit = self._emit_expr_value(node.args[1])
@@ -29677,11 +29365,11 @@ class CodeGen:
                     return self._rt_call("str_rsplit",
                                           [obj, sep, ir.Constant(i64, -1)])
                 return self._rt_call("str_rsplit_ws", [obj])
-            if method == "join":
+            elif method == "join":
                 if len(node.args) == 1:
                     lst = self._emit_expr_value(node.args[0])
                     return self._rt_call("str_join", [obj, lst])
-            if method == "replace":
+            elif method == "replace":
                 if len(node.args) == 3:
                     old = self._emit_expr_value(node.args[0])
                     new = self._emit_expr_value(node.args[1])
@@ -29692,7 +29380,7 @@ class CodeGen:
                     old = self._emit_expr_value(node.args[0])
                     new = self._emit_expr_value(node.args[1])
                     return self._rt_call("str_replace", [obj, old, new])
-            if method == "startswith":
+            elif method == "startswith":
                 if len(node.args) == 1:
                     arg = node.args[0]
                     val = self._emit_expr_value(arg)
@@ -29712,7 +29400,7 @@ class CodeGen:
                     end = self._emit_expr_value(node.args[2])
                     return self._rt_call("str_startswith_range",
                                          [obj, prefix, start, end])
-            if method == "endswith":
+            elif method == "endswith":
                 if len(node.args) == 1:
                     arg = node.args[0]
                     val = self._emit_expr_value(arg)
@@ -29731,15 +29419,15 @@ class CodeGen:
                     end = self._emit_expr_value(node.args[2])
                     return self._rt_call("str_endswith_range",
                                          [obj, suffix, start, end])
-            if method == "removeprefix":
+            elif method == "removeprefix":
                 if len(node.args) == 1:
                     prefix = self._emit_expr_value(node.args[0])
                     return self._rt_call("str_removeprefix", [obj, prefix])
-            if method == "removesuffix":
+            elif method == "removesuffix":
                 if len(node.args) == 1:
                     suffix = self._emit_expr_value(node.args[0])
                     return self._rt_call("str_removesuffix", [obj, suffix])
-            if method == "find":
+            elif method == "find":
                 if len(node.args) == 1:
                     sub = self._emit_expr_value(node.args[0])
                     return self._rt_call("str_find", [obj, sub])
@@ -29755,7 +29443,7 @@ class CodeGen:
                     end = self._emit_expr_value(node.args[2])
                     return self._rt_call("str_find_range",
                                          [obj, sub, start, end])
-            if method == "rfind":
+            elif method == "rfind":
                 if len(node.args) == 1:
                     sub = self._emit_expr_value(node.args[0])
                     return self._rt_call("str_rfind", [obj, sub])
@@ -29771,7 +29459,7 @@ class CodeGen:
                     end = self._emit_expr_value(node.args[2])
                     return self._rt_call("str_rfind_range",
                                          [obj, sub, start, end])
-            if method == "index":
+            elif method == "index":
                 if len(node.args) == 1:
                     sub = self._emit_expr_value(node.args[0])
                     return self._rt_call("str_index_sub", [obj, sub])
@@ -29787,7 +29475,7 @@ class CodeGen:
                     end = self._emit_expr_value(node.args[2])
                     return self._rt_call("str_index_sub_range",
                                          [obj, sub, start, end])
-            if method == "rindex":
+            elif method == "rindex":
                 if len(node.args) == 1:
                     sub = self._emit_expr_value(node.args[0])
                     return self._rt_call("str_rindex_sub", [obj, sub])
@@ -29803,7 +29491,7 @@ class CodeGen:
                     end = self._emit_expr_value(node.args[2])
                     return self._rt_call("str_rindex_sub_range",
                                          [obj, sub, start, end])
-            if method == "count":
+            elif method == "count":
                 if len(node.args) == 1:
                     sub = self._emit_expr_value(node.args[0])
                     return self._rt_call("str_count", [obj, sub])
@@ -29819,13 +29507,13 @@ class CodeGen:
                     end = self._emit_expr_value(node.args[2])
                     return self._rt_call("str_count_range",
                                          [obj, sub, start, end])
-            if method == "format":
+            elif method == "format":
                 return self._emit_str_format(node, obj)
-            if method == "translate":
+            elif method == "translate":
                 if len(node.args) == 1:
                     table = self._emit_expr_value(node.args[0])
                     return self._rt_call("str_translate", [obj, table])
-            if method == "encode":
+            elif method == "encode":
                 # str.encode() → bytes (same UTF-8 content, tagged as BYTES)
                 return self._rt_call("str_encode", [obj])
         # bytes methods
@@ -29833,24 +29521,24 @@ class CodeGen:
             if method == "decode" and len(node.args) <= 1:
                 # bytes.decode() → str (same UTF-8 content)
                 return self._rt_call("bytes_decode", [obj])
-            if method == "upper" and len(node.args) == 0:
+            elif method == "upper" and len(node.args) == 0:
                 return self._rt_call("str_upper", [obj])
-            if method == "lower" and len(node.args) == 0:
+            elif method == "lower" and len(node.args) == 0:
                 return self._rt_call("str_lower", [obj])
-            if method == "strip" and len(node.args) == 0:
+            elif method == "strip" and len(node.args) == 0:
                 return self._rt_call("str_strip", [obj])
-            if method == "lstrip" and len(node.args) == 0:
+            elif method == "lstrip" and len(node.args) == 0:
                 return self._rt_call("str_lstrip", [obj])
-            if method == "rstrip" and len(node.args) == 0:
+            elif method == "rstrip" and len(node.args) == 0:
                 return self._rt_call("str_rstrip", [obj])
-            if method == "replace" and len(node.args) >= 2:
+            elif method == "replace" and len(node.args) >= 2:
                 old = self._emit_expr_value(node.args[0])
                 new = self._emit_expr_value(node.args[1])
                 if len(node.args) == 3:
                     cnt = self._emit_expr_value(node.args[2])
                     return self._rt_call("str_replace3", [obj, old, new, cnt])
                 return self._rt_call("str_replace", [obj, old, new])
-            if method == "split" and len(node.args) <= 2:
+            elif method == "split" and len(node.args) <= 2:
                 if len(node.args) == 0:
                     return self._rt_call("bytes_split", [obj])
                 sep = self._emit_expr_value(node.args[0])
@@ -29858,22 +29546,22 @@ class CodeGen:
                     maxsplit = self._emit_expr_value(node.args[1])
                     return self._rt_call("str_split_max", [obj, sep, maxsplit])
                 return self._rt_call("str_split_max", [obj, sep, ir.Constant(i64, -1)])
-            if method == "join" and len(node.args) == 1:
+            elif method == "join" and len(node.args) == 1:
                 lst = self._emit_expr_value(node.args[0])
                 return self._rt_call("str_join", [obj, lst])
-            if method == "find" and len(node.args) >= 1:
+            elif method == "find" and len(node.args) >= 1:
                 sub = self._emit_expr_value(node.args[0])
                 return self._rt_call("str_find", [obj, sub])
-            if method == "rfind" and len(node.args) >= 1:
+            elif method == "rfind" and len(node.args) >= 1:
                 sub = self._emit_expr_value(node.args[0])
                 return self._rt_call("str_rfind", [obj, sub])
-            if method == "count" and len(node.args) >= 1:
+            elif method == "count" and len(node.args) >= 1:
                 sub = self._emit_expr_value(node.args[0])
                 return self._rt_call("str_count", [obj, sub])
-            if method == "startswith" and len(node.args) >= 1:
+            elif method == "startswith" and len(node.args) >= 1:
                 prefix = self._emit_expr_value(node.args[0])
                 return self._rt_call("str_startswith", [obj, prefix])
-            if method == "endswith" and len(node.args) >= 1:
+            elif method == "endswith" and len(node.args) >= 1:
                 suffix = self._emit_expr_value(node.args[0])
                 return self._rt_call("str_endswith", [obj, suffix])
         # int methods: bit_length, bit_count, to_bytes, etc.
@@ -29900,7 +29588,7 @@ class CodeGen:
                     "==", obj if isinstance(obj.type, ir.IntType) else
                     self.builder.ptrtoint(obj, i64), ir.Constant(i64, 0))
                 return self.builder.select(is_zero, ir.Constant(i64, 0), result)
-            if method == "bit_count" and len(node.args) == 0:
+            elif method == "bit_count" and len(node.args) == 0:
                 # int.bit_count() — count number of set bits (popcount)
                 val = obj if isinstance(obj.type, ir.IntType) else \
                     self.builder.ptrtoint(obj, i64)
@@ -29914,7 +29602,7 @@ class CodeGen:
                 ctpop = self.module.declare_intrinsic(
                     "llvm.ctpop", [i64], ctpop_fnty)
                 return self.builder.call(ctpop, [val])
-            if method == "to_bytes" and len(node.args) >= 2:
+            elif method == "to_bytes" and len(node.args) >= 2:
                 val = obj if isinstance(obj.type, ir.IntType) else \
                     self.builder.ptrtoint(obj, i64)
                 length = self._emit_expr_value(node.args[0])
@@ -29933,7 +29621,7 @@ class CodeGen:
                 floored = self.builder.call(floor_fn, [fval])
                 is_int = self.builder.fcmp_ordered("==", fval, floored)
                 return self.builder.zext(is_int, i32)
-            if method == "as_integer_ratio" and len(node.args) == 0:
+            elif method == "as_integer_ratio" and len(node.args) == 0:
                 fval = obj if isinstance(obj.type, ir.DoubleType) else \
                     self.builder.bitcast(obj, double)
                 return self._rt_call("float_as_integer_ratio", [fval])
@@ -29999,8 +29687,7 @@ class CodeGen:
 
         # Path (b): bare pointer — assume FpyObj* (class instance)
         obj = self._emit_expr_value(node.func.value)
-        if isinstance(obj.type, ir.IntType):
-            obj = self.builder.inttoptr(obj, i8_ptr)
+        obj = self._ensure_ptr(obj)
         name_ptr = self._make_string_constant(method)
         n_args = len(node.args)
         if n_args == 0:
@@ -30644,13 +30331,7 @@ class CodeGen:
                 obj = self._emit_cpython_call_raw(node.value)
             else:
                 obj = self._emit_expr_value(node.value)
-            if isinstance(obj.type, ir.IntType):
-                obj = self.builder.inttoptr(obj, i8_ptr)
-            elif (isinstance(obj.type, ir.LiteralStructType)
-                  and obj.type == fpy_val):
-                # FpyValue struct — extract data as pointer
-                data = self.builder.extract_value(obj, 1)
-                obj = self.builder.inttoptr(data, i8_ptr)
+            obj = self._ensure_ptr(obj)
             key = self._emit_expr_value(node.slice)
             tag, data = self._bare_to_tag_data(key, node.slice)
             # Return raw PyObject* to preserve pyobj semantics for chaining
@@ -30659,8 +30340,7 @@ class CodeGen:
         # Check for Counter subscript access — uses regular dict get (returns 0 for missing)
         if self._is_counter_expr(node.value):
             obj = self._emit_expr_value(node.value)
-            if isinstance(obj.type, ir.IntType):
-                obj = self.builder.inttoptr(obj, i8_ptr)
+            obj = self._ensure_ptr(obj)
             key = self._emit_expr_value(node.slice)
             # Counter[key] → dict lookup; missing keys should return 0
             # Use dict_has_key to check, then get or return 0
@@ -30702,8 +30382,7 @@ class CodeGen:
         # Check for defaultdict subscript access — auto-inserts default on miss
         if self._is_defaultdict_expr(node.value):
             obj = self._emit_expr_value(node.value)
-            if isinstance(obj.type, ir.IntType):
-                obj = self.builder.inttoptr(obj, i8_ptr)
+            obj = self._ensure_ptr(obj)
             key = self._emit_expr_value(node.slice)
             out_tag = self._create_entry_alloca(i32, "dd.tag")
             out_data = self._create_entry_alloca(i64, "dd.data")
@@ -30720,8 +30399,7 @@ class CodeGen:
         # Check for deque subscript access
         if self._is_deque_expr(node.value):
             obj = self._emit_expr_value(node.value)
-            if isinstance(obj.type, ir.IntType):
-                obj = self.builder.inttoptr(obj, i8_ptr)
+            obj = self._ensure_ptr(obj)
             idx = self._emit_expr_value(node.slice)
             out_tag = self._create_entry_alloca(i32, "dq.get.tag")
             out_data = self._create_entry_alloca(i64, "dq.get.data")
@@ -30868,8 +30546,7 @@ class CodeGen:
         # Check for __getitem__ on user-class objects
         if self._is_obj_expr(node.value):
             obj = self._emit_expr_value(node.value)
-            if isinstance(obj.type, ir.IntType):
-                obj = self.builder.inttoptr(obj, i8_ptr)
+            obj = self._ensure_ptr(obj)
             key = self._emit_expr_value(node.slice)
             if isinstance(key.type, ir.PointerType):
                 key = self.builder.ptrtoint(key, i64)
@@ -30923,11 +30600,7 @@ class CodeGen:
 
         # Fallback: treat as pyobj __getitem__ via bridge
         obj = self._emit_expr_value(node.value)
-        if isinstance(obj.type, ir.IntType):
-            obj = self.builder.inttoptr(obj, i8_ptr)
-        elif isinstance(obj.type, ir.LiteralStructType) and obj.type == fpy_val:
-            data = self.builder.extract_value(obj, 1)
-            obj = self.builder.inttoptr(data, i8_ptr)
+        obj = self._ensure_ptr(obj)
         key = self._emit_expr_value(node.slice)
         tag, data = self._bare_to_tag_data(key, node.slice)
         getitem = self._make_string_constant("__getitem__")
@@ -31002,8 +30675,7 @@ class CodeGen:
     def _emit_list_append_expr(self, list_ptr: ir.Value, node: ast.expr) -> None:
         """Append a Python expression's value to a list via FV-ABI."""
         # Ensure list_ptr is i8* (may be i64 from FV unwrap)
-        if isinstance(list_ptr.type, ir.IntType):
-            list_ptr = self.builder.inttoptr(list_ptr, i8_ptr)
+        list_ptr = self._ensure_ptr(list_ptr)
         # For string/None/bool constants, build the FpyValue directly.
         if isinstance(node, ast.Constant):
             if isinstance(node.value, str):
@@ -31921,8 +31593,7 @@ class CodeGen:
                     str_val = self._rt_call("tuple_to_str", [val])
                 elif self._is_set_expr(value.value):
                     val = self._emit_expr_value(value.value)
-                    if isinstance(val.type, ir.IntType):
-                        val = self.builder.inttoptr(val, i8_ptr)
+                    val = self._ensure_ptr(val)
                     keys = self._rt_call("set_to_list", [val])
                     sorted_keys = self._rt_call("list_sorted", [keys])
                     str_val = self._rt_call("list_to_str", [sorted_keys])
