@@ -13,6 +13,7 @@
 #include "threading.h"
 #include <stdio.h>
 #include <string.h>
+#include <stddef.h>
 #ifdef _WIN32
 #include <io.h>
 #include <fcntl.h>
@@ -230,7 +231,11 @@ extern void fpy_rc_decref(int32_t tag, int64_t data);
 extern FpyDict* fpy_dict_new(int64_t capacity);
 
 /* Object instance proxy (defined below closure proxy section) */
-typedef struct { PyObject_HEAD FpyObj *obj; } FpyObjProxy;
+typedef struct {
+    PyObject_HEAD
+    FpyObj *obj;
+    PyObject *weaklist;
+} FpyObjProxy;
 typedef struct { PyObject_HEAD FpyObj *obj; FpyMethodDef *method; } FpyBoundMethodProxy;
 static PyObject* fpy_obj_to_pyobject(FpyObj *obj);
 static PyTypeObject FpyObjProxyType;
@@ -378,15 +383,34 @@ static void pyobject_to_fpy(PyObject *obj, int32_t *out_tag, int64_t *out_data) 
     } else if (PyLong_Check(obj)) {
         *out_tag = FPY_TAG_INT;
         *out_data = (int64_t)PyLong_AsLongLong(obj);
+        if (PyErr_Occurred()) {
+            /* OverflowError — value too large for i64 */
+            bridge_propagate_exception();
+            *out_tag = FPY_TAG_NONE;
+            *out_data = 0;
+            return;
+        }
     } else if (PyFloat_Check(obj)) {
         *out_tag = FPY_TAG_FLOAT;
         double d = PyFloat_AsDouble(obj);
+        if (d == -1.0 && PyErr_Occurred()) {
+            bridge_propagate_exception();
+            *out_tag = FPY_TAG_NONE;
+            *out_data = 0;
+            return;
+        }
         memcpy(out_data, &d, sizeof(double));
     } else if (PyUnicode_Check(obj)) {
         *out_tag = FPY_TAG_STR;
         /* Get UTF-8 string — we strdup because the PyObject may be freed */
         const char *s = PyUnicode_AsUTF8(obj);
-        char *copy = fpy_strdup(s ? s : "");
+        if (!s) {
+            if (PyErr_Occurred()) bridge_propagate_exception();
+            *out_tag = FPY_TAG_NONE;
+            *out_data = 0;
+            return;
+        }
+        char *copy = fpy_strdup(s);
         *out_data = (int64_t)(intptr_t)copy;
     } else if (PyList_Check(obj)) {
         *out_tag = FPY_TAG_LIST;
@@ -1619,6 +1643,8 @@ static PyObject* fpy_obj_proxy_call(PyObject *self,
 
 static void fpy_obj_proxy_dealloc(PyObject *self) {
     FpyObjProxy *proxy = (FpyObjProxy*)self;
+    if (proxy->weaklist)
+        PyObject_ClearWeakRefs(self);
     if (proxy->obj)
         fpy_rc_decref(FPY_TAG_OBJ, (int64_t)(intptr_t)proxy->obj);
     Py_TYPE(self)->tp_free(self);
@@ -1637,6 +1663,7 @@ static PyTypeObject FpyObjProxyType = {
     .tp_setattro = fpy_obj_proxy_setattr,
     .tp_richcompare = fpy_obj_proxy_richcompare,
     .tp_flags = Py_TPFLAGS_DEFAULT,
+    .tp_weaklistoffset = offsetof(FpyObjProxy, weaklist),
     .tp_new = PyType_GenericNew,
 };
 
@@ -1650,6 +1677,7 @@ static PyObject* fpy_obj_to_pyobject(FpyObj *obj) {
     }
     FpyObjProxy *proxy = PyObject_New(FpyObjProxy, &FpyObjProxyType);
     proxy->obj = obj;
+    proxy->weaklist = NULL;
     fpy_rc_incref(FPY_TAG_OBJ, (int64_t)(intptr_t)obj);
     return (PyObject*)proxy;
 }

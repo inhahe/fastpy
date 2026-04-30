@@ -1,7 +1,21 @@
 """Helper to compile C++ files using MSVC with /O2 optimization."""
 import subprocess, os, tempfile
+from pathlib import Path
 
-VCVARS = r'C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat'
+
+def _find_vcvars() -> str:
+    """Find vcvars64.bat across VS versions."""
+    for year in ["2026", "2025", "2024", "2022"]:
+        for edition in ["Community", "Enterprise", "Professional", "BuildTools"]:
+            p = (f"C:\\Program Files\\Microsoft Visual Studio\\{year}"
+                 f"\\{edition}\\VC\\Auxiliary\\Build\\vcvars64.bat")
+            if Path(p).exists():
+                return p
+    return (r"C:\Program Files\Microsoft Visual Studio\2022\Community"
+            r"\VC\Auxiliary\Build\vcvars64.bat")  # fallback
+
+
+VCVARS = _find_vcvars()
 
 def compile_cpp(src_path, exe_path):
     """Compile a C++ source file to an optimized executable."""
