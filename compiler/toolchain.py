@@ -418,15 +418,17 @@ def _find_msvc_cl() -> str | None:
     """Find cl.exe by setting up MSVC environment via vcvars64.bat.
 
     Returns a bat preamble string that sets up the environment, or None
-    if MSVC cannot be found.
+    if MSVC cannot be found. Searches VS 2026, 2025, 2024, 2022 in order
+    so the newest available version is preferred.
     """
-    for edition in ["Community", "Enterprise", "Professional", "BuildTools"]:
-        vcvars = (
-            f"C:\\Program Files\\Microsoft Visual Studio\\2022\\{edition}"
-            f"\\VC\\Auxiliary\\Build\\vcvars64.bat"
-        )
-        if Path(vcvars).exists():
-            return f'call "{vcvars}" 1>NUL 2>NUL'
+    for year in ["2026", "2025", "2024", "2022"]:
+        for edition in ["Community", "Enterprise", "Professional", "BuildTools"]:
+            vcvars = (
+                f"C:\\Program Files\\Microsoft Visual Studio\\{year}\\{edition}"
+                f"\\VC\\Auxiliary\\Build\\vcvars64.bat"
+            )
+            if Path(vcvars).exists():
+                return f'call "{vcvars}" 1>NUL 2>NUL'
     return None
 
 
@@ -657,7 +659,7 @@ def ensure_runtime_built(python_exe: str | Path | None = None,
         vcvars_cmd = _find_msvc_cl()
         if vcvars_cmd is None:
             raise RuntimeError(
-                "Cannot find MSVC (Visual Studio 2022). "
+                "Cannot find MSVC (Visual Studio 2022 or later). "
                 "Install Visual Studio with C++ workload.")
 
         if need_shared_build:
@@ -735,14 +737,15 @@ def _link_windows(obj_files: list[Path], output_path: Path,
     py_lib_dir = _find_python_lib_dir(install)
     py_lib = _find_python_lib_name(install)
 
+    vcvars_cmd = _find_msvc_cl()
+    if vcvars_cmd is None:
+        raise RuntimeError(
+            "Cannot find MSVC (Visual Studio 2022 or later). "
+            "Install Visual Studio with C++ workload.")
+
     bat_content = (
         '@echo off\r\n'
-        'call "C:\\Program Files\\Microsoft Visual Studio\\2022\\Community'
-        '\\VC\\Auxiliary\\Build\\vcvars64.bat" 1>NUL 2>NUL\r\n'
-        'if errorlevel 1 (\r\n'
-        '    call "C:\\Program Files\\Microsoft Visual Studio\\2022\\Enterprise'
-        '\\VC\\Auxiliary\\Build\\vcvars64.bat" 1>NUL 2>NUL\r\n'
-        ')\r\n'
+        f'{vcvars_cmd}\r\n'
         f'link.exe /NOLOGO /OUT:"{out_str}" {obj_list} '
         f'/LIBPATH:"{py_lib_dir}" {py_lib} '
         '/DEFAULTLIB:ucrt /DEFAULTLIB:msvcrt '
