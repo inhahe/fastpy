@@ -7635,9 +7635,11 @@ class CodeGen:
                         call_tag = "dict"
                     elif info.is_vararg and param_idx == len(info.func.args) - 1:
                         call_tag = "list"
-                    if call_tag is not None and call_tag.startswith("list"):
+                    _ctk = (ValueType.from_old_tag(call_tag).kind
+                            if call_tag else None)
+                    if _ctk == VKind.LIST:
                         tag = call_tag if ":" in call_tag else "list:int"
-                    elif call_tag is not None and call_tag.startswith("dict"):
+                    elif _ctk == VKind.DICT and call_tag.startswith("dict"):
                         # Strip the value-type suffix from the variable tag
                         # (downstream expects bare "dict") but record the
                         # value-type in the matching helper set so d[k] can
@@ -7649,14 +7651,10 @@ class CodeGen:
                             self._dict_var_list_values.add(param.name)
                         elif call_tag == "dict:dict":
                             self._dict_var_dict_values.add(param.name)
-                    elif call_tag == "obj":
-                        tag = "obj"
-                    elif call_tag in ("path", "pyobj"):
-                        tag = call_tag
-                    elif call_tag in ("set", "complex", "bigint",
-                                      "decimal", "bytes", "closure",
-                                      "counter", "defaultdict", "deque",
-                                      "logger", "native_mod"):
+                    elif _ctk is not None and _ctk.is_ptr:
+                        # obj, str, set, bytes, tuple, pyobj, complex,
+                        # bigint, decimal, closure, counter, defaultdict,
+                        # deque, path, native_mod, logger
                         tag = call_tag
                     elif call_tag == "mixed":
                         tag = "mixed"  # VKind.UNKNOWN — runtime dispatch
@@ -11148,33 +11146,26 @@ class CodeGen:
                 ptr_val = self.builder.inttoptr(param, i8_ptr)
                 tag = "obj"
                 bare = ptr_val
-            elif call_tag == "str" and isinstance(param.type, ir.IntType):
-                ptr_val = self.builder.inttoptr(param, i8_ptr)
-                tag = "str"
-                bare = ptr_val
-            elif call_tag is not None and call_tag.startswith("list") and isinstance(param.type, ir.IntType):
-                ptr_val = self.builder.inttoptr(param, i8_ptr)
-                tag = call_tag
-                bare = ptr_val
-            elif call_tag is not None and call_tag.startswith("dict") and isinstance(param.type, ir.IntType):
-                ptr_val = self.builder.inttoptr(param, i8_ptr)
-                tag = "dict"
-                bare = ptr_val
-            elif call_tag == "float" and isinstance(param.type, ir.IntType):
-                dbl_val = self.builder.bitcast(param, double)
-                tag = "float"
-                bare = dbl_val
+            elif call_tag is not None and isinstance(param.type, ir.IntType):
+                _ctk = ValueType.from_old_tag(call_tag).kind
+                if _ctk.is_ptr:
+                    ptr_val = self.builder.inttoptr(param, i8_ptr)
+                    # Preserve compound tags (list:float) for downstream;
+                    # for dict strip value-type suffix (expect bare "dict")
+                    tag = "dict" if _ctk == VKind.DICT else call_tag
+                    bare = ptr_val
+                elif _ctk == VKind.FLOAT:
+                    bare = self.builder.bitcast(param, double)
+                    tag = "float"
+                elif _ctk == VKind.BOOL:
+                    tag = "bool"
+                    bare = param
+                else:
+                    tag = "int"
+                    bare = param
             elif pname in float_default_params and isinstance(param.type, ir.IntType):
-                dbl_val = self.builder.bitcast(param, double)
+                bare = self.builder.bitcast(param, double)
                 tag = "float"
-                bare = dbl_val
-            elif call_tag == "obj" and isinstance(param.type, ir.IntType):
-                ptr_val = self.builder.inttoptr(param, i8_ptr)
-                tag = "obj"
-                bare = ptr_val
-            elif call_tag == "bool" and isinstance(param.type, ir.IntType):
-                tag = "bool"
-                bare = param
             elif pname in bool_default_params and isinstance(param.type, ir.IntType):
                 tag = "bool"
                 bare = param
