@@ -22815,8 +22815,10 @@ class CodeGen:
     def _is_deque_expr(self, node: ast.expr) -> bool:
         """Check if an AST expression evaluates to a deque."""
         if isinstance(node, ast.Name) and node.id in self.variables:
+            # deque maps to VKind.LIST via from_old_tag, so check string tag
             _, type_tag = self.variables[node.id]
-            return type_tag == "deque"
+            return (type_tag == "deque" if isinstance(type_tag, str)
+                    else type_tag._to_tag() == "deque")
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
             native_imports = getattr(self, '_native_imports', {})
             if node.func.id in native_imports:
@@ -22827,8 +22829,10 @@ class CodeGen:
     def _is_counter_expr(self, node: ast.expr) -> bool:
         """Check if an AST expression evaluates to a Counter."""
         if isinstance(node, ast.Name) and node.id in self.variables:
+            # counter maps to VKind.DICT, so check string tag for specificity
             _, type_tag = self.variables[node.id]
-            return type_tag == "counter"
+            return (type_tag == "counter" if isinstance(type_tag, str)
+                    else type_tag._to_tag() == "counter")
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
             native_imports = getattr(self, '_native_imports', {})
             if node.func.id in native_imports:
@@ -22969,8 +22973,10 @@ class CodeGen:
     def _is_path_expr(self, node: ast.expr) -> bool:
         """Check if an AST expression evaluates to a pathlib.Path."""
         if isinstance(node, ast.Name) and node.id in self.variables:
+            # path maps to VKind.PYOBJ, so check string tag for specificity
             _, type_tag = self.variables[node.id]
-            return type_tag == "path"
+            return (type_tag == "path" if isinstance(type_tag, str)
+                    else type_tag._to_tag() == "path")
         # Direct Path(...) call via imported name
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
             native_imports = getattr(self, '_native_imports', {})
@@ -23010,13 +23016,15 @@ class CodeGen:
         if isinstance(node, (ast.List, ast.ListComp, ast.GeneratorExp)):
             return True
         if isinstance(node, ast.Name) and node.id in self.variables:
-            _, type_tag = self.variables[node.id]
-            return type_tag.startswith("list")
+            kind = self._var_kind(node.id)
+            return kind == VKind.LIST
         # Global variables not yet copied to self.variables (first access
         # from inside a function before _load_variable has been called):
         if isinstance(node, ast.Name) and node.id in self._global_vars:
             _, type_tag = self._global_vars[node.id]
-            return type_tag.startswith("list")
+            kind = (type_tag.kind if isinstance(type_tag, ValueType)
+                    else ValueType.from_old_tag(type_tag).kind)
+            return kind == VKind.LIST
         # sorted(), reversed(), list() return lists (set() now returns dict-backed set)
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
             if node.func.id in ("sorted", "reversed", "list", "enumerate", "zip", "map", "filter", "range"):
@@ -23249,14 +23257,15 @@ class CodeGen:
         if isinstance(node, (ast.Dict, ast.DictComp)):
             return True
         if isinstance(node, ast.Name):
-            _entry = None
+            _kind = VKind.UNKNOWN
             if node.id in self.variables:
-                _entry = self.variables[node.id]
+                _kind = self._var_kind(node.id)
             elif node.id in self._global_vars:
-                _entry = self._global_vars[node.id]
-            if _entry is not None:
-                _, type_tag = _entry
-                return type_tag == "dict"
+                _, _gt = self._global_vars[node.id]
+                _kind = (_gt.kind if isinstance(_gt, ValueType)
+                         else ValueType.from_old_tag(_gt).kind)
+            if _kind == VKind.DICT:
+                return True
         # Function calls that return dicts
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
             name = node.func.id
