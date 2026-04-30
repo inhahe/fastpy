@@ -15670,6 +15670,13 @@ class CodeGen:
                 pyobj = self.builder.call(
                     self.runtime["cpython_get_builtin"], [name_ptr])
                 return self.builder.ptrtoint(pyobj, i64)
+            elif name == "__debug__":
+                # __debug__ is True unless Python is run with -O
+                val = ir.Constant(i64, 1)
+                alloca = self._create_entry_alloca(i64, "__debug__")
+                self.builder.store(val, alloca)
+                self.variables["__debug__"] = (alloca, "bool")
+                return val
             elif name in ("__name__", "__file__", "__doc__",
                           "__loader__", "__spec__", "__package__",
                           "__builtins__", "__cached__", "__all__"):
@@ -17454,6 +17461,18 @@ class CodeGen:
                         self.runtime["exc_name_to_id"], [exc_name])
                     matches = self.builder.icmp_signed("==", effective_type, expected_id)
                     self.builder.cbranch(matches, handler_block, next_handler)
+                elif handler.type is not None and isinstance(handler.type, ast.Tuple):
+                    # except* (TypeError, ValueError): — OR chain of type checks
+                    any_match = ir.Constant(ir.IntType(1), 0)
+                    for elt in handler.type.elts:
+                        if isinstance(elt, ast.Name):
+                            elt_name = self._make_string_constant(elt.id)
+                            elt_id = self.builder.call(
+                                self.runtime["exc_name_to_id"], [elt_name])
+                            elt_match = self.builder.icmp_signed(
+                                "==", effective_type, elt_id)
+                            any_match = self.builder.or_(any_match, elt_match)
+                    self.builder.cbranch(any_match, handler_block, next_handler)
                 else:
                     self.builder.branch(handler_block)
 
@@ -18085,6 +18104,18 @@ class CodeGen:
                             self.runtime["exc_name_to_id"], [exc_name])
                         matches = self.builder.icmp_signed("==", exc_type, expected_id)
                         self.builder.cbranch(matches, handler_block, next_handler)
+                    elif isinstance(handler.type, ast.Tuple):
+                        # except (TypeError, ValueError): — OR chain of type checks
+                        any_match = ir.Constant(ir.IntType(1), 0)
+                        for elt in handler.type.elts:
+                            if isinstance(elt, ast.Name):
+                                elt_name = self._make_string_constant(elt.id)
+                                elt_id = self.builder.call(
+                                    self.runtime["exc_name_to_id"], [elt_name])
+                                elt_match = self.builder.icmp_signed(
+                                    "==", exc_type, elt_id)
+                                any_match = self.builder.or_(any_match, elt_match)
+                        self.builder.cbranch(any_match, handler_block, next_handler)
                     else:
                         self.builder.branch(handler_block)
 
@@ -18175,6 +18206,11 @@ class CodeGen:
                 else:
                     msg = self._make_string_constant("")
                 self.builder.call(self.runtime["raise"], [exc_id, msg])
+                # Handle "raise X from Y" — evaluate the cause expression
+                # (for side effects) even though we can't attach __cause__
+                # to the exception struct. This avoids silently ignoring it.
+                if node.cause is not None:
+                    self._emit_expr_value(node.cause)
             # If we're inside a try block, the exception check after this
             # statement will catch it. If not, early-return so the caller
             # can check the exception flag.
@@ -30228,6 +30264,8 @@ class CodeGen:
         """
         if isinstance(node, ast.Constant) and isinstance(node.value, bool):
             return True
+        if isinstance(node, ast.Name) and node.id == "__debug__":
+            return True
         if isinstance(node, ast.Name) and node.id in self.variables:
             _, tag = self.variables[node.id]
             if isinstance(tag, ValueType):
@@ -31886,7 +31924,9 @@ class CodeGen:
                         str_val = self._fv_call_str(fv)
 
                 # Apply conversion if requested
-                if conversion == 114:  # !r
+                if conversion in (114, 97):  # !r or !a
+                    # !r → repr(); !a → ascii() (like repr but escapes non-ASCII).
+                    # For now treat !a the same as !r since all strings are UTF-8.
                     # For strings, wrap in quotes. Non-strings: for now, same as str.
                     if (self._is_list_expr(value.value) or self._is_dict_expr(value.value)
                             or self._is_tuple_expr(value.value)

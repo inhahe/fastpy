@@ -129,6 +129,11 @@ def run_cpython(source: str, timeout: float = 10.0) -> RunResult:
 def run_executable(exe_path: Path, timeout: float = 10.0) -> RunResult:
     """Run a compiled executable and capture output."""
     try:
+        # Ensure Python DLLs (python3XX.dll) are on PATH for the compiled
+        # executable, which links against the CPython bridge.
+        env = os.environ.copy()
+        python_dir = os.path.dirname(sys.executable)
+        env["PATH"] = python_dir + os.pathsep + env.get("PATH", "")
         proc = subprocess.run(
             [str(exe_path)],
             capture_output=True,
@@ -136,6 +141,7 @@ def run_executable(exe_path: Path, timeout: float = 10.0) -> RunResult:
             timeout=timeout,
             encoding="utf-8",
             errors="replace",
+            env=env,
         )
         return RunResult(
             stdout=proc.stdout,
