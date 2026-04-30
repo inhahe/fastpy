@@ -11664,8 +11664,13 @@ class CodeGen:
             else:
                 self._bridge_fallback_stmt(node, "del on unsupported container type")
         elif isinstance(target, ast.Name):
-            # del variable — just remove from scope (CPython raises NameError on later use)
-            pass  # No-op for now; the variable stays in scope but could be undefined
+            # del variable — remove from scope so subsequent access raises NameError.
+            # This handles the static case (del x; print(x) → NameError).
+            # Conditional del (if cond: del x) remains approximate because
+            # we cannot track scope presence at runtime without per-load guards.
+            name = target.id
+            if name in self.variables:
+                del self.variables[name]
         else:
             self._bridge_fallback_stmt(node, f"del with {type(target).__name__} target")
 
@@ -15709,7 +15714,8 @@ class CodeGen:
                     exc_id = self.builder.call(self.runtime["exc_name_to_id"], [name_ptr])
                     msg_ptr = self._make_string_constant(msg)
                     self.builder.call(self.runtime["raise"], [exc_id, msg_ptr])
-                    self.builder.call(self.runtime["exc_unhandled"], [])
+                    if not self._in_try_block:
+                        self.builder.call(self.runtime["exc_unhandled"], [])
                     return ir.Constant(i64, 0)
         alloca, type_tag = self.variables[name]
         if type_tag == "cell":
