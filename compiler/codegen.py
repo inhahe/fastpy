@@ -15387,14 +15387,17 @@ class CodeGen:
     def _var_kind(self, name: str) -> VKind:
         """Get the VKind for a variable. Returns UNKNOWN if not found.
 
-        Phase 3 helper — cleaner than `self._var_kind(name) == VKind.STR`.
-        Usage: `if self.variables["x"][1] == "pyobj":` instead of
-        `if self.variables["x"][1] == "pyobj":`"""
+        Checks self.variables first, then self._global_vars for globals
+        not yet copied to the function scope."""
+        entry = None
         if name in self.variables:
-            _, vtype = self.variables[name]
+            entry = self.variables[name]
+        elif name in self._global_vars:
+            entry = self._global_vars[name]
+        if entry is not None:
+            _, vtype = entry
             if isinstance(vtype, ValueType):
                 return vtype.kind
-            # Legacy string tag fallback
             return ValueType.from_old_tag(vtype).kind
         return VKind.UNKNOWN
 
