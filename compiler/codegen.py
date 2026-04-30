@@ -2618,31 +2618,34 @@ class CodeGen:
         # ones reference them (e.g. SYSTEM=[sun, jupiter]).
         # Element types can be compound: "list:float" for a list of lists
         # of floats, allowing nested subscript to peel one layer at a time.
-        global_list_elem_types: dict[str, str] = {}
+        global_list_elem_types: dict[str, 'str | ValueType'] = {}
         for node in tree.body:
             if isinstance(node, ast.Assign) and len(node.targets) == 1:
                 if isinstance(node.targets[0], ast.Name):
                     name = node.targets[0].id
                     if global_types.get(name) != "list":
                         continue
-                    et = "int"  # default
+                    et = ValueType(VKind.INT)  # default
                     if isinstance(node.value, (ast.List, ast.ListComp)):
                         et = self._infer_list_elem_type(node.value)
-                        # _infer_list_elem_type returns "int" by default;
+                        # _infer_list_elem_type returns VKind.INT by default;
                         # also check if elements are Name refs to known
                         # list/dict/str/float globals.
-                        if et == "int" and isinstance(node.value, ast.List):
+                        if et.kind == VKind.INT and isinstance(node.value, ast.List):
                             for _elt in node.value.elts:
                                 if isinstance(_elt, ast.Name):
                                     ref_type = global_types.get(_elt.id)
                                     if ref_type == "list":
                                         # Compound: include inner elem type
-                                        inner = global_list_elem_types.get(
-                                            _elt.id, "int")
-                                        et = f"list:{inner}"
+                                        _inner = global_list_elem_types.get(
+                                            _elt.id)
+                                        _inner_vt = (_inner if isinstance(_inner, ValueType)
+                                                     else ValueType.from_old_tag(_inner)
+                                                     if _inner else ValueType(VKind.INT))
+                                        et = ValueType(VKind.LIST, elem_type=_inner_vt)
                                         break
                                     if ref_type in ("dict", "str", "float"):
-                                        et = ref_type
+                                        et = ValueType.from_old_tag(ref_type)
                                         break
                     elif (isinstance(node.value, ast.Call)
                           and isinstance(node.value.func, ast.Name)
@@ -2658,7 +2661,7 @@ class CodeGen:
                                             and rs.value is not None):
                                         ret_et = self._infer_list_elem_type(
                                             rs.value)
-                                        if ret_et != "int":
+                                        if ret_et.kind != VKind.INT:
                                             et = ret_et
                                         break
                                 break
@@ -2688,11 +2691,11 @@ class CodeGen:
                         arg = call.args[0]
                         vn = call.func.value.id
                         if isinstance(arg, (ast.List, ast.ListComp)):
-                            global_list_elem_types[vn] = "list"
+                            global_list_elem_types[vn] = ValueType(VKind.LIST)
                         elif isinstance(arg, (ast.Dict, ast.DictComp)):
-                            global_list_elem_types[vn] = "dict"
+                            global_list_elem_types[vn] = ValueType(VKind.DICT)
                         elif isinstance(arg, ast.Tuple):
-                            global_list_elem_types[vn] = "tuple"
+                            global_list_elem_types[vn] = ValueType(VKind.TUPLE)
 
         for node in ast.walk(tree):
             if isinstance(node, ast.Global):
@@ -4554,15 +4557,16 @@ class CodeGen:
                         _fn = self._user_functions[
                             node.value.func.id]
                         _existing = var_types.get(tgt.id)
-                        if _fn.ret_tag in ("ptr", "ptr:list"):
+                        _rtk = ValueType.from_old_tag(_fn.ret_tag).kind
+                        if _rtk == VKind.LIST:
                             if not (_existing and
                                     _existing.startswith("list:")):
                                 var_types[tgt.id] = "list"
-                        elif _fn.ret_tag == "dict":
+                        elif _rtk == VKind.DICT:
                             var_types[tgt.id] = "dict"
-                        elif _fn.ret_tag == "str":
+                        elif _rtk == VKind.STR:
                             var_types[tgt.id] = "str"
-                        elif _fn.ret_tag == "float":
+                        elif _rtk == VKind.FLOAT:
                             var_types[tgt.id] = "float"
 
         # Propagate function return types: data = make_list() → data is "list"
@@ -4618,7 +4622,9 @@ class CodeGen:
                                         break
                             # User function that returns float
                             if tgt not in local_types and _call_name in self._user_functions:
-                                if self._user_functions[_call_name].ret_tag == "float":
+                                if ValueType.from_old_tag(
+                                        self._user_functions[_call_name].ret_tag
+                                ).kind == VKind.FLOAT:
                                     local_types[tgt] = "float"
                             # Also check _func_ret_types (populated earlier in this pass)
                             if tgt not in local_types and _call_name in _func_ret_types:
@@ -4645,7 +4651,9 @@ class CodeGen:
                               and isinstance(n.value.func, ast.Name)):
                             _cn = n.value.func.id
                             if (_cn in self._user_functions
-                                    and self._user_functions[_cn].ret_tag == "float"):
+                                    and ValueType.from_old_tag(
+                                        self._user_functions[_cn].ret_tag
+                                    ).kind == VKind.FLOAT):
                                 local_types[tgt] = "float"
                                 _changed = True
                             elif _cn in _func_ret_types and _func_ret_types[_cn] == "float":
@@ -4783,7 +4791,8 @@ class CodeGen:
                                 # Function call — float if callee returns float
                                 _callee = elt.func.id
                                 _callee_info = self._user_functions.get(_callee)
-                                if _callee_info and _callee_info.ret_tag == "float":
+                                if (_callee_info and ValueType.from_old_tag(
+                                        _callee_info.ret_tag).kind == VKind.FLOAT):
                                     continue
                                 if _callee in _func_ret_types and _func_ret_types[_callee] == "float":
                                     continue
@@ -5210,20 +5219,13 @@ class CodeGen:
                       and arg.func.id in self._user_functions):
                     # User function call: propagate return type.
                     _fn_info = self._user_functions[arg.func.id]
-                    if _fn_info.ret_tag in ("ptr", "ptr:list"):
-                        arg_types.append("list")
-                    elif _fn_info.ret_tag == "dict":
-                        arg_types.append("dict")
-                    elif _fn_info.ret_tag == "str":
-                        arg_types.append("str")
-                    elif _fn_info.ret_tag == "float":
-                        arg_types.append("float")
-                    elif _fn_info.ret_tag == "bool":
-                        arg_types.append("bool")
-                    elif _fn_info.ret_tag == "obj":
-                        arg_types.append("obj")
-                    else:
-                        arg_types.append(None)
+                    _rtk = ValueType.from_old_tag(_fn_info.ret_tag).kind
+                    _RET_TAG_TO_ARG = {
+                        VKind.LIST: "list", VKind.DICT: "dict",
+                        VKind.STR: "str", VKind.FLOAT: "float",
+                        VKind.BOOL: "bool", VKind.OBJ: "obj",
+                    }
+                    arg_types.append(_RET_TAG_TO_ARG.get(_rtk))
                 elif (isinstance(arg, ast.Call)
                       and isinstance(arg.func, ast.Name)
                       and arg.func.id in getattr(self, '_native_imports', {})):
@@ -6222,13 +6224,14 @@ class CodeGen:
             fname = node.func.id
             if fname in self._user_functions:
                 info = self._user_functions[fname]
-                if info.ret_tag == "float":
+                _rtk = ValueType.from_old_tag(info.ret_tag).kind
+                if _rtk == VKind.FLOAT:
                     return "float"
-                if info.ret_tag == "int":
+                if _rtk == VKind.INT:
                     return "int"
-                if info.ret_tag == "bool":
+                if _rtk == VKind.BOOL:
                     return "bool"
-                if info.ret_tag == "str":
+                if _rtk == VKind.STR:
                     return "str"
         # Float-containing expression
         has_float = any(
@@ -6366,17 +6369,7 @@ class CodeGen:
             for i, _pn in enumerate(node.args.args):
                 ct = call_types[i] if i < len(call_types) else None
                 if ct is not None:
-                    if (ct in ("str", "list", "dict", "obj", "bigint",
-                               "complex", "decimal", "set", "bytes",
-                               "path", "pyobj", "closure", "tuple",
-                               "mixed")
-                            or ct.startswith("list:")
-                            or ct.startswith("dict:")):
-                        param_types.append(i8_ptr)
-                    elif ct == "float":
-                        param_types.append(double)
-                    else:
-                        param_types.append(i64)
+                    param_types.append(self._tag_to_llvm_param_type(ct))
                 elif _pn.arg in _str_heuristic_mixed:
                     param_types.append(i8_ptr)
                 else:
@@ -6392,17 +6385,7 @@ class CodeGen:
                     ct_idx = len(node.args.args) + ki
                     ct = call_types[ct_idx] if ct_idx < len(call_types) else None
                     if ct is not None:
-                        if (ct in ("str", "list", "dict", "obj", "bigint",
-                                   "complex", "decimal", "set", "bytes",
-                                   "path", "pyobj", "closure", "tuple",
-                                   "mixed")
-                                or ct.startswith("list:")
-                                or ct.startswith("dict:")):
-                            param_types.append(i8_ptr)
-                        elif ct == "float":
-                            param_types.append(double)
-                        else:
-                            param_types.append(i64)
+                        param_types.append(self._tag_to_llvm_param_type(ct))
                     elif kw_arg.arg in _str_heuristic:
                         param_types.append(i8_ptr)
                     else:
@@ -6454,18 +6437,8 @@ class CodeGen:
                 # if we know the caller passes int, respect that even if the
                 # param is used in an f-string (where it'd be int_to_str'd).
                 if i < len(call_types) and call_types[i] is not None:
-                    ct = call_types[i]
-                    if (ct in ("str", "list", "dict", "obj",
-                               "bigint", "complex", "decimal",
-                               "set", "bytes", "path", "pyobj",
-                               "closure", "tuple", "mixed")
-                            or ct.startswith("list:")
-                            or ct.startswith("dict:")):
-                        param_types.append(i8_ptr)
-                    elif ct == "float":
-                        param_types.append(double)
-                    else:
-                        param_types.append(i64)
+                    param_types.append(
+                        self._tag_to_llvm_param_type(call_types[i]))
                 elif pname in string_params_by_heuristic:
                     param_types.append(i8_ptr)
                 else:
@@ -6498,10 +6471,12 @@ class CodeGen:
                             elif _dn in self.variables:
                                 _, _outer_tag = self.variables[_dn]
                             if _outer_tag is not None:
-                                _ot_str = str(_outer_tag)
-                                if (_ot_str.startswith("list")
-                                        or _ot_str.startswith("dict")
-                                        or _ot_str in ("str", "obj")):
+                                _ot_kind = (
+                                    _outer_tag.kind
+                                    if isinstance(_outer_tag, ValueType)
+                                    else ValueType.from_old_tag(_outer_tag).kind
+                                )
+                                if _ot_kind.is_ptr:
                                     _def_is_ptr = True
                     if _def_is_ptr:
                         param_types.append(i8_ptr)
@@ -6513,18 +6488,11 @@ class CodeGen:
                         # call site passes a pointer type, use i8_ptr to
                         # avoid truncating pointers to i64.
                         _sigs = self._function_signatures.get(node.name, [])
-                        _has_ptr_sig = False
-                        for sig in _sigs:
-                            if i < len(sig) and sig[i] is not None:
-                                st = sig[i]
-                                if (st in ("str", "list", "dict", "obj",
-                                           "set", "bytes", "path", "pyobj",
-                                           "complex", "bigint", "decimal",
-                                           "closure", "tuple")
-                                        or st.startswith("list:")
-                                        or st.startswith("dict:")):
-                                    _has_ptr_sig = True
-                                    break
+                        _has_ptr_sig = any(
+                            i < len(sig) and sig[i] is not None
+                            and ValueType.from_old_tag(sig[i]).kind.is_ptr
+                            for sig in _sigs
+                        )
                         if _has_ptr_sig:
                             param_types.append(i8_ptr)
                         else:
@@ -6575,7 +6543,8 @@ class CodeGen:
             # return expression that mentions such a param should yield float.
             float_params = set()
             for i, pname in enumerate(param_names):
-                if i < len(call_types) and call_types[i] == "float":
+                if (i < len(call_types) and call_types[i] is not None
+                        and ValueType.from_old_tag(call_types[i]).kind == VKind.FLOAT):
                     float_params.add(pname)
                 # Also detect float params from default values when call-site
                 # analysis doesn't cover them (caller uses the default).
@@ -6666,11 +6635,11 @@ class CodeGen:
                             and isinstance(n.value.func, ast.Name)
                             and n.value.func.id in self._user_functions):
                         _callee = self._user_functions[n.value.func.id]
-                        if _callee.ret_tag in ("ptr", "ptr:list",
-                                               "str", "dict", "obj"):
+                        _rt_kind = ValueType.from_old_tag(_callee.ret_tag).kind
+                        if _rt_kind.is_ptr:
                             ret_type = i8_ptr
                             break
-                        if _callee.ret_tag == "float":
+                        if _rt_kind == VKind.FLOAT:
                             ret_type = double
                             break
                     # Returning a string-returning method call like s.upper(),
@@ -6716,7 +6685,7 @@ class CodeGen:
                         pidx = param_names.index(n.value.value.id)
                         if (pidx < len(call_types)
                                 and call_types[pidx] is not None
-                                and call_types[pidx].startswith("list")):
+                                and ValueType.from_old_tag(call_types[pidx]).kind == VKind.LIST):
                             ret_type = i8_ptr
                             break
                     # str + str, str * int, etc. → str return
@@ -6729,7 +6698,7 @@ class CodeGen:
                                     and operand.id in param_names):
                                 pidx = param_names.index(operand.id)
                                 if (pidx < len(call_types)
-                                        and call_types[pidx] == "str"):
+                                        and ValueType.from_old_tag(call_types[pidx]).kind == VKind.STR):
                                     found_str = True
                                     break
                             if (isinstance(operand, ast.Constant)
@@ -6765,9 +6734,8 @@ class CodeGen:
                         pidx = param_names.index(n.value.id)
                         if pidx < len(call_types) and call_types[pidx] is not None:
                             ct = call_types[pidx]
-                            if (ct == "str" or ct == "dict"
-                                    or ct.startswith("list")
-                                    or ct.startswith("dict:")):
+                            _ct_kind = ValueType.from_old_tag(ct).kind
+                            if _ct_kind.is_ptr:
                                 ret_type = i8_ptr
                                 break
                     # Check if returning a BinOp / IfExp / etc. containing strings.
@@ -12058,7 +12026,7 @@ class CodeGen:
                 # pattern): greet = wrap(greet); result = greet('world')
                 # must call through the closure, not the original function.
                 and not (node.value.func.id in self.variables
-                         and self.variables[node.value.func.id][1] == "closure")):
+                         and self._var_kind(node.value.func.id) == VKind.CLOSURE)):
             # Resolve specialization for correct ret_tag (int vs float etc.)
             lookup_name = node.value.func.id
             if lookup_name in self._monomorphized:
@@ -13983,13 +13951,14 @@ class CodeGen:
             # Check if function returns a pointer (tuple, list, or dict)
             if node.func.id in self._user_functions:
                 info = self._user_functions[node.func.id]
-                if info.ret_tag == "dict":
+                _rtk = ValueType.from_old_tag(info.ret_tag).kind
+                if _rtk == VKind.DICT:
                     return "dict"
                 if info.ret_tag == "ptr:list":
                     return "list:list"  # function returns list of lists
-                if info.ret_tag == "ptr":
+                if _rtk == VKind.LIST:
                     return "list:int"  # default to list for pointer returns
-                if info.ret_tag == "obj":
+                if _rtk == VKind.OBJ:
                     return "obj"
         if isinstance(node, (ast.Dict, ast.DictComp)):
             return "dict"
@@ -14567,58 +14536,64 @@ class CodeGen:
                     elif arg.id in local_var_types:
                         self._list_append_types[var_name] = local_var_types[arg.id]
                     elif arg.id in self.variables:
-                        _, tag = self.variables[arg.id]
-                        if tag == "str":
+                        _vk = self._var_kind(arg.id)
+                        if _vk == VKind.STR:
                             self._list_append_types[var_name] = "str"
-                        elif tag == "float":
+                        elif _vk == VKind.FLOAT:
                             self._list_append_types[var_name] = "float"
 
-    def _infer_list_elem_type(self, node: ast.expr) -> str:
-        """Infer the element type of a list expression."""
+    def _infer_list_elem_type(self, node: ast.expr) -> 'ValueType':
+        """Infer the element type of a list expression.
+
+        Returns a ValueType representing the element kind. Callers that
+        need a string tag can use ``result._to_tag()`` or str(result).
+        """
         if isinstance(node, (ast.List, ast.Tuple)):
             if not node.elts:
-                return "int"
+                return ValueType(VKind.INT)
             first = node.elts[0]
             if isinstance(first, ast.Constant):
                 if isinstance(first.value, str):
-                    return "str"
+                    return ValueType(VKind.STR)
                 elif isinstance(first.value, float):
-                    return "float"
+                    return ValueType(VKind.FLOAT)
             # Handle negative float literals: -1.0 is parsed as
             # UnaryOp(USub, Constant(1.0)), not Constant(-1.0).
             if (isinstance(first, ast.UnaryOp)
                     and isinstance(first.op, ast.USub)
                     and isinstance(first.operand, ast.Constant)):
                 if isinstance(first.operand.value, float):
-                    return "float"
+                    return ValueType(VKind.FLOAT)
             # Check if elements are nested lists or tuples (both stored as list pointers)
             if isinstance(first, (ast.List, ast.ListComp, ast.Tuple)):
-                return "list"
+                return ValueType(VKind.LIST)
             # Check if elements are dicts
             if isinstance(first, (ast.Dict, ast.DictComp)):
-                return "dict"
+                return ValueType(VKind.DICT)
             # Check if elements are constructor calls (list of objects)
             if isinstance(first, ast.Call) and isinstance(first.func, ast.Name):
                 if first.func.id in self._user_classes:
-                    return "obj"
+                    return ValueType(VKind.OBJ)
             # BinOp with a list/tuple operand: [[0]*n, ...] or [lst+lst, ...]
             if isinstance(first, ast.BinOp):
                 if (isinstance(first.left, (ast.List, ast.ListComp, ast.Tuple))
                         or isinstance(first.right, (ast.List, ast.ListComp, ast.Tuple))):
-                    return "list"
+                    return ValueType(VKind.LIST)
             # Check if elements are Name references to list/dict variables.
             # E.g., SYSTEM = [a, b] where a and b are lists → list:list.
             if isinstance(first, ast.Name):
                 if self._is_list_expr(first) or self._is_tuple_expr(first):
                     # Propagate inner element type: [a, b] where a is
                     # list:float → the outer list's element type is
-                    # "list:float", not just "list".
+                    # list(list:float), not just bare list.
                     inner_elem = self._get_list_elem_type(first)
                     if inner_elem and inner_elem != "int":
-                        return f"list:{inner_elem}"
-                    return "list"
+                        _inner_vt = (inner_elem if isinstance(inner_elem, ValueType)
+                                     else ValueType.from_old_tag(inner_elem))
+                        return ValueType(VKind.LIST, elem_type=_inner_vt)
+                    return ValueType(VKind.LIST)
                 if self._is_dict_expr(first):
-                    return "dict"
+                    return ValueType(VKind.DICT)
             # Mixed-type list: first element is scalar but list contains
             # containers (lists, dicts, tuples). E.g., [1, [2, 3], 4].
             # The FpyList stores correct per-element tags at runtime, but
@@ -14626,27 +14601,27 @@ class CodeGen:
             if any(isinstance(e, (ast.List, ast.ListComp, ast.Tuple,
                                   ast.Dict, ast.DictComp))
                    for e in node.elts):
-                return "mixed"
-            return "int"
+                return ValueType.from_old_tag("mixed")
+            return ValueType(VKind.INT)
         if isinstance(node, ast.ListComp):
             # Infer from the element expression
             elt = node.elt
             if isinstance(elt, (ast.List, ast.ListComp, ast.Tuple)):
-                return "list"
+                return ValueType(VKind.LIST)
             if isinstance(elt, (ast.Dict, ast.DictComp)):
-                return "dict"
+                return ValueType(VKind.DICT)
             if isinstance(elt, ast.Constant):
                 if isinstance(elt.value, str):
-                    return "str"
+                    return ValueType(VKind.STR)
                 if isinstance(elt.value, float):
-                    return "float"
+                    return ValueType(VKind.FLOAT)
             if isinstance(elt, ast.JoinedStr):
-                return "str"
+                return ValueType(VKind.STR)
             # BinOp with a list/tuple operand: [x]*n or lst+lst
             if isinstance(elt, ast.BinOp):
                 if (isinstance(elt.left, (ast.List, ast.ListComp, ast.Tuple))
                         or isinstance(elt.right, (ast.List, ast.ListComp, ast.Tuple))):
-                    return "list"
+                    return ValueType(VKind.LIST)
             # Bridge call as element: [mod.Cls(...) for ...]
             # where mod is a non-native imported module → pyobj elements.
             if (isinstance(elt, ast.Call)
@@ -14655,16 +14630,17 @@ class CodeGen:
                 _mod = elt.func.value.id
                 if (_mod in self._cpython_modules
                         and _mod not in self._NATIVE_MODULES):
-                    return "pyobj"
+                    return ValueType(VKind.PYOBJ)
             # Element is the outermost generator's loop variable:
             # `[p for p in people]` — inherit the iterable's element type.
             # Lets `[p for p in list_of_dicts]` be tagged list:dict.
             if (isinstance(elt, ast.Name) and node.generators
                     and isinstance(node.generators[0].target, ast.Name)
                     and node.generators[0].target.id == elt.id):
-                return self._get_list_elem_type(node.generators[0].iter)
-            return "int"
-        return "int"
+                _ret = self._get_list_elem_type(node.generators[0].iter)
+                return _ret if isinstance(_ret, ValueType) else ValueType.from_old_tag(_ret)
+            return ValueType(VKind.INT)
+        return ValueType(VKind.INT)
 
     def _emit_tuple_unpack(self, target: ast.Tuple, value_node: ast.expr, node: ast.AST) -> None:
         """Emit tuple unpacking: a, b, c = 1, 2, 3 or a, b, c = some_tuple."""
@@ -15400,6 +15376,19 @@ class CodeGen:
                 return vtype.kind
             return ValueType.from_old_tag(vtype).kind
         return VKind.UNKNOWN
+
+    @staticmethod
+    def _tag_to_llvm_param_type(tag) -> 'ir.Type':
+        """Convert a type tag (str or ValueType) to the LLVM param type.
+
+        Returns i8_ptr for pointer types and 'mixed', double for float,
+        i64 for everything else (int, bool, unknown)."""
+        vt = tag if isinstance(tag, ValueType) else ValueType.from_old_tag(tag)
+        if vt.kind.is_ptr or vt == "mixed":
+            return i8_ptr
+        if vt.kind == VKind.FLOAT:
+            return double
+        return i64
 
     # ── --typed mode: annotation-driven native code generation ─────────
 
@@ -18595,9 +18584,10 @@ class CodeGen:
             # Use the ret_tag to disambiguate.
             info = next((i for i in self._user_functions.values() if i.func is self.function), None)
             if info is not None:
-                if info.ret_tag in ("ptr", "ptr:list"):
+                _rtk = ValueType.from_old_tag(info.ret_tag).kind
+                if _rtk == VKind.LIST:
                     return self._fv_from_list(value)
-                if info.ret_tag == "dict":
+                if _rtk == VKind.DICT:
                     return self._fv_from_list(value)  # dicts stored as FpyList*
             # Default: treat as string
             value = self._ensure_ptr(value)
@@ -22579,9 +22569,9 @@ class CodeGen:
                                     and stmt.targets[0].value.id == "self"
                                     and stmt.targets[0].attr == node.attr):
                                 et = self._infer_list_elem_type(stmt.value)
-                                if et != "int":
+                                if et.kind != VKind.INT:
                                     return et
-                                # "int" might be wrong default — keep looking
+                                # VKind.INT might be wrong default — keep looking
                                 # in parent, but remember we found something
                 cls_name = ci.parent_name if ci else None
         # obj.attr where obj class is known: same __init__ lookup
@@ -22604,7 +22594,7 @@ class CodeGen:
                                     and stmt.targets[0].value.id == "self"
                                     and stmt.targets[0].attr == node.attr):
                                 et = self._infer_list_elem_type(stmt.value)
-                                if et != "int":
+                                if et.kind != VKind.INT:
                                     return et
         # Phase 3: read elem_type directly from ValueType when available.
         # Only use elem_type if it's explicitly set (not None) — bare "list"
@@ -22678,7 +22668,7 @@ class CodeGen:
                             and isinstance(_stmt.targets[0], ast.Name)
                             and _stmt.targets[0].id == node.id):
                         _et = self._infer_list_elem_type(_stmt.value)
-                        if _et != "int":  # non-default → trust it
+                        if _et.kind != VKind.INT:  # non-default → trust it
                             return _et
                         break
         # Infer from AST
