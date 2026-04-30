@@ -274,6 +274,12 @@ void fastpy_list_mark_tuple(FpyList *list) {
     if (list) list->is_tuple = 1;
 }
 
+/* Mark an existing FpyList as a list (clear tuple flag).
+   Used by star unpack: first, *rest = tuple → rest must be a list. */
+void fastpy_list_mark_list(FpyList *list) {
+    if (list) list->is_tuple = 0;
+}
+
 /* Unlocked append — caller must hold list->lock if needed */
 static void fpy_list_append_unlocked(FpyList *list, FpyValue value) {
     if (list->length >= list->capacity) {
@@ -3212,7 +3218,7 @@ FpyList* fastpy_str_split_max(const char *s, const char *sep, int64_t max_split)
     const char *p = s;
     const char *end = s + s_len;
     int64_t splits = 0;
-    while (p < end) {
+    while (p <= end) {
         if (max_split >= 0 && splits >= max_split) {
             size_t rest_len = end - p;
             char *seg = (char*)malloc(rest_len + 1);
@@ -3221,8 +3227,11 @@ FpyList* fastpy_str_split_max(const char *s, const char *sep, int64_t max_split)
             fpy_list_append(result, fpy_str(seg));
             break;
         }
-        const char *q = strstr(p, sep);
+        const char *q = (p <= end) ? strstr(p, sep) : NULL;
         if (!q) {
+            /* No more separators — add the rest of the string (may be empty
+               if the string ended with the separator, which is correct:
+               "a ".split(" ") → ["a", ""]). */
             size_t rest_len = end - p;
             char *seg = (char*)malloc(rest_len + 1);
             memcpy(seg, p, rest_len);
@@ -5819,6 +5828,54 @@ FpyComplex* fpy_complex_div(FpyComplex *a, FpyComplex *b) {
     return fpy_complex_new(
         (a->real * b->real + a->imag * b->imag) / denom,
         (a->imag * b->real - a->real * b->imag) / denom);
+}
+
+FpyComplex* fpy_complex_pow(FpyComplex *a, FpyComplex *b) {
+    /* Handle 0^b */
+    if (a->real == 0.0 && a->imag == 0.0) {
+        if (b->real == 0.0 && b->imag == 0.0)
+            return fpy_complex_new(1.0, 0.0);
+        if (b->real > 0.0)
+            return fpy_complex_new(0.0, 0.0);
+        fastpy_raise(FPY_EXC_ZERODIVISION,
+                     "zero to a negative or complex power");
+        return NULL;
+    }
+    /* Integer real exponent with no imaginary part: use repeated
+       multiplication for exact results (matches CPython). */
+    if (b->imag == 0.0 && b->real == (double)(int64_t)b->real
+            && b->real >= -100 && b->real <= 100) {
+        int64_t n = (int64_t)b->real;
+        FpyComplex base = *a;
+        if (n < 0) {
+            /* a^(-n) = 1 / a^n */
+            double denom = a->real * a->real + a->imag * a->imag;
+            base.real = a->real / denom;
+            base.imag = -a->imag / denom;
+            n = -n;
+        }
+        double rr = 1.0, ri = 0.0;
+        while (n > 0) {
+            if (n & 1) {
+                double tmp = rr * base.real - ri * base.imag;
+                ri = rr * base.imag + ri * base.real;
+                rr = tmp;
+            }
+            double tmp = base.real * base.real - base.imag * base.imag;
+            base.imag = 2.0 * base.real * base.imag;
+            base.real = tmp;
+            n >>= 1;
+        }
+        return fpy_complex_new(rr, ri);
+    }
+    /* General case: a^b = exp(b * ln(a)) using polar form. */
+    double abs_a = sqrt(a->real * a->real + a->imag * a->imag);
+    double arg_a = atan2(a->imag, a->real);
+    double ln_abs = log(abs_a);
+    double re = b->real * ln_abs - b->imag * arg_a;
+    double im = b->imag * ln_abs + b->real * arg_a;
+    double r = exp(re);
+    return fpy_complex_new(r * cos(im), r * sin(im));
 }
 
 FpyComplex* fpy_complex_neg(FpyComplex *a) {

@@ -147,6 +147,49 @@ These features work correctly but use the embedded CPython interpreter:
 - **Other stdlib modules** not implemented natively (e.g., collections,
   itertools, functools — except singledispatch which is native)
 
+## Bugs fixed (2026-04-30, CodeGenError sites, complex pow, dict comp zip types)
+
+### 155. `bool()` with no arguments raised CodeGenError (fixed)
+`bool()` should return `False` (Python semantics), but raised a compile-time
+CodeGenError "bool() takes exactly one argument". Fix: Added zero-args handler
+that returns `ir.Constant(i32, 0)`.
+
+### 156. `float()` with no arguments raised CodeGenError (fixed)
+`float()` should return `0.0` (Python semantics), but raised CodeGenError
+"float() takes exactly one argument". Fix: Added zero-args handler that returns
+`ir.Constant(double, 0.0)`.
+
+### 157. `dict([(1, 'a'), (2, 'b')])` with integer keys raised CodeGenError (fixed)
+`dict()` constructor with a literal list of (int_key, value) tuples raised
+"dict() key must be string". Fix: Added dispatch for integer keys using
+`dict_set_int_fv` alongside the existing `dict_set_fv` for string keys.
+
+### 158. `sorted(reverse=variable)` raised CodeGenError (fixed)
+`sorted(data, reverse=flag)` where `flag` is a variable (not a literal
+True/False) raised "sorted(reverse=) must be a literal True/False". Fix:
+Changed to bridge fallback so the expression works correctly via CPython.
+
+### 159. Complex `**` operator raised CodeGenError (fixed)
+`(1+2j) ** (3+0j)` raised "Unsupported complex operation: Pow". Fix: Added
+`fpy_complex_pow` runtime function with integer exponent fast path (repeated
+multiplication for exact results matching CPython) and general polar form
+(`exp(b * ln(a))`) for complex exponents. Also changed remaining unsupported
+complex operations to bridge fallback instead of CodeGenError.
+
+### 160. Dict comprehension with non-Name target raised CodeGenError (fixed)
+`{k: v for [k, v] in items}` (list target instead of tuple target) raised
+"Only simple variable targets in dict comprehensions". Fix: Changed to
+bridge fallback for unsupported target types.
+
+### 161. Dict comprehension with `zip()` didn't infer string key types (fixed)
+`{k: v for k, v in zip(keys, vals)}` where `keys` is a list of strings
+printed raw pointer values for string keys (e.g., `(140695388444139, 2)`
+instead of `('b', 2)`) because the tuple-unpacking dict comprehension
+path had no type inference for `zip()` iterators. All positions defaulted
+to "int" tag. Fix: Added zip() element type inference using
+`_get_list_elem_type()` for each zip argument, matching the existing logic
+in `_infer_for_tuple_elem_types()`.
+
 ## Bugs fixed (2026-04-28, list(iter), closure *args, diamond MRO, dict comp fixes, enumerate(str))
 
 ### 148. list(iterator_object) crashed (fixed)
