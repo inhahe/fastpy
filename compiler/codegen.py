@@ -2212,6 +2212,7 @@ class CodeGen:
         self.runtime["complex_sub"] = ir.Function(self.module, ft, name="fpy_complex_sub")
         self.runtime["complex_mul"] = ir.Function(self.module, ft, name="fpy_complex_mul")
         self.runtime["complex_div"] = ir.Function(self.module, ft, name="fpy_complex_div")
+        self.runtime["complex_pow"] = ir.Function(self.module, ft, name="fpy_complex_pow")
         ft = ir.FunctionType(i8_ptr, [i8_ptr])
         self.runtime["complex_neg"] = ir.Function(self.module, ft, name="fpy_complex_neg")
         ft = ir.FunctionType(double, [i8_ptr])
@@ -23464,9 +23465,12 @@ class CodeGen:
         elif isinstance(op, ast.Div):
             result = self.builder.call(self.runtime["complex_div"],
                                        [left_ptr, right_ptr])
+        elif isinstance(op, ast.Pow):
+            result = self.builder.call(self.runtime["complex_pow"],
+                                       [left_ptr, right_ptr])
         else:
-            raise CodeGenError(
-                f"Unsupported complex operation: {type(op).__name__}", node)
+            return self._bridge_fallback_expr(
+                node, f"complex operation: {type(op).__name__}")
         return self.builder.ptrtoint(result, i64)
 
     def _unknown_fv_to_double(self, node: ast.expr,
@@ -25465,11 +25469,16 @@ class CodeGen:
                         k_node, v_node = elt.elts
                         k_val = self._emit_expr_value(k_node)
                         v_val = self._emit_expr_value(v_node)
-                        if not isinstance(k_val.type, ir.PointerType):
-                            raise CodeGenError("dict() key must be string", node)
                         tag, data = self._bare_to_tag_data(v_val, v_node)
-                        self.builder.call(self.runtime["dict_set_fv"],
-                                          [d, k_val, ir.Constant(i32, tag), data])
+                        if isinstance(k_val.type, ir.PointerType):
+                            self.builder.call(self.runtime["dict_set_fv"],
+                                              [d, k_val, ir.Constant(i32, tag), data])
+                        elif isinstance(k_val.type, ir.IntType):
+                            self.builder.call(self.runtime["dict_set_int_fv"],
+                                              [d, k_val, ir.Constant(i32, tag), data])
+                        else:
+                            return self._bridge_fallback_expr(
+                                node, f"dict() with unsupported key type {k_val.type}")
                 return d
             return self._bridge_fallback_expr(node, "dict() with non-literal argument")
 
@@ -25798,9 +25807,11 @@ class CodeGen:
         return self._bridge_fallback_expr(node, "all() with non-list argument")
 
     def _emit_builtin_bool(self, node):
+        if len(node.args) == 0:
+            return ir.Constant(i32, 0)  # bool() → False
         if len(node.args) == 1:
             return self.builder.zext(self._truthiness_of_expr(node.args[0]), i32)
-        raise CodeGenError("bool() takes exactly one argument", node)
+        raise CodeGenError("bool() takes at most one argument", node)
 
     def _emit_builtin_float(self, node):
         if len(node.args) == 1:
@@ -25887,7 +25898,9 @@ class CodeGen:
             if isinstance(val.type, ir.PointerType):
                 return self._rt_call("str_to_float", [val])
             return val
-        raise CodeGenError("float() takes exactly one argument", node)
+        if len(node.args) == 0:
+            return ir.Constant(double, 0.0)  # float() → 0.0
+        raise CodeGenError("float() takes at most one argument", node)
 
     def _emit_builtin_str(self, node):
         if len(node.args) == 1:
@@ -28137,7 +28150,8 @@ class CodeGen:
                 if isinstance(kw.value, ast.Constant) and isinstance(kw.value.value, bool):
                     reverse = kw.value.value
                 else:
-                    raise CodeGenError("sorted(reverse=) must be a literal True/False", node)
+                    return self._bridge_fallback_expr(
+                        node, "sorted(reverse=) with non-literal value")
             elif kw.arg == "key":
                 key_func = kw.value
 
@@ -31661,6 +31675,14 @@ class CodeGen:
                         if _vt == "str" or (isinstance(_vt, ValueType)
                                              and _vt.kind == VKind.STR):
                             pos_tags[1] = "str"
+            # zip(a, b): infer element types from each arg's list element type
+            elif (isinstance(gen.iter, ast.Call)
+                    and isinstance(gen.iter.func, ast.Name)
+                    and gen.iter.func.id == "zip"):
+                for _zi, _zarg in enumerate(gen.iter.args[:n_targets]):
+                    et = self._get_list_elem_type(_zarg)
+                    if et:
+                        pos_tags[_zi] = et
             # Literal list of tuples: infer from first tuple element types
             elif isinstance(gen.iter, ast.List) and gen.iter.elts:
                 first_tup = gen.iter.elts[0]
@@ -31724,7 +31746,8 @@ class CodeGen:
             self.builder.position_at_end(end_block)
             return result_dict
         if not isinstance(gen.target, ast.Name):
-            raise CodeGenError("Only simple variable targets in dict comprehensions", node)
+            return self._bridge_fallback_expr(
+                node, f"dict comprehension with {type(gen.target).__name__} target")
 
         # ── List/tuple iteration path: {f(x): g(x) for x in some_list} ──
         is_range = (isinstance(gen.iter, ast.Call)

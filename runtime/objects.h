@@ -53,6 +53,7 @@ FpyComplex* fpy_complex_add(FpyComplex *a, FpyComplex *b);
 FpyComplex* fpy_complex_sub(FpyComplex *a, FpyComplex *b);
 FpyComplex* fpy_complex_mul(FpyComplex *a, FpyComplex *b);
 FpyComplex* fpy_complex_div(FpyComplex *a, FpyComplex *b);
+FpyComplex* fpy_complex_pow(FpyComplex *a, FpyComplex *b);
 FpyComplex* fpy_complex_neg(FpyComplex *a);
 double fpy_complex_abs(FpyComplex *a);
 void fpy_complex_print(FpyComplex *c);
