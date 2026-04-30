@@ -12196,34 +12196,11 @@ class CodeGen:
                             _sub_vkind = VKind.OBJ  # list of objects
                 elif isinstance(container, ast.Name):
                     _elem = self._get_list_elem_type(container)
-                    if _elem.startswith("obj"):
-                        _sub_vkind = VKind.OBJ
-                    elif _elem.startswith("int"):
-                        _sub_vkind = VKind.INT
-                    elif _elem.startswith("float"):
-                        _sub_vkind = VKind.FLOAT
-                    elif _elem.startswith("str"):
-                        _sub_vkind = VKind.STR
-                    elif _elem.startswith("list"):
-                        _sub_vkind = VKind.LIST
-                    elif _elem.startswith("dict"):
-                        _sub_vkind = VKind.DICT
-                    elif _elem.startswith("tuple"):
-                        _sub_vkind = VKind.TUPLE
+                    _sub_vkind = _elem.kind
                     # Propagate inner element type for containers.
-                    # E.g. SYSTEM is list:list:float → elem is "list:float"
-                    # → b1 should be ValueType(LIST, elem=ValueType(FLOAT))
-                    _sub_elem_type = None
-                    if _sub_vkind in (VKind.LIST, VKind.DICT, VKind.TUPLE) and ":" in _elem:
-                        _inner = _elem.split(":", 1)[1]
-                        _kind_map = {"int": VKind.INT, "float": VKind.FLOAT,
-                                     "str": VKind.STR, "obj": VKind.OBJ,
-                                     "bool": VKind.BOOL, "list": VKind.LIST,
-                                     "dict": VKind.DICT, "tuple": VKind.TUPLE}
-                        for _prefix, _k in _kind_map.items():
-                            if _inner.startswith(_prefix):
-                                _sub_elem_type = ValueType(_k)
-                                break
+                    # E.g. SYSTEM is list:list:float → elem is
+                    # ValueType(LIST, elem=FLOAT)
+                    _sub_elem_type = _elem.elem_type
                     self._store_variable(target_name, fv,
                                          ValueType(_sub_vkind, elem_type=_sub_elem_type,
                                                    class_name=_sub_cls))
@@ -13305,14 +13282,14 @@ class CodeGen:
         if self._is_dict_expr(node):
             return None
         elem_type = self._get_list_elem_type(node)
-        if elem_type in ("int", "float"):
-            return elem_type
+        if elem_type.kind in (VKind.INT, VKind.FLOAT):
+            return str(elem_type)
         # Analysis: list IS a list but elements aren't scalar → generic access
         if self._analyze_mode:
             from compiler.analysis import MEDIUM, IMPACT_GENERIC_LIST
             var_name = (node.id if isinstance(node, ast.Name)
                         else f"<expr at line {getattr(node, 'lineno', '?')}>")
-            et = elem_type or "unknown"
+            et = str(elem_type) or "unknown"
             self._record_finding(
                 MEDIUM, "generic_list_access", node,
                 construct=f"{var_name}[i]",
@@ -13658,7 +13635,7 @@ class CodeGen:
         if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
                 and node.func.id in ("min", "max") and node.args):
             et = self._get_list_elem_type(node.args[0])
-            et_kind = ValueType.from_old_tag(et).kind
+            et_kind = et.kind
             _MINMAX_KIND_TO_TAG = {
                 VKind.LIST: "list", VKind.TUPLE: "list",
                 VKind.DICT: "dict", VKind.STR: "str",
@@ -14588,10 +14565,8 @@ class CodeGen:
                     # list:float → the outer list's element type is
                     # list(list:float), not just bare list.
                     inner_elem = self._get_list_elem_type(first)
-                    if inner_elem and inner_elem != "int":
-                        _inner_vt = (inner_elem if isinstance(inner_elem, ValueType)
-                                     else ValueType.from_old_tag(inner_elem))
-                        return ValueType(VKind.LIST, elem_type=_inner_vt)
+                    if inner_elem.kind != VKind.INT:
+                        return ValueType(VKind.LIST, elem_type=inner_elem)
                     return ValueType(VKind.LIST)
                 if self._is_dict_expr(first):
                     return ValueType(VKind.DICT)
@@ -14638,8 +14613,7 @@ class CodeGen:
             if (isinstance(elt, ast.Name) and node.generators
                     and isinstance(node.generators[0].target, ast.Name)
                     and node.generators[0].target.id == elt.id):
-                _ret = self._get_list_elem_type(node.generators[0].iter)
-                return _ret if isinstance(_ret, ValueType) else ValueType.from_old_tag(_ret)
+                return self._get_list_elem_type(node.generators[0].iter)
             return ValueType(VKind.INT)
         return ValueType(VKind.INT)
 
@@ -18781,15 +18755,16 @@ class CodeGen:
                 self._store_variable(val_target.id, ch, "str")
         elif isinstance(val_target, ast.Name):
             elem_type = self._get_list_elem_type(lst_node)
-            if elem_type == "float":
+            _ek = elem_type.kind
+            if _ek == VKind.FLOAT:
                 var_tag = "float"
-            elif elem_type == "str":
+            elif _ek == VKind.STR:
                 var_tag = "str"
-            elif elem_type.startswith("list"):
-                var_tag = elem_type if ":" in elem_type else "list:int"
-            elif elem_type == "obj":
+            elif _ek == VKind.LIST:
+                var_tag = str(elem_type) if elem_type.elem_type else "list:int"
+            elif _ek == VKind.OBJ:
                 var_tag = "obj"
-            elif elem_type == "pyobj":
+            elif _ek == VKind.PYOBJ:
                 var_tag = "pyobj"
             else:
                 var_tag = "int"
@@ -19199,15 +19174,14 @@ class CodeGen:
         # alloca directly, bypassing the unwrap-then-rewrap round-trip.
         idx = self._load_variable(idx_name, node)
         elem_type = self._get_list_elem_type(node.iter)
-        # Convert elem_type string to VKind for dispatch
-        elem_kind = ValueType.from_old_tag(elem_type).kind
+        elem_kind = elem_type.kind
         # Determine the variable's tag from the list's element type
         _ELEM_KIND_TO_TAG = {
             VKind.OBJ: "obj", VKind.STR: "str", VKind.DICT: "dict",
             VKind.TUPLE: "tuple", VKind.FLOAT: "float", VKind.PYOBJ: "pyobj",
         }
         if elem_kind == VKind.LIST:
-            var_tag = elem_type if ":" in str(elem_type) else "list:int"
+            var_tag = str(elem_type) if elem_type.elem_type else "list:int"
         else:
             var_tag = _ELEM_KIND_TO_TAG.get(elem_kind, "int")
 
@@ -20138,11 +20112,11 @@ class CodeGen:
             idx = self.builder.load(idx_alloca)
             # Use the FV getter once; unwrap based on the static elem_type
             elem_type = self._get_list_elem_type(container_node)
-            if elem_type == "str" or isinstance(left_val.type, ir.PointerType):
+            if elem_type.kind == VKind.STR or isinstance(left_val.type, ir.PointerType):
                 elem = self._list_get_as_bare(container, idx, "str")
                 cmp_result = self._rt_call("str_compare", [left_val, elem])
                 eq = self.builder.icmp_signed("==", cmp_result, ir.Constant(i64, 0))
-            elif elem_type == "float" or isinstance(left_val.type, ir.DoubleType):
+            elif elem_type.kind == VKind.FLOAT or isinstance(left_val.type, ir.DoubleType):
                 elem = self._list_get_as_bare(container, idx, "float")
                 cmp_left = left_val
                 if isinstance(cmp_left.type, ir.IntType):
@@ -20647,7 +20621,8 @@ class CodeGen:
             # from copy.copy() shallow copies.
             if (isinstance(node.func.value, ast.Subscript)
                     and self._is_list_expr(node.func.value.value)
-                    and self._get_list_elem_type(node.func.value.value) == "mixed"):
+                    and self._get_list_elem_type(
+                        node.func.value.value) == "mixed"):
                 self._emit_mixed_elem_method(node)
                 return
             self._emit_method_call(node)
@@ -22548,7 +22523,7 @@ class CodeGen:
         # Fallback
         return self._fv_from_int(value)
 
-    def _get_list_elem_type(self, node: ast.expr) -> str:
+    def _get_list_elem_type(self, node: ast.expr) -> 'ValueType':
         """Get the element type of a list expression."""
         # self.attr on the current class: resolve through __init__ AST
         # to find the assignment `self.attr = [...]` and infer elem type
@@ -22607,15 +22582,16 @@ class CodeGen:
         if isinstance(node, ast.Name) and node.id in self.variables:
             _, type_tag = self.variables[node.id]
             if isinstance(type_tag, ValueType) and type_tag.elem_type is not None:
-                return type_tag.elem_type._to_tag()
+                return type_tag.elem_type
             # Legacy fallback: parse string tag for colon-separated types.
             # Use maxsplit=1 so compound types like "list:list:float"
             # peel one layer → "list:float".
             if isinstance(type_tag, str) and ":" in type_tag:
-                return type_tag.split(":", 1)[1]
+                return ValueType.from_old_tag(type_tag.split(":", 1)[1])
             # For tuples, check the literal definition for element type
             if type_tag == "tuple" and node.id in self._tuple_elem_types:
-                return self._tuple_elem_types[node.id]
+                _tet = self._tuple_elem_types[node.id]
+                return _tet if isinstance(_tet, ValueType) else ValueType.from_old_tag(_tet)
         # .values(), .items(), .keys() return lists of tagged values / strings.
         # items() returns tuples (list with is_tuple=1).
         # keys() returns strings (or ints for int-keyed dicts).
@@ -22623,44 +22599,44 @@ class CodeGen:
         if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
                 and node.func.attr in ("values", "items", "keys")):
             if node.func.attr == "items":
-                return "list"  # items() returns list of tuples (stored as FpyList)
+                return ValueType(VKind.LIST)  # items() returns list of tuples (stored as FpyList)
             if (node.func.attr == "keys"
                     and isinstance(node.func.value, ast.Name)
                     and self._is_int_keyed_dict(node.func.value)):
-                return "int"
-            return "str"
+                return ValueType(VKind.INT)
+            return ValueType(VKind.STR)
         # String methods that return lists of strings
         if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
                 and node.func.attr in ("split", "rsplit", "splitlines")):
-            return "str"
+            return ValueType(VKind.STR)
         # sorted(dict) or sorted(dict.keys()) returns list of keys
         if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
                 and node.func.id == "sorted" and len(node.args) == 1):
             arg = node.args[0]
             if self._is_dict_expr(arg):
                 if isinstance(arg, ast.Name) and self._is_int_keyed_dict(arg):
-                    return "int"
-                return "str"
+                    return ValueType(VKind.INT)
+                return ValueType(VKind.STR)
             # sorted(dict.keys()) / sorted(dict.values())
             if (isinstance(arg, ast.Call) and isinstance(arg.func, ast.Attribute)
                     and arg.func.attr in ("keys", "values", "items")):
                 if (arg.func.attr == "keys"
                         and isinstance(arg.func.value, ast.Name)
                         and self._is_int_keyed_dict(arg.func.value)):
-                    return "int"
-                return "str"
+                    return ValueType(VKind.INT)
+                return ValueType(VKind.STR)
         # Check if this is a function call that returns a list of lists
         # or a tuple of floats (from _func_ret_types analysis).
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
             if node.func.id in self._user_functions:
                 info = self._user_functions[node.func.id]
                 if info.ret_tag == "ptr:list":
-                    return "list"
+                    return ValueType(VKind.LIST)
                 if info.ret_tag == "ptr":
                     frt = getattr(self, '_func_ret_types', {})
                     rt = frt.get(node.func.id, "")
                     if rt.startswith("tuple:"):
-                        return rt.split(":", 1)[1]  # e.g. "float"
+                        return ValueType.from_old_tag(rt.split(":", 1)[1])
         # Global variable whose element type isn't in the tag: look up the
         # module-level AST definition and infer element type from the literal.
         if isinstance(node, ast.Name):
@@ -23048,7 +23024,7 @@ class CodeGen:
         if isinstance(node, ast.Subscript) and not isinstance(node.slice, ast.Slice):
             if self._is_list_expr(node.value):
                 elem_type = self._get_list_elem_type(node.value)
-                if elem_type.startswith("list"):
+                if elem_type.kind == VKind.LIST:
                     return True
             # Indexing a dict-with-list-values returns a list
             if (isinstance(node.value, ast.Name)
@@ -23289,7 +23265,7 @@ class CodeGen:
         if isinstance(node, ast.Subscript) and not isinstance(node.slice, ast.Slice):
             if self._is_list_expr(node.value):
                 elem_type = self._get_list_elem_type(node.value)
-                if elem_type == "dict":
+                if elem_type.kind == VKind.DICT:
                     return True
             if (isinstance(node.value, ast.Name)
                     and node.value.id in self._dict_var_dict_values):
@@ -26272,16 +26248,14 @@ class CodeGen:
                       self._emit_expr_value(node.args[0])
             length = self._rt_call("list_length", [lst])
             elem_type = self._get_list_elem_type(node.args[0])
-            is_str = (elem_type == "str")
-            # Pointer-based element types: str, list, tuple, dict, etc.
-            is_ptr = elem_type in ("str", "list", "tuple", "dict",
-                                    "set", "deque", "bytes", "obj")
+            is_str = (elem_type.kind == VKind.STR)
+            is_ptr = elem_type.kind.is_ptr
             result_type = i8_ptr if is_ptr else i64
-            bare_tag = elem_type if is_ptr else "int"
+            bare_tag = str(elem_type) if is_ptr else "int"
 
             # OBJ elements: use runtime min/max that dispatches
             # to __lt__ — no need for our own loop
-            if elem_type == "obj":
+            if elem_type.kind == VKind.OBJ:
                 rt_name = "list_min_fv" if name == "min" else "list_max_fv"
                 data_i64 = self.builder.call(self.runtime[rt_name], [lst])
                 return self.builder.inttoptr(data_i64, i8_ptr)
@@ -28203,12 +28177,12 @@ class CodeGen:
                 if isinstance(body, ast.Subscript):
                     # key=lambda x: x[i] on strings → returns string
                     elem_type = self._get_list_elem_type(node.args[0])
-                    if elem_type == "str":
+                    if elem_type.kind == VKind.STR:
                         key_returns_str = True
                 elif isinstance(body, ast.Name):
                     # key=lambda x: x on strings → returns string
                     elem_type = self._get_list_elem_type(node.args[0])
-                    if elem_type == "str":
+                    if elem_type.kind == VKind.STR:
                         key_returns_str = True
             elif isinstance(key_func, ast.Name):
                 if key_func.id == "str":
@@ -28407,9 +28381,9 @@ class CodeGen:
                 list_node = node.args[-1]
             if list_node is not None:
                 elem_type = self._get_list_elem_type(list_node)
-                if elem_type == "str":
+                if elem_type.kind == VKind.STR:
                     param_tag = "str"
-                elif elem_type.startswith("list") or elem_type == "tuple":
+                elif elem_type.kind in (VKind.LIST, VKind.TUPLE):
                     param_tag = "list"
         # Method call: obj.sort(key=lambda) — infer from obj's element type
         if (param_tag == "int" and isinstance(node, ast.Call)
@@ -28417,9 +28391,9 @@ class CodeGen:
                 and node.func.attr == "sort"):
             obj_node = node.func.value
             elem_type = self._get_list_elem_type(obj_node)
-            if elem_type == "str":
+            if elem_type.kind == VKind.STR:
                 param_tag = "str"
-            elif elem_type.startswith("list") or elem_type == "tuple":
+            elif elem_type.kind in (VKind.LIST, VKind.TUPLE):
                 param_tag = "list"
 
         # Save current emission state
@@ -30489,7 +30463,7 @@ class CodeGen:
                 return ret_type is None or isinstance(ret_type, ir.PointerType)
             # min/max on list of objects returns an object
             if (node.func.id in ("min", "max") and len(node.args) == 1
-                    and self._get_list_elem_type(node.args[0]) == "obj"):
+                    and self._get_list_elem_type(node.args[0]).kind == VKind.OBJ):
                 return True
             return False
         # Method calls that return an object (self or cls())
@@ -30940,10 +30914,9 @@ class CodeGen:
                               [obj, index, tag_slot, data_slot])
             data = self.builder.load(data_slot)
             elem_type = self._get_list_elem_type(node.value)
-            if (elem_type in ("str", "obj", "dict")
-                    or elem_type.startswith("list")):
+            if elem_type.kind.is_ptr:
                 return self.builder.inttoptr(data, i8_ptr)
-            if elem_type == "float":
+            if elem_type.kind == VKind.FLOAT:
                 return self.builder.bitcast(data, double)
             return data
 
@@ -31812,15 +31785,16 @@ class CodeGen:
                 var_tag = "str"
             else:
                 elem_type = self._get_list_elem_type(gen.iter)
-                if elem_type == "str":
+                _ek = elem_type.kind
+                if _ek == VKind.STR:
                     var_tag = "str"
-                elif elem_type == "obj":
+                elif _ek == VKind.OBJ:
                     var_tag = "obj"
-                elif elem_type == "float":
+                elif _ek == VKind.FLOAT:
                     var_tag = "float"
-                elif elem_type.startswith("list"):
-                    var_tag = elem_type if ":" in elem_type else "list:int"
-                elif elem_type == "dict":
+                elif _ek == VKind.LIST:
+                    var_tag = str(elem_type) if elem_type.elem_type else "list:int"
+                elif _ek == VKind.DICT:
                     var_tag = "dict"
                 else:
                     var_tag = "int"
