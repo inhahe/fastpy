@@ -2583,9 +2583,10 @@ class CodeGen:
                     elif (isinstance(node.value, ast.Call)
                           and isinstance(node.value.func, ast.Name)
                           and node.value.func.id in self._user_functions
-                          and self._user_functions[
-                              node.value.func.id].ret_tag in (
-                              "ptr", "ptr:list")):
+                          and ValueType.from_old_tag(
+                              self._user_functions[
+                                  node.value.func.id].ret_tag
+                          ).kind == VKind.LIST):
                         global_types[name] = "list"
                     elif isinstance(node.value, ast.Constant):
                         if isinstance(node.value.value, str):
@@ -22501,7 +22502,10 @@ class CodeGen:
             # Check function calls that return strings
             if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
                 name = node.func.id
-                if name in self._user_functions and self._user_functions[name].ret_tag == "str":
+                if (name in self._user_functions
+                        and ValueType.from_old_tag(
+                            self._user_functions[name].ret_tag
+                        ).kind == VKind.STR):
                     return self._fv_from_str(value)
             # Default pointer: string
             return self._fv_from_str(value)
@@ -23025,7 +23029,7 @@ class CodeGen:
             # User functions that return lists (ret_tag "ptr" with list_vars)
             if node.func.id in self._user_functions:
                 info = self._user_functions[node.func.id]
-                if info.ret_tag in ("ptr", "ptr:list"):
+                if ValueType.from_old_tag(info.ret_tag).kind == VKind.LIST:
                     return True
         # .split(), .keys(), .values(), .items(), .copy() return lists
         if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
@@ -23093,7 +23097,7 @@ class CodeGen:
             # var_assigned_from_ClassName`).
             if node.func.id in self._user_functions:
                 info = self._user_functions[node.func.id]
-                if info.ret_tag == "obj":
+                if ValueType.from_old_tag(info.ret_tag).kind == VKind.OBJ:
                     fn_def = getattr(self, "_function_def_nodes", {}).get(
                         node.func.id)
                     if fn_def is not None:
@@ -23265,7 +23269,8 @@ class CodeGen:
             if name == "dict":
                 return True
             if name in self._user_functions:
-                return self._user_functions[name].ret_tag == "dict"
+                return ValueType.from_old_tag(
+                    self._user_functions[name].ret_tag).kind == VKind.DICT
         # Object attribute access: obj.attr where attr is a dict
         if isinstance(node, ast.Attribute):
             obj_cls = self._infer_object_class(node.value)
@@ -26864,9 +26869,10 @@ class CodeGen:
             elif (isinstance(fn_node, ast.Name)
                     and fn_node.id in self._user_functions):
                 info = self._user_functions[fn_node.id]
-                if info.ret_tag == "str":
+                _rtk = ValueType.from_old_tag(info.ret_tag).kind
+                if _rtk == VKind.STR:
                     tag = FPY_TAG_STR
-                elif info.ret_tag == "float":
+                elif _rtk == VKind.FLOAT:
                     tag = FPY_TAG_FLOAT
                 else:
                     tag = FPY_TAG_INT
@@ -28209,7 +28215,7 @@ class CodeGen:
                     key_returns_str = True
                 elif key_func.id in self._user_functions:
                     info = self._user_functions[key_func.id]
-                    if info.ret_tag == "str":
+                    if ValueType.from_old_tag(info.ret_tag).kind == VKind.STR:
                         key_returns_str = True
             sort_fn = "list_sorted_by_key_str" if key_returns_str else "list_sorted_by_key_int"
             result = self.builder.call(self.runtime[sort_fn], [arg, fn_ptr])
@@ -30445,7 +30451,9 @@ class CodeGen:
                                 "issubclass", "any", "all"):
                 return True
             if node.func.id in self._user_functions:
-                return self._user_functions[node.func.id].ret_tag == "bool"
+                return ValueType.from_old_tag(
+                    self._user_functions[node.func.id].ret_tag
+                ).kind == VKind.BOOL
         return False
 
     def _class_has_method(self, class_name: str, method_name: str) -> bool:
