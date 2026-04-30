@@ -984,6 +984,11 @@ class CodeGen:
         self._opt_findings: list = []   # list[OptimizationFinding]
         self._current_scope = "module"  # updated on function/class/method entry
 
+        # BigInt overflow flag: set by _emit_int_binop when checked_pow/mul/add/sub
+        # might overflow to BigInt.  Consumed by _emit_binop to produce an FpyValue
+        # struct with the correct runtime tag (BIGINT vs INT).
+        self._bigint_overflow_flag: 'ir.Value | None' = None
+
         # Per-function dict mapping variable name → (native_alloca, VKind).
         # Populated from function parameter annotations and AnnAssign statements
         # when _typed_mode is True.  Variables in this dict bypass the FpyValue
@@ -12273,6 +12278,17 @@ class CodeGen:
 
         value = self._emit_expr_value(node.value)
 
+        # FpyValue struct with runtime tag (e.g. from BigInt overflow):
+        # store directly — the FpyValue path in _store_variable preserves
+        # the runtime tag without re-wrapping.
+        if (isinstance(value.type, ir.LiteralStructType)
+                and value.type == fpy_val
+                and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)):
+            self._store_variable(node.targets[0].id, value,
+                                 ValueType(VKind.FVALUE))
+            return
+
         type_tag = self._infer_type_tag(node.value, value)
 
         # CPython bridge builtin result: tag as "pyobj" so downstream
@@ -15043,6 +15059,21 @@ class CodeGen:
             result = self._emit_float_binop(node.op, current, rhs, node)
         else:
             result = self._emit_int_binop(node.op, current, rhs, node)
+            # Consume BigInt overflow flag — if the result might be BigInt,
+            # store as FpyValue to preserve the runtime tag.
+            _bigint_flag = self._bigint_overflow_flag
+            self._bigint_overflow_flag = None
+            if _bigint_flag is not None:
+                tag = self.builder.select(
+                    _bigint_flag,
+                    ir.Constant(i32, FPY_TAG_BIGINT),
+                    ir.Constant(i32, FPY_TAG_INT))
+                fv = ir.Constant(fpy_val, ir.Undefined)
+                fv = self.builder.insert_value(fv, tag, 0)
+                fv = self.builder.insert_value(fv, result, 1)
+                self._store_variable(target_name, fv,
+                                     ValueType(VKind.FVALUE))
+                return
 
         # Use the variable's existing tag to preserve type (rather than
         # guessing from the LLVM type which misidentifies pointers as "str").
@@ -16091,6 +16122,12 @@ class CodeGen:
         expression patterns. Falls back to _infer_type_tag → from_old_tag
         for expressions where Phase 3 doesn't have a fast path yet."""
         val = self._emit_expr_value(node)
+        # FpyValue struct: runtime-tagged value (e.g. from BigInt overflow
+        # in _emit_int_binop).  Mark as FVALUE so downstream code preserves
+        # the runtime tag.
+        if (isinstance(val.type, ir.LiteralStructType)
+                and val.type == fpy_val):
+            return TypedValue(val, ValueType(VKind.FVALUE))
         # --typed fast path: native-typed variable → exact VKind
         if isinstance(node, ast.Name) and node.id in self._native_vars:
             _, kind = self._native_vars[node.id]
@@ -23544,13 +23581,26 @@ class CodeGen:
                 self.builder.position_at_end(_n_int_blk)
                 _n_ires = self._emit_int_binop(
                     node.op, _nl_i64, _nr_i64, node)
+                # Consume BigInt overflow flag from _emit_int_binop
+                _n_bigint_flag = self._bigint_overflow_flag
+                self._bigint_overflow_flag = None
                 if isinstance(_n_ires.type, ir.DoubleType):
                     _n_idata = self.builder.bitcast(_n_ires, i64)
                     _n_itag = ir.Constant(i32, FPY_TAG_FLOAT)
+                elif (isinstance(_n_ires.type, ir.LiteralStructType)
+                        and _n_ires.type == fpy_val):
+                    _n_idata = self.builder.extract_value(_n_ires, 1)
+                    _n_itag = self.builder.extract_value(_n_ires, 0)
                 elif (isinstance(_n_ires.type, ir.IntType)
                         and _n_ires.type.width == 64):
                     _n_idata = _n_ires
-                    _n_itag = ir.Constant(i32, FPY_TAG_INT)
+                    if _n_bigint_flag is not None:
+                        _n_itag = self.builder.select(
+                            _n_bigint_flag,
+                            ir.Constant(i32, FPY_TAG_BIGINT),
+                            ir.Constant(i32, FPY_TAG_INT))
+                    else:
+                        _n_itag = ir.Constant(i32, FPY_TAG_INT)
                 else:
                     _n_idata = self.builder.sext(_n_ires, i64) \
                         if isinstance(_n_ires.type, ir.IntType) \
@@ -23961,8 +24011,22 @@ class CodeGen:
 
         # ── Fast path: int op int ──────────────────────────────────────
         if lk == VKind.INT and rk == VKind.INT:
-            return self._emit_int_binop(node.op, ltv.as_i64(self.builder),
-                                         rtv.as_i64(self.builder), node)
+            result = self._emit_int_binop(node.op, ltv.as_i64(self.builder),
+                                           rtv.as_i64(self.builder), node)
+            # If the operation might have overflowed to BigInt, wrap in an
+            # FpyValue struct with a dynamic tag so the runtime can distinguish.
+            bigint_flag = self._bigint_overflow_flag
+            self._bigint_overflow_flag = None
+            if bigint_flag is not None:
+                tag = self.builder.select(
+                    bigint_flag,
+                    ir.Constant(i32, FPY_TAG_BIGINT),
+                    ir.Constant(i32, FPY_TAG_INT))
+                fv = ir.Constant(fpy_val, ir.Undefined)
+                fv = self.builder.insert_value(fv, tag, 0)
+                fv = self.builder.insert_value(fv, result, 1)
+                return fv
+            return result
 
         # ── Fast path: str % ... (format) — must be checked before the
         #    float fast path, because "%.2f" % 3.14 has rk==FLOAT and
@@ -24379,6 +24443,9 @@ class CodeGen:
         self, op: ast.operator, left: ir.Value, right: ir.Value, node: ast.AST
     ) -> ir.Value:
         """Emit an integer binary operation."""
+        # Clear BigInt overflow flag from any prior call — the flag is only
+        # meaningful for the immediately preceding _emit_int_binop call.
+        self._bigint_overflow_flag = None
         # Safety: coerce pointer types to i64.  This handles cases where
         # a variable has VKind.OBJ but actually holds an integer value
         # (e.g. attr loads from receivers whose class isn't known).
@@ -24616,15 +24683,11 @@ class CodeGen:
             self.builder.position_at_end(ok_block)
             return result
         else:
-            # Default: return BigInt-tagged value or i64
-            # Use a select: if big, return the BigInt pointer as i64 (will be
-            # tagged BIGINT by the FV wrapping); if not, return the i64 result.
+            # Default: return BigInt-tagged value or i64.
+            # Set the overflow flag so _emit_binop can build an FpyValue
+            # with the correct dynamic tag (BIGINT vs INT).
             big_as_i64 = self.builder.ptrtoint(big_ptr, i64)
-            # We need to tag this differently. For now, just return the value.
-            # The FV wrapping will tag it as INT. BigInt tagging requires
-            # runtime support in _bare_to_tag_data which we'll add next.
-            # For practical purposes: if it fits in i64, return i64.
-            # If it doesn't, return the BigInt pointer.
+            self._bigint_overflow_flag = is_big
             return self.builder.select(is_big, big_as_i64, result)
 
     def _emit_intrinsic_overflow_op(
@@ -26278,17 +26341,47 @@ class CodeGen:
             return self.builder.load(result_alloca)
         if len(node.args) >= 2:
             # min/max with multiple inline args: min(a, b, c, ...)
-            result = self._emit_expr_value(node.args[0])
+            # Check if all args have the same type to decide dispatch.
+            args = [self._emit_expr_value(a) for a in node.args]
+            all_same_type = all(
+                type(a.type) == type(args[0].type)  # noqa: E721
+                and (not isinstance(a.type, ir.IntType)
+                     or a.type.width == args[0].type.width)
+                for a in args[1:]
+            )
+            if all_same_type:
+                # Homogeneous types: direct compare + select
+                result = args[0]
+                op = "<" if name == "min" else ">"
+                for other in args[1:]:
+                    if isinstance(result.type, ir.DoubleType):
+                        is_better = self.builder.fcmp_ordered(op, other, result)
+                    else:
+                        is_better = self.builder.icmp_signed(op, other, result)
+                    result = self.builder.select(is_better, other, result)
+                return result
+            # Mixed types (e.g. min(float, int)): Python returns the original
+            # value preserving its type.  Use FpyValue to track each arg's type,
+            # compare with promotion, and return the winner's original FpyValue.
             op = "<" if name == "min" else ">"
-            for arg_node in node.args[1:]:
-                other = self._emit_expr_value(arg_node)
-                # Use fcmp for floats, icmp for ints
-                if isinstance(result.type, ir.DoubleType):
-                    is_better = self.builder.fcmp_ordered(op, other, result)
-                else:
-                    is_better = self.builder.icmp_signed(op, other, result)
-                result = self.builder.select(is_better, other, result)
-            return result
+            # Wrap first arg in FpyValue
+            result_fv = self._wrap_for_print(args[0], node.args[0])
+            for i, other_val in enumerate(args[1:]):
+                other_fv = self._wrap_for_print(other_val, node.args[i + 1])
+                # Promote both to double for comparison
+                cmp_a = args[0] if i == 0 else self._fv_data_i64(result_fv)
+                cmp_b = other_val
+                # For comparison: both as double
+                a_dbl = (cmp_a if isinstance(cmp_a.type, ir.DoubleType)
+                         else self.builder.sitofp(
+                             cmp_a if isinstance(cmp_a.type, ir.IntType)
+                             else self._fv_data_i64(result_fv), double))
+                b_dbl = (cmp_b if isinstance(cmp_b.type, ir.DoubleType)
+                         else self.builder.sitofp(cmp_b, double))
+                is_better = self.builder.fcmp_ordered(op, b_dbl, a_dbl)
+                # Select the winner's FpyValue (preserving original type tag)
+                result_fv = self.builder.select(is_better, other_fv, result_fv)
+            return result_fv
         return self._bridge_fallback_expr(node, f"{name}() with unsupported args")
 
 

@@ -58,12 +58,23 @@ void fastpy_format_float(double value, char *buf, int bufsize) {
 
     if (absval == 0.0 || (absval >= 1e-4 && absval < 1e16)) {
         /* Use fixed-point notation. Convert %g precision (significant digits)
-         * to %f precision (decimal places): decimal_places = sig_digits - floor(log10(absval)) - 1 */
-        int int_digits = 1;
+         * to %f precision (decimal places): decimal_places = sig_digits - int_digits.
+         * int_digits counts digits before the decimal point for values >= 1,
+         * and is negative for values < 1 to account for leading zeros. */
+        int int_digits;
         if (absval >= 1.0) {
             double tmp = absval;
             int_digits = 0;
             while (tmp >= 1.0) { tmp /= 10.0; int_digits++; }
+        } else if (absval > 0.0) {
+            /* Values < 1: count leading zeros after the decimal point.
+             * E.g. 0.0001 → int_digits = -3 so decimal_places = prec + 3. */
+            double tmp = absval;
+            int_digits = 0;
+            while (tmp < 1.0) { tmp *= 10.0; int_digits--; }
+            int_digits++;  /* adjust: 0.0001 → -4+1=-3; 0.5 → -1+1=0 */
+        } else {
+            int_digits = 1;
         }
         int decimal_places = prec - int_digits;
         if (decimal_places < 1) decimal_places = 1;
@@ -95,8 +106,27 @@ void fastpy_format_float(double value, char *buf, int bufsize) {
         }
     }
 
-    /* Fall back to %g (scientific notation for very large/small numbers) */
-    snprintf(buf, bufsize, "%.*g", prec, value);
+    /* Fall back: scientific notation for very large/small numbers.
+     * Use %e (not %g) to match CPython's convention of always using
+     * scientific notation for |value| >= 1e16 or 0 < |value| < 1e-4.
+     * %g at high precision (e.g. 17) would still use fixed-point for
+     * values like 1.2e+16 (exponent 16 < precision 17). */
+    snprintf(buf, bufsize, "%.*e", prec - 1, value);
+    /* Strip trailing zeros in the mantissa (after the dot, before 'e').
+     * CPython prints "1.2e+16" not "1.20000000000000000e+16". */
+    char *e_pos = strchr(buf, 'e');
+    if (!e_pos) e_pos = strchr(buf, 'E');
+    if (e_pos) {
+        char *dot = strchr(buf, '.');
+        if (dot && dot < e_pos) {
+            char *end = e_pos - 1;
+            while (end > dot + 1 && *end == '0') end--;
+            /* Shift 'e...' part right after the trimmed mantissa */
+            if (end + 1 != e_pos) {
+                memmove(end + 1, e_pos, strlen(e_pos) + 1);
+            }
+        }
+    }
 
     /* Ensure there's a dot or 'e' so it looks like a float */
     if (!strchr(buf, '.') && !strchr(buf, 'e') && !strchr(buf, 'E')
