@@ -23403,6 +23403,470 @@ class CodeGen:
             return self.builder.sitofp(val, double)
         return val
 
+    def _emit_binop_unknown(self, node, ltv, rtv, lk, rk, op):
+        """Handle binop when either operand has VKind.UNKNOWN (runtime-tag dispatch)."""
+        # For Add with FpyValue operands, check runtime tags for STR.
+        # String pointers bitcast to double produce garbage, so we must
+        # dispatch to str_concat when both operands are strings.
+        if op == ast.Add:
+            l_fv = ltv.val
+            r_fv = rtv.val
+            # Extract runtime tags from FpyValue operands
+            l_tag = r_tag = None
+            if isinstance(l_fv.type, ir.LiteralStructType):
+                l_tag = self.builder.extract_value(l_fv, 0)
+            elif lk == VKind.UNKNOWN and isinstance(node.left, ast.Name):
+                alloca, _ = self.variables.get(node.left.id, (None, None))
+                if (alloca and isinstance(alloca.type, ir.PointerType)
+                        and alloca.type.pointee is fpy_val):
+                    fv = self.builder.load(alloca)
+                    l_tag = self.builder.extract_value(fv, 0)
+            if isinstance(r_fv.type, ir.LiteralStructType):
+                r_tag = self.builder.extract_value(r_fv, 0)
+            elif rk == VKind.UNKNOWN and isinstance(node.right, ast.Name):
+                alloca, _ = self.variables.get(node.right.id, (None, None))
+                if (alloca and isinstance(alloca.type, ir.PointerType)
+                        and alloca.type.pointee is fpy_val):
+                    fv = self.builder.load(alloca)
+                    r_tag = self.builder.extract_value(fv, 0)
+            if l_tag is not None and r_tag is not None:
+                both_str = self.builder.and_(
+                    self.builder.icmp_unsigned(
+                        "==", l_tag, ir.Constant(i32, FPY_TAG_STR)),
+                    self.builder.icmp_unsigned(
+                        "==", r_tag, ir.Constant(i32, FPY_TAG_STR)))
+                str_blk = self._new_block("unkn.str_add")
+                num_blk = self._new_block("unkn.num_add")
+                join_blk = self._new_block("unkn.add_join")
+                self.builder.cbranch(both_str, str_blk, num_blk)
+
+                # String path: extract data as pointers, call str_concat
+                self.builder.position_at_end(str_blk)
+                l_data = self.builder.extract_value(l_fv, 1) \
+                    if isinstance(l_fv.type, ir.LiteralStructType) \
+                    else ltv.as_i64(self.builder)
+                r_data = self.builder.extract_value(r_fv, 1) \
+                    if isinstance(r_fv.type, ir.LiteralStructType) \
+                    else rtv.as_i64(self.builder)
+                l_ptr = self.builder.inttoptr(l_data, i8_ptr)
+                r_ptr = self.builder.inttoptr(r_data, i8_ptr)
+                str_result = self.builder.call(
+                    self.runtime["str_concat"], [l_ptr, r_ptr])
+                # Convert to i8* result (same as VKind.STR)
+                str_as_i64 = self.builder.ptrtoint(str_result, i64)
+                self.builder.branch(join_blk)
+                str_end = self.builder.block
+
+                # Numeric path: split into int-preserving and float
+                # sub-paths when runtime tags are available so that
+                # UNKNOWN(INT) + UNKNOWN(INT) stays int.
+                self.builder.position_at_end(num_blk)
+                # Extract i64 data from each operand
+                _nl = l_fv if isinstance(l_fv.type, ir.LiteralStructType) \
+                    else ltv.val
+                _nr = r_fv if isinstance(r_fv.type, ir.LiteralStructType) \
+                    else rtv.val
+                _nl_i64 = self.builder.extract_value(_nl, 1) \
+                    if isinstance(_nl.type, ir.LiteralStructType) \
+                    else (_nl if isinstance(_nl.type, ir.IntType)
+                          and _nl.type.width == 64
+                          else self.builder.sext(_nl, i64)
+                          if isinstance(_nl.type, ir.IntType) else _nl)
+                _nr_i64 = self.builder.extract_value(_nr, 1) \
+                    if isinstance(_nr.type, ir.LiteralStructType) \
+                    else (_nr if isinstance(_nr.type, ir.IntType)
+                          and _nr.type.width == 64
+                          else self.builder.sext(_nr, i64)
+                          if isinstance(_nr.type, ir.IntType) else _nr)
+                # Check if both are INT
+                _n_both_int = self.builder.and_(
+                    self.builder.icmp_unsigned(
+                        "==", l_tag, ir.Constant(i32, FPY_TAG_INT)),
+                    self.builder.icmp_unsigned(
+                        "==", r_tag, ir.Constant(i32, FPY_TAG_INT)))
+                _n_int_blk = self._new_block("unkn.num_int")
+                _n_flt_blk = self._new_block("unkn.num_flt")
+                _n_join = self._new_block("unkn.num_join")
+                self.builder.cbranch(_n_both_int, _n_int_blk, _n_flt_blk)
+                # ── both-INT sub-path: integer addition ──
+                self.builder.position_at_end(_n_int_blk)
+                _n_ires = self._emit_int_binop(
+                    node.op, _nl_i64, _nr_i64, node)
+                if isinstance(_n_ires.type, ir.DoubleType):
+                    _n_idata = self.builder.bitcast(_n_ires, i64)
+                    _n_itag = ir.Constant(i32, FPY_TAG_FLOAT)
+                elif (isinstance(_n_ires.type, ir.IntType)
+                        and _n_ires.type.width == 64):
+                    _n_idata = _n_ires
+                    _n_itag = ir.Constant(i32, FPY_TAG_INT)
+                else:
+                    _n_idata = self.builder.sext(_n_ires, i64) \
+                        if isinstance(_n_ires.type, ir.IntType) \
+                        else self.builder.ptrtoint(_n_ires, i64)
+                    _n_itag = ir.Constant(i32, FPY_TAG_INT)
+                self.builder.branch(_n_join)
+                _n_int_end = self.builder.block
+                # ── float sub-path: tag-aware double conversion ──
+                self.builder.position_at_end(_n_flt_blk)
+                _lf = self.builder.icmp_unsigned(
+                    "==", l_tag, ir.Constant(i32, FPY_TAG_FLOAT))
+                _l_bc = self.builder.bitcast(_nl_i64, double)
+                _l_si = self.builder.sitofp(_nl_i64, double)
+                _ld = self.builder.select(_lf, _l_bc, _l_si)
+                _rf = self.builder.icmp_unsigned(
+                    "==", r_tag, ir.Constant(i32, FPY_TAG_FLOAT))
+                _r_bc = self.builder.bitcast(_nr_i64, double)
+                _r_si = self.builder.sitofp(_nr_i64, double)
+                _rd = self.builder.select(_rf, _r_bc, _r_si)
+                _n_fres = self._emit_float_binop(node.op, _ld, _rd, node)
+                if isinstance(_n_fres.type, ir.DoubleType):
+                    _n_fdata = self.builder.bitcast(_n_fres, i64)
+                elif (isinstance(_n_fres.type, ir.IntType)
+                        and _n_fres.type.width == 64):
+                    _n_fdata = _n_fres
+                else:
+                    _n_fdata = self.builder.sext(_n_fres, i64) \
+                        if isinstance(_n_fres.type, ir.IntType) \
+                        else self.builder.ptrtoint(_n_fres, i64)
+                self.builder.branch(_n_join)
+                _n_flt_end = self.builder.block
+                # ── numeric merge ──
+                self.builder.position_at_end(_n_join)
+                _n_tphi = self.builder.phi(i32, "unkn.num.tag")
+                _n_tphi.add_incoming(_n_itag, _n_int_end)
+                _n_tphi.add_incoming(
+                    ir.Constant(i32, FPY_TAG_FLOAT), _n_flt_end)
+                _n_dphi = self.builder.phi(i64, "unkn.num.data")
+                _n_dphi.add_incoming(_n_idata, _n_int_end)
+                _n_dphi.add_incoming(_n_fdata, _n_flt_end)
+                num_as_i64 = _n_dphi
+                num_tag = _n_tphi
+                self.builder.branch(join_blk)
+                num_end = self.builder.block
+
+                # Join: phi between string result and numeric result
+                self.builder.position_at_end(join_blk)
+                # Build FpyValue with correct tag
+                tag_phi = self.builder.phi(i32, "unkn.add.tag")
+                tag_phi.add_incoming(ir.Constant(i32, FPY_TAG_STR), str_end)
+                tag_phi.add_incoming(num_tag, num_end)
+                data_phi = self.builder.phi(i64, "unkn.add.data")
+                data_phi.add_incoming(str_as_i64, str_end)
+                data_phi.add_incoming(num_as_i64, num_end)
+                fv = self._fv_build_from_slots(tag_phi, data_phi)
+                return fv
+
+        # ── UNKNOWN + INT (or INT + UNKNOWN): runtime branch to
+        #    preserve integer results when the UNKNOWN operand is
+        #    actually INT at runtime.  Fixes the dict.get() counter
+        #    pattern: d[k] = d.get(k, 0) + 1 should stay int. ──────
+        if op != ast.Div and (
+            (lk == VKind.UNKNOWN and rk == VKind.INT)
+            or (lk == VKind.INT and rk == VKind.UNKNOWN)
+        ):
+            unkn_left = (lk == VKind.UNKNOWN)
+            unkn_raw = ltv.val if unkn_left else rtv.val
+            int_val = rtv.val if unkn_left else ltv.val
+            # Ensure int_val is i64
+            if isinstance(int_val.type, ir.IntType) and int_val.type.width != 64:
+                int_val = self.builder.sext(int_val, i64)
+            # Extract runtime tag and i64 data from the UNKNOWN operand.
+            # Two shapes: (a) raw FpyValue struct from a call like dict.get(),
+            # (b) bare i64 loaded from a named FV variable.
+            _rt_tag = None
+            _unkn_i64 = None
+            if (isinstance(unkn_raw.type, ir.LiteralStructType)
+                    and unkn_raw.type == fpy_val):
+                # Direct FpyValue struct (e.g. dict.get() result)
+                _rt_tag = self.builder.extract_value(unkn_raw, 0)
+                _unkn_i64 = self.builder.extract_value(unkn_raw, 1)
+            else:
+                # Bare i64 from a named variable — reload the FV for the tag
+                unkn_node = node.left if unkn_left else node.right
+                if isinstance(unkn_node, ast.Name):
+                    _alloca_info = self.variables.get(unkn_node.id)
+                    if _alloca_info is not None:
+                        _a, _ = _alloca_info
+                        if (isinstance(_a.type, ir.PointerType)
+                                and _a.type.pointee is fpy_val):
+                            _fv = self.builder.load(_a)
+                            _rt_tag = self._fv_tag(_fv)
+                if isinstance(unkn_raw.type, ir.IntType):
+                    _unkn_i64 = unkn_raw if unkn_raw.type.width == 64 \
+                        else self.builder.sext(unkn_raw, i64)
+            if _rt_tag is not None and _unkn_i64 is not None:
+                _is_int = self.builder.icmp_unsigned(
+                    "==", _rt_tag, ir.Constant(i32, FPY_TAG_INT))
+                _int_bb = self._new_block("unkn_int.iarith")
+                _flt_bb = self._new_block("unkn_int.farith")
+                _mrg_bb = self._new_block("unkn_int.merge")
+                self.builder.cbranch(_is_int, _int_bb, _flt_bb)
+                # ── INT path: integer arithmetic ──
+                self.builder.position_at_end(_int_bb)
+                if unkn_left:
+                    _ires = self._emit_int_binop(
+                        node.op, _unkn_i64, int_val, node)
+                else:
+                    _ires = self._emit_int_binop(
+                        node.op, int_val, _unkn_i64, node)
+                if isinstance(_ires.type, ir.DoubleType):
+                    _idata = self.builder.bitcast(_ires, i64)
+                    _itag = ir.Constant(i32, FPY_TAG_FLOAT)
+                elif (isinstance(_ires.type, ir.IntType)
+                        and _ires.type.width == 64):
+                    _idata = _ires
+                    _itag = ir.Constant(i32, FPY_TAG_INT)
+                else:
+                    _idata = self.builder.sext(_ires, i64) \
+                        if isinstance(_ires.type, ir.IntType) \
+                        else self.builder.ptrtoint(_ires, i64)
+                    _itag = ir.Constant(i32, FPY_TAG_INT)
+                self.builder.branch(_mrg_bb)
+                _int_end = self.builder.block
+                # ── FLOAT path: float arithmetic ──
+                self.builder.position_at_end(_flt_bb)
+                _unkn_d = self.builder.bitcast(_unkn_i64, double)
+                _int_d = self.builder.sitofp(int_val, double)
+                if unkn_left:
+                    _fres = self._emit_float_binop(
+                        node.op, _unkn_d, _int_d, node)
+                else:
+                    _fres = self._emit_float_binop(
+                        node.op, _int_d, _unkn_d, node)
+                if isinstance(_fres.type, ir.DoubleType):
+                    _fdata = self.builder.bitcast(_fres, i64)
+                elif (isinstance(_fres.type, ir.IntType)
+                        and _fres.type.width == 64):
+                    _fdata = _fres
+                else:
+                    _fdata = self.builder.sext(_fres, i64) \
+                        if isinstance(_fres.type, ir.IntType) \
+                        else self.builder.ptrtoint(_fres, i64)
+                self.builder.branch(_mrg_bb)
+                _flt_end = self.builder.block
+                # ── Merge: FpyValue with runtime-correct tag ──
+                self.builder.position_at_end(_mrg_bb)
+                _tag_phi = self.builder.phi(i32, "unkn_int.tag")
+                _tag_phi.add_incoming(_itag, _int_end)
+                _tag_phi.add_incoming(
+                    ir.Constant(i32, FPY_TAG_FLOAT), _flt_end)
+                _data_phi = self.builder.phi(i64, "unkn_int.data")
+                _data_phi.add_incoming(_idata, _int_end)
+                _data_phi.add_incoming(_fdata, _flt_end)
+                return self._fv_build_from_slots(_tag_phi, _data_phi)
+
+        # ── UNKNOWN + UNKNOWN: runtime branch preserving int-ness ──
+        # When both operands are UNKNOWN FpyValue structs (e.g. two
+        # dict.get() calls), check if both are INT at runtime and use
+        # integer arithmetic if so.
+        if (lk == VKind.UNKNOWN and rk == VKind.UNKNOWN
+                and op != ast.Div):
+            _lraw = ltv.val
+            _rraw = rtv.val
+            _ltag = _rtag = None
+            _li64 = _ri64 = None
+            # Extract tag + data from left
+            if (isinstance(_lraw.type, ir.LiteralStructType)
+                    and _lraw.type == fpy_val):
+                _ltag = self.builder.extract_value(_lraw, 0)
+                _li64 = self.builder.extract_value(_lraw, 1)
+            elif isinstance(node.left, ast.Name):
+                _la = self.variables.get(node.left.id)
+                if _la:
+                    _a, _ = _la
+                    if (isinstance(_a.type, ir.PointerType)
+                            and _a.type.pointee is fpy_val):
+                        _fv = self.builder.load(_a)
+                        _ltag = self._fv_tag(_fv)
+                if isinstance(_lraw.type, ir.IntType):
+                    _li64 = _lraw if _lraw.type.width == 64 \
+                        else self.builder.sext(_lraw, i64)
+            # Extract tag + data from right
+            if (isinstance(_rraw.type, ir.LiteralStructType)
+                    and _rraw.type == fpy_val):
+                _rtag = self.builder.extract_value(_rraw, 0)
+                _ri64 = self.builder.extract_value(_rraw, 1)
+            elif isinstance(node.right, ast.Name):
+                _ra = self.variables.get(node.right.id)
+                if _ra:
+                    _a, _ = _ra
+                    if (isinstance(_a.type, ir.PointerType)
+                            and _a.type.pointee is fpy_val):
+                        _fv = self.builder.load(_a)
+                        _rtag = self._fv_tag(_fv)
+                if isinstance(_rraw.type, ir.IntType):
+                    _ri64 = _rraw if _rraw.type.width == 64 \
+                        else self.builder.sext(_rraw, i64)
+            if (_ltag is not None and _rtag is not None
+                    and _li64 is not None and _ri64 is not None):
+                _both_int = self.builder.and_(
+                    self.builder.icmp_unsigned(
+                        "==", _ltag, ir.Constant(i32, FPY_TAG_INT)),
+                    self.builder.icmp_unsigned(
+                        "==", _rtag, ir.Constant(i32, FPY_TAG_INT)))
+                _uu_int = self._new_block("unkn_uu.iarith")
+                _uu_flt = self._new_block("unkn_uu.farith")
+                _uu_mrg = self._new_block("unkn_uu.merge")
+                self.builder.cbranch(_both_int, _uu_int, _uu_flt)
+                # ── both-INT path ──
+                self.builder.position_at_end(_uu_int)
+                _uires = self._emit_int_binop(
+                    node.op, _li64, _ri64, node)
+                if isinstance(_uires.type, ir.DoubleType):
+                    _uidata = self.builder.bitcast(_uires, i64)
+                    _uitag = ir.Constant(i32, FPY_TAG_FLOAT)
+                elif (isinstance(_uires.type, ir.IntType)
+                        and _uires.type.width == 64):
+                    _uidata = _uires
+                    _uitag = ir.Constant(i32, FPY_TAG_INT)
+                else:
+                    _uidata = self.builder.sext(_uires, i64) \
+                        if isinstance(_uires.type, ir.IntType) \
+                        else self.builder.ptrtoint(_uires, i64)
+                    _uitag = ir.Constant(i32, FPY_TAG_INT)
+                self.builder.branch(_uu_mrg)
+                _uu_int_end = self.builder.block
+                # ── float path: tag-aware conversion ──
+                self.builder.position_at_end(_uu_flt)
+                # Left: select(tag==FLOAT, bitcast, sitofp)
+                _l_is_f = self.builder.icmp_unsigned(
+                    "==", _ltag, ir.Constant(i32, FPY_TAG_FLOAT))
+                _l_bc = self.builder.bitcast(_li64, double)
+                _l_si = self.builder.sitofp(_li64, double)
+                _ld = self.builder.select(_l_is_f, _l_bc, _l_si)
+                # Right: same
+                _r_is_f = self.builder.icmp_unsigned(
+                    "==", _rtag, ir.Constant(i32, FPY_TAG_FLOAT))
+                _r_bc = self.builder.bitcast(_ri64, double)
+                _r_si = self.builder.sitofp(_ri64, double)
+                _rd = self.builder.select(_r_is_f, _r_bc, _r_si)
+                _ufres = self._emit_float_binop(
+                    node.op, _ld, _rd, node)
+                if isinstance(_ufres.type, ir.DoubleType):
+                    _ufdata = self.builder.bitcast(_ufres, i64)
+                elif (isinstance(_ufres.type, ir.IntType)
+                        and _ufres.type.width == 64):
+                    _ufdata = _ufres
+                else:
+                    _ufdata = self.builder.sext(_ufres, i64) \
+                        if isinstance(_ufres.type, ir.IntType) \
+                        else self.builder.ptrtoint(_ufres, i64)
+                self.builder.branch(_uu_mrg)
+                _uu_flt_end = self.builder.block
+                # ── merge ──
+                self.builder.position_at_end(_uu_mrg)
+                _uu_tphi = self.builder.phi(i32, "unkn_uu.tag")
+                _uu_tphi.add_incoming(_uitag, _uu_int_end)
+                _uu_tphi.add_incoming(
+                    ir.Constant(i32, FPY_TAG_FLOAT), _uu_flt_end)
+                _uu_dphi = self.builder.phi(i64, "unkn_uu.data")
+                _uu_dphi.add_incoming(_uidata, _uu_int_end)
+                _uu_dphi.add_incoming(_ufdata, _uu_flt_end)
+                return self._fv_build_from_slots(_uu_tphi, _uu_dphi)
+
+        # ── UNKNOWN with extractable tags: fv_binop dispatch ─────
+        # The tag-preserving fast paths above skip ast.Div (division
+        # always returns float so int-preservation is moot) and only
+        # handle INT/FLOAT branches — non-numeric types (str, list,
+        # etc.) cause garbage double conversions.  Route through the
+        # C fv_binop which handles ALL type combinations correctly
+        # (str concat, repeat, TypeError for invalid combos, and
+        # proper INT→FLOAT promotion for truediv).
+        _fv_op_map = {ast.Add: 0, ast.Sub: 1, ast.Mult: 2, ast.Div: 3,
+                      ast.FloorDiv: 4, ast.Mod: 5}
+        _gf_opc = _fv_op_map.get(op)
+        if _gf_opc is not None:
+            _gf_lt = _gf_ld = _gf_rt = _gf_rd = None
+            # Extract left tag + data
+            if lk == VKind.UNKNOWN:
+                if (isinstance(ltv.val.type, ir.LiteralStructType)
+                        and ltv.val.type == fpy_val):
+                    _gf_lt = self.builder.extract_value(ltv.val, 0)
+                    _gf_ld = self.builder.extract_value(ltv.val, 1)
+                elif isinstance(node.left, ast.Name):
+                    _al = self.variables.get(node.left.id)
+                    if _al:
+                        _a, _ = _al
+                        if (isinstance(_a.type, ir.PointerType)
+                                and _a.type.pointee is fpy_val):
+                            _fv = self.builder.load(_a)
+                            _gf_lt = self.builder.extract_value(_fv, 0)
+                            _gf_ld = self.builder.extract_value(_fv, 1)
+            else:
+                _gf_lt = ir.Constant(i32, ltv.vtype.kind.fpy_tag)
+                _gf_ld = ltv.as_i64(self.builder)
+            # Extract right tag + data
+            if rk == VKind.UNKNOWN:
+                if (isinstance(rtv.val.type, ir.LiteralStructType)
+                        and rtv.val.type == fpy_val):
+                    _gf_rt = self.builder.extract_value(rtv.val, 0)
+                    _gf_rd = self.builder.extract_value(rtv.val, 1)
+                elif isinstance(node.right, ast.Name):
+                    _ar = self.variables.get(node.right.id)
+                    if _ar:
+                        _a, _ = _ar
+                        if (isinstance(_a.type, ir.PointerType)
+                                and _a.type.pointee is fpy_val):
+                            _fv = self.builder.load(_a)
+                            _gf_rt = self.builder.extract_value(_fv, 0)
+                            _gf_rd = self.builder.extract_value(_fv, 1)
+            else:
+                _gf_rt = ir.Constant(i32, rtv.vtype.kind.fpy_tag)
+                _gf_rd = rtv.as_i64(self.builder)
+            if (_gf_lt is not None and _gf_ld is not None
+                    and _gf_rt is not None and _gf_rd is not None):
+                _ot = self._create_entry_alloca(i32, "ugf.tag")
+                _od = self._create_entry_alloca(i64, "ugf.data")
+                self.builder.call(self.runtime["fv_binop"],
+                                  [_gf_lt, _gf_ld, _gf_rt, _gf_rd,
+                                   ir.Constant(i32, _gf_opc),
+                                   _ot, _od])
+                self._emit_try_bail_if_exc()
+                return self._fv_build_from_slots(
+                    self.builder.load(_ot),
+                    self.builder.load(_od))
+
+        # ── Generic UNKNOWN fallback: promote both to double ──────
+        # This path handles cases where runtime tags couldn't be
+        # extracted (non-Name, non-struct operands).
+        left_v = ltv.val
+        right_v = rtv.val
+        if lk == VKind.UNKNOWN:
+            left_v = self._unknown_fv_to_double(node.left, left_v)
+        elif lk == VKind.INT:
+            left_v = self.builder.sitofp(left_v, double)
+        elif lk != VKind.FLOAT:
+            left_v = left_v if isinstance(left_v.type, ir.DoubleType) \
+                else self.builder.sitofp(left_v, double) \
+                if isinstance(left_v.type, ir.IntType) else left_v
+        if rk == VKind.UNKNOWN:
+            right_v = self._unknown_fv_to_double(node.right, right_v)
+        elif rk == VKind.INT:
+            right_v = self.builder.sitofp(right_v, double)
+        elif rk != VKind.FLOAT:
+            right_v = right_v if isinstance(right_v.type, ir.DoubleType) \
+                else self.builder.sitofp(right_v, double) \
+                if isinstance(right_v.type, ir.IntType) else right_v
+        # Safety: if either operand is still an FpyValue struct (not a
+        # bare scalar), extract the data i64 and use tag-aware
+        # conversion (sitofp for INT, bitcast for FLOAT).
+        for lbl, v, setter in [("left", left_v, "left_v"),
+                               ("right", right_v, "right_v")]:
+            if isinstance(v.type, ir.LiteralStructType):
+                _s_tag = self.builder.extract_value(v, 0)
+                _s_data = self.builder.extract_value(v, 1)
+                _s_is_flt = self.builder.icmp_unsigned(
+                    "==", _s_tag, ir.Constant(i32, FPY_TAG_FLOAT))
+                _s_bc = self.builder.bitcast(_s_data, double)
+                _s_si = self.builder.sitofp(_s_data, double)
+                converted = self.builder.select(
+                    _s_is_flt, _s_bc, _s_si)
+                if setter == "left_v":
+                    left_v = converted
+                else:
+                    right_v = converted
+        return self._emit_float_binop(node.op, left_v, right_v, node)
+
     def _emit_binop(self, node: ast.BinOp) -> ir.Value:
         """Emit a binary operation. Phase 2: TypedValue dispatch with fast paths."""
         ltv = self._emit_expr(node.left)
@@ -23416,467 +23880,7 @@ class CodeGen:
         # — the i64 data may be a float bit-pattern, not an integer.
         # Convert to double via a select(tag==FLOAT, bitcast, sitofp).
         if lk == VKind.UNKNOWN or rk == VKind.UNKNOWN:
-            # For Add with FpyValue operands, check runtime tags for STR.
-            # String pointers bitcast to double produce garbage, so we must
-            # dispatch to str_concat when both operands are strings.
-            if op == ast.Add:
-                l_fv = ltv.val
-                r_fv = rtv.val
-                # Extract runtime tags from FpyValue operands
-                l_tag = r_tag = None
-                if isinstance(l_fv.type, ir.LiteralStructType):
-                    l_tag = self.builder.extract_value(l_fv, 0)
-                elif lk == VKind.UNKNOWN and isinstance(node.left, ast.Name):
-                    alloca, _ = self.variables.get(node.left.id, (None, None))
-                    if (alloca and isinstance(alloca.type, ir.PointerType)
-                            and alloca.type.pointee is fpy_val):
-                        fv = self.builder.load(alloca)
-                        l_tag = self.builder.extract_value(fv, 0)
-                if isinstance(r_fv.type, ir.LiteralStructType):
-                    r_tag = self.builder.extract_value(r_fv, 0)
-                elif rk == VKind.UNKNOWN and isinstance(node.right, ast.Name):
-                    alloca, _ = self.variables.get(node.right.id, (None, None))
-                    if (alloca and isinstance(alloca.type, ir.PointerType)
-                            and alloca.type.pointee is fpy_val):
-                        fv = self.builder.load(alloca)
-                        r_tag = self.builder.extract_value(fv, 0)
-                if l_tag is not None and r_tag is not None:
-                    both_str = self.builder.and_(
-                        self.builder.icmp_unsigned(
-                            "==", l_tag, ir.Constant(i32, FPY_TAG_STR)),
-                        self.builder.icmp_unsigned(
-                            "==", r_tag, ir.Constant(i32, FPY_TAG_STR)))
-                    str_blk = self._new_block("unkn.str_add")
-                    num_blk = self._new_block("unkn.num_add")
-                    join_blk = self._new_block("unkn.add_join")
-                    self.builder.cbranch(both_str, str_blk, num_blk)
-
-                    # String path: extract data as pointers, call str_concat
-                    self.builder.position_at_end(str_blk)
-                    l_data = self.builder.extract_value(l_fv, 1) \
-                        if isinstance(l_fv.type, ir.LiteralStructType) \
-                        else ltv.as_i64(self.builder)
-                    r_data = self.builder.extract_value(r_fv, 1) \
-                        if isinstance(r_fv.type, ir.LiteralStructType) \
-                        else rtv.as_i64(self.builder)
-                    l_ptr = self.builder.inttoptr(l_data, i8_ptr)
-                    r_ptr = self.builder.inttoptr(r_data, i8_ptr)
-                    str_result = self.builder.call(
-                        self.runtime["str_concat"], [l_ptr, r_ptr])
-                    # Convert to i8* result (same as VKind.STR)
-                    str_as_i64 = self.builder.ptrtoint(str_result, i64)
-                    self.builder.branch(join_blk)
-                    str_end = self.builder.block
-
-                    # Numeric path: split into int-preserving and float
-                    # sub-paths when runtime tags are available so that
-                    # UNKNOWN(INT) + UNKNOWN(INT) stays int.
-                    self.builder.position_at_end(num_blk)
-                    # Extract i64 data from each operand
-                    _nl = l_fv if isinstance(l_fv.type, ir.LiteralStructType) \
-                        else ltv.val
-                    _nr = r_fv if isinstance(r_fv.type, ir.LiteralStructType) \
-                        else rtv.val
-                    _nl_i64 = self.builder.extract_value(_nl, 1) \
-                        if isinstance(_nl.type, ir.LiteralStructType) \
-                        else (_nl if isinstance(_nl.type, ir.IntType)
-                              and _nl.type.width == 64
-                              else self.builder.sext(_nl, i64)
-                              if isinstance(_nl.type, ir.IntType) else _nl)
-                    _nr_i64 = self.builder.extract_value(_nr, 1) \
-                        if isinstance(_nr.type, ir.LiteralStructType) \
-                        else (_nr if isinstance(_nr.type, ir.IntType)
-                              and _nr.type.width == 64
-                              else self.builder.sext(_nr, i64)
-                              if isinstance(_nr.type, ir.IntType) else _nr)
-                    # Check if both are INT
-                    _n_both_int = self.builder.and_(
-                        self.builder.icmp_unsigned(
-                            "==", l_tag, ir.Constant(i32, FPY_TAG_INT)),
-                        self.builder.icmp_unsigned(
-                            "==", r_tag, ir.Constant(i32, FPY_TAG_INT)))
-                    _n_int_blk = self._new_block("unkn.num_int")
-                    _n_flt_blk = self._new_block("unkn.num_flt")
-                    _n_join = self._new_block("unkn.num_join")
-                    self.builder.cbranch(_n_both_int, _n_int_blk, _n_flt_blk)
-                    # ── both-INT sub-path: integer addition ──
-                    self.builder.position_at_end(_n_int_blk)
-                    _n_ires = self._emit_int_binop(
-                        node.op, _nl_i64, _nr_i64, node)
-                    if isinstance(_n_ires.type, ir.DoubleType):
-                        _n_idata = self.builder.bitcast(_n_ires, i64)
-                        _n_itag = ir.Constant(i32, FPY_TAG_FLOAT)
-                    elif (isinstance(_n_ires.type, ir.IntType)
-                            and _n_ires.type.width == 64):
-                        _n_idata = _n_ires
-                        _n_itag = ir.Constant(i32, FPY_TAG_INT)
-                    else:
-                        _n_idata = self.builder.sext(_n_ires, i64) \
-                            if isinstance(_n_ires.type, ir.IntType) \
-                            else self.builder.ptrtoint(_n_ires, i64)
-                        _n_itag = ir.Constant(i32, FPY_TAG_INT)
-                    self.builder.branch(_n_join)
-                    _n_int_end = self.builder.block
-                    # ── float sub-path: tag-aware double conversion ──
-                    self.builder.position_at_end(_n_flt_blk)
-                    _lf = self.builder.icmp_unsigned(
-                        "==", l_tag, ir.Constant(i32, FPY_TAG_FLOAT))
-                    _l_bc = self.builder.bitcast(_nl_i64, double)
-                    _l_si = self.builder.sitofp(_nl_i64, double)
-                    _ld = self.builder.select(_lf, _l_bc, _l_si)
-                    _rf = self.builder.icmp_unsigned(
-                        "==", r_tag, ir.Constant(i32, FPY_TAG_FLOAT))
-                    _r_bc = self.builder.bitcast(_nr_i64, double)
-                    _r_si = self.builder.sitofp(_nr_i64, double)
-                    _rd = self.builder.select(_rf, _r_bc, _r_si)
-                    _n_fres = self._emit_float_binop(node.op, _ld, _rd, node)
-                    if isinstance(_n_fres.type, ir.DoubleType):
-                        _n_fdata = self.builder.bitcast(_n_fres, i64)
-                    elif (isinstance(_n_fres.type, ir.IntType)
-                            and _n_fres.type.width == 64):
-                        _n_fdata = _n_fres
-                    else:
-                        _n_fdata = self.builder.sext(_n_fres, i64) \
-                            if isinstance(_n_fres.type, ir.IntType) \
-                            else self.builder.ptrtoint(_n_fres, i64)
-                    self.builder.branch(_n_join)
-                    _n_flt_end = self.builder.block
-                    # ── numeric merge ──
-                    self.builder.position_at_end(_n_join)
-                    _n_tphi = self.builder.phi(i32, "unkn.num.tag")
-                    _n_tphi.add_incoming(_n_itag, _n_int_end)
-                    _n_tphi.add_incoming(
-                        ir.Constant(i32, FPY_TAG_FLOAT), _n_flt_end)
-                    _n_dphi = self.builder.phi(i64, "unkn.num.data")
-                    _n_dphi.add_incoming(_n_idata, _n_int_end)
-                    _n_dphi.add_incoming(_n_fdata, _n_flt_end)
-                    num_as_i64 = _n_dphi
-                    num_tag = _n_tphi
-                    self.builder.branch(join_blk)
-                    num_end = self.builder.block
-
-                    # Join: phi between string result and numeric result
-                    self.builder.position_at_end(join_blk)
-                    # Build FpyValue with correct tag
-                    tag_phi = self.builder.phi(i32, "unkn.add.tag")
-                    tag_phi.add_incoming(ir.Constant(i32, FPY_TAG_STR), str_end)
-                    tag_phi.add_incoming(num_tag, num_end)
-                    data_phi = self.builder.phi(i64, "unkn.add.data")
-                    data_phi.add_incoming(str_as_i64, str_end)
-                    data_phi.add_incoming(num_as_i64, num_end)
-                    fv = self._fv_build_from_slots(tag_phi, data_phi)
-                    return fv
-
-            # ── UNKNOWN + INT (or INT + UNKNOWN): runtime branch to
-            #    preserve integer results when the UNKNOWN operand is
-            #    actually INT at runtime.  Fixes the dict.get() counter
-            #    pattern: d[k] = d.get(k, 0) + 1 should stay int. ──────
-            if op != ast.Div and (
-                (lk == VKind.UNKNOWN and rk == VKind.INT)
-                or (lk == VKind.INT and rk == VKind.UNKNOWN)
-            ):
-                unkn_left = (lk == VKind.UNKNOWN)
-                unkn_raw = ltv.val if unkn_left else rtv.val
-                int_val = rtv.val if unkn_left else ltv.val
-                # Ensure int_val is i64
-                if isinstance(int_val.type, ir.IntType) and int_val.type.width != 64:
-                    int_val = self.builder.sext(int_val, i64)
-                # Extract runtime tag and i64 data from the UNKNOWN operand.
-                # Two shapes: (a) raw FpyValue struct from a call like dict.get(),
-                # (b) bare i64 loaded from a named FV variable.
-                _rt_tag = None
-                _unkn_i64 = None
-                if (isinstance(unkn_raw.type, ir.LiteralStructType)
-                        and unkn_raw.type == fpy_val):
-                    # Direct FpyValue struct (e.g. dict.get() result)
-                    _rt_tag = self.builder.extract_value(unkn_raw, 0)
-                    _unkn_i64 = self.builder.extract_value(unkn_raw, 1)
-                else:
-                    # Bare i64 from a named variable — reload the FV for the tag
-                    unkn_node = node.left if unkn_left else node.right
-                    if isinstance(unkn_node, ast.Name):
-                        _alloca_info = self.variables.get(unkn_node.id)
-                        if _alloca_info is not None:
-                            _a, _ = _alloca_info
-                            if (isinstance(_a.type, ir.PointerType)
-                                    and _a.type.pointee is fpy_val):
-                                _fv = self.builder.load(_a)
-                                _rt_tag = self._fv_tag(_fv)
-                    if isinstance(unkn_raw.type, ir.IntType):
-                        _unkn_i64 = unkn_raw if unkn_raw.type.width == 64 \
-                            else self.builder.sext(unkn_raw, i64)
-                if _rt_tag is not None and _unkn_i64 is not None:
-                    _is_int = self.builder.icmp_unsigned(
-                        "==", _rt_tag, ir.Constant(i32, FPY_TAG_INT))
-                    _int_bb = self._new_block("unkn_int.iarith")
-                    _flt_bb = self._new_block("unkn_int.farith")
-                    _mrg_bb = self._new_block("unkn_int.merge")
-                    self.builder.cbranch(_is_int, _int_bb, _flt_bb)
-                    # ── INT path: integer arithmetic ──
-                    self.builder.position_at_end(_int_bb)
-                    if unkn_left:
-                        _ires = self._emit_int_binop(
-                            node.op, _unkn_i64, int_val, node)
-                    else:
-                        _ires = self._emit_int_binop(
-                            node.op, int_val, _unkn_i64, node)
-                    if isinstance(_ires.type, ir.DoubleType):
-                        _idata = self.builder.bitcast(_ires, i64)
-                        _itag = ir.Constant(i32, FPY_TAG_FLOAT)
-                    elif (isinstance(_ires.type, ir.IntType)
-                            and _ires.type.width == 64):
-                        _idata = _ires
-                        _itag = ir.Constant(i32, FPY_TAG_INT)
-                    else:
-                        _idata = self.builder.sext(_ires, i64) \
-                            if isinstance(_ires.type, ir.IntType) \
-                            else self.builder.ptrtoint(_ires, i64)
-                        _itag = ir.Constant(i32, FPY_TAG_INT)
-                    self.builder.branch(_mrg_bb)
-                    _int_end = self.builder.block
-                    # ── FLOAT path: float arithmetic ──
-                    self.builder.position_at_end(_flt_bb)
-                    _unkn_d = self.builder.bitcast(_unkn_i64, double)
-                    _int_d = self.builder.sitofp(int_val, double)
-                    if unkn_left:
-                        _fres = self._emit_float_binop(
-                            node.op, _unkn_d, _int_d, node)
-                    else:
-                        _fres = self._emit_float_binop(
-                            node.op, _int_d, _unkn_d, node)
-                    if isinstance(_fres.type, ir.DoubleType):
-                        _fdata = self.builder.bitcast(_fres, i64)
-                    elif (isinstance(_fres.type, ir.IntType)
-                            and _fres.type.width == 64):
-                        _fdata = _fres
-                    else:
-                        _fdata = self.builder.sext(_fres, i64) \
-                            if isinstance(_fres.type, ir.IntType) \
-                            else self.builder.ptrtoint(_fres, i64)
-                    self.builder.branch(_mrg_bb)
-                    _flt_end = self.builder.block
-                    # ── Merge: FpyValue with runtime-correct tag ──
-                    self.builder.position_at_end(_mrg_bb)
-                    _tag_phi = self.builder.phi(i32, "unkn_int.tag")
-                    _tag_phi.add_incoming(_itag, _int_end)
-                    _tag_phi.add_incoming(
-                        ir.Constant(i32, FPY_TAG_FLOAT), _flt_end)
-                    _data_phi = self.builder.phi(i64, "unkn_int.data")
-                    _data_phi.add_incoming(_idata, _int_end)
-                    _data_phi.add_incoming(_fdata, _flt_end)
-                    return self._fv_build_from_slots(_tag_phi, _data_phi)
-
-            # ── UNKNOWN + UNKNOWN: runtime branch preserving int-ness ──
-            # When both operands are UNKNOWN FpyValue structs (e.g. two
-            # dict.get() calls), check if both are INT at runtime and use
-            # integer arithmetic if so.
-            if (lk == VKind.UNKNOWN and rk == VKind.UNKNOWN
-                    and op != ast.Div):
-                _lraw = ltv.val
-                _rraw = rtv.val
-                _ltag = _rtag = None
-                _li64 = _ri64 = None
-                # Extract tag + data from left
-                if (isinstance(_lraw.type, ir.LiteralStructType)
-                        and _lraw.type == fpy_val):
-                    _ltag = self.builder.extract_value(_lraw, 0)
-                    _li64 = self.builder.extract_value(_lraw, 1)
-                elif isinstance(node.left, ast.Name):
-                    _la = self.variables.get(node.left.id)
-                    if _la:
-                        _a, _ = _la
-                        if (isinstance(_a.type, ir.PointerType)
-                                and _a.type.pointee is fpy_val):
-                            _fv = self.builder.load(_a)
-                            _ltag = self._fv_tag(_fv)
-                    if isinstance(_lraw.type, ir.IntType):
-                        _li64 = _lraw if _lraw.type.width == 64 \
-                            else self.builder.sext(_lraw, i64)
-                # Extract tag + data from right
-                if (isinstance(_rraw.type, ir.LiteralStructType)
-                        and _rraw.type == fpy_val):
-                    _rtag = self.builder.extract_value(_rraw, 0)
-                    _ri64 = self.builder.extract_value(_rraw, 1)
-                elif isinstance(node.right, ast.Name):
-                    _ra = self.variables.get(node.right.id)
-                    if _ra:
-                        _a, _ = _ra
-                        if (isinstance(_a.type, ir.PointerType)
-                                and _a.type.pointee is fpy_val):
-                            _fv = self.builder.load(_a)
-                            _rtag = self._fv_tag(_fv)
-                    if isinstance(_rraw.type, ir.IntType):
-                        _ri64 = _rraw if _rraw.type.width == 64 \
-                            else self.builder.sext(_rraw, i64)
-                if (_ltag is not None and _rtag is not None
-                        and _li64 is not None and _ri64 is not None):
-                    _both_int = self.builder.and_(
-                        self.builder.icmp_unsigned(
-                            "==", _ltag, ir.Constant(i32, FPY_TAG_INT)),
-                        self.builder.icmp_unsigned(
-                            "==", _rtag, ir.Constant(i32, FPY_TAG_INT)))
-                    _uu_int = self._new_block("unkn_uu.iarith")
-                    _uu_flt = self._new_block("unkn_uu.farith")
-                    _uu_mrg = self._new_block("unkn_uu.merge")
-                    self.builder.cbranch(_both_int, _uu_int, _uu_flt)
-                    # ── both-INT path ──
-                    self.builder.position_at_end(_uu_int)
-                    _uires = self._emit_int_binop(
-                        node.op, _li64, _ri64, node)
-                    if isinstance(_uires.type, ir.DoubleType):
-                        _uidata = self.builder.bitcast(_uires, i64)
-                        _uitag = ir.Constant(i32, FPY_TAG_FLOAT)
-                    elif (isinstance(_uires.type, ir.IntType)
-                            and _uires.type.width == 64):
-                        _uidata = _uires
-                        _uitag = ir.Constant(i32, FPY_TAG_INT)
-                    else:
-                        _uidata = self.builder.sext(_uires, i64) \
-                            if isinstance(_uires.type, ir.IntType) \
-                            else self.builder.ptrtoint(_uires, i64)
-                        _uitag = ir.Constant(i32, FPY_TAG_INT)
-                    self.builder.branch(_uu_mrg)
-                    _uu_int_end = self.builder.block
-                    # ── float path: tag-aware conversion ──
-                    self.builder.position_at_end(_uu_flt)
-                    # Left: select(tag==FLOAT, bitcast, sitofp)
-                    _l_is_f = self.builder.icmp_unsigned(
-                        "==", _ltag, ir.Constant(i32, FPY_TAG_FLOAT))
-                    _l_bc = self.builder.bitcast(_li64, double)
-                    _l_si = self.builder.sitofp(_li64, double)
-                    _ld = self.builder.select(_l_is_f, _l_bc, _l_si)
-                    # Right: same
-                    _r_is_f = self.builder.icmp_unsigned(
-                        "==", _rtag, ir.Constant(i32, FPY_TAG_FLOAT))
-                    _r_bc = self.builder.bitcast(_ri64, double)
-                    _r_si = self.builder.sitofp(_ri64, double)
-                    _rd = self.builder.select(_r_is_f, _r_bc, _r_si)
-                    _ufres = self._emit_float_binop(
-                        node.op, _ld, _rd, node)
-                    if isinstance(_ufres.type, ir.DoubleType):
-                        _ufdata = self.builder.bitcast(_ufres, i64)
-                    elif (isinstance(_ufres.type, ir.IntType)
-                            and _ufres.type.width == 64):
-                        _ufdata = _ufres
-                    else:
-                        _ufdata = self.builder.sext(_ufres, i64) \
-                            if isinstance(_ufres.type, ir.IntType) \
-                            else self.builder.ptrtoint(_ufres, i64)
-                    self.builder.branch(_uu_mrg)
-                    _uu_flt_end = self.builder.block
-                    # ── merge ──
-                    self.builder.position_at_end(_uu_mrg)
-                    _uu_tphi = self.builder.phi(i32, "unkn_uu.tag")
-                    _uu_tphi.add_incoming(_uitag, _uu_int_end)
-                    _uu_tphi.add_incoming(
-                        ir.Constant(i32, FPY_TAG_FLOAT), _uu_flt_end)
-                    _uu_dphi = self.builder.phi(i64, "unkn_uu.data")
-                    _uu_dphi.add_incoming(_uidata, _uu_int_end)
-                    _uu_dphi.add_incoming(_ufdata, _uu_flt_end)
-                    return self._fv_build_from_slots(_uu_tphi, _uu_dphi)
-
-            # ── UNKNOWN with extractable tags: fv_binop dispatch ─────
-            # The tag-preserving fast paths above skip ast.Div (division
-            # always returns float so int-preservation is moot) and only
-            # handle INT/FLOAT branches — non-numeric types (str, list,
-            # etc.) cause garbage double conversions.  Route through the
-            # C fv_binop which handles ALL type combinations correctly
-            # (str concat, repeat, TypeError for invalid combos, and
-            # proper INT→FLOAT promotion for truediv).
-            _fv_op_map = {ast.Add: 0, ast.Sub: 1, ast.Mult: 2, ast.Div: 3,
-                          ast.FloorDiv: 4, ast.Mod: 5}
-            _gf_opc = _fv_op_map.get(op)
-            if _gf_opc is not None:
-                _gf_lt = _gf_ld = _gf_rt = _gf_rd = None
-                # Extract left tag + data
-                if lk == VKind.UNKNOWN:
-                    if (isinstance(ltv.val.type, ir.LiteralStructType)
-                            and ltv.val.type == fpy_val):
-                        _gf_lt = self.builder.extract_value(ltv.val, 0)
-                        _gf_ld = self.builder.extract_value(ltv.val, 1)
-                    elif isinstance(node.left, ast.Name):
-                        _al = self.variables.get(node.left.id)
-                        if _al:
-                            _a, _ = _al
-                            if (isinstance(_a.type, ir.PointerType)
-                                    and _a.type.pointee is fpy_val):
-                                _fv = self.builder.load(_a)
-                                _gf_lt = self.builder.extract_value(_fv, 0)
-                                _gf_ld = self.builder.extract_value(_fv, 1)
-                else:
-                    _gf_lt = ir.Constant(i32, ltv.vtype.kind.fpy_tag)
-                    _gf_ld = ltv.as_i64(self.builder)
-                # Extract right tag + data
-                if rk == VKind.UNKNOWN:
-                    if (isinstance(rtv.val.type, ir.LiteralStructType)
-                            and rtv.val.type == fpy_val):
-                        _gf_rt = self.builder.extract_value(rtv.val, 0)
-                        _gf_rd = self.builder.extract_value(rtv.val, 1)
-                    elif isinstance(node.right, ast.Name):
-                        _ar = self.variables.get(node.right.id)
-                        if _ar:
-                            _a, _ = _ar
-                            if (isinstance(_a.type, ir.PointerType)
-                                    and _a.type.pointee is fpy_val):
-                                _fv = self.builder.load(_a)
-                                _gf_rt = self.builder.extract_value(_fv, 0)
-                                _gf_rd = self.builder.extract_value(_fv, 1)
-                else:
-                    _gf_rt = ir.Constant(i32, rtv.vtype.kind.fpy_tag)
-                    _gf_rd = rtv.as_i64(self.builder)
-                if (_gf_lt is not None and _gf_ld is not None
-                        and _gf_rt is not None and _gf_rd is not None):
-                    _ot = self._create_entry_alloca(i32, "ugf.tag")
-                    _od = self._create_entry_alloca(i64, "ugf.data")
-                    self.builder.call(self.runtime["fv_binop"],
-                                      [_gf_lt, _gf_ld, _gf_rt, _gf_rd,
-                                       ir.Constant(i32, _gf_opc),
-                                       _ot, _od])
-                    self._emit_try_bail_if_exc()
-                    return self._fv_build_from_slots(
-                        self.builder.load(_ot),
-                        self.builder.load(_od))
-
-            # ── Generic UNKNOWN fallback: promote both to double ──────
-            # This path handles cases where runtime tags couldn't be
-            # extracted (non-Name, non-struct operands).
-            left_v = ltv.val
-            right_v = rtv.val
-            if lk == VKind.UNKNOWN:
-                left_v = self._unknown_fv_to_double(node.left, left_v)
-            elif lk == VKind.INT:
-                left_v = self.builder.sitofp(left_v, double)
-            elif lk != VKind.FLOAT:
-                left_v = left_v if isinstance(left_v.type, ir.DoubleType) \
-                    else self.builder.sitofp(left_v, double) \
-                    if isinstance(left_v.type, ir.IntType) else left_v
-            if rk == VKind.UNKNOWN:
-                right_v = self._unknown_fv_to_double(node.right, right_v)
-            elif rk == VKind.INT:
-                right_v = self.builder.sitofp(right_v, double)
-            elif rk != VKind.FLOAT:
-                right_v = right_v if isinstance(right_v.type, ir.DoubleType) \
-                    else self.builder.sitofp(right_v, double) \
-                    if isinstance(right_v.type, ir.IntType) else right_v
-            # Safety: if either operand is still an FpyValue struct (not a
-            # bare scalar), extract the data i64 and use tag-aware
-            # conversion (sitofp for INT, bitcast for FLOAT).
-            for lbl, v, setter in [("left", left_v, "left_v"),
-                                   ("right", right_v, "right_v")]:
-                if isinstance(v.type, ir.LiteralStructType):
-                    _s_tag = self.builder.extract_value(v, 0)
-                    _s_data = self.builder.extract_value(v, 1)
-                    _s_is_flt = self.builder.icmp_unsigned(
-                        "==", _s_tag, ir.Constant(i32, FPY_TAG_FLOAT))
-                    _s_bc = self.builder.bitcast(_s_data, double)
-                    _s_si = self.builder.sitofp(_s_data, double)
-                    converted = self.builder.select(
-                        _s_is_flt, _s_bc, _s_si)
-                    if setter == "left_v":
-                        left_v = converted
-                    else:
-                        right_v = converted
-            return self._emit_float_binop(node.op, left_v, right_v, node)
+            return self._emit_binop_unknown(node, ltv, rtv, lk, rk, op)
 
         # ── Fast path: BigInt arithmetic ───────────────────────────────
         if lk == VKind.BIGINT or rk == VKind.BIGINT:
