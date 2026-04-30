@@ -55,7 +55,10 @@ def _gen_arithmetic(rng: random.Random) -> str:
         if op in ("//", "%"):
             lines.append(f"r{i} = {a} {op} {b} if {b} != 0 else 0")
         elif op == "**":
-            lines.append(f"r{i} = {a} {op} min(abs({b}), 10)")
+            # Clamp exponent to avoid overflow; use int() to avoid
+            # min() mixed-type issue (min(float, int) returns float in
+            # compiled code but int in CPython — known limitation)
+            lines.append(f"r{i} = {a} {op} min(int(abs({b})), 10)")
         else:
             lines.append(f"r{i} = {a} {op} {b}")
         lines.append(f"print(r{i})")

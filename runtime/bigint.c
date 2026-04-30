@@ -489,7 +489,10 @@ int64_t fpy_checked_pow(int64_t base, int64_t exp, FpyBigInt **big) {
         return 0;
     }
 
-    /* Try i64 with overflow checks */
+    /* Try i64 with overflow checks.
+     * Classic binary exponentiation: shift e first, then square b
+     * only if more iterations remain.  This avoids a false overflow
+     * from an unnecessary final b*b squaring. */
     int64_t result = 1;
     int64_t b = base;
     int64_t e = exp;
@@ -518,13 +521,14 @@ int64_t fpy_checked_pow(int64_t base, int64_t exp, FpyBigInt **big) {
                 return 0;
             }
         }
+        e >>= 1;
+        if (e == 0) break;  /* Don't square base when we're done */
         FpyBigInt *tmp = NULL;
         b = fpy_checked_mul(b, b, &tmp);
         if (tmp) {
             /* Base squared overflowed — finish in BigInt */
             FpyBigInt *bb = tmp;
             FpyBigInt *br = fpy_bigint_from_i64(result);
-            e >>= 1;
             while (e > 0) {
                 if (e & 1) {
                     FpyBigInt *t = fpy_bigint_mul(br, bb);
@@ -540,7 +544,6 @@ int64_t fpy_checked_pow(int64_t base, int64_t exp, FpyBigInt **big) {
             *big = br;
             return 0;
         }
-        e >>= 1;
     }
     return result;
 }
