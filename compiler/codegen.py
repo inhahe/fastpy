@@ -2209,6 +2209,7 @@ class CodeGen:
         self.runtime["obj_to_str"] = ir.Function(self.module, ft, name="fastpy_obj_to_str")
         self.runtime["obj_to_repr"] = ir.Function(self.module, ft, name="fastpy_obj_to_repr")
         self.runtime["obj_classname"] = ir.Function(self.module, ft, name="fastpy_obj_classname")
+        self.runtime["obj_classname_safe"] = ir.Function(self.module, ft, name="fastpy_obj_classname_safe")
         self.runtime["obj_type_repr"] = ir.Function(self.module, ft, name="fastpy_obj_type_repr")
         ft = ir.FunctionType(double, [i8_ptr, i8_ptr])
         self.runtime["obj_call_method0_double"] = ir.Function(self.module, ft, name="fastpy_obj_call_method0_double")
@@ -25811,8 +25812,9 @@ class CodeGen:
                             i8_ptr, "typename")
                         default = self._make_string_constant("object")
                         self.builder.store(default, result_alloca)
-                        # For OBJ tag, use native obj_classname (NOT
-                        # cpython_typeof — native FpyObj isn't a PyObject*)
+                        # For OBJ tag, use obj_classname_safe which handles
+                        # both native FpyObj* and opaque PyObject* (bridge
+                        # values like uuid.UUID) via the magic header check.
                         is_obj = self.builder.icmp_signed(
                             "==", fv_tag, ir.Constant(i32, FPY_TAG_OBJ))
                         obj_block = self._new_block("typename.obj")
@@ -25821,7 +25823,7 @@ class CodeGen:
                         self.builder.position_at_end(obj_block)
                         obj_ptr = self._ensure_ptr(fv_data)
                         runtime_name = self.builder.call(
-                            self.runtime["obj_classname"], [obj_ptr])
+                            self.runtime["obj_classname_safe"], [obj_ptr])
                         self.builder.store(runtime_name, result_alloca)
                         self.builder.branch(merge_block)
                         self.builder.position_at_end(merge_block)

@@ -5838,6 +5838,23 @@ const char* fastpy_obj_classname(FpyObj *obj) {
     return fpy_classes[obj->class_id].name;
 }
 
+/* Safe class name: works for both native FpyObj and opaque PyObject*.
+ * OBJ-tagged FpyValues may hold either an FpyObj* (native user class)
+ * or a raw PyObject* (opaque bridge value like uuid.UUID).  Check the
+ * magic header to distinguish.  Falls back to cpython_typeof for
+ * non-native pointers. */
+extern const char* fpy_cpython_typeof(void *obj);
+const char* fastpy_obj_classname_safe(void *ptr) {
+    if (!ptr) return "NoneType";
+    FpyObj *obj = (FpyObj*)ptr;
+    if (obj->magic == FPY_OBJ_MAGIC &&
+        obj->class_id >= 0 && obj->class_id < fpy_class_count) {
+        return fpy_classes[obj->class_id].name;
+    }
+    /* Not a native FpyObj — treat as PyObject* */
+    return fpy_cpython_typeof(ptr);
+}
+
 /* Get "<class '__main__.ClassName'>" for an object (type(obj) display) */
 const char* fastpy_obj_type_repr(FpyObj *obj) {
     const char *name = fpy_classes[obj->class_id].name;
