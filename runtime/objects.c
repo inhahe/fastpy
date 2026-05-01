@@ -30,6 +30,17 @@ extern int fastpy_exc_pending(void);
  * can be pending per thread, so a single buffer is safe. */
 static FPY_THREAD_LOCAL char _err_buf[256];
 
+/* --- Object free-list allocator ---
+ * Maintain per-slot-count free lists so freed objects can be reused
+ * without calling malloc.  Each free-list entry repurposes the
+ * `dynamic_attrs` pointer as the "next" link.
+ * This eliminates malloc/free overhead in tight loops that create
+ * and destroy many objects of the same class.  */
+#define FPY_OBJ_FREELIST_SLOTS  16   /* cover slot counts 0..15 */
+#define FPY_OBJ_FREELIST_MAX    256  /* max cached objects per slot count */
+static FpyObj* fpy_obj_freelist[FPY_OBJ_FREELIST_SLOTS];
+static int     fpy_obj_freelist_count[FPY_OBJ_FREELIST_SLOTS];
+
 /* --- List operations --- */
 
 /* --- Refcounted string allocation --- */
@@ -224,8 +235,18 @@ void fpy_rc_decref(int32_t tag, int64_t data) {
                             free(obj->dynamic_attrs->names);
                             free(obj->dynamic_attrs->values);
                             free(obj->dynamic_attrs);
+                            obj->dynamic_attrs = NULL;
                         }
-                        free(obj);
+                        /* Push to free-list if possible, else free */
+                        int _sc = fpy_classes[obj->class_id].slot_count;
+                        if (_sc < FPY_OBJ_FREELIST_SLOTS
+                                && fpy_obj_freelist_count[_sc] < FPY_OBJ_FREELIST_MAX) {
+                            obj->dynamic_attrs = (FpyObjAttrs*)fpy_obj_freelist[_sc];
+                            fpy_obj_freelist[_sc] = obj;
+                            fpy_obj_freelist_count[_sc]++;
+                        } else {
+                            free(obj);
+                        }
                     }
                     break;
                 }
@@ -5536,13 +5557,24 @@ static void* fpy_arena_alloc(size_t size) {
 }
 
 /* Create a new object instance.
- * Single allocation via bump allocator: the FpyObj header and its slot
- * array are contiguous. Each allocation is a pointer advance — no
- * malloc overhead per object.  */
+ * Uses a per-slot-count free-list: if a previously freed object of the
+ * same size is available, reuse it (pointer pop — no malloc).
+ * Otherwise falls back to malloc with contiguous header+slots layout. */
 FpyObj* fastpy_obj_new(int class_id) {
     int sc = fpy_classes[class_id].slot_count;
     size_t total = sizeof(FpyObj) + sizeof(FpyValue) * sc;
-    FpyObj *obj = (FpyObj*)malloc(total);
+    FpyObj *obj;
+    int from_freelist = 0;
+
+    /* Try free-list first */
+    if (sc < FPY_OBJ_FREELIST_SLOTS && fpy_obj_freelist[sc]) {
+        obj = fpy_obj_freelist[sc];
+        fpy_obj_freelist[sc] = (FpyObj*)obj->dynamic_attrs;
+        fpy_obj_freelist_count[sc]--;
+        from_freelist = 1;
+    } else {
+        obj = (FpyObj*)malloc(total);
+    }
     obj->refcount = 1;
     obj->magic = FPY_OBJ_MAGIC;
     obj->class_id = class_id;
@@ -5563,7 +5595,10 @@ FpyObj* fastpy_obj_new(int class_id) {
     memset(&obj->gc_node, 0, sizeof(FpyGCNode));
     obj->gc_node.gc_type = FPY_GC_TYPE_OBJ;
     fpy_gc_track(&obj->gc_node);
-    fpy_gc_maybe_collect();
+    /* Skip gc_maybe_collect for free-list reuse — no new memory was
+     * allocated, so there's nothing for the GC to reclaim. */
+    if (!from_freelist)
+        fpy_gc_maybe_collect();
     return obj;
 }
 
