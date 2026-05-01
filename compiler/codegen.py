@@ -9896,6 +9896,272 @@ class CodeGen:
 
         return ret_type, init_arg_count, init_defaults
 
+    def _dcl_flatten_mro_methods(
+        self, class_name: str, parent_name: str | None,
+        secondary_bases: list[str],
+        methods: dict, method_asts: dict,
+        list_attrs: set, dict_attrs: set,
+    ) -> set[str]:
+        """Compute C3 MRO and flatten methods from secondary bases.
+
+        Mutates *methods*, *method_asts*, *list_attrs*, *dict_attrs* in place.
+        Returns own_method_names (methods defined directly in this class body,
+        before flattening from bases).
+        """
+        own_method_names = set(methods.keys())
+        # Multiple inheritance: compute C3 MRO and flatten methods in
+        # MRO order. Each method is taken from the first class in the MRO
+        # that *directly defines* it (using own_method_names).
+        all_bases = [parent_name] + secondary_bases if parent_name else secondary_bases
+        # Compute C3 linearization for correct diamond-resolution
+        mro_names = self._compute_c3_mro(class_name, all_bases)
+        # Store MRO for runtime dispatch (used when >1 base)
+        if not hasattr(self, '_class_mro'):
+            self._class_mro = {}
+        self._class_mro[class_name] = mro_names
+        # Flatten methods from MRO (skip self, already collected).
+        # Only consider each class's OWN methods (not inherited ones)
+        # to respect C3 ordering: in D(B, C) where B(A) and C(A),
+        # B inherits A.greet but C defines its own greet. C's greet
+        # should win because C appears before A in D's MRO.
+        # Build the primary parent chain (accessible via runtime parent_id walk)
+        _primary_chain: set[str] = set()
+        _pn = parent_name
+        while _pn and _pn in self._user_classes:
+            _primary_chain.add(_pn)
+            _pn = self._user_classes[_pn].parent_name
+        # Collect methods visible through the primary parent chain
+        _primary_methods: set[str] = set(own_method_names)
+        _pn = parent_name
+        while _pn and _pn in self._user_classes:
+            _pi = self._user_classes[_pn]
+            if _pi.methods:
+                _primary_methods |= set(_pi.methods.keys())
+            _pn = _pi.parent_name
+        # Walk MRO to flatten methods from secondary bases.
+        # Only add methods from classes NOT in the primary parent chain,
+        # OR methods that OVERRIDE a primary-chain method earlier in MRO.
+        _seen = set(own_method_names)
+        for mro_cls in mro_names[1:]:  # skip self (index 0)
+            mro_info = self._user_classes.get(mro_cls)
+            if mro_info is None:
+                continue
+            # Skip classes in the primary chain (their methods are
+            # accessible via runtime parent_id walk already)
+            if mro_cls in _primary_chain:
+                # But track their own methods as "seen" so we don't
+                # re-add them from later MRO entries
+                own = mro_info.own_method_names if mro_info.own_method_names is not None else set(mro_info.methods.keys())
+                _seen |= own
+                continue
+            # Secondary base: add its own methods if not already seen
+            # by an earlier class in the MRO (including primary chain classes).
+            # MRO position of the current secondary base:
+            _sec_pos = mro_names.index(mro_cls) if mro_cls in mro_names else 999
+            own = mro_info.own_method_names if mro_info.own_method_names is not None else set(mro_info.methods.keys())
+            for m_name in own:
+                if m_name in _seen or m_name not in mro_info.methods:
+                    continue
+                # Check if a primary-chain class that appears EARLIER
+                # in the MRO defines this method as its own. If so,
+                # that class takes precedence via the parent_id walk.
+                _earlier_primary_defines = m_name in own_method_names
+                if not _earlier_primary_defines:
+                    _pn2 = parent_name
+                    while _pn2 and _pn2 in self._user_classes:
+                        _pi2 = self._user_classes[_pn2]
+                        if (_pi2.own_method_names is not None
+                                and m_name in _pi2.own_method_names):
+                            # This primary-chain class defines the method.
+                            # Only block the secondary base if this class
+                            # appears EARLIER in MRO than the secondary.
+                            _pn2_pos = mro_names.index(_pn2) if _pn2 in mro_names else 999
+                            if _pn2_pos < _sec_pos:
+                                _earlier_primary_defines = True
+                                break
+                        _pn2 = _pi2.parent_name
+                if not _earlier_primary_defines:
+                    # No earlier primary-chain class owns this method;
+                    # this secondary base's definition wins by MRO order.
+                    methods[m_name] = mro_info.methods[m_name]
+                    _seen.add(m_name)
+                    if mro_info.method_asts and m_name in mro_info.method_asts:
+                        method_asts[m_name] = mro_info.method_asts[m_name]
+        for sec_base in secondary_bases:
+            # Inherit container/float/string/bool attrs from secondary bases
+            if sec_base in self._class_container_attrs:
+                s_list, s_dict = self._class_container_attrs[sec_base]
+                list_attrs |= s_list
+                dict_attrs |= s_dict
+                self._class_container_attrs[class_name] = (list_attrs, dict_attrs)
+            self._per_class_float_attrs[class_name] |= self._per_class_float_attrs.get(sec_base, set())
+            self._per_class_string_attrs[class_name] |= self._per_class_string_attrs.get(sec_base, set())
+            self._per_class_bool_attrs[class_name] |= self._per_class_bool_attrs.get(sec_base, set())
+        return own_method_names
+
+    def _dcl_precompute_typed_attrs(
+        self, node: ast.ClassDef, class_name: str,
+        parent_name: str | None,
+        list_attrs: set, dict_attrs: set,
+    ) -> tuple[dict[str, str], set, set, set]:
+        """Pre-compute list element types, float/string/bool attribute sets.
+
+        Also reports boxed-attribute analysis findings and stores per-class
+        attribute sets for child class inheritance.
+
+        Returns (list_attr_elem_types, float_attrs, string_attrs, bool_attrs).
+        """
+        # Pre-compute element types for list attributes from call-site analysis.
+        # This allows detecting that `return self.items[i]` returns a string
+        # when `self.items.append(str_param)` is called.
+        list_attr_elem_types: dict[str, str] = {}
+        for method_node in node.body:
+            if not isinstance(method_node, ast.FunctionDef):
+                continue
+            m_params = [arg.arg for arg in method_node.args.args]
+            q_key = f"{class_name}.{method_node.name}"
+            m_call_types = self._call_site_param_types.get(
+                q_key, self._call_site_param_types.get(method_node.name, []))
+            for n in ast.walk(method_node):
+                if (isinstance(n, ast.Call)
+                        and isinstance(n.func, ast.Attribute)
+                        and n.func.attr == "append"
+                        and isinstance(n.func.value, ast.Attribute)
+                        and isinstance(n.func.value.value, ast.Name)
+                        and n.func.value.value.id == "self"
+                        and n.func.value.attr in list_attrs
+                        and len(n.args) == 1):
+                    attr_name = n.func.value.attr
+                    arg = n.args[0]
+                    if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+                        list_attr_elem_types[attr_name] = "str"
+                    elif isinstance(arg, (ast.List, ast.ListComp)):
+                        list_attr_elem_types[attr_name] = "list"
+                    elif isinstance(arg, (ast.Dict, ast.DictComp)):
+                        list_attr_elem_types[attr_name] = "dict"
+                    elif isinstance(arg, ast.Name) and arg.id in m_params:
+                        pidx = m_params.index(arg.id) - 1  # skip self
+                        if 0 <= pidx < len(m_call_types) and m_call_types[pidx]:
+                            ct = m_call_types[pidx]
+                            _ck = ValueType.from_old_tag(ct).kind
+                            _CK_TO_TAG = {VKind.STR: "str", VKind.LIST: "list",
+                                          VKind.DICT: "dict", VKind.OBJ: "obj"}
+                            if _ck in _CK_TO_TAG:
+                                list_attr_elem_types[attr_name] = _CK_TO_TAG[_ck]
+
+        # Pre-compute float, string, and bool attrs for return-type detection.
+        # Uses _call_site_param_types (available from Pass 0.75). For
+        # variants, use the variant's own call-types so attr typing matches
+        # the constructor signature.
+        float_attrs = self._detect_class_float_attrs(node, class_name)
+        string_attrs = self._detect_class_string_attrs(node, class_name)
+        bool_attrs = self._detect_class_bool_attrs(node, class_name)
+        # Inherit from parent class
+        if parent_name:
+            float_attrs |= self._per_class_float_attrs.get(parent_name, set())
+            string_attrs |= self._per_class_string_attrs.get(parent_name, set())
+            bool_attrs |= self._per_class_bool_attrs.get(parent_name, set())
+        # Store for child class inheritance during this pass
+        self._per_class_float_attrs[class_name] = float_attrs
+        self._per_class_string_attrs[class_name] = string_attrs
+        self._per_class_bool_attrs[class_name] = bool_attrs
+
+        # ── Analysis: report boxed (untyped) attributes ──
+        if self._analyze_mode and class_name in self._class_attr_slots:
+            from compiler.analysis import MEDIUM, IMPACT_BOXED_ATTR
+            all_slots = set(self._class_attr_slots[class_name].keys())
+            typed = (float_attrs | string_attrs | bool_attrs
+                     | list_attrs | dict_attrs
+                     | set(self._class_obj_attr_types.get(class_name, {}).keys()))
+            boxed = all_slots - typed
+            for attr in sorted(boxed):
+                self._record_finding(
+                    MEDIUM, "boxed_attr", node,
+                    construct=f"self.{attr}",
+                    missed=f"Native-typed attribute ({class_name}.{attr})",
+                    reason=f"Could not infer type of {class_name}.{attr} "
+                           f"from constructor or assignments",
+                    impact=IMPACT_BOXED_ATTR,
+                    suggestion=f"Ensure self.{attr} is always assigned a "
+                               f"consistent type (int, float, str, bool, "
+                               f"list, or a known class)",
+                )
+
+        return list_attr_elem_types, float_attrs, string_attrs, bool_attrs
+
+    def _dcl_emit_class_var_globals(
+        self, node: ast.ClassDef, class_name: str,
+    ) -> None:
+        """Pre-scan class body for constant attrs and create LLVM globals
+        for any that are mutated (e.g. ``ClassName.attr = ...``).
+
+        Populates ``self._class_const_attrs[class_name]`` and creates
+        entries in ``self._class_var_globals`` / ``self._class_var_str_inits``
+        for int/float/bool/str/None constants that need shared storage.
+        """
+        # Pre-scan class body for class-level constant assignments (not inside methods)
+        const_attrs: dict[str, ast.expr] = {}
+        for item in node.body:
+            if (isinstance(item, ast.Assign) and len(item.targets) == 1
+                    and isinstance(item.targets[0], ast.Name)):
+                const_attrs[item.targets[0].id] = item.value
+        self._class_const_attrs[class_name] = const_attrs
+
+        # For class-level constants with mutable-looking usage (i.e.,
+        # `ClassName.attr = ...` somewhere in the program), create LLVM
+        # globals so reads/writes go through shared storage. Supports
+        # int/float/bool/str/None constants.
+        if not hasattr(self, "_class_var_globals"):
+            self._class_var_globals = {}
+        for attr_name, val_node in const_attrs.items():
+            if not self._class_var_is_mutated(node, attr_name):
+                continue
+            if isinstance(val_node, ast.Constant):
+                v = val_node.value
+                if isinstance(v, bool):
+                    gtype = i32
+                    init = ir.Constant(i32, 1 if v else 0)
+                elif isinstance(v, int):
+                    gtype = i64
+                    init = ir.Constant(i64, v)
+                elif isinstance(v, float):
+                    gtype = double
+                    init = ir.Constant(double, v)
+                elif isinstance(v, str):
+                    # String globals — pointer to the string constant
+                    str_ptr = self._make_string_constant(v)
+                    gtype = i8_ptr
+                    init = None  # will be set via initializer
+                    gvar = ir.GlobalVariable(
+                        self.module, gtype,
+                        name=f"fastpy.classvar.{class_name}.{attr_name}")
+                    # For string globals, the initializer is the bitcast pointer.
+                    # llvmlite requires the initializer match the global's type.
+                    gvar.linkage = "private"
+                    gvar.initializer = ir.Constant(gtype, None)
+                    # Store the string pointer in fastpy_main initialization.
+                    if not hasattr(self, "_class_var_str_inits"):
+                        self._class_var_str_inits = []
+                    self._class_var_str_inits.append((gvar, v))
+                    self._class_var_globals[(class_name, attr_name)] = (gvar, "str")
+                    continue
+                elif v is None:
+                    # None-initialized class vars use i8* so they can hold
+                    # object pointers later and null → is-None check works.
+                    gtype = i8_ptr
+                    init = ir.Constant(i8_ptr, None)
+                else:
+                    continue
+                gvar = ir.GlobalVariable(
+                    self.module, gtype,
+                    name=f"fastpy.classvar.{class_name}.{attr_name}")
+                gvar.linkage = "private"
+                gvar.initializer = init
+                tag = ("bool" if gtype == i32
+                       else "float" if gtype == double
+                       else ("none" if isinstance(val_node.value, type(None)) else "int"))
+                self._class_var_globals[(class_name, attr_name)] = (gvar, tag)
+
     def _declare_class(self, node: ast.ClassDef,
                        _sig_override: list | None = None,
                        _name_override: str | None = None) -> None:
@@ -10043,68 +10309,7 @@ class CodeGen:
             dict_attrs |= p_dict
         self._class_container_attrs[class_name] = (list_attrs, dict_attrs)
 
-        # Pre-scan class body for class-level constant assignments (not inside methods)
-        const_attrs: dict[str, ast.expr] = {}
-        for item in node.body:
-            if (isinstance(item, ast.Assign) and len(item.targets) == 1
-                    and isinstance(item.targets[0], ast.Name)):
-                const_attrs[item.targets[0].id] = item.value
-        self._class_const_attrs[class_name] = const_attrs
-
-        # For class-level constants with mutable-looking usage (i.e.,
-        # `ClassName.attr = ...` somewhere in the program), create LLVM
-        # globals so reads/writes go through shared storage. Supports
-        # int/float/bool/str/None constants.
-        if not hasattr(self, "_class_var_globals"):
-            self._class_var_globals = {}
-        for attr_name, val_node in const_attrs.items():
-            if not self._class_var_is_mutated(node, attr_name):
-                continue
-            if isinstance(val_node, ast.Constant):
-                v = val_node.value
-                if isinstance(v, bool):
-                    gtype = i32
-                    init = ir.Constant(i32, 1 if v else 0)
-                elif isinstance(v, int):
-                    gtype = i64
-                    init = ir.Constant(i64, v)
-                elif isinstance(v, float):
-                    gtype = double
-                    init = ir.Constant(double, v)
-                elif isinstance(v, str):
-                    # String globals — pointer to the string constant
-                    str_ptr = self._make_string_constant(v)
-                    gtype = i8_ptr
-                    init = None  # will be set via initializer
-                    gvar = ir.GlobalVariable(
-                        self.module, gtype,
-                        name=f"fastpy.classvar.{class_name}.{attr_name}")
-                    # For string globals, the initializer is the bitcast pointer.
-                    # llvmlite requires the initializer match the global's type.
-                    gvar.linkage = "private"
-                    gvar.initializer = ir.Constant(gtype, None)
-                    # Store the string pointer in fastpy_main initialization.
-                    if not hasattr(self, "_class_var_str_inits"):
-                        self._class_var_str_inits = []
-                    self._class_var_str_inits.append((gvar, v))
-                    self._class_var_globals[(class_name, attr_name)] = (gvar, "str")
-                    continue
-                elif v is None:
-                    # None-initialized class vars use i8* so they can hold
-                    # object pointers later and null → is-None check works.
-                    gtype = i8_ptr
-                    init = ir.Constant(i8_ptr, None)
-                else:
-                    continue
-                gvar = ir.GlobalVariable(
-                    self.module, gtype,
-                    name=f"fastpy.classvar.{class_name}.{attr_name}")
-                gvar.linkage = "private"
-                gvar.initializer = init
-                tag = ("bool" if gtype == i32
-                       else "float" if gtype == double
-                       else ("none" if isinstance(val_node.value, type(None)) else "int"))
-                self._class_var_globals[(class_name, attr_name)] = (gvar, tag)
+        self._dcl_emit_class_var_globals(node, class_name)
 
         # Create a global variable to hold the runtime class_id
         class_id_global = ir.GlobalVariable(self.module, i32,
@@ -10120,81 +10325,9 @@ class CodeGen:
         init_arg_count = 0
         init_defaults: list = []
 
-        # Pre-compute element types for list attributes from call-site analysis.
-        # This allows detecting that `return self.items[i]` returns a string
-        # when `self.items.append(str_param)` is called.
-        list_attr_elem_types: dict[str, str] = {}
-        for method_node in node.body:
-            if not isinstance(method_node, ast.FunctionDef):
-                continue
-            m_params = [arg.arg for arg in method_node.args.args]
-            q_key = f"{class_name}.{method_node.name}"
-            m_call_types = self._call_site_param_types.get(
-                q_key, self._call_site_param_types.get(method_node.name, []))
-            for n in ast.walk(method_node):
-                if (isinstance(n, ast.Call)
-                        and isinstance(n.func, ast.Attribute)
-                        and n.func.attr == "append"
-                        and isinstance(n.func.value, ast.Attribute)
-                        and isinstance(n.func.value.value, ast.Name)
-                        and n.func.value.value.id == "self"
-                        and n.func.value.attr in list_attrs
-                        and len(n.args) == 1):
-                    attr_name = n.func.value.attr
-                    arg = n.args[0]
-                    if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
-                        list_attr_elem_types[attr_name] = "str"
-                    elif isinstance(arg, (ast.List, ast.ListComp)):
-                        list_attr_elem_types[attr_name] = "list"
-                    elif isinstance(arg, (ast.Dict, ast.DictComp)):
-                        list_attr_elem_types[attr_name] = "dict"
-                    elif isinstance(arg, ast.Name) and arg.id in m_params:
-                        pidx = m_params.index(arg.id) - 1  # skip self
-                        if 0 <= pidx < len(m_call_types) and m_call_types[pidx]:
-                            ct = m_call_types[pidx]
-                            _ck = ValueType.from_old_tag(ct).kind
-                            _CK_TO_TAG = {VKind.STR: "str", VKind.LIST: "list",
-                                          VKind.DICT: "dict", VKind.OBJ: "obj"}
-                            if _ck in _CK_TO_TAG:
-                                list_attr_elem_types[attr_name] = _CK_TO_TAG[_ck]
-
-        # Pre-compute float, string, and bool attrs for return-type detection.
-        # Uses _call_site_param_types (available from Pass 0.75). For
-        # variants, use the variant's own call-types so attr typing matches
-        # the constructor signature.
-        float_attrs = self._detect_class_float_attrs(node, class_name)
-        string_attrs = self._detect_class_string_attrs(node, class_name)
-        bool_attrs = self._detect_class_bool_attrs(node, class_name)
-        # Inherit from parent class
-        if parent_name:
-            float_attrs |= self._per_class_float_attrs.get(parent_name, set())
-            string_attrs |= self._per_class_string_attrs.get(parent_name, set())
-            bool_attrs |= self._per_class_bool_attrs.get(parent_name, set())
-        # Store for child class inheritance during this pass
-        self._per_class_float_attrs[class_name] = float_attrs
-        self._per_class_string_attrs[class_name] = string_attrs
-        self._per_class_bool_attrs[class_name] = bool_attrs
-
-        # ── Analysis: report boxed (untyped) attributes ──
-        if self._analyze_mode and class_name in self._class_attr_slots:
-            from compiler.analysis import MEDIUM, IMPACT_BOXED_ATTR
-            all_slots = set(self._class_attr_slots[class_name].keys())
-            typed = (float_attrs | string_attrs | bool_attrs
-                     | list_attrs | dict_attrs
-                     | set(self._class_obj_attr_types.get(class_name, {}).keys()))
-            boxed = all_slots - typed
-            for attr in sorted(boxed):
-                self._record_finding(
-                    MEDIUM, "boxed_attr", node,
-                    construct=f"self.{attr}",
-                    missed=f"Native-typed attribute ({class_name}.{attr})",
-                    reason=f"Could not infer type of {class_name}.{attr} "
-                           f"from constructor or assignments",
-                    impact=IMPACT_BOXED_ATTR,
-                    suggestion=f"Ensure self.{attr} is always assigned a "
-                               f"consistent type (int, float, str, bool, "
-                               f"list, or a known class)",
-                )
+        list_attr_elem_types, float_attrs, string_attrs, bool_attrs = (
+            self._dcl_precompute_typed_attrs(
+                node, class_name, parent_name, list_attrs, dict_attrs))
 
         # Deduplicate methods: Python allows redefining a method in the same
         # class body — the last definition wins.  Build a map of method_name →
@@ -10316,96 +10449,9 @@ class CodeGen:
                 methods[method_name] = func
                 method_asts[method_name] = item
 
-        # Record own methods (defined in this class body) before flattening
-        _own_method_names = set(methods.keys())
-        # Multiple inheritance: compute C3 MRO and flatten methods in
-        # MRO order. Each method is taken from the first class in the MRO
-        # that *directly defines* it (using own_method_names).
-        all_bases = [parent_name] + secondary_bases if parent_name else secondary_bases
-        # Compute C3 linearization for correct diamond-resolution
-        mro_names = self._compute_c3_mro(class_name, all_bases)
-        # Store MRO for runtime dispatch (used when >1 base)
-        if not hasattr(self, '_class_mro'):
-            self._class_mro = {}
-        self._class_mro[class_name] = mro_names
-        # Flatten methods from MRO (skip self, already collected).
-        # Only consider each class's OWN methods (not inherited ones)
-        # to respect C3 ordering: in D(B, C) where B(A) and C(A),
-        # B inherits A.greet but C defines its own greet. C's greet
-        # should win because C appears before A in D's MRO.
-        # Build the primary parent chain (accessible via runtime parent_id walk)
-        _primary_chain: set[str] = set()
-        _pn = parent_name
-        while _pn and _pn in self._user_classes:
-            _primary_chain.add(_pn)
-            _pn = self._user_classes[_pn].parent_name
-        # Collect methods visible through the primary parent chain
-        _primary_methods: set[str] = set(_own_method_names)
-        _pn = parent_name
-        while _pn and _pn in self._user_classes:
-            _pi = self._user_classes[_pn]
-            if _pi.methods:
-                _primary_methods |= set(_pi.methods.keys())
-            _pn = _pi.parent_name
-        # Walk MRO to flatten methods from secondary bases.
-        # Only add methods from classes NOT in the primary parent chain,
-        # OR methods that OVERRIDE a primary-chain method earlier in MRO.
-        _seen = set(_own_method_names)
-        for mro_cls in mro_names[1:]:  # skip self (index 0)
-            mro_info = self._user_classes.get(mro_cls)
-            if mro_info is None:
-                continue
-            # Skip classes in the primary chain (their methods are
-            # accessible via runtime parent_id walk already)
-            if mro_cls in _primary_chain:
-                # But track their own methods as "seen" so we don't
-                # re-add them from later MRO entries
-                own = mro_info.own_method_names if mro_info.own_method_names is not None else set(mro_info.methods.keys())
-                _seen |= own
-                continue
-            # Secondary base: add its own methods if not already seen
-            # by an earlier class in the MRO (including primary chain classes).
-            # MRO position of the current secondary base:
-            _sec_pos = mro_names.index(mro_cls) if mro_cls in mro_names else 999
-            own = mro_info.own_method_names if mro_info.own_method_names is not None else set(mro_info.methods.keys())
-            for m_name in own:
-                if m_name in _seen or m_name not in mro_info.methods:
-                    continue
-                # Check if a primary-chain class that appears EARLIER
-                # in the MRO defines this method as its own. If so,
-                # that class takes precedence via the parent_id walk.
-                _earlier_primary_defines = m_name in _own_method_names
-                if not _earlier_primary_defines:
-                    _pn2 = parent_name
-                    while _pn2 and _pn2 in self._user_classes:
-                        _pi2 = self._user_classes[_pn2]
-                        if (_pi2.own_method_names is not None
-                                and m_name in _pi2.own_method_names):
-                            # This primary-chain class defines the method.
-                            # Only block the secondary base if this class
-                            # appears EARLIER in MRO than the secondary.
-                            _pn2_pos = mro_names.index(_pn2) if _pn2 in mro_names else 999
-                            if _pn2_pos < _sec_pos:
-                                _earlier_primary_defines = True
-                                break
-                        _pn2 = _pi2.parent_name
-                if not _earlier_primary_defines:
-                    # No earlier primary-chain class owns this method;
-                    # this secondary base's definition wins by MRO order.
-                    methods[m_name] = mro_info.methods[m_name]
-                    _seen.add(m_name)
-                    if mro_info.method_asts and m_name in mro_info.method_asts:
-                        method_asts[m_name] = mro_info.method_asts[m_name]
-        for sec_base in secondary_bases:
-            # Inherit container/float/string/bool attrs from secondary bases
-            if sec_base in self._class_container_attrs:
-                s_list, s_dict = self._class_container_attrs[sec_base]
-                list_attrs |= s_list
-                dict_attrs |= s_dict
-                self._class_container_attrs[class_name] = (list_attrs, dict_attrs)
-            self._per_class_float_attrs[class_name] |= self._per_class_float_attrs.get(sec_base, set())
-            self._per_class_string_attrs[class_name] |= self._per_class_string_attrs.get(sec_base, set())
-            self._per_class_bool_attrs[class_name] |= self._per_class_bool_attrs.get(sec_base, set())
+        _own_method_names = self._dcl_flatten_mro_methods(
+            class_name, parent_name, secondary_bases,
+            methods, method_asts, list_attrs, dict_attrs)
 
         # Extract __match_args__ from class body (if present)
         match_args = None
