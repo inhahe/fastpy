@@ -32199,47 +32199,13 @@ class CodeGen:
             cmp = self.builder.icmp_signed("<", idx, length)
             self.builder.cbranch(cmp, body_block, end_block)
             self.builder.position_at_end(body_block)
-            # Infer per-position types for tuple elements
+            # Infer per-position types for tuple elements using the same
+            # logic as for-loop tuple unpacking (handles enumerate, zip,
+            # dict.items(), sorted(d.items()), and literal list of tuples).
             n_targets = len(gen.target.elts)
-            pos_tags: list[str] = ["int"] * n_targets
-            # enumerate(iterable) → (int, elem_type)
-            if (isinstance(gen.iter, ast.Call)
-                    and isinstance(gen.iter.func, ast.Name)
-                    and gen.iter.func.id == "enumerate"
-                    and n_targets == 2):
-                pos_tags[0] = "int"
-                if gen.iter.args:
-                    et = self._get_list_elem_type(gen.iter.args[0])
-                    pos_tags[1] = et if et else "int"
-                    # String iteration yields str characters
-                    if (isinstance(gen.iter.args[0], ast.Constant)
-                            and isinstance(gen.iter.args[0].value, str)):
-                        pos_tags[1] = "str"
-                    elif (isinstance(gen.iter.args[0], ast.Name)
-                          and gen.iter.args[0].id in self.variables):
-                        _, _vt = self.variables[gen.iter.args[0].id]
-                        if (isinstance(_vt, ValueType) and _vt.kind == VKind.STR
-                                or _vt == "str"):
-                            pos_tags[1] = "str"
-            # zip(a, b): infer element types from each arg's list element type
-            elif (isinstance(gen.iter, ast.Call)
-                    and isinstance(gen.iter.func, ast.Name)
-                    and gen.iter.func.id == "zip"):
-                for _zi, _zarg in enumerate(gen.iter.args[:n_targets]):
-                    et = self._get_list_elem_type(_zarg)
-                    if et:
-                        pos_tags[_zi] = et
-            # Literal list of tuples: infer from first tuple element types
-            elif isinstance(gen.iter, ast.List) and gen.iter.elts:
-                first_tup = gen.iter.elts[0]
-                if isinstance(first_tup, ast.Tuple):
-                    for _pi, _pel in enumerate(first_tup.elts):
-                        if _pi < n_targets:
-                            if isinstance(_pel, ast.Constant):
-                                if isinstance(_pel.value, str):
-                                    pos_tags[_pi] = "str"
-                                elif isinstance(_pel.value, float):
-                                    pos_tags[_pi] = "float"
+            pos_tags = self._infer_for_tuple_elem_types(gen.iter, n_targets)
+            # Replace "unknown" defaults with "int" for backward compat
+            pos_tags = [t if t != "unknown" else "int" for t in pos_tags]
             # Get the tuple element and unpack
             tag_s = self._create_entry_alloca(i32, "dc.tag")
             data_s = self._create_entry_alloca(i64, "dc.data")
