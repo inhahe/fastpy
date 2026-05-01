@@ -7533,9 +7533,9 @@ class CodeGen:
             func.attributes.add('noinline')
         else:
             body_size = sum(1 for _ in ast.walk(node))
-            if body_size <= 25:
+            if body_size <= 50:
                 func.attributes.add('alwaysinline')
-            elif body_size <= 80:
+            elif body_size <= 120:
                 func.attributes.add('inlinehint')
 
         for param, name in zip(func.args, param_names):
@@ -10559,9 +10559,9 @@ class CodeGen:
                 # 'internal' on declarations without body for nested classes).
                 # Store as attribute to apply later.
                 method_size = sum(1 for _ in ast.walk(item))
-                if method_size <= 25:
+                if method_size <= 50:
                     func.attributes.add('alwaysinline')
-                elif method_size <= 80:
+                elif method_size <= 120:
                     func.attributes.add('inlinehint')
 
                 # Name parameters
@@ -18772,6 +18772,13 @@ class CodeGen:
             if not (isinstance(alloca.type, ir.PointerType)
                     and alloca.type.pointee is fpy_val):
                 continue  # not an FV local
+            # Skip decref for variables known to be non-refcounted scalars
+            # (INT, FLOAT, BOOL, NONE).  rc_decref checks tag < FPY_TAG_STR
+            # and returns immediately for these, but the function call
+            # overhead adds up in tight loops with inlined methods.
+            vk = self._var_kind(var_name)
+            if vk in (VKind.INT, VKind.FLOAT, VKind.BOOL, VKind.NONE):
+                continue
             fv = self.builder.load(alloca, name=f"{var_name}.cleanup")
             fv_tag = self.builder.extract_value(fv, 0)
             fv_data = self.builder.extract_value(fv, 1)
