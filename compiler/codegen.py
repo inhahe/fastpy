@@ -9575,7 +9575,8 @@ class CodeGen:
 
     def _dcl_detect_method_ret_type(
         self, item: ast.FunctionDef, method_name: str,
-        class_name: str, parent_name: str | None,
+        class_name: str, class_node: ast.ClassDef,
+        parent_name: str | None,
         float_attrs: set, string_attrs: set, bool_attrs: set,
         list_attrs: set, dict_attrs: set,
         list_attr_elem_types: dict,
@@ -9817,7 +9818,7 @@ class CodeGen:
                             and n.value.value.attr in dict_attrs):
                         dict_attr_name = n.value.value.attr
                         vtype = self._infer_dict_attr_value_type(
-                            node, dict_attr_name)
+                            class_node, dict_attr_name)
                         if vtype == "str":
                             ret_type = i8_ptr
                             break
@@ -10422,7 +10423,7 @@ class CodeGen:
 
                 # Determine return type
                 ret_type, _init_argc, _init_defs = self._dcl_detect_method_ret_type(
-                    item, method_name, class_name, parent_name,
+                    item, method_name, class_name, node, parent_name,
                     float_attrs, string_attrs, bool_attrs,
                     list_attrs, dict_attrs, list_attr_elem_types,
                     float_method_params, methods, params)
@@ -13777,56 +13778,12 @@ class CodeGen:
             self.builder.call(self.runtime["obj_set_fv"],
                               [obj, attr_name, ir.Constant(i32, tag), data])
 
-    def _infer_type_tag(self, node: ast.expr, value: ir.Value) -> str:
-        """Infer the Python type tag from an AST node and LLVM value."""
-        if isinstance(node, ast.Constant):
-            if node.value is None:
-                return "none"
-            if isinstance(node.value, bool):
-                return "bool"
-            if isinstance(node.value, bytes):
-                return "bytes"
-            if isinstance(node.value, complex):
-                return "complex"
-            if (isinstance(node.value, int)
-                    and (node.value > 2**63 - 1 or node.value < -(2**63))):
-                return "bigint"
-        # Constant-folded BigInt/Complex: BinOp/UnaryOp that evaluated at compile time
-        if isinstance(node, (ast.BinOp, ast.UnaryOp)):
-            folded = self._try_constant_fold(node)
-            if folded is not None and isinstance(folded, complex):
-                return "complex"
-            if (folded is not None and isinstance(folded, int)
-                    and (folded > 2**63 - 1 or folded < -(2**63))):
-                return "bigint"
-        # BinOp with a complex operand produces complex
-        if isinstance(node, ast.BinOp):
-            if self._is_complex_expr(node.left) or self._is_complex_expr(node.right):
-                return "complex"
-        # BinOp with a BigInt operand produces BigInt
-        if isinstance(node, ast.BinOp):
-            if self._is_bigint_expr(node.left) or self._is_bigint_expr(node.right):
-                return "bigint"
-        # UnaryOp on BigInt produces BigInt
-        if isinstance(node, ast.UnaryOp) and self._is_bigint_expr(node.operand):
-            return "bigint"
-        # UnaryOp on complex produces complex
-        if isinstance(node, ast.UnaryOp) and self._is_complex_expr(node.operand):
-            return "complex"
-        # UnaryOp on OBJ produces OBJ (e.g. __neg__, __pos__, __invert__)
-        if (isinstance(node, ast.UnaryOp)
-                and isinstance(node.op, (ast.USub, ast.UAdd, ast.Invert))
-                and self._is_obj_expr(node.operand)):
-            return "obj"
-        # BinOp on OBJ produces OBJ (e.g. __add__, __sub__, __mul__, etc.)
-        if isinstance(node, ast.BinOp):
-            if self._is_obj_expr(node.left) or self._is_obj_expr(node.right):
-                return "obj"
-        # Compare / not / isinstance / bool() / hasattr() produce booleans
-        if isinstance(node, ast.Compare):
-            return "bool"
-        if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
-            return "bool"
+    def _infer_call_type_tag(self, node: ast.Call) -> str | None:
+        """Infer type tag for a Call expression.
+
+        Returns the tag string, or None to fall through to
+        ``_llvm_type_tag``.
+        """
         # Builtin calls that return bool
         if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
                 and node.func.id in ("hasattr", "isinstance", "issubclass",
@@ -13844,76 +13801,6 @@ class CodeGen:
             }
             if et_kind in _MINMAX_KIND_TO_TAG:
                 return _MINMAX_KIND_TO_TAG[et_kind]
-        # BoolOp (and/or) with all bool-typed operands → bool result; with
-        # mixed types, the result is the left/right operand's type (we
-        # conservatively return "int" for mixed since Python would too).
-        if isinstance(node, ast.BoolOp):
-            if all(self._is_bool_typed(v) for v in node.values):
-                return "bool"
-        # bool & bool, bool | bool, bool ^ bool → bool (Python semantics)
-        if (isinstance(node, ast.BinOp)
-                and isinstance(node.op, (ast.BitAnd, ast.BitOr, ast.BitXor))
-                and self._is_bool_typed(node.left)
-                and self._is_bool_typed(node.right)):
-            return "bool"
-        # Attribute access: detect container (list/dict) and object attrs
-        # so len(), print, and binops dispatch correctly.
-        if isinstance(node, ast.Attribute):
-            # Path attribute types: .name/.stem/.suffix return str,
-            # .parent/.resolve() return path (PyObject*)
-            if self._is_path_expr(node.value):
-                _path_str_attrs = {"name", "stem", "suffix"}
-                _path_path_attrs = {"parent"}
-                if node.attr in _path_str_attrs:
-                    return "str"
-                if node.attr in _path_path_attrs:
-                    return "path"
-            obj_cls = self._infer_object_class(node.value)
-            if obj_cls and obj_cls in self._class_container_attrs:
-                list_attrs, dict_attrs = self._class_container_attrs[obj_cls]
-                if node.attr in list_attrs:
-                    return "list:int"
-                if node.attr in dict_attrs:
-                    return "dict"
-            if self._is_obj_expr(node):
-                return "obj"
-        # Name: propagate the variable's stored tag so `cur = head` keeps
-        # obj/bool/float/list/dict/tuple/str tagging instead of falling
-        # Phase 3: variables store ValueType objects. For any variable with
-        # a known type (not UNKNOWN/FVALUE), return the string tag directly.
-        # This replaces the old manual whitelist with a universal check.
-        # Also check _global_vars so globals accessed inside functions
-        # are correctly typed (self.variables is function-scoped).
-        if isinstance(node, ast.Name):
-            _var_entry = None
-            if node.id in self.variables:
-                _var_entry = self.variables[node.id]
-            elif node.id in self._global_vars:
-                _var_entry = self._global_vars[node.id]
-            if _var_entry is not None:
-                _, var_tag = _var_entry
-                if isinstance(var_tag, ValueType):
-                    if var_tag.kind not in (VKind.UNKNOWN, VKind.FVALUE):
-                        return var_tag._to_tag()
-                else:
-                    # Legacy string tag — convert to VKind but return the
-                    # original string to preserve aliases (counter, deque).
-                    # Exclude "int" (default assumption, falls through to
-                    # AST inference) and "cell" tags.
-                    _vt = ValueType.from_old_tag(var_tag)
-                    if (_vt.kind not in (VKind.INT, VKind.UNKNOWN, VKind.FVALUE)
-                            or var_tag.startswith("list")
-                            or var_tag.startswith("dict:")
-                            or var_tag in ("namedtuple_type", "unknown",
-                                           "mixed")):
-                        return var_tag
-        if isinstance(node, (ast.List, ast.ListComp, ast.GeneratorExp)):
-            elem_type = self._infer_list_elem_type(node)
-            return f"list:{elem_type}"
-        if isinstance(node, (ast.Dict, ast.DictComp)):
-            return "dict"
-        if isinstance(node, ast.Tuple):
-            return "tuple"
         # type(f) where f is a user function → pyobj (returns CPython type object)
         if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
                 and node.func.id == "type" and len(getattr(node, 'args', [])) == 1):
@@ -13985,7 +13872,6 @@ class CodeGen:
         if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
                 and node.func.attr == "decode"):
             return "str"
-        # bytes.method() that returns bytes (upper, lower, strip, replace, etc.)
         _bytes_to_bytes_methods = {"upper", "lower", "strip", "lstrip", "rstrip",
                                    "replace", "split", "join", "find", "rfind",
                                    "count", "startswith", "endswith"}
@@ -14139,8 +14025,211 @@ class CodeGen:
                     return "list:int"  # default to list for pointer returns
                 if _rtk == VKind.OBJ:
                     return "obj"
+        # Method calls on pyobj receivers return pyobj — EXCEPT for native
+        # modules (time, os, json, etc.) whose functions return native types.
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            if self._is_pyobj_receiver(node.func.value):
+                # Check if receiver is a native module — if so, use LLVM type
+                recv_name = (node.func.value.id
+                             if isinstance(node.func.value, ast.Name) else None)
+                if recv_name and recv_name in getattr(self, '_native_modules', set()):
+                    pass  # fall through to _llvm_type_tag below
+                else:
+                    return "pyobj"
+        # Bridge-imported callable (from django.template import Template)
+        # called from inside a function — result is always pyobj.
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id in getattr(self, '_bridge_imports', {})):
+            return "pyobj"
+        # Direct call of pyobj or native_func variable that goes through bridge
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id in self.variables
+                and self.variables[node.func.id][1] in ("pyobj", "native_func")):
+            # native_func: if the native handler didn't handle it, result is pyobj
+            native_imports = getattr(self, '_native_imports', {})
+            if node.func.id in native_imports:
+                mod, attr = native_imports[node.func.id]
+                val = self._emit_native_module_call(mod, attr, node)
+                if val is None:
+                    return "pyobj"  # Fell through to bridge
+            elif self._var_kind(node.func.id) == VKind.PYOBJ:
+                return "pyobj"
+        # Method calls that return lists/dicts/sets/tuples
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            method = node.func.attr
+            if method in ("split", "rsplit", "splitlines", "partition",
+                           "rpartition"):
+                return "list:str"
+            if method in ("keys", "values", "items"):
+                return "list:str"
+            if method == "popitem" and self._is_dict_expr(node.func.value):
+                return "tuple"
+            if method == "as_integer_ratio":
+                return "tuple"
+            if method == "copy":
+                if self._is_list_expr(node.func.value):
+                    return "list:int"
+                if self._is_dict_expr(node.func.value):
+                    return "dict"
+                if self._is_set_expr(node.func.value):
+                    return "set"
+            # Set methods that return sets
+            if method in ("union", "intersection", "difference",
+                           "symmetric_difference"):
+                if self._is_set_expr(node.func.value):
+                    return "set"
+            # Collections module methods that return lists
+            if method in ("most_common", "elements"):
+                if self._is_counter_expr(node.func.value):
+                    return "list:list"
+            # User class method return: check method return type
+            ret_type = self._find_method_return_type(node.func.value, method)
+            if ret_type is not None and isinstance(ret_type, ir.PointerType):
+                if self._method_returns_list(node.func.value, method):
+                    return "list:int"
+                if self._method_returns_dict(node.func.value, method):
+                    return "dict"
+                if self._method_returns_tuple(node.func.value, method):
+                    return "tuple"
+                # Return self or cls(...) — returns an obj
+                if self._infer_object_class(node) is not None:
+                    return "obj"
+        # Builtin calls that return lists
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            if node.func.id in ("sorted", "reversed", "list"):
+                # Inherit elem type from argument
+                if node.args:
+                    if self._is_list_expr(node.args[0]):
+                        elem = self._get_list_elem_type(node.args[0])
+                        return f"list:{elem}"
+                return "list:int"
+        return None
+
+    def _infer_type_tag(self, node: ast.expr, value: ir.Value) -> str:
+        """Infer the Python type tag from an AST node and LLVM value."""
+        if isinstance(node, ast.Constant):
+            if node.value is None:
+                return "none"
+            if isinstance(node.value, bool):
+                return "bool"
+            if isinstance(node.value, bytes):
+                return "bytes"
+            if isinstance(node.value, complex):
+                return "complex"
+            if (isinstance(node.value, int)
+                    and (node.value > 2**63 - 1 or node.value < -(2**63))):
+                return "bigint"
+        # Constant-folded BigInt/Complex: BinOp/UnaryOp that evaluated at compile time
+        if isinstance(node, (ast.BinOp, ast.UnaryOp)):
+            folded = self._try_constant_fold(node)
+            if folded is not None and isinstance(folded, complex):
+                return "complex"
+            if (folded is not None and isinstance(folded, int)
+                    and (folded > 2**63 - 1 or folded < -(2**63))):
+                return "bigint"
+        # BinOp with a complex operand produces complex
+        if isinstance(node, ast.BinOp):
+            if self._is_complex_expr(node.left) or self._is_complex_expr(node.right):
+                return "complex"
+        # BinOp with a BigInt operand produces BigInt
+        if isinstance(node, ast.BinOp):
+            if self._is_bigint_expr(node.left) or self._is_bigint_expr(node.right):
+                return "bigint"
+        # UnaryOp on BigInt produces BigInt
+        if isinstance(node, ast.UnaryOp) and self._is_bigint_expr(node.operand):
+            return "bigint"
+        # UnaryOp on complex produces complex
+        if isinstance(node, ast.UnaryOp) and self._is_complex_expr(node.operand):
+            return "complex"
+        # UnaryOp on OBJ produces OBJ (e.g. __neg__, __pos__, __invert__)
+        if (isinstance(node, ast.UnaryOp)
+                and isinstance(node.op, (ast.USub, ast.UAdd, ast.Invert))
+                and self._is_obj_expr(node.operand)):
+            return "obj"
+        # BinOp on OBJ produces OBJ (e.g. __add__, __sub__, __mul__, etc.)
+        if isinstance(node, ast.BinOp):
+            if self._is_obj_expr(node.left) or self._is_obj_expr(node.right):
+                return "obj"
+        # Compare / not produce booleans
+        if isinstance(node, ast.Compare):
+            return "bool"
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+            return "bool"
+        # Delegate all Call-expression inference to helper
+        if isinstance(node, ast.Call):
+            tag = self._infer_call_type_tag(node)
+            if tag is not None:
+                return tag
+        # BoolOp (and/or) with all bool-typed operands → bool result; with
+        # mixed types, the result is the left/right operand's type (we
+        # conservatively return "int" for mixed since Python would too).
+        if isinstance(node, ast.BoolOp):
+            if all(self._is_bool_typed(v) for v in node.values):
+                return "bool"
+        # bool & bool, bool | bool, bool ^ bool → bool (Python semantics)
+        if (isinstance(node, ast.BinOp)
+                and isinstance(node.op, (ast.BitAnd, ast.BitOr, ast.BitXor))
+                and self._is_bool_typed(node.left)
+                and self._is_bool_typed(node.right)):
+            return "bool"
+        # Attribute access: detect container (list/dict) and object attrs
+        # so len(), print, and binops dispatch correctly.
+        if isinstance(node, ast.Attribute):
+            # Path attribute types: .name/.stem/.suffix return str,
+            # .parent/.resolve() return path (PyObject*)
+            if self._is_path_expr(node.value):
+                _path_str_attrs = {"name", "stem", "suffix"}
+                _path_path_attrs = {"parent"}
+                if node.attr in _path_str_attrs:
+                    return "str"
+                if node.attr in _path_path_attrs:
+                    return "path"
+            obj_cls = self._infer_object_class(node.value)
+            if obj_cls and obj_cls in self._class_container_attrs:
+                list_attrs, dict_attrs = self._class_container_attrs[obj_cls]
+                if node.attr in list_attrs:
+                    return "list:int"
+                if node.attr in dict_attrs:
+                    return "dict"
+            if self._is_obj_expr(node):
+                return "obj"
+        # Name: propagate the variable's stored tag so `cur = head` keeps
+        # obj/bool/float/list/dict/tuple/str tagging instead of falling
+        # Phase 3: variables store ValueType objects. For any variable with
+        # a known type (not UNKNOWN/FVALUE), return the string tag directly.
+        # This replaces the old manual whitelist with a universal check.
+        # Also check _global_vars so globals accessed inside functions
+        # are correctly typed (self.variables is function-scoped).
+        if isinstance(node, ast.Name):
+            _var_entry = None
+            if node.id in self.variables:
+                _var_entry = self.variables[node.id]
+            elif node.id in self._global_vars:
+                _var_entry = self._global_vars[node.id]
+            if _var_entry is not None:
+                _, var_tag = _var_entry
+                if isinstance(var_tag, ValueType):
+                    if var_tag.kind not in (VKind.UNKNOWN, VKind.FVALUE):
+                        return var_tag._to_tag()
+                else:
+                    # Legacy string tag — convert to VKind but return the
+                    # original string to preserve aliases (counter, deque).
+                    # Exclude "int" (default assumption, falls through to
+                    # AST inference) and "cell" tags.
+                    _vt = ValueType.from_old_tag(var_tag)
+                    if (_vt.kind not in (VKind.INT, VKind.UNKNOWN, VKind.FVALUE)
+                            or var_tag.startswith("list")
+                            or var_tag.startswith("dict:")
+                            or var_tag in ("namedtuple_type", "unknown",
+                                           "mixed")):
+                        return var_tag
+        if isinstance(node, (ast.List, ast.ListComp, ast.GeneratorExp)):
+            elem_type = self._infer_list_elem_type(node)
+            return f"list:{elem_type}"
         if isinstance(node, (ast.Dict, ast.DictComp)):
             return "dict"
+        if isinstance(node, ast.Tuple):
+            return "tuple"
         # dict | dict → dict
         if (isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr)
                 and self._is_dict_expr(node.left) and self._is_dict_expr(node.right)):
@@ -14195,35 +14284,6 @@ class CodeGen:
                 return "pyobj"
             if self._is_pyobj_receiver(node.value):
                 return "pyobj"
-        # Method calls on pyobj receivers return pyobj — EXCEPT for native
-        # modules (time, os, json, etc.) whose functions return native types.
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
-            if self._is_pyobj_receiver(node.func.value):
-                # Check if receiver is a native module — if so, use LLVM type
-                recv_name = (node.func.value.id
-                             if isinstance(node.func.value, ast.Name) else None)
-                if recv_name and recv_name in getattr(self, '_native_modules', set()):
-                    pass  # fall through to _llvm_type_tag below
-                else:
-                    return "pyobj"
-        # Bridge-imported callable (from django.template import Template)
-        # called from inside a function — result is always pyobj.
-        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
-                and node.func.id in getattr(self, '_bridge_imports', {})):
-            return "pyobj"
-        # Direct call of pyobj or native_func variable that goes through bridge
-        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
-                and node.func.id in self.variables
-                and self.variables[node.func.id][1] in ("pyobj", "native_func")):
-            # native_func: if the native handler didn't handle it, result is pyobj
-            native_imports = getattr(self, '_native_imports', {})
-            if node.func.id in native_imports:
-                mod, attr = native_imports[node.func.id]
-                val = self._emit_native_module_call(mod, attr, node)
-                if val is None:
-                    return "pyobj"  # Fell through to bridge
-            elif self._var_kind(node.func.id) == VKind.PYOBJ:
-                return "pyobj"
         # Attribute access on pyobj/native_mod that goes through bridge → pyobj
         if (isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name)
                 and node.value.id in self.variables
@@ -14242,55 +14302,6 @@ class CodeGen:
                          and node.value.id in getattr(self, '_native_modules', set()))
                 and not self._is_path_expr(node.value)):
             return "pyobj"
-        # Method calls that return lists/dicts/sets/tuples
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
-            method = node.func.attr
-            if method in ("split", "rsplit", "splitlines", "partition",
-                           "rpartition"):
-                return "list:str"
-            if method in ("keys", "values", "items"):
-                return "list:str"
-            if method == "popitem" and self._is_dict_expr(node.func.value):
-                return "tuple"
-            if method == "as_integer_ratio":
-                return "tuple"
-            if method == "copy":
-                if self._is_list_expr(node.func.value):
-                    return "list:int"
-                if self._is_dict_expr(node.func.value):
-                    return "dict"
-                if self._is_set_expr(node.func.value):
-                    return "set"
-            # Set methods that return sets
-            if method in ("union", "intersection", "difference",
-                           "symmetric_difference"):
-                if self._is_set_expr(node.func.value):
-                    return "set"
-            # Collections module methods that return lists
-            if method in ("most_common", "elements"):
-                if self._is_counter_expr(node.func.value):
-                    return "list:list"
-            # User class method return: check method return type
-            ret_type = self._find_method_return_type(node.func.value, method)
-            if ret_type is not None and isinstance(ret_type, ir.PointerType):
-                if self._method_returns_list(node.func.value, method):
-                    return "list:int"
-                if self._method_returns_dict(node.func.value, method):
-                    return "dict"
-                if self._method_returns_tuple(node.func.value, method):
-                    return "tuple"
-                # Return self or cls(...) — returns an obj
-                if self._infer_object_class(node) is not None:
-                    return "obj"
-        # Builtin calls that return lists
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
-            if node.func.id in ("sorted", "reversed", "list"):
-                # Inherit elem type from argument
-                if node.args:
-                    if self._is_list_expr(node.args[0]):
-                        elem = self._get_list_elem_type(node.args[0])
-                        return f"list:{elem}"
-                return "list:int"
         # Defaultdict subscript: infer value type from factory
         if (isinstance(node, ast.Subscript)
                 and not isinstance(node.slice, ast.Slice)
