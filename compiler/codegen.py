@@ -249,8 +249,10 @@ class ValueType:
     # This is handled by __eq__ above via the tuple's __contains__.
 
     @staticmethod
-    def from_old_tag(tag: str) -> 'ValueType':
+    def from_old_tag(tag: str | None) -> 'ValueType':
         """Convert old string tag to ValueType (for migration)."""
+        if tag is None:
+            return ValueType(VKind.UNKNOWN)
         if isinstance(tag, ValueType):
             return tag  # already a ValueType
         _map = {
