@@ -41,23 +41,27 @@ fpy_val_ptr = ir.PointerType(fpy_val)
 # side-table so FpyObj is ~24 bytes (was ~1560). Used for direct-struct
 # IR access to obj->slots[idx] (skips the fastpy_obj_get_slot /
 # fastpy_obj_set_slot function call overhead).
-# FpyObj layout on x64:
-#   offset  0: i32 refcount
-#   offset  4: (padding)
-#   offset  8: FpyGCNode (24 bytes: 2 ptrs + 2 i32s)
-#   offset 32: i32 magic
-#   offset 36: i32 class_id
+# FpyObj layout on x64 (MSVC, sizeof=104):
+#   offset  0: i32 refcount  (+4 pad)
+#   offset  8: FpyGCNode (24 bytes: gc_prev, gc_next, gc_refs+flags)
+#   offset 32: i32 magic + i32 class_id
 #   offset 40: ptr slots
 #   offset 48: ptr dynamic_attrs
-# Represent GC node as 3 opaque i64s to match alignment:
+#   offset 56: ptr weakref_list
+#   offset 64: CRITICAL_SECTION lock (40 bytes)
+# Represent as i64-sized fields to match alignment. ALL fields must be
+# present so that sizeof(fpy_obj_type) == sizeof(FpyObj) — this is
+# required for the inline-slot optimization (GEP obj, [1] → first slot).
 fpy_obj_type = ir.LiteralStructType([
-    i64,                             # refcount (i32) + padding (4 bytes) = 8
-    i64,                             # gc_node.gc_prev
-    i64,                             # gc_node.gc_next
-    i64,                             # gc_node.gc_refs (i32) + gc_node.gc_flags (i32)
-    i64,                             # magic (i32) + class_id (i32)
-    fpy_val_ptr,                     # slots
-    i8_ptr,                          # dynamic_attrs (opaque to codegen)
+    i64,                             # 0: refcount (i32) + padding = 8
+    i64,                             # 1: gc_node.gc_prev
+    i64,                             # 2: gc_node.gc_next
+    i64,                             # 3: gc_node.gc_refs (i32) + gc_flags+gc_type (i32)
+    i64,                             # 4: magic (i32) + class_id (i32)
+    fpy_val_ptr,                     # 5: slots
+    i8_ptr,                          # 6: dynamic_attrs
+    i8_ptr,                          # 7: weakref_list
+    ir.ArrayType(i64, 5),            # 8: lock (CRITICAL_SECTION = 40 bytes on x64)
 ])
 fpy_obj_ptr = ir.PointerType(fpy_obj_type)
 
@@ -13279,22 +13283,26 @@ class CodeGen:
 
     def _emit_slot_addr_direct(self, obj: ir.Value, slot_idx: int
                                 ) -> tuple[ir.Value, ir.Value]:
-        """Compute (&slot.tag, &slot.data) without issuing loads. Shared by
-        both read and write paths. The slots-pointer load is marked
-        !invariant.load — the obj->slots pointer is set once in obj_new
-        and never changes, so LLVM can CSE this load across multiple
-        attribute accesses on the same object (e.g., inside a loop)."""
+        """Compute (&slot.tag, &slot.data) via inline address arithmetic.
+
+        Since fastpy_obj_new allocates slots contiguously after the FpyObj
+        header (obj->slots = (FpyValue*)(obj + 1)), we can compute the slot
+        address as (FpyValue*)(obj + 1) + slot_idx — zero memory loads.
+        This eliminates one pointer-chase from the hot path (critical for
+        linked-list traversal where obj changes every iteration and the
+        slots-pointer load cannot be CSE'd across iterations).
+
+        Requires fpy_obj_type to model ALL fields of the C struct so that
+        sizeof(fpy_obj_type) == sizeof(FpyObj) in the LLVM data layout."""
         obj_typed = self.builder.bitcast(obj, fpy_obj_ptr)
-        slots_pp = self.builder.gep(
-            obj_typed,
-            [ir.Constant(i32, 0), ir.Constant(i32, 5)],  # index 5: slots (after refcount+pad, gc_node[3], magic+class_id)
-            inbounds=True)
-        slots_ptr = self.builder.load(slots_pp)
-        if not hasattr(self, "_invariant_md"):
-            self._invariant_md = self.module.add_metadata([])
-        slots_ptr.set_metadata("invariant.load", self._invariant_md)
+        # GEP by 1 element → advances by sizeof(FpyObj) bytes → first slot
+        past_obj = self.builder.gep(
+            obj_typed, [ir.Constant(i32, 1)], inbounds=True)
+        # Cast to FpyValue* (pointer to array of FpyValue)
+        slots_base = self.builder.bitcast(past_obj, fpy_val_ptr)
+        # Index into slot[slot_idx]
         slot_addr = self.builder.gep(
-            slots_ptr, [ir.Constant(i64, slot_idx)], inbounds=True)
+            slots_base, [ir.Constant(i64, slot_idx)], inbounds=True)
         tag_addr = self.builder.gep(
             slot_addr,
             [ir.Constant(i32, 0), ir.Constant(i32, 0)],
@@ -13356,24 +13364,7 @@ class CodeGen:
         increfing the new value (if borrowed) and decrefing the old
         value.  The higher-level ``_emit_attr_store`` handles this.
         """
-        obj_typed = self.builder.bitcast(obj, fpy_obj_ptr)
-        slots_pp = self.builder.gep(
-            obj_typed,
-            [ir.Constant(i32, 0), ir.Constant(i32, 5)],  # index 5: slots (after refcount+pad, gc_node[3], magic+class_id)
-            inbounds=True)
-        slots_ptr = self.builder.load(slots_pp)
-        slot_addr = self.builder.gep(
-            slots_ptr, [ir.Constant(i64, slot_idx)], inbounds=True)
-        tag_addr = self.builder.gep(
-            slot_addr,
-            [ir.Constant(i32, 0), ir.Constant(i32, 0)],
-            inbounds=True)
-        data_addr = self.builder.gep(
-            slot_addr,
-            [ir.Constant(i32, 0), ir.Constant(i32, 1)],
-            inbounds=True)
-
-        # Store new value.
+        tag_addr, data_addr = self._emit_slot_addr_direct(obj, slot_idx)
         self.builder.store(tag, tag_addr)
         self.builder.store(data, data_addr)
 
