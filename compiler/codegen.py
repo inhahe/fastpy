@@ -3210,11 +3210,11 @@ class CodeGen:
 
                 # Store the final decorated result
                 if isinstance(func_ptr.type, ir.PointerType):
-                    self._store_variable(node.name, func_ptr, "closure")
+                    self._store_variable(node.name, func_ptr, ValueType(VKind.CLOSURE))
                 else:
                     self._store_variable(
                         node.name,
-                        self._ensure_ptr(func_ptr), "closure")
+                        self._ensure_ptr(func_ptr), ValueType(VKind.CLOSURE))
 
     def _gen_compile_cpython(self, tree: ast.Module) -> None:
         """Compile CPython-bridge generators, classes, and function groups.
@@ -3244,7 +3244,7 @@ class CodeGen:
                 name_ptr = self._make_string_constant(node.name)
                 cls_ptr = self.builder.call(
                     self.runtime["cpython_exec_get"], [source_ptr, name_ptr])
-                self._store_variable(node.name, cls_ptr, "pyobj")
+                self._store_variable(node.name, cls_ptr, ValueType(VKind.PYOBJ))
 
         # Compile CPython-bridge function groups (e.g. dataclasses) via exec_get.
         if self._cpython_functions:
@@ -3273,7 +3273,7 @@ class CodeGen:
                 name_ptr = self._make_string_constant(base_name)
                 func_ptr = self.builder.call(
                     self.runtime["cpython_exec_get"], [source_ptr, name_ptr])
-                self._store_variable(base_name, func_ptr, "pyobj")
+                self._store_variable(base_name, func_ptr, ValueType(VKind.PYOBJ))
 
     def _gen_detect_bare_abi(self, tree: ast.Module) -> None:
         """Determine if module-level code can use bare-ABI mode.
@@ -3994,7 +3994,7 @@ class CodeGen:
                                       [closure])
 
                 # Store closure as a variable with the inner function's name
-                self._store_variable(node.name, closure, "closure")
+                self._store_variable(node.name, closure, ValueType(VKind.CLOSURE))
                 return
 
         # Not a closure — just a regular nested def (no captures)
@@ -4018,7 +4018,7 @@ class CodeGen:
                 if _inner_has_vararg:
                     self.builder.call(self.runtime["closure_set_vararg"],
                                       [closure])
-                self._store_variable(node.name, closure, "closure")
+                self._store_variable(node.name, closure, ValueType(VKind.CLOSURE))
             elif _inner_has_vararg:
                 # *args function: returns FpyValue but closure expects i64.
                 # Create a thin wrapper that extracts .data from the return.
@@ -4044,10 +4044,10 @@ class CodeGen:
                 ])
                 self.builder.call(self.runtime["closure_set_vararg"],
                                   [closure])
-                self._store_variable(node.name, closure, "closure")
+                self._store_variable(node.name, closure, ValueType(VKind.CLOSURE))
             else:
                 func_ptr = self.builder.ptrtoint(info.func, i64)
-                self._store_variable(node.name, func_ptr, "int")
+                self._store_variable(node.name, func_ptr, ValueType(VKind.INT))
 
     def _emit_closure_body(self, func: ir.Function, node: ast.FunctionDef,
                            captures: list[str]) -> None:
@@ -11939,7 +11939,7 @@ class CodeGen:
                 if not cls_info.methods:
                     cls_pyobj = self.builder.load(out_data)
                     cls_ptr = self._ensure_ptr(cls_pyobj)
-                    self._store_variable(cls_info.name, cls_ptr, "pyobj")
+                    self._store_variable(cls_info.name, cls_ptr, ValueType(VKind.PYOBJ))
 
         elif meta_name and meta_name in self._user_classes:
             meta_info = self._user_classes[meta_name]
@@ -12307,7 +12307,7 @@ class CodeGen:
             if is_pyobj_direct:
                 val = self._emit_expr_value(rhs)
                 val = self._ensure_ptr(val)
-                self._store_variable(target_name, val, "pyobj")
+                self._store_variable(target_name, val, ValueType(VKind.PYOBJ))
                 return True
             if is_pyobj_call or is_pyobj_call_chain:
                 pyobj_ptr = self._emit_cpython_call_raw(rhs)
@@ -12323,7 +12323,7 @@ class CodeGen:
                 attr_name = self._make_string_constant(rhs.attr)
                 pyobj_ptr = self.builder.call(
                     self.runtime["cpython_getattr"], [obj, attr_name])
-            self._store_variable(target_name, pyobj_ptr, "pyobj")
+            self._store_variable(target_name, pyobj_ptr, ValueType(VKind.PYOBJ))
             return True
 
         # --- BinOp on pyobj operands ---
@@ -12353,7 +12353,7 @@ class CodeGen:
                                    out_tag, out_data])
                 result_data = self.builder.load(out_data)
                 result_ptr = self._ensure_ptr(result_data)
-                self._store_variable(target_name, result_ptr, "pyobj")
+                self._store_variable(target_name, result_ptr, ValueType(VKind.PYOBJ))
                 return True
 
         # --- Native module call ---
@@ -12381,7 +12381,7 @@ class CodeGen:
                 fv = self._fv_build_from_slots(bridge_tag, bridge_data)
                 self._store_variable(target_name, fv, inferred)
             else:
-                self._store_variable(target_name, pyobj_ptr, "pyobj")
+                self._store_variable(target_name, pyobj_ptr, ValueType(VKind.PYOBJ))
             return True
 
         # --- FV-ABI user function call ---
@@ -12565,7 +12565,7 @@ class CodeGen:
             if mode.endswith('32'):
                 value = self.builder.sext(
                     self.builder.trunc(value, ir.IntType(32)), i64)
-            self._store_variable(varname, value, "int")
+            self._store_variable(varname, value, ValueType(VKind.INT))
             return
 
         # Track defaultdict factory type: d = defaultdict(list)
@@ -15141,7 +15141,7 @@ class CodeGen:
                         # unpacking a tuple.  list_slice copies the source
                         # is_tuple flag, so clear it explicitly.
                         self.builder.call(self.runtime["list_mark_list"], [rest])
-                        self._store_variable(name, rest, "list:int")
+                        self._store_variable(name, rest, ValueType(VKind.LIST, elem_type=ValueType(VKind.INT)))
                     elif isinstance(tgt, ast.Name):
                         if i < star_idx:
                             idx = ir.Constant(i64, i)
@@ -15150,7 +15150,7 @@ class CodeGen:
                             offset = len(target.elts) - i
                             idx = self.builder.sub(list_len, ir.Constant(i64, offset))
                         elem = self._list_get_as_bare(val, idx, "int")
-                        self._store_variable(tgt.id, elem, "int")
+                        self._store_variable(tgt.id, elem, ValueType(VKind.INT))
                     else:
                         self._bridge_fallback_stmt(node, "unsupported unpack target")
             else:
@@ -15179,7 +15179,7 @@ class CodeGen:
                         # Create a synthetic Name node so recursive call
                         # hits the list/tuple branch with the sub-list
                         _sub_name = f"__nested_unp_{i}"
-                        self._store_variable(_sub_name, sub_list, "list:int")
+                        self._store_variable(_sub_name, sub_list, ValueType(VKind.LIST, elem_type=ValueType(VKind.INT)))
                         sub_val_node = ast.Name(id=_sub_name, ctx=ast.Load())
                         self._emit_tuple_unpack(tgt, sub_val_node, node)
                     elif isinstance(tgt, ast.Subscript):
@@ -15208,7 +15208,7 @@ class CodeGen:
                     elem_data = self.builder.load(data_s)
                     # Build FpyValue directly from runtime tag+data
                     fv = self._fv_build_from_slots(elem_tag, elem_data)
-                    self._store_variable(tgt.id, fv, "int")
+                    self._store_variable(tgt.id, fv, ValueType(VKind.INT))
                 elif isinstance(tgt, (ast.Tuple, ast.List)):
                     # Nested unpack from general RHS
                     sub_list = self._list_get_as_bare(
@@ -15216,7 +15216,7 @@ class CodeGen:
                     self._unpack_targets_from_list(tgt.elts, sub_list, node)
                 elif isinstance(tgt, ast.Starred) and isinstance(tgt.value, ast.Name):
                     # *rest — collect remaining elements (skip for now)
-                    self._store_variable(tgt.value.id, val_ptr, "list:int")
+                    self._store_variable(tgt.value.id, val_ptr, ValueType(VKind.LIST, elem_type=ValueType(VKind.INT)))
                 elif isinstance(tgt, ast.Subscript):
                     # d[key], b = func() — extract element and store via
                     # subscript.  Use FV-ABI to preserve the runtime tag.
@@ -15456,7 +15456,7 @@ class CodeGen:
                     self.runtime["obj_call_method1"],
                     [obj, method_name, rhs_i64])
                 result = self._ensure_ptr(result_i64)
-                self._store_variable(target_name, result, "obj")
+                self._store_variable(target_name, result, ValueType(VKind.OBJ))
                 return
 
         # LIST += (list concatenation)
@@ -15480,14 +15480,14 @@ class CodeGen:
             result = self._rt_call("str_concat",
                                    [tv_current.as_ptr(self.builder),
                                     self._ensure_ptr(rhs)])
-            self._store_variable(target_name, result, "str")
+            self._store_variable(target_name, result, ValueType(VKind.STR))
             return
 
         # STR *= n (string repetition)
         if left_kind == VKind.STR and isinstance(node.op, ast.Mult):
             result = self._rt_call("str_repeat",
                                    [tv_current.as_ptr(self.builder), rhs])
-            self._store_variable(target_name, result, "str")
+            self._store_variable(target_name, result, ValueType(VKind.STR))
             return
 
         # SET |=, &=, -=, ^= (set operations — delegated to binop)
@@ -15497,7 +15497,7 @@ class CodeGen:
             synthetic_binop = ast.BinOp(left=node.target, op=node.op, right=node.value)
             ast.copy_location(synthetic_binop, node)
             result = self._emit_binop(synthetic_binop)
-            self._store_variable(target_name, result, "set")
+            self._store_variable(target_name, result, ValueType(VKind.SET))
             return
 
         # Legacy fallback for pointer types not caught above
@@ -15510,7 +15510,7 @@ class CodeGen:
                 return
             if isinstance(rhs.type, ir.PointerType):
                 result = self._rt_call("str_concat", [current, rhs])
-                self._store_variable(target_name, result, "str")
+                self._store_variable(target_name, result, ValueType(VKind.STR))
                 return
 
         if isinstance(current.type, ir.PointerType) and isinstance(node.op, ast.Mult):
@@ -16262,7 +16262,7 @@ class CodeGen:
                     mod_ptr = self.builder.call(
                         self.runtime["cpython_import"],
                         [self._make_string_constant(name)])
-                    self._store_variable(name, mod_ptr, "pyobj")
+                    self._store_variable(name, mod_ptr, ValueType(VKind.PYOBJ))
                     return mod_ptr
                 except (ImportError, ValueError):
                     # Truly undefined variable — emit NameError at runtime.
@@ -16827,7 +16827,7 @@ class CodeGen:
         var_name = node.target.id
 
         # Initialize loop variable
-        self._store_variable(var_name, start, "int")
+        self._store_variable(var_name, start, ValueType(VKind.INT))
 
         cond_block = self._new_block("for.cond")
         body_block = self._new_block("for.body")
@@ -16863,7 +16863,7 @@ class CodeGen:
         self.builder.position_at_end(incr_block)
         current = self._load_variable(var_name, node)
         incremented = self.builder.add(current, step)
-        self._store_variable(var_name, incremented, "int")
+        self._store_variable(var_name, incremented, ValueType(VKind.INT))
         self.builder.branch(cond_block)
 
         # Else (runs if loop completed without break)
@@ -16923,7 +16923,7 @@ class CodeGen:
                     self.runtime["cpython_call0_raw"], [enter_method])
                 # Bind `as var` as pyobj
                 if opt_var is not None and isinstance(opt_var, ast.Name):
-                    self._store_variable(opt_var.id, enter_result, "pyobj")
+                    self._store_variable(opt_var.id, enter_result, ValueType(VKind.PYOBJ))
             else:
                 mgr = self._emit_expr_value(ctx_expr)
                 # Ensure mgr is a pointer (object)
@@ -16955,7 +16955,7 @@ class CodeGen:
                     if _returns_self and cls:
                         val_ptr = self._ensure_ptr(
                             enter_result, name="with.val")
-                        self._store_variable(opt_var.id, val_ptr, "obj")
+                        self._store_variable(opt_var.id, val_ptr, ValueType(VKind.OBJ))
                         self._obj_var_class[opt_var.id] = cls
                     else:
                         # __enter__ returns a non-self value (int, str, etc.)
@@ -16963,7 +16963,7 @@ class CodeGen:
                         ret_tag = self.builder.call(
                             self.runtime["get_ret_tag"], [])
                         fv = self._fv_build_from_slots(ret_tag, enter_result)
-                        self._store_variable(opt_var.id, fv, "int")
+                        self._store_variable(opt_var.id, fv, ValueType(VKind.INT))
 
             # Store mgr pointer for the finally block's __exit__ call.
             # Use a local alloca so it survives across basic blocks.
@@ -17217,13 +17217,13 @@ class CodeGen:
                     subject_fv, subject_tag, subject_data,
                     pattern.pattern, node)
                 if pattern.name:
-                    self._store_variable(pattern.name, subject_fv, "int")
+                    self._store_variable(pattern.name, subject_fv, ValueType(VKind.INT))
                 return inner
             if pattern.name is None:
                 # case _ → wildcard, always matches
                 return None
             # case name → capture, always matches, binds subject
-            self._store_variable(pattern.name, subject_fv, "int")
+            self._store_variable(pattern.name, subject_fv, ValueType(VKind.INT))
             return None
 
         # ── MatchOr: case 1 | 2 | 3 ──────────────────────────────────
@@ -17319,7 +17319,7 @@ class CodeGen:
                         ir.Constant(i64, 1),  # has_stop
                     ])
                     star_fv = self._fv_from_list(star_list)
-                    self._store_variable(star_pat.name, star_fv, "list:int")
+                    self._store_variable(star_pat.name, star_fv, ValueType(VKind.LIST, elem_type=ValueType(VKind.INT)))
             else:
                 # No star — exact-length matching (original code)
                 for i, sub_pat in enumerate(pattern.patterns):
@@ -17447,7 +17447,7 @@ class CodeGen:
                     self.builder.position_at_end(store_blk)
                     self._store_variable(
                         pattern.patterns[0].name, subject_fv,
-                        _BUILTIN_TYPE_TAG.get(cls_name, "int"))
+                        _BUILTIN_TYPE_TAG.get(cls_name, ValueType(VKind.INT)))
                     self.builder.branch(skip_blk)
                     self.builder.position_at_end(skip_blk)
                 return tag_ok
@@ -17559,7 +17559,7 @@ class CodeGen:
         name_ptr = self._make_string_constant(effective_name)
         func_ptr = self.builder.call(
             self.runtime["cpython_exec_get"], [source_ptr, name_ptr])
-        self._store_variable(effective_name, func_ptr, "pyobj")
+        self._store_variable(effective_name, func_ptr, ValueType(VKind.PYOBJ))
 
     def _emit_yield(self, node: ast.Yield) -> None:
         """Emit `yield val` — appends to the generator's result list.
@@ -17687,7 +17687,7 @@ class CodeGen:
                 mod_ptr = self.builder.call(
                     self.runtime["cpython_import"],
                     [self._make_string_constant(mod_name)])
-                self._store_variable(var_name, mod_ptr, "native_mod")
+                self._store_variable(var_name, mod_ptr, ValueType(VKind.NATIVE_MOD))
                 # For dotted imports (import os.path), also store top-level name
                 if "." in var_name:
                     top = var_name.split(".")[0]
@@ -17696,7 +17696,7 @@ class CodeGen:
                         top_ptr = self.builder.call(
                             self.runtime["cpython_import"],
                             [self._make_string_constant(top)])
-                        self._store_variable(top, top_ptr, "native_mod")
+                        self._store_variable(top, top_ptr, ValueType(VKind.NATIVE_MOD))
                 continue
 
             # Create a global to hold the module PyObject*
@@ -17733,7 +17733,7 @@ class CodeGen:
                 top_mod = self.builder.call(
                     self.runtime["cpython_import"], [top_name_ptr])
                 self.builder.store(top_mod, self._cpython_modules[top_name])
-                self._store_variable(top_name, top_mod, "pyobj")
+                self._store_variable(top_name, top_mod, ValueType(VKind.PYOBJ))
             else:
                 # Module-level imports must be LLVM globals so user
                 # functions can access them as bare names.
@@ -17746,7 +17746,7 @@ class CodeGen:
                     gvar.linkage = "private"
                     self._global_vars[var_name] = (
                         gvar, ValueType(VKind.PYOBJ))
-                self._store_variable(var_name, mod_ptr, "pyobj")
+                self._store_variable(var_name, mod_ptr, ValueType(VKind.PYOBJ))
 
     def _emit_import_from(self, node: ast.ImportFrom) -> None:
         """Emit `from module import name1, name2`."""
@@ -17841,7 +17841,7 @@ class CodeGen:
                 gvar.linkage = "private"
                 self._global_vars[var_name] = (
                     gvar, ValueType(VKind.PYOBJ))
-            self._store_variable(var_name, pyobj, "pyobj")
+            self._store_variable(var_name, pyobj, ValueType(VKind.PYOBJ))
             # Track the module/attr so we can re-fetch at call time
             if not hasattr(self, '_bridge_imports'):
                 self._bridge_imports = {}
@@ -18014,7 +18014,7 @@ class CodeGen:
                 self.builder.position_at_end(handler_block)
                 if handler.name:
                     msg = self.builder.call(self.runtime["exc_get_msg"], [])
-                    self._store_variable(handler.name, msg, "str")
+                    self._store_variable(handler.name, msg, ValueType(VKind.STR))
                 self.builder.call(self.runtime["exc_clear"], [])
                 self._emit_stmts(handler.body)
                 if not self.builder.block.is_terminated:
@@ -18621,7 +18621,7 @@ class CodeGen:
                     # bare except:
                     if handler.name:
                         msg = self.builder.call(self.runtime["exc_get_msg"], [])
-                        self._store_variable(handler.name, msg, "str")
+                        self._store_variable(handler.name, msg, ValueType(VKind.STR))
                     self.builder.call(self.runtime["exc_clear"], [])
                     self._emit_stmts(handler.body)
                     if not self.builder.block.is_terminated:
@@ -18670,7 +18670,7 @@ class CodeGen:
                     self.builder.position_at_end(handler_block)
                     if handler.name:
                         msg = self.builder.call(self.runtime["exc_get_msg"], [])
-                        self._store_variable(handler.name, msg, "str")
+                        self._store_variable(handler.name, msg, ValueType(VKind.STR))
                         # Track the exception class name for type(e).__name__
                         if isinstance(handler.type, ast.Name):
                             self._exc_vars[handler.name] = handler.type.id
@@ -19275,8 +19275,8 @@ class CodeGen:
         self._block_counter += 1
         idx_name = f"__enum_idx_{self._block_counter}"
         cnt_name = f"__enum_cnt_{self._block_counter}"
-        self._store_variable(idx_name, ir.Constant(i64, 0), "int")
-        self._store_variable(cnt_name, start_val, "int")
+        self._store_variable(idx_name, ir.Constant(i64, 0), ValueType(VKind.INT))
+        self._store_variable(cnt_name, start_val, ValueType(VKind.INT))
 
         cond_block = self._new_block("forenum.cond")
         body_block = self._new_block("forenum.body")
@@ -19297,7 +19297,7 @@ class CodeGen:
         # Assign the counter variable (first target)
         idx_target = targets[0]
         if isinstance(idx_target, ast.Name):
-            self._store_variable(idx_target.id, cnt, "int")
+            self._store_variable(idx_target.id, cnt, ValueType(VKind.INT))
 
         # Assign the element variable (second target)
         val_target = targets[1]
@@ -19305,7 +19305,7 @@ class CodeGen:
             # String iteration: extract single character via str_index
             if isinstance(val_target, ast.Name):
                 ch = self._rt_call("str_index", [lst_ptr, idx])
-                self._store_variable(val_target.id, ch, "str")
+                self._store_variable(val_target.id, ch, ValueType(VKind.STR))
         elif isinstance(val_target, ast.Name):
             elem_type = self._get_list_elem_type(lst_node)
             _ek = elem_type.kind
@@ -19339,8 +19339,8 @@ class CodeGen:
         self.builder.position_at_end(incr_block)
         idx = self._load_variable(idx_name, node)
         cnt = self._load_variable(cnt_name, node)
-        self._store_variable(idx_name, self.builder.add(idx, ir.Constant(i64, 1)), "int")
-        self._store_variable(cnt_name, self.builder.add(cnt, ir.Constant(i64, 1)), "int")
+        self._store_variable(idx_name, self.builder.add(idx, ir.Constant(i64, 1)), ValueType(VKind.INT))
+        self._store_variable(cnt_name, self.builder.add(cnt, ir.Constant(i64, 1)), ValueType(VKind.INT))
         self.builder.branch(cond_block)
 
         self.builder.position_at_end(end_block)
@@ -19395,7 +19395,7 @@ class CodeGen:
         # don't clobber each other's counter.
         self._block_counter += 1
         idx_name = f"__for_tup_idx_{self._block_counter}"
-        self._store_variable(idx_name, ir.Constant(i64, 0), "int")
+        self._store_variable(idx_name, ir.Constant(i64, 0), ValueType(VKind.INT))
 
         cond_block = self._new_block("fort.cond")
         body_block = self._new_block("fort.body")
@@ -19439,7 +19439,7 @@ class CodeGen:
                     rest = self._rt_call("list_slice", [
                         elem_list, start, stop, ir.Constant(i64, 1),
                         ir.Constant(i64, 1)])
-                    self._store_variable(name, rest, "list:int")
+                    self._store_variable(name, rest, ValueType(VKind.LIST, elem_type=ValueType(VKind.INT)))
                 elif isinstance(tgt, ast.Name):
                     if i < star_idx:
                         el_idx = ir.Constant(i64, i)
@@ -19477,7 +19477,7 @@ class CodeGen:
 
         self.builder.position_at_end(incr_block)
         idx = self._load_variable(idx_name, node)
-        self._store_variable(idx_name, self.builder.add(idx, ir.Constant(i64, 1)), "int")
+        self._store_variable(idx_name, self.builder.add(idx, ir.Constant(i64, 1)), ValueType(VKind.INT))
         self.builder.branch(cond_block)
 
         self.builder.position_at_end(end_block)
@@ -19499,7 +19499,7 @@ class CodeGen:
         str_len = self._rt_call("str_len", [str_val])
 
         idx_name = f"__idx_str_{var_name}"
-        self._store_variable(idx_name, ir.Constant(i64, 0), "int")
+        self._store_variable(idx_name, ir.Constant(i64, 0), ValueType(VKind.INT))
 
         cond_block = self._new_block("fors.cond")
         body_block = self._new_block("fors.body")
@@ -19515,7 +19515,7 @@ class CodeGen:
         self.builder.position_at_end(body_block)
         idx = self._load_variable(idx_name, node)
         ch = self._rt_call("str_index", [str_val, idx])
-        self._store_variable(var_name, ch, "str")
+        self._store_variable(var_name, ch, ValueType(VKind.STR))
 
         self._loop_stack.append((end_block, incr_block))
         _prev_hot = self._in_hot_loop
@@ -19528,7 +19528,7 @@ class CodeGen:
 
         self.builder.position_at_end(incr_block)
         idx = self._load_variable(idx_name, node)
-        self._store_variable(idx_name, self.builder.add(idx, ir.Constant(i64, 1)), "int")
+        self._store_variable(idx_name, self.builder.add(idx, ir.Constant(i64, 1)), ValueType(VKind.INT))
         self.builder.branch(cond_block)
 
         self.builder.position_at_end(end_block)
@@ -19580,7 +19580,7 @@ class CodeGen:
 
         self.builder.position_at_end(body_block)
         # Store the result as the loop variable
-        self._store_variable(var_name, result, "int")
+        self._store_variable(var_name, result, ValueType(VKind.INT))
 
         self._loop_stack.append((end_block, cond_block))
         _prev_hot = self._in_hot_loop
@@ -19642,7 +19642,7 @@ class CodeGen:
         self.builder.position_at_end(body_block)
         # Store the raw PyObject* as pyobj — keeps item as a Python object
         # for downstream operations (print, attribute access, method calls).
-        self._store_variable(var_name, raw_item, "pyobj")
+        self._store_variable(var_name, raw_item, ValueType(VKind.PYOBJ))
 
         self._loop_stack.append((end_block, cond_block))
         _prev_hot = self._in_hot_loop
@@ -19686,7 +19686,7 @@ class CodeGen:
         self._rt_call("list_get_fv",
                           [lst, idx, tag_slot, data_slot])
         elem = self.builder.load(data_slot)
-        self._store_variable(var_name, elem, "int")
+        self._store_variable(var_name, elem, ValueType(VKind.INT))
 
         self._loop_stack.append((end_block, cond_block))
         _prev_hot = self._in_hot_loop
@@ -19719,7 +19719,7 @@ class CodeGen:
 
         # Index variable
         idx_name = f"__idx_{var_name}"
-        self._store_variable(idx_name, ir.Constant(i64, 0), "int")
+        self._store_variable(idx_name, ir.Constant(i64, 0), ValueType(VKind.INT))
 
         cond_block = self._new_block("forl.cond")
         body_block = self._new_block("forl.body")
@@ -19742,14 +19742,10 @@ class CodeGen:
         elem_type = self._get_list_elem_type(node.iter)
         elem_kind = elem_type.kind
         # Determine the variable's tag from the list's element type
-        _ELEM_KIND_TO_TAG = {
-            VKind.OBJ: "obj", VKind.STR: "str", VKind.DICT: "dict",
-            VKind.TUPLE: "tuple", VKind.FLOAT: "float", VKind.PYOBJ: "pyobj",
-        }
         if elem_kind == VKind.LIST:
-            var_tag = str(elem_type) if elem_type.elem_type else "list:int"
+            var_tag = elem_type if elem_type.elem_type else ValueType(VKind.LIST, elem_type=ValueType(VKind.INT))
         else:
-            var_tag = _ELEM_KIND_TO_TAG.get(elem_kind, "int")
+            var_tag = ValueType(elem_kind) if elem_kind != VKind.INT else ValueType(VKind.INT)
 
         # F1 optimization: for int/float element lists, use inline GEP
         # to read element data directly instead of calling list_get_fv.
@@ -19790,7 +19786,7 @@ class CodeGen:
         self.builder.position_at_end(incr_block)
         idx = self._load_variable(idx_name, node)
         incremented = self.builder.add(idx, ir.Constant(i64, 1))
-        self._store_variable(idx_name, incremented, "int")
+        self._store_variable(idx_name, incremented, ValueType(VKind.INT))
         self.builder.branch(cond_block)
 
         if else_block:
@@ -19840,7 +19836,7 @@ class CodeGen:
                 pass  # int is a safe default for sets
 
         idx_name = f"__idx_{var_name}"
-        self._store_variable(idx_name, ir.Constant(i64, 0), "int")
+        self._store_variable(idx_name, ir.Constant(i64, 0), ValueType(VKind.INT))
 
         cond_block = self._new_block("ford.cond")
         body_block = self._new_block("ford.body")
@@ -19874,7 +19870,7 @@ class CodeGen:
         self.builder.position_at_end(incr_block)
         idx = self._load_variable(idx_name, node)
         incremented = self.builder.add(idx, ir.Constant(i64, 1))
-        self._store_variable(idx_name, incremented, "int")
+        self._store_variable(idx_name, incremented, ValueType(VKind.INT))
         self.builder.branch(cond_block)
 
         if else_block:
@@ -19909,7 +19905,7 @@ class CodeGen:
 
         self._block_counter += 1
         idx_name = f"__for_di_idx_{self._block_counter}"
-        self._store_variable(idx_name, ir.Constant(i64, 0), "int")
+        self._store_variable(idx_name, ir.Constant(i64, 0), ValueType(VKind.INT))
 
         cond_block = self._new_block("fdi.cond")
         body_block = self._new_block("fdi.body")
@@ -19946,7 +19942,7 @@ class CodeGen:
         self.builder.position_at_end(incr_block)
         idx = self._load_variable(idx_name, node)
         incremented = self.builder.add(idx, ir.Constant(i64, 1))
-        self._store_variable(idx_name, incremented, "int")
+        self._store_variable(idx_name, incremented, ValueType(VKind.INT))
         self.builder.branch(cond_block)
 
         if else_block:
@@ -32506,7 +32502,7 @@ class CodeGen:
                 stop = self._emit_expr_value(range_args[1])
                 step = self._emit_expr_value(range_args[2])
 
-            self._store_variable(var_name, start, "int")
+            self._store_variable(var_name, start, ValueType(VKind.INT))
 
             cond_block = self._new_block("lc.cond")
             body_block = self._new_block("lc.body")
@@ -32525,7 +32521,7 @@ class CodeGen:
             self.builder.position_at_end(incr_block)
             current = self._load_variable(var_name, node)
             incremented = self.builder.add(current, step)
-            self._store_variable(var_name, incremented, "int")
+            self._store_variable(var_name, incremented, ValueType(VKind.INT))
             self.builder.branch(cond_block)
 
             self.builder.position_at_end(end_block)
@@ -32535,7 +32531,7 @@ class CodeGen:
             iter_len = self._rt_call("list_length", [iter_val])
 
             idx_name = f"__lc_idx_{var_name}"
-            self._store_variable(idx_name, ir.Constant(i64, 0), "int")
+            self._store_variable(idx_name, ir.Constant(i64, 0), ValueType(VKind.INT))
 
             cond_block = self._new_block("lc.cond")
             body_block = self._new_block("lc.body")
@@ -32601,7 +32597,7 @@ class CodeGen:
 
             self.builder.position_at_end(incr_block)
             idx = self._load_variable(idx_name, node)
-            self._store_variable(idx_name, self.builder.add(idx, ir.Constant(i64, 1)), "int")
+            self._store_variable(idx_name, self.builder.add(idx, ir.Constant(i64, 1)), ValueType(VKind.INT))
             self.builder.branch(cond_block)
 
             self.builder.position_at_end(end_block)
@@ -32647,11 +32643,11 @@ class CodeGen:
                 start = ir.Constant(i64, 0) if len(r_args) == 1 else self._emit_expr_value(r_args[0])
                 stop = self._emit_expr_value(r_args[0] if len(r_args) == 1 else r_args[1])
                 step = ir.Constant(i64, 1) if len(r_args) < 3 else self._emit_expr_value(r_args[2])
-                self._store_variable(var, start, "int")
+                self._store_variable(var, start, ValueType(VKind.INT))
             else:
                 iter_val = self._emit_expr_value(gen.iter)
                 iter_len = self._rt_call("list_length", [iter_val])
-                self._store_variable(idx_name, ir.Constant(i64, 0), "int")
+                self._store_variable(idx_name, ir.Constant(i64, 0), ValueType(VKind.INT))
 
             cond_b = self._new_block(f"{lbl}.cond")
             body_b = self._new_block(f"{lbl}.body")
@@ -32695,10 +32691,10 @@ class CodeGen:
             self.builder.position_at_end(incr_b)
             if is_range:
                 cur = self._load_variable(var, node)
-                self._store_variable(var, self.builder.add(cur, step), "int")
+                self._store_variable(var, self.builder.add(cur, step), ValueType(VKind.INT))
             else:
                 idx = self._load_variable(idx_name, node)
-                self._store_variable(idx_name, self.builder.add(idx, ir.Constant(i64, 1)), "int")
+                self._store_variable(idx_name, self.builder.add(idx, ir.Constant(i64, 1)), ValueType(VKind.INT))
             self.builder.branch(cond_b)
 
             self.builder.position_at_end(end_b)
@@ -32727,11 +32723,11 @@ class CodeGen:
             range_args = gen0.iter.args
             start0 = ir.Constant(i64, 0) if len(range_args) == 1 else self._emit_expr_value(range_args[0])
             stop0 = self._emit_expr_value(range_args[0] if len(range_args) == 1 else range_args[1])
-            self._store_variable(var0, start0, "int")
+            self._store_variable(var0, start0, ValueType(VKind.INT))
         else:
             outer_list = self._emit_expr_value(gen0.iter)
             outer_len = self._rt_call("list_length", [outer_list])
-            self._store_variable(idx0_name, ir.Constant(i64, 0), "int")
+            self._store_variable(idx0_name, ir.Constant(i64, 0), ValueType(VKind.INT))
 
         outer_cond = self._new_block("nlc.outer.cond")
         outer_body = self._new_block("nlc.outer.body")
@@ -32765,13 +32761,13 @@ class CodeGen:
             r1args = gen1.iter.args
             start1 = ir.Constant(i64, 0) if len(r1args) == 1 else self._emit_expr_value(r1args[0])
             stop1 = self._emit_expr_value(r1args[0] if len(r1args) == 1 else r1args[1])
-            self._store_variable(var1, start1, "int")
+            self._store_variable(var1, start1, ValueType(VKind.INT))
         else:
             # Iterate over list/variable
             inner_list = self._emit_expr_value(gen1.iter)
             inner_len = self._rt_call("list_length", [inner_list])
             idx1_name = f"__nlc_idx_{var1}"
-            self._store_variable(idx1_name, ir.Constant(i64, 0), "int")
+            self._store_variable(idx1_name, ir.Constant(i64, 0), ValueType(VKind.INT))
 
         inner_cond = self._new_block("nlc.inner.cond")
         inner_body = self._new_block("nlc.inner.body")
@@ -32798,10 +32794,10 @@ class CodeGen:
         self.builder.position_at_end(inner_incr)
         if is_range1:
             cur1 = self._load_variable(var1, node)
-            self._store_variable(var1, self.builder.add(cur1, ir.Constant(i64, 1)), "int")
+            self._store_variable(var1, self.builder.add(cur1, ir.Constant(i64, 1)), ValueType(VKind.INT))
         else:
             idx1 = self._load_variable(idx1_name, node)
-            self._store_variable(idx1_name, self.builder.add(idx1, ir.Constant(i64, 1)), "int")
+            self._store_variable(idx1_name, self.builder.add(idx1, ir.Constant(i64, 1)), ValueType(VKind.INT))
         self.builder.branch(inner_cond)
 
         self.builder.position_at_end(inner_end)
@@ -32810,10 +32806,10 @@ class CodeGen:
         self.builder.position_at_end(outer_incr)
         if is_range0:
             cur0 = self._load_variable(var0, node)
-            self._store_variable(var0, self.builder.add(cur0, ir.Constant(i64, 1)), "int")
+            self._store_variable(var0, self.builder.add(cur0, ir.Constant(i64, 1)), ValueType(VKind.INT))
         else:
             idx0 = self._load_variable(idx0_name, node)
-            self._store_variable(idx0_name, self.builder.add(idx0, ir.Constant(i64, 1)), "int")
+            self._store_variable(idx0_name, self.builder.add(idx0, ir.Constant(i64, 1)), ValueType(VKind.INT))
         self.builder.branch(outer_cond)
 
         self.builder.position_at_end(outer_end)
@@ -33020,7 +33016,7 @@ class CodeGen:
             idx = self.builder.load(idx_alloca)
             if iter_kind == VKind.STR:
                 char_ptr = self._rt_call("str_index", [list_ptr, idx])
-                self._store_variable(var_name, char_ptr, "str")
+                self._store_variable(var_name, char_ptr, ValueType(VKind.STR))
             elif _dc_dict_zerocopy:
                 # F2: zero-copy dict key access
                 self._fv_store_from_list(var_name, list_ptr, idx, var_tag,
@@ -33072,7 +33068,7 @@ class CodeGen:
             step = ir.Constant(i64, 1) if len(range_args) < 3 else self._emit_expr_value(range_args[2])
 
         var_name = gen.target.id
-        self._store_variable(var_name, start, "int")
+        self._store_variable(var_name, start, ValueType(VKind.INT))
 
         cond_block = self._new_block("dc.cond")
         body_block = self._new_block("dc.body")
@@ -33114,7 +33110,7 @@ class CodeGen:
 
         self.builder.position_at_end(incr_block)
         current = self._load_variable(var_name, node)
-        self._store_variable(var_name, self.builder.add(current, step), "int")
+        self._store_variable(var_name, self.builder.add(current, step), ValueType(VKind.INT))
         self.builder.branch(cond_block)
 
         self.builder.position_at_end(end_block)
