@@ -159,6 +159,7 @@ class VKind(Enum):
     COUNTER = auto()    # collections.Counter (dict-like with count semantics)
     DEFAULTDICT = auto()  # collections.defaultdict (dict with factory)
     DEQUE = auto()      # collections.deque (list-like with O(1) popleft)
+    CHAINMAP = auto()   # collections.ChainMap (layered dict)
     NATIVE_MOD = auto()  # imported native module (e.g. json, os, math)
     NATIVE_FUNC = auto()  # from-imported native function (e.g. from math import sqrt)
     LOGGER = auto()     # logging.Logger instance
@@ -173,7 +174,7 @@ class VKind(Enum):
                         VKind.DECIMAL, VKind.COMPLEX, VKind.BIGINT,
                         VKind.CLOSURE, VKind.CELL, VKind.PATH,
                         VKind.COUNTER, VKind.DEFAULTDICT, VKind.DEQUE,
-                        VKind.NATIVE_MOD, VKind.LOGGER)
+                        VKind.CHAINMAP, VKind.NATIVE_MOD, VKind.LOGGER)
 
     @property
     def fpy_tag(self) -> int:
@@ -185,7 +186,8 @@ class VKind(Enum):
             VKind.COMPLEX: 11, VKind.DECIMAL: 12, VKind.TUPLE: 5,
             VKind.PYOBJ: 6, VKind.CLOSURE: 0,
             VKind.PATH: 6, VKind.COUNTER: 7, VKind.DEFAULTDICT: 7,
-            VKind.DEQUE: 5, VKind.NATIVE_MOD: 6, VKind.LOGGER: 6,
+            VKind.DEQUE: 5, VKind.CHAINMAP: 6,
+            VKind.NATIVE_MOD: 6, VKind.LOGGER: 6,
         }.get(self, 0)
 
     @property
@@ -238,8 +240,10 @@ class ValueType:
         self.class_name = class_name
         self._tag_cache: str | None = None
 
-    # --- String tag compatibility layer ---
-    # These methods let ValueType be used wherever a string tag was expected.
+    # --- String tag conversion ---
+    # _to_tag() converts ValueType to the old string format for CSA boundaries,
+    # debug output, and FuncInfo.ret_tag interop. The string equality,
+    # startswith/split/__contains__ compat methods were removed in C2.
 
     def _to_tag(self) -> str:
         """Convert to old-style string tag for backward compatibility."""
@@ -255,7 +259,8 @@ class ValueType:
             VKind.CLS: "cls", VKind.FVALUE: "int",
             VKind.UNKNOWN: "int", VKind.PATH: "path",
             VKind.COUNTER: "counter", VKind.DEFAULTDICT: "defaultdict",
-            VKind.DEQUE: "deque", VKind.NATIVE_MOD: "native_mod",
+            VKind.DEQUE: "deque", VKind.CHAINMAP: "chainmap",
+            VKind.NATIVE_MOD: "native_mod",
             VKind.NATIVE_FUNC: "native_func", VKind.LOGGER: "logger",
             VKind.MIXED: "mixed",
         }
@@ -268,8 +273,6 @@ class ValueType:
         return base
 
     def __eq__(self, other):
-        if isinstance(other, str):
-            return self._to_tag() == other
         if isinstance(other, ValueType):
             return self.kind == other.kind and self.elem_type == other.elem_type
         if isinstance(other, VKind):
@@ -283,7 +286,7 @@ class ValueType:
         return not result
 
     def __hash__(self):
-        return hash(self._to_tag())
+        return hash((self.kind, self.elem_type))
 
     def __repr__(self):
         return f"ValueType({self._to_tag()})"
@@ -294,15 +297,9 @@ class ValueType:
     def __bool__(self):
         return True  # a ValueType is always truthy (non-empty tag)
 
-    # String protocol methods for backward compatibility
-    def startswith(self, prefix: str) -> bool:
-        return self._to_tag().startswith(prefix)
-
-    def split(self, sep: str, maxsplit: int = -1) -> list[str]:
-        return self._to_tag().split(sep, maxsplit)
-
-    def __contains__(self, item: str) -> bool:
-        return item in self._to_tag()
+    # NOTE: String protocol methods (startswith, split, __contains__)
+    # were removed in C2. All codegen-layer code now uses VKind-based
+    # comparisons instead of treating ValueType as a string.
 
     # Support `tag in ("str", "int", ...)` membership tests
     # This is handled by __eq__ above via the tuple's __contains__.
@@ -322,13 +319,13 @@ class ValueType:
             "complex": VKind.COMPLEX, "bigint": VKind.BIGINT,
             "bytes": VKind.BYTES, "closure": VKind.CLOSURE,
             "mixed": VKind.MIXED,
-            # Aliases: counter/defaultdict share FpyDict struct, so all
-            # dict runtime functions work — keep as VKind.DICT.
-            # The _is_deque_expr/_is_counter_expr helpers check raw string
-            # tags for type-specific dispatch.
-            "counter": VKind.DICT, "defaultdict": VKind.DICT,
+            # Specialized collection subtypes — each has its own VKind even
+            # though they share runtime structs (e.g. counter/defaultdict use
+            # FpyDict, chainmap uses FpyObj).  The VKind distinction drives
+            # compile-time type checks (_is_counter_expr, etc.).
+            "counter": VKind.COUNTER, "defaultdict": VKind.DEFAULTDICT,
             "deque": VKind.DEQUE,
-            "chainmap": VKind.OBJ, "logger": VKind.OBJ,
+            "chainmap": VKind.CHAINMAP, "logger": VKind.LOGGER,
             "ptr": VKind.LIST, "ptr:list": VKind.LIST,
             "path": VKind.PATH, "native_func": VKind.NATIVE_FUNC,
             "native_mod": VKind.NATIVE_MOD, "cls": VKind.CLS,
@@ -6558,13 +6555,17 @@ class CodeGen:
             return self._infer_call_arg_type(node.operand)
         if isinstance(node, ast.Name):
             if node.id in self.variables:
-                _, tag = self.variables[node.id]
-                _tk = (tag.kind if isinstance(tag, ValueType)
-                       else self._tag_kind(tag))
+                _tk = self._var_kind(node.id)
+                # Map collection subtypes to their base kind for specialization
+                _DICT_LIKE_KINDS = (VKind.DICT, VKind.COUNTER,
+                                    VKind.DEFAULTDICT, VKind.CHAINMAP)
+                _OBJ_LIKE_KINDS = (VKind.OBJ, VKind.LOGGER)
                 if _tk in (VKind.INT, VKind.FLOAT, VKind.STR,
-                           VKind.BOOL, VKind.OBJ, VKind.LIST,
-                           VKind.DICT):
-                    return str(tag) if _tk != VKind.DICT else "dict"
+                           VKind.BOOL, VKind.LIST) + _OBJ_LIKE_KINDS:
+                    _, tag = self.variables[node.id]
+                    return tag._to_tag() if isinstance(tag, ValueType) else str(tag)
+                if _tk in _DICT_LIKE_KINDS:
+                    return "dict"
         # Attribute access: resolve via the owning class's attr-type sets.
         # This lets `compute(self.val)` monomorphize correctly when val is
         # a known-typed attr (float/bool/string/list/dict/obj).
@@ -12397,14 +12398,15 @@ class CodeGen:
             info = self._user_functions[lookup_name]
             if (info.uses_fv_abi and info.ret_tag != "void"):
                 fv = self._emit_user_call_fv(rhs)
-                type_tag = info.ret_tag
-                if type_tag == "ptr":
-                    type_tag = "list:int"
-                elif type_tag == "ptr:list":
-                    type_tag = "list:list"
+                if info.ret_tag == "ptr":
+                    type_vt = ValueType(VKind.LIST, elem_type=ValueType(VKind.INT))
+                elif info.ret_tag == "ptr:list":
+                    type_vt = ValueType(VKind.LIST, elem_type=ValueType(VKind.LIST))
+                else:
+                    type_vt = ValueType.from_old_tag(info.ret_tag)
                 if target_name in self._user_functions:
-                    type_tag = "closure"
-                self._store_variable(target_name, fv, type_tag)
+                    type_vt = ValueType(VKind.CLOSURE)
+                self._store_variable(target_name, fv, type_vt)
                 return True
 
         # --- Attribute RHS on object receiver ---
@@ -14217,7 +14219,7 @@ class CodeGen:
                 elif fn == "namedtuple":
                     return ValueType(VKind.INT)
                 elif fn == "ChainMap":
-                    return ValueType(VKind.OBJ)
+                    return ValueType(VKind.CHAINMAP)
         # Collections module — from-import calls: Counter(), defaultdict(), deque()
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
             native_imports = getattr(self, '_native_imports', {})
@@ -14235,7 +14237,7 @@ class CodeGen:
                     elif fn == "namedtuple":
                         return ValueType(VKind.INT)
                     elif fn == "ChainMap":
-                        return ValueType(VKind.OBJ)
+                        return ValueType(VKind.CHAINMAP)
                 if mod == "logging" and fn == "getLogger":
                     return ValueType(VKind.LOGGER)
                 if mod == "functools" and fn == "partial":
@@ -15463,16 +15465,18 @@ class CodeGen:
         if left_kind in (VKind.LIST, VKind.TUPLE) and isinstance(node.op, ast.Add):
             result = self._rt_call("list_concat",
                                    [tv_current.as_ptr(self.builder), rhs])
-            _, tag = self.variables.get(target_name, (None, "list:int"))
-            self._store_variable(target_name, result, tag or "list:int")
+            _default_list = ValueType(VKind.LIST, elem_type=ValueType(VKind.INT))
+            _, tag = self.variables.get(target_name, (None, _default_list))
+            self._store_variable(target_name, result, tag or _default_list)
             return
 
         # LIST *= n (list repetition)
         if left_kind in (VKind.LIST, VKind.TUPLE) and isinstance(node.op, ast.Mult):
             result = self._rt_call("list_repeat",
                                    [tv_current.as_ptr(self.builder), rhs])
-            _, tag = self.variables.get(target_name, (None, "list:int"))
-            self._store_variable(target_name, result, tag or "list:int")
+            _default_list = ValueType(VKind.LIST, elem_type=ValueType(VKind.INT))
+            _, tag = self.variables.get(target_name, (None, _default_list))
+            self._store_variable(target_name, result, tag or _default_list)
             return
 
         # STR += (string concatenation)
@@ -15504,9 +15508,10 @@ class CodeGen:
         if isinstance(current.type, ir.PointerType) and isinstance(node.op, ast.Add):
             if (self._var_kind(target_name) == VKind.LIST
                     or self._is_list_expr(ast.Name(id=target_name))):
-                _, tag = self.variables.get(target_name, (None, "list:int"))
+                _default_list = ValueType(VKind.LIST, elem_type=ValueType(VKind.INT))
+                _, tag = self.variables.get(target_name, (None, _default_list))
                 result = self._rt_call("list_concat", [current, rhs])
-                self._store_variable(target_name, result, tag or "list:int")
+                self._store_variable(target_name, result, tag or _default_list)
                 return
             if isinstance(rhs.type, ir.PointerType):
                 result = self._rt_call("str_concat", [current, rhs])
@@ -19202,7 +19207,7 @@ class CodeGen:
         # For Name iterators not resolved from literal: try to propagate
         # element types from the variable's type tag.
         if isinstance(iter_node, ast.Name) and list_node is None:
-            _raw_tag = self.variables.get(iter_node.id, (None, "unknown"))[1]
+            _raw_tag = self.variables.get(iter_node.id, (None, ValueType(VKind.UNKNOWN)))[1]
             _vt = _raw_tag if isinstance(_raw_tag, ValueType) else ValueType.from_old_tag(str(_raw_tag))
             # If we know nothing specific, keep defaults but don't force "str"
             if _vt.kind == VKind.LIST and _vt.elem_type is not None:
@@ -20073,7 +20078,7 @@ class CodeGen:
                 and node.id in self.variables
                 and node.id not in self._global_vars):
             alloca, type_tag = self.variables[node.id]
-            if (type_tag != "cell"
+            if (self._tag_kind(type_tag) != VKind.CELL
                     and isinstance(alloca.type, ir.PointerType)
                     and alloca.type.pointee is fpy_val):
                 fv = self.builder.load(alloca, name=f"{node.id}.fv")
@@ -21594,7 +21599,7 @@ class CodeGen:
             return obj
 
         # Check if this is an actual closure variable vs a raw function pointer
-        _, tag = self.variables.get(name, (None, "int"))
+        _, tag = self.variables.get(name, (None, ValueType(VKind.INT)))
         is_closure = (self._tag_kind(tag) == VKind.CLOSURE)
 
         # Handle f(*args) — Starred arg in closure/function-pointer call.
@@ -22889,7 +22894,7 @@ class CodeGen:
                 and node.id in self.variables
                 and node.id not in self._global_vars):
             alloca, type_tag = self.variables[node.id]
-            if (type_tag != "cell"
+            if (self._tag_kind(type_tag) != VKind.CELL
                     and isinstance(alloca.type, ir.PointerType)
                     and alloca.type.pointee is fpy_val):
                 return self.builder.load(alloca, name=f"{node.id}.fv")
@@ -23351,10 +23356,9 @@ class CodeGen:
             if isinstance(type_tag, ValueType) and type_tag.elem_type is not None:
                 return type_tag.elem_type
             # Legacy fallback: parse string tag for colon-separated types.
-            # This path only fires for the rare case where a variable still
-            # has a legacy string tag with compound types (e.g. "list:float").
-            # Will become dead code once all upstream sources produce ValueType.
-            if isinstance(type_tag, str) and ":" in type_tag:
+            # Dead code — all upstream sources now produce ValueType.
+            # Kept as safety net until C2 removes the string-compat layer.
+            if isinstance(type_tag, str) and ":" in type_tag:  # pragma: no cover
                 return ValueType.from_old_tag(type_tag.split(":", 1)[1])
             # For tuples, check the literal definition for element type
             if self._tag_kind(type_tag) == VKind.TUPLE and node.id in self._tuple_elem_types:
@@ -23551,19 +23555,6 @@ class CodeGen:
             return True
         return False
 
-    def _var_tag_eq(self, name: str, tag_str: str) -> bool:
-        """Check if a variable's raw tag matches a specific string.
-
-        Unlike _var_kind(), this preserves aliased distinctions
-        (counter vs dict, path vs pyobj) by comparing raw tags."""
-        entry = self.variables.get(name) or self._global_vars.get(name)
-        if entry is None:
-            return False
-        _, vtype = entry
-        if isinstance(vtype, ValueType):
-            return vtype._to_tag() == tag_str
-        return str(vtype) == tag_str
-
     def _is_deque_expr(self, node: ast.expr) -> bool:
         """Check if an AST expression evaluates to a deque."""
         if isinstance(node, ast.Name) and node.id in self.variables:
@@ -23578,7 +23569,7 @@ class CodeGen:
     def _is_counter_expr(self, node: ast.expr) -> bool:
         """Check if an AST expression evaluates to a Counter."""
         if isinstance(node, ast.Name) and node.id in self.variables:
-            return self._var_tag_eq(node.id, "counter")
+            return self._var_kind(node.id) == VKind.COUNTER
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
             native_imports = getattr(self, '_native_imports', {})
             if node.func.id in native_imports:
@@ -23589,8 +23580,7 @@ class CodeGen:
     def _is_defaultdict_expr(self, node: ast.expr) -> bool:
         """Check if an AST expression evaluates to a defaultdict."""
         if isinstance(node, ast.Name) and node.id in self.variables:
-            _, type_tag = self.variables[node.id]
-            return type_tag == "defaultdict"
+            return self._var_kind(node.id) == VKind.DEFAULTDICT
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
             native_imports = getattr(self, '_native_imports', {})
             if node.func.id in native_imports:
@@ -23601,15 +23591,13 @@ class CodeGen:
     def _is_chainmap_expr(self, node: ast.expr) -> bool:
         """Check if an AST expression evaluates to a ChainMap."""
         if isinstance(node, ast.Name) and node.id in self.variables:
-            _, type_tag = self.variables[node.id]
-            return type_tag == "chainmap"
+            return self._var_kind(node.id) == VKind.CHAINMAP
         return False
 
     def _is_logger_expr(self, node: ast.expr) -> bool:
         """Check if an AST expression evaluates to a logging.Logger."""
         if isinstance(node, ast.Name) and node.id in self.variables:
-            _, type_tag = self.variables[node.id]
-            return type_tag == "logger"
+            return self._var_kind(node.id) == VKind.LOGGER
         return False
 
     def _is_pyobj_receiver(self, node: ast.expr) -> bool:
@@ -23719,7 +23707,7 @@ class CodeGen:
     def _is_path_expr(self, node: ast.expr) -> bool:
         """Check if an AST expression evaluates to a pathlib.Path."""
         if isinstance(node, ast.Name) and node.id in self.variables:
-            return self._var_tag_eq(node.id, "path")
+            return self._var_kind(node.id) == VKind.PATH
         # Direct Path(...) call via imported name
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
             native_imports = getattr(self, '_native_imports', {})
@@ -28097,7 +28085,7 @@ class CodeGen:
             _factory_names = {0: "list", 1: "int", 2: "str", 3: "float", 4: "dict"}
             self._last_dd_factory = _factory_names.get(factory_tag, "int")
             # Mark the result — caller will store in a variable name
-            self._last_collections_type = "defaultdict"
+            # (dead field removed in C2 cleanup)
             return result
 
         # --- deque ---
@@ -28117,7 +28105,7 @@ class CodeGen:
                 arg = self._ensure_ptr(arg)
                 result = self.builder.call(
                     self.runtime["deque_from_list"], [arg, maxlen])
-            self._last_collections_type = "deque"
+            # (dead field removed in C2 cleanup)
             return result
 
         # --- OrderedDict ---
@@ -28175,7 +28163,7 @@ class CodeGen:
                     # We'll store the type_id as a constant — the result of
                     # namedtuple() call is conceptually a "class". When it's
                     # called later, we intercept it.
-                    self._last_collections_type = "namedtuple"
+                    # (dead field removed in C2 cleanup)
                     self._last_namedtuple_info = {
                         "type_name": type_name,
                         "fields": field_names,
@@ -28203,7 +28191,7 @@ class CodeGen:
                 result = self._rt_call(
                     "chainmap_from_dicts",
                     [arr_ptr, ir.Constant(i32, n)])
-            self._last_collections_type = "chainmap"
+            # (dead field removed in C2 cleanup)
             return result
 
         return None
@@ -28504,7 +28492,7 @@ class CodeGen:
                 other = self._ensure_ptr(other)
                 result = self.builder.call(self.runtime["path_join"],
                                             [result, other])
-            self._last_collections_type = "path"
+            # (dead field removed in C2 cleanup)
             return result
         return None
 
@@ -28748,7 +28736,7 @@ class CodeGen:
             else:
                 name = self._make_string_constant("root")
             result = self.builder.call(self.runtime["logging_getLogger"], [name])
-            self._last_collections_type = "logger"
+            # (dead field removed in C2 cleanup)
             return result
 
         return None
@@ -30998,9 +30986,8 @@ class CodeGen:
         # would misroute them through FV dispatch → AttributeError.
         _use_fv_dispatch = False
         if isinstance(node.func.value, ast.Name) and node.func.value.id in self.variables:
-            _, _rcv_tag = self.variables[node.func.value.id]
-            _rcv_tag_str = str(_rcv_tag)
-            if _rcv_tag_str in ("path", "pyobj"):
+            _rcv_kind = self._var_kind(node.func.value.id)
+            if _rcv_kind in (VKind.PATH, VKind.PYOBJ):
                 _use_fv_dispatch = True
 
         if _use_fv_dispatch:
