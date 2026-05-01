@@ -186,11 +186,16 @@ struct FpyObj {
     FpyGCNode gc_node;                   /* cycle collector tracking */
     int magic;                           /* FPY_OBJ_MAGIC for native objects */
     int class_id;
-    FpyValue *slots;                 /* size = class's slot_count, NULL if 0 */
     FpyObjAttrs *dynamic_attrs;      /* NULL unless used */
     FpyWeakRef *weakref_list;        /* singly-linked list of weak refs, NULL if none */
     fpy_mutex_t lock;                /* per-object lock (free-threaded mode) */
 };
+
+/* Inline slot access: slots are allocated contiguously after the FpyObj
+ * header (in the same malloc block), so their address is always (obj + 1).
+ * This macro replaces the old obj->slots pointer — no pointer field needed,
+ * no memory load, just address arithmetic. */
+#define FPY_OBJ_SLOTS(obj) ((FpyValue*)((obj) + 1))
 
 /* List: growable array of FpyValue. `is_tuple` distinguishes tuple-
    typed lists for display purposes (they print with parens). */

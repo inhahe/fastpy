@@ -1389,13 +1389,16 @@ static int fpy_obj_try_get_attr(FpyObj *obj, const char *name,
                                  int32_t *out_tag, int64_t *out_data) {
     FpyClassDef *cls = &fpy_classes[obj->class_id];
     /* Static slots */
-    for (int i = 0; i < cls->slot_count; i++) {
-        if (cls->slot_names[i] &&
-            (cls->slot_names[i] == name ||
-             strcmp(cls->slot_names[i], name) == 0)) {
-            *out_tag = obj->slots[i].tag;
-            *out_data = obj->slots[i].data.i;
-            return 1;
+    if (cls->slot_count > 0) {
+        FpyValue *slots = FPY_OBJ_SLOTS(obj);
+        for (int i = 0; i < cls->slot_count; i++) {
+            if (cls->slot_names[i] &&
+                (cls->slot_names[i] == name ||
+                 strcmp(cls->slot_names[i], name) == 0)) {
+                *out_tag = slots[i].tag;
+                *out_data = slots[i].data.i;
+                return 1;
+            }
         }
     }
     /* Dynamic attrs */
