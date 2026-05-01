@@ -13906,7 +13906,7 @@ class CodeGen:
                 if self._is_list_expr(value_node) or self._is_tuple_expr(value_node):
                     tag = FPY_TAG_LIST
                 elif self._is_dict_expr(value_node):
-                    tag = FPY_TAG_LIST  # dicts stored as list pointers (tag reused)
+                    tag = FPY_TAG_DICT
                 elif self._is_obj_expr(value_node):
                     tag = FPY_TAG_OBJ
                 else:
@@ -13922,14 +13922,29 @@ class CodeGen:
         _steal = isinstance(value_node, (
             ast.Call, ast.List, ast.ListComp,
             ast.Dict, ast.DictComp, ast.Set, ast.SetComp))
+        tag_const = ir.Constant(i32, tag)
         # Try static slot fast path first (direct pointer-arithmetic store).
         slot_idx = self._get_attr_slot(target)
         if slot_idx is not None:
-            self._emit_slot_set_direct(
-                obj, slot_idx, ir.Constant(i32, tag), data)
+            # Decref old slot value (may be non-trivial on reassignment).
+            old_tag, old_data = self._emit_slot_get_direct(obj, slot_idx)
+            self.builder.call(self.runtime["rc_decref"],
+                              [old_tag, old_data])
+            self._emit_slot_set_direct(obj, slot_idx, tag_const, data)
+            # Incref new value unless it's an owned reference (steal).
+            if not _steal:
+                self.builder.call(self.runtime["rc_incref"],
+                                  [tag_const, data])
         else:
+            # obj_set_fv handles incref(new) + decref(old) internally.
             self.builder.call(self.runtime["obj_set_fv"],
-                              [obj, attr_name, ir.Constant(i32, tag), data])
+                              [obj, attr_name, tag_const, data])
+            # For steal sources (owned-reference), obj_set_fv's incref
+            # is unwanted — the slot should absorb the existing refcount.
+            # Compensate with a decref so the net change is zero (steal).
+            if _steal:
+                self.builder.call(self.runtime["rc_decref"],
+                                  [tag_const, data])
 
     def _infer_call_type_tag(self, node: ast.Call) -> str | None:
         """Infer type tag for a Call expression.
