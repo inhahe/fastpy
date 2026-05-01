@@ -127,13 +127,24 @@ class VKind(Enum):
     BYTES = auto()      # bytes (stored as char* like str, but tagged BYTES)
     FVALUE = auto()     # runtime-typed FpyValue {tag, data}
     UNKNOWN = auto()    # compile-time type not known
+    # Specialized subtypes — each needs distinct dispatch at compile time
+    PATH = auto()       # pathlib.Path (bridge object with native handlers)
+    COUNTER = auto()    # collections.Counter (dict-like with count semantics)
+    DEFAULTDICT = auto()  # collections.defaultdict (dict with factory)
+    DEQUE = auto()      # collections.deque (list-like with O(1) popleft)
+    NATIVE_MOD = auto()  # imported native module (e.g. json, os, math)
+    NATIVE_FUNC = auto()  # from-imported native function (e.g. from math import sqrt)
+    LOGGER = auto()     # logging.Logger instance
+    MIXED = auto()      # multiple types possible — runtime dispatch needed
 
     @property
     def is_ptr(self) -> bool:
         return self in (VKind.STR, VKind.BYTES, VKind.LIST, VKind.DICT,
                         VKind.SET, VKind.TUPLE, VKind.OBJ, VKind.PYOBJ,
                         VKind.DECIMAL, VKind.COMPLEX, VKind.BIGINT,
-                        VKind.CLOSURE)
+                        VKind.CLOSURE, VKind.PATH, VKind.COUNTER,
+                        VKind.DEFAULTDICT, VKind.DEQUE, VKind.NATIVE_MOD,
+                        VKind.LOGGER)
 
     @property
     def fpy_tag(self) -> int:
@@ -143,7 +154,9 @@ class VKind(Enum):
             VKind.NONE: 4, VKind.LIST: 5, VKind.OBJ: 6, VKind.DICT: 7,
             VKind.BYTES: 8, VKind.SET: 9, VKind.BIGINT: 10,
             VKind.COMPLEX: 11, VKind.DECIMAL: 12, VKind.TUPLE: 5,
-            VKind.PYOBJ: 6, VKind.CLOSURE: 0,  # INT tag: closures aren't FpyObj
+            VKind.PYOBJ: 6, VKind.CLOSURE: 0,
+            VKind.PATH: 6, VKind.COUNTER: 7, VKind.DEFAULTDICT: 7,
+            VKind.DEQUE: 5, VKind.NATIVE_MOD: 6, VKind.LOGGER: 6,
         }.get(self, 0)
 
     @property
@@ -166,6 +179,10 @@ class VKind(Enum):
             VKind.DECIMAL: "decimal", VKind.COMPLEX: "complex",
             VKind.BIGINT: "bigint", VKind.CLOSURE: "closure",
             VKind.FVALUE: "int", VKind.UNKNOWN: "int",
+            VKind.PATH: "path", VKind.COUNTER: "counter",
+            VKind.DEFAULTDICT: "defaultdict", VKind.DEQUE: "deque",
+            VKind.NATIVE_MOD: "native_mod", VKind.NATIVE_FUNC: "native_func",
+            VKind.LOGGER: "logger", VKind.MIXED: "mixed",
         }.get(self, "int")
 
 
@@ -200,7 +217,11 @@ class ValueType:
             VKind.OBJ: "obj", VKind.PYOBJ: "pyobj", VKind.DECIMAL: "decimal",
             VKind.COMPLEX: "complex", VKind.BIGINT: "bigint",
             VKind.CLOSURE: "closure", VKind.FVALUE: "int",
-            VKind.UNKNOWN: "int",
+            VKind.UNKNOWN: "int", VKind.PATH: "path",
+            VKind.COUNTER: "counter", VKind.DEFAULTDICT: "defaultdict",
+            VKind.DEQUE: "deque", VKind.NATIVE_MOD: "native_mod",
+            VKind.NATIVE_FUNC: "native_func", VKind.LOGGER: "logger",
+            VKind.MIXED: "mixed",
         }
         base = _kind_to_tag.get(self.kind, "int")
         if self.kind == VKind.LIST and self.elem_type:
@@ -262,6 +283,10 @@ class ValueType:
             "pyobj": VKind.PYOBJ, "decimal": VKind.DECIMAL,
             "complex": VKind.COMPLEX, "bigint": VKind.BIGINT,
             "bytes": VKind.BYTES, "closure": VKind.CLOSURE,
+            "mixed": VKind.MIXED,
+            # Aliases: map to parent kind for backward compatibility with
+            # _var_kind() checks.  Direct VKind variants (COUNTER, DEQUE,
+            # etc.) are used by code that explicitly stores those tags.
             "counter": VKind.DICT, "defaultdict": VKind.DICT,
             "deque": VKind.LIST,
             "chainmap": VKind.OBJ, "logger": VKind.OBJ,
