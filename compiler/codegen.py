@@ -4736,6 +4736,154 @@ class CodeGen:
                     var_types[node.targets[0].id] = rt
         return _func_ret_types
 
+    def _csa_track_objects(
+        self, tree: ast.Module,
+        class_parents: dict[str, str | None],
+        var_types: dict[str, str],
+    ) -> tuple[dict[str, str], dict[tuple[str, str], str]]:
+        """Track object instances, constructor args, and self.attr classes.
+
+        Builds several mappings used by the main call-site scan:
+
+        - ``obj_classes``: variable name → class name (e.g. ``x = MyClass()``).
+          Includes fixpoint propagation through function return types.
+        - ``self_attr_classes``: (class, attr) → class name from
+          ``self.attr = ClassName(...)`` in methods.
+
+        Also sets ``self._csa_obj_classes``,
+        ``self._csa_constructor_arg_classes``, and
+        ``self._csa_func_param_classes``.  Mutates *var_types* in-place
+        (registers ``"obj"`` for known instances).
+
+        Returns ``(obj_classes, self_attr_classes)``.
+        """
+        # Track variable → class name from assignments like `x = MyClass(...)`
+        obj_classes: dict[str, str] = {}
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Assign) and len(node.targets) == 1
+                    and isinstance(node.targets[0], ast.Name)
+                    and isinstance(node.value, ast.Call)
+                    and isinstance(node.value.func, ast.Name)
+                    and node.value.func.id in class_parents):
+                obj_classes[node.targets[0].id] = node.value.func.id
+
+        # Iterative fixpoint: also track assignments from function calls
+        # whose return type we've inferred as obj. Scan function defs to
+        # find `return ClassName(...)` / `return var_assigned_from_Class()`
+        # and propagate their target class to callers of that function.
+        func_returns_cls: dict[str, str] = {}
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.FunctionDef):
+                continue
+            local_obj: dict[str, str] = {}
+            for _ in range(5):  # fixpoint, usually 2-3 iterations max
+                prev_size = len(local_obj)
+                for n in ast.walk(node):
+                    if not (isinstance(n, ast.Assign) and len(n.targets) == 1
+                            and isinstance(n.targets[0], ast.Name)):
+                        continue
+                    tgt = n.targets[0].id
+                    if (isinstance(n.value, ast.Call)
+                            and isinstance(n.value.func, ast.Name)
+                            and n.value.func.id in class_parents):
+                        local_obj[tgt] = n.value.func.id
+                    elif (isinstance(n.value, ast.Name)
+                          and n.value.id in local_obj):
+                        local_obj[tgt] = local_obj[n.value.id]
+                if len(local_obj) == prev_size:
+                    break
+            for n in ast.walk(node):
+                if isinstance(n, ast.Return) and n.value is not None:
+                    if (isinstance(n.value, ast.Call)
+                            and isinstance(n.value.func, ast.Name)
+                            and n.value.func.id in class_parents):
+                        func_returns_cls[node.name] = n.value.func.id
+                        break
+                    if (isinstance(n.value, ast.Name)
+                            and n.value.id in local_obj):
+                        func_returns_cls[node.name] = local_obj[n.value.id]
+                        break
+        # Propagate to `var = func()` module-level assignments
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Assign) and len(node.targets) == 1
+                    and isinstance(node.targets[0], ast.Name)
+                    and isinstance(node.value, ast.Call)
+                    and isinstance(node.value.func, ast.Name)
+                    and node.value.func.id in func_returns_cls):
+                if node.targets[0].id not in obj_classes:
+                    obj_classes[node.targets[0].id] = func_returns_cls[node.value.func.id]
+
+        # Save for reuse by other passes (e.g. global class-attr scan).
+        self._csa_obj_classes = dict(obj_classes)
+
+        # Register object instances in var_types so call-site analysis knows
+        # when a class instance is passed as a function argument.
+        for vname in obj_classes:
+            var_types[vname] = "obj"
+
+        # Track constructor arg classes: when ClassName(var, ...) is called
+        # and var is a known object instance, record that arg index → class.
+        self._csa_constructor_arg_classes: dict[str, dict[int, str]] = {}
+        for n in ast.walk(tree):
+            if (isinstance(n, ast.Call)
+                    and isinstance(n.func, ast.Name)
+                    and n.func.id in class_parents):
+                cls_called = n.func.id
+                for arg_idx, arg in enumerate(n.args):
+                    arg_cls = None
+                    if isinstance(arg, ast.Name) and arg.id in obj_classes:
+                        arg_cls = obj_classes[arg.id]
+                    elif (isinstance(arg, ast.Call)
+                            and isinstance(arg.func, ast.Name)
+                            and arg.func.id in class_parents):
+                        arg_cls = arg.func.id
+                    if arg_cls:
+                        if cls_called not in self._csa_constructor_arg_classes:
+                            self._csa_constructor_arg_classes[cls_called] = {}
+                        self._csa_constructor_arg_classes[cls_called][arg_idx] = arg_cls
+
+        # Track obj-param classes per function.
+        self._csa_func_param_classes: dict[str, dict[int, str]] = {}
+        for n in ast.walk(tree):
+            if not (isinstance(n, ast.Call)
+                    and isinstance(n.func, ast.Name)):
+                continue
+            fn_name = n.func.id
+            for arg_idx, arg in enumerate(n.args):
+                arg_cls = None
+                if isinstance(arg, ast.Name) and arg.id in obj_classes:
+                    arg_cls = obj_classes[arg.id]
+                elif (isinstance(arg, ast.Call)
+                        and isinstance(arg.func, ast.Name)
+                        and arg.func.id in class_parents):
+                    arg_cls = arg.func.id
+                if arg_cls:
+                    self._csa_func_param_classes.setdefault(
+                        fn_name, {})[arg_idx] = arg_cls
+
+        # Build (class, attr) -> class_name map from `self.attr = ClassName(...)`
+        self_attr_classes: dict[tuple[str, str], str] = {}
+        for cls_node in ast.walk(tree):
+            if not isinstance(cls_node, ast.ClassDef):
+                continue
+            for method in cls_node.body:
+                if not isinstance(method, ast.FunctionDef):
+                    continue
+                for n in ast.walk(method):
+                    if not (isinstance(n, ast.Assign)
+                            and len(n.targets) == 1
+                            and isinstance(n.targets[0], ast.Attribute)
+                            and isinstance(n.targets[0].value, ast.Name)
+                            and n.targets[0].value.id == "self"):
+                        continue
+                    attr = n.targets[0].attr
+                    if (isinstance(n.value, ast.Call)
+                            and isinstance(n.value.func, ast.Name)
+                            and n.value.func.id in class_parents):
+                        self_attr_classes[(cls_node.name, attr)] = n.value.func.id
+
+        return obj_classes, self_attr_classes
+
     def _csa_post_scan_propagation(
         self, tree: ast.Module,
         class_parents: dict[str, str | None],
@@ -5198,147 +5346,8 @@ class CodeGen:
                           and var_types.get(node.value.func.value.id) == "pyobj"):
                         var_types[tgt] = "pyobj"
 
-        # Track variable → class name from assignments like `x = MyClass(...)`
-        obj_classes: dict[str, str] = {}
-        for node in ast.walk(tree):
-            if (isinstance(node, ast.Assign) and len(node.targets) == 1
-                    and isinstance(node.targets[0], ast.Name)
-                    and isinstance(node.value, ast.Call)
-                    and isinstance(node.value.func, ast.Name)
-                    and node.value.func.id in class_parents):
-                obj_classes[node.targets[0].id] = node.value.func.id
-
-        # Iterative fixpoint: also track assignments from function calls
-        # whose return type we've inferred as obj. Scan function defs to
-        # find `return ClassName(...)` / `return var_assigned_from_Class()`
-        # and propagate their target class to callers of that function.
-        func_returns_cls: dict[str, str] = {}
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.FunctionDef):
-                continue
-            # Iteratively build local_obj: start with direct
-            # ClassName(...) assignments, then propagate through Name-to-
-            # Name assignments (x = y where y is a known obj).
-            local_obj: dict[str, str] = {}
-            for _ in range(5):  # fixpoint, usually 2-3 iterations max
-                prev_size = len(local_obj)
-                for n in ast.walk(node):
-                    if not (isinstance(n, ast.Assign) and len(n.targets) == 1
-                            and isinstance(n.targets[0], ast.Name)):
-                        continue
-                    tgt = n.targets[0].id
-                    if (isinstance(n.value, ast.Call)
-                            and isinstance(n.value.func, ast.Name)
-                            and n.value.func.id in class_parents):
-                        local_obj[tgt] = n.value.func.id
-                    elif (isinstance(n.value, ast.Name)
-                          and n.value.id in local_obj):
-                        local_obj[tgt] = local_obj[n.value.id]
-                if len(local_obj) == prev_size:
-                    break
-            for n in ast.walk(node):
-                if isinstance(n, ast.Return) and n.value is not None:
-                    if (isinstance(n.value, ast.Call)
-                            and isinstance(n.value.func, ast.Name)
-                            and n.value.func.id in class_parents):
-                        func_returns_cls[node.name] = n.value.func.id
-                        break
-                    if (isinstance(n.value, ast.Name)
-                            and n.value.id in local_obj):
-                        func_returns_cls[node.name] = local_obj[n.value.id]
-                        break
-        # Propagate to `var = func()` module-level assignments
-        for node in ast.walk(tree):
-            if (isinstance(node, ast.Assign) and len(node.targets) == 1
-                    and isinstance(node.targets[0], ast.Name)
-                    and isinstance(node.value, ast.Call)
-                    and isinstance(node.value.func, ast.Name)
-                    and node.value.func.id in func_returns_cls):
-                if node.targets[0].id not in obj_classes:
-                    obj_classes[node.targets[0].id] = func_returns_cls[node.value.func.id]
-
-        # Save for reuse by other passes (e.g. global class-attr scan).
-        self._csa_obj_classes = dict(obj_classes)
-
-        # Register object instances in var_types so call-site analysis knows
-        # when a class instance is passed as a function argument.
-        for vname in obj_classes:
-            var_types[vname] = "obj"
-
-        # Track constructor arg classes: when ClassName(var, ...) is called
-        # and var is a known object instance, record that arg index → class.
-        # Used by _detect_class_container_attrs to build obj_attr_types.
-        self._csa_constructor_arg_classes: dict[str, dict[int, str]] = {}
-        for n in ast.walk(tree):
-            if (isinstance(n, ast.Call)
-                    and isinstance(n.func, ast.Name)
-                    and n.func.id in class_parents):
-                cls_called = n.func.id
-                for arg_idx, arg in enumerate(n.args):
-                    arg_cls = None
-                    # Case 1: arg is a known object variable
-                    if isinstance(arg, ast.Name) and arg.id in obj_classes:
-                        arg_cls = obj_classes[arg.id]
-                    # Case 2: arg is a constructor call ClassName(...)
-                    elif (isinstance(arg, ast.Call)
-                            and isinstance(arg.func, ast.Name)
-                            and arg.func.id in class_parents):
-                        arg_cls = arg.func.id
-                    if arg_cls:
-                        if cls_called not in self._csa_constructor_arg_classes:
-                            self._csa_constructor_arg_classes[cls_called] = {}
-                        self._csa_constructor_arg_classes[cls_called][arg_idx] = arg_cls
-
-        # Track obj-param classes per function. `_csa_func_param_classes`
-        # maps func_name -> {param_idx: class_name}. Used in
-        # `_emit_function_def` to tag obj params with their specific class
-        # so `self.variables[param].class` resolves correctly for downstream
-        # `x.attr` accesses.
-        self._csa_func_param_classes: dict[str, dict[int, str]] = {}
-        for n in ast.walk(tree):
-            if not (isinstance(n, ast.Call)
-                    and isinstance(n.func, ast.Name)):
-                continue
-            fn_name = n.func.id
-            # Skip class constructors (already handled above); we care about
-            # regular user functions and class methods invoked as obj.m(x).
-            for arg_idx, arg in enumerate(n.args):
-                arg_cls = None
-                if isinstance(arg, ast.Name) and arg.id in obj_classes:
-                    arg_cls = obj_classes[arg.id]
-                elif (isinstance(arg, ast.Call)
-                        and isinstance(arg.func, ast.Name)
-                        and arg.func.id in class_parents):
-                    arg_cls = arg.func.id
-                if arg_cls:
-                    self._csa_func_param_classes.setdefault(
-                        fn_name, {})[arg_idx] = arg_cls
-
-        # Build (class, attr) -> class_name map from `self.attr = ClassName(...)`
-        # in class methods.  Also detects `self.attr = self.other_obj_attr`
-        # chains.  Used below so `self.attr` as an arg to a constructor
-        # propagates the correct "obj" type for the parameter, enabling the
-        # runtime null-check that preserves NONE tags (linked list etc.).
-        self_attr_classes: dict[tuple[str, str], str] = {}
-        for cls_node in ast.walk(tree):
-            if not isinstance(cls_node, ast.ClassDef):
-                continue
-            for method in cls_node.body:
-                if not isinstance(method, ast.FunctionDef):
-                    continue
-                for n in ast.walk(method):
-                    if not (isinstance(n, ast.Assign)
-                            and len(n.targets) == 1
-                            and isinstance(n.targets[0], ast.Attribute)
-                            and isinstance(n.targets[0].value, ast.Name)
-                            and n.targets[0].value.id == "self"):
-                        continue
-                    attr = n.targets[0].attr
-                    # self.attr = ClassName(...)
-                    if (isinstance(n.value, ast.Call)
-                            and isinstance(n.value.func, ast.Name)
-                            and n.value.func.id in class_parents):
-                        self_attr_classes[(cls_node.name, attr)] = n.value.func.id
+        obj_classes, self_attr_classes = self._csa_track_objects(
+            tree, class_parents, var_types)
 
         # Track loop variable types from for-in iterables
         for node in ast.walk(tree):
@@ -5399,10 +5408,6 @@ class CodeGen:
                     elif isinstance(n.value, (ast.List, ast.ListComp)):
                         func_param_dict_refinements.setdefault(
                             node.name, {})[pname] = "dict:list"
-
-        # (cls() type propagation is done after the main walk below)
-            if not isinstance(cls_node, ast.ClassDef):
-                continue
 
         # Phase 4: pre-scan function aliases (f = func_name) so call-site
         # analysis treats f(args) as func_name(args) for type inference.
