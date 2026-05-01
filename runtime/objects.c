@@ -8,6 +8,14 @@
 #include "bigint.h"
 #include <math.h>
 
+/* The codegen computes inline slot addresses as (FpyValue*)(obj + 1) + idx,
+ * relying on sizeof(FpyObj) == 104 on x64.  If the struct layout changes,
+ * this will fire at compile time rather than silently corrupting memory. */
+static_assert(sizeof(FpyObj) == 104,
+    "FpyObj size changed -- update fpy_obj_type in codegen.py to match");
+static_assert(sizeof(FpyValue) == 16,
+    "FpyValue size changed -- update fpy_val_type in codegen.py to match");
+
 /* Forward declarations */
 void fastpy_tuple_write(FpyList *tuple);
 void fastpy_dict_write(FpyDict *dict);
