@@ -1192,8 +1192,13 @@ class CodeGen:
         # Class-level constant attributes: class_name -> {attr: ast.Constant}
         self._class_const_attrs: dict[str, dict[str, ast.expr]] = {}
 
-        # Track variable -> class name for object-typed variables
+        # Track variable -> class name for object-typed variables.
+        # _obj_var_class: "best known" class (could be base class)
+        # _obj_var_pinned: variables whose EXACT runtime class is known
+        #   (from direct constructor: x = Foo()).  Only these should
+        #   prevent polymorphic dispatch in _receiver_may_be_subclass.
         self._obj_var_class: dict[str, str] = {}
+        self._obj_var_pinned: set[str] = set()
 
         # Track dict variables whose values are all lists (so d[k] returns a list)
         self._dict_var_list_values: set[str] = set()
@@ -2319,6 +2324,8 @@ class CodeGen:
         self.runtime["set_vtable_entry"] = ir.Function(self.module, ft, name="fastpy_set_vtable_entry")
         ft = ir.FunctionType(i8_ptr, [i8_ptr, i32])
         self.runtime["vtable_lookup"] = ir.Function(self.module, ft, name="fastpy_vtable_lookup")
+        ft = ir.FunctionType(void, [i32])
+        self.runtime["inherit_parent_vtable"] = ir.Function(self.module, ft, name="fastpy_inherit_parent_vtable")
         # Native type.__new__: create class from namespace dict
         ft = ir.FunctionType(i32, [i8_ptr, i32, i8_ptr])
         self.runtime["type_new_from_dict"] = ir.Function(
@@ -8074,6 +8081,7 @@ class CodeGen:
         self._dict_var_obj_values = set()
         self._dict_var_key_types = {}
         self._obj_var_class = {}
+        self._obj_var_pinned = set()
         self._int_mode_vars = {}
         # Pre-scan for typed annotations contradicted by later assignments
         if self._typed_mode:
@@ -11613,6 +11621,10 @@ class CodeGen:
             self.builder.call(self.runtime["set_vtable_entry"],
                               [class_id, ir.Constant(i32, slot), func_ptr])
 
+        # Copy parent vtable entries into child so that inherited methods
+        # are available for O(1) vtable dispatch without a parent walk.
+        self.builder.call(self.runtime["inherit_parent_vtable"], [class_id])
+
         # Generator destructor: if this class was generated from a generator
         # with try/finally blocks, register the close() method as a destructor.
         # The GC calls this when the object is collected, ensuring finally blocks run.
@@ -12617,6 +12629,8 @@ class CodeGen:
                                          ValueType(VKind.OBJ, class_name=class_name),
                                          steal=_steal)
                     self._obj_var_class[target.id] = class_name
+                    if _steal:
+                        self._obj_var_pinned.add(target.id)
                 else:
                     self._store_variable(target.id, value, type_tag,
                                          steal=_steal)
@@ -29694,16 +29708,62 @@ class CodeGen:
                     direct_func = ci.methods[method]
                     break
                 cn = ci.parent_name
-            # Virtual dispatch: if the receiver's concrete class isn't
-            # pinned (e.g., `self` inside a class method — could be any
-            # subclass) and some subclass of obj_cls overrides this
-            # method, we can't statically bind.
-            _overridden = self._method_overridden_in_subclass(obj_cls, method) if direct_func is not None else False
+            # Virtual dispatch decision.
+            # For `self` inside a class method: _infer_object_class
+            # returns the declaring class, so _method_overridden_in_subclass
+            # correctly checks all subclasses. Direct dispatch is safe
+            # when no subclass overrides the method.
+            #
+            # For other non-pinned receivers (function params, loop vars,
+            # method returns): _infer_object_class may return ANY class
+            # in the hierarchy (from call-site analysis), not necessarily
+            # the base class. Checking _method_overridden_in_subclass
+            # on the WRONG class would miss overrides.  So for non-self
+            # non-pinned receivers, always use vtable dispatch.
             _may_sub = self._receiver_may_be_subclass(attr.value) if direct_func is not None else False
-            if (direct_func is not None
-                    and _overridden
-                    and _may_sub):
-                direct_func = None
+            _is_self = isinstance(attr.value, ast.Name) and attr.value.id == "self"
+            _need_vtable = False
+            if direct_func is not None and _may_sub:
+                if _is_self:
+                    # self: safe to check overrides on declaring class
+                    _need_vtable = self._method_overridden_in_subclass(obj_cls, method)
+                else:
+                    # Non-self non-pinned: always need vtable dispatch
+                    _need_vtable = True
+            if _need_vtable:
+                # Can't statically bind — need virtual dispatch.
+                # Use O(1) vtable lookup instead of falling through to
+                # the string-based obj_call_methodN runtime functions.
+                vtable_slot = getattr(self, '_vtable_indices', {}).get(method)
+                if vtable_slot is not None:
+                    n_dispatch_args = len(call_args)
+                    slot_val = ir.Constant(i32, vtable_slot)
+                    func_ptr = self.builder.call(
+                        self.runtime["vtable_lookup"], [obj, slot_val])
+                    # The vtable stores the i64-ABI dispatch function,
+                    # same pointer that register_method receives.
+                    if is_double_ret:
+                        ret_t = ir.DoubleType()
+                    else:
+                        ret_t = i64
+                    ftype = ir.FunctionType(
+                        ret_t, [i8_ptr] + [i64] * n_dispatch_args)
+                    func_typed = self.builder.bitcast(
+                        func_ptr, ir.PointerType(ftype))
+                    result = self.builder.call(
+                        func_typed, [obj] + call_args)
+                    # Post-process return type to match caller expectations
+                    if not is_double_ret:
+                        ret_type = self._find_method_return_type(
+                            attr.value, method)
+                        if ret_type and isinstance(ret_type, ir.PointerType):
+                            result = self.builder.inttoptr(result, i8_ptr)
+                        elif (ret_type
+                              and isinstance(ret_type, ir.IntType)
+                              and ret_type.width == 32):
+                            result = self.builder.trunc(result, i32)
+                    return result
+                direct_func = None  # no vtable slot → string-based fallback
             if direct_func is not None:
                 # Coerce args to match the method's LLVM signature
                 direct_args = [obj]  # self
@@ -29745,33 +29805,64 @@ class CodeGen:
 
         # Use actual dispatch arg count (mixed params expand to 2 args each)
         n_dispatch_args = len(call_args)
-        if n_dispatch_args == 0:
+
+        # Vtable fast-path: if the method name has a vtable slot, try O(1)
+        # dispatch first.  Falls back to string-based obj_call_methodN when
+        # the vtable returns NULL (method not on this specific class's
+        # hierarchy — possible because vtable slot indices are shared
+        # across all class hierarchies).
+        vtable_slot = getattr(self, '_vtable_indices', {}).get(method)
+        if vtable_slot is not None and n_dispatch_args <= 4:
+            slot_val = ir.Constant(i32, vtable_slot)
+            func_ptr = self.builder.call(
+                self.runtime["vtable_lookup"], [obj, slot_val])
+            null_ptr = ir.Constant(i8_ptr, None)
+            is_null = self.builder.icmp_unsigned("==", func_ptr, null_ptr)
+
+            bb_vtable = self.builder.append_basic_block("vt.dispatch")
+            bb_fallback = self.builder.append_basic_block("vt.fallback")
+            bb_merge = self.builder.append_basic_block("vt.merge")
+            self.builder.cbranch(is_null, bb_fallback, bb_vtable)
+
+            # ── vtable hit: call directly ──
+            self.builder.position_at_end(bb_vtable)
             if is_double_ret:
-                result = self.builder.call(
-                    self.runtime["obj_call_method0_double"], [obj, method_name_ptr])
+                ret_t = ir.DoubleType()
             else:
-                result = self.builder.call(
-                    self.runtime["obj_call_method0"], [obj, method_name_ptr])
-        elif n_dispatch_args == 1:
-            if is_double_ret:
-                result = self.builder.call(
-                    self.runtime["obj_call_method1_double"], [obj, method_name_ptr, call_args[0]])
-            else:
-                result = self.builder.call(
-                    self.runtime["obj_call_method1"], [obj, method_name_ptr, call_args[0]])
-        elif n_dispatch_args == 2:
-            result = self.builder.call(
-                self.runtime["obj_call_method2"], [obj, method_name_ptr, call_args[0], call_args[1]])
-        elif n_dispatch_args == 3:
-            result = self.builder.call(
-                self.runtime["obj_call_method3"],
-                [obj, method_name_ptr, call_args[0], call_args[1], call_args[2]])
-        elif n_dispatch_args == 4:
-            result = self.builder.call(
-                self.runtime["obj_call_method4"],
-                [obj, method_name_ptr, call_args[0], call_args[1], call_args[2], call_args[3]])
+                ret_t = i64
+            ftype = ir.FunctionType(
+                ret_t, [i8_ptr] + [i64] * n_dispatch_args)
+            func_typed = self.builder.bitcast(
+                func_ptr, ir.PointerType(ftype))
+            vt_result = self.builder.call(
+                func_typed, [obj] + call_args)
+            bb_vt_end = self.builder.block  # may differ after call
+            self.builder.branch(bb_merge)
+
+            # ── vtable miss: string-based fallback ──
+            self.builder.position_at_end(bb_fallback)
+            fb_result = self._emit_string_method_dispatch(
+                obj, method_name_ptr, call_args, n_dispatch_args,
+                is_double_ret, node)
+            if fb_result is None:
+                # bridge fallback path — can't merge
+                self.builder.position_at_end(bb_merge)
+                return vt_result
+            bb_fb_end = self.builder.block
+            self.builder.branch(bb_merge)
+
+            # ── merge ──
+            self.builder.position_at_end(bb_merge)
+            result = self.builder.phi(ret_t, name="vt.result")
+            result.add_incoming(vt_result, bb_vt_end)
+            result.add_incoming(fb_result, bb_fb_end)
         else:
-            return self._bridge_fallback_expr(node, f"method call with {n_dispatch_args} args (max 4)")
+            result = self._emit_string_method_dispatch(
+                obj, method_name_ptr, call_args, n_dispatch_args,
+                is_double_ret, node)
+            if result is None:
+                return self._bridge_fallback_expr(
+                    node, f"method call with {n_dispatch_args} args (max 4)")
 
         # Check if the method returns a string or bool — cast from i64
         if not is_double_ret:
@@ -29782,6 +29873,46 @@ class CodeGen:
                 result = self.builder.trunc(result, i32)
         return result
 
+
+    def _emit_string_method_dispatch(self, obj, method_name_ptr,
+                                      call_args, n_dispatch_args,
+                                      is_double_ret, node):
+        """Emit the old string-based obj_call_methodN dispatch.
+
+        Returns the LLVM result value, or None if the arg count exceeds
+        the supported maximum (caller should use bridge fallback).
+        """
+        if n_dispatch_args == 0:
+            if is_double_ret:
+                return self.builder.call(
+                    self.runtime["obj_call_method0_double"],
+                    [obj, method_name_ptr])
+            return self.builder.call(
+                self.runtime["obj_call_method0"],
+                [obj, method_name_ptr])
+        elif n_dispatch_args == 1:
+            if is_double_ret:
+                return self.builder.call(
+                    self.runtime["obj_call_method1_double"],
+                    [obj, method_name_ptr, call_args[0]])
+            return self.builder.call(
+                self.runtime["obj_call_method1"],
+                [obj, method_name_ptr, call_args[0]])
+        elif n_dispatch_args == 2:
+            return self.builder.call(
+                self.runtime["obj_call_method2"],
+                [obj, method_name_ptr, call_args[0], call_args[1]])
+        elif n_dispatch_args == 3:
+            return self.builder.call(
+                self.runtime["obj_call_method3"],
+                [obj, method_name_ptr,
+                 call_args[0], call_args[1], call_args[2]])
+        elif n_dispatch_args == 4:
+            return self.builder.call(
+                self.runtime["obj_call_method4"],
+                [obj, method_name_ptr,
+                 call_args[0], call_args[1], call_args[2], call_args[3]])
+        return None  # unsupported arg count
 
     def _emit_method_call_str(self, node, obj):
         """Emit string method calls. Returns None if not recognized."""
@@ -30515,9 +30646,11 @@ class CodeGen:
         if isinstance(node, ast.Name) and node.id == "self":
             return True
         if isinstance(node, ast.Name) and node.id in self.variables:
-            # If the variable's exact class came from a direct constructor,
-            # the runtime class is pinned.
-            if node.id in self._obj_var_class:
+            # Only treat the class as pinned (exact runtime type known) if
+            # it was assigned from a direct constructor call (x = Foo()).
+            # Function parameters, for-loop variables, method returns, etc.
+            # only have a "best guess" base class and may be subclasses.
+            if node.id in self._obj_var_pinned:
                 return False
             return True
         # Method call returning obj — class may be subclass
