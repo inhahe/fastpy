@@ -4445,134 +4445,26 @@ class CodeGen:
                     )
                     self._current_scope = old_scope
 
-    def _analyze_call_sites(self, tree: ast.Module) -> None:
-        """Scan all call sites to determine argument types for each function."""
-        # Save the module tree so other detectors (e.g. the class-attr
-        # global scan) can walk it.
-        self._csa_root_tree = tree
-        # Build class inheritance map and cache class AST nodes
-        class_parents: dict[str, str | None] = {}
-        self._csa_class_asts: dict[str, ast.ClassDef] = {}
-        func_asts: dict[str, ast.FunctionDef] = {}
-        for node in ast.walk(tree):
-            if isinstance(node, ast.ClassDef):
-                parent = node.bases[0].id if node.bases and isinstance(node.bases[0], ast.Name) else None
-                class_parents[node.name] = parent
-                self._csa_class_asts[node.name] = node
-            elif isinstance(node, ast.FunctionDef):
-                # Track the first FunctionDef per name (module-level takes
-                # precedence over nested; class methods tracked separately).
-                func_asts.setdefault(node.name, node)
+    # ------------------------------------------------------------------
+    # _analyze_call_sites helper methods (D2 extraction)
+    # ------------------------------------------------------------------
 
-        # Build static variable type map from assignments
-        var_types: dict[str, str] = {}
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Assign) and len(node.targets) == 1:
-                tgt = node.targets[0]
-                if isinstance(tgt, ast.Name):
-                    if isinstance(node.value, ast.List):
-                        if node.value.elts and isinstance(node.value.elts[0], (ast.List, ast.ListComp)):
-                            var_types[tgt.id] = "list:list"
-                        elif (node.value.elts
-                              and all(isinstance(e, ast.Constant)
-                                      and isinstance(e.value, str)
-                                      for e in node.value.elts)):
-                            var_types[tgt.id] = "list:str"
-                        elif (node.value.elts
-                              and all(isinstance(e, ast.Constant)
-                                      and isinstance(e.value, float)
-                                      for e in node.value.elts)):
-                            var_types[tgt.id] = "list:float"
-                        else:
-                            var_types[tgt.id] = "list"
-                    elif isinstance(node.value, ast.ListComp):
-                        var_types[tgt.id] = "list"
-                    elif isinstance(node.value, (ast.Dict, ast.DictComp)):
-                        var_types[tgt.id] = "dict"
-                    elif isinstance(node.value, ast.Set):
-                        var_types[tgt.id] = "list"
-                    elif isinstance(node.value, ast.Constant):
-                        if isinstance(node.value.value, str):
-                            var_types[tgt.id] = "str"
-                        elif isinstance(node.value.value, float):
-                            var_types[tgt.id] = "float"
-                        elif isinstance(node.value.value, complex):
-                            var_types[tgt.id] = "complex"
-                        elif isinstance(node.value.value, bytes):
-                            var_types[tgt.id] = "bytes"
-                        elif (isinstance(node.value.value, int)
-                              and not isinstance(node.value.value, bool)
-                              and (node.value.value > 2**63 - 1
-                                   or node.value.value < -(2**63))):
-                            var_types[tgt.id] = "bigint"
-                    # list * N or N * list (e.g. [0] * 4, [1.0] * n)
-                    elif (isinstance(node.value, ast.BinOp)
-                          and isinstance(node.value.op, ast.Mult)
-                          and (isinstance(node.value.left,
-                                         (ast.List, ast.Tuple))
-                               or isinstance(node.value.right,
-                                             (ast.List, ast.Tuple)))):
-                        # Detect element type for list*N
-                        _rep_list = (node.value.left
-                                     if isinstance(node.value.left,
-                                                   (ast.List, ast.Tuple))
-                                     else node.value.right)
-                        if (isinstance(_rep_list, (ast.List, ast.Tuple))
-                                and _rep_list.elts
-                                and isinstance(_rep_list.elts[0],
-                                               ast.Constant)
-                                and isinstance(_rep_list.elts[0].value,
-                                               float)):
-                            var_types[tgt.id] = "list:float"
-                        else:
-                            var_types[tgt.id] = "list"
-                    # BinOp/UnaryOp that constant-folds to bigint/complex
-                    elif isinstance(node.value, (ast.BinOp, ast.UnaryOp)):
-                        try:
-                            folded = self._try_constant_fold(node.value)
-                            if (folded is not None and isinstance(folded, int)
-                                    and not isinstance(folded, bool)
-                                    and (folded > 2**63 - 1
-                                         or folded < -(2**63))):
-                                var_types[tgt.id] = "bigint"
-                            elif (folded is not None
-                                    and isinstance(folded, complex)):
-                                var_types[tgt.id] = "complex"
-                        except Exception:
-                            pass
-                    # range(), sorted(), reversed(), list() calls
-                    elif (isinstance(node.value, ast.Call)
-                          and isinstance(node.value.func, ast.Name)
-                          and node.value.func.id in (
-                              "range", "sorted", "reversed", "list",
-                              "tuple", "map", "filter", "zip",
-                              "enumerate")):
-                        var_types[tgt.id] = "list"
-                    # User function call that returns list/dict/str.
-                    # Don't downgrade a specific type (e.g. "list:float")
-                    # to a generic one ("list").
-                    elif (isinstance(node.value, ast.Call)
-                          and isinstance(node.value.func, ast.Name)
-                          and node.value.func.id
-                              in self._user_functions):
-                        _fn = self._user_functions[
-                            node.value.func.id]
-                        _existing = var_types.get(tgt.id)
-                        _rtk = ValueType.from_old_tag(_fn.ret_tag).kind
-                        if _rtk == VKind.LIST:
-                            if not (_existing and
-                                    _existing.startswith("list:")):
-                                var_types[tgt.id] = "list"
-                        elif _rtk == VKind.DICT:
-                            var_types[tgt.id] = "dict"
-                        elif _rtk == VKind.STR:
-                            var_types[tgt.id] = "str"
-                        elif _rtk == VKind.FLOAT:
-                            var_types[tgt.id] = "float"
+    def _csa_propagate_ret_types(
+        self, tree: ast.Module,
+        func_asts: dict[str, ast.FunctionDef],
+        var_types: dict[str, str],
+    ) -> dict[str, str]:
+        """Infer function return types and propagate to module-level var_types.
 
-        # Propagate function return types: data = make_list() → data is "list"
-        # This catches the pattern where a function returns a list/dict/str
-        # and the result is passed to another function.
+        Walks each function body to detect local variable types and return
+        statements, building a ``_func_ret_types`` mapping.  Also detects
+        list-append element types and tuple-float return patterns.
+
+        After per-function analysis, propagates return types back to
+        module-level ``var_types`` for calls like ``data = make_list()``.
+
+        *var_types* is mutated in-place.  Returns ``_func_ret_types``.
+        """
         _func_ret_types: dict[str, str] = {}
         self._func_ret_types = _func_ret_types  # expose for _infer_type_tag
         for fname, fnode in func_asts.items():
@@ -4832,6 +4724,7 @@ class CodeGen:
                         called = n.value.func.id
                         if called in _func_ret_types:
                             _func_ret_types[fname] = _func_ret_types[called]
+        # Propagate return types back to module-level var_types
         for node in ast.walk(tree):
             if (isinstance(node, ast.Assign) and len(node.targets) == 1
                     and isinstance(node.targets[0], ast.Name)
@@ -4841,6 +4734,303 @@ class CodeGen:
                 rt = _func_ret_types[node.value.func.id]
                 if rt.startswith("list") or rt == "dict" or rt == "str":
                     var_types[node.targets[0].id] = rt
+        return _func_ret_types
+
+    def _csa_propagate_call_graph(
+        self,
+        func_asts: dict[str, ast.FunctionDef],
+        class_parents: dict[str, str | None],
+    ) -> None:
+        """Propagate signatures through the call graph.
+
+        When function F is called inside G's body with G's parameter as an
+        argument, F needs a signature per G-signature.  Iterates until no
+        new sigs are added.  This ensures ``inner(y)`` inside a
+        monomorphized ``outer(y)`` gets the right specialization at each
+        call site.
+
+        Also includes class methods: a method call ``compute(self.val)``
+        where ``self.val``'s type is known from ``__init__`` propagates that
+        type as the callee's arg sig.
+        """
+        propagate_scopes: list[tuple[str | None, ast.FunctionDef]] = []
+        for name, fn in func_asts.items():
+            propagate_scopes.append((None, fn))
+        for cls_name, cls_node in self._csa_class_asts.items():
+            for item in cls_node.body:
+                if isinstance(item, ast.FunctionDef):
+                    propagate_scopes.append((cls_name, item))
+        changed = True
+        iterations = 0
+        while changed and iterations < 10:
+            iterations += 1
+            changed = False
+            for owner_cls, caller_ast in propagate_scopes:
+                caller_name = caller_ast.name
+                # For methods, use "Class.method" as the key to match how
+                # _analyze_call_sites registers method sigs.
+                caller_key = (f"{owner_cls}.{caller_name}"
+                              if owner_cls else caller_name)
+                caller_sigs = self._function_signatures.get(caller_key, [])
+                if not caller_sigs:
+                    continue
+                # For methods, self is the first param (skip it).
+                caller_params = [a.arg for a in caller_ast.args.args]
+                caller_params += [a.arg for a in caller_ast.args.kwonlyargs]
+                is_method = owner_cls is not None
+                for caller_sig in list(caller_sigs):
+                    # Build the set of param → type for this signature
+                    param_type_of: dict[str, str] = {}
+                    for pi, pt in enumerate(caller_sig):
+                        if pi < len(caller_params) and pt is not None:
+                            param_type_of[caller_params[pi]] = pt
+                    # For methods, self.attr types add useful info even
+                    # when caller's param types are empty; skip only if
+                    # there's no info at all.
+                    if not param_type_of and not is_method:
+                        continue
+                    # Walk calls inside caller's body
+                    for n in ast.walk(caller_ast):
+                        if not (isinstance(n, ast.Call)
+                                and isinstance(n.func, ast.Name)):
+                            continue
+                        callee = n.func.id
+                        if callee not in self._function_signatures:
+                            continue
+                        if callee == caller_name:
+                            continue  # self-recursion handled elsewhere
+                        # Build callee sig by substituting caller's param
+                        # types into the call's args. Also resolve self.attr
+                        # references for method callers via
+                        # _infer_attr_type_from_init.
+                        def _arg_type(arg: ast.expr) -> str | None:
+                            if (isinstance(arg, ast.Name)
+                                    and arg.id in param_type_of):
+                                return param_type_of[arg.id]
+                            if isinstance(arg, ast.Constant):
+                                v = arg.value
+                                if isinstance(v, bool):
+                                    return "bool"
+                                if isinstance(v, float):
+                                    return "float"
+                                if isinstance(v, int):
+                                    return "int"
+                                if isinstance(v, str):
+                                    return "str"
+                                return None
+                            if (is_method
+                                    and isinstance(arg, ast.Attribute)
+                                    and isinstance(arg.value, ast.Name)
+                                    and arg.value.id == "self"):
+                                return self._infer_attr_type_from_init(
+                                    owner_cls, arg.attr, class_parents)
+                            if (isinstance(arg, ast.BinOp)
+                                    and isinstance(arg.op, (ast.Add, ast.Sub,
+                                                            ast.Mult, ast.Div))):
+                                has_float = False
+                                for sub in ast.walk(arg):
+                                    t: str | None = None
+                                    if (isinstance(sub, ast.Name)
+                                            and sub.id in param_type_of):
+                                        t = param_type_of[sub.id]
+                                    elif (is_method
+                                          and isinstance(sub, ast.Attribute)
+                                          and isinstance(sub.value, ast.Name)
+                                          and sub.value.id == "self"):
+                                        t = self._infer_attr_type_from_init(
+                                            owner_cls, sub.attr, class_parents)
+                                    elif (isinstance(sub, ast.Constant)
+                                          and isinstance(sub.value, float)):
+                                        t = "float"
+                                    if t == "float":
+                                        has_float = True
+                                        break
+                                if isinstance(arg.op, ast.Div) or has_float:
+                                    return "float"
+                                return "int"
+                            return None
+
+                        callee_sig: list[str | None] = []
+                        for arg in n.args:
+                            callee_sig.append(_arg_type(arg))
+                        # Also account for keyword args in the call
+                        if n.keywords and callee in func_asts:
+                            callee_def = func_asts[callee]
+                            callee_params = [
+                                a.arg for a in callee_def.args.args]
+                            callee_params += [
+                                a.arg for a in callee_def.args.kwonlyargs]
+                            while len(callee_sig) < len(callee_params):
+                                callee_sig.append(None)
+                            for kw in n.keywords:
+                                if (kw.arg is None
+                                        or kw.arg not in callee_params):
+                                    continue
+                                pi = callee_params.index(kw.arg)
+                                if pi >= len(callee_sig):
+                                    continue
+                                kt = _arg_type(kw.value)
+                                if kt is not None:
+                                    callee_sig[pi] = kt
+                        new_sig = tuple(callee_sig)
+                        if new_sig not in self._function_signatures[callee]:
+                            self._function_signatures[callee].append(new_sig)
+                            changed = True
+                        # Also merge into _call_site_param_types so the
+                        # non-monomorphization path still sees the right
+                        # param types for functions without scalar conflicts.
+                        existing = self._call_site_param_types.setdefault(
+                            callee, [])
+                        for i, t in enumerate(callee_sig):
+                            if t is None:
+                                continue
+                            while len(existing) <= i:
+                                existing.append(None)
+                            if existing[i] is None:
+                                existing[i] = t
+                                changed = True
+                            elif existing[i] != t:
+                                # Compatible bool/int? leave as int.
+                                if {existing[i], t} == {"int", "bool"}:
+                                    existing[i] = "int"
+                                elif existing[i] == "mixed":
+                                    pass  # keep mixed
+                                else:
+                                    # Genuine conflict → "mixed" (will be
+                                    # handled by monomorphization pass).
+                                    existing[i] = "mixed"
+
+    def _csa_build_var_types(self, tree: ast.Module) -> dict[str, str]:
+        """Build static variable type map from module-level assignments."""
+        var_types: dict[str, str] = {}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign) and len(node.targets) == 1:
+                tgt = node.targets[0]
+                if isinstance(tgt, ast.Name):
+                    if isinstance(node.value, ast.List):
+                        if node.value.elts and isinstance(node.value.elts[0], (ast.List, ast.ListComp)):
+                            var_types[tgt.id] = "list:list"
+                        elif (node.value.elts
+                              and all(isinstance(e, ast.Constant)
+                                      and isinstance(e.value, str)
+                                      for e in node.value.elts)):
+                            var_types[tgt.id] = "list:str"
+                        elif (node.value.elts
+                              and all(isinstance(e, ast.Constant)
+                                      and isinstance(e.value, float)
+                                      for e in node.value.elts)):
+                            var_types[tgt.id] = "list:float"
+                        else:
+                            var_types[tgt.id] = "list"
+                    elif isinstance(node.value, ast.ListComp):
+                        var_types[tgt.id] = "list"
+                    elif isinstance(node.value, (ast.Dict, ast.DictComp)):
+                        var_types[tgt.id] = "dict"
+                    elif isinstance(node.value, ast.Set):
+                        var_types[tgt.id] = "list"
+                    elif isinstance(node.value, ast.Constant):
+                        if isinstance(node.value.value, str):
+                            var_types[tgt.id] = "str"
+                        elif isinstance(node.value.value, float):
+                            var_types[tgt.id] = "float"
+                        elif isinstance(node.value.value, complex):
+                            var_types[tgt.id] = "complex"
+                        elif isinstance(node.value.value, bytes):
+                            var_types[tgt.id] = "bytes"
+                        elif (isinstance(node.value.value, int)
+                              and not isinstance(node.value.value, bool)
+                              and (node.value.value > 2**63 - 1
+                                   or node.value.value < -(2**63))):
+                            var_types[tgt.id] = "bigint"
+                    # list * N or N * list (e.g. [0] * 4, [1.0] * n)
+                    elif (isinstance(node.value, ast.BinOp)
+                          and isinstance(node.value.op, ast.Mult)
+                          and (isinstance(node.value.left,
+                                         (ast.List, ast.Tuple))
+                               or isinstance(node.value.right,
+                                             (ast.List, ast.Tuple)))):
+                        # Detect element type for list*N
+                        _rep_list = (node.value.left
+                                     if isinstance(node.value.left,
+                                                   (ast.List, ast.Tuple))
+                                     else node.value.right)
+                        if (isinstance(_rep_list, (ast.List, ast.Tuple))
+                                and _rep_list.elts
+                                and isinstance(_rep_list.elts[0],
+                                               ast.Constant)
+                                and isinstance(_rep_list.elts[0].value,
+                                               float)):
+                            var_types[tgt.id] = "list:float"
+                        else:
+                            var_types[tgt.id] = "list"
+                    # BinOp/UnaryOp that constant-folds to bigint/complex
+                    elif isinstance(node.value, (ast.BinOp, ast.UnaryOp)):
+                        try:
+                            folded = self._try_constant_fold(node.value)
+                            if (folded is not None and isinstance(folded, int)
+                                    and not isinstance(folded, bool)
+                                    and (folded > 2**63 - 1
+                                         or folded < -(2**63))):
+                                var_types[tgt.id] = "bigint"
+                            elif (folded is not None
+                                    and isinstance(folded, complex)):
+                                var_types[tgt.id] = "complex"
+                        except Exception:
+                            pass
+                    # range(), sorted(), reversed(), list() calls
+                    elif (isinstance(node.value, ast.Call)
+                          and isinstance(node.value.func, ast.Name)
+                          and node.value.func.id in (
+                              "range", "sorted", "reversed", "list",
+                              "tuple", "map", "filter", "zip",
+                              "enumerate")):
+                        var_types[tgt.id] = "list"
+                    # User function call that returns list/dict/str.
+                    # Don't downgrade a specific type (e.g. "list:float")
+                    # to a generic one ("list").
+                    elif (isinstance(node.value, ast.Call)
+                          and isinstance(node.value.func, ast.Name)
+                          and node.value.func.id
+                              in self._user_functions):
+                        _fn = self._user_functions[
+                            node.value.func.id]
+                        _existing = var_types.get(tgt.id)
+                        _rtk = ValueType.from_old_tag(_fn.ret_tag).kind
+                        if _rtk == VKind.LIST:
+                            if not (_existing and
+                                    _existing.startswith("list:")):
+                                var_types[tgt.id] = "list"
+                        elif _rtk == VKind.DICT:
+                            var_types[tgt.id] = "dict"
+                        elif _rtk == VKind.STR:
+                            var_types[tgt.id] = "str"
+                        elif _rtk == VKind.FLOAT:
+                            var_types[tgt.id] = "float"
+        return var_types
+
+    def _analyze_call_sites(self, tree: ast.Module) -> None:
+        """Scan all call sites to determine argument types for each function."""
+        # Save the module tree so other detectors (e.g. the class-attr
+        # global scan) can walk it.
+        self._csa_root_tree = tree
+        # Build class inheritance map and cache class AST nodes
+        class_parents: dict[str, str | None] = {}
+        self._csa_class_asts: dict[str, ast.ClassDef] = {}
+        func_asts: dict[str, ast.FunctionDef] = {}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ClassDef):
+                parent = node.bases[0].id if node.bases and isinstance(node.bases[0], ast.Name) else None
+                class_parents[node.name] = parent
+                self._csa_class_asts[node.name] = node
+            elif isinstance(node, ast.FunctionDef):
+                # Track the first FunctionDef per name (module-level takes
+                # precedence over nested; class methods tracked separately).
+                func_asts.setdefault(node.name, node)
+
+        var_types = self._csa_build_var_types(tree)
+
+        _func_ret_types = self._csa_propagate_ret_types(
+            tree, func_asts, var_types)
 
         # Track pyobj variables from bridge imports: `t = Template(...)` and
         # method calls on pyobj vars: `out = t.render(ctx)`. This lets
@@ -5579,161 +5769,7 @@ class CodeGen:
                             for i in range(len(existing), len(cls_arg_types)):
                                 existing.append(cls_arg_types[i])
 
-        # Propagate signatures through the call graph: when function F is
-        # called inside G's body with G's parameter as an argument, F needs a
-        # signature per G-signature. Iterate until no new sigs are added.
-        # This ensures `inner(y)` inside a monomorphized `outer(y)` gets the
-        # right specialization of inner at each call site.
-        #
-        # Also include class methods: a method call `compute(self.val)` where
-        # self.val's type is known from __init__ should propagate that type
-        # as the callee's arg sig.
-        propagate_scopes: list[tuple[str | None, ast.FunctionDef]] = []
-        for name, fn in func_asts.items():
-            propagate_scopes.append((None, fn))
-        for cls_name, cls_node in self._csa_class_asts.items():
-            for item in cls_node.body:
-                if isinstance(item, ast.FunctionDef):
-                    propagate_scopes.append((cls_name, item))
-        changed = True
-        iterations = 0
-        while changed and iterations < 10:
-            iterations += 1
-            changed = False
-            for owner_cls, caller_ast in propagate_scopes:
-                caller_name = caller_ast.name
-                # For methods, use "Class.method" as the key to match how
-                # _analyze_call_sites registers method sigs.
-                caller_key = (f"{owner_cls}.{caller_name}"
-                              if owner_cls else caller_name)
-                caller_sigs = self._function_signatures.get(caller_key, [])
-                if not caller_sigs:
-                    continue
-                # For methods, self is the first param (skip it).
-                caller_params = [a.arg for a in caller_ast.args.args]
-                caller_params += [a.arg for a in caller_ast.args.kwonlyargs]
-                is_method = owner_cls is not None
-                for caller_sig in list(caller_sigs):
-                    # Build the set of param → type for this signature
-                    param_type_of: dict[str, str] = {}
-                    for pi, pt in enumerate(caller_sig):
-                        if pi < len(caller_params) and pt is not None:
-                            param_type_of[caller_params[pi]] = pt
-                    # For methods, self.attr types add useful info even
-                    # when caller's param types are empty; skip only if
-                    # there's no info at all.
-                    if not param_type_of and not is_method:
-                        continue
-                    # Walk calls inside caller's body
-                    for n in ast.walk(caller_ast):
-                        if not (isinstance(n, ast.Call)
-                                and isinstance(n.func, ast.Name)):
-                            continue
-                        callee = n.func.id
-                        if callee not in self._function_signatures:
-                            continue
-                        if callee == caller_name:
-                            continue  # self-recursion handled elsewhere
-                        # Build callee sig by substituting caller's param
-                        # types into the call's args. Also resolve self.attr
-                        # references for method callers via
-                        # _infer_attr_type_from_init.
-                        def _arg_type(arg: ast.expr) -> str | None:
-                            if (isinstance(arg, ast.Name)
-                                    and arg.id in param_type_of):
-                                return param_type_of[arg.id]
-                            if isinstance(arg, ast.Constant):
-                                v = arg.value
-                                if isinstance(v, bool):
-                                    return "bool"
-                                if isinstance(v, float):
-                                    return "float"
-                                if isinstance(v, int):
-                                    return "int"
-                                if isinstance(v, str):
-                                    return "str"
-                                return None
-                            if (is_method
-                                    and isinstance(arg, ast.Attribute)
-                                    and isinstance(arg.value, ast.Name)
-                                    and arg.value.id == "self"):
-                                return self._infer_attr_type_from_init(
-                                    owner_cls, arg.attr, class_parents)
-                            if (isinstance(arg, ast.BinOp)
-                                    and isinstance(arg.op, (ast.Add, ast.Sub,
-                                                            ast.Mult, ast.Div))):
-                                has_float = False
-                                for sub in ast.walk(arg):
-                                    t: str | None = None
-                                    if (isinstance(sub, ast.Name)
-                                            and sub.id in param_type_of):
-                                        t = param_type_of[sub.id]
-                                    elif (is_method
-                                          and isinstance(sub, ast.Attribute)
-                                          and isinstance(sub.value, ast.Name)
-                                          and sub.value.id == "self"):
-                                        t = self._infer_attr_type_from_init(
-                                            owner_cls, sub.attr, class_parents)
-                                    elif (isinstance(sub, ast.Constant)
-                                          and isinstance(sub.value, float)):
-                                        t = "float"
-                                    if t == "float":
-                                        has_float = True
-                                        break
-                                if isinstance(arg.op, ast.Div) or has_float:
-                                    return "float"
-                                return "int"
-                            return None
-
-                        callee_sig: list[str | None] = []
-                        for arg in n.args:
-                            callee_sig.append(_arg_type(arg))
-                        # Also account for keyword args in the call
-                        if n.keywords and callee in func_asts:
-                            callee_def = func_asts[callee]
-                            callee_params = [
-                                a.arg for a in callee_def.args.args]
-                            callee_params += [
-                                a.arg for a in callee_def.args.kwonlyargs]
-                            while len(callee_sig) < len(callee_params):
-                                callee_sig.append(None)
-                            for kw in n.keywords:
-                                if (kw.arg is None
-                                        or kw.arg not in callee_params):
-                                    continue
-                                pi = callee_params.index(kw.arg)
-                                if pi >= len(callee_sig):
-                                    continue
-                                kt = _arg_type(kw.value)
-                                if kt is not None:
-                                    callee_sig[pi] = kt
-                        new_sig = tuple(callee_sig)
-                        if new_sig not in self._function_signatures[callee]:
-                            self._function_signatures[callee].append(new_sig)
-                            changed = True
-                        # Also merge into _call_site_param_types so the
-                        # non-monomorphization path still sees the right
-                        # param types for functions without scalar conflicts.
-                        existing = self._call_site_param_types.setdefault(
-                            callee, [])
-                        for i, t in enumerate(callee_sig):
-                            if t is None:
-                                continue
-                            while len(existing) <= i:
-                                existing.append(None)
-                            if existing[i] is None:
-                                existing[i] = t
-                                changed = True
-                            elif existing[i] != t:
-                                # Compatible bool/int? leave as int.
-                                if {existing[i], t} == {"int", "bool"}:
-                                    existing[i] = "int"
-                                elif existing[i] == "mixed":
-                                    pass  # keep mixed
-                                else:
-                                    # Genuine conflict → "mixed" (will be
-                                    # handled by monomorphization pass).
-                                    existing[i] = "mixed"
+        self._csa_propagate_call_graph(func_asts, class_parents)
 
         # Propagate super().__init__() arg types to parent class __init__.
         # Without this, `class Circle(Shape): super().__init__("circle")`
