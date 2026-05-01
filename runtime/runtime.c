@@ -690,6 +690,8 @@ extern int64_t fastpy_dict_length(FpyDict*);
 extern FpyList* fastpy_dict_keys(FpyDict*);
 extern FpyList* fastpy_dict_values(FpyDict*);
 extern FpyList* fastpy_dict_items(FpyDict*);
+extern void fastpy_dict_key_fv(FpyDict*, int64_t, int32_t*, int64_t*);
+extern void fastpy_dict_value_fv(FpyDict*, int64_t, int32_t*, int64_t*);
 extern int32_t fastpy_dict_has_key(FpyDict*, const char*);
 extern void fastpy_dict_update(FpyDict*, FpyDict*);
 extern FpyList* fastpy_tuple_new(void);
