@@ -7596,115 +7596,17 @@ class CodeGen:
 
         return string_params
 
-    def _emit_function_def(self, node: ast.FunctionDef,
-                           _sig_override: list | None = None,
-                           _name_override: str | None = None) -> None:
-        """Generate code for a user function body.
+    def _efd_store_parameters(self, node: ast.FunctionDef,
+                              info, _sig_override: list | None,
+                              bool_default_params: set,
+                              string_params: set,
+                              saved) -> None:
+        """Store function parameters as local variables.
 
-        When the function was monomorphized in _declare_user_function, emit
-        one body per specialization by recursing with the specialization's
-        signature and mangled name.
+        Handles bare-ABI (native types), FV-ABI (FpyValue structs with
+        type inference from call sites, defaults, varargs/kwargs), and
+        old ABI (vararg/kwarg only) parameter storage paths.
         """
-        # Dispatch to specializations on the top-level call
-        if _sig_override is None and _name_override is None:
-            specs = self._monomorphized.get(node.name)
-            if specs:
-                for sig in specs:
-                    mangled = f"{node.name}__{self._mangle_sig(sig)}"
-                    self._emit_function_def(
-                        node, _sig_override=list(sig),
-                        _name_override=mangled)
-                return
-
-        effective_name = _name_override if _name_override else node.name
-        self._current_func_name = effective_name  # Phase 4: for indirect call ABI detection
-
-        # CPython generators: skip body emission. The function will be
-        # compiled and stored via CPython bridge in fastpy_main.
-        if effective_name in getattr(self, '_cpython_generators', set()):
-            return
-
-        info = self._user_functions[effective_name]
-        # Save outer state. Dict-value-type sets are scoped per-function so
-        # a `d` param in one function doesn't pollute another's heuristics.
-        saved = (self.function, self.builder, self.variables, self._loop_stack,
-                 self._list_append_types,
-                 self._dict_var_int_values, self._dict_var_list_values,
-                 self._dict_var_dict_values, self._dict_var_obj_values,
-                 self._dict_var_key_types,
-                 self._obj_var_class, self._native_vars,
-                 self._unsafe_typed_vars, self._int_mode_vars,
-                 self._current_fn_bare_abi)
-
-        # Set up function state
-        self.function = info.func
-        self._current_fn_bare_abi = info.uses_bare_abi
-        entry = info.func.append_basic_block("entry")
-        self.builder = _SafeIRBuilder(entry)
-        self.variables = {}
-        self._native_vars = {}
-        self._loop_stack = []
-        self._list_append_types = {}
-        self._dict_var_int_values = set()
-        self._dict_var_list_values = set()
-        self._dict_var_dict_values = set()
-        self._dict_var_obj_values = set()
-        self._dict_var_key_types = {}
-        self._obj_var_class = {}
-        self._int_mode_vars = {}
-        # Pre-scan for typed annotations contradicted by later assignments
-        if self._typed_mode:
-            self._unsafe_typed_vars = self._scan_unsafe_typed_vars(node.body)
-
-        # Pre-scan function body for list append patterns. Build a
-        # param-name → type map from call-site analysis so `for c in s:`
-        # where `s` is a str-typed param can feed str-typed append() calls.
-        prescan_known: dict[str, str] = {}
-        pre_param_names = [a.arg for a in node.args.args]
-        pre_param_names += [a.arg for a in node.args.kwonlyargs]
-        # For monomorphized variants, use the sig override directly instead
-        # of the original function's (possibly mixed) call-site types.
-        if _sig_override is not None:
-            pre_call_types = list(_sig_override)
-        else:
-            pre_call_types = self._call_site_param_types.get(node.name, [])
-        for i, pname in enumerate(pre_param_names):
-            if i < len(pre_call_types) and pre_call_types[i] is not None:
-                prescan_known[pname] = pre_call_types[i]
-        self._prescan_list_append_types(node.body, prescan_known)
-        self._current_scope_stmts = node.body
-
-        # Detect which params are used as strings (in f-strings, concat, etc.)
-        string_params = self._detect_string_params(node)
-
-        # Detect params with bool defaults (e.g. def f(x, verbose=False))
-        bool_default_params: set[str] = set()
-        pos_params = [a.arg for a in node.args.args]
-        for di, d in enumerate(node.args.defaults):
-            pidx = len(pos_params) - len(node.args.defaults) + di
-            if (isinstance(d, ast.Constant)
-                    and isinstance(d.value, bool)
-                    and 0 <= pidx < len(pos_params)):
-                bool_default_params.add(pos_params[pidx])
-        # And kwonly bool defaults
-        for name, d in zip([a.arg for a in node.args.kwonlyargs],
-                            node.args.kw_defaults):
-            if (d is not None and isinstance(d, ast.Constant)
-                    and isinstance(d.value, bool)):
-                bool_default_params.add(name)
-
-        # Track parameter names so _emit_scope_decref skips them
-        # (parameters are borrowed references from the caller)
-        self._current_func_params = set(
-            a.arg for a in node.args.args)
-        if node.args.kwonlyargs:
-            self._current_func_params.update(a.arg for a in node.args.kwonlyargs)
-        if node.args.vararg:
-            self._current_func_params.add(node.args.vararg.arg)
-        if node.args.kwarg:
-            self._current_func_params.add(node.args.kwarg.arg)
-
-        # Store parameters as local variables
         has_vararg = node.args.vararg is not None
         has_kwarg = node.args.kwarg is not None
         if _sig_override is not None:
@@ -7949,61 +7851,15 @@ class CodeGen:
                 tag = "int"
             self.variables[param.name] = (alloca, tag)
 
-        # --typed mode: parse parameter annotations and create native allocas
-        # with entry guards that verify the FpyValue tag matches the annotation.
-        if self._typed_mode and info.uses_fv_abi:
-            ast_params = list(node.args.args)
-            for pidx, ast_arg in enumerate(ast_params):
-                kind = self._parse_annotation(ast_arg.annotation)
-                if kind is None or kind not in self._VKIND_TO_LLVM:
-                    continue
-                pname = ast_arg.arg
-                if pname not in self.variables:
-                    continue
-                # Extract Annotated markers for int overflow policy
-                if ast_arg.annotation is not None and kind == VKind.INT:
-                    _, markers = self._unwrap_annotated(ast_arg.annotation)
-                    if 'Unchecked32' in markers:
-                        self._int_mode_vars[pname] = 'unchecked32'
-                    elif 'Checked32' in markers:
-                        self._int_mode_vars[pname] = 'checked32'
-                    elif 'Unchecked' in markers:
-                        self._int_mode_vars[pname] = 'unchecked'
-                    elif 'Checked' in markers:
-                        self._int_mode_vars[pname] = 'checked'
-                # The parameter is already stored as FpyValue in self.variables.
-                # Create a native-type alloca and add a guard + unbox.
-                alloca, _tag = self.variables[pname]
-                fv = self.builder.load(alloca, name=f"{pname}.fv")
-                tag_val = self.builder.extract_value(fv, 0)
-                expected_tag = ir.Constant(i32, self._VKIND_TO_FPY_TAG[kind])
-                ok = self.builder.icmp_unsigned("==", tag_val, expected_tag)
-                ok_block = self._new_block(f"typed.{pname}.ok")
-                err_block = self._new_block(f"typed.{pname}.err")
-                self.builder.cbranch(ok, ok_block, err_block)
-                # Error path: raise TypeError
-                self.builder.position_at_end(err_block)
-                self._emit_type_error(
-                    f"expected {kind.old_tag} for parameter '{pname}'", node)
-                if not self.builder.block.is_terminated:
-                    self.builder.branch(ok_block)
-                # OK path: unbox to native type and store
-                self.builder.position_at_end(ok_block)
-                native_type = self._VKIND_TO_LLVM[kind]
-                native_alloca = self._create_entry_alloca(native_type, f"{pname}.typed")
-                native_val = self._typed_unbox_fv(fv, kind)
-                self.builder.store(native_val, native_alloca)
-                self._native_vars[pname] = (native_alloca, kind)
-                # Update self.variables so _emit_expr sees the correct VKind
-                self.variables[pname] = (native_alloca, ValueType(kind))
+    def _efd_refine_annotations(self, node: ast.FunctionDef,
+                                info) -> None:
+        """Refine variable type tags from parameter annotations.
 
-        # Always-on annotation reading: parse parameter annotations to refine
-        # variable type tags even without --typed mode.  This enables correct
-        # method dispatch for typed parameters (e.g. def f(p: Path) allows
-        # p.resolve() to dispatch to native path handlers).
-        # Reads container annotations (list[int], dict[str,int]), scalar types
-        # (int, float, str, bool), bridge types (Path), and user classes.
-        # No native allocas — just tag updates for compile-time type inference.
+        Reads container annotations (list[int], dict[str,int]), scalar
+        types (int, float, str, bool), bridge types (Path), and user
+        classes.  No native allocas -- just tag updates for compile-time
+        type inference.
+        """
         if info.uses_fv_abi:
             ast_params = list(node.args.args)
             _native_imports = getattr(self, '_native_imports', {})
@@ -8078,6 +7934,167 @@ class CodeGen:
                         alloca, _ = self.variables[pname]
                         self.variables[pname] = (alloca, "path")
                         continue
+
+    def _emit_function_def(self, node: ast.FunctionDef,
+                           _sig_override: list | None = None,
+                           _name_override: str | None = None) -> None:
+        """Generate code for a user function body.
+
+        When the function was monomorphized in _declare_user_function, emit
+        one body per specialization by recursing with the specialization's
+        signature and mangled name.
+        """
+        # Dispatch to specializations on the top-level call
+        if _sig_override is None and _name_override is None:
+            specs = self._monomorphized.get(node.name)
+            if specs:
+                for sig in specs:
+                    mangled = f"{node.name}__{self._mangle_sig(sig)}"
+                    self._emit_function_def(
+                        node, _sig_override=list(sig),
+                        _name_override=mangled)
+                return
+
+        effective_name = _name_override if _name_override else node.name
+        self._current_func_name = effective_name  # Phase 4: for indirect call ABI detection
+
+        # CPython generators: skip body emission. The function will be
+        # compiled and stored via CPython bridge in fastpy_main.
+        if effective_name in getattr(self, '_cpython_generators', set()):
+            return
+
+        info = self._user_functions[effective_name]
+        # Save outer state. Dict-value-type sets are scoped per-function so
+        # a `d` param in one function doesn't pollute another's heuristics.
+        saved = (self.function, self.builder, self.variables, self._loop_stack,
+                 self._list_append_types,
+                 self._dict_var_int_values, self._dict_var_list_values,
+                 self._dict_var_dict_values, self._dict_var_obj_values,
+                 self._dict_var_key_types,
+                 self._obj_var_class, self._native_vars,
+                 self._unsafe_typed_vars, self._int_mode_vars,
+                 self._current_fn_bare_abi)
+
+        # Set up function state
+        self.function = info.func
+        self._current_fn_bare_abi = info.uses_bare_abi
+        entry = info.func.append_basic_block("entry")
+        self.builder = _SafeIRBuilder(entry)
+        self.variables = {}
+        self._native_vars = {}
+        self._loop_stack = []
+        self._list_append_types = {}
+        self._dict_var_int_values = set()
+        self._dict_var_list_values = set()
+        self._dict_var_dict_values = set()
+        self._dict_var_obj_values = set()
+        self._dict_var_key_types = {}
+        self._obj_var_class = {}
+        self._int_mode_vars = {}
+        # Pre-scan for typed annotations contradicted by later assignments
+        if self._typed_mode:
+            self._unsafe_typed_vars = self._scan_unsafe_typed_vars(node.body)
+
+        # Pre-scan function body for list append patterns. Build a
+        # param-name → type map from call-site analysis so `for c in s:`
+        # where `s` is a str-typed param can feed str-typed append() calls.
+        prescan_known: dict[str, str] = {}
+        pre_param_names = [a.arg for a in node.args.args]
+        pre_param_names += [a.arg for a in node.args.kwonlyargs]
+        # For monomorphized variants, use the sig override directly instead
+        # of the original function's (possibly mixed) call-site types.
+        if _sig_override is not None:
+            pre_call_types = list(_sig_override)
+        else:
+            pre_call_types = self._call_site_param_types.get(node.name, [])
+        for i, pname in enumerate(pre_param_names):
+            if i < len(pre_call_types) and pre_call_types[i] is not None:
+                prescan_known[pname] = pre_call_types[i]
+        self._prescan_list_append_types(node.body, prescan_known)
+        self._current_scope_stmts = node.body
+
+        # Detect which params are used as strings (in f-strings, concat, etc.)
+        string_params = self._detect_string_params(node)
+
+        # Detect params with bool defaults (e.g. def f(x, verbose=False))
+        bool_default_params: set[str] = set()
+        pos_params = [a.arg for a in node.args.args]
+        for di, d in enumerate(node.args.defaults):
+            pidx = len(pos_params) - len(node.args.defaults) + di
+            if (isinstance(d, ast.Constant)
+                    and isinstance(d.value, bool)
+                    and 0 <= pidx < len(pos_params)):
+                bool_default_params.add(pos_params[pidx])
+        # And kwonly bool defaults
+        for name, d in zip([a.arg for a in node.args.kwonlyargs],
+                            node.args.kw_defaults):
+            if (d is not None and isinstance(d, ast.Constant)
+                    and isinstance(d.value, bool)):
+                bool_default_params.add(name)
+
+        # Track parameter names so _emit_scope_decref skips them
+        # (parameters are borrowed references from the caller)
+        self._current_func_params = set(
+            a.arg for a in node.args.args)
+        if node.args.kwonlyargs:
+            self._current_func_params.update(a.arg for a in node.args.kwonlyargs)
+        if node.args.vararg:
+            self._current_func_params.add(node.args.vararg.arg)
+        if node.args.kwarg:
+            self._current_func_params.add(node.args.kwarg.arg)
+
+        self._efd_store_parameters(node, info, _sig_override,
+                                   bool_default_params, string_params, saved)
+
+        # --typed mode: parse parameter annotations and create native allocas
+        # with entry guards that verify the FpyValue tag matches the annotation.
+        if self._typed_mode and info.uses_fv_abi:
+            ast_params = list(node.args.args)
+            for pidx, ast_arg in enumerate(ast_params):
+                kind = self._parse_annotation(ast_arg.annotation)
+                if kind is None or kind not in self._VKIND_TO_LLVM:
+                    continue
+                pname = ast_arg.arg
+                if pname not in self.variables:
+                    continue
+                # Extract Annotated markers for int overflow policy
+                if ast_arg.annotation is not None and kind == VKind.INT:
+                    _, markers = self._unwrap_annotated(ast_arg.annotation)
+                    if 'Unchecked32' in markers:
+                        self._int_mode_vars[pname] = 'unchecked32'
+                    elif 'Checked32' in markers:
+                        self._int_mode_vars[pname] = 'checked32'
+                    elif 'Unchecked' in markers:
+                        self._int_mode_vars[pname] = 'unchecked'
+                    elif 'Checked' in markers:
+                        self._int_mode_vars[pname] = 'checked'
+                # The parameter is already stored as FpyValue in self.variables.
+                # Create a native-type alloca and add a guard + unbox.
+                alloca, _tag = self.variables[pname]
+                fv = self.builder.load(alloca, name=f"{pname}.fv")
+                tag_val = self.builder.extract_value(fv, 0)
+                expected_tag = ir.Constant(i32, self._VKIND_TO_FPY_TAG[kind])
+                ok = self.builder.icmp_unsigned("==", tag_val, expected_tag)
+                ok_block = self._new_block(f"typed.{pname}.ok")
+                err_block = self._new_block(f"typed.{pname}.err")
+                self.builder.cbranch(ok, ok_block, err_block)
+                # Error path: raise TypeError
+                self.builder.position_at_end(err_block)
+                self._emit_type_error(
+                    f"expected {kind.old_tag} for parameter '{pname}'", node)
+                if not self.builder.block.is_terminated:
+                    self.builder.branch(ok_block)
+                # OK path: unbox to native type and store
+                self.builder.position_at_end(ok_block)
+                native_type = self._VKIND_TO_LLVM[kind]
+                native_alloca = self._create_entry_alloca(native_type, f"{pname}.typed")
+                native_val = self._typed_unbox_fv(fv, kind)
+                self.builder.store(native_val, native_alloca)
+                self._native_vars[pname] = (native_alloca, kind)
+                # Update self.variables so _emit_expr sees the correct VKind
+                self.variables[pname] = (native_alloca, ValueType(kind))
+
+        self._efd_refine_annotations(node, info)
 
         # Phase 4: set up function aliases for parameters that received
         # function references at call sites. E.g., apply(add, 5, 6) where
