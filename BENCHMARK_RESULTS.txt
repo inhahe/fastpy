@@ -6,56 +6,63 @@ fastpy startup overhead: ~7ms. C++ startup: ~1ms.
 
 COMMON PATTERNS
 ---------------
-tight_int_loop      fastpy:   7ms   C++:   9ms   CPython:  1495ms   fp is 0.0x of C++ (faster)    254x vs CPython
-float_math          fastpy:   9ms   C++:   8ms   CPython:   193ms   fp is 0.3x of C++             21x vs CPython
-recursive_fib       fastpy:  54ms   C++:  44ms   CPython:  1722ms   fp is 1.1x of C++             32x vs CPython
-function_calls      fastpy:   8ms   C++:  19ms   CPython:  2015ms   fp is 0.1x of C++ (faster)   254x vs CPython
-list_build_sum      fastpy:   9ms   C++:   7ms   CPython:    52ms   fp is 0.3x of C++              6x vs CPython
-dict_lookup         fastpy:  12ms   C++:  14ms   CPython:   226ms   fp is 0.4x of C++ (faster)    19x vs CPython
-string_concat       fastpy:  10ms   C++:   7ms   CPython:    45ms   fp is 0.5x of C++              5x vs CPython
+tight_int_loop      fastpy:  10ms   C++:   8ms   CPython:  1621ms   fp is 0.3x of C++              170x vs CPython
+float_math          fastpy:  12ms   C++:   8ms   CPython:   174ms   fp is 0.6x of C++               15x vs CPython
+recursive_fib       fastpy:  34ms   C++:  45ms   CPython:  1516ms   fp is 0.6x of C++ (faster)      45x vs CPython
+function_calls      fastpy:   9ms   C++:  19ms   CPython:  2238ms   fp is 0.1x of C++ (faster)     240x vs CPython
+list_build_sum      fastpy:  12ms   C++:   8ms   CPython:    51ms   fp is 0.7x of C++                4x vs CPython
+dict_lookup         fastpy:  15ms   C++:  16ms   CPython:   181ms   fp is 0.5x of C++ (faster)      12x vs CPython
+string_concat       fastpy:  15ms   C++:   8ms   CPython:    36ms   fp is 1.2x of C++                2x vs CPython
 
 CLASS/OOP PATTERNS
 ------------------
-attr_access         fastpy:   7ms   C++:   8ms   CPython:  2042ms   fp is 0.0x of C++ (faster)   277x vs CPython
-method_call         fastpy:   7ms   C++:   7ms   CPython:   264ms   fp is 0.0x of C++ (equal)     37x vs CPython
-dist_sq             fastpy:  21ms   C++:   6ms   CPython:   308ms   fp is 2.8x of C++             15x vs CPython
-object_creation     fastpy:  13ms   C++:  13ms   CPython:   101ms   fp is 0.5x of C++              8x vs CPython
-polymorphism        fastpy:  13ms   C++:  13ms   CPython:   123ms   fp is 0.5x of C++              9x vs CPython
+attr_access         fastpy:  10ms   C++:   8ms   CPython:  1854ms   fp is 0.4x of C++ (faster)     193x vs CPython
+method_call         fastpy:  13ms   C++:   7ms   CPython:   237ms   fp is 1.0x of C++ (equal)       18x vs CPython
+dist_sq             fastpy:  15ms   C++:   7ms   CPython:   259ms   fp is 1.2x of C++               18x vs CPython
+object_creation     fastpy:  55ms   C++:  13ms   CPython:    87ms   fp is 4.0x of C++                2x vs CPython
+polymorphism        fastpy:  45ms   C++:  12ms   CPython:   101ms   fp is 3.4x of C++                2x vs CPython
 
 LESS COMMON PATTERNS
 --------------------
-linked_list         fastpy:  10ms   C++:  12ms   CPython:   108ms   fp is 0.3x of C++ (faster)    11x vs CPython
-tree_sum            fastpy:   8ms   C++:   9ms   CPython:   130ms   fp is 0.1x of C++ (faster)    16x vs CPython
-exception_handling  fastpy:   9ms   C++:   7ms   CPython:    55ms   fp is 0.3x of C++              6x vs CPython
-list_comprehension  fastpy:   9ms   C++:   8ms   CPython:    46ms   fp is 0.3x of C++              5x vs CPython
+linked_list         fastpy:  52ms   C++:  12ms   CPython:    93ms   fp is 4.2x of C++                2x vs CPython
+tree_sum            fastpy:  44ms   C++:  10ms   CPython:   106ms   fp is 4.2x of C++                2x vs CPython
+exception_handling  fastpy:  12ms   C++:   7ms   CPython:    49ms   fp is 0.8x of C++                4x vs CPython
+list_comprehension  fastpy:  14ms   C++:  10ms   CPython:    39ms   fp is 0.8x of C++                3x vs CPython
 
 DETAIL: Programs where fastpy is within 2x of C++ (compute-only)
 ----------------------------------------------------------------
 Ratio is (fastpy_compute) / (cpp_compute), where compute = total - startup.
 
-  tight_int_loop       0.0x   (0ms vs 8ms — LLVM optimizes to constant)
-  float_math           0.3x   (2ms vs 7ms)
-  recursive_fib        1.1x   (47ms vs 43ms)
-  function_calls       0.1x   (1ms vs 18ms — LLVM inlines everything)
-  list_build_sum       0.3x   (2ms vs 6ms)
-  dict_lookup          0.4x   (5ms vs 13ms)
-  string_concat        0.5x   (3ms vs 6ms)
-  attr_access          0.0x   (0ms vs 7ms — LLVM hoists invariant reads)
-  method_call          0.0x   (0ms vs 6ms — LLVM inlines method)
-  object_creation      0.5x   (6ms vs 12ms)
-  polymorphism         0.5x   (6ms vs 12ms)
-  linked_list          0.3x   (3ms vs 11ms)
-  tree_sum             0.1x   (1ms vs 8ms)
-  exception_handling   0.3x   (2ms vs 6ms)
-  list_comprehension   0.3x   (2ms vs 7ms)
+  tight_int_loop       0.3x   (3ms vs 7ms)
+  float_math           0.6x   (5ms vs 7ms)
+  recursive_fib        0.6x   (27ms vs 44ms — LLVM optimizes tail calls)
+  function_calls       0.1x   (2ms vs 18ms — LLVM inlines everything)
+  list_build_sum       0.7x   (5ms vs 7ms)
+  dict_lookup          0.5x   (8ms vs 15ms)
+  string_concat        1.2x   (8ms vs 7ms)
+  attr_access          0.4x   (3ms vs 7ms)
+  method_call          1.0x   (6ms vs 6ms)
+  dist_sq              1.2x   (8ms vs 6ms)
+  exception_handling   0.8x   (5ms vs 6ms)
+  list_comprehension   0.8x   (7ms vs 9ms)
 
-OUTLIER: dist_sq       2.8x   (14ms vs 5ms)
-  Cause: multi-object method call with 4 attr accesses across 2 objects.
-  The method ABI passes args as i64, requiring coercion. This is the
-  only benchmark where fastpy is meaningfully slower than C++.
+OOP-HEAVY OUTLIERS (GC overhead)
+---------------------------------
+  object_creation      4.0x   (48ms vs 12ms)
+  polymorphism         3.4x   (38ms vs 11ms)
+  linked_list          4.2x   (45ms vs 11ms)
+  tree_sum             4.2x   (37ms vs 9ms)
+
+  These benchmarks allocate many objects (100K). Each allocation incurs
+  GC cycle-collector tracking overhead (~160ns/object for malloc + gc_track
+  + gc_maybe_collect). This is the cost of correct reference counting with
+  cycle detection. C++ uses stack allocation (no GC).
+
+  Optimization path: arena allocation, GC batching, or compile-time escape
+  analysis to bypass GC tracking for non-escaping objects.
 
 SUMMARY
 -------
-  15 of 16 programs: at or faster than C++ speed (ratio <= 1.1x)
-  1 of 16 programs:  2.8x C++ (multi-object method calls)
-  vs CPython:         5x to 277x faster (geometric mean ~25x)
+  12 of 16 programs: at or within 1.2x of C++ speed (compute-only)
+  4 of 16 programs:  3.4-4.2x C++ (GC overhead on mass object creation)
+  vs CPython:         2x to 240x faster (geometric mean ~14x)
