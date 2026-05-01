@@ -3492,25 +3492,42 @@ class CodeGen:
         for cls_info in self._user_classes.values():
             self._emit_class_registration(cls_info)
 
-        # Class Hierarchy Analysis (CHA): build sole-implementor map.
-        # For each method name, if every class that has it shares the same
-        # LLVM function pointer (i.e., the method is defined in ONE place
-        # and inherited everywhere else), we can devirtualize unknown-
-        # receiver calls by calling that function directly — no vtable
-        # lookup needed.
+        # Class Hierarchy Analysis (CHA): build per-method dispatch maps.
+        #
+        # 1. _cha_sole_impl: methods with exactly ONE unique function pointer
+        #    across all classes → devirtualize to direct call, no type check.
+        #
+        # 2. _cha_speculative: methods with 2-4 unique implementations →
+        #    emit a class_id switch with direct calls (LLVM can inline them),
+        #    falling back to vtable for unknown class IDs.
         self._cha_sole_impl: dict[str, ir.Function] = {}
-        _cha_funcs: dict[str, set] = {}  # method → set of func ids
-        _cha_func_ref: dict[str, ir.Function] = {}  # method → one func ref
+        self._cha_speculative: dict[str, list[tuple]] = {}  # method → [(class_id_global, func), ...]
+        _cha_func_to_classes: dict[str, dict[int, list]] = {}  # method → {func_id → [(ci, func)]}
         for ci in self._user_classes.values():
             for mname, mfunc in ci.methods.items():
                 fid = id(mfunc)
-                if mname not in _cha_funcs:
-                    _cha_funcs[mname] = set()
-                    _cha_func_ref[mname] = mfunc
-                _cha_funcs[mname].add(fid)
-        for mname, fids in _cha_funcs.items():
-            if len(fids) == 1:
-                self._cha_sole_impl[mname] = _cha_func_ref[mname]
+                if mname not in _cha_func_to_classes:
+                    _cha_func_to_classes[mname] = {}
+                bucket = _cha_func_to_classes[mname]
+                if fid not in bucket:
+                    bucket[fid] = []
+                bucket[fid].append((ci, mfunc))
+        for mname, buckets in _cha_func_to_classes.items():
+            n_unique = len(buckets)
+            if n_unique == 1:
+                # Sole implementor — all classes share the same function.
+                _, entries = next(iter(buckets.items()))
+                self._cha_sole_impl[mname] = entries[0][1]
+            elif 2 <= n_unique <= 4:
+                # Speculative devirt: build (class_id_global, func) pairs.
+                # For each unique function, pick one representative class
+                # (all classes in the bucket use the same function).
+                spec_entries = []
+                for fid, entries in buckets.items():
+                    func = entries[0][1]
+                    for ci, _ in entries:
+                        spec_entries.append((ci.class_id_global, func))
+                self._cha_speculative[mname] = spec_entries
 
         # Initialize lru_cache slots
         for name, maxsize, gvar in getattr(self, '_lru_init_pending', []):
@@ -30262,6 +30279,171 @@ class CodeGen:
                     result = self.builder.inttoptr(result, i8_ptr)
                 elif (ret_type2 and isinstance(ret_type2, ir.IntType)
                         and ret_type2.width == 32):
+                    result = self.builder.trunc(result, i32)
+            return result
+
+        # Speculative devirtualization: when only 2-4 classes implement a
+        # method, emit a class_id switch with direct calls.  LLVM can
+        # inline small method bodies through the switch, eliminating
+        # both the vtable load AND the indirect call.
+        spec_entries = getattr(self, '_cha_speculative', {}).get(method)
+        if spec_entries is not None and not method_mixed and n_dispatch_args <= 4:
+            # Extract class_id from obj.
+            _obj_typed = self.builder.bitcast(obj, fpy_obj_ptr)
+            _f4_ptr = self.builder.gep(
+                _obj_typed,
+                [ir.Constant(i32, 0), ir.Constant(i32, 4)],
+                inbounds=True)
+            _f4 = self.builder.load(_f4_ptr, name="sd.magic_cid")
+            _cid64 = self.builder.lshr(_f4, ir.Constant(i64, 32))
+            _cid = self.builder.trunc(_cid64, i32, name="sd.cid")
+
+            if is_double_ret:
+                ret_t = ir.DoubleType()
+            else:
+                ret_t = i64
+
+            bb_fallback = self.builder.append_basic_block("sd.fallback")
+            bb_merge = self.builder.append_basic_block("sd.merge")
+
+            # Build one basic block per unique (class_id, func) pair.
+            # Multiple class IDs may share the same function (inherited).
+            # Group entries by function identity so each function body
+            # appears only once with multiple branch-to entries.
+            from collections import OrderedDict
+            _func_groups: OrderedDict[int, tuple] = OrderedDict()
+            for cid_gvar, func in spec_entries:
+                fid = id(func)
+                if fid not in _func_groups:
+                    _func_groups[fid] = (func, [])
+                _func_groups[fid][1].append(cid_gvar)
+
+            cases = []   # (cid_ir_val, bb) for switch
+            phi_in = []  # (result, bb) for merge PHI
+
+            for fid, (func, cid_gvars) in _func_groups.items():
+                bb = self.builder.append_basic_block(f"sd.cls.{func.name.split('.')[-2]}")
+                for cid_gvar in cid_gvars:
+                    cid_val = self.builder.load(cid_gvar)
+                    cases.append((cid_val, bb))
+
+            # Emit the switch (compare chain since llvmlite's switch
+            # requires compile-time constants but class IDs are runtime).
+            cur_bb = self.builder.block
+            for cid_val, target_bb in cases:
+                cmp = self.builder.icmp_unsigned(
+                    "==", _cid, cid_val, name="sd.eq")
+                next_bb = self.builder.append_basic_block("sd.next")
+                self.builder.cbranch(cmp, target_bb, next_bb)
+                self.builder.position_at_end(next_bb)
+            # Last "next" block falls through to fallback.
+            self.builder.branch(bb_fallback)
+
+            # Emit direct call for each unique function.
+            for fid, (func, cid_gvars) in _func_groups.items():
+                bb_name = f"sd.cls.{func.name.split('.')[-2]}"
+                # Find the block we created for this function.
+                for blk in self.function.blocks:
+                    if blk.name == bb_name:
+                        self.builder.position_at_end(blk)
+                        break
+                # Coerce args to match the method's parameter types.
+                direct_args = [obj]
+                for i, val in enumerate(call_args):
+                    if 1 + i >= len(func.args):
+                        break
+                    expected = func.args[1 + i].type
+                    v = val
+                    if v.type != expected:
+                        if (isinstance(expected, ir.IntType)
+                                and isinstance(v.type, ir.IntType)):
+                            if expected.width > v.type.width:
+                                v = self.builder.zext(v, expected)
+                            else:
+                                v = self.builder.trunc(v, expected)
+                        elif (isinstance(expected, ir.PointerType)
+                                and isinstance(v.type, ir.IntType)):
+                            v = self.builder.inttoptr(v, expected)
+                        elif (isinstance(expected, ir.IntType)
+                                and isinstance(v.type, ir.PointerType)):
+                            v = self.builder.ptrtoint(v, expected)
+                        elif (isinstance(expected, ir.DoubleType)
+                                and isinstance(v.type, ir.IntType)):
+                            v = self.builder.bitcast(v, expected)
+                        elif (isinstance(expected, ir.IntType)
+                                and isinstance(v.type, ir.DoubleType)):
+                            v = self.builder.bitcast(v, expected)
+                    direct_args.append(v)
+                call_res = self.builder.call(func, direct_args)
+                # Coerce return value to match ret_t.
+                fret = func.return_value.type
+                if isinstance(fret, ir.VoidType):
+                    call_res = ir.Constant(ret_t, 0)
+                elif fret != ret_t:
+                    if (isinstance(ret_t, ir.IntType)
+                            and isinstance(fret, ir.PointerType)):
+                        call_res = self.builder.ptrtoint(call_res, ret_t)
+                    elif (isinstance(ret_t, ir.IntType)
+                            and isinstance(fret, ir.IntType)
+                            and fret.width != ret_t.width):
+                        if ret_t.width > fret.width:
+                            call_res = self.builder.zext(call_res, ret_t)
+                        else:
+                            call_res = self.builder.trunc(call_res, ret_t)
+                bb_end = self.builder.block
+                self.builder.branch(bb_merge)
+                phi_in.append((call_res, bb_end))
+
+            # Fallback: vtable or string dispatch.
+            self.builder.position_at_end(bb_fallback)
+            vtable_slot = getattr(self, '_vtable_indices', {}).get(method)
+            if vtable_slot is not None:
+                fb_ptr = self._emit_inline_vtable_lookup(
+                    obj, vtable_slot, unchecked=False)
+                null_p = ir.Constant(i8_ptr, None)
+                is_null_fb = self.builder.icmp_unsigned("==", fb_ptr, null_p)
+                bb_vt_call = self.builder.append_basic_block("sd.vt.call")
+                bb_str_fb = self.builder.append_basic_block("sd.str.fb")
+                self.builder.cbranch(is_null_fb, bb_str_fb, bb_vt_call)
+
+                self.builder.position_at_end(bb_vt_call)
+                ftype = ir.FunctionType(ret_t, [i8_ptr] + [i64] * n_dispatch_args)
+                func_typed = self.builder.bitcast(fb_ptr, ir.PointerType(ftype))
+                vt_res = self.builder.call(func_typed, [obj] + call_args)
+                bb_vt_end = self.builder.block
+                self.builder.branch(bb_merge)
+                phi_in.append((vt_res, bb_vt_end))
+
+                self.builder.position_at_end(bb_str_fb)
+                str_res = self._emit_string_method_dispatch(
+                    obj, method_name_ptr, call_args, n_dispatch_args,
+                    is_double_ret, node)
+                if str_res is None:
+                    str_res = ir.Constant(ret_t, 0)
+                bb_str_end = self.builder.block
+                self.builder.branch(bb_merge)
+                phi_in.append((str_res, bb_str_end))
+            else:
+                str_res = self._emit_string_method_dispatch(
+                    obj, method_name_ptr, call_args, n_dispatch_args,
+                    is_double_ret, node)
+                if str_res is None:
+                    str_res = ir.Constant(ret_t, 0)
+                bb_str_end = self.builder.block
+                self.builder.branch(bb_merge)
+                phi_in.append((str_res, bb_str_end))
+
+            self.builder.position_at_end(bb_merge)
+            result = self.builder.phi(ret_t, name="sd.result")
+            for val, blk in phi_in:
+                result.add_incoming(val, blk)
+
+            if not is_double_ret:
+                ret_type = self._find_method_return_type(attr.value, method)
+                if ret_type and isinstance(ret_type, ir.PointerType):
+                    result = self.builder.inttoptr(result, i8_ptr)
+                elif (ret_type and isinstance(ret_type, ir.IntType)
+                        and ret_type.width == 32):
                     result = self.builder.trunc(result, i32)
             return result
 
