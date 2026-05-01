@@ -751,6 +751,7 @@ def _link_windows(obj_files: list[Path], output_path: Path,
         '/DEFAULTLIB:ucrt /DEFAULTLIB:msvcrt '
         '/DEFAULTLIB:legacy_stdio_definitions '
         '/SUBSYSTEM:CONSOLE '
+        '/STACK:8388608 '
         '/EXPORT:fastpy_get_jit_symbols /EXPORT:fastpy_get_jit_symbol_count\r\n'
         'if errorlevel 1 (\r\n'
         '    echo LINK_FAILED\r\n'
@@ -795,6 +796,9 @@ def _link_posix(obj_files: list[Path], output_path: Path,
     cmd += [str(p) for p in obj_files]
     cmd += [f"-L{py_lib_dir}", f"-l{py_lib}"]
     cmd += ["-lm", "-ldl"]
+    # 8 MB stack — prevents stack overflow from recursive refcount release
+    # on deep object chains (e.g. 100K-node linked lists).
+    cmd += ["-Wl,-z,stacksize=8388608"]
     if IS_LINUX:
         cmd += ["-lpthread"]
     # Add rpath so the executable can find libpython at runtime
