@@ -15473,17 +15473,11 @@ class CodeGen:
             self.variables[name] = (gvar, type_tag)
             return
 
-        # Closure cell: unchanged — stored via cell_set
-        elif name in self.variables:
-            alloca, old_tag = self.variables[name]
-            # "cell" is a special storage tag for closure cells, not a type.
-            # Works for both string "cell" and ValueType via __eq__ compat.
-            if old_tag == "cell":
-                cell_ptr = self.builder.load(alloca)
-                self.builder.call(self.runtime["cell_set"], [cell_ptr, value])
-                return
-
         # --typed fast path: store native value directly, no FpyValue wrapping.
+        # Must be checked BEFORE self.variables because variables in _native_vars
+        # are also in self.variables — if we hit the self.variables branch first,
+        # the non-cell fallthrough leads to the FV path which creates a new
+        # fpy_val alloca, diverging from the native alloca that _load_variable uses.
         elif name in self._native_vars:
             alloca, kind = self._native_vars[name]
             native_type = self._VKIND_TO_LLVM[kind]
@@ -15506,6 +15500,16 @@ class CodeGen:
             # correct VKind for this variable.
             self.variables[name] = (alloca, ValueType(kind))
             return
+
+        # Closure cell: unchanged — stored via cell_set
+        elif name in self.variables:
+            alloca, old_tag = self.variables[name]
+            # "cell" is a special storage tag for closure cells, not a type.
+            # Works for both string "cell" and ValueType via __eq__ compat.
+            if old_tag == "cell":
+                cell_ptr = self.builder.load(alloca)
+                self.builder.call(self.runtime["cell_set"], [cell_ptr, value])
+                return
 
         if not self._USE_FV_LOCALS or self._current_fn_bare_abi:
             # Bare-type alloca: store native values directly (no FpyValue wrapping).
@@ -16191,7 +16195,15 @@ class CodeGen:
             return self.builder.trunc(data, i32)
         if kind == VKind.NONE:
             return ir.Constant(i64, 0)
-        # INT, UNKNOWN, FVALUE -> return as i64
+        # FVALUE: return the full fpy_val struct so the runtime tag is
+        # preserved.  All downstream operations (binop, subscript, print,
+        # len, compare) have explicit fpy_val-struct handling that dispatches
+        # correctly based on the runtime tag.  Stripping to bare i64 here
+        # causes the tag to be lost, making downstream code treat int data
+        # as a pointer (crash) or use the wrong operation.
+        if kind == VKind.FVALUE:
+            return fv
+        # INT, UNKNOWN -> return as i64
         return self._fv_as_int(fv)
 
     def _fv_store_from_list(self, name: str, list_val: ir.Value,
@@ -24541,7 +24553,12 @@ class CodeGen:
                 result = self.builder.call(
                     self.runtime["obj_call_method1"],
                     [ltv.as_ptr(self.builder), name_ptr, rtv.as_i64(self.builder)])
-                # Check method return type: only inttoptr if it returns a pointer
+                # Check method return type: only inttoptr if it returns a pointer.
+                # For scalar returns (int/float), wrap in FpyValue so that
+                # _emit_expr tags it as FVALUE — this prevents _infer_type_tag
+                # from blindly tagging it "obj" (since the BinOp has an OBJ
+                # operand) which would make downstream binops treat the raw
+                # scalar as a pointer.
                 ret_type = self._find_method_return_type(node.left, method)
                 if ret_type is None:
                     # Unknown class/method → assume object (safe default)
@@ -24549,8 +24566,12 @@ class CodeGen:
                 if isinstance(ret_type, ir.PointerType):
                     return self.builder.inttoptr(result, i8_ptr)
                 if isinstance(ret_type, ir.DoubleType):
-                    return self.builder.bitcast(result, double)
-                return result  # raw i64 for known int returns
+                    data = self.builder.bitcast(result, i64)
+                    return self._fv_build_from_slots(
+                        ir.Constant(i32, FPY_TAG_FLOAT), data)
+                # int return → FpyValue with INT tag
+                return self._fv_build_from_slots(
+                    ir.Constant(i32, FPY_TAG_INT), result)
 
         # ── Fast path: bool as int ─────────────────────────────────────
         if lk == VKind.BOOL and rk in (VKind.INT, VKind.BOOL):
@@ -24582,8 +24603,12 @@ class CodeGen:
                 if isinstance(ret_type, ir.PointerType):
                     return self.builder.inttoptr(result, i8_ptr)
                 if isinstance(ret_type, ir.DoubleType):
-                    return self.builder.bitcast(result, double)
-                return result
+                    data = self.builder.bitcast(result, i64)
+                    return self._fv_build_from_slots(
+                        ir.Constant(i32, FPY_TAG_FLOAT), data)
+                # int return → FpyValue with INT tag
+                return self._fv_build_from_slots(
+                    ir.Constant(i32, FPY_TAG_INT), result)
 
         # ── Fast path: OBJ used as int (e.g. attr from unknown-class
         #    receiver holding an integer value) ────────────────────────
@@ -31468,7 +31493,7 @@ class CodeGen:
                 and node.value.id in self.variables
                 and not isinstance(node.slice, ast.Slice)):
             _unk_alloca, _unk_tag = self.variables[node.value.id]
-            if (self._tag_kind(_unk_tag) == VKind.UNKNOWN
+            if (self._tag_kind(_unk_tag) in (VKind.UNKNOWN, VKind.FVALUE)
                     and isinstance(_unk_alloca.type, ir.PointerType)
                     and _unk_alloca.type.pointee is fpy_val):
                 # Load the container's runtime tag and data
