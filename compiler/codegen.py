@@ -28532,24 +28532,33 @@ class CodeGen:
                     self.runtime["obj_call_method0"],
                     [tv.as_ptr(self.builder), name_ptr])
 
-        # Runtime dispatch for UNKNOWN/mixed types: extract tag+data
-        # from FpyValue and let the C runtime choose the right len().
-        # Also handle PYOBJ — bridge call results are stored as FpyValue
-        # structs with runtime tags (e.g. tag=BYTES for struct.pack result),
-        # NOT as raw PyObject* pointers.  Passing the native data to
-        # cpython_len (which expects PyObject*) would crash.
-        if kind in (VKind.UNKNOWN, VKind.PYOBJ):
-            fv = None
-            if isinstance(arg_node, ast.Name):
-                fv = self._load_fv_raw(arg_node.id)
+        # Runtime dispatch via fv_len for all remaining types.
+        # fv_len handles STR/LIST/DICT/SET/BYTES/OBJ (including PyObject*)
+        # via a tag-based switch and returns 0 for unsupported tags.
+        # This replaces the old cpython_len fallback which would crash on
+        # native pointers (cpython_len expects PyObject*, not fastpy ptrs).
+
+        # FVALUE: tv.val is already an fpy_val struct — extract tag+data directly
+        if (isinstance(tv.val.type, ir.LiteralStructType)
+                and tv.val.type == fpy_val):
+            tag = self._fv_tag(tv.val)
+            data = self._fv_data_i64(tv.val)
+            return self.builder.call(self.runtime["fv_len"], [tag, data])
+
+        # Name reference: re-load FpyValue from its alloca to get runtime tag.
+        # This handles MIXED/UNKNOWN/PYOBJ params stored as fpy_val allocas.
+        if isinstance(arg_node, ast.Name):
+            fv = self._load_fv_raw(arg_node.id)
             if fv is not None:
                 tag = self._fv_tag(fv)
                 data = self._fv_data_i64(fv)
                 return self.builder.call(self.runtime["fv_len"], [tag, data])
 
-        # Slow path: CPython bridge (works for any type)
-        return self.builder.call(self.runtime["cpython_len"],
-                                  [tv.as_ptr(self.builder)])
+        # Last resort: infer tag at compile time from the value's LLVM type
+        # and AST context. Less precise for runtime-polymorphic values, but
+        # safe (fv_len returns 0 for unrecognized tags rather than crashing).
+        tag, data = self._to_tag_data_ir(tv.val, arg_node)
+        return self.builder.call(self.runtime["fv_len"], [tag, data])
 
     def _emit_builtin_sorted(self, node: ast.Call) -> ir.Value:
         """Emit sorted() — returns a new sorted list. Supports reverse=/key= keywords."""
