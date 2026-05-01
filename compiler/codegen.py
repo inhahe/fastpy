@@ -507,6 +507,29 @@ class _SafeIRBuilder(ir.IRBuilder):
     produce correct types directly."""
 
     coercion_count: int = 0  # class-level counter for audit
+    # E1: per-function coercion tracking (enabled by FASTPY_COERCION_DEBUG=1)
+    _coercion_sites: dict = {}  # {fn_name: {(arg_idx, from_type, to_type): count}}
+    _coercion_debug: bool = False
+
+    @classmethod
+    def enable_coercion_debug(cls):
+        cls._coercion_debug = True
+        cls._coercion_sites = {}
+
+    @classmethod
+    def coercion_report(cls) -> str:
+        """Return a summary of coercion sites, sorted by frequency."""
+        if not cls._coercion_sites:
+            return f"Total coercions: {cls.coercion_count} (no site details)"
+        lines = [f"Total coercions: {cls.coercion_count}"]
+        flat = []
+        for fn, sites in cls._coercion_sites.items():
+            for (idx, ft, tt), count in sites.items():
+                flat.append((count, fn, idx, ft, tt))
+        flat.sort(reverse=True)
+        for count, fn, idx, ft, tt in flat[:30]:
+            lines.append(f"  {count:5d}x  {fn}  arg[{idx}]: {ft} → {tt}")
+        return "\n".join(lines)
 
     def call(self, fn, args, name='', cconv=None, tail=False, fastmath=(),
              attrs=(), arg_attrs=None):
@@ -518,6 +541,11 @@ class _SafeIRBuilder(ir.IRBuilder):
                 if arg.type == ptype:
                     continue
                 _SafeIRBuilder.coercion_count += 1
+                if _SafeIRBuilder._coercion_debug:
+                    fn_name = getattr(fn, 'name', str(fn))
+                    key = (i, str(arg.type), str(ptype))
+                    sites = _SafeIRBuilder._coercion_sites.setdefault(fn_name, {})
+                    sites[key] = sites.get(key, 0) + 1
                 # i64 → i8* (pointer)
                 if (isinstance(ptype, ir.PointerType)
                         and isinstance(arg.type, ir.IntType)
