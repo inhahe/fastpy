@@ -8,5 +8,6 @@ __pycache__/
 *.lib
 .pytest_cache/
 .hypothesis/
+.build/
 web/venv*/
 *.egg-info/

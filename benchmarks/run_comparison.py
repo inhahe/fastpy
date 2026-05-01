@@ -16,7 +16,9 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from compiler.pipeline import compile_source
 from benchmarks.compile_cpp import compile_cpp
 
-TMPDIR = tempfile.mkdtemp(prefix="fastpy_bench_")
+_BUILD_ROOT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".build")
+os.makedirs(_BUILD_ROOT, exist_ok=True)
+TMPDIR = tempfile.mkdtemp(prefix="fastpy_bench_", dir=_BUILD_ROOT)
 
 # -- Benchmark definitions -------------------------------------------
 # Each entry: (name, category, python_src, cpp_src)
@@ -595,4 +597,9 @@ def main():
     print(f"{'=' * 85}")
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    finally:
+        # Clean up temp build directory
+        import shutil
+        shutil.rmtree(TMPDIR, ignore_errors=True)

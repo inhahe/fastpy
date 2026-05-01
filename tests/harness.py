@@ -219,6 +219,14 @@ def diff_test(
     assert compile_result.executable is not None
     compiled_result = run_executable(compile_result.executable, timeout)
 
+    # Clean up the temp build directory
+    import shutil
+    exe_dir = compile_result.executable.parent
+    try:
+        shutil.rmtree(exe_dir, ignore_errors=True)
+    except OSError:
+        pass
+
     # Step 4: Compare outputs
     differences: list[str] = []
 

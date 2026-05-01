@@ -141,7 +141,11 @@ def compile_source(source: str, output: Path | None = None,
 
     # Stage 4: Compile to native executable
     if output is None:
-        tmp_dir = tempfile.mkdtemp(prefix="fastpy_")
+        # Use a local .build directory (easy to exclude from antivirus)
+        # instead of system temp (which accumulates stale dirs).
+        build_root = Path(__file__).resolve().parent.parent / ".build"
+        build_root.mkdir(exist_ok=True)
+        tmp_dir = tempfile.mkdtemp(prefix="fastpy_", dir=str(build_root))
         import sys as _sys
         exe_name = "output.exe" if _sys.platform == "win32" else "output"
         output = Path(tmp_dir) / exe_name
