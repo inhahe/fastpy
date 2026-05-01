@@ -26533,7 +26533,7 @@ class CodeGen:
             return self._rt_call("set_from_list", [arg])
         if len(node.args) == 0:
             return self.builder.call(self.runtime["dict_new"], [])
-        raise CodeGenError(f"{name}() takes 0 or 1 arguments", node)
+        raise CodeGenError("set() takes 0 or 1 arguments", node)
 
     def _emit_builtin_min(self, node):
         # Resolve which builtin (min or max) from the call node
