@@ -6316,88 +6316,147 @@ class CodeGen:
             return "float"
         return None
 
-    def _declare_user_function(self, node: ast.FunctionDef,
-                               _sig_override: list | None = None,
-                               _name_override: str | None = None) -> None:
-        """Forward-declare a user function.
+    def _duf_select_abi(
+        self, node: ast.FunctionDef, ret_type,
+        has_vararg: bool, has_kwarg: bool,
+        param_names: list[str], param_types: list,
+        call_types: list, _name_override: str | None,
+    ) -> tuple[bool, bool]:
+        """Select ABI (bare vs FpyValue) and detect may-return-none.
 
-        When _sig_override / _name_override are provided, emit a monomorphized
-        specialization with the supplied argument types and key it under the
-        overridden name in self._user_functions. When they are None and the
-        function has scalar-conflicting call signatures, recursively declare
-        one specialization per signature and register them in
-        self._monomorphized.
+        Returns (uses_bare, may_return_none).
         """
-        # Check for monomorphization (only on top-level declaration pass)
-        if _sig_override is None and _name_override is None:
-            if node.name in self._user_functions:
-                return
-            sigs = self._function_signatures.get(node.name, [])
-            # Monomorphize only for non-vararg/kwarg functions where scalar
-            # types differ across call sites.
-            is_special = (node.args.vararg is not None
-                          or node.args.kwarg is not None)
-            if (not is_special
-                    and self._signature_scalar_conflict(sigs)):
-                # Fill None positions in each sig from the merged
-                # _call_site_param_types. This ensures specializations
-                # inherit pointer types (list, dict, str, obj) that are
-                # consistent across all call sites but missing from
-                # individual sigs (e.g., forwarded params from callers).
-                merged_types = self._call_site_param_types.get(
-                    node.name, [])
-                filled_sigs = []
-                for sig in sigs:
-                    filled = list(sig)
-                    # Pad to at least merged length
-                    while len(filled) < len(merged_types):
-                        filled.append(None)
-                    for fi in range(min(len(filled), len(merged_types))):
-                        if filled[fi] is None and merged_types[fi] is not None:
-                            filled[fi] = merged_types[fi]
-                    filled_sigs.append(tuple(filled))
-                self._monomorphized[node.name] = filled_sigs
-                if self._analyze_mode:
-                    from compiler.analysis import LOW, IMPACT_MONOMORPHIZED
-                    sig_strs = [
-                        "(" + ", ".join(s or "?" for s in sig) + ")"
-                        for sig in filled_sigs
-                    ]
-                    self._record_finding(
-                        LOW, "monomorphized", node,
-                        construct=f"function {node.name}()",
-                        missed=f"Single function body for {node.name}",
-                        reason=f"Scalar type conflict across {len(filled_sigs)}"
-                               f" call signatures: {', '.join(sig_strs)}",
-                        impact=IMPACT_MONOMORPHIZED,
-                        suggestion="Call the function with consistent "
-                                   "argument types (all int or all float) "
-                                   "to avoid generating multiple variants",
-                    )
-                for fsig in filled_sigs:
-                    mangled = f"{node.name}__{self._mangle_sig(fsig)}"
-                    self._declare_user_function(
-                        node, _sig_override=list(fsig),
-                        _name_override=mangled)
-                # Register the original name as an alias pointing to the
-                # first specialization's FuncInfo. This keeps "name in
-                # self._user_functions" true for code that predates
-                # monomorphization-aware dispatch. The actual call sites
-                # resolve to the correct specialization via
-                # _resolve_specialization before calling.
-                first_mangled = f"{node.name}__{self._mangle_sig(filled_sigs[0])}"
-                if first_mangled in self._user_functions:
-                    self._user_functions[node.name] = self._user_functions[first_mangled]
-                    self._function_def_nodes[node.name] = node
-                return
-        else:
-            # Specialization path: skip if already declared under this name
-            key_name = _name_override if _name_override else node.name
-            if key_name in self._user_functions:
-                return
+        # --- Detect may_return_none early (needed for ABI classification) ---
+        _may_return_none = False
+        has_value_return = False
+        none_default_params: set[str] = set()
+        n_params = len(param_names)
+        for di, d in enumerate(node.args.defaults):
+            if isinstance(d, ast.Constant) and d.value is None:
+                pidx = n_params - len(node.args.defaults) + di
+                if pidx < n_params:
+                    none_default_params.add(param_names[pidx])
+        for n in ast.walk(node):
+            if isinstance(n, ast.Return):
+                if n.value is None:
+                    _may_return_none = True
+                elif (isinstance(n.value, ast.Constant)
+                        and n.value.value is None):
+                    _may_return_none = True
+                elif (isinstance(n.value, ast.Name)
+                        and n.value.id in none_default_params):
+                    _may_return_none = True
+                else:
+                    has_value_return = True
+        if has_value_return and not _may_return_none:
+            last_stmt = node.body[-1] if node.body else None
+            if not isinstance(last_stmt, ast.Return):
+                _may_return_none = True
 
-        has_vararg = node.args.vararg is not None
-        has_kwarg = node.args.kwarg is not None
+        # --- ABI selection: bare-type vs FpyValue ---
+        # Bare-type ABI: direct i64/double/i32 params and return.  Enables
+        # LLVM to constant-fold, inline, and apply SROA.  Only for simple
+        # scalar functions with no runtime-typed behaviour.
+        # Note: ret_tag isn't computed yet, so we check ret_type directly.
+        # Scalar ret_types: i64 (int), double (float), i32 (bool), void.
+        # Non-scalar: i8_ptr (str/list/dict/obj) — excluded.
+        _SCALAR_TYPES = (ir.IntType, ir.DoubleType)
+        _is_scalar_ret = (isinstance(ret_type, (ir.IntType, ir.DoubleType))
+                          or isinstance(ret_type, ir.VoidType))
+        # Body analysis: reject functions whose body uses non-scalar types.
+        # Check for AST nodes that imply pointer/heap operations:
+        #   lists, dicts, strings, subscripts, attributes, comprehensions,
+        #   try/except, class instantiation, etc.
+        _NON_SCALAR_AST = (
+            ast.List, ast.Dict, ast.Set, ast.ListComp, ast.DictComp,
+            ast.SetComp, ast.Subscript, ast.Attribute, ast.JoinedStr,
+            ast.Try, ast.Raise, ast.Import, ast.ImportFrom,
+            ast.Tuple, ast.FunctionDef, ast.AsyncFunctionDef,
+        )
+        _body_is_scalar = not any(
+            (isinstance(n, _NON_SCALAR_AST) and n is not node)
+            or (isinstance(n, ast.Constant) and isinstance(n.value, str))
+            for n in ast.walk(node)
+        )
+        # If any call-site signature has a pointer type (str, list, dict,
+        # obj), the function handles non-scalar values and needs FpyValue
+        # tags to distinguish types at runtime. Check both the merged
+        # call_types and the raw per-call-site signatures.
+        _has_mixed_call_types = any(
+            ct == "mixed" for ct in call_types
+        )
+        _SCALAR_CALL_TYPES = {"int", "float", "bool"}
+        _sigs = self._function_signatures.get(node.name, [])
+        _has_ptr_in_sigs = any(
+            st is not None and st not in _SCALAR_CALL_TYPES
+            for sig in _sigs
+            for st in sig
+        )
+        uses_bare = (
+            not has_vararg
+            and not has_kwarg
+            and not _may_return_none
+            and _is_scalar_ret
+            and _body_is_scalar
+            and all(isinstance(t, _SCALAR_TYPES) for t in param_types)
+            and not node.decorator_list
+            and not _has_mixed_call_types
+            and not _has_ptr_in_sigs
+            and node.name not in getattr(self, '_generator_funcs', set())
+        )
+
+        if not uses_bare and self._analyze_mode:
+            from compiler.analysis import HIGH, IMPACT_BARE_ABI_FUNC
+            blockers = []
+            if has_vararg:
+                blockers.append("*args parameter")
+            if has_kwarg:
+                blockers.append("**kwargs parameter")
+            if _may_return_none:
+                blockers.append("may return None")
+            if not _is_scalar_ret:
+                blockers.append("non-scalar return type")
+            if not _body_is_scalar:
+                blockers.append("non-scalar body (strings, lists, dicts, "
+                                "attrs, or exceptions)")
+            if not all(isinstance(t, _SCALAR_TYPES) for t in param_types):
+                blockers.append("non-scalar parameter types")
+            if node.decorator_list:
+                blockers.append("has decorator(s)")
+            if _has_mixed_call_types:
+                blockers.append("mixed-type call sites")
+            if _has_ptr_in_sigs:
+                blockers.append("pointer types in call signatures")
+            if node.name in getattr(self, '_generator_funcs', set()):
+                blockers.append("generator function (contains yield)")
+            if blockers:
+                effective = _name_override or node.name
+                old_scope = self._current_scope
+                self._current_scope = f"function:{effective}"
+                self._record_finding(
+                    HIGH, "bare_abi_disabled", node,
+                    construct=f"function {effective}()",
+                    missed="Function bare-ABI mode (C-speed scalar ops)",
+                    reason="; ".join(blockers),
+                    impact=IMPACT_BARE_ABI_FUNC,
+                    suggestion="Keep function body to pure scalar arithmetic "
+                               "(int/float/bool); avoid strings, lists, "
+                               "attrs, or returning None",
+                )
+                self._current_scope = old_scope
+
+
+        return uses_bare, _may_return_none
+
+    def _duf_resolve_params(
+        self, node: ast.FunctionDef,
+        _sig_override: list | None,
+        has_vararg: bool, has_kwarg: bool,
+    ) -> tuple[list[str], list, list, bool]:
+        """Resolve parameter names, LLVM types, call-site type tags, returns_param.
+
+        Returns (param_names, param_types, call_types, returns_param).
+        """
         returns_param = False
         call_types: list = []
 
@@ -6573,20 +6632,16 @@ class CodeGen:
                         else:
                             param_types.append(i64)
 
-        ret_type = i8_ptr if returns_param else i64
+        return param_names, param_types, call_types, returns_param
 
-        # Return type annotation overrides: -> float, -> bool, -> str
-        if node.returns is not None:
-            if (isinstance(node.returns, ast.Name)
-                    and node.returns.id == 'float'):
-                ret_type = double
-            elif (isinstance(node.returns, ast.Name)
-                    and node.returns.id == 'bool'):
-                ret_type = i32
-            elif (isinstance(node.returns, ast.Name)
-                    and node.returns.id in ('str', 'list', 'dict', 'tuple')):
-                ret_type = i8_ptr
+    def _duf_detect_ret_type(
+        self, node: ast.FunctionDef, ret_type,
+        param_names: list[str], call_types: list,
+    ) -> tuple:
+        """Detect LLVM return type from return expressions and resolve conflicts.
 
+        Returns (ret_type, has_return_value, str_vars, dict_vars, list_vars, obj_vars).
+        """
         # Only scan returns in THIS function, not nested defs.
         _nested_ids = set()
         for _item in ast.walk(node):
@@ -6609,6 +6664,9 @@ class CodeGen:
                             str_vars.add(tgt.id)
                         elif isinstance(n.value, ast.JoinedStr):
                             str_vars.add(tgt.id)
+
+        dict_vars: set[str] = set()
+        list_vars: set[str] = set()
 
         if not has_return_value:
             ret_type = void
@@ -6968,212 +7026,15 @@ class CodeGen:
                 if _has_int_return:
                     ret_type = i64
 
-        # Detect generator functions (contain yield/yield from)
-        is_generator = any(
-            isinstance(n, (ast.Yield, ast.YieldFrom))
-            for n in ast.walk(node)
-        )
-        # Generators using yield-as-expression (x=yield) need CPython's
-        # coroutine support. Skip the LLVM declaration entirely — the
-        # function will be compiled through CPython bridge and stored as
-        # a pyobj variable in fastpy_main.
-        if is_generator and self._generator_needs_cpython(node):
-            effective_name = _name_override if _name_override else node.name
-            if not hasattr(self, '_cpython_generators'):
-                self._cpython_generators = set()
-            self._cpython_generators.add(effective_name)
-            return
-        if is_generator:
-            self._generator_funcs.add(
-                _name_override if _name_override else node.name)
-            # Generators return a list (of yielded values)
-            ret_type = i8_ptr
-            ret_tag = "ptr:list"
+        return ret_type, has_return_value, str_vars, dict_vars, list_vars, obj_vars
 
-        # Float-returning functions: if a parameter's type wasn't determined
-        # by call-site analysis or defaults, and the function body uses
-        # floats, promote the parameter to double. This ensures FV-ABI
-        # unwrapping uses bitcast (correct for float data) instead of
-        # sitofp (correct only for integer data).
-        if ret_type == double:
-            _body_has_float = any(
-                isinstance(_c, ast.Constant) and isinstance(_c.value, float)
-                for _c in ast.walk(node)
-            )
-            if _body_has_float:
-                for i in range(len(param_types)):
-                    if param_types[i] == i64:
-                        # Only promote if call-site didn't specify a type
-                        if not (i < len(call_types) and call_types[i] is not None):
-                            param_types[i] = double
-
-        # Remember the statically-inferred bare types — the body expects
-        # these, and we'll unwrap FpyValue params at entry to match.
-        static_param_types = list(param_types)
-        static_ret_type = ret_type
-
-        # --- Detect may_return_none early (needed for ABI classification) ---
-        _may_return_none = False
-        has_value_return = False
-        none_default_params: set[str] = set()
-        n_params = len(param_names)
-        for di, d in enumerate(node.args.defaults):
-            if isinstance(d, ast.Constant) and d.value is None:
-                pidx = n_params - len(node.args.defaults) + di
-                if pidx < n_params:
-                    none_default_params.add(param_names[pidx])
-        for n in ast.walk(node):
-            if isinstance(n, ast.Return):
-                if n.value is None:
-                    _may_return_none = True
-                elif (isinstance(n.value, ast.Constant)
-                        and n.value.value is None):
-                    _may_return_none = True
-                elif (isinstance(n.value, ast.Name)
-                        and n.value.id in none_default_params):
-                    _may_return_none = True
-                else:
-                    has_value_return = True
-        if has_value_return and not _may_return_none:
-            last_stmt = node.body[-1] if node.body else None
-            if not isinstance(last_stmt, ast.Return):
-                _may_return_none = True
-
-        # --- ABI selection: bare-type vs FpyValue ---
-        # Bare-type ABI: direct i64/double/i32 params and return.  Enables
-        # LLVM to constant-fold, inline, and apply SROA.  Only for simple
-        # scalar functions with no runtime-typed behaviour.
-        # Note: ret_tag isn't computed yet, so we check ret_type directly.
-        # Scalar ret_types: i64 (int), double (float), i32 (bool), void.
-        # Non-scalar: i8_ptr (str/list/dict/obj) — excluded.
-        _SCALAR_TYPES = (ir.IntType, ir.DoubleType)
-        _is_scalar_ret = (isinstance(ret_type, (ir.IntType, ir.DoubleType))
-                          or isinstance(ret_type, ir.VoidType))
-        # Body analysis: reject functions whose body uses non-scalar types.
-        # Check for AST nodes that imply pointer/heap operations:
-        #   lists, dicts, strings, subscripts, attributes, comprehensions,
-        #   try/except, class instantiation, etc.
-        _NON_SCALAR_AST = (
-            ast.List, ast.Dict, ast.Set, ast.ListComp, ast.DictComp,
-            ast.SetComp, ast.Subscript, ast.Attribute, ast.JoinedStr,
-            ast.Try, ast.Raise, ast.Import, ast.ImportFrom,
-            ast.Tuple, ast.FunctionDef, ast.AsyncFunctionDef,
-        )
-        _body_is_scalar = not any(
-            (isinstance(n, _NON_SCALAR_AST) and n is not node)
-            or (isinstance(n, ast.Constant) and isinstance(n.value, str))
-            for n in ast.walk(node)
-        )
-        # If any call-site signature has a pointer type (str, list, dict,
-        # obj), the function handles non-scalar values and needs FpyValue
-        # tags to distinguish types at runtime. Check both the merged
-        # call_types and the raw per-call-site signatures.
-        _has_mixed_call_types = any(
-            ct == "mixed" for ct in call_types
-        )
-        _SCALAR_CALL_TYPES = {"int", "float", "bool"}
-        _sigs = self._function_signatures.get(node.name, [])
-        _has_ptr_in_sigs = any(
-            st is not None and st not in _SCALAR_CALL_TYPES
-            for sig in _sigs
-            for st in sig
-        )
-        uses_bare = (
-            not has_vararg
-            and not has_kwarg
-            and not _may_return_none
-            and _is_scalar_ret
-            and _body_is_scalar
-            and all(isinstance(t, _SCALAR_TYPES) for t in param_types)
-            and not node.decorator_list
-            and not _has_mixed_call_types
-            and not _has_ptr_in_sigs
-            and node.name not in getattr(self, '_generator_funcs', set())
-        )
-
-        if not uses_bare and self._analyze_mode:
-            from compiler.analysis import HIGH, IMPACT_BARE_ABI_FUNC
-            blockers = []
-            if has_vararg:
-                blockers.append("*args parameter")
-            if has_kwarg:
-                blockers.append("**kwargs parameter")
-            if _may_return_none:
-                blockers.append("may return None")
-            if not _is_scalar_ret:
-                blockers.append("non-scalar return type")
-            if not _body_is_scalar:
-                blockers.append("non-scalar body (strings, lists, dicts, "
-                                "attrs, or exceptions)")
-            if not all(isinstance(t, _SCALAR_TYPES) for t in param_types):
-                blockers.append("non-scalar parameter types")
-            if node.decorator_list:
-                blockers.append("has decorator(s)")
-            if _has_mixed_call_types:
-                blockers.append("mixed-type call sites")
-            if _has_ptr_in_sigs:
-                blockers.append("pointer types in call signatures")
-            if node.name in getattr(self, '_generator_funcs', set()):
-                blockers.append("generator function (contains yield)")
-            if blockers:
-                effective = _name_override or node.name
-                old_scope = self._current_scope
-                self._current_scope = f"function:{effective}"
-                self._record_finding(
-                    HIGH, "bare_abi_disabled", node,
-                    construct=f"function {effective}()",
-                    missed="Function bare-ABI mode (C-speed scalar ops)",
-                    reason="; ".join(blockers),
-                    impact=IMPACT_BARE_ABI_FUNC,
-                    suggestion="Keep function body to pure scalar arithmetic "
-                               "(int/float/bool); avoid strings, lists, "
-                               "attrs, or returning None",
-                )
-                self._current_scope = old_scope
-
-        uses_fv = not (has_vararg or has_kwarg) and not uses_bare
-        if uses_bare:
-            # Bare-type ABI: direct scalar params and return
-            func_type = ir.FunctionType(
-                ret_type if ret_type != void else void, param_types)
-        elif uses_fv:
-            fv_ret = fpy_val if ret_type != void else void
-            func_type = ir.FunctionType(fv_ret, [fpy_val] * len(param_names))
-        else:
-            # kwargs/vararg: special param types but FpyValue return
-            fv_ret = fpy_val if ret_type != void else void
-            func_type = ir.FunctionType(fv_ret, param_types)
-
-        # When specializing, use the mangled name for the LLVM symbol too,
-        # so the specializations don't collide at link time.
-        effective_name = _name_override if _name_override else node.name
-        fn_name = f"fastpy.user.{effective_name}"
-        func = ir.Function(self.module, func_type, name=fn_name)
-
-        # Internal linkage: since all code compiles into one module, user
-        # functions are never called from outside. Internal linkage lets
-        # LLVM's optimizer inline aggressively and eliminate dead code.
-        func.linkage = "internal"
-
-        # Size-based inline strategy: small functions get alwaysinline,
-        # medium get inlinehint, large get nothing (LLVM decides).
-        # Exception: functions containing `raise` must NOT be inlined,
-        # because LLVM's inliner breaks the flag-based exception flow
-        # (the inlined raise+return sequence can be reordered relative
-        # to the caller's exc_pending check).
-        has_raise = any(isinstance(n, ast.Raise) for n in ast.walk(node))
-        if has_raise:
-            func.attributes.add('noinline')
-        else:
-            body_size = sum(1 for _ in ast.walk(node))
-            if body_size <= 25:
-                func.attributes.add('alwaysinline')
-            elif body_size <= 80:
-                func.attributes.add('inlinehint')
-
-        for param, name in zip(func.args, param_names):
-            param.name = name
-
+    def _duf_determine_ret_tag(
+        self, node: ast.FunctionDef, ret_type,
+        has_return_value: bool, has_kwarg: bool, returns_param: bool,
+        str_vars: set, dict_vars: set, list_vars: set, obj_vars: set,
+        param_names: list[str], call_types: list,
+    ) -> str:
+        """Determine semantic return tag from return expressions and annotations."""
         # Determine semantic return tag (may differ from LLVM type)
         returns_str = False
         returns_dict = False
@@ -7385,6 +7246,205 @@ class CodeGen:
                     elif ann.value.id in ("tuple", "Tuple"):
                         ret_tag = "ptr"
 
+        return ret_tag
+
+    def _declare_user_function(self, node: ast.FunctionDef,
+                               _sig_override: list | None = None,
+                               _name_override: str | None = None) -> None:
+        """Forward-declare a user function.
+
+        When _sig_override / _name_override are provided, emit a monomorphized
+        specialization with the supplied argument types and key it under the
+        overridden name in self._user_functions. When they are None and the
+        function has scalar-conflicting call signatures, recursively declare
+        one specialization per signature and register them in
+        self._monomorphized.
+        """
+        # Check for monomorphization (only on top-level declaration pass)
+        if _sig_override is None and _name_override is None:
+            if node.name in self._user_functions:
+                return
+            sigs = self._function_signatures.get(node.name, [])
+            # Monomorphize only for non-vararg/kwarg functions where scalar
+            # types differ across call sites.
+            is_special = (node.args.vararg is not None
+                          or node.args.kwarg is not None)
+            if (not is_special
+                    and self._signature_scalar_conflict(sigs)):
+                # Fill None positions in each sig from the merged
+                # _call_site_param_types. This ensures specializations
+                # inherit pointer types (list, dict, str, obj) that are
+                # consistent across all call sites but missing from
+                # individual sigs (e.g., forwarded params from callers).
+                merged_types = self._call_site_param_types.get(
+                    node.name, [])
+                filled_sigs = []
+                for sig in sigs:
+                    filled = list(sig)
+                    # Pad to at least merged length
+                    while len(filled) < len(merged_types):
+                        filled.append(None)
+                    for fi in range(min(len(filled), len(merged_types))):
+                        if filled[fi] is None and merged_types[fi] is not None:
+                            filled[fi] = merged_types[fi]
+                    filled_sigs.append(tuple(filled))
+                self._monomorphized[node.name] = filled_sigs
+                if self._analyze_mode:
+                    from compiler.analysis import LOW, IMPACT_MONOMORPHIZED
+                    sig_strs = [
+                        "(" + ", ".join(s or "?" for s in sig) + ")"
+                        for sig in filled_sigs
+                    ]
+                    self._record_finding(
+                        LOW, "monomorphized", node,
+                        construct=f"function {node.name}()",
+                        missed=f"Single function body for {node.name}",
+                        reason=f"Scalar type conflict across {len(filled_sigs)}"
+                               f" call signatures: {', '.join(sig_strs)}",
+                        impact=IMPACT_MONOMORPHIZED,
+                        suggestion="Call the function with consistent "
+                                   "argument types (all int or all float) "
+                                   "to avoid generating multiple variants",
+                    )
+                for fsig in filled_sigs:
+                    mangled = f"{node.name}__{self._mangle_sig(fsig)}"
+                    self._declare_user_function(
+                        node, _sig_override=list(fsig),
+                        _name_override=mangled)
+                # Register the original name as an alias pointing to the
+                # first specialization's FuncInfo. This keeps "name in
+                # self._user_functions" true for code that predates
+                # monomorphization-aware dispatch. The actual call sites
+                # resolve to the correct specialization via
+                # _resolve_specialization before calling.
+                first_mangled = f"{node.name}__{self._mangle_sig(filled_sigs[0])}"
+                if first_mangled in self._user_functions:
+                    self._user_functions[node.name] = self._user_functions[first_mangled]
+                    self._function_def_nodes[node.name] = node
+                return
+        else:
+            # Specialization path: skip if already declared under this name
+            key_name = _name_override if _name_override else node.name
+            if key_name in self._user_functions:
+                return
+
+        has_vararg = node.args.vararg is not None
+        has_kwarg = node.args.kwarg is not None
+        param_names, param_types, call_types, returns_param = self._duf_resolve_params(
+            node, _sig_override, has_vararg, has_kwarg)
+
+        ret_type = i8_ptr if returns_param else i64
+
+        # Return type annotation overrides: -> float, -> bool, -> str
+        if node.returns is not None:
+            if (isinstance(node.returns, ast.Name)
+                    and node.returns.id == 'float'):
+                ret_type = double
+            elif (isinstance(node.returns, ast.Name)
+                    and node.returns.id == 'bool'):
+                ret_type = i32
+            elif (isinstance(node.returns, ast.Name)
+                    and node.returns.id in ('str', 'list', 'dict', 'tuple')):
+                ret_type = i8_ptr
+
+        (ret_type, has_return_value, str_vars, dict_vars,
+         list_vars, obj_vars) = self._duf_detect_ret_type(
+            node, ret_type, param_names, call_types)
+        # Detect generator functions (contain yield/yield from)
+        is_generator = any(
+            isinstance(n, (ast.Yield, ast.YieldFrom))
+            for n in ast.walk(node)
+        )
+        # Generators using yield-as-expression (x=yield) need CPython's
+        # coroutine support. Skip the LLVM declaration entirely — the
+        # function will be compiled through CPython bridge and stored as
+        # a pyobj variable in fastpy_main.
+        if is_generator and self._generator_needs_cpython(node):
+            effective_name = _name_override if _name_override else node.name
+            if not hasattr(self, '_cpython_generators'):
+                self._cpython_generators = set()
+            self._cpython_generators.add(effective_name)
+            return
+        if is_generator:
+            self._generator_funcs.add(
+                _name_override if _name_override else node.name)
+            # Generators return a list (of yielded values)
+            ret_type = i8_ptr
+            ret_tag = "ptr:list"
+
+        # Float-returning functions: if a parameter's type wasn't determined
+        # by call-site analysis or defaults, and the function body uses
+        # floats, promote the parameter to double. This ensures FV-ABI
+        # unwrapping uses bitcast (correct for float data) instead of
+        # sitofp (correct only for integer data).
+        if ret_type == double:
+            _body_has_float = any(
+                isinstance(_c, ast.Constant) and isinstance(_c.value, float)
+                for _c in ast.walk(node)
+            )
+            if _body_has_float:
+                for i in range(len(param_types)):
+                    if param_types[i] == i64:
+                        # Only promote if call-site didn't specify a type
+                        if not (i < len(call_types) and call_types[i] is not None):
+                            param_types[i] = double
+
+        # Remember the statically-inferred bare types — the body expects
+        # these, and we'll unwrap FpyValue params at entry to match.
+        static_param_types = list(param_types)
+        static_ret_type = ret_type
+
+        uses_bare, _may_return_none = self._duf_select_abi(
+            node, ret_type, has_vararg, has_kwarg,
+            param_names, param_types, call_types, _name_override)
+        uses_fv = not (has_vararg or has_kwarg) and not uses_bare
+        if uses_bare:
+            # Bare-type ABI: direct scalar params and return
+            func_type = ir.FunctionType(
+                ret_type if ret_type != void else void, param_types)
+        elif uses_fv:
+            fv_ret = fpy_val if ret_type != void else void
+            func_type = ir.FunctionType(fv_ret, [fpy_val] * len(param_names))
+        else:
+            # kwargs/vararg: special param types but FpyValue return
+            fv_ret = fpy_val if ret_type != void else void
+            func_type = ir.FunctionType(fv_ret, param_types)
+
+        # When specializing, use the mangled name for the LLVM symbol too,
+        # so the specializations don't collide at link time.
+        effective_name = _name_override if _name_override else node.name
+        fn_name = f"fastpy.user.{effective_name}"
+        func = ir.Function(self.module, func_type, name=fn_name)
+
+        # Internal linkage: since all code compiles into one module, user
+        # functions are never called from outside. Internal linkage lets
+        # LLVM's optimizer inline aggressively and eliminate dead code.
+        func.linkage = "internal"
+
+        # Size-based inline strategy: small functions get alwaysinline,
+        # medium get inlinehint, large get nothing (LLVM decides).
+        # Exception: functions containing `raise` must NOT be inlined,
+        # because LLVM's inliner breaks the flag-based exception flow
+        # (the inlined raise+return sequence can be reordered relative
+        # to the caller's exc_pending check).
+        has_raise = any(isinstance(n, ast.Raise) for n in ast.walk(node))
+        if has_raise:
+            func.attributes.add('noinline')
+        else:
+            body_size = sum(1 for _ in ast.walk(node))
+            if body_size <= 25:
+                func.attributes.add('alwaysinline')
+            elif body_size <= 80:
+                func.attributes.add('inlinehint')
+
+        for param, name in zip(func.args, param_names):
+            param.name = name
+
+        ret_tag = self._duf_determine_ret_tag(
+            node, ret_type, has_return_value, has_kwarg, returns_param,
+            str_vars, dict_vars, list_vars, obj_vars,
+            param_names, call_types,
+        )
         # For functions with keyword-only args, combine their defaults into
         # one right-aligned list matching the combined param_names.
         # kw_defaults has one entry per kwonlyarg (None if no default).
