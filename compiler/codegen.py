@@ -6172,12 +6172,12 @@ class CodeGen:
         if isinstance(node, ast.Name):
             if node.id in self.variables:
                 _, tag = self.variables[node.id]
-                if tag in ("int", "float", "str", "bool", "obj"):
-                    return tag
-                if tag.startswith("list"):
-                    return tag
-                if tag == "dict":
-                    return "dict"
+                _tk = (tag.kind if isinstance(tag, ValueType)
+                       else ValueType.from_old_tag(tag).kind)
+                if _tk in (VKind.INT, VKind.FLOAT, VKind.STR,
+                           VKind.BOOL, VKind.OBJ, VKind.LIST,
+                           VKind.DICT):
+                    return str(tag) if _tk != VKind.DICT else "dict"
         # Attribute access: resolve via the owning class's attr-type sets.
         # This lets `compute(self.val)` monomorphize correctly when val is
         # a known-typed attr (float/bool/string/list/dict/obj).
@@ -7885,9 +7885,10 @@ class CodeGen:
                         val_nested = self._parse_container_annotation(
                             ast_arg.annotation.slice.elts[1])
                         if val_nested is not None:
-                            if val_nested.startswith("list"):
+                            _vnk = ValueType.from_old_tag(val_nested).kind
+                            if _vnk == VKind.LIST:
                                 self._dict_var_list_values.add(pname)
-                            elif val_nested == "dict":
+                            elif _vnk == VKind.DICT:
                                 self._dict_var_dict_values.add(pname)
                     continue
 
@@ -9693,14 +9694,11 @@ class CodeGen:
                         pidx = m_params.index(arg.id) - 1  # skip self
                         if 0 <= pidx < len(m_call_types) and m_call_types[pidx]:
                             ct = m_call_types[pidx]
-                            if ct == "str":
-                                list_attr_elem_types[attr_name] = "str"
-                            elif ct.startswith("list"):
-                                list_attr_elem_types[attr_name] = "list"
-                            elif ct.startswith("dict"):
-                                list_attr_elem_types[attr_name] = "dict"
-                            elif ct == "obj":
-                                list_attr_elem_types[attr_name] = "obj"
+                            _ck = ValueType.from_old_tag(ct).kind
+                            _CK_TO_TAG = {VKind.STR: "str", VKind.LIST: "list",
+                                          VKind.DICT: "dict", VKind.OBJ: "obj"}
+                            if _ck in _CK_TO_TAG:
+                                list_attr_elem_types[attr_name] = _CK_TO_TAG[_ck]
 
         # Pre-compute float, string, and bool attrs for return-type detection.
         # Uses _call_site_param_types (available from Pass 0.75). For
@@ -11599,9 +11597,10 @@ class CodeGen:
                         val_nested = self._parse_container_annotation(
                             node.annotation.slice.elts[1])
                         if val_nested is not None:
-                            if val_nested.startswith("list"):
+                            _vnk = ValueType.from_old_tag(val_nested).kind
+                            if _vnk == VKind.LIST:
                                 self._dict_var_list_values.add(varname)
-                            elif val_nested == "dict":
+                            elif _vnk == VKind.DICT:
                                 self._dict_var_dict_values.add(varname)
                     return
             # Non-typed or unrecognized annotation → treat as regular assignment
@@ -14982,8 +14981,9 @@ class CodeGen:
 
         # Legacy fallback for pointer types not caught above
         if isinstance(current.type, ir.PointerType) and isinstance(node.op, ast.Add):
-            _, tag = self.variables.get(target_name, (None, ""))
-            if tag.startswith("list") or self._is_list_expr(ast.Name(id=target_name)):
+            if (self._var_kind(target_name) == VKind.LIST
+                    or self._is_list_expr(ast.Name(id=target_name))):
+                _, tag = self.variables.get(target_name, (None, "list:int"))
                 result = self._rt_call("list_concat", [current, rhs])
                 self._store_variable(target_name, result, tag or "list:int")
                 return
@@ -28620,12 +28620,15 @@ class CodeGen:
         if isinstance(node, ast.JoinedStr):
             return "str"
         if isinstance(node, ast.Name) and node.id in self.variables:
-            _, tag = self.variables[node.id]
-            if tag.startswith("list"):
-                return "list"
-            if tag in ("int", "float", "str", "dict", "bool", "set", "tuple",
-                        "complex", "none", "bytes"):
-                return tag
+            _vk = self._var_kind(node.id)
+            _VK_MAP = {
+                VKind.LIST: "list", VKind.INT: "int", VKind.FLOAT: "float",
+                VKind.STR: "str", VKind.DICT: "dict", VKind.BOOL: "bool",
+                VKind.SET: "set", VKind.TUPLE: "tuple", VKind.COMPLEX: "complex",
+                VKind.NONE: "none", VKind.BYTES: "bytes",
+            }
+            if _vk in _VK_MAP:
+                return _VK_MAP[_vk]
         return "unknown"
 
     def _emit_mixed_elem_method(self, node: ast.Call) -> None:
