@@ -2457,8 +2457,10 @@ class CodeGen:
             return self._fv_from_str(value)
         raise CodeGenError(f"Cannot wrap LLVM type {value.type} in FpyValue")
 
-    def generate(self, tree: ast.Module) -> str:
-        """Generate LLVM IR from a Python AST. Returns IR as string."""
+    def _gen_prescan(self, tree: ast.Module) -> None:
+        """Pre-scan/analysis passes (0–0.9): normalization, closure/lambda
+        detection, global inference, call-site analysis, dataclass expansion,
+        slot allocation, singledispatch/lru_cache registration."""
         # Normalize: merge positional-only args into regular args.
         # At the codegen level, posonly and regular args are identical;
         # the `/` marker only constrains calling convention (no keyword passing).
@@ -2926,6 +2928,10 @@ class CodeGen:
                             mangled = f"{base_name}__{type_name}"
                             self._singledispatch[base_name][type_name] = mangled
                             self._singledispatch_variants[mangled] = node
+
+    def generate(self, tree: ast.Module) -> str:
+        """Generate LLVM IR from a Python AST. Returns IR as string."""
+        self._gen_prescan(tree)
 
         # Pass 1: forward-declare all user functions and class methods
         # Also scan for nested classes (class B inside class A)
@@ -11913,6 +11919,270 @@ class CodeGen:
             # Expression with no side effect — skip it
             pass
 
+    def _assign_fv_fast_path(self, node: ast.Assign) -> bool:
+        """Handle FV-ABI fast paths for assignment.
+
+        Covers pyobj attr/call/chain, pyobj binop, native module calls,
+        FV-ABI user function calls, obj attribute RHS, and list/tuple
+        subscript RHS.  Returns True if the assignment was fully handled.
+        """
+        if not (len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)):
+            return False
+        target_name = node.targets[0].id
+        rhs = node.value
+
+        # --- CPython module attribute or method result ---
+        def _is_path_var(n):
+            return (isinstance(n, ast.Name) and n.id in self.variables
+                    and self._is_path_expr(n))
+        is_pyobj_attr = (isinstance(rhs, ast.Attribute)
+                         and isinstance(rhs.value, ast.Name)
+                         and rhs.value.id in self.variables
+                         and self._var_kind(rhs.value.id) == VKind.PYOBJ
+                         and not _is_path_var(rhs.value))
+        is_pyobj_attr_chain = (not is_pyobj_attr
+                               and isinstance(rhs, ast.Attribute)
+                               and self._is_pyobj_receiver(rhs.value)
+                               and not _is_path_var(rhs.value)
+                               and not (isinstance(rhs.value, ast.Name)
+                                        and rhs.value.id in getattr(self, '_native_modules', set())))
+        is_pyobj_call = (isinstance(rhs, ast.Call)
+                         and isinstance(rhs.func, ast.Attribute)
+                         and isinstance(rhs.func.value, ast.Name)
+                         and rhs.func.value.id in self.variables
+                         and self._var_kind(rhs.func.value.id) == VKind.PYOBJ
+                         and rhs.func.value.id not in getattr(self, '_native_modules', set())
+                         and not _is_path_var(rhs.func.value))
+        is_pyobj_call_chain = (not is_pyobj_call
+                               and isinstance(rhs, ast.Call)
+                               and isinstance(rhs.func, ast.Attribute)
+                               and self._is_pyobj_receiver(rhs.func.value)
+                               and not (isinstance(rhs.func.value, ast.Name) and _is_path_var(rhs.func.value))
+                               and not (isinstance(rhs.func.value, ast.Name)
+                                        and rhs.func.value.id in getattr(self, '_native_modules', set())))
+        is_pyobj_direct = (isinstance(rhs, ast.Call)
+                           and isinstance(rhs.func, ast.Name)
+                           and rhs.func.id in self.variables
+                           and self._var_kind(rhs.func.id) == VKind.PYOBJ)
+        if (is_pyobj_attr or is_pyobj_attr_chain
+                or is_pyobj_call or is_pyobj_call_chain
+                or is_pyobj_direct):
+            if is_pyobj_direct:
+                val = self._emit_expr_value(rhs)
+                val = self._ensure_ptr(val)
+                self._store_variable(target_name, val, "pyobj")
+                return True
+            if is_pyobj_call or is_pyobj_call_chain:
+                pyobj_ptr = self._emit_cpython_call_raw(rhs)
+            elif is_pyobj_attr_chain:
+                obj = self._emit_expr_value(rhs.value)
+                obj = self._ensure_ptr(obj)
+                attr_name = self._make_string_constant(rhs.attr)
+                pyobj_ptr = self.builder.call(
+                    self.runtime["cpython_getattr"], [obj, attr_name])
+            else:
+                obj = self._load_variable(rhs.value.id, rhs)
+                obj = self._ensure_ptr(obj)
+                attr_name = self._make_string_constant(rhs.attr)
+                pyobj_ptr = self.builder.call(
+                    self.runtime["cpython_getattr"], [obj, attr_name])
+            self._store_variable(target_name, pyobj_ptr, "pyobj")
+            return True
+
+        # --- BinOp on pyobj operands ---
+        if isinstance(rhs, ast.BinOp):
+            lhs_pyobj = (isinstance(rhs.left, ast.Name)
+                         and rhs.left.id in self.variables
+                         and self._var_kind(rhs.left.id) == VKind.PYOBJ)
+            rhs_pyobj = (isinstance(rhs.right, ast.Name)
+                         and rhs.right.id in self.variables
+                         and self._var_kind(rhs.right.id) == VKind.PYOBJ)
+            if lhs_pyobj and rhs_pyobj:
+                left = self._emit_expr_value(rhs.left)
+                right = self._emit_expr_value(rhs.right)
+                left = self._ensure_ptr(left)
+                right = self._ensure_ptr(right)
+                out_tag = self._create_entry_alloca(i32, "pybin.tag")
+                out_data = self._create_entry_alloca(i64, "pybin.data")
+                _pyobj_ops = {ast.Add: 0, ast.Sub: 1, ast.Mult: 2,
+                              ast.Div: 3, ast.FloorDiv: 4, ast.Mod: 5,
+                              ast.Pow: 6}
+                op_code = _pyobj_ops.get(type(rhs.op), 0)
+                self.builder.call(self.runtime["cpython_binop"],
+                                  [left,
+                                   ir.Constant(i32, FPY_TAG_OBJ),
+                                   self.builder.ptrtoint(right, i64),
+                                   ir.Constant(i32, op_code),
+                                   out_tag, out_data])
+                result_data = self.builder.load(out_data)
+                result_ptr = self.builder.inttoptr(result_data, i8_ptr)
+                self._store_variable(target_name, result_ptr, "pyobj")
+                return True
+
+        # --- Native module call ---
+        if (isinstance(rhs, ast.Call)
+                and isinstance(rhs.func, ast.Attribute)
+                and isinstance(rhs.func.value, ast.Name)
+                and rhs.func.value.id in getattr(self, '_native_modules', set())):
+            mod_name = rhs.func.value.id
+            func_name = rhs.func.attr
+            native_result = self._emit_native_module_call(
+                mod_name, func_name, rhs)
+            if native_result is not None:
+                type_tag = self._infer_type_tag(rhs, native_result)
+                self._store_variable(target_name, native_result, type_tag)
+                return True
+            pyobj_ptr = self._emit_cpython_call_raw(rhs)
+            inferred = self._infer_type_tag(rhs, None)
+            if inferred not in ("unknown", "pyobj"):
+                tag_slot = self._create_entry_alloca(i32, "bridge.cvt.tag")
+                data_slot = self._create_entry_alloca(i64, "bridge.cvt.data")
+                self.builder.call(self.runtime["cpython_to_fv"],
+                                  [pyobj_ptr, tag_slot, data_slot])
+                bridge_tag = self.builder.load(tag_slot)
+                bridge_data = self.builder.load(data_slot)
+                fv = self._fv_build_from_slots(bridge_tag, bridge_data)
+                self._store_variable(target_name, fv, inferred)
+            else:
+                self._store_variable(target_name, pyobj_ptr, "pyobj")
+            return True
+
+        # --- FV-ABI user function call ---
+        if (isinstance(rhs, ast.Call)
+                and isinstance(rhs.func, ast.Name)
+                and rhs.func.id in self._user_functions
+                and not (rhs.func.id in self.variables
+                         and self._var_kind(rhs.func.id) == VKind.CLOSURE)):
+            lookup_name = rhs.func.id
+            if lookup_name in self._monomorphized:
+                lookup_name = self._resolve_specialization(
+                    lookup_name, rhs.args, rhs.keywords)
+            info = self._user_functions[lookup_name]
+            if (info.uses_fv_abi and info.ret_tag != "void"):
+                fv = self._emit_user_call_fv(rhs)
+                type_tag = info.ret_tag
+                if type_tag == "ptr":
+                    type_tag = "list:int"
+                elif type_tag == "ptr:list":
+                    type_tag = "list:list"
+                if target_name in self._user_functions:
+                    type_tag = "closure"
+                self._store_variable(target_name, fv, type_tag)
+                return True
+
+        # --- Attribute RHS on object receiver ---
+        if (isinstance(rhs, ast.Attribute)
+                and (self._is_obj_expr(rhs)
+                     or self._is_obj_expr(rhs.value))):
+            cls = self._infer_object_class(rhs)
+            _fv_attr_handled = False
+            if cls or self._is_obj_expr(rhs):
+                vkind = VKind.OBJ
+                _fv_attr_handled = True
+            else:
+                attr_name_str = rhs.attr
+                recv_cls = self._infer_object_class(rhs.value)
+                if recv_cls is not None:
+                    vkind = VKind.OBJ
+                    cls_float_a = self._per_class_float_attrs.get(recv_cls, set())
+                    cls_bool_a = self._per_class_bool_attrs.get(recv_cls, set())
+                    cls_str_a = self._per_class_string_attrs.get(recv_cls, set())
+                    cls_obj_a = getattr(self, '_class_obj_attrs', {}).get(recv_cls, set())
+                    cls_container = self._class_container_attrs.get(recv_cls, (set(), set()))
+                    cls_list_a, cls_dict_a = cls_container
+                    if attr_name_str in cls_float_a:
+                        vkind = VKind.FLOAT
+                    elif attr_name_str in cls_bool_a:
+                        vkind = VKind.BOOL
+                    elif attr_name_str in cls_str_a:
+                        vkind = VKind.STR
+                    elif attr_name_str in cls_list_a:
+                        vkind = VKind.LIST
+                    elif attr_name_str in cls_dict_a:
+                        vkind = VKind.DICT
+                    elif attr_name_str in cls_obj_a:
+                        vkind = VKind.OBJ
+                    elif (attr_name_str not in cls_obj_a
+                          and attr_name_str not in cls_str_a
+                          and attr_name_str not in cls_list_a
+                          and attr_name_str not in cls_dict_a):
+                        slots = self._class_attr_slots.get(recv_cls, {})
+                        if attr_name_str in slots:
+                            vkind = VKind.INT
+                    _fv_attr_handled = True
+                else:
+                    vkind = VKind.OBJ
+                    for _chk_cls in self._user_classes:
+                        _chk_float = self._per_class_float_attrs.get(_chk_cls, set())
+                        _chk_bool = self._per_class_bool_attrs.get(_chk_cls, set())
+                        _chk_str = self._per_class_string_attrs.get(_chk_cls, set())
+                        _chk_cont = self._class_container_attrs.get(_chk_cls, (set(), set()))
+                        _chk_list, _chk_dict = _chk_cont
+                        _chk_obj = getattr(self, '_class_obj_attrs', {}).get(_chk_cls, set())
+                        _chk_slots = self._class_attr_slots.get(_chk_cls, {})
+                        if attr_name_str in _chk_float:
+                            vkind = VKind.FLOAT; break
+                        elif attr_name_str in _chk_bool:
+                            vkind = VKind.BOOL; break
+                        elif attr_name_str in _chk_str:
+                            vkind = VKind.STR; break
+                        elif attr_name_str in _chk_list:
+                            vkind = VKind.LIST; break
+                        elif attr_name_str in _chk_dict:
+                            vkind = VKind.DICT; break
+                        elif attr_name_str in _chk_obj:
+                            vkind = VKind.OBJ; break
+                        elif (attr_name_str in _chk_slots
+                              and attr_name_str not in _chk_obj
+                              and attr_name_str not in _chk_str
+                              and attr_name_str not in _chk_list
+                              and attr_name_str not in _chk_dict):
+                            vkind = VKind.INT; break
+                    _fv_attr_handled = True
+            if _fv_attr_handled:
+                fv = self._load_or_wrap_fv(rhs)
+                self._store_variable(target_name, fv,
+                                     ValueType(vkind, class_name=cls))
+                if cls:
+                    self._obj_var_class[target_name] = cls
+                return True
+
+        # --- Subscript RHS on list/tuple containers ---
+        if (isinstance(rhs, ast.Subscript)
+                and not isinstance(rhs.slice, ast.Slice)):
+            container = rhs.value
+            if (self._is_list_expr(container)
+                    or self._is_tuple_expr(container)):
+                fv = self._load_or_wrap_fv(rhs)
+                _sub_vkind = VKind.OBJ
+                _sub_cls = None
+                if isinstance(container, ast.Attribute):
+                    recv_cls = self._infer_object_class(container.value)
+                    if recv_cls:
+                        list_attrs, _ = self._class_container_attrs.get(
+                            recv_cls, (set(), set()))
+                        if container.attr in list_attrs:
+                            _sub_vkind = VKind.OBJ
+                elif isinstance(container, ast.Name):
+                    _elem = self._get_list_elem_type(container)
+                    _sub_vkind = _elem.kind
+                    _sub_elem_type = _elem.elem_type
+                    self._store_variable(target_name, fv,
+                                         ValueType(_sub_vkind, elem_type=_sub_elem_type,
+                                                   class_name=_sub_cls))
+                    if _sub_cls:
+                        self._obj_var_class[target_name] = _sub_cls
+                    return True
+                else:
+                    self._store_variable(target_name, fv,
+                                         ValueType(_sub_vkind, class_name=_sub_cls))
+                    if _sub_cls:
+                        self._obj_var_class[target_name] = _sub_cls
+                    return True
+
+        return False
+
     def _emit_assign(self, node: ast.Assign) -> None:
         """Emit a variable assignment: x = expr, or tuple unpacking: a, b = 1, 2"""
         # Handle tuple unpacking: a, b, c = expr
@@ -12042,375 +12312,9 @@ class CodeGen:
                     _bm_obj, _bm_method)
                 return
 
-        # CPython module attribute or method result: use _load_or_wrap_fv
-        # to get a proper FpyValue with the runtime tag from the bridge.
-        if (self._USE_FV_LOCALS
-                and len(node.targets) == 1
-                and isinstance(node.targets[0], ast.Name)):
-            rhs = node.value
-            # Helper: check if a Name node refers to a path-typed variable.
-            # Path variables use VKind.PYOBJ but have dedicated native
-            # handlers, so they must NOT be routed through the generic
-            # CPython bridge.
-            def _is_path_var(n):
-                return (isinstance(n, ast.Name) and n.id in self.variables
-                        and self._is_path_expr(n))
-            is_pyobj_attr = (isinstance(rhs, ast.Attribute)
-                             and isinstance(rhs.value, ast.Name)
-                             and rhs.value.id in self.variables
-                             and self._var_kind(rhs.value.id) == VKind.PYOBJ
-                             and not _is_path_var(rhs.value))
-            # Chained pyobj attribute: foo.bar.baz where foo is pyobj
-            # Exclude direct native module attributes and path variables
-            is_pyobj_attr_chain = (not is_pyobj_attr
-                                   and isinstance(rhs, ast.Attribute)
-                                   and self._is_pyobj_receiver(rhs.value)
-                                   and not _is_path_var(rhs.value)
-                                   and not (isinstance(rhs.value, ast.Name)
-                                            and rhs.value.id in getattr(self, '_native_modules', set())))
-            is_pyobj_call = (isinstance(rhs, ast.Call)
-                             and isinstance(rhs.func, ast.Attribute)
-                             and isinstance(rhs.func.value, ast.Name)
-                             and rhs.func.value.id in self.variables
-                             and self._var_kind(rhs.func.value.id) == VKind.PYOBJ
-                             # Exclude native modules — they have PYOBJ kind but
-                             # should use the native dispatch path, not bridge
-                             and rhs.func.value.id not in getattr(self, '_native_modules', set())
-                             # Exclude path variables — they have dedicated handlers
-                             and not _is_path_var(rhs.func.value))
-            # Chained pyobj call: urllib.parse.urlparse(...) where urllib is pyobj
-            # Exclude direct native module calls (collections.Counter, etc.)
-            is_pyobj_call_chain = (not is_pyobj_call
-                                   and isinstance(rhs, ast.Call)
-                                   and isinstance(rhs.func, ast.Attribute)
-                                   and self._is_pyobj_receiver(rhs.func.value)
-                                   and not (isinstance(rhs.func.value, ast.Name) and _is_path_var(rhs.func.value))
-                                   and not (isinstance(rhs.func.value, ast.Name)
-                                            and rhs.func.value.id in getattr(self, '_native_modules', set())))
-            is_pyobj_direct = (isinstance(rhs, ast.Call)
-                               and isinstance(rhs.func, ast.Name)
-                               and rhs.func.id in self.variables
-                               and self._var_kind(rhs.func.id) == VKind.PYOBJ)
-            if (is_pyobj_attr or is_pyobj_attr_chain
-                    or is_pyobj_call or is_pyobj_call_chain
-                    or is_pyobj_direct):
-                if is_pyobj_direct:
-                    # Direct call: g() where g is a CPython function.
-                    # Store result as pyobj for method calls on the result.
-                    val = self._emit_expr_value(rhs)
-                    val = self._ensure_ptr(val)
-                    self._store_variable(node.targets[0].id, val, "pyobj")
-                    return
-                # Method call (math.sqrt()) or attribute (math.pi):
-                # Store the raw PyObject* as pyobj so downstream operations
-                # (method calls, subscript, len, int(), print) all route
-                # through the CPython bridge with correct type semantics.
-                if is_pyobj_call or is_pyobj_call_chain:
-                    pyobj_ptr = self._emit_cpython_call_raw(rhs)
-                elif is_pyobj_attr_chain:
-                    # Chained attribute: evaluate receiver, then getattr
-                    obj = self._emit_expr_value(rhs.value)
-                    obj = self._ensure_ptr(obj)
-                    attr_name = self._make_string_constant(rhs.attr)
-                    pyobj_ptr = self.builder.call(
-                        self.runtime["cpython_getattr"], [obj, attr_name])
-                else:
-                    # Attribute access: get the raw PyObject*
-                    obj = self._load_variable(rhs.value.id, rhs)
-                    obj = self._ensure_ptr(obj)
-                    attr_name = self._make_string_constant(rhs.attr)
-                    pyobj_ptr = self.builder.call(
-                        self.runtime["cpython_getattr"], [obj, attr_name])
-                self._store_variable(node.targets[0].id, pyobj_ptr, "pyobj")
-                return
-
-        # BinOp on pyobj operands: d2 = d + t where d and t are pyobj.
-        # cpython_binop returns FpyValue {tag, data} but we need to keep
-        # the result as a raw PyObject* for downstream attribute access.
-        if (self._USE_FV_LOCALS
-                and len(node.targets) == 1
-                and isinstance(node.targets[0], ast.Name)
-                and isinstance(node.value, ast.BinOp)):
-            lhs_pyobj = (isinstance(node.value.left, ast.Name)
-                         and node.value.left.id in self.variables
-                         and self._var_kind(node.value.left.id) == VKind.PYOBJ)
-            rhs_pyobj = (isinstance(node.value.right, ast.Name)
-                         and node.value.right.id in self.variables
-                         and self._var_kind(node.value.right.id) == VKind.PYOBJ)
-            if lhs_pyobj and rhs_pyobj:
-                # Both sides are PyObject* — use cpython_concat which takes
-                # (pyobj, pyobj) and returns {tag, data}
-                left = self._emit_expr_value(node.value.left)
-                right = self._emit_expr_value(node.value.right)
-                left = self._ensure_ptr(left)
-                right = self._ensure_ptr(right)
-                out_tag = self._create_entry_alloca(i32, "pybin.tag")
-                out_data = self._create_entry_alloca(i64, "pybin.data")
-                _pyobj_ops = {ast.Add: 0, ast.Sub: 1, ast.Mult: 2,
-                              ast.Div: 3, ast.FloorDiv: 4, ast.Mod: 5,
-                              ast.Pow: 6}
-                op_code = _pyobj_ops.get(type(node.value.op), 0)
-                self.builder.call(self.runtime["cpython_binop"],
-                                  [left,
-                                   ir.Constant(i32, FPY_TAG_OBJ),
-                                   self.builder.ptrtoint(right, i64),
-                                   ir.Constant(i32, op_code),
-                                   out_tag, out_data])
-                # The result is an opaque PyObject* — store as pyobj
-                result_data = self.builder.load(out_data)
-                result_ptr = self.builder.inttoptr(result_data, i8_ptr)
-                self._store_variable(node.targets[0].id, result_ptr, "pyobj")
-                return
-
-        # Native module call: x = textwrap.fill(...), x = pprint.pformat(...)
-        # Try the native dispatch first (fast path for math.sqrt, json.dumps
-        # with no kwargs, etc.).  If the native handler doesn't cover this
-        # function, fall back to the CPython bridge.  The bridge returns a raw
-        # PyObject* that we store as "pyobj" so _load_or_wrap_fv will convert
-        # it at use-time with the correct runtime tag.
-        if (self._USE_FV_LOCALS
-                and len(node.targets) == 1
-                and isinstance(node.targets[0], ast.Name)
-                and isinstance(node.value, ast.Call)
-                and isinstance(node.value.func, ast.Attribute)
-                and isinstance(node.value.func.value, ast.Name)
-                and node.value.func.value.id in getattr(self, '_native_modules', set())):
-            rhs = node.value
-            mod_name = rhs.func.value.id
-            func_name = rhs.func.attr
-            native_result = self._emit_native_module_call(
-                mod_name, func_name, rhs)
-            if native_result is not None:
-                # Natively handled — use normal type inference + store
-                type_tag = self._infer_type_tag(rhs, native_result)
-                self._store_variable(node.targets[0].id, native_result, type_tag)
-                return
-            # Not natively handled — call through CPython bridge.
-            # If we know the return type at compile time (e.g. json.dumps
-            # → str, json.loads → dict), convert PyObject* → native via
-            # cpython_to_fv so downstream native handlers see native
-            # char*/FpyDict*/FpyList* instead of raw PyObject pointers.
-            # For unknown types, keep as raw PyObject* with "pyobj" tag
-            # so CPython API calls (len, type, etc.) work correctly.
-            pyobj_ptr = self._emit_cpython_call_raw(rhs)
-            inferred = self._infer_type_tag(rhs, None)
-            if inferred not in ("unknown", "pyobj"):
-                # Known type: convert to native format
-                tag_slot = self._create_entry_alloca(i32, "bridge.cvt.tag")
-                data_slot = self._create_entry_alloca(i64, "bridge.cvt.data")
-                self.builder.call(self.runtime["cpython_to_fv"],
-                                  [pyobj_ptr, tag_slot, data_slot])
-                bridge_tag = self.builder.load(tag_slot)
-                bridge_data = self.builder.load(data_slot)
-                fv = self._fv_build_from_slots(bridge_tag, bridge_data)
-                self._store_variable(node.targets[0].id, fv, inferred)
-            else:
-                # Unknown type: keep as raw PyObject*
-                self._store_variable(node.targets[0].id, pyobj_ptr, "pyobj")
+        # FV-ABI fast paths: pyobj, native module, user fn, obj attr, subscript
+        if self._USE_FV_LOCALS and self._assign_fv_fast_path(node):
             return
-
-        # For FV-ABI user function calls, store the raw FpyValue directly
-        # to preserve the runtime tag. This avoids the unwrap/re-wrap cycle
-        # that loses type information (e.g., a string return gets unwrapped
-        # via static_ret_type=i64 → bare integer, then re-wrapped as INT
-        # instead of STR). The callee's FpyValue already has the correct
-        # runtime tag, so storing it directly is always correct.
-        if (self._USE_FV_LOCALS
-                and len(node.targets) == 1
-                and isinstance(node.targets[0], ast.Name)
-                and isinstance(node.value, ast.Call)
-                and isinstance(node.value.func, ast.Name)
-                and node.value.func.id in self._user_functions
-                # Skip when the called function was reassigned (decorator
-                # pattern): greet = wrap(greet); result = greet('world')
-                # must call through the closure, not the original function.
-                and not (node.value.func.id in self.variables
-                         and self._var_kind(node.value.func.id) == VKind.CLOSURE)):
-            # Resolve specialization for correct ret_tag (int vs float etc.)
-            lookup_name = node.value.func.id
-            if lookup_name in self._monomorphized:
-                lookup_name = self._resolve_specialization(
-                    lookup_name, node.value.args, node.value.keywords)
-            info = self._user_functions[lookup_name]
-            if (info.uses_fv_abi and info.ret_tag != "void"):
-                fv = self._emit_user_call_fv(node.value)
-                type_tag = info.ret_tag
-                # Normalize legacy "ptr" tag → "list" so downstream checks
-                # (_is_list_expr, _get_list_elem_type) recognize the variable.
-                if type_tag == "ptr":
-                    type_tag = "list:int"
-                elif type_tag == "ptr:list":
-                    type_tag = "list:list"
-                # Decorator pattern: target = deco(target) where target is
-                # a known user function.  The result is a callable (closure
-                # or wrapper) that must be called indirectly via call_ptr,
-                # not directly via the original function's LLVM symbol.
-                # Tag as "closure" so _emit_closure_call is used.
-                target_name = node.targets[0].id
-                if target_name in self._user_functions:
-                    type_tag = "closure"
-                self._store_variable(target_name, fv, type_tag)
-                return
-
-        # Fast path for Attribute RHS on an object receiver: use
-        # _load_or_wrap_fv to preserve the runtime tag. Any attribute on
-        # a user-class object might hold None (from `self.attr = None` in
-        # __init__), so we need the full tag+data read — the data-only
-        # optimization in _emit_attr_load would stamp OBJ tag even when
-        # the slot actually holds NONE, breaking `is None` checks.
-        # Broadened from the original `_is_obj_expr(node.value)` check
-        # (which missed cases where the attr wasn't recognized as obj
-        # but the receiver was) to catch any attr access on an obj
-        # receiver.
-        _fv_attr_handled = False
-        if (self._USE_FV_LOCALS
-                and len(node.targets) == 1
-                and isinstance(node.targets[0], ast.Name)
-                and isinstance(node.value, ast.Attribute)
-                and (self._is_obj_expr(node.value)
-                     or self._is_obj_expr(node.value.value))):
-            # Emit the attr expression as FV (preserves runtime tag, so
-            # NONE sentinels from uninitialized slots roundtrip correctly).
-            target_name = node.targets[0].id
-            # Determine the correct VKind for the attribute value.
-            # When the attribute result itself is an object, use OBJ.
-            # Otherwise, determine from class attribute analysis so that
-            # integer/float/string/bool attrs aren't mistyped as OBJ.
-            cls = self._infer_object_class(node.value)
-            if cls or self._is_obj_expr(node.value):
-                vkind = VKind.OBJ
-                _fv_attr_handled = True
-            else:
-                # The receiver is an obj but the attribute may be
-                # int/float/str/bool/container. Determine from class info.
-                attr_name_str = node.value.attr
-                recv_cls = self._infer_object_class(node.value.value)
-                if recv_cls is not None:
-                    vkind = VKind.OBJ  # default for known class
-                    # Check known non-object attr types
-                    cls_float_a = self._per_class_float_attrs.get(recv_cls, set())
-                    cls_bool_a = self._per_class_bool_attrs.get(recv_cls, set())
-                    cls_str_a = self._per_class_string_attrs.get(recv_cls, set())
-                    cls_obj_a = getattr(self, '_class_obj_attrs', {}).get(recv_cls, set())
-                    cls_container = self._class_container_attrs.get(recv_cls, (set(), set()))
-                    cls_list_a, cls_dict_a = cls_container
-                    if attr_name_str in cls_float_a:
-                        vkind = VKind.FLOAT
-                    elif attr_name_str in cls_bool_a:
-                        vkind = VKind.BOOL
-                    elif attr_name_str in cls_str_a:
-                        vkind = VKind.STR
-                    elif attr_name_str in cls_list_a:
-                        vkind = VKind.LIST
-                    elif attr_name_str in cls_dict_a:
-                        vkind = VKind.DICT
-                    elif attr_name_str in cls_obj_a:
-                        vkind = VKind.OBJ
-                    elif (attr_name_str not in cls_obj_a
-                          and attr_name_str not in cls_str_a
-                          and attr_name_str not in cls_list_a
-                          and attr_name_str not in cls_dict_a):
-                        # Attr is not in any pointer-type set. It's either
-                        # an integer attr or an undetected obj attr. Check
-                        # if it appears in the class slots — if the slot
-                        # exists and none of the pointer sets claim it,
-                        # it's an integer/bool attribute.
-                        slots = self._class_attr_slots.get(recv_cls, {})
-                        if attr_name_str in slots:
-                            vkind = VKind.INT
-                    _fv_attr_handled = True
-                else:
-                    # recv_cls is None — unknown receiver class. Check if
-                    # the attribute name appears as a non-obj attribute in
-                    # ANY known class. This covers `count = work.datum`
-                    # where we can't determine work's class but datum is
-                    # an int attribute in Packet.
-                    vkind = VKind.OBJ  # safe default
-                    for _chk_cls in self._user_classes:
-                        _chk_float = self._per_class_float_attrs.get(_chk_cls, set())
-                        _chk_bool = self._per_class_bool_attrs.get(_chk_cls, set())
-                        _chk_str = self._per_class_string_attrs.get(_chk_cls, set())
-                        _chk_cont = self._class_container_attrs.get(_chk_cls, (set(), set()))
-                        _chk_list, _chk_dict = _chk_cont
-                        _chk_obj = getattr(self, '_class_obj_attrs', {}).get(_chk_cls, set())
-                        _chk_slots = self._class_attr_slots.get(_chk_cls, {})
-                        if attr_name_str in _chk_float:
-                            vkind = VKind.FLOAT; break
-                        elif attr_name_str in _chk_bool:
-                            vkind = VKind.BOOL; break
-                        elif attr_name_str in _chk_str:
-                            vkind = VKind.STR; break
-                        elif attr_name_str in _chk_list:
-                            vkind = VKind.LIST; break
-                        elif attr_name_str in _chk_dict:
-                            vkind = VKind.DICT; break
-                        elif attr_name_str in _chk_obj:
-                            vkind = VKind.OBJ; break
-                        elif (attr_name_str in _chk_slots
-                              and attr_name_str not in _chk_obj
-                              and attr_name_str not in _chk_str
-                              and attr_name_str not in _chk_list
-                              and attr_name_str not in _chk_dict):
-                            vkind = VKind.INT; break
-                    _fv_attr_handled = True
-            if _fv_attr_handled:
-                fv = self._load_or_wrap_fv(node.value)
-                self._store_variable(target_name, fv,
-                                     ValueType(vkind, class_name=cls))
-                if cls:
-                    self._obj_var_class[target_name] = cls
-                return
-
-        # Fast path for Subscript RHS on list/tuple containers in FV mode:
-        # use _load_or_wrap_fv to preserve the runtime tag of the element.
-        # Without this, _emit_expr_value uses _emit_slot_get_data_only which
-        # returns only the i64 data, and _store_variable wraps it with a
-        # compile-time tag (often INT=0).  For OBJ pointers this makes
-        # rc_incref a no-op (INT is not heap-allocated).  When the value
-        # later flows through a non-FV ABI boundary the tag is corrected to
-        # OBJ, causing scope_decref to emit a real rc_decref — a net -1
-        # refcount leak that eventually frees live objects.
-        if (self._USE_FV_LOCALS
-                and len(node.targets) == 1
-                and isinstance(node.targets[0], ast.Name)
-                and isinstance(node.value, ast.Subscript)
-                and not isinstance(node.value.slice, ast.Slice)):
-            container = node.value.value
-            if (self._is_list_expr(container)
-                    or self._is_tuple_expr(container)):
-                target_name = node.targets[0].id
-                fv = self._load_or_wrap_fv(node.value)
-                # Determine VKind from context — use OBJ if the list is
-                # known to hold objects, otherwise fall back to generic tag.
-                _sub_vkind = VKind.OBJ  # safe default for mixed lists
-                _sub_cls = None
-                if isinstance(container, ast.Attribute):
-                    recv_cls = self._infer_object_class(container.value)
-                    if recv_cls:
-                        # Check if we know the element type from class attrs
-                        list_attrs, _ = self._class_container_attrs.get(
-                            recv_cls, (set(), set()))
-                        if container.attr in list_attrs:
-                            _sub_vkind = VKind.OBJ  # list of objects
-                elif isinstance(container, ast.Name):
-                    _elem = self._get_list_elem_type(container)
-                    _sub_vkind = _elem.kind
-                    # Propagate inner element type for containers.
-                    # E.g. SYSTEM is list:list:float → elem is
-                    # ValueType(LIST, elem=FLOAT)
-                    _sub_elem_type = _elem.elem_type
-                    self._store_variable(target_name, fv,
-                                         ValueType(_sub_vkind, elem_type=_sub_elem_type,
-                                                   class_name=_sub_cls))
-                    if _sub_cls:
-                        self._obj_var_class[target_name] = _sub_cls
-                    return
-                else:
-                    self._store_variable(target_name, fv,
-                                         ValueType(_sub_vkind, class_name=_sub_cls))
-                    if _sub_cls:
-                        self._obj_var_class[target_name] = _sub_cls
-                    return
 
         # Early-out: in-place prefix reverse  a[:N] = a[M::-1]
         # Must be detected BEFORE evaluating the RHS, otherwise
