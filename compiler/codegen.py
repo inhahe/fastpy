@@ -292,12 +292,14 @@ class ValueType:
             "complex": VKind.COMPLEX, "bigint": VKind.BIGINT,
             "bytes": VKind.BYTES, "closure": VKind.CLOSURE,
             "mixed": VKind.MIXED,
-            # Aliases: map specialized types to parent kinds to preserve
-            # existing _var_kind() == VKind.DICT/LIST checks.  The
-            # _is_deque_expr/_is_counter_expr helpers check raw string tags
-            # for type-specific dispatch.
+            # Aliases: counter/defaultdict share FpyDict struct, so all
+            # dict runtime functions work — keep as VKind.DICT.
+            # Deque has different struct (FpyDeque), so it MUST map to
+            # VKind.DEQUE to prevent list_length/list_get_fv struct mismatch.
+            # The _is_deque_expr/_is_counter_expr helpers check raw string
+            # tags for type-specific dispatch.
             "counter": VKind.DICT, "defaultdict": VKind.DICT,
-            "deque": VKind.LIST,
+            "deque": VKind.DEQUE,
             "chainmap": VKind.OBJ, "logger": VKind.OBJ,
             "ptr": VKind.LIST, "ptr:list": VKind.LIST,
             "path": VKind.PYOBJ, "native_func": VKind.NATIVE_FUNC,
@@ -15568,6 +15570,15 @@ class CodeGen:
         self.variables[name] = (alloca, type_tag)
         self.builder.store(fv, alloca)
 
+    @staticmethod
+    def _tag_kind(tag) -> VKind:
+        """Convert any tag (str or ValueType) to VKind."""
+        if isinstance(tag, ValueType):
+            return tag.kind
+        if isinstance(tag, VKind):
+            return tag
+        return ValueType.from_old_tag(str(tag)).kind
+
     def _var_kind(self, name: str) -> VKind:
         """Get the VKind for a variable. Returns UNKNOWN if not found.
 
@@ -15592,7 +15603,7 @@ class CodeGen:
         Returns i8_ptr for pointer types and 'mixed', double for float,
         i64 for everything else (int, bool, unknown)."""
         vt = tag if isinstance(tag, ValueType) else ValueType.from_old_tag(tag)
-        if vt.kind.is_ptr or vt == "mixed":
+        if vt.kind.is_ptr or vt.kind == VKind.MIXED:
             return i8_ptr
         if vt.kind == VKind.FLOAT:
             return double
@@ -16427,9 +16438,8 @@ class CodeGen:
                 self.variables[_iter_name] = self._global_vars[_iter_name]
         if isinstance(node.iter, ast.Name) and node.iter.id in self.variables:
             _, tag = self.variables[node.iter.id]
-            # Deque check BEFORE VKind.LIST: deque maps to VKind.LIST
-            # via from_old_tag but has a different struct layout (FpyDeque
-            # vs FpyList). Must convert to list first via deque_to_list.
+            # Deque has a different struct layout (FpyDeque vs FpyList).
+            # Must convert to list first via deque_to_list.
             if tag == "deque":
                 self._emit_for_deque(node)
                 return
@@ -22499,7 +22509,7 @@ class CodeGen:
                 and node.value.id in self.variables
                 and not isinstance(node.slice, ast.Slice)):
             _unk_alloca, _unk_tag = self.variables[node.value.id]
-            if (str(_unk_tag) == "unknown"
+            if (self._tag_kind(_unk_tag) == VKind.UNKNOWN
                     and isinstance(_unk_alloca.type, ir.PointerType)
                     and _unk_alloca.type.pointee is fpy_val):
                 # Load the container's runtime tag and data
@@ -23100,7 +23110,6 @@ class CodeGen:
     def _is_deque_expr(self, node: ast.expr) -> bool:
         """Check if an AST expression evaluates to a deque."""
         if isinstance(node, ast.Name) and node.id in self.variables:
-            # deque maps to VKind.LIST via from_old_tag, so check string tag
             _, type_tag = self.variables[node.id]
             return (type_tag == "deque" if isinstance(type_tag, str)
                     else type_tag._to_tag() == "deque")
@@ -23114,7 +23123,7 @@ class CodeGen:
     def _is_counter_expr(self, node: ast.expr) -> bool:
         """Check if an AST expression evaluates to a Counter."""
         if isinstance(node, ast.Name) and node.id in self.variables:
-            # counter maps to VKind.DICT, so check string tag for specificity
+            # counter maps to VKind.DICT (shared struct), check string tag for specificity
             _, type_tag = self.variables[node.id]
             return (type_tag == "counter" if isinstance(type_tag, str)
                     else type_tag._to_tag() == "counter")
@@ -23802,7 +23811,7 @@ class CodeGen:
         Uses ``select`` so no extra basic blocks are needed."""
         if isinstance(node, ast.Name) and node.id in self.variables:
             alloca, tag = self.variables[node.id]
-            if (str(tag) == "unknown"
+            if (self._tag_kind(tag) == VKind.UNKNOWN
                     and isinstance(alloca.type, ir.PointerType)
                     and alloca.type.pointee is fpy_val):
                 fv = self.builder.load(alloca, name=f"{node.id}.fv.arith")
@@ -28411,9 +28420,8 @@ class CodeGen:
         kind = tv.vtype.kind
         arg_node = node.args[0]
 
-        # Deque check BEFORE VKind.LIST: deque maps to VKind.LIST via
-        # from_old_tag but FpyDeque has a different struct layout than
-        # FpyList, so list_length reads the wrong offset.
+        # Deque: FpyDeque has a different struct layout than FpyList,
+        # so list_length reads the wrong offset.
         if self._is_deque_expr(arg_node):
             return self.builder.call(self.runtime["deque_length"],
                                       [tv.as_ptr(self.builder)])
@@ -31239,7 +31247,7 @@ class CodeGen:
                 and node.value.id in self.variables
                 and not isinstance(node.slice, ast.Slice)):
             _unk_alloca, _unk_tag = self.variables[node.value.id]
-            if (str(_unk_tag) == "unknown"
+            if (self._tag_kind(_unk_tag) == VKind.UNKNOWN
                     and isinstance(_unk_alloca.type, ir.PointerType)
                     and _unk_alloca.type.pointee is fpy_val):
                 # Load the container's runtime tag and data
