@@ -337,6 +337,12 @@ typedef struct {
 int32_t fastpy_dict_equal(FpyDict *a, FpyDict *b);
 int32_t fastpy_set_equal(FpyDict *a, FpyDict *b);
 
+/* Zero-copy dict element access (for iteration without materializing a list) */
+void fastpy_dict_key_fv(FpyDict *dict, int64_t index,
+                        int32_t *out_tag, int64_t *out_data);
+void fastpy_dict_value_fv(FpyDict *dict, int64_t index,
+                          int32_t *out_tag, int64_t *out_data);
+
 /* Variadic closure call: takes a list of args, unpacks and dispatches. */
 int64_t fastpy_closure_call_list(void *closure, void *args_list);
 

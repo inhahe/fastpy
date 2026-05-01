@@ -1912,6 +1912,22 @@ int64_t fastpy_dict_length(FpyDict *dict) {
     return dict->length;
 }
 
+/* Zero-copy element access for dict/set iteration.
+ * Read key/value at compact-array index without materializing a list. */
+void fastpy_dict_key_fv(FpyDict *dict, int64_t index,
+                        int32_t *out_tag, int64_t *out_data) {
+    FpyValue v = dict->keys[index];
+    *out_tag = v.tag;
+    *out_data = v.data.i;
+}
+
+void fastpy_dict_value_fv(FpyDict *dict, int64_t index,
+                          int32_t *out_tag, int64_t *out_data) {
+    FpyValue v = dict->values[index];
+    *out_tag = v.tag;
+    *out_data = v.data.i;
+}
+
 /* --- Set operations (dict-backed, O(1) membership via hash table) ---
  *
  * Sets are FpyDict where keys = elements, values = fpy_none().

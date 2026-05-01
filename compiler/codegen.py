@@ -1652,6 +1652,9 @@ class CodeGen:
         self.runtime["dict_items"] = ir.Function(self.module, ft, name="fastpy_dict_items")
         ft = ir.FunctionType(i64, [i8_ptr])
         self.runtime["dict_length"] = ir.Function(self.module, ft, name="fastpy_dict_length")
+        ft = ir.FunctionType(void, [i8_ptr, i64, ir.PointerType(i32), ir.PointerType(i64)])
+        self.runtime["dict_key_fv"] = ir.Function(self.module, ft, name="fastpy_dict_key_fv")
+        self.runtime["dict_value_fv"] = ir.Function(self.module, ft, name="fastpy_dict_value_fv")
         ft = ir.FunctionType(i8_ptr, [i8_ptr])
         self.runtime["dict_to_str"] = ir.Function(self.module, ft, name="fastpy_dict_to_str")
 
@@ -16099,17 +16102,23 @@ class CodeGen:
         return self._fv_as_int(fv)
 
     def _fv_store_from_list(self, name: str, list_val: ir.Value,
-                             idx: ir.Value, type_tag: str) -> None:
-        """Fetch an FV element from list_val[idx] and store directly into
-        the variable's FV alloca. Avoids the unwrap-then-rewrap round-trip
-        that happens if you call list_get_* → _store_variable.
+                             idx: ir.Value, type_tag: str, *,
+                             get_fn: str = "list_get_fv") -> None:
+        """Fetch an FV element from list_val[idx] (or dict key/value at idx)
+        and store directly into the variable's FV alloca.  Avoids the
+        unwrap-then-rewrap round-trip that happens if you call
+        list_get_* → _store_variable.
+
+        Pass get_fn="dict_key_fv" or "dict_value_fv" for zero-copy
+        dict/set iteration (reads from the compact key/value array
+        without materializing a temporary list).
         """
         if not self._USE_FV_LOCALS or self._current_fn_bare_abi:
             # Bare-type path: unwrap FV element to bare type, then store
             # via _store_variable (which uses bare allocas in bare-ABI).
             tag_slot = self._create_entry_alloca(i32, "lget.tag")
             data_slot = self._create_entry_alloca(i64, "lget.data")
-            self._rt_call("list_get_fv",
+            self._rt_call(get_fn,
                               [list_val, idx, tag_slot, data_slot])
             data = self.builder.load(data_slot)
             fv = self._fv_build_from_slots(
@@ -16121,7 +16130,7 @@ class CodeGen:
         # FV path: get (tag, data) and pack directly into the alloca's FV
         tag_slot = self._create_entry_alloca(i32, "lget.tag")
         data_slot = self._create_entry_alloca(i64, "lget.data")
-        self._rt_call("list_get_fv",
+        self._rt_call(get_fn,
                           [list_val, idx, tag_slot, data_slot])
         loaded_tag = self.builder.load(tag_slot)
         loaded_data = self.builder.load(data_slot)
@@ -19040,6 +19049,19 @@ class CodeGen:
             self._emit_for_enumerate_inline(node)
             return
 
+        # F2 optimization: for k, v in dict.items() — zero-copy iteration.
+        # Reads dict->keys[i] and dict->values[i] directly instead of
+        # materializing a list of 2-element tuples via fastpy_dict_items().
+        if (len(targets) == 2
+                and all(isinstance(t, ast.Name) for t in targets)
+                and isinstance(node.iter, ast.Call)
+                and isinstance(node.iter.func, ast.Attribute)
+                and node.iter.func.attr == "items"
+                and not node.iter.args
+                and self._is_dict_expr(node.iter.func.value)):
+            self._emit_for_dict_items_zerocopy(node)
+            return
+
         iter_tv = self._emit_expr(node.iter)
         iter_val = iter_tv.as_ptr(self.builder)
         iter_len = self._rt_call("list_length", [iter_val])
@@ -19466,14 +19488,16 @@ class CodeGen:
             self.builder.call(self.runtime["rc_decref"], [_tag, _data])
 
     def _emit_for_dict(self, node: ast.For) -> None:
-        """Emit for k in <dict>/<set>: iterate over dict's keys (= set elements)."""
+        """Emit for k in <dict>/<set>: zero-copy iteration over the dict's
+        compact key array.  Reads keys[i] directly via dict_key_fv instead
+        of materializing a temporary list with dict_keys().
+        """
         var_name = node.target.id
 
-        # Call dict_keys to get a list of keys, then iterate
+        # F2: zero-copy — get length directly, iterate via dict_key_fv
         dict_tv = self._emit_expr(node.iter)
         dict_val = dict_tv.as_ptr(self.builder)
-        keys_list = self._rt_call("dict_keys", [dict_val])
-        list_len = self._rt_call("list_length", [keys_list])
+        dict_len = self._rt_call("dict_length", [dict_val])
 
         # Determine the key/element type. For sets, the elements can be
         # any type (int, str, etc.). For dicts, keys are typically strings.
@@ -19503,13 +19527,15 @@ class CodeGen:
 
         self.builder.position_at_end(cond_block)
         idx = self._load_variable(idx_name, node)
-        cond = self.builder.icmp_signed("<", idx, list_len)
+        cond = self.builder.icmp_signed("<", idx, dict_len)
         after_loop = else_block if else_block else end_block
         self.builder.cbranch(cond, body_block, after_loop)
 
         self.builder.position_at_end(body_block)
         idx = self._load_variable(idx_name, node)
-        self._fv_store_from_list(var_name, keys_list, idx, key_type)
+        # Zero-copy: read directly from dict->keys[idx]
+        self._fv_store_from_list(var_name, dict_val, idx, key_type,
+                                 get_fn="dict_key_fv")
 
         self._loop_stack.append((end_block, incr_block))
         _prev_hot = self._in_hot_loop
@@ -19533,12 +19559,78 @@ class CodeGen:
                 self.builder.branch(end_block)
 
         self.builder.position_at_end(end_block)
+        # No temporary list to decref — zero-copy iteration
 
-        # dict_keys() always returns a temporary list — decref it
-        if self._USE_REFCOUNT:
-            _tag = ir.Constant(i32, FPY_TAG_LIST)
-            _data = self.builder.ptrtoint(keys_list, i64)
-            self.builder.call(self.runtime["rc_decref"], [_tag, _data])
+    def _emit_for_dict_items_zerocopy(self, node: ast.For) -> None:
+        """Emit for (k, v) in dict.items() using zero-copy access.
+
+        Reads dict->keys[i] and dict->values[i] directly instead of
+        materializing a list of N 2-element tuples.  Eliminates N+1 heap
+        allocations per loop execution.
+        """
+        targets = node.target.elts
+        key_target = targets[0]  # ast.Name (guard checked by caller)
+        val_target = targets[1]  # ast.Name
+
+        # Emit the dict (not the .items() call)
+        dict_tv = self._emit_expr(node.iter.func.value)
+        dict_val = dict_tv.as_ptr(self.builder)
+        dict_len = self._rt_call("dict_length", [dict_val])
+
+        # Infer key/value types
+        inner_types = self._infer_for_tuple_elem_types(node.iter, 2)
+        key_type = inner_types[0] if inner_types else "str"
+        val_type = inner_types[1] if len(inner_types) > 1 else "str"
+
+        self._block_counter += 1
+        idx_name = f"__for_di_idx_{self._block_counter}"
+        self._store_variable(idx_name, ir.Constant(i64, 0), "int")
+
+        cond_block = self._new_block("fdi.cond")
+        body_block = self._new_block("fdi.body")
+        incr_block = self._new_block("fdi.incr")
+        else_block = self._new_block("fdi.else") if node.orelse else None
+        end_block = self._new_block("fdi.end")
+
+        self.builder.branch(cond_block)
+
+        self.builder.position_at_end(cond_block)
+        idx = self._load_variable(idx_name, node)
+        cond = self.builder.icmp_signed("<", idx, dict_len)
+        after_loop = else_block if else_block else end_block
+        self.builder.cbranch(cond, body_block, after_loop)
+
+        self.builder.position_at_end(body_block)
+        idx = self._load_variable(idx_name, node)
+
+        # Zero-copy: read key and value directly from dict arrays
+        self._fv_store_from_list(key_target.id, dict_val, idx, key_type,
+                                 get_fn="dict_key_fv")
+        self._fv_store_from_list(val_target.id, dict_val, idx, val_type,
+                                 get_fn="dict_value_fv")
+
+        self._loop_stack.append((end_block, incr_block))
+        _prev_hot = self._in_hot_loop
+        self._in_hot_loop = True
+        self._emit_stmts(node.body)
+        self._in_hot_loop = _prev_hot
+        self._loop_stack.pop()
+        if not self.builder.block.is_terminated:
+            self.builder.branch(incr_block)
+
+        self.builder.position_at_end(incr_block)
+        idx = self._load_variable(idx_name, node)
+        incremented = self.builder.add(idx, ir.Constant(i64, 1))
+        self._store_variable(idx_name, incremented, "int")
+        self.builder.branch(cond_block)
+
+        if else_block:
+            self.builder.position_at_end(else_block)
+            self._emit_stmts(node.orelse)
+            if not self.builder.block.is_terminated:
+                self.builder.branch(end_block)
+
+        self.builder.position_at_end(end_block)
 
     def _emit_break(self, node: ast.Break) -> None:
         if not self._loop_stack:
@@ -31987,12 +32079,12 @@ class CodeGen:
                 return self._bridge_fallback_expr(
                     node, "dict comprehension with non-iterable")
             list_ptr = iter_tv.as_ptr(self.builder)
-            if iter_kind == VKind.DICT:
-                # dict iteration yields keys — use dict_keys runtime
-                list_ptr = self.builder.call(
-                    self.runtime["dict_keys"], [list_ptr])
+            _dc_dict_zerocopy = (iter_kind == VKind.DICT)
             if iter_kind == VKind.STR:
                 list_len = self._rt_call("str_len", [list_ptr])
+            elif _dc_dict_zerocopy:
+                # F2: zero-copy — iterate dict keys directly
+                list_len = self._rt_call("dict_length", [list_ptr])
             else:
                 list_len = self._rt_call("list_length", [list_ptr])
             var_name = gen.target.id
@@ -32034,6 +32126,10 @@ class CodeGen:
             if iter_kind == VKind.STR:
                 char_ptr = self._rt_call("str_index", [list_ptr, idx])
                 self._store_variable(var_name, char_ptr, "str")
+            elif _dc_dict_zerocopy:
+                # F2: zero-copy dict key access
+                self._fv_store_from_list(var_name, list_ptr, idx, var_tag,
+                                         get_fn="dict_key_fv")
             else:
                 self._fv_store_from_list(var_name, list_ptr, idx, var_tag)
             # Handle filter conditions
