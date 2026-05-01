@@ -4736,6 +4736,150 @@ class CodeGen:
                     var_types[node.targets[0].id] = rt
         return _func_ret_types
 
+    def _csa_post_scan_propagation(
+        self, tree: ast.Module,
+        class_parents: dict[str, str | None],
+        obj_classes: dict[str, str],
+        var_types: dict[str, str],
+        func_asts: dict[str, ast.FunctionDef],
+    ) -> None:
+        """Propagate types from super().__init__(), dunder operators, and key funcs.
+
+        Handles three groups of post-scan type propagation:
+        1. ``super().__init__()`` / ``super().__method()`` arg types → parent
+        2. ``obj[k] = v`` / ``obj[k]`` / ``k in obj`` → __setitem__/__getitem__/__contains__
+        3. ``sorted(lst, key=func)`` / ``min/max(lst, key=func)`` → key func param types
+        """
+        # 1. Propagate super().__init__() arg types to parent class __init__.
+        for cls_name, cls_node in self._csa_class_asts.items():
+            parent = class_parents.get(cls_name)
+            if parent is None:
+                continue
+            for item in cls_node.body:
+                if not isinstance(item, ast.FunctionDef):
+                    continue
+                for n in ast.walk(item):
+                    if not isinstance(n, ast.Call):
+                        continue
+                    # Match super().__method(args...)
+                    if not (isinstance(n.func, ast.Attribute)
+                            and isinstance(n.func.value, ast.Call)
+                            and isinstance(n.func.value.func, ast.Name)
+                            and n.func.value.func.id == "super"):
+                        continue
+                    method_name = n.func.attr
+                    # Infer argument types (excluding self)
+                    arg_types: list[str | None] = []
+                    for arg in n.args:
+                        arg_types.append(
+                            self._infer_call_arg_type(arg))
+                    if not any(t is not None for t in arg_types):
+                        continue
+                    # For __init__, register under parent class name
+                    # (constructor call convention). For other methods,
+                    # register under "Parent.method".
+                    if method_name == "__init__":
+                        parent_key = parent
+                    else:
+                        parent_key = f"{parent}.{method_name}"
+                    existing = self._call_site_param_types.setdefault(
+                        parent_key, [])
+                    for i, t in enumerate(arg_types):
+                        if t is None:
+                            continue
+                        while len(existing) <= i:
+                            existing.append(None)
+                        # Override: super().__init__() arg types are more
+                        # accurate than the heuristic parent propagation
+                        # from child constructor calls (which assumes
+                        # child args == parent args, wrong when the child
+                        # passes different values to super().__init__).
+                        existing[i] = t
+
+        # 2. Register dunder call-site types from operator patterns.
+        # __setitem__ from `obj[key] = val`
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Assign)
+                    and len(node.targets) == 1
+                    and isinstance(node.targets[0], ast.Subscript)
+                    and isinstance(node.targets[0].value, ast.Name)):
+                obj_name = node.targets[0].value.id
+                if obj_name in obj_classes:
+                    cls_name = obj_classes[obj_name]
+                    key_type = self._infer_call_arg_type(node.targets[0].slice)
+                    val_type = self._infer_call_arg_type(node.value)
+                    qkey = f"{cls_name}.__setitem__"
+                    existing = self._call_site_param_types.get(qkey)
+                    types = [key_type, val_type]
+                    if existing is None:
+                        self._call_site_param_types[qkey] = types
+                    # Also register under bare name for fallback
+                    if "__setitem__" not in self._call_site_param_types:
+                        self._call_site_param_types["__setitem__"] = types
+        # __getitem__ from `obj[key]`
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Subscript)
+                    and not isinstance(node.slice, ast.Slice)
+                    and isinstance(node.value, ast.Name)):
+                obj_name = node.value.id
+                if obj_name in obj_classes:
+                    cls_name = obj_classes[obj_name]
+                    key_type = self._infer_call_arg_type(node.slice)
+                    qkey = f"{cls_name}.__getitem__"
+                    types = [key_type]
+                    if qkey not in self._call_site_param_types:
+                        self._call_site_param_types[qkey] = types
+                    if "__getitem__" not in self._call_site_param_types:
+                        self._call_site_param_types["__getitem__"] = types
+        # __contains__ from `key in obj`
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Compare):
+                for op, comp in zip(node.ops, node.comparators):
+                    if isinstance(op, ast.In) and isinstance(comp, ast.Name):
+                        obj_name = comp.id
+                        if obj_name in obj_classes:
+                            cls_name = obj_classes[obj_name]
+                            elem_type = self._infer_call_arg_type(node.left)
+                            qkey = f"{cls_name}.__contains__"
+                            types = [elem_type]
+                            if qkey not in self._call_site_param_types:
+                                self._call_site_param_types[qkey] = types
+                            if "__contains__" not in self._call_site_param_types:
+                                self._call_site_param_types["__contains__"] = types
+
+        # 3. Trace sorted/min/max key functions.
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            if not (isinstance(node.func, ast.Name)
+                    and node.func.id in ("sorted", "min", "max")):
+                continue
+            key_func_name = None
+            for kw in node.keywords:
+                if kw.arg == "key" and isinstance(kw.value, ast.Name):
+                    key_func_name = kw.value.id
+            if key_func_name is None or key_func_name not in func_asts:
+                continue
+            # Determine the list's element type
+            if node.args:
+                list_node = node.args[0]
+                elem_type = None
+                if isinstance(list_node, ast.List) and list_node.elts:
+                    if all(isinstance(e, ast.Constant) and isinstance(e.value, str)
+                           for e in list_node.elts):
+                        elem_type = "str"
+                elif isinstance(list_node, ast.Name) and list_node.id in var_types:
+                    vt = var_types[list_node.id]
+                    if vt == "list:str":
+                        elem_type = "str"
+                if elem_type is not None:
+                    existing = self._call_site_param_types.setdefault(
+                        key_func_name, [])
+                    if not existing:
+                        existing.append(elem_type)
+                    elif existing[0] is None:
+                        existing[0] = elem_type
+
     def _csa_propagate_call_graph(
         self,
         func_asts: dict[str, ast.FunctionDef],
@@ -5771,146 +5915,8 @@ class CodeGen:
 
         self._csa_propagate_call_graph(func_asts, class_parents)
 
-        # Propagate super().__init__() arg types to parent class __init__.
-        # Without this, `class Circle(Shape): super().__init__("circle")`
-        # doesn't record "str" for Shape.__init__'s `name` parameter.
-        # For __init__, use the parent class name as the key (not
-        # "Parent.__init__"), because the method body looks up
-        # _call_site_param_types[class_name] for constructor types.
-        # For other methods, use "Parent.method" as the key.
-        for cls_name, cls_node in self._csa_class_asts.items():
-            parent = class_parents.get(cls_name)
-            if parent is None:
-                continue
-            for item in cls_node.body:
-                if not isinstance(item, ast.FunctionDef):
-                    continue
-                for n in ast.walk(item):
-                    if not isinstance(n, ast.Call):
-                        continue
-                    # Match super().__method(args...)
-                    if not (isinstance(n.func, ast.Attribute)
-                            and isinstance(n.func.value, ast.Call)
-                            and isinstance(n.func.value.func, ast.Name)
-                            and n.func.value.func.id == "super"):
-                        continue
-                    method_name = n.func.attr
-                    # Infer argument types (excluding self)
-                    arg_types: list[str | None] = []
-                    for arg in n.args:
-                        arg_types.append(
-                            self._infer_call_arg_type(arg))
-                    if not any(t is not None for t in arg_types):
-                        continue
-                    # For __init__, register under parent class name
-                    # (constructor call convention). For other methods,
-                    # register under "Parent.method".
-                    if method_name == "__init__":
-                        parent_key = parent
-                    else:
-                        parent_key = f"{parent}.{method_name}"
-                    existing = self._call_site_param_types.setdefault(
-                        parent_key, [])
-                    for i, t in enumerate(arg_types):
-                        if t is None:
-                            continue
-                        while len(existing) <= i:
-                            existing.append(None)
-                        # Override: super().__init__() arg types are more
-                        # accurate than the heuristic parent propagation
-                        # from child constructor calls (which assumes
-                        # child args == parent args, wrong when the child
-                        # passes different values to super().__init__).
-                        existing[i] = t
-
-        # Register __setitem__ call-site types from `obj[key] = val` patterns.
-        # This lets the method body know the param types (str key, int val, etc.)
-        for node in ast.walk(tree):
-            if (isinstance(node, ast.Assign)
-                    and len(node.targets) == 1
-                    and isinstance(node.targets[0], ast.Subscript)
-                    and isinstance(node.targets[0].value, ast.Name)):
-                obj_name = node.targets[0].value.id
-                if obj_name in obj_classes:
-                    cls_name = obj_classes[obj_name]
-                    key_type = self._infer_call_arg_type(node.targets[0].slice)
-                    val_type = self._infer_call_arg_type(node.value)
-                    qkey = f"{cls_name}.__setitem__"
-                    existing = self._call_site_param_types.get(qkey)
-                    types = [key_type, val_type]
-                    if existing is None:
-                        self._call_site_param_types[qkey] = types
-                    # Also register under bare name for fallback
-                    if "__setitem__" not in self._call_site_param_types:
-                        self._call_site_param_types["__setitem__"] = types
-
-        # Register __getitem__ call-site types from `obj[key]` patterns.
-        # This lets the method body know the param types (str key, etc.)
-        for node in ast.walk(tree):
-            if (isinstance(node, ast.Subscript)
-                    and not isinstance(node.slice, ast.Slice)
-                    and isinstance(node.value, ast.Name)):
-                obj_name = node.value.id
-                if obj_name in obj_classes:
-                    cls_name = obj_classes[obj_name]
-                    key_type = self._infer_call_arg_type(node.slice)
-                    qkey = f"{cls_name}.__getitem__"
-                    types = [key_type]
-                    if qkey not in self._call_site_param_types:
-                        self._call_site_param_types[qkey] = types
-                    if "__getitem__" not in self._call_site_param_types:
-                        self._call_site_param_types["__getitem__"] = types
-
-        # Register __contains__ call-site types from `key in obj` patterns.
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Compare):
-                for op, comp in zip(node.ops, node.comparators):
-                    if isinstance(op, ast.In) and isinstance(comp, ast.Name):
-                        obj_name = comp.id
-                        if obj_name in obj_classes:
-                            cls_name = obj_classes[obj_name]
-                            elem_type = self._infer_call_arg_type(node.left)
-                            qkey = f"{cls_name}.__contains__"
-                            types = [elem_type]
-                            if qkey not in self._call_site_param_types:
-                                self._call_site_param_types[qkey] = types
-                            if "__contains__" not in self._call_site_param_types:
-                                self._call_site_param_types["__contains__"] = types
-
-        # Trace sorted(list, key=func) / min/max(list, key=func) to populate
-        # call-site types for the key function. The key function receives
-        # elements of the list, so its param type matches the list's elem type.
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Call):
-                continue
-            if not (isinstance(node.func, ast.Name)
-                    and node.func.id in ("sorted", "min", "max")):
-                continue
-            key_func_name = None
-            for kw in node.keywords:
-                if kw.arg == "key" and isinstance(kw.value, ast.Name):
-                    key_func_name = kw.value.id
-            if key_func_name is None or key_func_name not in func_asts:
-                continue
-            # Determine the list's element type
-            if node.args:
-                list_node = node.args[0]
-                elem_type = None
-                if isinstance(list_node, ast.List) and list_node.elts:
-                    if all(isinstance(e, ast.Constant) and isinstance(e.value, str)
-                           for e in list_node.elts):
-                        elem_type = "str"
-                elif isinstance(list_node, ast.Name) and list_node.id in var_types:
-                    vt = var_types[list_node.id]
-                    if vt == "list:str":
-                        elem_type = "str"
-                if elem_type is not None:
-                    existing = self._call_site_param_types.setdefault(
-                        key_func_name, [])
-                    if not existing:
-                        existing.append(elem_type)
-                    elif existing[0] is None:
-                        existing[0] = elem_type
+        self._csa_post_scan_propagation(
+            tree, class_parents, obj_classes, var_types, func_asts)
 
         # ── Analysis: report functions with unresolved parameter types ──
         if self._analyze_mode:
