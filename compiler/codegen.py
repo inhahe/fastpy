@@ -64,6 +64,30 @@ fpy_obj_type = ir.LiteralStructType([
 ])
 fpy_obj_ptr = ir.PointerType(fpy_obj_type)
 
+# FpyClassDef layout — must match struct FpyClassDef in objects.h:
+# FpyClassDef layout on x64:
+#   offset  0: int class_id (i32) + 4 padding
+#   offset  8: const char *name (i8*)
+#   offset 16: int parent_id (i32) + 4 padding
+#   offset 24: FpyMethodDef *methods (i8*)
+#   offset 32: int method_count (i32) + int slot_count (i32)
+#   offset 40: const char **slot_names (i8*)
+#   offset 48: void (*destructor)(FpyObj*) (i8*)
+#   offset 56: void **vtable (i8*)
+#   offset 64: int vtable_size (i32) + 4 padding
+# Modeled as i64 + pointer pairs to match alignment (72 bytes total).
+fpy_classdef_type = ir.LiteralStructType([
+    i64,    # 0: class_id(i32) + padding → offset 0
+    i8_ptr, # 1: name → offset 8
+    i64,    # 2: parent_id(i32) + padding → offset 16
+    i8_ptr, # 3: methods → offset 24
+    i64,    # 4: method_count(i32) + slot_count(i32) → offset 32
+    i8_ptr, # 5: slot_names → offset 40
+    i8_ptr, # 6: destructor → offset 48
+    i8_ptr, # 7: vtable (void**) → offset 56
+    i64,    # 8: vtable_size(i32) + padding → offset 64
+])
+
 # FpyList layout — must match struct FpyList in objects.h:
 # FpyList layout on x64:
 #   offset  0: i32 refcount  (+ 4 padding)
@@ -2327,6 +2351,12 @@ class CodeGen:
         self.runtime["vtable_lookup"] = ir.Function(self.module, ft, name="fastpy_vtable_lookup")
         ft = ir.FunctionType(void, [i32])
         self.runtime["inherit_parent_vtable"] = ir.Function(self.module, ft, name="fastpy_inherit_parent_vtable")
+        # fpy_classes global array — declared external, defined in objects.c.
+        # Used by _emit_inline_vtable_lookup to avoid the C function call.
+        fpy_classes_arr_type = ir.ArrayType(fpy_classdef_type, 256)
+        self.fpy_classes_global = ir.GlobalVariable(
+            self.module, fpy_classes_arr_type, name="fpy_classes")
+        self.fpy_classes_global.linkage = 'external'
         # Native type.__new__: create class from namespace dict
         ft = ir.FunctionType(i32, [i8_ptr, i32, i8_ptr])
         self.runtime["type_new_from_dict"] = ir.Function(
@@ -3461,6 +3491,26 @@ class CodeGen:
         # Register classes with the runtime
         for cls_info in self._user_classes.values():
             self._emit_class_registration(cls_info)
+
+        # Class Hierarchy Analysis (CHA): build sole-implementor map.
+        # For each method name, if every class that has it shares the same
+        # LLVM function pointer (i.e., the method is defined in ONE place
+        # and inherited everywhere else), we can devirtualize unknown-
+        # receiver calls by calling that function directly — no vtable
+        # lookup needed.
+        self._cha_sole_impl: dict[str, ir.Function] = {}
+        _cha_funcs: dict[str, set] = {}  # method → set of func ids
+        _cha_func_ref: dict[str, ir.Function] = {}  # method → one func ref
+        for ci in self._user_classes.values():
+            for mname, mfunc in ci.methods.items():
+                fid = id(mfunc)
+                if mname not in _cha_funcs:
+                    _cha_funcs[mname] = set()
+                    _cha_func_ref[mname] = mfunc
+                _cha_funcs[mname].add(fid)
+        for mname, fids in _cha_funcs.items():
+            if len(fids) == 1:
+                self._cha_sole_impl[mname] = _cha_func_ref[mname]
 
         # Initialize lru_cache slots
         for name, maxsize, gvar in getattr(self, '_lru_init_pending', []):
@@ -30098,9 +30148,11 @@ class CodeGen:
                 vtable_slot = getattr(self, '_vtable_indices', {}).get(method)
                 if vtable_slot is not None:
                     n_dispatch_args = len(call_args)
-                    slot_val = ir.Constant(i32, vtable_slot)
-                    func_ptr = self.builder.call(
-                        self.runtime["vtable_lookup"], [obj, slot_val])
+                    # Inline vtable lookup — unchecked because direct_func
+                    # was already resolved (the method exists in this
+                    # hierarchy), so the vtable entry is guaranteed valid.
+                    func_ptr = self._emit_inline_vtable_lookup(
+                        obj, vtable_slot, unchecked=True)
                     # The vtable stores the i64-ABI dispatch function,
                     # same pointer that register_method receives.
                     if is_double_ret:
@@ -30167,6 +30219,52 @@ class CodeGen:
         # Use actual dispatch arg count (mixed params expand to 2 args each)
         n_dispatch_args = len(call_args)
 
+        # CHA sole-implementor fast-path: when every class in the program
+        # shares the same function pointer for this method (defined once in
+        # a base, inherited everywhere), skip the vtable entirely and call
+        # the function directly.  No type check needed — guaranteed correct
+        # for any receiver class.
+        cha_func = getattr(self, '_cha_sole_impl', {}).get(method)
+        if cha_func is not None and not method_mixed:
+            direct_args = [obj]
+            for i, val in enumerate(call_args):
+                if 1 + i >= len(cha_func.args):
+                    break
+                expected = cha_func.args[1 + i].type
+                if val.type != expected:
+                    if (isinstance(expected, ir.IntType)
+                            and isinstance(val.type, ir.IntType)
+                            and expected.width != val.type.width):
+                        if expected.width > val.type.width:
+                            val = self.builder.zext(val, expected)
+                        else:
+                            val = self.builder.trunc(val, expected)
+                    elif (isinstance(expected, ir.IntType)
+                            and isinstance(val.type, ir.PointerType)):
+                        val = self.builder.ptrtoint(val, expected)
+                    elif (isinstance(expected, ir.PointerType)
+                            and isinstance(val.type, ir.IntType)):
+                        val = self.builder.inttoptr(val, expected)
+                    elif (isinstance(expected, ir.DoubleType)
+                            and isinstance(val.type, ir.IntType)):
+                        val = self.builder.bitcast(val, expected)
+                    elif (isinstance(expected, ir.IntType)
+                            and isinstance(val.type, ir.DoubleType)):
+                        val = self.builder.bitcast(val, expected)
+                direct_args.append(val)
+            result = self.builder.call(cha_func, direct_args)
+            ret_type = cha_func.return_value.type
+            if isinstance(ret_type, ir.VoidType):
+                return ir.Constant(i64, 0)
+            if not is_double_ret:
+                ret_type2 = self._find_method_return_type(attr.value, method)
+                if ret_type2 and isinstance(ret_type2, ir.PointerType):
+                    result = self.builder.inttoptr(result, i8_ptr)
+                elif (ret_type2 and isinstance(ret_type2, ir.IntType)
+                        and ret_type2.width == 32):
+                    result = self.builder.trunc(result, i32)
+            return result
+
         # Vtable fast-path: if the method name has a vtable slot, try O(1)
         # dispatch first.  Falls back to string-based obj_call_methodN when
         # the vtable returns NULL (method not on this specific class's
@@ -30174,9 +30272,10 @@ class CodeGen:
         # across all class hierarchies).
         vtable_slot = getattr(self, '_vtable_indices', {}).get(method)
         if vtable_slot is not None and n_dispatch_args <= 4:
-            slot_val = ir.Constant(i32, vtable_slot)
-            func_ptr = self.builder.call(
-                self.runtime["vtable_lookup"], [obj, slot_val])
+            # Inline vtable lookup — checked, because the receiver's class
+            # is unknown at compile time and may lack this vtable slot.
+            func_ptr = self._emit_inline_vtable_lookup(
+                obj, vtable_slot, unchecked=False)
             null_ptr = ir.Constant(i8_ptr, None)
             is_null = self.builder.icmp_unsigned("==", func_ptr, null_ptr)
 
@@ -31025,6 +31124,102 @@ class CodeGen:
         if isinstance(node, ast.Attribute):
             return True
         return False
+
+    def _emit_inline_vtable_lookup(self, obj, slot_idx, unchecked=False):
+        """Emit inline LLVM IR for vtable lookup, replacing the C call to
+        fastpy_vtable_lookup.  Returns i8_ptr (function pointer, or NULL
+        if the slot is empty / out-of-bounds).
+
+        Equivalent C code::
+
+            FpyClassDef *cls = &fpy_classes[obj->class_id];
+            if (cls->vtable && slot < cls->vtable_size)
+                return cls->vtable[slot];
+            return NULL;
+
+        When *unchecked* is True, skip the NULL/bounds guard — the caller
+        guarantees the vtable entry exists (e.g. the direct-dispatch
+        ``_need_vtable`` path where the method was already resolved
+        statically).  This reduces the hot path to three loads + one GEP.
+        """
+        # 1. Extract class_id from obj field 4 (high 32 bits of the i64).
+        obj_typed = self.builder.bitcast(obj, fpy_obj_ptr)
+        field4_ptr = self.builder.gep(
+            obj_typed,
+            [ir.Constant(i32, 0), ir.Constant(i32, 4)],
+            inbounds=True)
+        field4 = self.builder.load(field4_ptr, name="vti.magic_cid")
+        class_id_i64 = self.builder.lshr(
+            field4, ir.Constant(i64, 32), name="vti.cid64")
+        class_id = self.builder.trunc(class_id_i64, i32, name="vti.cid")
+
+        # 2. GEP into fpy_classes[class_id].
+        cls_ptr = self.builder.gep(
+            self.fpy_classes_global,
+            [ir.Constant(i32, 0), class_id],
+            inbounds=True,
+            name="vti.cls")
+
+        # 3. Load vtable pointer (field 7 = void**).
+        vtable_ptr_ptr = self.builder.gep(
+            cls_ptr,
+            [ir.Constant(i32, 0), ir.Constant(i32, 7)],
+            inbounds=True)
+        vtable_raw = self.builder.load(vtable_ptr_ptr, name="vti.vtbl")
+
+        slot_val = (ir.Constant(i32, slot_idx)
+                    if isinstance(slot_idx, int) else slot_idx)
+
+        if unchecked:
+            # Caller guarantees entry is valid — straight load.
+            vtable_typed = self.builder.bitcast(
+                vtable_raw, ir.PointerType(i8_ptr))
+            entry_ptr = self.builder.gep(
+                vtable_typed, [slot_val], inbounds=True)
+            return self.builder.load(entry_ptr, name="vti.fn")
+
+        # 4. Checked path: validate vtable != NULL && slot < vtable_size.
+        vtable_size_ptr = self.builder.gep(
+            cls_ptr,
+            [ir.Constant(i32, 0), ir.Constant(i32, 8)],
+            inbounds=True)
+        vtable_size_raw = self.builder.load(vtable_size_ptr)
+        vtable_size = self.builder.trunc(
+            vtable_size_raw, i32, name="vti.vtsz")
+
+        null = ir.Constant(i8_ptr, None)
+        has_vtable = self.builder.icmp_unsigned(
+            "!=", vtable_raw, null, name="vti.has")
+        in_bounds = self.builder.icmp_signed(
+            "<", slot_val, vtable_size, name="vti.inb")
+        ok = self.builder.and_(has_vtable, in_bounds, name="vti.ok")
+
+        bb_load = self.builder.append_basic_block("vti.load")
+        bb_null = self.builder.append_basic_block("vti.null")
+        bb_done = self.builder.append_basic_block("vti.done")
+        self.builder.cbranch(ok, bb_load, bb_null)
+
+        # Hit: load vtable[slot].
+        self.builder.position_at_end(bb_load)
+        vtable_typed = self.builder.bitcast(
+            vtable_raw, ir.PointerType(i8_ptr))
+        entry_ptr = self.builder.gep(
+            vtable_typed, [slot_val], inbounds=True)
+        func_ptr = self.builder.load(entry_ptr, name="vti.fn")
+        bb_load_end = self.builder.block
+        self.builder.branch(bb_done)
+
+        # Miss: return NULL.
+        self.builder.position_at_end(bb_null)
+        bb_null_end = self.builder.block
+        self.builder.branch(bb_done)
+
+        # Merge.
+        self.builder.position_at_end(bb_done)
+        result = self.builder.phi(i8_ptr, name="vti.result")
+        result.add_incoming(func_ptr, bb_load_end)
+        result.add_incoming(null, bb_null_end)
+        return result
 
     def _method_returns_list(self, obj_node: ast.expr, method_name: str) -> bool:
         """Check if a class method returns a list, by inspecting its AST."""
