@@ -14892,6 +14892,14 @@ class CodeGen:
                         self._store_variable(_sub_name, sub_list, "list:int")
                         sub_val_node = ast.Name(id=_sub_name, ctx=ast.Load())
                         self._emit_tuple_unpack(tgt, sub_val_node, node)
+                    elif isinstance(tgt, ast.Subscript):
+                        elem = self._list_get_as_bare(
+                            val, ir.Constant(i64, i), _et)
+                        self._emit_subscript_store(tgt, elem, node)
+                    elif isinstance(tgt, ast.Attribute):
+                        elem = self._list_get_as_bare(
+                            val, ir.Constant(i64, i), _et)
+                        self._emit_attr_store(tgt, elem, node)
                     else:
                         self._bridge_fallback_stmt(node, "unsupported unpack target")
         else:
@@ -14919,6 +14927,43 @@ class CodeGen:
                 elif isinstance(tgt, ast.Starred) and isinstance(tgt.value, ast.Name):
                     # *rest — collect remaining elements (skip for now)
                     self._store_variable(tgt.value.id, val_ptr, "list:int")
+                elif isinstance(tgt, ast.Subscript):
+                    # d[key], b = func() — extract element and store via
+                    # subscript.  Use FV-ABI to preserve the runtime tag.
+                    elem_tag, elem_data = self._fv_list_get(
+                        val_ptr, ir.Constant(i64, i), "unp")
+                    container = self._emit_expr_value(tgt.value)
+                    container = self._ensure_ptr(container)
+                    key = self._emit_expr_value(tgt.slice)
+                    if (self._is_dict_expr(tgt.value)
+                            or self._is_defaultdict_expr(tgt.value)
+                            or self._is_counter_expr(tgt.value)):
+                        if isinstance(key.type, ir.IntType):
+                            self._rt_call("dict_set_int_fv",
+                                          [container, key, elem_tag, elem_data])
+                        else:
+                            self._rt_call("dict_set_fv",
+                                          [container, key, elem_tag, elem_data])
+                    else:
+                        self._rt_call("list_set_fv",
+                                      [container, key, elem_tag, elem_data])
+                elif isinstance(tgt, ast.Attribute):
+                    # obj.attr, b = func() — extract element and store via
+                    # attribute.  Use FV-ABI to preserve the runtime tag.
+                    elem_tag, elem_data = self._fv_list_get(
+                        val_ptr, ir.Constant(i64, i), "unp")
+                    obj = self._emit_expr_value(tgt.value)
+                    obj = self._ensure_ptr(obj)
+                    attr_name = self._make_string_constant(tgt.attr)
+                    slot_idx = self._get_attr_slot(tgt)
+                    if slot_idx is not None:
+                        self._emit_slot_set_direct(
+                            obj, slot_idx, elem_tag, elem_data)
+                    else:
+                        self._rt_call("obj_set_fv",
+                                      [obj, attr_name, elem_tag, elem_data])
+                else:
+                    self._bridge_fallback_stmt(node, "unsupported unpack target")
 
     def _emit_aug_assign(self, node: ast.AugAssign) -> None:
         """Emit augmented assignment: x += expr, x -= expr, etc."""
