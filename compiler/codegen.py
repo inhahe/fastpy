@@ -9573,6 +9573,329 @@ class CodeGen:
         local_vars = getattr(self, '_gen_current_locals', set())
         return _GenVarRewriter(local_vars).visit(node)
 
+    def _dcl_detect_method_ret_type(
+        self, item: ast.FunctionDef, method_name: str,
+        class_name: str, parent_name: str | None,
+        float_attrs: set, string_attrs: set, bool_attrs: set,
+        list_attrs: set, dict_attrs: set,
+        list_attr_elem_types: dict,
+        float_method_params: set, methods: dict,
+        params: list[str],
+    ):
+        """Detect LLVM return type for a class method.
+
+        Returns (ret_type, init_arg_count, init_defaults).
+        For non-__init__ methods, init_arg_count and init_defaults are None.
+        """
+        init_arg_count = None
+        init_defaults = None
+        has_return = any(
+            isinstance(n, ast.Return) and n.value is not None
+            for n in ast.walk(item)
+        )
+        # __init__ and __str__ have special return handling
+        if method_name == "__init__":
+            ret_type = void
+            init_arg_count = len(params) - 1  # exclude self
+            init_defaults = list(item.args.defaults)
+        elif method_name in ("__str__", "__repr__"):
+            ret_type = i8_ptr  # returns string
+            param_types = [i8_ptr]  # just self
+        else:
+            ret_type = i64 if has_return else void
+
+        # Check for string or float returns
+        if has_return and method_name not in ("__str__", "__repr__"):
+            for n in ast.walk(item):
+                if isinstance(n, ast.Return) and n.value is not None:
+                    # Check for string return
+                    if isinstance(n.value, (ast.Constant,)) and isinstance(getattr(n.value, 'value', None), str):
+                        ret_type = i8_ptr
+                        break
+                    if isinstance(n.value, (ast.JoinedStr,)):
+                        ret_type = i8_ptr
+                        break
+                    # Check for list / tuple / dict return
+                    if isinstance(n.value, (ast.List, ast.ListComp, ast.Tuple,
+                                             ast.Dict, ast.DictComp)):
+                        ret_type = i8_ptr
+                        break
+                    # Check for `return self` (fluent chain) — returns obj
+                    if isinstance(n.value, ast.Name) and n.value.id == "self":
+                        ret_type = i8_ptr
+                        break
+                    # return local_var where local was assigned from
+                    # self.typed_attr (data flow within the method)
+                    if isinstance(n.value, ast.Name) and n.value.id != "self":
+                        var_name = n.value.id
+                        for s in ast.walk(item):
+                            if (isinstance(s, ast.Assign)
+                                    and len(s.targets) == 1
+                                    and isinstance(s.targets[0], ast.Name)
+                                    and s.targets[0].id == var_name):
+                                # self.attr source
+                                if (isinstance(s.value, ast.Attribute)
+                                        and isinstance(s.value.value, ast.Name)
+                                        and s.value.value.id == "self"):
+                                    a = s.value.attr
+                                    if a in float_attrs:
+                                        ret_type = double
+                                    elif a in string_attrs:
+                                        ret_type = i8_ptr
+                                    elif a in bool_attrs:
+                                        ret_type = i32
+                                    break
+                                # list/dict/tuple/set literal or
+                                # comprehension source
+                                if isinstance(s.value, (
+                                        ast.List, ast.ListComp,
+                                        ast.Tuple, ast.Dict,
+                                        ast.DictComp, ast.Set,
+                                        ast.SetComp)):
+                                    ret_type = i8_ptr
+                                    break
+                        if ret_type != i64:
+                            break
+                    # return local_var[index] where local was assigned
+                    # from an expression returning list of strings
+                    if (isinstance(n.value, ast.Subscript)
+                            and isinstance(n.value.value, ast.Name)):
+                        var_name = n.value.value.id
+                        for s in ast.walk(item):
+                            if (isinstance(s, ast.Assign)
+                                    and len(s.targets) == 1
+                                    and isinstance(s.targets[0], ast.Name)
+                                    and s.targets[0].id == var_name):
+                                rhs = s.value
+                                # .split(), .keys(), .values(), .items()
+                                # return list of strings
+                                if (isinstance(rhs, ast.Call)
+                                        and isinstance(rhs.func, ast.Attribute)
+                                        and rhs.func.attr in (
+                                            "split", "keys", "values",
+                                            "items", "splitlines")):
+                                    ret_type = i8_ptr
+                                # List literal of strings
+                                elif (isinstance(rhs, ast.List)
+                                        and rhs.elts
+                                        and all(isinstance(e, ast.Constant)
+                                                and isinstance(e.value, str)
+                                                for e in rhs.elts)):
+                                    ret_type = i8_ptr
+                                break
+                        if ret_type != i64:
+                            break
+                    # Check for `return cls(...)` inside classmethod — returns obj
+                    if (isinstance(n.value, ast.Call)
+                            and isinstance(n.value.func, ast.Name)
+                            and n.value.func.id == "cls"):
+                        ret_type = i8_ptr
+                        break
+                    # return self.<list_attr>[slice] — always a list
+                    if (isinstance(n.value, ast.Subscript)
+                            and isinstance(n.value.slice, ast.Slice)
+                            and isinstance(n.value.value, ast.Attribute)
+                            and isinstance(n.value.value.value, ast.Name)
+                            and n.value.value.value.id == "self"):
+                        attr = n.value.value.attr
+                        if attr in list_attrs or attr in string_attrs:
+                            ret_type = i8_ptr
+                            break
+                    # return self.<list_attr>[i] — subscript on list attr
+                    # Only safe when element type is "str" — other types
+                    # (list, dict, obj) need FV ABI which methods don't
+                    # use yet.
+                    if (isinstance(n.value, ast.Subscript)
+                            and isinstance(n.value.value, ast.Attribute)
+                            and isinstance(n.value.value.value, ast.Name)
+                            and n.value.value.value.id == "self"):
+                        attr = n.value.value.attr
+                        if attr in list_attrs:
+                            etype = list_attr_elem_types.get(attr)
+                            if etype == "str":
+                                ret_type = i8_ptr
+                                break
+                    # return str_method_call
+                    if (isinstance(n.value, ast.Call)
+                            and isinstance(n.value.func, ast.Attribute)
+                            and n.value.func.attr in (
+                                "upper", "lower", "strip", "lstrip",
+                                "rstrip", "replace", "join", "format")):
+                        ret_type = i8_ptr
+                        break
+                    # Bool-returning: Compare, Not, bool Constant,
+                    # BoolOp where all operands are bool-typed.
+                    if isinstance(n.value, ast.Compare):
+                        ret_type = i32
+                        break
+                    if (isinstance(n.value, ast.UnaryOp)
+                            and isinstance(n.value.op, ast.Not)):
+                        ret_type = i32
+                        break
+                    if (isinstance(n.value, ast.Constant)
+                            and isinstance(n.value.value, bool)):
+                        ret_type = i32
+                        break
+                    if isinstance(n.value, ast.BoolOp) and all(
+                            isinstance(v, ast.Compare)
+                            or (isinstance(v, ast.UnaryOp)
+                                and isinstance(v.op, ast.Not))
+                            or (isinstance(v, ast.Constant)
+                                and isinstance(v.value, bool))
+                            for v in n.value.values):
+                        ret_type = i32
+                        break
+                    # return int/len/str/float/bool(...) — explicit type wrapper
+                    if (isinstance(n.value, ast.Call)
+                            and isinstance(n.value.func, ast.Name)):
+                        if n.value.func.id in ("int", "len", "abs",
+                                                "ord", "round"):
+                            ret_type = i64
+                            break
+                        if n.value.func.id == "float":
+                            ret_type = double
+                            break
+                        if n.value.func.id in ("str", "list", "sorted",
+                                                "reversed", "dict"):
+                            ret_type = i8_ptr
+                            break
+                        if n.value.func.id in ("bool", "isinstance",
+                                                "any", "all"):
+                            ret_type = i32
+                            break
+                        # return ClassName(...) — user class constructor
+                        # (include the class currently being declared)
+                        if (n.value.func.id in self._user_classes
+                                or n.value.func.id == class_name):
+                            ret_type = i8_ptr
+                            break
+                    # return self.<attr> where attr type is known
+                    if (isinstance(n.value, ast.Attribute)
+                            and isinstance(n.value.value, ast.Name)
+                            and n.value.value.id == "self"):
+                        if n.value.attr in string_attrs:
+                            ret_type = i8_ptr
+                            break
+                        if n.value.attr in float_attrs:
+                            ret_type = double
+                            break
+                        if n.value.attr in bool_attrs:
+                            ret_type = i32
+                            break
+                        if n.value.attr in list_attrs or n.value.attr in dict_attrs:
+                            ret_type = i8_ptr
+                            break
+                    # return self.obj_attr.inner_attr — nested attr access
+                    if (isinstance(n.value, ast.Attribute)
+                            and isinstance(n.value.value, ast.Attribute)
+                            and isinstance(n.value.value.value, ast.Name)
+                            and n.value.value.value.id == "self"):
+                        outer_attr = n.value.value.attr  # self.outer
+                        inner_attr = n.value.attr  # .inner
+                        obj_types = self._class_obj_attr_types.get(class_name, {})
+                        if outer_attr in obj_types:
+                            inner_cls = obj_types[outer_attr]
+                            # Check attr type in the nested class
+                            if inner_attr in self._per_class_float_attrs.get(inner_cls, set()):
+                                ret_type = double
+                                break
+                            if inner_attr in self._per_class_string_attrs.get(inner_cls, set()):
+                                ret_type = i8_ptr
+                                break
+                            if inner_attr in self._per_class_bool_attrs.get(inner_cls, set()):
+                                ret_type = i32
+                                break
+                    # return self.dict_attr[key] — dict subscript on self's attr
+                    # Only safe for strings (where default subscript path
+                    # already returns a pointer; int/float need different
+                    # subscript handling that isn't yet implemented here).
+                    if (isinstance(n.value, ast.Subscript)
+                            and not isinstance(n.value.slice, ast.Slice)
+                            and isinstance(n.value.value, ast.Attribute)
+                            and isinstance(n.value.value.value, ast.Name)
+                            and n.value.value.value.id == "self"
+                            and n.value.value.attr in dict_attrs):
+                        dict_attr_name = n.value.value.attr
+                        vtype = self._infer_dict_attr_value_type(
+                            node, dict_attr_name)
+                        if vtype == "str":
+                            ret_type = i8_ptr
+                            break
+                    # return self.method() — inherit the method's
+                    # return type from the current class (or parent).
+                    # Check the class being built first (methods
+                    # defined earlier in the body), then walk the
+                    # parent chain via _user_classes.
+                    if (isinstance(n.value, ast.Call)
+                            and isinstance(n.value.func, ast.Attribute)
+                            and isinstance(n.value.func.value, ast.Name)
+                            and n.value.func.value.id == "self"):
+                        method_called = n.value.func.attr
+                        m_ret = None
+                        if method_called in methods:
+                            m_ret = methods[method_called].return_value.type
+                        else:
+                            cn_lookup = parent_name
+                            while cn_lookup and cn_lookup in self._user_classes:
+                                ci_lookup = self._user_classes[cn_lookup]
+                                if method_called in ci_lookup.methods:
+                                    m_ret = ci_lookup.methods[method_called].return_value.type
+                                    break
+                                cn_lookup = ci_lookup.parent_name
+                        if m_ret is not None and not isinstance(m_ret, ir.VoidType):
+                            ret_type = m_ret
+                            break
+                    # return self.obj_attr.method() — nested method call
+                    if (isinstance(n.value, ast.Call)
+                            and isinstance(n.value.func, ast.Attribute)
+                            and isinstance(n.value.func.value, ast.Attribute)
+                            and isinstance(n.value.func.value.value, ast.Name)
+                            and n.value.func.value.value.id == "self"):
+                        outer_attr = n.value.func.value.attr  # self.outer
+                        inner_method = n.value.func.attr  # .method (avoid shadow)
+                        obj_types = self._class_obj_attr_types.get(class_name, {})
+                        if outer_attr in obj_types:
+                            inner_cls = obj_types[outer_attr]
+                            inner_cls_info = self._user_classes.get(inner_cls)
+                            if inner_cls_info and inner_method in inner_cls_info.methods:
+                                inner_ret = inner_cls_info.methods[inner_method].return_value.type
+                                if not isinstance(inner_ret, ir.VoidType):
+                                    ret_type = inner_ret
+                                    break
+                    for sub in ast.walk(n.value):
+                        # Python's / (truediv) always returns float
+                        if isinstance(sub, ast.Div):
+                            ret_type = double
+                            break
+                        if isinstance(sub, ast.Constant) and isinstance(sub.value, float):
+                            ret_type = double
+                            break
+                        if isinstance(sub, ast.Constant) and isinstance(sub.value, str):
+                            ret_type = i8_ptr
+                            break
+                        # self.float_attr references
+                        if (isinstance(sub, ast.Attribute)
+                                and isinstance(sub.value, ast.Name)
+                                and sub.value.id == "self"
+                                and sub.attr in float_attrs):
+                            ret_type = double
+                            break
+                        # self.string_attr references
+                        if (isinstance(sub, ast.Attribute)
+                                and isinstance(sub.value, ast.Name)
+                                and sub.value.id == "self"
+                                and sub.attr in string_attrs):
+                            ret_type = i8_ptr
+                            break
+                        # Float params from call-site analysis
+                        if (isinstance(sub, ast.Name)
+                                and sub.id in float_method_params):
+                            ret_type = double
+                            break
+
+
+        return ret_type, init_arg_count, init_defaults
+
     def _declare_class(self, node: ast.ClassDef,
                        _sig_override: list | None = None,
                        _name_override: str | None = None) -> None:
@@ -9965,310 +10288,14 @@ class CodeGen:
                         float_method_params.add(params[pidx])
 
                 # Determine return type
-                has_return = any(
-                    isinstance(n, ast.Return) and n.value is not None
-                    for n in ast.walk(item)
-                )
-                # __init__ and __str__ have special return handling
-                if method_name == "__init__":
-                    ret_type = void
-                    init_arg_count = len(params) - 1  # exclude self
-                    init_defaults = list(item.args.defaults)
-                elif method_name in ("__str__", "__repr__"):
-                    ret_type = i8_ptr  # returns string
-                    param_types = [i8_ptr]  # just self
-                else:
-                    ret_type = i64 if has_return else void
-
-                # Check for string or float returns
-                if has_return and method_name not in ("__str__", "__repr__"):
-                    for n in ast.walk(item):
-                        if isinstance(n, ast.Return) and n.value is not None:
-                            # Check for string return
-                            if isinstance(n.value, (ast.Constant,)) and isinstance(getattr(n.value, 'value', None), str):
-                                ret_type = i8_ptr
-                                break
-                            if isinstance(n.value, (ast.JoinedStr,)):
-                                ret_type = i8_ptr
-                                break
-                            # Check for list / tuple / dict return
-                            if isinstance(n.value, (ast.List, ast.ListComp, ast.Tuple,
-                                                     ast.Dict, ast.DictComp)):
-                                ret_type = i8_ptr
-                                break
-                            # Check for `return self` (fluent chain) — returns obj
-                            if isinstance(n.value, ast.Name) and n.value.id == "self":
-                                ret_type = i8_ptr
-                                break
-                            # return local_var where local was assigned from
-                            # self.typed_attr (data flow within the method)
-                            if isinstance(n.value, ast.Name) and n.value.id != "self":
-                                var_name = n.value.id
-                                for s in ast.walk(item):
-                                    if (isinstance(s, ast.Assign)
-                                            and len(s.targets) == 1
-                                            and isinstance(s.targets[0], ast.Name)
-                                            and s.targets[0].id == var_name):
-                                        # self.attr source
-                                        if (isinstance(s.value, ast.Attribute)
-                                                and isinstance(s.value.value, ast.Name)
-                                                and s.value.value.id == "self"):
-                                            a = s.value.attr
-                                            if a in float_attrs:
-                                                ret_type = double
-                                            elif a in string_attrs:
-                                                ret_type = i8_ptr
-                                            elif a in bool_attrs:
-                                                ret_type = i32
-                                            break
-                                        # list/dict/tuple/set literal or
-                                        # comprehension source
-                                        if isinstance(s.value, (
-                                                ast.List, ast.ListComp,
-                                                ast.Tuple, ast.Dict,
-                                                ast.DictComp, ast.Set,
-                                                ast.SetComp)):
-                                            ret_type = i8_ptr
-                                            break
-                                if ret_type != i64:
-                                    break
-                            # return local_var[index] where local was assigned
-                            # from an expression returning list of strings
-                            if (isinstance(n.value, ast.Subscript)
-                                    and isinstance(n.value.value, ast.Name)):
-                                var_name = n.value.value.id
-                                for s in ast.walk(item):
-                                    if (isinstance(s, ast.Assign)
-                                            and len(s.targets) == 1
-                                            and isinstance(s.targets[0], ast.Name)
-                                            and s.targets[0].id == var_name):
-                                        rhs = s.value
-                                        # .split(), .keys(), .values(), .items()
-                                        # return list of strings
-                                        if (isinstance(rhs, ast.Call)
-                                                and isinstance(rhs.func, ast.Attribute)
-                                                and rhs.func.attr in (
-                                                    "split", "keys", "values",
-                                                    "items", "splitlines")):
-                                            ret_type = i8_ptr
-                                        # List literal of strings
-                                        elif (isinstance(rhs, ast.List)
-                                                and rhs.elts
-                                                and all(isinstance(e, ast.Constant)
-                                                        and isinstance(e.value, str)
-                                                        for e in rhs.elts)):
-                                            ret_type = i8_ptr
-                                        break
-                                if ret_type != i64:
-                                    break
-                            # Check for `return cls(...)` inside classmethod — returns obj
-                            if (isinstance(n.value, ast.Call)
-                                    and isinstance(n.value.func, ast.Name)
-                                    and n.value.func.id == "cls"):
-                                ret_type = i8_ptr
-                                break
-                            # return self.<list_attr>[slice] — always a list
-                            if (isinstance(n.value, ast.Subscript)
-                                    and isinstance(n.value.slice, ast.Slice)
-                                    and isinstance(n.value.value, ast.Attribute)
-                                    and isinstance(n.value.value.value, ast.Name)
-                                    and n.value.value.value.id == "self"):
-                                attr = n.value.value.attr
-                                if attr in list_attrs or attr in string_attrs:
-                                    ret_type = i8_ptr
-                                    break
-                            # return self.<list_attr>[i] — subscript on list attr
-                            # Only safe when element type is "str" — other types
-                            # (list, dict, obj) need FV ABI which methods don't
-                            # use yet.
-                            if (isinstance(n.value, ast.Subscript)
-                                    and isinstance(n.value.value, ast.Attribute)
-                                    and isinstance(n.value.value.value, ast.Name)
-                                    and n.value.value.value.id == "self"):
-                                attr = n.value.value.attr
-                                if attr in list_attrs:
-                                    etype = list_attr_elem_types.get(attr)
-                                    if etype == "str":
-                                        ret_type = i8_ptr
-                                        break
-                            # return str_method_call
-                            if (isinstance(n.value, ast.Call)
-                                    and isinstance(n.value.func, ast.Attribute)
-                                    and n.value.func.attr in (
-                                        "upper", "lower", "strip", "lstrip",
-                                        "rstrip", "replace", "join", "format")):
-                                ret_type = i8_ptr
-                                break
-                            # Bool-returning: Compare, Not, bool Constant,
-                            # BoolOp where all operands are bool-typed.
-                            if isinstance(n.value, ast.Compare):
-                                ret_type = i32
-                                break
-                            if (isinstance(n.value, ast.UnaryOp)
-                                    and isinstance(n.value.op, ast.Not)):
-                                ret_type = i32
-                                break
-                            if (isinstance(n.value, ast.Constant)
-                                    and isinstance(n.value.value, bool)):
-                                ret_type = i32
-                                break
-                            if isinstance(n.value, ast.BoolOp) and all(
-                                    isinstance(v, ast.Compare)
-                                    or (isinstance(v, ast.UnaryOp)
-                                        and isinstance(v.op, ast.Not))
-                                    or (isinstance(v, ast.Constant)
-                                        and isinstance(v.value, bool))
-                                    for v in n.value.values):
-                                ret_type = i32
-                                break
-                            # return int/len/str/float/bool(...) — explicit type wrapper
-                            if (isinstance(n.value, ast.Call)
-                                    and isinstance(n.value.func, ast.Name)):
-                                if n.value.func.id in ("int", "len", "abs",
-                                                        "ord", "round"):
-                                    ret_type = i64
-                                    break
-                                if n.value.func.id == "float":
-                                    ret_type = double
-                                    break
-                                if n.value.func.id in ("str", "list", "sorted",
-                                                        "reversed", "dict"):
-                                    ret_type = i8_ptr
-                                    break
-                                if n.value.func.id in ("bool", "isinstance",
-                                                        "any", "all"):
-                                    ret_type = i32
-                                    break
-                                # return ClassName(...) — user class constructor
-                                # (include the class currently being declared)
-                                if (n.value.func.id in self._user_classes
-                                        or n.value.func.id == class_name):
-                                    ret_type = i8_ptr
-                                    break
-                            # return self.<attr> where attr type is known
-                            if (isinstance(n.value, ast.Attribute)
-                                    and isinstance(n.value.value, ast.Name)
-                                    and n.value.value.id == "self"):
-                                if n.value.attr in string_attrs:
-                                    ret_type = i8_ptr
-                                    break
-                                if n.value.attr in float_attrs:
-                                    ret_type = double
-                                    break
-                                if n.value.attr in bool_attrs:
-                                    ret_type = i32
-                                    break
-                                if n.value.attr in list_attrs or n.value.attr in dict_attrs:
-                                    ret_type = i8_ptr
-                                    break
-                            # return self.obj_attr.inner_attr — nested attr access
-                            if (isinstance(n.value, ast.Attribute)
-                                    and isinstance(n.value.value, ast.Attribute)
-                                    and isinstance(n.value.value.value, ast.Name)
-                                    and n.value.value.value.id == "self"):
-                                outer_attr = n.value.value.attr  # self.outer
-                                inner_attr = n.value.attr  # .inner
-                                obj_types = self._class_obj_attr_types.get(class_name, {})
-                                if outer_attr in obj_types:
-                                    inner_cls = obj_types[outer_attr]
-                                    # Check attr type in the nested class
-                                    if inner_attr in self._per_class_float_attrs.get(inner_cls, set()):
-                                        ret_type = double
-                                        break
-                                    if inner_attr in self._per_class_string_attrs.get(inner_cls, set()):
-                                        ret_type = i8_ptr
-                                        break
-                                    if inner_attr in self._per_class_bool_attrs.get(inner_cls, set()):
-                                        ret_type = i32
-                                        break
-                            # return self.dict_attr[key] — dict subscript on self's attr
-                            # Only safe for strings (where default subscript path
-                            # already returns a pointer; int/float need different
-                            # subscript handling that isn't yet implemented here).
-                            if (isinstance(n.value, ast.Subscript)
-                                    and not isinstance(n.value.slice, ast.Slice)
-                                    and isinstance(n.value.value, ast.Attribute)
-                                    and isinstance(n.value.value.value, ast.Name)
-                                    and n.value.value.value.id == "self"
-                                    and n.value.value.attr in dict_attrs):
-                                dict_attr_name = n.value.value.attr
-                                vtype = self._infer_dict_attr_value_type(
-                                    node, dict_attr_name)
-                                if vtype == "str":
-                                    ret_type = i8_ptr
-                                    break
-                            # return self.method() — inherit the method's
-                            # return type from the current class (or parent).
-                            # Check the class being built first (methods
-                            # defined earlier in the body), then walk the
-                            # parent chain via _user_classes.
-                            if (isinstance(n.value, ast.Call)
-                                    and isinstance(n.value.func, ast.Attribute)
-                                    and isinstance(n.value.func.value, ast.Name)
-                                    and n.value.func.value.id == "self"):
-                                method_called = n.value.func.attr
-                                m_ret = None
-                                if method_called in methods:
-                                    m_ret = methods[method_called].return_value.type
-                                else:
-                                    cn_lookup = parent_name
-                                    while cn_lookup and cn_lookup in self._user_classes:
-                                        ci_lookup = self._user_classes[cn_lookup]
-                                        if method_called in ci_lookup.methods:
-                                            m_ret = ci_lookup.methods[method_called].return_value.type
-                                            break
-                                        cn_lookup = ci_lookup.parent_name
-                                if m_ret is not None and not isinstance(m_ret, ir.VoidType):
-                                    ret_type = m_ret
-                                    break
-                            # return self.obj_attr.method() — nested method call
-                            if (isinstance(n.value, ast.Call)
-                                    and isinstance(n.value.func, ast.Attribute)
-                                    and isinstance(n.value.func.value, ast.Attribute)
-                                    and isinstance(n.value.func.value.value, ast.Name)
-                                    and n.value.func.value.value.id == "self"):
-                                outer_attr = n.value.func.value.attr  # self.outer
-                                inner_method = n.value.func.attr  # .method (avoid shadow)
-                                obj_types = self._class_obj_attr_types.get(class_name, {})
-                                if outer_attr in obj_types:
-                                    inner_cls = obj_types[outer_attr]
-                                    inner_cls_info = self._user_classes.get(inner_cls)
-                                    if inner_cls_info and inner_method in inner_cls_info.methods:
-                                        inner_ret = inner_cls_info.methods[inner_method].return_value.type
-                                        if not isinstance(inner_ret, ir.VoidType):
-                                            ret_type = inner_ret
-                                            break
-                            for sub in ast.walk(n.value):
-                                # Python's / (truediv) always returns float
-                                if isinstance(sub, ast.Div):
-                                    ret_type = double
-                                    break
-                                if isinstance(sub, ast.Constant) and isinstance(sub.value, float):
-                                    ret_type = double
-                                    break
-                                if isinstance(sub, ast.Constant) and isinstance(sub.value, str):
-                                    ret_type = i8_ptr
-                                    break
-                                # self.float_attr references
-                                if (isinstance(sub, ast.Attribute)
-                                        and isinstance(sub.value, ast.Name)
-                                        and sub.value.id == "self"
-                                        and sub.attr in float_attrs):
-                                    ret_type = double
-                                    break
-                                # self.string_attr references
-                                if (isinstance(sub, ast.Attribute)
-                                        and isinstance(sub.value, ast.Name)
-                                        and sub.value.id == "self"
-                                        and sub.attr in string_attrs):
-                                    ret_type = i8_ptr
-                                    break
-                                # Float params from call-site analysis
-                                if (isinstance(sub, ast.Name)
-                                        and sub.id in float_method_params):
-                                    ret_type = double
-                                    break
-
+                ret_type, _init_argc, _init_defs = self._dcl_detect_method_ret_type(
+                    item, method_name, class_name, parent_name,
+                    float_attrs, string_attrs, bool_attrs,
+                    list_attrs, dict_attrs, list_attr_elem_types,
+                    float_method_params, methods, params)
+                if _init_argc is not None:
+                    init_arg_count = _init_argc
+                    init_defaults = _init_defs
                 func_type = ir.FunctionType(ret_type, param_types)
                 fn_name = f"fastpy.class.{class_name}.{method_name}"
                 func = ir.Function(self.module, func_type, name=fn_name)
