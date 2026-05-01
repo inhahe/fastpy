@@ -11823,12 +11823,11 @@ class CodeGen:
             _bm_is_native = False
             if _bm_obj in self.variables:
                 _bm_kind = self._var_kind(_bm_obj)
-                _bm_tag = str(self.variables[_bm_obj][1])
-                if (_bm_kind == VKind.LIST or _bm_tag.startswith("list")):
+                if _bm_kind == VKind.LIST:
                     _bm_is_native = _bm_method in _NATIVE_LIST_METHODS
-                elif (_bm_kind == VKind.DICT or _bm_tag.startswith("dict")):
+                elif _bm_kind == VKind.DICT:
                     _bm_is_native = _bm_method in _NATIVE_DICT_METHODS
-                elif (_bm_kind == VKind.STR or _bm_tag == "str"):
+                elif _bm_kind == VKind.STR:
                     _bm_is_native = _bm_method in _NATIVE_STR_METHODS
             if _bm_is_native:
                 self._bound_method_aliases[node.targets[0].id] = (
@@ -13686,17 +13685,17 @@ class CodeGen:
                     if var_tag.kind not in (VKind.UNKNOWN, VKind.FVALUE):
                         return var_tag._to_tag()
                 else:
-                    # Legacy string tag (shouldn't happen after Phase 3, but safe)
-                    if var_tag in ("obj", "bool", "float", "str", "dict", "tuple",
-                                    "none", "complex", "counter", "defaultdict",
-                                    "deque", "chainmap", "namedtuple_type", "logger",
-                                    "path", "decimal", "set", "bigint", "pyobj",
-                                    "closure", "native_mod", "unknown", "mixed"):
+                    # Legacy string tag — convert to VKind but return the
+                    # original string to preserve aliases (counter, deque).
+                    # Exclude "int" (default assumption, falls through to
+                    # AST inference) and "cell" tags.
+                    _vt = ValueType.from_old_tag(var_tag)
+                    if (_vt.kind not in (VKind.INT, VKind.UNKNOWN, VKind.FVALUE)
+                            or var_tag.startswith("list")
+                            or var_tag.startswith("dict:")
+                            or var_tag in ("namedtuple_type", "unknown",
+                                           "mixed")):
                         return var_tag
-                    if var_tag.startswith("list"):
-                        return var_tag
-                    if var_tag.startswith("dict:"):
-                        return "dict"
         if isinstance(node, (ast.List, ast.ListComp, ast.GeneratorExp)):
             elem_type = self._infer_list_elem_type(node)
             return f"list:{elem_type}"
@@ -14994,8 +14993,8 @@ class CodeGen:
                 return
 
         if isinstance(current.type, ir.PointerType) and isinstance(node.op, ast.Mult):
-            _, tag = self.variables.get(target_name, (None, ""))
-            if tag.startswith("list"):
+            if self._var_kind(target_name) == VKind.LIST:
+                _, tag = self.variables[target_name]
                 result = self._rt_call("list_repeat", [current, rhs])
                 self._store_variable(target_name, result, tag)
                 return
@@ -15540,14 +15539,9 @@ class CodeGen:
                     # Container annotations: list[int], dict[str, int], etc.
                     container_tag = self._parse_container_annotation(stmt.annotation)
                     if container_tag is not None:
-                        if container_tag.startswith("list"):
-                            annotated[stmt.target.id] = VKind.LIST
-                        elif container_tag.startswith("dict"):
-                            annotated[stmt.target.id] = VKind.DICT
-                        elif container_tag.startswith("set"):
-                            annotated[stmt.target.id] = VKind.SET
-                        elif container_tag.startswith("tuple"):
-                            annotated[stmt.target.id] = VKind.TUPLE
+                        _ck = ValueType.from_old_tag(container_tag).kind
+                        if _ck in (VKind.LIST, VKind.DICT, VKind.SET, VKind.TUPLE):
+                            annotated[stmt.target.id] = _ck
 
         if not annotated:
             return set()
