@@ -5409,16 +5409,49 @@ void fastpy_set_vtable_entry(int class_id, int slot, void *func) {
     cls->vtable[slot] = func;
 }
 
-/* Fast O(1) vtable dispatch — returns the function pointer for the
- * given slot on the object's class. Falls back to parent chain. */
-void* fastpy_vtable_lookup(FpyObj *obj, int slot) {
-    int cid = obj->class_id;
-    while (cid >= 0) {
-        FpyClassDef *cls = &fpy_classes[cid];
-        if (cls->vtable && slot < cls->vtable_size && cls->vtable[slot])
-            return cls->vtable[slot];
-        cid = cls->parent_id;
+/* Copy parent's vtable entries into child class.  Must be called AFTER
+ * all of the child's own methods have been registered via set_vtable_entry
+ * so that overrides are already in place.  Parent entries fill only NULL
+ * slots, so child overrides are preserved.
+ *
+ * Requires classes to be registered in dependency order (parent before
+ * child).  Multi-level inheritance works because the parent's vtable
+ * already contains its ancestors' entries by the time we copy. */
+void fastpy_inherit_parent_vtable(int class_id) {
+    FpyClassDef *cls = &fpy_classes[class_id];
+    int pid = cls->parent_id;
+    if (pid < 0) return;
+    FpyClassDef *parent = &fpy_classes[pid];
+    if (!parent->vtable || parent->vtable_size == 0) return;
+
+    /* Ensure child vtable is at least as large as parent's. */
+    if (!cls->vtable) {
+        cls->vtable_size = parent->vtable_size;
+        cls->vtable = (void**)calloc(cls->vtable_size, sizeof(void*));
+    } else if (cls->vtable_size < parent->vtable_size) {
+        int old_size = cls->vtable_size;
+        cls->vtable_size = parent->vtable_size;
+        cls->vtable = (void**)realloc(cls->vtable,
+                                       cls->vtable_size * sizeof(void*));
+        for (int i = old_size; i < cls->vtable_size; i++)
+            cls->vtable[i] = NULL;
     }
+
+    /* Fill NULL slots with parent's entries (child overrides stay). */
+    for (int i = 0; i < parent->vtable_size; i++) {
+        if (!cls->vtable[i] && parent->vtable[i])
+            cls->vtable[i] = parent->vtable[i];
+    }
+}
+
+/* O(1) vtable dispatch — returns the function pointer for the given slot
+ * on the object's class.  After fastpy_inherit_parent_vtable() has been
+ * called for every class, all inherited methods are already in the child's
+ * vtable, so no parent-chain walk is needed. */
+void* fastpy_vtable_lookup(FpyObj *obj, int slot) {
+    FpyClassDef *cls = &fpy_classes[obj->class_id];
+    if (cls->vtable && slot < cls->vtable_size)
+        return cls->vtable[slot];
     return NULL;
 }
 
