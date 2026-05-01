@@ -2931,6 +2931,196 @@ class CodeGen:
                             self._singledispatch[base_name][type_name] = mangled
                             self._singledispatch_variants[mangled] = node
 
+    def _gen_apply_decorators(self, tree: ast.Module) -> None:
+        """Apply decorators to top-level functions.
+
+        @deco def f(...) becomes f = deco(f).  For @deco(args), this is
+        f = deco(args)(f).  Python applies decorators bottom-up:
+        @d1 @d2 def f => f = d1(d2(f)), so we iterate in REVERSE order.
+        """
+        _SKIP_DECORATOR_NAMES = frozenset((
+            "staticmethod", "classmethod", "property",
+            "lru_cache", "contextmanager", "abstractmethod", "wraps",
+        ))
+        for node in tree.body:
+            if (isinstance(node, ast.FunctionDef)
+                    and node.decorator_list
+                    and node.name in self._user_functions):
+                # Filter out built-in decorators that are handled elsewhere
+                active_decos = []
+                for deco in node.decorator_list:
+                    if isinstance(deco, ast.Name) and deco.id in _SKIP_DECORATOR_NAMES:
+                        continue
+                    if isinstance(deco, ast.Attribute):
+                        continue  # @x.setter etc — handled by class
+                    if (isinstance(deco, ast.Call)
+                            and isinstance(deco.func, ast.Name)
+                            and deco.func.id in _SKIP_DECORATOR_NAMES):
+                        continue
+                    active_decos.append(deco)
+                if not active_decos:
+                    continue
+
+                info = self._user_functions[node.name]
+                # Start with the original function's pointer (i64).
+                if info.uses_fv_abi:
+                    wrapper = self._get_or_emit_i64_wrapper(info)
+                    func_ptr = self.builder.ptrtoint(wrapper, i64)
+                else:
+                    func_ptr = self.builder.ptrtoint(info.func, i64)
+
+                # Apply decorators bottom-up (reverse order)
+                for deco in reversed(active_decos):
+                    # @deco — simple decorator: func_ptr = deco(func_ptr)
+                    if isinstance(deco, ast.Name) and deco.id in self._user_functions:
+                        deco_info = self._user_functions[deco.id]
+                        if deco_info.uses_fv_abi:
+                            fv = self._fv_from_int(func_ptr)
+                            result = self.builder.call(deco_info.func, [fv])
+                            # Result is FpyValue — extract data as new func_ptr
+                            func_ptr = self.builder.extract_value(result, 1)
+                        else:
+                            func_ptr = self.builder.call(deco_info.func, [func_ptr])
+
+                    # @deco — closure/variable decorator
+                    elif (isinstance(deco, ast.Name)
+                          and deco.id in self.variables
+                          and self._var_kind(deco.id) == VKind.CLOSURE):
+                        deco_val = self._emit_expr_value(deco)
+                        deco_val = self._ensure_ptr(deco_val)
+                        func_ptr = self.builder.call(
+                            self.runtime["call_ptr1"], [deco_val, func_ptr])
+
+                    # @deco(args) — decorator with args: func_ptr = deco(args)(func_ptr)
+                    elif isinstance(deco, ast.Call):
+                        actual_deco = self._emit_expr_value(deco)
+                        actual_deco = self._ensure_ptr(actual_deco)
+                        func_ptr = self.builder.call(
+                            self.runtime["call_ptr1"],
+                            [actual_deco, func_ptr])
+
+                # Store the final decorated result
+                if isinstance(func_ptr.type, ir.PointerType):
+                    self._store_variable(node.name, func_ptr, "closure")
+                else:
+                    self._store_variable(
+                        node.name,
+                        self.builder.inttoptr(func_ptr, i8_ptr), "closure")
+
+    def _gen_compile_cpython(self, tree: ast.Module) -> None:
+        """Compile CPython-bridge generators, classes, and function groups.
+
+        Uses exec_get to compile source through CPython and store the
+        resulting objects as pyobj variables.
+        """
+        # Compile CPython generators: functions marked as needing CPython's
+        # coroutine support get compiled via exec_get and stored as pyobj.
+        for node in tree.body:
+            if (isinstance(node, ast.FunctionDef)
+                    and node.name in getattr(self, '_cpython_generators', set())):
+                self._emit_cpython_generator(node, node.name)
+
+        # Compile CPython classes (dataclasses etc.) via exec_get
+        for node in tree.body:
+            if (isinstance(node, ast.ClassDef)
+                    and node.name in getattr(self, '_cpython_classes', set())):
+                # Collect all imports + the class definition as source
+                imports = []
+                for imp in tree.body:
+                    if isinstance(imp, (ast.Import, ast.ImportFrom)):
+                        imports.append(ast.unparse(imp))
+                class_src = ast.unparse(ast.Module(body=[node], type_ignores=[]))
+                full_src = "\n".join(imports) + "\n" + class_src
+                source_ptr = self._make_string_constant(full_src)
+                name_ptr = self._make_string_constant(node.name)
+                cls_ptr = self.builder.call(
+                    self.runtime["cpython_exec_get"], [source_ptr, name_ptr])
+                self._store_variable(node.name, cls_ptr, "pyobj")
+
+        # Compile CPython-bridge function groups (e.g. dataclasses) via exec_get.
+        if self._cpython_functions:
+            sd_blocks: dict[str, list[ast.stmt]] = {}
+            for node in tree.body:
+                if isinstance(node, ast.FunctionDef) and node.name in self._cpython_functions:
+                    for deco in node.decorator_list:
+                        if isinstance(deco, ast.Name) and deco.id not in ("singledispatch",):
+                            sd_blocks.setdefault(node.name, []).append(node)
+                        elif (isinstance(deco, ast.Call)
+                                and isinstance(deco.func, ast.Attribute)
+                                and deco.func.attr == "register"
+                                and isinstance(deco.func.value, ast.Name)):
+                            sd_blocks.setdefault(deco.func.value.id, []).append(node)
+
+            for base_name, func_nodes in sd_blocks.items():
+                imports = []
+                for imp in tree.body:
+                    if isinstance(imp, (ast.Import, ast.ImportFrom)):
+                        imports.append(ast.unparse(imp))
+                funcs_src = "\n".join(
+                    ast.unparse(ast.Module(body=[fn], type_ignores=[]))
+                    for fn in func_nodes)
+                full_src = "\n".join(imports) + "\n" + funcs_src
+                source_ptr = self._make_string_constant(full_src)
+                name_ptr = self._make_string_constant(base_name)
+                func_ptr = self.builder.call(
+                    self.runtime["cpython_exec_get"], [source_ptr, name_ptr])
+                self._store_variable(base_name, func_ptr, "pyobj")
+
+    def _gen_detect_bare_abi(self, tree: ast.Module) -> None:
+        """Determine if module-level code can use bare-ABI mode.
+
+        When True: plain arithmetic (no BigInt), no shadow stack, no
+        line tracking -- lets LLVM optimize module-level tight loops
+        at C++ speed.  Disabled when module-level code uses OOP features,
+        exception handling, or imports.
+        """
+        _main_stmts = [n for n in tree.body
+                       if not isinstance(n, (ast.FunctionDef, ast.ClassDef))]
+        _has_classes = any(isinstance(n, ast.ClassDef) for n in tree.body)
+        _main_has_complex = _has_classes or any(
+            isinstance(n, (ast.List, ast.Dict, ast.Set, ast.ListComp,
+                           ast.DictComp, ast.SetComp, ast.Subscript,
+                           ast.Attribute, ast.JoinedStr, ast.Try,
+                           ast.Raise, ast.Import, ast.ImportFrom,
+                           ast.Tuple))
+            or (isinstance(n, ast.Constant) and isinstance(n.value, str))
+            for stmt in _main_stmts
+            for n in ast.walk(stmt)
+        )
+        self._current_fn_bare_abi = not _main_has_complex
+
+        if _main_has_complex and self._analyze_mode:
+            from compiler.analysis import HIGH, IMPACT_BARE_ABI_MODULE
+            # Identify what specifically disabled bare-ABI
+            _COMPLEX_NAMES = {
+                ast.List: "list literal", ast.Dict: "dict literal",
+                ast.Set: "set literal", ast.ListComp: "list comprehension",
+                ast.DictComp: "dict comprehension",
+                ast.SetComp: "set comprehension",
+                ast.Subscript: "subscript access", ast.Attribute: "attribute access",
+                ast.JoinedStr: "f-string", ast.Try: "try/except",
+                ast.Raise: "raise", ast.Import: "import",
+                ast.ImportFrom: "import", ast.Tuple: "tuple literal",
+            }
+            blockers = set()
+            if _has_classes:
+                blockers.add("class definition")
+            for stmt in _main_stmts:
+                for n in ast.walk(stmt):
+                    if type(n) in _COMPLEX_NAMES:
+                        blockers.add(_COMPLEX_NAMES[type(n)])
+                    elif isinstance(n, ast.Constant) and isinstance(n.value, str):
+                        blockers.add("string constant")
+            self._record_finding(
+                HIGH, "bare_abi_disabled", None,
+                construct=", ".join(sorted(blockers)),
+                missed="Module-level bare-ABI mode",
+                reason=f"Module code uses: {', '.join(sorted(blockers))}",
+                impact=IMPACT_BARE_ABI_MODULE,
+                suggestion="Move complex operations into functions; keep "
+                           "module-level code as simple scalar arithmetic",
+            )
+
     def generate(self, tree: ast.Module) -> str:
         """Generate LLVM IR from a Python AST. Returns IR as string."""
         self._gen_prescan(tree)
@@ -3127,186 +3317,11 @@ class CodeGen:
                     and node.targets[0].attr in ("stdout", "stderr", "stdin")):
                 self._sys_reassigned_attrs.add(node.targets[0].attr)
 
-        # Apply decorators to top-level functions: @deco def f(...) → f = deco(f)
-        # For @deco(args), this is f = deco(args)(f) — two-step application.
-        # Python applies decorators bottom-up: @d1 @d2 def f ⇒ f = d1(d2(f)).
-        # So we iterate the decorator_list in REVERSE order and chain the
-        # results: each decorator receives the previous decorator's output.
-        _SKIP_DECORATOR_NAMES = frozenset((
-            "staticmethod", "classmethod", "property",
-            "lru_cache", "contextmanager", "abstractmethod", "wraps",
-        ))
-        for node in tree.body:
-            if (isinstance(node, ast.FunctionDef)
-                    and node.decorator_list
-                    and node.name in self._user_functions):
-                # Filter out built-in decorators that are handled elsewhere
-                active_decos = []
-                for deco in node.decorator_list:
-                    if isinstance(deco, ast.Name) and deco.id in _SKIP_DECORATOR_NAMES:
-                        continue
-                    if isinstance(deco, ast.Attribute):
-                        continue  # @x.setter etc — handled by class
-                    if (isinstance(deco, ast.Call)
-                            and isinstance(deco.func, ast.Name)
-                            and deco.func.id in _SKIP_DECORATOR_NAMES):
-                        continue
-                    active_decos.append(deco)
-                if not active_decos:
-                    continue
+        self._gen_apply_decorators(tree)
 
-                info = self._user_functions[node.name]
-                # Start with the original function's pointer (i64).
-                if info.uses_fv_abi:
-                    wrapper = self._get_or_emit_i64_wrapper(info)
-                    func_ptr = self.builder.ptrtoint(wrapper, i64)
-                else:
-                    func_ptr = self.builder.ptrtoint(info.func, i64)
+        self._gen_compile_cpython(tree)
 
-                # Apply decorators bottom-up (reverse order)
-                for deco in reversed(active_decos):
-                    # @deco — simple decorator: func_ptr = deco(func_ptr)
-                    if isinstance(deco, ast.Name) and deco.id in self._user_functions:
-                        deco_info = self._user_functions[deco.id]
-                        if deco_info.uses_fv_abi:
-                            fv = self._fv_from_int(func_ptr)
-                            result = self.builder.call(deco_info.func, [fv])
-                            # Result is FpyValue — extract data as new func_ptr
-                            func_ptr = self.builder.extract_value(result, 1)
-                        else:
-                            func_ptr = self.builder.call(deco_info.func, [func_ptr])
-
-                    # @deco — closure/variable decorator
-                    elif (isinstance(deco, ast.Name)
-                          and deco.id in self.variables
-                          and self._var_kind(deco.id) == VKind.CLOSURE):
-                        deco_val = self._emit_expr_value(deco)
-                        deco_val = self._ensure_ptr(deco_val)
-                        func_ptr = self.builder.call(
-                            self.runtime["call_ptr1"], [deco_val, func_ptr])
-
-                    # @deco(args) — decorator with args: func_ptr = deco(args)(func_ptr)
-                    elif isinstance(deco, ast.Call):
-                        actual_deco = self._emit_expr_value(deco)
-                        actual_deco = self._ensure_ptr(actual_deco)
-                        func_ptr = self.builder.call(
-                            self.runtime["call_ptr1"],
-                            [actual_deco, func_ptr])
-
-                # Store the final decorated result
-                if isinstance(func_ptr.type, ir.PointerType):
-                    self._store_variable(node.name, func_ptr, "closure")
-                else:
-                    self._store_variable(
-                        node.name,
-                        self.builder.inttoptr(func_ptr, i8_ptr), "closure")
-
-        # Compile CPython generators: functions marked as needing CPython's
-        # coroutine support get compiled via exec_get and stored as pyobj.
-        for node in tree.body:
-            if (isinstance(node, ast.FunctionDef)
-                    and node.name in getattr(self, '_cpython_generators', set())):
-                self._emit_cpython_generator(node, node.name)
-
-        # Compile CPython classes (dataclasses etc.) via exec_get
-        for node in tree.body:
-            if (isinstance(node, ast.ClassDef)
-                    and node.name in getattr(self, '_cpython_classes', set())):
-                # Collect all imports + the class definition as source
-                imports = []
-                for imp in tree.body:
-                    if isinstance(imp, (ast.Import, ast.ImportFrom)):
-                        imports.append(ast.unparse(imp))
-                class_src = ast.unparse(ast.Module(body=[node], type_ignores=[]))
-                full_src = "\n".join(imports) + "\n" + class_src
-                source_ptr = self._make_string_constant(full_src)
-                name_ptr = self._make_string_constant(node.name)
-                cls_ptr = self.builder.call(
-                    self.runtime["cpython_exec_get"], [source_ptr, name_ptr])
-                self._store_variable(node.name, cls_ptr, "pyobj")
-
-        # Compile CPython-bridge function groups (e.g. dataclasses) via exec_get.
-        if self._cpython_functions:
-            sd_blocks: dict[str, list[ast.stmt]] = {}
-            for node in tree.body:
-                if isinstance(node, ast.FunctionDef) and node.name in self._cpython_functions:
-                    for deco in node.decorator_list:
-                        if isinstance(deco, ast.Name) and deco.id not in ("singledispatch",):
-                            sd_blocks.setdefault(node.name, []).append(node)
-                        elif (isinstance(deco, ast.Call)
-                                and isinstance(deco.func, ast.Attribute)
-                                and deco.func.attr == "register"
-                                and isinstance(deco.func.value, ast.Name)):
-                            sd_blocks.setdefault(deco.func.value.id, []).append(node)
-
-            for base_name, func_nodes in sd_blocks.items():
-                imports = []
-                for imp in tree.body:
-                    if isinstance(imp, (ast.Import, ast.ImportFrom)):
-                        imports.append(ast.unparse(imp))
-                funcs_src = "\n".join(
-                    ast.unparse(ast.Module(body=[fn], type_ignores=[]))
-                    for fn in func_nodes)
-                full_src = "\n".join(imports) + "\n" + funcs_src
-                source_ptr = self._make_string_constant(full_src)
-                name_ptr = self._make_string_constant(base_name)
-                func_ptr = self.builder.call(
-                    self.runtime["cpython_exec_get"], [source_ptr, name_ptr])
-                self._store_variable(base_name, func_ptr, "pyobj")
-
-        # Determine if module-level code can use bare-ABI mode.
-        # When True: plain arithmetic (no BigInt), no shadow stack, no
-        # line tracking — lets LLVM optimize module-level tight loops
-        # at C++ speed.  Safe because module-level vars are globals.
-        # Disabled when module-level code uses OOP features (attr access,
-        # subscript), exception handling, or imports — these interact
-        # with FpyValue tags and shadow stack in ways bare-ABI can't handle.
-        _main_stmts = [n for n in tree.body
-                       if not isinstance(n, (ast.FunctionDef, ast.ClassDef))]
-        _has_classes = any(isinstance(n, ast.ClassDef) for n in tree.body)
-        _main_has_complex = _has_classes or any(
-            isinstance(n, (ast.List, ast.Dict, ast.Set, ast.ListComp,
-                           ast.DictComp, ast.SetComp, ast.Subscript,
-                           ast.Attribute, ast.JoinedStr, ast.Try,
-                           ast.Raise, ast.Import, ast.ImportFrom,
-                           ast.Tuple))
-            or (isinstance(n, ast.Constant) and isinstance(n.value, str))
-            for stmt in _main_stmts
-            for n in ast.walk(stmt)
-        )
-        self._current_fn_bare_abi = not _main_has_complex
-
-        if _main_has_complex and self._analyze_mode:
-            from compiler.analysis import HIGH, IMPACT_BARE_ABI_MODULE
-            # Identify what specifically disabled bare-ABI
-            _COMPLEX_NAMES = {
-                ast.List: "list literal", ast.Dict: "dict literal",
-                ast.Set: "set literal", ast.ListComp: "list comprehension",
-                ast.DictComp: "dict comprehension",
-                ast.SetComp: "set comprehension",
-                ast.Subscript: "subscript access", ast.Attribute: "attribute access",
-                ast.JoinedStr: "f-string", ast.Try: "try/except",
-                ast.Raise: "raise", ast.Import: "import",
-                ast.ImportFrom: "import", ast.Tuple: "tuple literal",
-            }
-            blockers = set()
-            if _has_classes:
-                blockers.add("class definition")
-            for stmt in _main_stmts:
-                for n in ast.walk(stmt):
-                    if type(n) in _COMPLEX_NAMES:
-                        blockers.add(_COMPLEX_NAMES[type(n)])
-                    elif isinstance(n, ast.Constant) and isinstance(n.value, str):
-                        blockers.add("string constant")
-            self._record_finding(
-                HIGH, "bare_abi_disabled", None,
-                construct=", ".join(sorted(blockers)),
-                missed="Module-level bare-ABI mode",
-                reason=f"Module code uses: {', '.join(sorted(blockers))}",
-                impact=IMPACT_BARE_ABI_MODULE,
-                suggestion="Move complex operations into functions; keep "
-                           "module-level code as simple scalar arithmetic",
-            )
+        self._gen_detect_bare_abi(tree)
 
         # Push shadow frame for module-level code (skip for bare-ABI main)
         if not self._current_fn_bare_abi:
