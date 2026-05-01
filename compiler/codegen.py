@@ -12940,7 +12940,7 @@ class CodeGen:
         elif (isinstance(node.value, ast.Name)
               and self._current_class is not None
               and node.value.id in self.variables
-              and self.variables[node.value.id][1] == "cls"):
+              and self._tag_kind(self.variables[node.value.id][1]) == VKind.CLS):
             attr_class_name = self._current_class
         if attr_class_name is not None:
             class_name = attr_class_name
@@ -13242,7 +13242,7 @@ class CodeGen:
         for var_name, (alloca, tag) in self.variables.items():
             if var_name in self._global_vars:
                 continue
-            if tag == "cell":
+            if self._tag_kind(tag) == VKind.CELL:
                 continue
             key = self._make_string_constant(var_name)
             if (self._USE_FV_LOCALS
@@ -13773,7 +13773,7 @@ class CodeGen:
         elif (isinstance(target.value, ast.Name)
               and self._current_class is not None
               and target.value.id in self.variables
-              and self.variables[target.value.id][1] == "cls"):
+              and self._tag_kind(self.variables[target.value.id][1]) == VKind.CLS):
             attr_class_name = self._current_class
         if attr_class_name is not None:
             class_name = attr_class_name
@@ -15700,9 +15700,8 @@ class CodeGen:
         # Closure cell: unchanged — stored via cell_set
         elif name in self.variables:
             alloca, old_tag = self.variables[name]
-            # "cell" is a special storage tag for closure cells, not a type.
-            # Works for both string "cell" and ValueType via __eq__ compat.
-            if old_tag == "cell":
+            # CELL is a special storage kind for closure cells, not a value type.
+            if self._tag_kind(old_tag) == VKind.CELL:
                 cell_ptr = self.builder.load(alloca)
                 self.builder.call(self.runtime["cell_set"], [cell_ptr, value])
                 return
@@ -16278,7 +16277,7 @@ class CodeGen:
                         self.builder.call(self.runtime["exc_unhandled"], [])
                     return ir.Constant(i64, 0)
         alloca, type_tag = self.variables[name]
-        if type_tag == "cell":
+        if self._tag_kind(type_tag) == VKind.CELL:
             # Mutable closure variable — load cell pointer, then get value
             cell_ptr = self.builder.load(alloca, name=f"{name}.cell")
             return self.builder.call(self.runtime["cell_get"], [cell_ptr])
@@ -19028,7 +19027,7 @@ class CodeGen:
                 continue
             if var_name in param_names:
                 continue  # borrowed reference from caller
-            if tag == "cell":
+            if self._tag_kind(tag) == VKind.CELL:
                 continue  # cells are managed separately
             if var_name in self._global_vars:
                 continue  # globals outlive the function
@@ -20658,7 +20657,7 @@ class CodeGen:
             elif (isinstance(other.value, ast.Name)
                   and self._current_class is not None
                   and other.value.id in self.variables
-                  and self.variables[other.value.id][1] == "cls"):
+                  and self._tag_kind(self.variables[other.value.id][1]) == VKind.CLS):
                 attr_class = self._current_class
             if attr_class:
                 key = (attr_class, other.attr)
