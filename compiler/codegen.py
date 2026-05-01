@@ -2512,11 +2512,11 @@ class CodeGen:
 
     def _fv_as_str(self, fv: ir.Value) -> ir.Value:
         """Extract data as i8* (assumes tag is STR)."""
-        return self.builder.inttoptr(self._fv_data_i64(fv), i8_ptr)
+        return self._ensure_ptr(self._fv_data_i64(fv))
 
     def _fv_as_ptr(self, fv: ir.Value) -> ir.Value:
         """Extract data as i8* (for list/obj pointers)."""
-        return self.builder.inttoptr(self._fv_data_i64(fv), i8_ptr)
+        return self._ensure_ptr(self._fv_data_i64(fv))
 
     def _fv_unpack(self, fv: ir.Value) -> tuple[ir.Value, ir.Value]:
         """Unpack an FpyValue into (tag, data_i64) — the ABI-stable pair we pass to runtime."""
@@ -2588,7 +2588,7 @@ class CodeGen:
         self.builder.cbranch(is_null, end_bb, do_bb)
 
         self.builder.position_at_end(do_bb)
-        ptr = self.builder.inttoptr(data_i64, i8_ptr)
+        ptr = self._ensure_ptr(data_i64)
         rc_ptr = self.builder.bitcast(ptr, ir.PointerType(i32))
         rc = self.builder.load(rc_ptr)
         is_imm = self.builder.icmp_unsigned(
@@ -2619,7 +2619,7 @@ class CodeGen:
         self.builder.cbranch(is_null, end_bb, do_bb)
 
         self.builder.position_at_end(do_bb)
-        ptr = self.builder.inttoptr(data_i64, i8_ptr)
+        ptr = self._ensure_ptr(data_i64)
         rc_ptr = self.builder.bitcast(ptr, ir.PointerType(i32))
         rc = self.builder.load(rc_ptr)
         is_imm = self.builder.icmp_unsigned(
@@ -3194,7 +3194,7 @@ class CodeGen:
                 else:
                     self._store_variable(
                         node.name,
-                        self.builder.inttoptr(func_ptr, i8_ptr), "closure")
+                        self._ensure_ptr(func_ptr), "closure")
 
     def _gen_compile_cpython(self, tree: ast.Module) -> None:
         """Compile CPython-bridge generators, classes, and function groups.
@@ -8138,7 +8138,7 @@ class CodeGen:
             elif isinstance(param.type, ir.DoubleType):
                 tag = "float"
             elif param.name in string_params and isinstance(param.type, ir.IntType):
-                ptr_val = self.builder.inttoptr(param, i8_ptr)
+                ptr_val = self._ensure_ptr(param)
                 alloca = self.builder.alloca(i8_ptr, name=param.name)
                 self.builder.store(ptr_val, alloca)
                 tag = "str"
@@ -11667,17 +11667,17 @@ class CodeGen:
                 # Param is compared with `is None` in the body — treat as
                 # potentially None. The runtime null-check will emit
                 # {NONE, 0} when the value is 0.
-                ptr_val = self.builder.inttoptr(param, i8_ptr)
+                ptr_val = self._ensure_ptr(param)
                 tag = "obj"
                 bare = ptr_val
             elif pname in obj_params and isinstance(param.type, ir.IntType):
-                ptr_val = self.builder.inttoptr(param, i8_ptr)
+                ptr_val = self._ensure_ptr(param)
                 tag = "obj"
                 bare = ptr_val
             elif call_tag is not None and isinstance(param.type, ir.IntType):
                 _ctk = ValueType.from_old_tag(call_tag).kind
                 if _ctk.is_ptr:
-                    ptr_val = self.builder.inttoptr(param, i8_ptr)
+                    ptr_val = self._ensure_ptr(param)
                     # Preserve compound tags (list:float) for downstream;
                     # for dict strip value-type suffix (expect bare "dict")
                     tag = "dict" if _ctk == VKind.DICT else call_tag
@@ -11698,7 +11698,7 @@ class CodeGen:
                 tag = "bool"
                 bare = param
             elif pname in string_params and isinstance(param.type, ir.IntType):
-                ptr_val = self.builder.inttoptr(param, i8_ptr)
+                ptr_val = self._ensure_ptr(param)
                 tag = "str"
                 bare = ptr_val
             else:
@@ -11918,7 +11918,7 @@ class CodeGen:
                 # Only fall back to pyobj if we don't have a native registration.
                 if not cls_info.methods:
                     cls_pyobj = self.builder.load(out_data)
-                    cls_ptr = self.builder.inttoptr(cls_pyobj, i8_ptr)
+                    cls_ptr = self._ensure_ptr(cls_pyobj)
                     self._store_variable(cls_info.name, cls_ptr, "pyobj")
 
         elif meta_name and meta_name in self._user_classes:
@@ -12332,7 +12332,7 @@ class CodeGen:
                                    ir.Constant(i32, op_code),
                                    out_tag, out_data])
                 result_data = self.builder.load(out_data)
-                result_ptr = self.builder.inttoptr(result_data, i8_ptr)
+                result_ptr = self._ensure_ptr(result_data)
                 self._store_variable(target_name, result_ptr, "pyobj")
                 return True
 
@@ -12986,7 +12986,7 @@ class CodeGen:
         # call-site "obj" fix), the data is i64.  Convert to i8* so that
         # obj_get_fv receives the correct pointer type.
         if isinstance(obj.type, ir.IntType) and obj.type.width == 64:
-            obj = self.builder.inttoptr(obj, i8_ptr, name="obj.ptr")
+            obj = self._ensure_ptr(obj, name="obj.ptr")
 
         # Try static slot fast path first — direct GEP IR skips the
         # fastpy_obj_get_slot call overhead. Since the caller only uses
@@ -13050,7 +13050,7 @@ class CodeGen:
 
         if is_container or is_str or is_obj_attr:
             # Return as i8* — pointer (either list/dict/obj pointer or string)
-            return self.builder.inttoptr(data_i64, i8_ptr)
+            return self._ensure_ptr(data_i64)
         if is_float:
             # Return as double — bitcast i64 data back to double
             return self.builder.bitcast(data_i64, double)
@@ -13278,7 +13278,7 @@ class CodeGen:
                         wrapper = self._get_or_emit_i64_wrapper(info)
                         func_ptr = self.builder.bitcast(wrapper, i8_ptr)
                     else:
-                        func_ptr = self.builder.inttoptr(value, i8_ptr)
+                        func_ptr = self._ensure_ptr(value)
                     wrapped = self.builder.call(
                         self.runtime["cpython_wrap_native"], [func_ptr])
                     return FPY_TAG_OBJ, self.builder.ptrtoint(wrapped, i64)
@@ -13810,7 +13810,7 @@ class CodeGen:
 
         obj = self._emit_expr_value(target.value)
         if isinstance(obj.type, ir.IntType) and obj.type.width == 64:
-            obj = self.builder.inttoptr(obj, i8_ptr, name="obj.ptr")
+            obj = self._ensure_ptr(obj, name="obj.ptr")
         attr_name = self._make_string_constant(target.attr)
 
         # Runtime-tag-preserving fast path: when the RHS is a Name variable
@@ -13880,9 +13880,7 @@ class CodeGen:
                 if src_slot is not None and tgt_slot is not None:
                     # Both slots known — direct copy
                     rhs_obj = self._emit_expr_value(value_node.value)
-                    if isinstance(rhs_obj.type, ir.IntType):
-                        rhs_obj = self.builder.inttoptr(
-                            rhs_obj, i8_ptr)
+                    rhs_obj = self._ensure_ptr(rhs_obj)
                     tag_val, data_val = self._emit_slot_get_direct(
                         rhs_obj, src_slot)
                     self._emit_slot_set_direct(
@@ -13892,9 +13890,7 @@ class CodeGen:
                     # Slot unknown (class not resolved) — use runtime
                     # name-based get/set to preserve the tag faithfully.
                     rhs_obj = self._emit_expr_value(value_node.value)
-                    if isinstance(rhs_obj.type, ir.IntType):
-                        rhs_obj = self.builder.inttoptr(
-                            rhs_obj, i8_ptr)
+                    rhs_obj = self._ensure_ptr(rhs_obj)
                     rhs_attr_name = self._make_string_constant(
                         value_node.attr)
                     _tag_s = self._create_entry_alloca(i32, "rhs.tag")
@@ -15268,7 +15264,7 @@ class CodeGen:
                     result_i64 = self.builder.call(
                         self.runtime["obj_call_method1"],
                         [obj, method_name, rhs_i64])
-                    result = self.builder.inttoptr(result_i64, i8_ptr)
+                    result = self._ensure_ptr(result_i64)
                     self._emit_attr_store(node.target, result, node,
                                           value_node=node.value)
                     return
@@ -15285,7 +15281,7 @@ class CodeGen:
                 if _is_str_attr or isinstance(rhs.type, ir.PointerType):
                     rhs_ptr = rhs
                     if isinstance(rhs.type, ir.IntType):
-                        rhs_ptr = self.builder.inttoptr(rhs, i8_ptr)
+                        rhs_ptr = self._ensure_ptr(rhs)
                     result = self._rt_call("str_concat", [current, rhs_ptr])
                     self._emit_attr_store(node.target, result, node,
                                           value_node=node.value)
@@ -15302,7 +15298,7 @@ class CodeGen:
                 if _is_list_attr:
                     rhs_ptr = rhs
                     if isinstance(rhs.type, ir.IntType):
-                        rhs_ptr = self.builder.inttoptr(rhs, i8_ptr)
+                        rhs_ptr = self._ensure_ptr(rhs)
                     result = self._rt_call("list_concat",
                                            [current, rhs_ptr])
                     self._emit_attr_store(node.target, result, node,
@@ -15384,7 +15380,7 @@ class CodeGen:
                 result = self._emit_int_binop(node.op, current, rhs, node)
             elif isinstance(rhs.type, ir.PointerType) and isinstance(node.op, ast.Add):
                 # String concatenation
-                current_ptr = self.builder.inttoptr(data, i8_ptr)
+                current_ptr = self._ensure_ptr(data)
                 result = self._rt_call("str_concat", [current_ptr, rhs])
             else:
                 # Fall back to the original typed-subscript path
@@ -15432,7 +15428,7 @@ class CodeGen:
                 result_i64 = self.builder.call(
                     self.runtime["obj_call_method1"],
                     [obj, method_name, rhs_i64])
-                result = self.builder.inttoptr(result_i64, i8_ptr)
+                result = self._ensure_ptr(result_i64)
                 self._store_variable(target_name, result, "obj")
                 return
 
@@ -15667,7 +15663,7 @@ class CodeGen:
                 value = self.builder.sext(value, i64) if value.type.width < 64 \
                     else self.builder.trunc(value, i64)
             elif kind == VKind.STR and isinstance(value.type, ir.IntType):
-                value = self.builder.inttoptr(value, i8_ptr)
+                value = self._ensure_ptr(value)
             self.builder.store(value, alloca)
             # Also update self.variables type tag so _emit_expr reads the
             # correct VKind for this variable.
@@ -16144,7 +16140,7 @@ class CodeGen:
         if kind == VKind.FLOAT:
             return self.builder.bitcast(data, double)
         if kind == VKind.STR:
-            return self.builder.inttoptr(data, i8_ptr)
+            return self._ensure_ptr(data)
         return data
 
     def _load_variable(self, name: str, node: ast.AST) -> ir.Value:
@@ -16324,7 +16320,7 @@ class CodeGen:
                 return self._fv_none()
             if kind == VKind.PYOBJ:
                 # i64 holding a PyObject* pointer -- wrap as OBJ
-                ptr = self.builder.inttoptr(value, i8_ptr)
+                ptr = self._ensure_ptr(value)
                 return self._fv_from_obj(ptr)
             if kind == VKind.BIGINT:
                 return self._fv_build_from_slots(
@@ -16335,7 +16331,7 @@ class CodeGen:
             # Pointer types stored as i64 (e.g. from defaultdict subscript
             # which returns bare out_data): convert to pointer and wrap.
             if kind.is_ptr:
-                ptr = self.builder.inttoptr(value, i8_ptr)
+                ptr = self._ensure_ptr(value)
                 return self._wrap_bare_to_fv(ptr, type_tag)
             return self._fv_from_int(value)
         # Double
@@ -16490,7 +16486,7 @@ class CodeGen:
         _vt = (elem_type if isinstance(elem_type, ValueType)
                else ValueType.from_old_tag(elem_type))
         if _vt.kind.is_ptr:
-            return self.builder.inttoptr(data, i8_ptr)
+            return self._ensure_ptr(data)
         if _vt.kind == VKind.FLOAT:
             return self.builder.bitcast(data, double)
         return data  # int (default)
@@ -16510,16 +16506,16 @@ class CodeGen:
             return "str"
         return "unknown"
 
-    def _ensure_ptr(self, val: 'ir.Value') -> 'ir.Value':
+    def _ensure_ptr(self, val: 'ir.Value', name: str = '') -> 'ir.Value':
         """Coerce a value to i8* pointer. Handles i64 (inttoptr), FpyValue (extract+inttoptr)."""
         if isinstance(val.type, ir.PointerType):
             return val
         if isinstance(val.type, ir.IntType):
-            return self.builder.inttoptr(val, i8_ptr)
+            return self.builder.inttoptr(val, i8_ptr, name=name)
         if isinstance(val.type, ir.LiteralStructType) and val.type == fpy_val:
             data = self.builder.extract_value(val, 1)
-            return self.builder.inttoptr(data, i8_ptr)
-        return self.builder.inttoptr(self.builder.bitcast(val, i64), i8_ptr)
+            return self.builder.inttoptr(data, i8_ptr, name=name)
+        return self.builder.inttoptr(self.builder.bitcast(val, i64), i8_ptr, name=name)
 
     def _rt_call(self, name: str, args: list) -> 'ir.Value':
         """Call a runtime function with automatic type coercion.
@@ -16548,7 +16544,7 @@ class CodeGen:
             elif isinstance(arg.type, ir.LiteralStructType) and arg.type == fpy_val:
                 data = self.builder.extract_value(arg, 1)
                 if isinstance(param.type, ir.PointerType):
-                    coerced.append(self.builder.inttoptr(data, i8_ptr))
+                    coerced.append(self._ensure_ptr(data))
                 else:
                     coerced.append(data)
             else:
@@ -16903,7 +16899,7 @@ class CodeGen:
                 mgr = self._emit_expr_value(ctx_expr)
                 # Ensure mgr is a pointer (object)
                 if isinstance(mgr.type, ir.IntType) and mgr.type.width == 64:
-                    mgr = self.builder.inttoptr(mgr, i8_ptr, name="with.mgr")
+                    mgr = self._ensure_ptr(mgr, name="with.mgr")
 
                 # Call __enter__() → returns a value (the `as` target)
                 enter_name = self._make_string_constant("__enter__")
@@ -16928,8 +16924,8 @@ class CodeGen:
                                         _returns_self = True
                                         break
                     if _returns_self and cls:
-                        val_ptr = self.builder.inttoptr(
-                            enter_result, i8_ptr, name="with.val")
+                        val_ptr = self._ensure_ptr(
+                            enter_result, name="with.val")
                         self._store_variable(opt_var.id, val_ptr, "obj")
                         self._obj_var_class[opt_var.id] = cls
                     else:
@@ -17151,7 +17147,7 @@ class CodeGen:
             elif isinstance(val.type, ir.PointerType):
                 tag_ok = self.builder.icmp_signed(
                     "==", subject_tag, ir.Constant(i32, FPY_TAG_STR))
-                subj_ptr = self.builder.inttoptr(subject_data, i8_ptr)
+                subj_ptr = self._ensure_ptr(subject_data)
                 cmp = self._rt_call("str_compare", [subj_ptr, val])
                 str_ok = self.builder.icmp_signed(
                     "==", cmp, ir.Constant(i64, 0))
@@ -17227,7 +17223,7 @@ class CodeGen:
             self.builder.cbranch(is_seq, check_block, fail_block)
 
             self.builder.position_at_end(check_block)
-            list_ptr = self.builder.inttoptr(subject_data, i8_ptr)
+            list_ptr = self._ensure_ptr(subject_data)
             length = self._rt_call("list_length", [list_ptr])
 
             # Check for MatchStar: case [first, *rest, last]
@@ -17329,7 +17325,7 @@ class CodeGen:
             self.builder.cbranch(is_dict, check_block, fail_block)
 
             self.builder.position_at_end(check_block)
-            dict_ptr = self.builder.inttoptr(subject_data, i8_ptr)
+            dict_ptr = self._ensure_ptr(subject_data)
             elem_ok = ir.Constant(ir.IntType(1), 1)
 
             for key_node, pat in zip(pattern.keys, pattern.patterns):
@@ -17440,7 +17436,7 @@ class CodeGen:
 
                 # isinstance check — short-circuit to fail if wrong class
                 self.builder.position_at_end(isinstance_block)
-                obj_ptr = self.builder.inttoptr(subject_data, i8_ptr)
+                obj_ptr = self._ensure_ptr(subject_data)
                 expected_id = self.builder.load(cls_info.class_id_global)
                 isinstance_result = self.builder.call(
                     self.runtime["isinstance"], [obj_ptr, expected_id])
@@ -18138,7 +18134,7 @@ class CodeGen:
             obj = self.builder.call(
                 self.runtime["cpython_to_pyobj"], [rcv_tag, rcv_data])
         elif isinstance(obj.type, ir.IntType):
-            obj = self.builder.inttoptr(obj, i8_ptr)
+            obj = self._ensure_ptr(obj)
         # Get the callable attribute
         attr_name = self._make_string_constant(attr.attr)
         callable_ptr = self.builder.call(
@@ -18378,7 +18374,7 @@ class CodeGen:
             # Fall back to FV path for 3+ args
             fv = self._emit_cpython_method_call(node)
             data = self.builder.extract_value(fv, 1)
-            return self.builder.inttoptr(data, i8_ptr)
+            return self._ensure_ptr(data)
 
     def _emit_cpython_call_with_ptr(self, callable_ptr: 'ir.Value',
                                      node: ast.Call) -> 'ir.Value':
@@ -19532,7 +19528,7 @@ class CodeGen:
         iterator = self.builder.call(
             self.runtime["obj_call_method0"], [obj, iter_name])
         # iterator is i64 (result of method call) — convert to ptr
-        iter_ptr = self.builder.inttoptr(iterator, i8_ptr)
+        iter_ptr = self._ensure_ptr(iterator)
 
         next_name = self._make_string_constant("__next__")
 
@@ -20437,7 +20433,7 @@ class CodeGen:
                         and isinstance(cmp_right.type, ir.PointerType)
                         and isinstance(op, (ast.Eq, ast.NotEq,
                                             ast.Lt, ast.LtE, ast.Gt, ast.GtE))):
-                    left_as_ptr = self.builder.inttoptr(cmp_left, i8_ptr)
+                    left_as_ptr = self._ensure_ptr(cmp_left)
                     cmp_result = self._rt_call("str_compare",
                                                [left_as_ptr, cmp_right])
                     zero = ir.Constant(i64, 0)
@@ -20457,7 +20453,7 @@ class CodeGen:
                         and isinstance(cmp_right.type, ir.IntType)
                         and isinstance(op, (ast.Eq, ast.NotEq,
                                             ast.Lt, ast.LtE, ast.Gt, ast.GtE))):
-                    right_as_ptr = self.builder.inttoptr(cmp_right, i8_ptr)
+                    right_as_ptr = self._ensure_ptr(cmp_right)
                     cmp_result = self._rt_call("str_compare",
                                                [cmp_left, right_as_ptr])
                     zero = ir.Constant(i64, 0)
@@ -20568,9 +20564,9 @@ class CodeGen:
             right = self._emit_expr_value(right_node)
             # Coerce to same type for comparison
             if isinstance(left.type, ir.PointerType) and isinstance(right.type, ir.IntType):
-                right = self.builder.inttoptr(right, i8_ptr)
+                right = self._ensure_ptr(right)
             elif isinstance(right.type, ir.PointerType) and isinstance(left.type, ir.IntType):
-                left = self.builder.inttoptr(left, i8_ptr)
+                left = self._ensure_ptr(left)
             if left.type != right.type:
                 if isinstance(left.type, ir.PointerType):
                     left = self.builder.ptrtoint(left, i64)
@@ -20783,7 +20779,7 @@ class CodeGen:
                     self.runtime["dict_has_int_key"], [container, left_val])
             else:
                 if not isinstance(left_val.type, ir.PointerType):
-                    left_val = self.builder.inttoptr(left_val, i8_ptr)
+                    left_val = self._ensure_ptr(left_val)
                 result = self.builder.call(
                     self.runtime["dict_has_key"], [container, left_val])
             result_i1 = self.builder.icmp_signed("!=", result, ir.Constant(i32, 0))
@@ -21270,10 +21266,9 @@ class CodeGen:
                 if isinstance(arg.type, ir.PointerType):
                     code_ptr = arg
                 elif isinstance(arg.type, ir.IntType):
-                    code_ptr = self.builder.inttoptr(arg, i8_ptr)
+                    code_ptr = self._ensure_ptr(arg)
                 else:
-                    code_ptr = self.builder.inttoptr(
-                        self.builder.bitcast(arg, i64), i8_ptr)
+                    code_ptr = self._ensure_ptr(arg)
                 self.builder.call(self.runtime["cpython_exec_locals"],
                                   [code_ptr, locals_dict])
                 return
@@ -21453,11 +21448,10 @@ class CodeGen:
         val = self._load_variable(name, node)
         # val is an i64 holding the FpyWeakRef* pointer
         if isinstance(val.type, ir.IntType):
-            wr_ptr = self.builder.inttoptr(val, i8_ptr)
+            wr_ptr = self._ensure_ptr(val)
         elif isinstance(val.type, ir.LiteralStructType):
             # FV: extract the data field (i64) and convert to pointer
-            wr_ptr = self.builder.inttoptr(
-                self.builder.extract_value(val, 1), i8_ptr)
+            wr_ptr = self._ensure_ptr(val)
         else:
             wr_ptr = val
         obj_ptr = self.builder.call(self.runtime["weakref_deref"], [wr_ptr])
@@ -21589,7 +21583,7 @@ class CodeGen:
         if has_starred and n_args == 1 and isinstance(node.args[0], ast.Starred):
             args_list = self._emit_expr_value(node.args[0].value)
             args_list = self._ensure_ptr(args_list)
-            ptr = self.builder.inttoptr(val, i8_ptr) if isinstance(val.type, ir.IntType) else val
+            ptr = self._ensure_ptr(val)
             return self.builder.call(
                 self.runtime["closure_call_list"], [ptr, args_list])
 
@@ -21597,7 +21591,7 @@ class CodeGen:
         # A "closure"-tagged variable might be either a real FpyClosure*
         # (from a decorator that returns a nested function) or a raw
         # function pointer (from an identity-style decorator).
-        ptr = self.builder.inttoptr(val, i8_ptr) if isinstance(val.type, ir.IntType) else val
+        ptr = self._ensure_ptr(val)
         if n_args == 0:
             return self.builder.call(self.runtime["call_ptr0"], [ptr])
         elif n_args == 1:
@@ -21610,7 +21604,7 @@ class CodeGen:
 
         # 3+ args: pack into list and use closure_call_list
         if n_args >= 3:
-            ptr = self.builder.inttoptr(val, i8_ptr) if isinstance(val.type, ir.IntType) else val
+            ptr = self._ensure_ptr(val)
             args_list = self.builder.call(self.runtime["list_new"], [])
             for arg_node in node.args:
                 v = self._emit_expr_value(arg_node)
@@ -23043,7 +23037,7 @@ class CodeGen:
                          and node.value.id in self._user_classes)):
             obj = self._emit_expr_value(node.value)
             if isinstance(obj.type, ir.IntType) and obj.type.width == 64:
-                obj = self.builder.inttoptr(obj, i8_ptr, name="obj.ptr")
+                obj = self._ensure_ptr(obj, name="obj.ptr")
             if isinstance(obj.type, ir.PointerType):
                 slot_idx = self._get_attr_slot(node)
                 if slot_idx is not None:
@@ -24194,7 +24188,7 @@ class CodeGen:
         # Get both operands as complex pointers
         if left_is_complex:
             left_val = self._emit_expr_value(node.left)
-            left_ptr = self.builder.inttoptr(left_val, i8_ptr)
+            left_ptr = self._ensure_ptr(left_val)
         else:
             # Convert scalar to complex(val, 0)
             left_val = self._emit_expr_value(node.left)
@@ -24205,7 +24199,7 @@ class CodeGen:
                 [left_val, ir.Constant(double, 0.0)])
         if right_is_complex:
             right_val = self._emit_expr_value(node.right)
-            right_ptr = self.builder.inttoptr(right_val, i8_ptr)
+            right_ptr = self._ensure_ptr(right_val)
         else:
             right_val = self._emit_expr_value(node.right)
             if isinstance(right_val.type, ir.IntType):
@@ -24303,8 +24297,8 @@ class CodeGen:
                 r_data = self.builder.extract_value(r_fv, 1) \
                     if isinstance(r_fv.type, ir.LiteralStructType) \
                     else rtv.as_i64(self.builder)
-                l_ptr = self.builder.inttoptr(l_data, i8_ptr)
-                r_ptr = self.builder.inttoptr(r_data, i8_ptr)
+                l_ptr = self._ensure_ptr(l_data)
+                r_ptr = self._ensure_ptr(r_data)
                 str_result = self.builder.call(
                     self.runtime["str_concat"], [l_ptr, r_ptr])
                 # Convert to i8* result (same as VKind.STR)
@@ -24889,9 +24883,9 @@ class CodeGen:
                 ret_type = self._find_method_return_type(node.left, method)
                 if ret_type is None:
                     # Unknown class/method → assume object (safe default)
-                    return self.builder.inttoptr(result, i8_ptr)
+                    return self._ensure_ptr(result)
                 if isinstance(ret_type, ir.PointerType):
-                    return self.builder.inttoptr(result, i8_ptr)
+                    return self._ensure_ptr(result)
                 if isinstance(ret_type, ir.DoubleType):
                     data = self.builder.bitcast(result, i64)
                     return self._fv_build_from_slots(
@@ -24926,9 +24920,9 @@ class CodeGen:
                     [rtv.as_ptr(self.builder), name_ptr, ltv.as_i64(self.builder)])
                 ret_type = self._find_method_return_type(node.right, rmethod)
                 if ret_type is None:
-                    return self.builder.inttoptr(result, i8_ptr)
+                    return self._ensure_ptr(result)
                 if isinstance(ret_type, ir.PointerType):
-                    return self.builder.inttoptr(result, i8_ptr)
+                    return self._ensure_ptr(result)
                 if isinstance(ret_type, ir.DoubleType):
                     data = self.builder.bitcast(result, i64)
                     return self._fv_build_from_slots(
@@ -25685,14 +25679,14 @@ class CodeGen:
                 name_ptr = self._make_string_constant("__neg__")
                 result = self.builder.call(
                     self.runtime["obj_call_method0"], [obj, name_ptr])
-                return self.builder.inttoptr(result, i8_ptr)
+                return self._ensure_ptr(result)
             # BigInt negation: if the operand is a bigint variable, call bigint_neg
             # and return the result tagged as BIGINT so print/assignment handle it correctly.
             if (isinstance(node.operand, ast.Name)
                     and node.operand.id in self.variables
                     and self._var_kind(node.operand.id) == VKind.BIGINT):
                 operand = self._emit_expr_value(node.operand)
-                ptr = self.builder.inttoptr(operand, i8_ptr)
+                ptr = self._ensure_ptr(operand)
                 result = self.builder.call(self.runtime["bigint_neg"], [ptr])
                 result_i64 = self.builder.ptrtoint(result, i64)
                 # Return as FpyValue with BIGINT tag
@@ -25703,7 +25697,7 @@ class CodeGen:
             # Complex negation: -c → complex_neg(c)
             if self._is_complex_expr(node.operand):
                 operand = self._emit_expr_value(node.operand)
-                ptr = self.builder.inttoptr(operand, i8_ptr)
+                ptr = self._ensure_ptr(operand)
                 result = self.builder.call(self.runtime["complex_neg"], [ptr])
                 return self.builder.ptrtoint(result, i64)
             operand = self._emit_expr_value(node.operand)
@@ -25722,7 +25716,7 @@ class CodeGen:
                     name_ptr = self._make_string_constant("__pos__")
                     result = self.builder.call(
                         self.runtime["obj_call_method0"], [obj, name_ptr])
-                    return self.builder.inttoptr(result, i8_ptr)
+                    return self._ensure_ptr(result)
             return self._emit_expr_value(node.operand)
         elif isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Invert):
             # __invert__ on user-class objects
@@ -25734,7 +25728,7 @@ class CodeGen:
                     name_ptr = self._make_string_constant("__invert__")
                     result = self.builder.call(
                         self.runtime["obj_call_method0"], [obj, name_ptr])
-                    return self.builder.inttoptr(result, i8_ptr)
+                    return self._ensure_ptr(result)
             operand = self._emit_expr_value(node.operand)
             if isinstance(operand.type, ir.IntType):
                 return self.builder.not_(operand)
@@ -25821,7 +25815,7 @@ class CodeGen:
                         merge_block = self._new_block("typename.merge")
                         self.builder.cbranch(is_obj, obj_block, merge_block)
                         self.builder.position_at_end(obj_block)
-                        obj_ptr = self.builder.inttoptr(fv_data, i8_ptr)
+                        obj_ptr = self._ensure_ptr(fv_data)
                         runtime_name = self.builder.call(
                             self.runtime["obj_classname"], [obj_ptr])
                         self.builder.store(runtime_name, result_alloca)
@@ -26090,7 +26084,7 @@ class CodeGen:
                     merge_block = self._new_block("type.merge")
                     self.builder.cbranch(is_obj, obj_block, merge_block)
                     self.builder.position_at_end(obj_block)
-                    obj_ptr = self.builder.inttoptr(fv_data, i8_ptr)
+                    obj_ptr = self._ensure_ptr(fv_data)
                     runtime_type = self.builder.call(
                         self.runtime["obj_type_repr"], [obj_ptr])
                     self.builder.store(runtime_type, result_alloca)
@@ -26139,7 +26133,7 @@ class CodeGen:
                     merge_block = self._new_block("type.expr.merge")
                     self.builder.cbranch(is_obj, obj_block, merge_block)
                     self.builder.position_at_end(obj_block)
-                    obj_ptr = self.builder.inttoptr(fv_data, i8_ptr)
+                    obj_ptr = self._ensure_ptr(fv_data)
                     runtime_type = self.builder.call(
                         self.runtime["obj_type_repr"], [obj_ptr])
                     self.builder.store(runtime_type, result_alloca)
@@ -26264,7 +26258,7 @@ class CodeGen:
             if isinstance(result.type, ir.PointerType) or result.type == i8_ptr:
                 self.builder.call(self.runtime["list_mark_tuple"], [result])
             else:
-                ptr = self.builder.inttoptr(result, i8_ptr)
+                ptr = self._ensure_ptr(result)
                 self.builder.call(self.runtime["list_mark_tuple"], [ptr])
             return result
         if len(node.args) == 0:
@@ -26378,7 +26372,7 @@ class CodeGen:
                     self.builder.cbranch(is_str, str_bb, else_bb)
                     # String path
                     self.builder.position_at_end(str_bb)
-                    str_ptr = self.builder.inttoptr(fv_data, i8_ptr)
+                    str_ptr = self._ensure_ptr(fv_data)
                     int_from_str = self._rt_call("str_to_int", [str_ptr])
                     self.builder.store(int_from_str, result_alloca)
                     self.builder.branch(merge_bb)
@@ -26441,10 +26435,9 @@ class CodeGen:
         if isinstance(arg.type, ir.PointerType):
             expr_ptr = arg
         elif isinstance(arg.type, ir.IntType):
-            expr_ptr = self.builder.inttoptr(arg, i8_ptr)
+            expr_ptr = self._ensure_ptr(arg)
         else:
-            expr_ptr = self.builder.inttoptr(
-                self.builder.bitcast(arg, i64), i8_ptr)
+            expr_ptr = self._ensure_ptr(arg)
         out_tag = self._create_entry_alloca(i32, "eval.tag")
         out_data = self._create_entry_alloca(i64, "eval.data")
         self.builder.call(self.runtime["cpython_eval_locals"],
@@ -26468,10 +26461,9 @@ class CodeGen:
         if isinstance(arg.type, ir.PointerType):
             code_ptr = arg
         elif isinstance(arg.type, ir.IntType):
-            code_ptr = self.builder.inttoptr(arg, i8_ptr)
+            code_ptr = self._ensure_ptr(arg)
         else:
-            code_ptr = self.builder.inttoptr(
-                self.builder.bitcast(arg, i64), i8_ptr)
+            code_ptr = self._ensure_ptr(arg)
         # jit_exec tries native compilation first, falls back to CPython
         self.builder.call(self.runtime["jit_exec"], [code_ptr])
         return ir.Constant(i64, 0)
@@ -26645,7 +26637,7 @@ class CodeGen:
                     self.builder.cbranch(is_str, str_bb, check_float_bb)
                     # String path
                     self.builder.position_at_end(str_bb)
-                    str_ptr = self.builder.inttoptr(fv_data, i8_ptr)
+                    str_ptr = self._ensure_ptr(fv_data)
                     f_from_str = self._rt_call("str_to_float", [str_ptr])
                     self.builder.store(f_from_str, result_alloca)
                     self.builder.branch(merge_bb)
@@ -26685,7 +26677,7 @@ class CodeGen:
                 obj = self._ensure_ptr(obj)
                 result = self.builder.call(
                     self.runtime["obj_to_str"], [obj])
-                return self.builder.inttoptr(result, i8_ptr)
+                return self._ensure_ptr(result)
             # Use FV dispatch so runtime tag drives the conversion
             # (e.g. dict values whose compile-time tag is wrong).
             fv = self._load_or_wrap_fv(node.args[0])
@@ -26788,14 +26780,14 @@ class CodeGen:
             arg_node = node.args[0]
             if self._is_complex_expr(arg_node):
                 val = self._emit_expr_value(arg_node)
-                ptr = self.builder.inttoptr(val, i8_ptr)
+                ptr = self._ensure_ptr(val)
                 return self.builder.call(
                     self.runtime["complex_abs"], [ptr])
             if (isinstance(arg_node, ast.Call)
                     and isinstance(arg_node.func, ast.Name)
                     and arg_node.func.id == "complex"):
                 val = self._emit_expr_value(arg_node)
-                ptr = self.builder.inttoptr(val, i8_ptr)
+                ptr = self._ensure_ptr(val)
                 return self.builder.call(
                     self.runtime["complex_abs"], [ptr])
             # Object __abs__: dispatch to dunder (returns object)
@@ -26806,7 +26798,7 @@ class CodeGen:
                 result_i64 = self.builder.call(
                     self.runtime["obj_call_method0"],
                     [obj, name_ptr])
-                return self.builder.inttoptr(result_i64, i8_ptr)
+                return self._ensure_ptr(result_i64)
             val = self._emit_expr_value(arg_node)
             if isinstance(val.type, ir.IntType):
                 neg = self.builder.neg(val)
@@ -26920,7 +26912,7 @@ class CodeGen:
                 obj = self._ensure_ptr(obj)
                 result = self.builder.call(
                     self.runtime["obj_to_repr"], [obj])
-                return self.builder.inttoptr(result, i8_ptr)
+                return self._ensure_ptr(result)
             # Use FV dispatch so runtime tag drives the conversion.
             fv = self._load_or_wrap_fv(node.args[0])
             return self._fv_call_repr(fv)
@@ -27019,7 +27011,7 @@ class CodeGen:
             if elem_type.kind == VKind.OBJ:
                 rt_name = "list_min_fv" if name == "min" else "list_max_fv"
                 data_i64 = self.builder.call(self.runtime[rt_name], [lst])
-                return self.builder.inttoptr(data_i64, i8_ptr)
+                return self._ensure_ptr(data_i64)
 
             result_alloca = self._create_entry_alloca(result_type, f"{name}.result")
             first = self._list_get_as_bare(
@@ -27047,7 +27039,7 @@ class CodeGen:
                     if isinstance(e.type, ir.IntType):
                         return self.builder.call(
                             self.runtime["list_length"], [
-                                self.builder.inttoptr(e, i8_ptr)])
+                                self._ensure_ptr(e)])
                     return ir.Constant(i64, 0)
                 if key_func_name == "abs":
                     neg = self.builder.neg(e)
@@ -27641,7 +27633,7 @@ class CodeGen:
             self.builder.call(self.runtime["json_loads"],
                               [arg, out_tag, out_data])
             data_val = self.builder.load(out_data)
-            return self.builder.inttoptr(data_val, i8_ptr)
+            return self._ensure_ptr(data_val)
         return None
 
     def _emit_os_call(self, func_name, node):
@@ -27725,7 +27717,7 @@ class CodeGen:
             result = self.builder.load(out_data)
             inferred = self._infer_type_tag(node.args[0], val)
             if inferred not in ("int", "float", "bool", "none", "unknown"):
-                result = self.builder.inttoptr(result, i8_ptr)
+                result = self._ensure_ptr(result)
             return result
         return None
 
@@ -28179,7 +28171,7 @@ class CodeGen:
                 for idx, arg in enumerate(node.args):
                     dict_val = self._emit_expr_value(arg)
                     if not isinstance(dict_val.type, ir.PointerType):
-                        dict_val = self.builder.inttoptr(dict_val, i8_ptr)
+                        dict_val = self._ensure_ptr(dict_val)
                     ptr = self.builder.gep(arr, [
                         ir.Constant(i64, 0), ir.Constant(i32, idx)])
                     self.builder.store(dict_val, ptr)
@@ -28993,7 +28985,7 @@ class CodeGen:
             self.builder.call(self.runtime["cpython_to_fv"],
                               [ptr, tag_slot, data_slot])
             data = self.builder.load(data_slot)
-            native_list = self.builder.inttoptr(data, i8_ptr)
+            native_list = self._ensure_ptr(data)
             result = self._rt_call("list_sorted", [native_list])
             if reverse:
                 result = self._rt_call("list_reversed", [result])
@@ -29196,12 +29188,12 @@ class CodeGen:
 
         # Param — type determines how it's stored and accessed
         if param_kind == VKind.STR:
-            ptr = self.builder.inttoptr(func.args[0], i8_ptr)
+            ptr = self._ensure_ptr(func.args[0])
             alloca = self.builder.alloca(i8_ptr, name=param_name)
             self.builder.store(ptr, alloca)
             self.variables[param_name] = (alloca, "str")
         elif param_kind == VKind.LIST:
-            ptr = self.builder.inttoptr(func.args[0], i8_ptr)
+            ptr = self._ensure_ptr(func.args[0])
             alloca = self.builder.alloca(i8_ptr, name=param_name)
             self.builder.store(ptr, alloca)
             self.variables[param_name] = (alloca, "list:int")
@@ -29297,7 +29289,7 @@ class CodeGen:
                 if tname in self._user_classes:
                     obj = self._emit_expr_value(node.args[0])
                     if isinstance(obj.type, ir.IntType) and obj.type.width == 64:
-                        obj = self.builder.inttoptr(obj, i8_ptr)
+                        obj = self._ensure_ptr(obj)
                     cls_info = self._user_classes[tname]
                     class_id = self.builder.load(cls_info.class_id_global)
                     r = self.builder.call(self.runtime["isinstance"], [obj, class_id])
@@ -29364,7 +29356,7 @@ class CodeGen:
             return ir.Constant(i32, 1)
         # Coerce obj to i8* if needed (may come in as i64 from FV unwrap).
         if isinstance(obj.type, ir.IntType) and obj.type.width == 64:
-            obj = self.builder.inttoptr(obj, i8_ptr)
+            obj = self._ensure_ptr(obj)
         # For monomorphized classes, check against all variants: obj is an
         # instance of the original class if it matches any variant's class_id.
         if class_name in self._monomorphized_classes:
@@ -29458,7 +29450,7 @@ class CodeGen:
         self._rt_call("list_get_fv",
                       [list_ptr, index, tag_slot, data_slot])
         elem_data = self.builder.load(data_slot)
-        elem_ptr = self.builder.inttoptr(elem_data, i8_ptr)
+        elem_ptr = self._ensure_ptr(elem_data)
 
         # Dispatch list methods on the inner container
         if method == "append" and len(node.args) == 1:
@@ -30022,10 +30014,9 @@ class CodeGen:
         if (isinstance(obj.type, ir.LiteralStructType)
                 and obj.type == fpy_val):
             # FpyValue struct: extract data and convert to pointer
-            obj = self.builder.inttoptr(
-                self.builder.extract_value(obj, 1), i8_ptr, name="obj.ptr")
+            obj = self._ensure_ptr(obj, name="obj.ptr")
         elif isinstance(obj.type, ir.IntType) and obj.type.width == 64:
-            obj = self.builder.inttoptr(obj, i8_ptr, name="obj.ptr")
+            obj = self._ensure_ptr(obj, name="obj.ptr")
         method_name_ptr = self._make_string_constant(method)
         n_args = len(node.args)
         # Check which params are mixed for this method
@@ -30187,7 +30178,7 @@ class CodeGen:
                         ret_type = self._find_method_return_type(
                             attr.value, method)
                         if ret_type and isinstance(ret_type, ir.PointerType):
-                            result = self.builder.inttoptr(result, i8_ptr)
+                            result = self._ensure_ptr(result)
                         elif (ret_type
                               and isinstance(ret_type, ir.IntType)
                               and ret_type.width == 32):
@@ -30276,7 +30267,7 @@ class CodeGen:
             if not is_double_ret:
                 ret_type2 = self._find_method_return_type(attr.value, method)
                 if ret_type2 and isinstance(ret_type2, ir.PointerType):
-                    result = self.builder.inttoptr(result, i8_ptr)
+                    result = self._ensure_ptr(result)
                 elif (ret_type2 and isinstance(ret_type2, ir.IntType)
                         and ret_type2.width == 32):
                     result = self.builder.trunc(result, i32)
@@ -30441,7 +30432,7 @@ class CodeGen:
             if not is_double_ret:
                 ret_type = self._find_method_return_type(attr.value, method)
                 if ret_type and isinstance(ret_type, ir.PointerType):
-                    result = self.builder.inttoptr(result, i8_ptr)
+                    result = self._ensure_ptr(result)
                 elif (ret_type and isinstance(ret_type, ir.IntType)
                         and ret_type.width == 32):
                     result = self.builder.trunc(result, i32)
@@ -30510,7 +30501,7 @@ class CodeGen:
         if not is_double_ret:
             ret_type = self._find_method_return_type(attr.value, method)
             if ret_type and isinstance(ret_type, ir.PointerType):
-                result = self.builder.inttoptr(result, i8_ptr)
+                result = self._ensure_ptr(result)
             elif ret_type and isinstance(ret_type, ir.IntType) and ret_type.width == 32:
                 result = self.builder.trunc(result, i32)
         return result
@@ -32091,7 +32082,7 @@ class CodeGen:
                 if _ktk == VKind.FLOAT:
                     return self.builder.bitcast(data, double)
                 if _ktk.is_ptr:
-                    return self.builder.inttoptr(data, i8_ptr)
+                    return self._ensure_ptr(data)
             # If the dict is known to hold ints, return the data as i64
             if base_name is not None and base_name in self._dict_var_int_values:
                 return data
@@ -32099,11 +32090,11 @@ class CodeGen:
             if base_name is not None and (
                     base_name in self._dict_var_list_values
                     or base_name in self._dict_var_dict_values):
-                return self.builder.inttoptr(data, i8_ptr)
+                return self._ensure_ptr(data)
             # If the dict is known to hold objects, return the raw pointer
             if (base_name is not None
                     and base_name in getattr(self, "_dict_var_obj_values", set())):
-                return self.builder.inttoptr(data, i8_ptr)
+                return self._ensure_ptr(data)
             # Unknown value type: return FpyValue with the runtime tag
             # so downstream code (print, assignment, etc.) can dispatch
             # correctly. Without this, string values from dicts with int
@@ -32132,7 +32123,7 @@ class CodeGen:
             data = self.builder.load(data_slot)
             elem_type = self._get_list_elem_type(node.value)
             if elem_type.kind.is_ptr:
-                return self.builder.inttoptr(data, i8_ptr)
+                return self._ensure_ptr(data)
             if elem_type.kind == VKind.FLOAT:
                 return self.builder.bitcast(data, double)
             return data
@@ -32888,7 +32879,7 @@ class CodeGen:
             tag_s = self._create_entry_alloca(i32, "dc.tag")
             data_s = self._create_entry_alloca(i64, "dc.data")
             self._rt_call("list_get_fv", [iter_val, idx, tag_s, data_s])
-            elem_ptr = self.builder.inttoptr(self.builder.load(data_s), i8_ptr)
+            elem_ptr = self._ensure_ptr(self.builder.load(data_s))
             for ti, tgt in enumerate(gen.target.elts):
                 if isinstance(tgt, ast.Name):
                     t2 = self._create_entry_alloca(i32, f"dc.t{ti}")
@@ -32901,7 +32892,7 @@ class CodeGen:
                         # Pointer types: convert i64 data to pointer
                         self._store_variable(
                             tgt.id,
-                            self.builder.inttoptr(self.builder.load(d2), i8_ptr),
+                            self._ensure_ptr(self.builder.load(d2)),
                             _var_tag)
                     else:
                         self._store_variable(tgt.id, self.builder.load(d2), _var_tag)
@@ -33030,7 +33021,7 @@ class CodeGen:
             else:
                 self.builder.call(self.runtime["dict_set_fv"],
                                   [dict_ptr,
-                                   self.builder.inttoptr(key, i8_ptr),
+                                   self._ensure_ptr(key),
                                    ir.Constant(i32, v_tag), v_data])
             self.builder.branch(incr_block)
             self.builder.position_at_end(incr_block)
@@ -33224,7 +33215,7 @@ class CodeGen:
                 elif self._is_obj_expr(value.value):
                     val = self._emit_expr_value(value.value)
                     if isinstance(val.type, ir.IntType) and val.type.width == 64:
-                        val = self.builder.inttoptr(val, i8_ptr, name="obj.ptr")
+                        val = self._ensure_ptr(val, name="obj.ptr")
                     if spec_str:
                         # f"{obj:spec}" → dispatch to __format__ if available
                         str_val = self._apply_format_spec(val, spec_str, value.value, node)
@@ -33254,7 +33245,7 @@ class CodeGen:
                         # Regular slot access — use obj_get_fv → fv_str
                         obj = self._emit_expr_value(value.value.value)
                         if isinstance(obj.type, ir.IntType) and obj.type.width == 64:
-                            obj = self.builder.inttoptr(obj, i8_ptr, name="obj.ptr")
+                            obj = self._ensure_ptr(obj, name="obj.ptr")
                         slot_idx = self._get_attr_slot(value.value)
                         if slot_idx is not None:
                             init_only = self._is_init_only_attr(value.value)
@@ -33462,12 +33453,12 @@ class CodeGen:
                 result = self.builder.call(
                     self.runtime["obj_call_method1"],
                     [value, name_ptr, spec_i64])
-                return self.builder.inttoptr(result, i8_ptr)
+                return self._ensure_ptr(result)
             # No __format__: convert to string via __str__, then apply str format
             str_name = self._make_string_constant("__str__")
             str_result = self.builder.call(
                 self.runtime["obj_call_method0"], [value, str_name])
-            str_ptr = self.builder.inttoptr(str_result, i8_ptr)
+            str_ptr = self._ensure_ptr(str_result)
             return self.builder.call(self.runtime["format_spec_str"], [str_ptr, spec_ptr])
         # String format
         if isinstance(value.type, ir.PointerType):
