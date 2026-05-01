@@ -7194,11 +7194,12 @@ class CodeGen:
                     pidx = param_names.index(n.value.id)
                     if pidx < len(call_types) and call_types[pidx] is not None:
                         ct = call_types[pidx]
-                        if ct == "str":
+                        _ctk = ValueType.from_old_tag(ct).kind
+                        if _ctk == VKind.STR:
                             returns_str = True
-                        elif ct == "dict" or ct.startswith("dict:"):
+                        elif _ctk == VKind.DICT:
                             returns_dict = True
-                        elif ct.startswith("list"):
+                        elif _ctk == VKind.LIST:
                             returns_list = True
 
         # Detect obj-valued returns (variable tracked in obj_vars from the
@@ -7731,7 +7732,7 @@ class CodeGen:
                     # Record the specific class for obj-typed params so
                     # downstream attr accesses can resolve through
                     # _obj_var_class → _class_obj_attr_types.
-                    if tag == "obj":
+                    if ValueType.from_old_tag(tag).kind == VKind.OBJ:
                         param_cls_map = getattr(
                             self, '_csa_func_param_classes', {}).get(
                             node.name, {})
@@ -20907,11 +20908,14 @@ class CodeGen:
                                 cls_call_types = self._call_site_param_types.get("cls", [])
                                 arg_idx = node.args.index(arg_node)
                                 ct = cls_call_types[arg_idx] if arg_idx < len(cls_call_types) else None
-                                if ct == "str" or (isinstance(arg_node, ast.Name)
-                                        and arg_node.id in self.variables
-                                        and self._var_kind(arg_node.id) == VKind.STR):
+                                _ctk = ValueType.from_old_tag(ct).kind if ct else None
+                                if (_ctk == VKind.STR
+                                        or (isinstance(arg_node, ast.Name)
+                                            and arg_node.id in self.variables
+                                            and self._var_kind(arg_node.id) == VKind.STR)):
                                     call_args.append(self._fv_build(FPY_TAG_STR, v))
-                                elif ct == "bool" or (isinstance(arg_node, ast.Constant) and isinstance(arg_node.value, bool)):
+                                elif (_ctk == VKind.BOOL
+                                      or (isinstance(arg_node, ast.Constant) and isinstance(arg_node.value, bool))):
                                     bval = self.builder.zext(v, i64) if v.type.width < 64 else v
                                     call_args.append(self._fv_build(FPY_TAG_BOOL, bval))
                                 else:
