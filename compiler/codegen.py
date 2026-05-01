@@ -163,15 +163,17 @@ class VKind(Enum):
     NATIVE_FUNC = auto()  # from-imported native function (e.g. from math import sqrt)
     LOGGER = auto()     # logging.Logger instance
     MIXED = auto()      # multiple types possible — runtime dispatch needed
+    CELL = auto()       # closure cell (heap-allocated mutable capture)
+    CLS = auto()        # classmethod `cls` parameter (i32 class_id)
 
     @property
     def is_ptr(self) -> bool:
         return self in (VKind.STR, VKind.BYTES, VKind.LIST, VKind.DICT,
                         VKind.SET, VKind.TUPLE, VKind.OBJ, VKind.PYOBJ,
                         VKind.DECIMAL, VKind.COMPLEX, VKind.BIGINT,
-                        VKind.CLOSURE, VKind.PATH, VKind.COUNTER,
-                        VKind.DEFAULTDICT, VKind.DEQUE, VKind.NATIVE_MOD,
-                        VKind.LOGGER)
+                        VKind.CLOSURE, VKind.CELL, VKind.PATH,
+                        VKind.COUNTER, VKind.DEFAULTDICT, VKind.DEQUE,
+                        VKind.NATIVE_MOD, VKind.LOGGER)
 
     @property
     def fpy_tag(self) -> int:
@@ -249,7 +251,8 @@ class ValueType:
             VKind.DICT: "dict", VKind.SET: "set", VKind.TUPLE: "tuple",
             VKind.OBJ: "obj", VKind.PYOBJ: "pyobj", VKind.DECIMAL: "decimal",
             VKind.COMPLEX: "complex", VKind.BIGINT: "bigint",
-            VKind.CLOSURE: "closure", VKind.FVALUE: "int",
+            VKind.CLOSURE: "closure", VKind.CELL: "cell",
+            VKind.CLS: "cls", VKind.FVALUE: "int",
             VKind.UNKNOWN: "int", VKind.PATH: "path",
             VKind.COUNTER: "counter", VKind.DEFAULTDICT: "defaultdict",
             VKind.DEQUE: "deque", VKind.NATIVE_MOD: "native_mod",
@@ -327,9 +330,9 @@ class ValueType:
             "deque": VKind.DEQUE,
             "chainmap": VKind.OBJ, "logger": VKind.OBJ,
             "ptr": VKind.LIST, "ptr:list": VKind.LIST,
-            "path": VKind.PYOBJ, "native_func": VKind.NATIVE_FUNC,
-            "native_mod": VKind.NATIVE_MOD, "cls": VKind.INT,
-            "cell": VKind.UNKNOWN, "namedtuple_type": VKind.INT,
+            "path": VKind.PATH, "native_func": VKind.NATIVE_FUNC,
+            "native_mod": VKind.NATIVE_MOD, "cls": VKind.CLS,
+            "cell": VKind.CELL, "namedtuple_type": VKind.INT,
         }
         if tag.startswith("list"):
             if ":" in tag:
@@ -2833,14 +2836,14 @@ class CodeGen:
                                     if ref_type == "list":
                                         # Compound: include inner elem type
                                         _inner = global_list_elem_types.get(
-                                            _elt.id)
-                                        _inner_vt = (_inner if isinstance(_inner, ValueType)
-                                                     else ValueType.from_old_tag(_inner)
-                                                     if _inner else ValueType(VKind.INT))
-                                        et = ValueType(VKind.LIST, elem_type=_inner_vt)
+                                            _elt.id, ValueType(VKind.INT))
+                                        if not isinstance(_inner, ValueType):
+                                            _inner = ValueType(VKind.INT)
+                                        et = ValueType(VKind.LIST, elem_type=_inner)
                                         break
-                                    if ref_type in ("dict", "str", "float"):
-                                        et = ValueType.from_old_tag(ref_type)
+                                    _REF_TYPE_MAP = {"dict": VKind.DICT, "str": VKind.STR, "float": VKind.FLOAT}
+                                    if ref_type in _REF_TYPE_MAP:
+                                        et = ValueType(_REF_TYPE_MAP[ref_type])
                                         break
                     elif (isinstance(node.value, ast.Call)
                           and isinstance(node.value.func, ast.Name)
@@ -2897,26 +2900,34 @@ class CodeGen:
                 for name in node.names:
                     if name not in self._global_vars:
                         gtype = global_types.get(name)
-                        if gtype in ("list", "dict", "str", "set", "tuple"):
+                        _GTYPE_VKIND = {"list": VKind.LIST, "dict": VKind.DICT,
+                                        "str": VKind.STR, "set": VKind.SET,
+                                        "tuple": VKind.TUPLE}
+                        if gtype in _GTYPE_VKIND:
                             gvar = ir.GlobalVariable(self.module, i8_ptr,
                                                      name=f"fastpy.global.{name}")
                             gvar.initializer = ir.Constant(i8_ptr, None)
                             gvar.linkage = "private"
-                            _elt = global_list_elem_types.get(name, "int")
-                            tag = gtype if gtype != "list" else f"list:{_elt}"
+                            if gtype == "list":
+                                _elt = global_list_elem_types.get(name, ValueType(VKind.INT))
+                                if not isinstance(_elt, ValueType):
+                                    _elt = ValueType(VKind.INT)
+                                tag = ValueType(VKind.LIST, elem_type=_elt)
+                            else:
+                                tag = ValueType(_GTYPE_VKIND[gtype])
                             self._global_vars[name] = (gvar, tag)
                         elif gtype == "float":
                             gvar = ir.GlobalVariable(self.module, double,
                                                      name=f"fastpy.global.{name}")
                             gvar.initializer = ir.Constant(double, 0.0)
                             gvar.linkage = "private"
-                            self._global_vars[name] = (gvar, "float")
+                            self._global_vars[name] = (gvar, ValueType(VKind.FLOAT))
                         else:
                             gvar = ir.GlobalVariable(self.module, i64,
                                                      name=f"fastpy.global.{name}")
                             gvar.initializer = ir.Constant(i64, 0)
                             gvar.linkage = "private"
-                            self._global_vars[name] = (gvar, "int")
+                            self._global_vars[name] = (gvar, ValueType(VKind.INT))
 
         # Pass 0.72: auto-create globals for module-level variables read from
         # functions. Python allows reading module-level vars without `global`.
@@ -2950,26 +2961,34 @@ class CodeGen:
                             and child.id not in local_assigns
                             and child.id not in self._global_vars):
                         gtype = global_types.get(child.id)
-                        if gtype in ("list", "dict", "str", "set", "tuple"):
+                        _GTYPE_VKIND2 = {"list": VKind.LIST, "dict": VKind.DICT,
+                                         "str": VKind.STR, "set": VKind.SET,
+                                         "tuple": VKind.TUPLE}
+                        if gtype in _GTYPE_VKIND2:
                             gvar = ir.GlobalVariable(self.module, i8_ptr,
                                                      name=f"fastpy.global.{child.id}")
                             gvar.initializer = ir.Constant(i8_ptr, None)
                             gvar.linkage = "private"
-                            _elt = global_list_elem_types.get(child.id, "int")
-                            tag = gtype if gtype != "list" else f"list:{_elt}"
+                            if gtype == "list":
+                                _elt = global_list_elem_types.get(child.id, ValueType(VKind.INT))
+                                if not isinstance(_elt, ValueType):
+                                    _elt = ValueType(VKind.INT)
+                                tag = ValueType(VKind.LIST, elem_type=_elt)
+                            else:
+                                tag = ValueType(_GTYPE_VKIND2[gtype])
                             self._global_vars[child.id] = (gvar, tag)
                         elif gtype == "float":
                             gvar = ir.GlobalVariable(self.module, double,
                                                      name=f"fastpy.global.{child.id}")
                             gvar.initializer = ir.Constant(double, 0.0)
                             gvar.linkage = "private"
-                            self._global_vars[child.id] = (gvar, "float")
+                            self._global_vars[child.id] = (gvar, ValueType(VKind.FLOAT))
                         else:
                             gvar = ir.GlobalVariable(self.module, i64,
                                                      name=f"fastpy.global.{child.id}")
                             gvar.initializer = ir.Constant(i64, 0)
                             gvar.linkage = "private"
-                            self._global_vars[child.id] = (gvar, "int")
+                            self._global_vars[child.id] = (gvar, ValueType(VKind.INT))
 
         # Pass 0.75: analyze call sites to determine parameter types
         self._call_site_param_types: dict[str, list[str | None]] = {}
@@ -3945,7 +3964,7 @@ class CodeGen:
                         cell_allocas[var_name] = cell_alloca
                         # Also mark the outer variable as cell-backed so
                         # inline calls to g() will read from the cell
-                        self.variables[var_name] = (cell_alloca, "cell")
+                        self.variables[var_name] = (cell_alloca, ValueType(VKind.CELL))
                     else:
                         val = self._load_variable(var_name, node)
                         if isinstance(val.type, ir.PointerType):
@@ -4068,12 +4087,12 @@ class CodeGen:
             self.builder.store(param, alloca)
             if pname in nonlocal_vars:
                 # Mutable capture — param is a cell pointer (i8*)
-                self.variables[pname] = (alloca, "cell")
+                self.variables[pname] = (alloca, ValueType(VKind.CELL))
             elif node.args.vararg and pname == node.args.vararg.arg:
                 # *args parameter — it's a list pointer (i8*)
-                self.variables[pname] = (alloca, "list:int")
+                self.variables[pname] = (alloca, ValueType(VKind.LIST, elem_type=ValueType(VKind.INT)))
             else:
-                self.variables[pname] = (alloca, "int")
+                self.variables[pname] = (alloca, ValueType(VKind.INT))
 
         self._emit_stmts(node.body)
 
@@ -4155,7 +4174,7 @@ class CodeGen:
             for param, pname in zip(func.args, param_names):
                 alloca = self.builder.alloca(param.type, name=pname)
                 self.builder.store(param, alloca)
-                self.variables[pname] = (alloca, "int")
+                self.variables[pname] = (alloca, ValueType(VKind.INT))
             result = self._emit_expr_value(node.body)
             expected_ret = func.return_value.type
             if result.type != expected_ret:
@@ -6334,7 +6353,7 @@ class CodeGen:
         for param, pname in zip(func.args, params):
             alloca = self.builder.alloca(param.type, name=pname)
             self.builder.store(param, alloca)
-            self.variables[pname] = (alloca, "int")
+            self.variables[pname] = (alloca, ValueType(VKind.INT))
 
         # Evaluate body and return
         result = self._emit_expr_value(lam.body)
@@ -8199,28 +8218,28 @@ class CodeGen:
                     scalar_kind = self._ANNOTATION_TO_VKIND.get(ann_name)
                     if scalar_kind is not None:
                         alloca, _ = self.variables[pname]
-                        self.variables[pname] = (alloca, scalar_kind.old_tag)
+                        self.variables[pname] = (alloca, ValueType(scalar_kind))
                         continue
                     # Bridge-imported types: from pathlib import Path, etc.
                     if ann_name in _native_imports:
                         mod, fn = _native_imports[ann_name]
                         if mod == "pathlib" and fn == "Path":
                             alloca, _ = self.variables[pname]
-                            self.variables[pname] = (alloca, "path")
+                            self.variables[pname] = (alloca, ValueType(VKind.PATH))
                         else:
                             # Other native-imported types → pyobj
                             alloca, _ = self.variables[pname]
-                            self.variables[pname] = (alloca, "pyobj")
+                            self.variables[pname] = (alloca, ValueType(VKind.PYOBJ))
                         continue
                     # User-defined class names → obj
                     if ann_name in self._user_classes:
                         alloca, _ = self.variables[pname]
-                        self.variables[pname] = (alloca, "obj")
+                        self.variables[pname] = (alloca, ValueType(VKind.OBJ))
                         continue
                     # Bare "Path" when pathlib is imported as module
                     if ann_name == "Path" and "pathlib" in getattr(self, '_native_modules', set()):
                         alloca, _ = self.variables[pname]
-                        self.variables[pname] = (alloca, "path")
+                        self.variables[pname] = (alloca, ValueType(VKind.PATH))
                         continue
 
                 # (c) Module-qualified annotations: pathlib.Path, etc.
@@ -8228,7 +8247,7 @@ class CodeGen:
                         and isinstance(ann.value, ast.Name)):
                     if ann.value.id == "pathlib" and ann.attr == "Path":
                         alloca, _ = self.variables[pname]
-                        self.variables[pname] = (alloca, "path")
+                        self.variables[pname] = (alloca, ValueType(VKind.PATH))
                         continue
 
     def _emit_function_def(self, node: ast.FunctionDef,
@@ -8413,7 +8432,7 @@ class CodeGen:
                     # raw function pointers via magic number).
                     if pname in self.variables:
                         alloca, _ = self.variables[pname]
-                        self.variables[pname] = (alloca, "closure")
+                        self.variables[pname] = (alloca, ValueType(VKind.CLOSURE))
 
         # Generator setup: create a list to collect yielded values
         is_gen = effective_name in self._generator_funcs
@@ -11634,7 +11653,7 @@ class CodeGen:
                 # Tagged "cls" so cls.attr access routes through class variable globals.
                 alloca = self.builder.alloca(param.type, name=pname)
                 self.builder.store(param, alloca)
-                self.variables[pname] = (alloca, "cls")
+                self.variables[pname] = (alloca, ValueType(VKind.CLS))
                 llvm_arg_idx += 1
                 continue
 
@@ -11646,7 +11665,7 @@ class CodeGen:
                 fv = self._fv_build_from_slots(tag_i32, data_param)
                 alloca = self.builder.alloca(fpy_val, name=pname)
                 self.builder.store(fv, alloca)
-                self.variables[pname] = (alloca, "int")  # generic tag
+                self.variables[pname] = (alloca, ValueType(VKind.INT))  # generic tag
                 llvm_arg_idx += 2
                 continue
 
@@ -12712,8 +12731,9 @@ class CodeGen:
             target_name = node.targets[0].id
             if target_name in self._list_append_types:
                 _et = self._list_append_types[target_name]
-                type_tag = ValueType(VKind.LIST, elem_type=(
-                    _et if isinstance(_et, ValueType) else ValueType.from_old_tag(_et)))
+                if not isinstance(_et, ValueType):
+                    _et = ValueType(VKind.INT)  # fallback; all new paths produce ValueType
+                type_tag = ValueType(VKind.LIST, elem_type=_et)
 
         # Track tuple element types for subscript dispatch
         if (type_tag.kind == VKind.TUPLE and len(node.targets) == 1
@@ -12721,9 +12741,9 @@ class CodeGen:
                 and isinstance(node.value, ast.Tuple) and node.value.elts):
             elts = node.value.elts
             if all(isinstance(e, ast.Constant) and isinstance(e.value, str) for e in elts):
-                self._tuple_elem_types[node.targets[0].id] = "str"
+                self._tuple_elem_types[node.targets[0].id] = ValueType(VKind.STR)
             elif all(isinstance(e, ast.Constant) and isinstance(e.value, float) for e in elts):
-                self._tuple_elem_types[node.targets[0].id] = "float"
+                self._tuple_elem_types[node.targets[0].id] = ValueType(VKind.FLOAT)
 
         # Track class name for object variables
         class_name = None
@@ -14881,30 +14901,31 @@ class CodeGen:
                                 return True
                         return False
                     if isinstance(arg, ast.List) and arg.elts and _has_any_float(arg.elts):
-                        self._list_append_types[var_name] = "list:float"
+                        self._list_append_types[var_name] = ValueType(VKind.LIST, elem_type=ValueType(VKind.FLOAT))
                     else:
-                        self._list_append_types[var_name] = "list"
+                        self._list_append_types[var_name] = ValueType(VKind.LIST)
                 elif isinstance(arg, ast.Tuple):
                     # Appending a tuple literal — tuple elements
-                    self._list_append_types[var_name] = "tuple"
+                    self._list_append_types[var_name] = ValueType(VKind.TUPLE)
                 elif isinstance(arg, (ast.Dict, ast.DictComp)):
                     # Appending a dict literal — dict elements
-                    self._list_append_types[var_name] = "dict"
+                    self._list_append_types[var_name] = ValueType(VKind.DICT)
                 elif isinstance(arg, ast.Name) and (arg.id in self._list_append_types or arg.id in list_vars):
                     # Appending a variable that is a list
-                    self._list_append_types[var_name] = "list"
+                    self._list_append_types[var_name] = ValueType(VKind.LIST)
                 elif isinstance(arg, ast.Call) and isinstance(arg.func, ast.Name):
                     _fn = arg.func.id
                     if _fn in self._user_classes:
-                        self._list_append_types[var_name] = "obj"
+                        self._list_append_types[var_name] = ValueType(VKind.OBJ)
                     elif _fn in self._user_functions:
                         _rt = self._user_functions[_fn].ret_tag
-                        if _rt in ("float", "str"):
-                            self._list_append_types[var_name] = _rt
+                        _RT_MAP = {"float": VKind.FLOAT, "str": VKind.STR}
+                        if _rt in _RT_MAP:
+                            self._list_append_types[var_name] = ValueType(_RT_MAP[_rt])
                     elif _fn == "float":
-                        self._list_append_types[var_name] = "float"
+                        self._list_append_types[var_name] = ValueType(VKind.FLOAT)
                     elif _fn == "str":
-                        self._list_append_types[var_name] = "str"
+                        self._list_append_types[var_name] = ValueType(VKind.STR)
                 elif (isinstance(arg, ast.Call)
                       and isinstance(arg.func, ast.Attribute)
                       and isinstance(arg.func.value, ast.Name)):
@@ -14913,13 +14934,13 @@ class CodeGen:
                     if (_mod in _imported_modules
                             and _mod not in self._NATIVE_MODULES
                             and _mod not in self._user_classes):
-                        self._list_append_types[var_name] = "pyobj"
+                        self._list_append_types[var_name] = ValueType(VKind.PYOBJ)
                 elif isinstance(arg, ast.Constant):
                     # String/float/bool constants propagate to element type
                     if isinstance(arg.value, str):
-                        self._list_append_types[var_name] = "str"
+                        self._list_append_types[var_name] = ValueType(VKind.STR)
                     elif isinstance(arg.value, float):
-                        self._list_append_types[var_name] = "float"
+                        self._list_append_types[var_name] = ValueType(VKind.FLOAT)
                 elif isinstance(arg, ast.BinOp):
                     # Arithmetic expression: x.append(a * 1.0) or
                     # x.append(0.0 - val) — detect float from operands
@@ -14936,32 +14957,33 @@ class CodeGen:
                                     and loop_var_types[_operand.id] == "float"):
                                 _is_float_binop = True
                     if _is_float_binop:
-                        self._list_append_types[var_name] = "float"
+                        self._list_append_types[var_name] = ValueType(VKind.FLOAT)
                 elif isinstance(arg, ast.UnaryOp) and isinstance(arg.op, ast.USub):
                     # Negation: x.append(-val) — detect float from operand
                     _inner = arg.operand
                     if (isinstance(_inner, ast.Constant)
                             and isinstance(_inner.value, float)):
-                        self._list_append_types[var_name] = "float"
+                        self._list_append_types[var_name] = ValueType(VKind.FLOAT)
                     elif (isinstance(_inner, ast.Name)
                           and _inner.id in local_var_types
                           and local_var_types[_inner.id] == "float"):
-                        self._list_append_types[var_name] = "float"
+                        self._list_append_types[var_name] = ValueType(VKind.FLOAT)
                 elif isinstance(arg, ast.JoinedStr):
-                    self._list_append_types[var_name] = "str"
+                    self._list_append_types[var_name] = ValueType(VKind.STR)
                 elif isinstance(arg, ast.Name):
                     # Appending a known-typed variable (loop var from str
                     # iteration, previously-assigned str var, etc.).
-                    if arg.id in loop_var_types:
-                        self._list_append_types[var_name] = loop_var_types[arg.id]
-                    elif arg.id in local_var_types:
-                        self._list_append_types[var_name] = local_var_types[arg.id]
+                    _LVT_MAP = {"str": VKind.STR, "float": VKind.FLOAT}
+                    if arg.id in loop_var_types and loop_var_types[arg.id] in _LVT_MAP:
+                        self._list_append_types[var_name] = ValueType(_LVT_MAP[loop_var_types[arg.id]])
+                    elif arg.id in local_var_types and local_var_types[arg.id] in _LVT_MAP:
+                        self._list_append_types[var_name] = ValueType(_LVT_MAP[local_var_types[arg.id]])
                     elif arg.id in self.variables:
                         _vk = self._var_kind(arg.id)
                         if _vk == VKind.STR:
-                            self._list_append_types[var_name] = "str"
+                            self._list_append_types[var_name] = ValueType(VKind.STR)
                         elif _vk == VKind.FLOAT:
-                            self._list_append_types[var_name] = "float"
+                            self._list_append_types[var_name] = ValueType(VKind.FLOAT)
 
     def _infer_list_elem_type(self, node: ast.expr) -> 'ValueType':
         """Infer the element type of a list expression.
@@ -16174,7 +16196,7 @@ class CodeGen:
                 # Store it so subsequent accesses don't re-resolve
                 alloca = self._create_entry_alloca(i32, name)
                 self.builder.store(class_id, alloca)
-                self.variables[name] = (alloca, "cls")
+                self.variables[name] = (alloca, ValueType(VKind.CLS))
             elif name in ("str", "int", "float", "bool", "list", "dict",
                          "tuple", "set", "type", "object", "bytes",
                          "None", "True", "False", "Exception",
@@ -16218,7 +16240,7 @@ class CodeGen:
                 val = ir.Constant(i64, 1)
                 alloca = self._create_entry_alloca(i64, "__debug__")
                 self.builder.store(val, alloca)
-                self.variables["__debug__"] = (alloca, "bool")
+                self.variables["__debug__"] = (alloca, ValueType(VKind.BOOL))
                 return val
             elif name in ("__name__", "__file__", "__doc__",
                           "__loader__", "__spec__", "__package__",
@@ -17377,7 +17399,7 @@ class CodeGen:
                     ir.Constant(fpy_val, ir.Undefined), tag_val, 0)
                 tmp = self.builder.insert_value(tmp, rest_data, 1)
                 self.builder.store(tmp, rest_fv)
-                self.variables[pattern.rest] = (rest_fv, "dict")
+                self.variables[pattern.rest] = (rest_fv, ValueType(VKind.DICT))
 
             last_check = self.builder.block
             self.builder.branch(done_block)
@@ -23334,14 +23356,15 @@ class CodeGen:
             if isinstance(type_tag, ValueType) and type_tag.elem_type is not None:
                 return type_tag.elem_type
             # Legacy fallback: parse string tag for colon-separated types.
-            # Use maxsplit=1 so compound types like "list:list:float"
-            # peel one layer → "list:float".
+            # This path only fires for the rare case where a variable still
+            # has a legacy string tag with compound types (e.g. "list:float").
+            # Will become dead code once all upstream sources produce ValueType.
             if isinstance(type_tag, str) and ":" in type_tag:
                 return ValueType.from_old_tag(type_tag.split(":", 1)[1])
             # For tuples, check the literal definition for element type
             if self._tag_kind(type_tag) == VKind.TUPLE and node.id in self._tuple_elem_types:
                 _tet = self._tuple_elem_types[node.id]
-                return _tet if isinstance(_tet, ValueType) else ValueType.from_old_tag(_tet)
+                return _tet if isinstance(_tet, ValueType) else ValueType(VKind.INT)
         # .values(), .items(), .keys() return lists of tagged values / strings.
         # items() returns tuples (list with is_tuple=1).
         # keys() returns strings (or ints for int-keyed dicts).
@@ -29197,16 +29220,16 @@ class CodeGen:
             ptr = self._ensure_ptr(func.args[0])
             alloca = self.builder.alloca(i8_ptr, name=param_name)
             self.builder.store(ptr, alloca)
-            self.variables[param_name] = (alloca, "str")
+            self.variables[param_name] = (alloca, ValueType(VKind.STR))
         elif param_kind == VKind.LIST:
             ptr = self._ensure_ptr(func.args[0])
             alloca = self.builder.alloca(i8_ptr, name=param_name)
             self.builder.store(ptr, alloca)
-            self.variables[param_name] = (alloca, "list:int")
+            self.variables[param_name] = (alloca, ValueType(VKind.LIST, elem_type=ValueType(VKind.INT)))
         else:
             alloca = self.builder.alloca(i64, name=param_name)
             self.builder.store(func.args[0], alloca)
-            self.variables[param_name] = (alloca, "int")
+            self.variables[param_name] = (alloca, ValueType(VKind.INT))
 
         # Emit the body expression and return it
         result = self._emit_expr_value(lam.body)
