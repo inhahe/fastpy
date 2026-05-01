@@ -14020,7 +14020,7 @@ class CodeGen:
         # Attribute access on pyobj/native_mod that goes through bridge → pyobj
         if (isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name)
                 and node.value.id in self.variables
-                and self.variables[node.value.id][1] in ("pyobj", "native_mod")):
+                and self._var_kind(node.value.id) == VKind.PYOBJ):
             # Check if we handle this attribute natively
             if self._var_kind(node.value.id) == VKind.PYOBJ:
                 val = self._emit_native_module_attr(node.value.id, node.attr)
@@ -25097,8 +25097,7 @@ class CodeGen:
             # resolved correctly inside functions, not just at module scope.
             _is_pyobj_var = (isinstance(node.value, ast.Name)
                              and node.value.id in self.variables
-                             and self.variables[node.value.id][1] in (
-                                 "pyobj", "native_mod"))
+                             and self._var_kind(node.value.id) == VKind.PYOBJ)
             _is_module_import = (isinstance(node.value, ast.Name)
                                  and node.value.id in self._cpython_modules)
             if _is_pyobj_var or _is_module_import:
