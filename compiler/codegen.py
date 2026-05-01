@@ -13168,13 +13168,15 @@ class CodeGen:
         phi = self.builder.phi(i64, "lget.val")
         phi.add_incoming(ir.Constant(i64, 0), bb_err_end)
         phi.add_incoming(data, bb_ok_end)
-        if elem_type == "float":
+        _ek = (elem_type.kind if isinstance(elem_type, ValueType)
+               else ValueType.from_old_tag(elem_type).kind)
+        if _ek == VKind.FLOAT:
             return self.builder.bitcast(phi, double)
         return phi
 
     def _inline_list_get_no_bounds(self, list_ptr: ir.Value,
                                      index: ir.Value,
-                                     elem_type: str) -> ir.Value:
+                                     elem_type: 'str | ValueType') -> ir.Value:
         """Emit inline list element read WITHOUT bounds checking.
 
         Used inside for-loops where the index is already guaranteed to be
@@ -13198,7 +13200,9 @@ class CodeGen:
             [ir.Constant(i32, 0), ir.Constant(i32, 1)],
             inbounds=True)
         data = self.builder.load(data_addr)
-        if elem_type == "float":
+        _ek = (elem_type.kind if isinstance(elem_type, ValueType)
+               else ValueType.from_old_tag(elem_type).kind)
+        if _ek == VKind.FLOAT:
             return self.builder.bitcast(data, double)
         return data
 
@@ -25716,8 +25720,7 @@ class CodeGen:
             if isinstance(_arg0, ast.Constant) and isinstance(_arg0.value, str):
                 _arg_is_str = True
             elif isinstance(_arg0, ast.Name) and _arg0.id in self.variables:
-                _, _tag = self.variables[_arg0.id]
-                if (isinstance(_tag, ValueType) and _tag.kind == VKind.STR) or _tag == "str":
+                if self._var_kind(_arg0.id) == VKind.STR:
                     _arg_is_str = True
             if _arg_is_str:
                 return self._rt_call("enumerate_str", [lst, start])
@@ -26666,8 +26669,7 @@ class CodeGen:
             return data
         # __call__ on user-class objects — use direct dispatch for correct types
         if isinstance(node.func, ast.Name) and node.func.id in self.variables:
-            _, tag = self.variables[node.func.id]
-            if tag == "obj":
+            if self._var_kind(node.func.id) == VKind.OBJ:
                 obj_cls = self._obj_var_class.get(node.func.id)
                 if obj_cls and self._class_has_method(obj_cls, "__call__"):
                     # Direct dispatch to __call__
@@ -30854,11 +30856,12 @@ class CodeGen:
                     and isinstance(node.slice.value, str)):
                 key_type = self._dict_var_key_types[base_name].get(
                     node.slice.value)
-                if key_type == "int" or key_type == "bool":
+                _ktk = ValueType.from_old_tag(key_type).kind
+                if _ktk in (VKind.INT, VKind.BOOL):
                     return data
-                if key_type == "float":
+                if _ktk == VKind.FLOAT:
                     return self.builder.bitcast(data, double)
-                if key_type in ("str", "list", "dict", "obj"):
+                if _ktk.is_ptr:
                     return self.builder.inttoptr(data, i8_ptr)
             # If the dict is known to hold ints, return the data as i64
             if base_name is not None and base_name in self._dict_var_int_values:
@@ -32091,8 +32094,7 @@ class CodeGen:
                         if isinstance(value.value, ast.Constant) and isinstance(value.value.value, str):
                             val_type = "str"
                         elif isinstance(value.value, ast.Name) and value.value.id in self.variables:
-                            _, tag = self.variables[value.value.id]
-                            if tag == "str":
+                            if self._var_kind(value.value.id) == VKind.STR:
                                 val_type = "str"
                         elif isinstance(value.value, ast.JoinedStr):
                             val_type = "str"
