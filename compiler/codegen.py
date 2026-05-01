@@ -7144,11 +7144,17 @@ class CodeGen:
             if _has_ptr_return:
                 # Mixed return types: use i64 (FpyValue ABI handles tag dispatch)
                 ret_type = i64
-            if not _has_ptr_return:
+            if not _has_ptr_return and not float_params:
                 # Also check for float+int mixed returns (e.g. try: return 1/x
                 # except: return -1). If ret_type is double but some returns are
                 # plain integer constants/expressions, downgrade to i64 so the
                 # caller can print int vs float correctly.
+                #
+                # Skip this downgrade when float_params is non-empty: that
+                # means we're in a float specialization of a monomorphized
+                # function, where `return 0` is just a base case that will
+                # be promoted to double at the return site. Downgrading to
+                # i64 here would cause fptosi truncation at every recursion.
                 _has_int_return = False
                 for n in ast.walk(node):
                     if id(n) in _nested_ids:
