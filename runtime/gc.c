@@ -130,11 +130,12 @@ static void gc_visit_refs(FpyGCNode *node, gc_visitor_fn visitor) {
         }
         case FPY_GC_TYPE_OBJ: {
             FpyObj *obj = (FpyObj*)container;
-            if (obj->slots) {
-                extern FpyClassDef fpy_classes[];
-                int sc = fpy_classes[obj->class_id].slot_count;
+            extern FpyClassDef fpy_classes[];
+            int sc = fpy_classes[obj->class_id].slot_count;
+            if (sc > 0) {
+                FpyValue *slots = FPY_OBJ_SLOTS(obj);
                 for (int i = 0; i < sc; i++) {
-                    FpyGCNode *ref = gc_node_from_value(obj->slots[i]);
+                    FpyGCNode *ref = gc_node_from_value(slots[i]);
                     if (ref && (ref->gc_flags & FPY_GC_TRACKED))
                         visitor(ref);
                 }

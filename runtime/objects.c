@@ -9,9 +9,10 @@
 #include <math.h>
 
 /* The codegen computes inline slot addresses as (FpyValue*)(obj + 1) + idx,
- * relying on sizeof(FpyObj) == 104 on x64.  If the struct layout changes,
- * this will fire at compile time rather than silently corrupting memory. */
-static_assert(sizeof(FpyObj) == 104,
+ * relying on sizeof(FpyObj) == 96 on x64 (after slots pointer removal).
+ * If the struct layout changes, this will fire at compile time rather than
+ * silently corrupting memory. */
+static_assert(sizeof(FpyObj) == 96,
     "FpyObj size changed -- update fpy_obj_type in codegen.py to match");
 static_assert(sizeof(FpyValue) == 16,
     "FpyValue size changed -- update fpy_val_type in codegen.py to match");
@@ -231,10 +232,10 @@ void fpy_rc_decref(int32_t tag, int64_t data) {
                             wr = next;
                         }
                         /* Free slots (decref each), dynamic_attrs, and the obj */
-                        if (obj->slots) {
+                        {
                             int sc = fpy_classes[obj->class_id].slot_count;
                             for (int i = 0; i < sc; i++)
-                                FPY_VAL_DECREF(obj->slots[i]);
+                                FPY_VAL_DECREF(FPY_OBJ_SLOTS(obj)[i]);
                             /* slots are contiguous with obj (malloc'd together), don't free separately */
                         }
                         if (obj->dynamic_attrs) {
@@ -5594,16 +5595,14 @@ FpyObj* fastpy_obj_new(int class_id) {
     obj->dynamic_attrs = NULL;
     obj->weakref_list = NULL;
     if (sc > 0) {
-        obj->slots = (FpyValue*)(obj + 1);
+        FpyValue *slots = FPY_OBJ_SLOTS(obj);
         for (int i = 0; i < sc; i++) {
-            obj->slots[i].tag = FPY_TAG_NONE;
-            obj->slots[i].data.i = 0;
+            slots[i].tag = FPY_TAG_NONE;
+            slots[i].data.i = 0;
         }
-    } else {
-        obj->slots = NULL;
     }
     /* Track AFTER the object is fully initialized — gc_maybe_collect may
-     * traverse this object's slots, so magic/class_id/slots must be valid. */
+     * traverse this object's slots, so magic/class_id must be valid. */
     memset(&obj->gc_node, 0, sizeof(FpyGCNode));
     obj->gc_node.gc_type = FPY_GC_TYPE_OBJ;
     fpy_gc_track(&obj->gc_node);
@@ -5617,17 +5616,19 @@ FpyObj* fastpy_obj_new(int class_id) {
 /* Fast-path static slot access. Slot index is known at compile time.
  * Manages refcounts: increfs the new value, decrefs the old. */
 void fastpy_obj_set_slot(FpyObj *obj, int slot, int32_t tag, int64_t data) {
-    FpyValue old = obj->slots[slot];
+    FpyValue *slots = FPY_OBJ_SLOTS(obj);
+    FpyValue old = slots[slot];
     fpy_rc_incref(tag, data);
-    obj->slots[slot].tag = tag;
-    obj->slots[slot].data.i = data;
+    slots[slot].tag = tag;
+    slots[slot].data.i = data;
     fpy_rc_decref(old.tag, old.data.i);
 }
 
 void fastpy_obj_get_slot(FpyObj *obj, int slot,
                           int32_t *out_tag, int64_t *out_data) {
-    *out_tag = obj->slots[slot].tag;
-    *out_data = obj->slots[slot].data.i;
+    FpyValue *slots = FPY_OBJ_SLOTS(obj);
+    *out_tag = slots[slot].tag;
+    *out_data = slots[slot].data.i;
 }
 
 /* Set an attribute on an object */
@@ -5643,8 +5644,9 @@ void fastpy_obj_set_fv(FpyObj *obj, const char *name, int32_t tag, int64_t data)
     /* Check static slots first (covers all compiler-known attrs) */
     int slot = fpy_find_slot(obj->class_id, name);
     if (slot >= 0) {
-        FpyValue old = obj->slots[slot];
-        obj->slots[slot] = v;
+        FpyValue *slots = FPY_OBJ_SLOTS(obj);
+        FpyValue old = slots[slot];
+        slots[slot] = v;
         fpy_rc_decref(old.tag, old.data.i);
         return;
     }
@@ -5680,8 +5682,9 @@ void fastpy_obj_get_fv(FpyObj *obj, const char *name, int32_t *out_tag, int64_t 
     /* Check static slots first */
     int slot = fpy_find_slot(obj->class_id, name);
     if (slot >= 0) {
-        *out_tag = obj->slots[slot].tag;
-        *out_data = obj->slots[slot].data.i;
+        FpyValue *slots = FPY_OBJ_SLOTS(obj);
+        *out_tag = slots[slot].tag;
+        *out_data = slots[slot].data.i;
         return;
     }
     /* Dynamic attr fallback */

@@ -41,27 +41,26 @@ fpy_val_ptr = ir.PointerType(fpy_val)
 # side-table so FpyObj is ~24 bytes (was ~1560). Used for direct-struct
 # IR access to obj->slots[idx] (skips the fastpy_obj_get_slot /
 # fastpy_obj_set_slot function call overhead).
-# FpyObj layout on x64 (MSVC, sizeof=104):
+# FpyObj layout on x64 (MSVC, sizeof=96):
 #   offset  0: i32 refcount  (+4 pad)
 #   offset  8: FpyGCNode (24 bytes: gc_prev, gc_next, gc_refs+flags)
 #   offset 32: i32 magic + i32 class_id
-#   offset 40: ptr slots
-#   offset 48: ptr dynamic_attrs
-#   offset 56: ptr weakref_list
-#   offset 64: CRITICAL_SECTION lock (40 bytes)
-# Represent as i64-sized fields to match alignment. ALL fields must be
-# present so that sizeof(fpy_obj_type) == sizeof(FpyObj) — this is
-# required for the inline-slot optimization (GEP obj, [1] → first slot).
+#   offset 40: ptr dynamic_attrs
+#   offset 48: ptr weakref_list
+#   offset 56: CRITICAL_SECTION lock (40 bytes)
+# NOTE: the 'slots' pointer field was removed — slots are always inline
+# at (obj + 1), accessed via GEP arithmetic (zero pointer loads).
+# ALL fields must be present so that sizeof(fpy_obj_type) == sizeof(FpyObj)
+# — required for the inline-slot optimization (GEP obj, [1] → first slot).
 fpy_obj_type = ir.LiteralStructType([
     i64,                             # 0: refcount (i32) + padding = 8
     i64,                             # 1: gc_node.gc_prev
     i64,                             # 2: gc_node.gc_next
     i64,                             # 3: gc_node.gc_refs (i32) + gc_flags+gc_type (i32)
     i64,                             # 4: magic (i32) + class_id (i32)
-    fpy_val_ptr,                     # 5: slots
-    i8_ptr,                          # 6: dynamic_attrs
-    i8_ptr,                          # 7: weakref_list
-    ir.ArrayType(i64, 5),            # 8: lock (CRITICAL_SECTION = 40 bytes on x64)
+    i8_ptr,                          # 5: dynamic_attrs
+    i8_ptr,                          # 6: weakref_list
+    ir.ArrayType(i64, 5),            # 7: lock (CRITICAL_SECTION = 40 bytes on x64)
 ])
 fpy_obj_ptr = ir.PointerType(fpy_obj_type)
 
