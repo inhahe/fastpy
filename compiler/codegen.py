@@ -13757,10 +13757,17 @@ class CodeGen:
                 and isinstance(value_node, ast.Name)
                 and value_node.id in self.variables):
             alloca_var, var_tag = self.variables[value_node.id]
-            _vk = ValueType.from_old_tag(var_tag).kind
-            if (_vk in (VKind.OBJ, VKind.NONE)
-                    and isinstance(alloca_var.type, ir.PointerType)
+            if (isinstance(alloca_var.type, ir.PointerType)
                     and alloca_var.type.pointee is fpy_val):
+                # FpyValue alloca: load the runtime tag + data and store
+                # both into the slot.  This preserves the correct runtime
+                # type for mixed-type parameters (e.g., __init__ param
+                # `data` that receives lists, dicts, or strings depending
+                # on the call site).  Previously this path only handled
+                # VKind.OBJ/NONE; expanding to all VKinds fixes the bug
+                # where `self.data = data` with a list param stored
+                # tag=INT instead of tag=LIST, causing len(obj.data) to
+                # return 0.
                 slot_idx = self._get_attr_slot(target)
                 if slot_idx is not None:
                     fv = self.builder.load(alloca_var, name=f"{value_node.id}.fv")
@@ -13768,8 +13775,8 @@ class CodeGen:
                     data_val = self.builder.extract_value(fv, 1)
                     # Incref the value being stored — the variable's
                     # alloca holds a borrowed reference; the slot needs
-                    # its own.  rc_incref is safe for NONE (data=0 →
-                    # early return) and for OBJ (valid pointer).
+                    # its own.  rc_incref is a no-op for scalars (INT,
+                    # FLOAT, BOOL, NONE), safe for all heap types.
                     self.builder.call(self.runtime["rc_incref"],
                                       [tag_val, data_val])
                     self._emit_slot_set_direct(
@@ -21694,7 +21701,144 @@ class CodeGen:
         else:
             return self._bridge_fallback_expr(node, f"constructor with {n_args} args (max 4)")
 
+        # ── Call-site slot tag patch ───────────────────────────��──────
+        # Class methods receive params as bare i64 (no tag). When call-site
+        # types conflict (list vs dict vs str), the merged type is None and
+        # the __init__ body stamps the static tag (INT) into the slot. That
+        # is wrong for pointer-type values. Fix: after __init__ returns,
+        # overwrite each affected slot's tag with the correct runtime value
+        # known at the call site.
+        self._patch_init_slot_tags(cls_info, class_name, node, n_args, obj,
+                                   init_args)
+
         return obj
+
+    def _patch_init_slot_tags(self, cls_info, class_name: str,
+                               node: ast.Call, n_args: int,
+                               obj: ir.Value,
+                               init_args: list[ir.Value]) -> None:
+        """Overwrite slot tags that __init__ may have stamped incorrectly.
+
+        When __init__ params have conflicting call-site types (e.g. data
+        receives list, dict, and str across different call sites), the
+        merged type is None and the method body defaults to tag=INT.  The
+        caller knows the correct type — patch the slot directly.
+
+        Only fires when:
+        * The class has a user-defined __init__ with AST available
+        * The __init__ contains simple ``self.attr = param`` patterns
+        * The argument's static VKind differs from INT (lists, dicts, strs)
+        """
+        init_ast = cls_info.method_asts.get("__init__")
+        if init_ast is None:
+            return
+        class_slots = self._class_attr_slots.get(class_name, {})
+        if not class_slots:
+            return
+
+        # Build mapping: user_arg_index → slot_index for
+        # ``self.attr = param`` assignments in __init__.
+        init_params = [a.arg for a in init_ast.args.args]  # includes 'self'
+        param_to_slot: dict[int, int] = {}
+        for stmt in init_ast.body:
+            if (isinstance(stmt, ast.Assign)
+                    and len(stmt.targets) == 1
+                    and isinstance(stmt.targets[0], ast.Attribute)
+                    and isinstance(stmt.targets[0].value, ast.Name)
+                    and stmt.targets[0].value.id == "self"
+                    and isinstance(stmt.value, ast.Name)
+                    and stmt.value.id in init_params
+                    and stmt.value.id != "self"):
+                attr_name = stmt.targets[0].attr
+                param_name = stmt.value.id
+                if attr_name in class_slots:
+                    param_idx = init_params.index(param_name) - 1  # -1 for self
+                    param_to_slot[param_idx] = class_slots[attr_name]
+
+        if not param_to_slot:
+            return
+
+        # Check if any of the mapped params have a conflicting call-site
+        # type (merged to None). Only patch in that case.
+        method_call_types = self._call_site_param_types.get(
+            class_name, [])
+        has_conflict = False
+        for pidx in param_to_slot:
+            if pidx >= len(method_call_types) or method_call_types[pidx] is None:
+                has_conflict = True
+                break
+        if not has_conflict:
+            return
+
+        n_provided = len(node.args)
+        for arg_idx in range(min(n_provided, n_args)):
+            if arg_idx not in param_to_slot:
+                continue
+            slot_idx = param_to_slot[arg_idx]
+            arg_node = node.args[arg_idx]
+
+            # Get the runtime tag for this argument.
+            tag_val = self._infer_arg_runtime_tag(arg_node)
+            if tag_val is None:
+                continue
+
+            # Data is already in init_args[arg_idx]; ensure it's i64.
+            data_val = init_args[arg_idx]
+            if isinstance(data_val.type, ir.PointerType):
+                data_val = self.builder.ptrtoint(data_val, i64)
+            elif isinstance(data_val.type, ir.DoubleType):
+                data_val = self.builder.bitcast(data_val, i64)
+            elif isinstance(data_val.type, ir.IntType) and data_val.type.width != 64:
+                data_val = self.builder.zext(data_val, i64)
+
+            self._emit_slot_set_direct(obj, slot_idx, tag_val, data_val)
+
+    def _infer_arg_runtime_tag(self, node: ast.expr) -> 'ir.Value | None':
+        """Return an i32 IR value with the correct FPY_TAG for *node*.
+
+        For literals and known-type expressions, returns a compile-time
+        constant. For variables stored as FpyValue, loads the runtime tag
+        from the alloca. Returns None when the tag can't be determined.
+        """
+        # Literal containers
+        if isinstance(node, (ast.List, ast.ListComp)):
+            return ir.Constant(i32, FPY_TAG_LIST)
+        if isinstance(node, ast.Tuple):
+            return ir.Constant(i32, FPY_TAG_LIST)
+        if isinstance(node, (ast.Dict, ast.DictComp)):
+            return ir.Constant(i32, FPY_TAG_DICT)
+        if isinstance(node, (ast.Set, ast.SetComp)):
+            return ir.Constant(i32, FPY_TAG_SET)
+
+        # Constants
+        if isinstance(node, ast.Constant):
+            if isinstance(node.value, str):
+                return ir.Constant(i32, FPY_TAG_STR)
+            if isinstance(node.value, bool):
+                return ir.Constant(i32, FPY_TAG_BOOL)
+            if isinstance(node.value, int):
+                return ir.Constant(i32, FPY_TAG_INT)
+            if isinstance(node.value, float):
+                return ir.Constant(i32, FPY_TAG_FLOAT)
+            if node.value is None:
+                return ir.Constant(i32, FPY_TAG_NONE)
+            if isinstance(node.value, bytes):
+                return ir.Constant(i32, FPY_TAG_BYTES)
+
+        # Variable with FpyValue alloca: load the runtime tag.
+        if isinstance(node, ast.Name) and node.id in self.variables:
+            alloca, _ = self.variables[node.id]
+            if (isinstance(alloca.type, ir.PointerType)
+                    and alloca.type.pointee is fpy_val):
+                fv = self.builder.load(alloca, name=f"{node.id}.tag.fv")
+                return self.builder.extract_value(fv, 0, name=f"{node.id}.tag")
+
+        # Constructor call → OBJ
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            if node.func.id in self._user_classes:
+                return ir.Constant(i32, FPY_TAG_OBJ)
+
+        return None
 
     def _emit_lru_cached_call(self, node: ast.Call, name: str) -> ir.Value:
         """Emit a call to an @lru_cache decorated function with caching.
@@ -28645,7 +28789,23 @@ class CodeGen:
             return self.builder.call(self.runtime["deque_length"],
                                       [tv.as_ptr(self.builder)])
 
-        # Fast paths based on known type
+        # Attribute reference: load the full FpyValue from the object slot
+        # to get the runtime tag.  This MUST come before the static fast
+        # paths because the prescan may have assigned the wrong VKind when
+        # the same class is instantiated with different attribute types
+        # (e.g. Box([1,2,3]) and Box("hello") — the static VKind for
+        # `data` might be STR when the runtime value is LIST).
+        if isinstance(arg_node, ast.Attribute):
+            slot_idx = self._get_attr_slot(arg_node)
+            if slot_idx is not None:
+                recv = self._emit_expr_value(arg_node.value)
+                recv = self._ensure_ptr(recv)
+                s_tag, s_data = self._emit_slot_get_direct(recv, slot_idx)
+                return self.builder.call(
+                    self.runtime["fv_len"], [s_tag, s_data])
+
+        # Fast paths based on known type (safe for Name variables and
+        # expressions where the static VKind is reliable).
         if kind in (VKind.LIST, VKind.TUPLE):
             return self._rt_call("list_length", [tv.as_ptr(self.builder)])
         if kind in (VKind.DICT, VKind.SET):
