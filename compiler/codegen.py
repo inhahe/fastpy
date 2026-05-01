@@ -7155,7 +7155,9 @@ class CodeGen:
                         if isinstance(sub, ast.Name) and sub.id in param_names:
                             pidx = param_names.index(sub.id)
                             if (pidx < len(call_types)
-                                    and call_types[pidx] == "str"):
+                                    and call_types[pidx] is not None
+                                    and ValueType.from_old_tag(
+                                        call_types[pidx]).kind == VKind.STR):
                                 returns_str = True
                                 break
                         # Subscript on a str-valued param container
