@@ -186,6 +186,12 @@ class VKind(Enum):
         }.get(self, "int")
 
 
+# Grouped VKind sets for dispatch: list-like containers (support iteration,
+# append, len), dict-like containers (support key lookup, items, values).
+_LIST_LIKE = (VKind.LIST, VKind.TUPLE, VKind.DEQUE)
+_DICT_LIKE = (VKind.DICT, VKind.COUNTER, VKind.DEFAULTDICT)
+
+
 class ValueType:
     """Static type information for a compiled value.
 
@@ -236,6 +242,8 @@ class ValueType:
             return self._to_tag() == other
         if isinstance(other, ValueType):
             return self.kind == other.kind and self.elem_type == other.elem_type
+        if isinstance(other, VKind):
+            return self.kind == other
         return NotImplemented
 
     def __ne__(self, other):
@@ -284,15 +292,16 @@ class ValueType:
             "complex": VKind.COMPLEX, "bigint": VKind.BIGINT,
             "bytes": VKind.BYTES, "closure": VKind.CLOSURE,
             "mixed": VKind.MIXED,
-            # Aliases: map to parent kind for backward compatibility with
-            # _var_kind() checks.  Direct VKind variants (COUNTER, DEQUE,
-            # etc.) are used by code that explicitly stores those tags.
+            # Aliases: map specialized types to parent kinds to preserve
+            # existing _var_kind() == VKind.DICT/LIST checks.  The
+            # _is_deque_expr/_is_counter_expr helpers check raw string tags
+            # for type-specific dispatch.
             "counter": VKind.DICT, "defaultdict": VKind.DICT,
             "deque": VKind.LIST,
             "chainmap": VKind.OBJ, "logger": VKind.OBJ,
             "ptr": VKind.LIST, "ptr:list": VKind.LIST,
-            "path": VKind.PYOBJ, "native_func": VKind.UNKNOWN,
-            "native_mod": VKind.PYOBJ, "cls": VKind.INT,
+            "path": VKind.PYOBJ, "native_func": VKind.NATIVE_FUNC,
+            "native_mod": VKind.NATIVE_MOD, "cls": VKind.INT,
             "cell": VKind.UNKNOWN, "namedtuple_type": VKind.INT,
         }
         if tag.startswith("list"):
@@ -7741,8 +7750,8 @@ class CodeGen:
                         # bigint, decimal, closure, counter, defaultdict,
                         # deque, path, native_mod, logger
                         tag = call_tag
-                    elif call_tag == "mixed":
-                        tag = "mixed"  # VKind.UNKNOWN — runtime dispatch
+                    elif ValueType.from_old_tag(call_tag).kind == VKind.MIXED:
+                        tag = "mixed"  # VKind.MIXED — runtime dispatch
                     else:
                         # Check if this param has conflicting types across
                         # call sites (cleared by post-merge cleanup). If so,
@@ -7914,7 +7923,7 @@ class CodeGen:
                     alloca, _ = self.variables[pname]
                     self.variables[pname] = (alloca, container_tag)
                     # Dict value type tracking: extract from annotation node
-                    if (container_tag == "dict"
+                    if (ValueType.from_old_tag(container_tag).kind == VKind.DICT
                             and isinstance(ast_arg.annotation, ast.Subscript)
                             and isinstance(ast_arg.annotation.slice, ast.Tuple)
                             and len(ast_arg.annotation.slice.elts) == 2):
@@ -11456,7 +11465,7 @@ class CodeGen:
                 # branch so the FV gets NONE tag instead of OBJ tag with a
                 # null pointer. Without this, `self.attr = param` stores
                 # {OBJ, 0} and `obj.attr is None` returns False.
-                if tag == "obj" and isinstance(param.type, ir.IntType):
+                if ValueType.from_old_tag(tag).kind == VKind.OBJ and isinstance(param.type, ir.IntType):
                     is_null = self.builder.icmp_unsigned(
                         "==", param, ir.Constant(param.type, 0))
                     fv_none = self._fv_none()
@@ -11858,15 +11867,12 @@ class CodeGen:
                         alloca, _ = self.variables[varname]
                         self.variables[varname] = (alloca, container_tag)
                     # Dict value type tracking: extract from annotation node
-                    if (container_tag == "dict"
+                    if (ValueType.from_old_tag(container_tag).kind == VKind.DICT
                             and isinstance(node.annotation, ast.Subscript)
                             and isinstance(node.annotation.slice, ast.Tuple)
                             and len(node.annotation.slice.elts) == 2):
                         val_kind = self._parse_annotation(node.annotation.slice.elts[1])
-                        _vk_map = {VKind.INT: "int", VKind.STR: "str",
-                                   VKind.FLOAT: "float"}
-                        val_tag = _vk_map.get(val_kind)
-                        if val_tag == "int":
+                        if val_kind == VKind.INT:
                             self._dict_var_int_values.add(varname)
                         val_nested = self._parse_container_annotation(
                             node.annotation.slice.elts[1])
@@ -12454,7 +12460,7 @@ class CodeGen:
                 type_tag = f"list:{self._list_append_types[target_name]}"
 
         # Track tuple element types for subscript dispatch
-        if (type_tag == "tuple" and len(node.targets) == 1
+        if (ValueType.from_old_tag(type_tag).kind == VKind.TUPLE and len(node.targets) == 1
                 and isinstance(node.targets[0], ast.Name)
                 and isinstance(node.value, ast.Tuple) and node.value.elts):
             elts = node.value.elts
@@ -13575,7 +13581,8 @@ class CodeGen:
                 and isinstance(value_node, ast.Name)
                 and value_node.id in self.variables):
             alloca_var, var_tag = self.variables[value_node.id]
-            if (var_tag in ("obj", "none")
+            _vk = ValueType.from_old_tag(var_tag).kind
+            if (_vk in (VKind.OBJ, VKind.NONE)
                     and isinstance(alloca_var.type, ir.PointerType)
                     and alloca_var.type.pointee is fpy_val):
                 slot_idx = self._get_attr_slot(target)
@@ -14007,7 +14014,7 @@ class CodeGen:
         # Direct call of pyobj or native_func variable that goes through bridge
         if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
                 and node.func.id in self.variables
-                and self.variables[node.func.id][1] in ("pyobj", "native_func")):
+                and self._var_kind(node.func.id) in (VKind.PYOBJ, VKind.NATIVE_FUNC)):
             # native_func: if the native handler didn't handle it, result is pyobj
             native_imports = getattr(self, '_native_imports', {})
             if node.func.id in native_imports:
@@ -16140,11 +16147,8 @@ class CodeGen:
         # (never decref'd) and the last element gets an unbalanced
         # decref from scope_decref.
         # Scalar fast path: skip for int/float/bool (value types, no heap).
-        _is_scalar_elem = (isinstance(type_tag, ValueType)
-                           and type_tag.kind in (VKind.INT, VKind.FLOAT,
-                                                 VKind.BOOL))
-        if not _is_scalar_elem and isinstance(type_tag, str):
-            _is_scalar_elem = type_tag in ("int", "float", "bool")
+        _is_scalar_elem = ValueType.from_old_tag(type_tag).kind in (
+            VKind.INT, VKind.FLOAT, VKind.BOOL)
         if self._USE_REFCOUNT and not _is_scalar_elem:
             old_fv = self.builder.load(alloca)
             old_tag = self.builder.extract_value(old_fv, 0)
@@ -20262,8 +20266,7 @@ class CodeGen:
         if isinstance(other, ast.Constant) and other.value is None:
             is_other_none = True
         elif isinstance(other, ast.Name) and other.id in self.variables:
-            _, tag = self.variables[other.id]
-            if tag == "none":
+            if self._var_kind(other.id) == VKind.NONE:
                 is_other_none = True
         val = 1 if is_other_none else 0
         if isinstance(op, ast.IsNot):
@@ -20373,7 +20376,7 @@ class CodeGen:
             if not left_is_str and left_kind is None:
                 # Fallback: check AST for string literals / string variables
                 l_tag = self._infer_type_tag(node.left, None)
-                if l_tag == "str" or (isinstance(l_tag, ValueType) and l_tag.kind == VKind.STR):
+                if ValueType.from_old_tag(l_tag).kind == VKind.STR:
                     left_is_str = True
 
             if left_is_str:
@@ -20775,8 +20778,7 @@ class CodeGen:
                 return
             # Check if it's a closure variable
             elif name in self.variables:
-                _, tag = self.variables[name]
-                if tag == "closure":
+                if self._var_kind(name) == VKind.CLOSURE:
                     self._emit_closure_call(node)
                     return
             # Module-level pyobj from-imports (e.g. Template, Context from
@@ -21183,7 +21185,7 @@ class CodeGen:
 
         # Check if this is an actual closure variable vs a raw function pointer
         _, tag = self.variables.get(name, (None, "int"))
-        is_closure = (tag == "closure")
+        is_closure = (ValueType.from_old_tag(tag).kind == VKind.CLOSURE)
 
         # Handle f(*args) — Starred arg in closure/function-pointer call.
         # Common in decorator wrappers: def wrapper(*args): return f(*args)
@@ -22807,7 +22809,7 @@ class CodeGen:
             if isinstance(type_tag, str) and ":" in type_tag:
                 return ValueType.from_old_tag(type_tag.split(":", 1)[1])
             # For tuples, check the literal definition for element type
-            if type_tag == "tuple" and node.id in self._tuple_elem_types:
+            if ValueType.from_old_tag(type_tag).kind == VKind.TUPLE and node.id in self._tuple_elem_types:
                 _tet = self._tuple_elem_types[node.id]
                 return _tet if isinstance(_tet, ValueType) else ValueType.from_old_tag(_tet)
         # .values(), .items(), .keys() return lists of tagged values / strings.
@@ -22981,8 +22983,7 @@ class CodeGen:
                 _entry = self._global_vars[node.id]
             if _entry is not None:
                 _, type_tag = _entry
-                return (type_tag.kind == VKind.SET if isinstance(type_tag, ValueType)
-                        else type_tag == "set")
+                return ValueType.from_old_tag(type_tag).kind == VKind.SET
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
             if node.func.id == "set":
                 return True
@@ -23386,8 +23387,7 @@ class CodeGen:
                 _entry = self._global_vars[node.id]
             if _entry is not None:
                 _, type_tag = _entry
-                return (type_tag.kind == VKind.TUPLE if isinstance(type_tag, ValueType)
-                        else type_tag == "tuple")
+                return ValueType.from_old_tag(type_tag).kind == VKind.TUPLE
         # Function calls that return tuples
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
             name = node.func.id
@@ -23551,8 +23551,7 @@ class CodeGen:
         (could hold different types at runtime, e.g., function parameter
         called with both int and str arguments at different call sites)."""
         if isinstance(node, ast.Name) and node.id in self.variables:
-            _, tag = self.variables[node.id]
-            return tag == "mixed"
+            return self._var_kind(node.id) == VKind.MIXED
         return False
 
     def _is_fv_float_var(self, node: ast.expr) -> bool:
@@ -25331,7 +25330,7 @@ class CodeGen:
                     actual_tag = self.variables[node.value.id][1]
                 else:
                     actual_tag = "pyobj"
-                if actual_tag == "native_mod":
+                if ValueType.from_old_tag(actual_tag).kind == VKind.NATIVE_MOD:
                     # For native_mod: try native attr first, fall back to bridge
                     result = self._emit_native_module_attr(node.value.id, node.attr)
                     if result is not None:
@@ -25664,7 +25663,7 @@ class CodeGen:
             is_bytes = False
             if isinstance(arg, ast.Name) and arg.id in self.variables:
                 _, vtag = self.variables[arg.id]
-                is_bytes = (vtag == "bytes")
+                is_bytes = (ValueType.from_old_tag(vtag).kind == VKind.BYTES)
             if is_bytes:
                 b = self._emit_expr_value(arg)
                 b = self._ensure_ptr(b)
@@ -26715,10 +26714,10 @@ class CodeGen:
                 return self._emit_weakref_deref(node)
             # Check for closure variable
             elif name in self.variables:
-                _, tag = self.variables[name]
-                if tag == "closure":
+                _vk = self._var_kind(name)
+                if _vk == VKind.CLOSURE:
                     return self._emit_closure_call(node)
-                if tag == "native_func":
+                if _vk == VKind.NATIVE_FUNC:
                     # Native function via from-import — if native handler didn't
                     # handle it (returned None above), fall through to bridge.
                     # Import the real module and call the function through CPython.
@@ -26732,7 +26731,7 @@ class CodeGen:
                             [mod_ptr, self._make_string_constant(attr)])
                         # Call it through the bridge
                         return self._emit_cpython_call_with_ptr(func_ptr, node)
-                if tag == "pyobj":
+                if _vk == VKind.PYOBJ:
                     # Call a CPython bridge object (class constructor, function, etc.)
                     # Re-fetch from module at call time to avoid stale pointers.
                     bridge_imports = getattr(self, '_bridge_imports', {})
@@ -27506,7 +27505,7 @@ class CodeGen:
             if len(node.args) == 1:
                 # Counter("string") → count character occurrences
                 arg_tag = self._infer_type_tag(node.args[0], None)
-                if (arg_tag == "str"
+                if (ValueType.from_old_tag(arg_tag).kind == VKind.STR
                         or (isinstance(node.args[0], ast.Constant)
                             and isinstance(node.args[0].value, str))):
                     arg = self._emit_expr_value(node.args[0])
@@ -28579,7 +28578,7 @@ class CodeGen:
 
         # Infer the lambda parameter type from context. For sorted/map/filter,
         # the param type matches the list's element type.
-        param_tag = "int"
+        param_kind = VKind.INT
         if isinstance(node, ast.Call) and len(node.args) >= 1:
             # Find the list argument (not the function argument).
             # sorted(list, key=lambda) → args[0] is the list
@@ -28595,19 +28594,19 @@ class CodeGen:
             if list_node is not None:
                 elem_type = self._get_list_elem_type(list_node)
                 if elem_type.kind == VKind.STR:
-                    param_tag = "str"
+                    param_kind = VKind.STR
                 elif elem_type.kind in (VKind.LIST, VKind.TUPLE):
-                    param_tag = "list"
+                    param_kind = VKind.LIST
         # Method call: obj.sort(key=lambda) — infer from obj's element type
-        if (param_tag == "int" and isinstance(node, ast.Call)
+        if (param_kind == VKind.INT and isinstance(node, ast.Call)
                 and isinstance(node.func, ast.Attribute)
                 and node.func.attr == "sort"):
             obj_node = node.func.value
             elem_type = self._get_list_elem_type(obj_node)
             if elem_type.kind == VKind.STR:
-                param_tag = "str"
+                param_kind = VKind.STR
             elif elem_type.kind in (VKind.LIST, VKind.TUPLE):
-                param_tag = "list"
+                param_kind = VKind.LIST
 
         # Save current emission state
         saved = (self.function, self.builder, self.variables, self._loop_stack,
@@ -28624,12 +28623,12 @@ class CodeGen:
         self._current_scope_stmts = []
 
         # Param — type determines how it's stored and accessed
-        if param_tag == "str":
+        if param_kind == VKind.STR:
             ptr = self.builder.inttoptr(func.args[0], i8_ptr)
             alloca = self.builder.alloca(i8_ptr, name=param_name)
             self.builder.store(ptr, alloca)
             self.variables[param_name] = (alloca, "str")
-        elif param_tag == "list":
+        elif param_kind == VKind.LIST:
             ptr = self.builder.inttoptr(func.args[0], i8_ptr)
             alloca = self.builder.alloca(i8_ptr, name=param_name)
             self.builder.store(ptr, alloca)
@@ -31196,12 +31195,13 @@ class CodeGen:
         if isinstance(obj.type, ir.PointerType):
             # Bytes subscript: b"hello"[0] → int (byte value), not char
             val_tag = self._infer_type_tag(node.value, obj)
-            if val_tag == "bytes" and not isinstance(node.slice, ast.Slice):
+            _vt_tag = ValueType.from_old_tag(val_tag).kind
+            if _vt_tag == VKind.BYTES and not isinstance(node.slice, ast.Slice):
                 index = self._emit_expr_value(node.slice)
                 return self._rt_call("bytes_get", [obj, index])
             # Bytes slicing: b"hello"[1:3] → b'el' (same char* slice, but
             # stored with BYTES type tag so print shows b'...' prefix)
-            if val_tag == "bytes" and isinstance(node.slice, ast.Slice):
+            if _vt_tag == VKind.BYTES and isinstance(node.slice, ast.Slice):
                 return self._emit_string_slice(obj, node.slice, node)
             # String indexing/slicing
             if isinstance(node.slice, ast.Slice):

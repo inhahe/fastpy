@@ -353,10 +353,12 @@ static PyObject* fpy_to_pyobject(int32_t tag, int64_t data) {
             if (!dec_cls) { free(s); Py_RETURN_NONE; }
             PyObject *str_arg = PyUnicode_FromString(s);
             free(s);
+            if (!str_arg) { Py_DECREF(dec_cls); Py_RETURN_NONE; }
             PyObject *result = PyObject_CallOneArg(dec_cls, str_arg);
             Py_DECREF(dec_cls);
             Py_DECREF(str_arg);
-            return result ? result : Py_None;
+            if (!result) { PyErr_Clear(); Py_RETURN_NONE; }
+            return result;
         }
         default:
             /* Unknown type — return None */
@@ -369,7 +371,12 @@ static PyObject* fpy_to_pyobject(int32_t tag, int64_t data) {
 static void pyobject_to_fpy(PyObject *obj, int32_t *out_tag, int64_t *out_data) {
     if (!obj) {
         /* NULL from a failed bridge call (TypeError, etc.) — return None
-         * instead of tagging NULL as a real value and segfaulting later. */
+         * instead of tagging NULL as a real value and segfaulting later.
+         *
+         * NOTE: we intentionally do NOT propagate PyErr here because many
+         * callers already check !result and call bridge_propagate_exception()
+         * before reaching this function.  Propagating stale errors here
+         * can crash programs with no actual error. */
         *out_tag = FPY_TAG_NONE;
         *out_data = 0;
         return;
@@ -546,6 +553,12 @@ void fpy_cpython_call(void *callable, int32_t argc,
  * access on modules: `math.pi` returns a PyFloat which needs to be
  * converted to FpyValue{FLOAT, bits}. */
 void fpy_cpython_to_fv(void *obj, int32_t *out_tag, int64_t *out_data) {
+    if (!obj) {
+        /* NULL safety: pyobject_to_fpy handles NULL and propagates any
+         * pending exception. Avoid Py_DECREF(NULL) crash below. */
+        pyobject_to_fpy(NULL, out_tag, out_data);
+        return;
+    }
     pyobject_to_fpy((PyObject*)obj, out_tag, out_data);
     /* For OBJ-tagged results, incref to keep the reference alive
      * (since we're giving the caller a raw pointer) */
@@ -1011,35 +1024,41 @@ static const char* _path_as_cstr(void *path_obj) {
 
 static void* _path_get_prop(void *obj, const char *prop) {
     PyObject *r = PyObject_GetAttrString((PyObject*)obj, prop);
-    if (!r) { PyErr_Print(); exit(1); }
+    if (!r) { bridge_propagate_exception(); return NULL; }
     return (void*)r;
 }
 
 static void* _path_call0(void *obj, const char *method) {
     PyObject *r = PyObject_CallMethod((PyObject*)obj, method, NULL);
-    if (!r) { PyErr_Print(); exit(1); }
+    if (!r) { bridge_propagate_exception(); return NULL; }
     return (void*)r;
 }
 
 void* fastpy_path_new(const char *s) {
     fpy_cpython_init();
     PyObject *mod = PyImport_ImportModule("pathlib");
+    if (!mod) { bridge_propagate_exception(); return NULL; }
     PyObject *cls = PyObject_GetAttrString(mod, "Path");
+    if (!cls) { Py_DECREF(mod); bridge_propagate_exception(); return NULL; }
     PyObject *arg = PyUnicode_FromString(s ? s : ".");
+    if (!arg) { Py_DECREF(cls); Py_DECREF(mod); bridge_propagate_exception(); return NULL; }
     PyObject *args_tuple = PyTuple_Pack(1, arg);
+    if (!args_tuple) { Py_DECREF(arg); Py_DECREF(cls); Py_DECREF(mod); bridge_propagate_exception(); return NULL; }
     PyObject *result = PyObject_Call(cls, args_tuple, NULL);
-    Py_DECREF(arg);
     Py_DECREF(args_tuple);
+    Py_DECREF(arg);
     Py_DECREF(cls);
     Py_DECREF(mod);
-    if (!result) { PyErr_Print(); exit(1); }
+    if (!result) { bridge_propagate_exception(); return NULL; }
     return (void*)result;
 }
 
 void* fastpy_path_cwd(void) {
     fpy_cpython_init();
     PyObject *mod = PyImport_ImportModule("pathlib");
+    if (!mod) { bridge_propagate_exception(); return NULL; }
     PyObject *cls = PyObject_GetAttrString(mod, "Path");
+    if (!cls) { Py_DECREF(mod); bridge_propagate_exception(); return NULL; }
     void *r = _path_call0(cls, "cwd");
     Py_DECREF(cls);
     Py_DECREF(mod);
@@ -1053,10 +1072,11 @@ void* fastpy_path_join(void *self, void *other) {
     if (!r) {
         PyErr_Clear();
         PyObject *ostr = PyUnicode_FromString((const char*)other);
+        if (!ostr) { bridge_propagate_exception(); return NULL; }
         r = PyNumber_TrueDivide((PyObject*)self, ostr);
         Py_DECREF(ostr);
     }
-    if (!r) { PyErr_Print(); exit(1); }
+    if (!r) { bridge_propagate_exception(); return NULL; }
     return (void*)r;
 }
 
