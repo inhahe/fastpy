@@ -2534,6 +2534,90 @@ class CodeGen:
             return self._fv_from_str(value)
         raise CodeGenError(f"Cannot wrap LLVM type {value.type} in FpyValue")
 
+    # ── Inline refcount operations ──────────────────────────────────────
+    # For OBJ-typed variables where we know the pointer is a native FpyObj*
+    # (not a PyObject*), we can emit the refcount operation as inline IR
+    # instead of calling the opaque C function. This lets LLVM optimize
+    # hot loops (e.g., linked list traversal) by seeing the loads/stores.
+    #
+    # FpyObj layout: refcount (i32) is at offset 0.
+    # FPY_RC_IMMORTAL = INT32_MAX = 0x7FFFFFFF.
+
+    _RC_IMMORTAL = 0x7FFFFFFF
+
+    def _emit_inline_obj_incref(self, data_i64: ir.Value) -> None:
+        """Emit inline incref for a known-OBJ pointer.
+
+        Equivalent to: if (ptr && ptr->refcount != IMMORTAL) ptr->refcount++
+        Null check handles the None case (e.g., end of linked list).
+        """
+        is_null = self.builder.icmp_unsigned(
+            "==", data_i64, ir.Constant(i64, 0))
+        do_bb = self._new_block("irc.inc")
+        end_bb = self._new_block("irc.end")
+        self.builder.cbranch(is_null, end_bb, do_bb)
+
+        self.builder.position_at_end(do_bb)
+        ptr = self.builder.inttoptr(data_i64, i8_ptr)
+        rc_ptr = self.builder.bitcast(ptr, ir.PointerType(i32))
+        rc = self.builder.load(rc_ptr)
+        is_imm = self.builder.icmp_unsigned(
+            "==", rc, ir.Constant(i32, self._RC_IMMORTAL))
+        inc_bb = self._new_block("irc.do")
+        self.builder.cbranch(is_imm, end_bb, inc_bb)
+
+        self.builder.position_at_end(inc_bb)
+        new_rc = self.builder.add(rc, ir.Constant(i32, 1))
+        self.builder.store(new_rc, rc_ptr)
+        self.builder.branch(end_bb)
+
+        self.builder.position_at_end(end_bb)
+
+    def _emit_inline_obj_decref(self, data_i64: ir.Value) -> None:
+        """Emit inline decref for a known-OBJ pointer.
+
+        Equivalent to: if (ptr && ptr->refcount != IMMORTAL) {
+            if (--ptr->refcount == 0) fpy_rc_decref(OBJ, ptr);  // full destroy
+        }
+        The hot path (refcount > 1 after decrement) is pure inline
+        loads/stores. Only the cold destroy path calls the C function.
+        """
+        is_null = self.builder.icmp_unsigned(
+            "==", data_i64, ir.Constant(i64, 0))
+        do_bb = self._new_block("drc.dec")
+        end_bb = self._new_block("drc.end")
+        self.builder.cbranch(is_null, end_bb, do_bb)
+
+        self.builder.position_at_end(do_bb)
+        ptr = self.builder.inttoptr(data_i64, i8_ptr)
+        rc_ptr = self.builder.bitcast(ptr, ir.PointerType(i32))
+        rc = self.builder.load(rc_ptr)
+        is_imm = self.builder.icmp_unsigned(
+            "==", rc, ir.Constant(i32, self._RC_IMMORTAL))
+        dec_bb = self._new_block("drc.do")
+        self.builder.cbranch(is_imm, end_bb, dec_bb)
+
+        self.builder.position_at_end(dec_bb)
+        new_rc = self.builder.sub(rc, ir.Constant(i32, 1))
+        is_zero = self.builder.icmp_unsigned(
+            "==", new_rc, ir.Constant(i32, 0))
+        store_bb = self._new_block("drc.store")
+        destroy_bb = self._new_block("drc.destroy")
+        self.builder.cbranch(is_zero, destroy_bb, store_bb)
+
+        # Hot path: refcount still > 0, just store
+        self.builder.position_at_end(store_bb)
+        self.builder.store(new_rc, rc_ptr)
+        self.builder.branch(end_bb)
+
+        # Cold path: refcount hit zero, call full C decref for destruction
+        self.builder.position_at_end(destroy_bb)
+        self.builder.call(self.runtime["rc_decref"],
+                          [ir.Constant(i32, FPY_TAG_OBJ), data_i64])
+        self.builder.branch(end_bb)
+
+        self.builder.position_at_end(end_bb)
+
     def _gen_prescan(self, tree: ast.Module) -> None:
         """Pre-scan/analysis passes (0–0.9): normalization, closure/lambda
         detection, global inference, call-site analysis, dataclass expansion,
@@ -15624,12 +15708,17 @@ class CodeGen:
                 if self._USE_REFCOUNT:
                     self._entry_store_fv_none(alloca)
             elif self._USE_REFCOUNT and not _old_is_scalar:
-                # Decref the old value being overwritten
+                # Decref the old value being overwritten.
+                # Inline fast path for OBJ: emit direct refcount decrement
+                # as IR so LLVM can optimize hot loops (linked list traversal).
                 old_fv = self.builder.load(alloca, name=f"{name}.old")
                 old_tag_val = self.builder.extract_value(old_fv, 0)
                 old_data = self.builder.extract_value(old_fv, 1)
-                self.builder.call(self.runtime["rc_decref"],
-                                  [old_tag_val, old_data])
+                if _old_kind_s == VKind.OBJ:
+                    self._emit_inline_obj_decref(old_data)
+                else:
+                    self.builder.call(self.runtime["rc_decref"],
+                                      [old_tag_val, old_data])
         else:
             alloca = self._create_entry_alloca(fpy_val, name)
             # Always zero-init new FV allocas so _emit_scope_decref is safe
@@ -15649,8 +15738,14 @@ class CodeGen:
         if self._USE_REFCOUNT and not steal and not _new_is_scalar:
             new_tag = self.builder.extract_value(fv, 0)
             new_data = self.builder.extract_value(fv, 1)
-            self.builder.call(self.runtime["rc_incref"],
-                              [new_tag, new_data])
+            # Inline fast path for OBJ: direct refcount increment as IR
+            _new_kind = (type_tag.kind if isinstance(type_tag, ValueType)
+                         else ValueType.from_old_tag(type_tag).kind)
+            if _new_kind == VKind.OBJ:
+                self._emit_inline_obj_incref(new_data)
+            else:
+                self.builder.call(self.runtime["rc_incref"],
+                                  [new_tag, new_data])
         self.variables[name] = (alloca, type_tag)
         self.builder.store(fv, alloca)
 
@@ -16194,7 +16289,13 @@ class CodeGen:
             data = self._fv_as_int(fv)
             return self.builder.trunc(data, i32)
         if kind == VKind.NONE:
-            return ir.Constant(i64, 0)
+            # Must load the actual data from the FpyValue, not return a
+            # compile-time constant.  Inside loops a variable initially set
+            # to None can be reassigned to OBJ; the static VKind stays NONE
+            # until _store_variable runs (which happens AFTER the load).
+            # Returning a constant 0 would ignore the runtime value and
+            # silently discard the reassigned pointer on every iteration.
+            return self._fv_as_int(fv)
         # FVALUE: return the full fpy_val struct so the runtime tag is
         # preserved.  All downstream operations (binop, subscript, print,
         # len, compare) have explicit fpy_val-struct handling that dispatches
