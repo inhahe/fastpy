@@ -294,8 +294,6 @@ class ValueType:
             "mixed": VKind.MIXED,
             # Aliases: counter/defaultdict share FpyDict struct, so all
             # dict runtime functions work — keep as VKind.DICT.
-            # Deque has different struct (FpyDeque), so it MUST map to
-            # VKind.DEQUE to prevent list_length/list_get_fv struct mismatch.
             # The _is_deque_expr/_is_counter_expr helpers check raw string
             # tags for type-specific dispatch.
             "counter": VKind.DICT, "defaultdict": VKind.DICT,
@@ -4656,7 +4654,7 @@ class CodeGen:
                         and n.value.func.attr == "append"
                         and isinstance(n.value.func.value, ast.Name)
                         and n.value.func.value.id in local_types
-                        and local_types[n.value.func.value.id].startswith("list")
+                        and ValueType.from_old_tag(local_types[n.value.func.value.id]).kind == VKind.LIST
                         and len(n.value.args) == 1):
                     arg = n.value.args[0]
                     var = n.value.func.value.id
@@ -4829,7 +4827,8 @@ class CodeGen:
                     and isinstance(node.value.func, ast.Name)
                     and node.value.func.id in _func_ret_types):
                 rt = _func_ret_types[node.value.func.id]
-                if rt.startswith("list") or rt == "dict" or rt == "str":
+                _rtk = ValueType.from_old_tag(rt).kind
+                if _rtk in (VKind.LIST, VKind.DICT, VKind.STR):
                     var_types[node.targets[0].id] = rt
         return _func_ret_types
 
@@ -5246,9 +5245,11 @@ class CodeGen:
                             continue  # same type, no conflict
                         # Types conflict — check if it's a safe refinement
                         # or a genuine conflict requiring "mixed"
-                        if (sig_arg_types[i].startswith("list:") and existing[i] == "list"):
+                        if (ValueType.from_old_tag(sig_arg_types[i]).kind == VKind.LIST
+                                and existing[i] == "list"):
                             existing[i] = sig_arg_types[i]  # refine list element type
-                        elif (existing[i].startswith("list:") and sig_arg_types[i] == "list"):
+                        elif (ValueType.from_old_tag(existing[i]).kind == VKind.LIST
+                              and sig_arg_types[i] == "list"):
                             pass  # keep the more specific type
                         elif (sig_arg_types[i] == "bool" and existing[i] == "int"):
                             pass  # bool is a subtype of int, keep int
@@ -5914,7 +5915,8 @@ class CodeGen:
                         _rtk = ValueType.from_old_tag(_fn.ret_tag).kind
                         if _rtk == VKind.LIST:
                             if not (_existing and
-                                    _existing.startswith("list:")):
+                                    ValueType.from_old_tag(_existing).kind == VKind.LIST
+                                    and _existing != "list"):
                                 var_types[tgt.id] = "list"
                         elif _rtk == VKind.DICT:
                             var_types[tgt.id] = "dict"
@@ -6010,7 +6012,7 @@ class CodeGen:
                     and isinstance(node.targets[0], ast.Subscript)
                     and isinstance(node.targets[0].value, ast.Name)):
                 base = node.targets[0].value.id
-                if base in var_types and var_types[base].startswith("dict"):
+                if base in var_types and ValueType.from_old_tag(var_types[base]).kind in _DICT_LIKE:
                     if isinstance(node.value, (ast.Dict, ast.DictComp)):
                         var_types[base] = "dict:dict"
                     elif isinstance(node.value, (ast.List, ast.ListComp)):
@@ -7775,17 +7777,19 @@ class CodeGen:
                             if call_tag else None)
                     if _ctk == VKind.LIST:
                         tag = call_tag if ":" in call_tag else "list:int"
-                    elif _ctk == VKind.DICT and call_tag.startswith("dict"):
+                    elif _ctk in _DICT_LIKE:
                         # Strip the value-type suffix from the variable tag
                         # (downstream expects bare "dict") but record the
                         # value-type in the matching helper set so d[k] can
                         # unwrap to the right bare LLVM type.
                         tag = "dict"
-                        if call_tag == "dict:int":
+                        _ct_str = str(call_tag)
+                        _dict_val = _ct_str.split(":", 1)[1] if ":" in _ct_str else None
+                        if _dict_val == "int":
                             self._dict_var_int_values.add(param.name)
-                        elif call_tag == "dict:list":
+                        elif _dict_val == "list":
                             self._dict_var_list_values.add(param.name)
-                        elif call_tag == "dict:dict":
+                        elif _dict_val == "dict":
                             self._dict_var_dict_values.add(param.name)
                     elif _ctk is not None and _ctk.is_ptr:
                         # obj, str, set, bytes, tuple, pyobj, complex,
@@ -12500,7 +12504,10 @@ class CodeGen:
 
         # If assigning an empty list and pre-scan detected the actual element type,
         # override the default "list:int" tag
-        if (type_tag == "list:int" and len(node.targets) == 1
+        _tt_vt = ValueType.from_old_tag(type_tag)
+        if (_tt_vt.kind == VKind.LIST
+                and (not _tt_vt.elem_type or _tt_vt.elem_type.kind == VKind.INT)
+                and len(node.targets) == 1
                 and isinstance(node.targets[0], ast.Name)):
             target_name = node.targets[0].id
             if target_name in self._list_append_types:
@@ -14231,16 +14238,15 @@ class CodeGen:
                     if var_tag.kind not in (VKind.UNKNOWN, VKind.FVALUE):
                         return var_tag._to_tag()
                 else:
-                    # Legacy string tag — convert to VKind but return the
-                    # original string to preserve aliases (counter, deque).
-                    # Exclude "int" (default assumption, falls through to
-                    # AST inference) and "cell" tags.
+                    # String tag — convert to VKind for dispatch, but
+                    # return raw string to preserve aliases (counter,
+                    # dict:int) that from_old_tag would normalize away.
                     _vt = ValueType.from_old_tag(var_tag)
-                    if (_vt.kind not in (VKind.INT, VKind.UNKNOWN, VKind.FVALUE)
-                            or var_tag.startswith("list")
-                            or var_tag.startswith("dict:")
-                            or var_tag in ("namedtuple_type", "unknown",
-                                           "mixed")):
+                    if _vt.kind not in (VKind.INT, VKind.UNKNOWN, VKind.FVALUE):
+                        return var_tag
+                    # Special cases that map to INT/UNKNOWN but carry
+                    # semantic meaning that downstream needs.
+                    if var_tag in ("namedtuple_type", "unknown", "mixed"):
                         return var_tag
         if isinstance(node, (ast.List, ast.ListComp, ast.GeneratorExp)):
             elem_type = self._infer_list_elem_type(node)
@@ -14373,11 +14379,12 @@ class CodeGen:
                      or self._is_tuple_expr(node.value))
                 and not self._is_dict_expr(node.value)):
             elem = self._get_list_elem_type(node.value)
-            if elem.startswith("list"):
+            _ek = ValueType.from_old_tag(elem).kind
+            if _ek == VKind.LIST:
                 return elem  # compound: "list:float" stays as-is
-            if elem in ("str", "dict", "obj", "tuple"):
-                return elem
-            if elem == "float":
+            if _ek in (VKind.STR, VKind.DICT, VKind.OBJ, VKind.TUPLE):
+                return _ek.old_tag
+            if _ek == VKind.FLOAT:
                 return "float"
             # "int" / unknown → fall through to _llvm_type_tag
         # BinOp: object operator overloading OR list concat/repeat
@@ -14438,19 +14445,14 @@ class CodeGen:
         # Subscript on a list: infer element type
         if isinstance(node, ast.Subscript) and not isinstance(node.slice, ast.Slice):
             if isinstance(node.value, ast.Name) and node.value.id in self.variables:
-                _, vtype = self.variables[node.value.id]
-                if vtype.startswith("list:"):
-                    elem = vtype.split(":", 1)[1]
-                    if elem.startswith("list"):
-                        return elem  # "list:float" from "list:list:float"
-                    if elem == "str":
-                        return "str"
-                    if elem == "float":
-                        return "float"
-                    if elem == "dict":
-                        return "dict"
-                    if elem == "obj":
-                        return "obj"
+                _vt = self.variables[node.value.id][1]
+                _vt = _vt if isinstance(_vt, ValueType) else ValueType.from_old_tag(_vt)
+                if _vt.kind == VKind.LIST and _vt.elem_type is not None:
+                    _ek2 = _vt.elem_type.kind
+                    if _ek2 == VKind.LIST:
+                        return _vt.elem_type._to_tag()  # "list:float" from "list:list:float"
+                    if _ek2 in (VKind.STR, VKind.FLOAT, VKind.DICT, VKind.OBJ):
+                        return _ek2.old_tag
         # Set operations (|, &, -, ^) produce sets
         if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.BitOr, ast.BitAnd, ast.BitXor, ast.Sub)):
             if self._is_set_expr(node.left) or self._is_set_expr(node.right):
@@ -16480,12 +16482,12 @@ class CodeGen:
                 self.variables[_iter_name] = self._global_vars[_iter_name]
         if isinstance(node.iter, ast.Name) and node.iter.id in self.variables:
             _, tag = self.variables[node.iter.id]
+            vtype = tag if isinstance(tag, ValueType) else ValueType.from_old_tag(tag)
             # Deque has a different struct layout (FpyDeque vs FpyList).
             # Must convert to list first via deque_to_list.
-            if tag == "deque":
+            if vtype.kind == VKind.DEQUE:
                 self._emit_for_deque(node)
                 return
-            vtype = ValueType.from_old_tag(tag)
             if vtype.kind in (VKind.LIST, VKind.TUPLE):
                 self._emit_for_list(node)
                 return
@@ -18933,11 +18935,12 @@ class CodeGen:
         # For Name iterators not resolved from literal: try to propagate
         # element types from the variable's type tag.
         if isinstance(iter_node, ast.Name) and list_node is None:
-            var_tag = str(self.variables.get(iter_node.id, (None, "unknown"))[1])
+            _raw_tag = self.variables.get(iter_node.id, (None, "unknown"))[1]
+            _vt = _raw_tag if isinstance(_raw_tag, ValueType) else ValueType.from_old_tag(str(_raw_tag))
             # If we know nothing specific, keep defaults but don't force "str"
-            if var_tag.startswith("list") and ":" in var_tag:
+            if _vt.kind == VKind.LIST and _vt.elem_type is not None:
                 # e.g. list:list or list:obj — propagate inner type for all slots
-                inner = var_tag.split(":", 1)[1]
+                inner = _vt.elem_type._to_tag()
                 for i in range(n):
                     if types[i] == "str":
                         types[i] = inner
@@ -23001,7 +23004,7 @@ class CodeGen:
                 if info.ret_tag == "ptr":
                     frt = getattr(self, '_func_ret_types', {})
                     rt = frt.get(node.func.id, "")
-                    if rt.startswith("tuple:"):
+                    if ValueType.from_old_tag(rt).kind == VKind.TUPLE and ":" in str(rt):
                         return ValueType.from_old_tag(rt.split(":", 1)[1])
         # Global variable whose element type isn't in the tag: look up the
         # module-level AST definition and infer element type from the literal.
@@ -23149,12 +23152,23 @@ class CodeGen:
             return True
         return False
 
+    def _var_tag_eq(self, name: str, tag_str: str) -> bool:
+        """Check if a variable's raw tag matches a specific string.
+
+        Unlike _var_kind(), this preserves aliased distinctions
+        (counter vs dict, path vs pyobj) by comparing raw tags."""
+        entry = self.variables.get(name) or self._global_vars.get(name)
+        if entry is None:
+            return False
+        _, vtype = entry
+        if isinstance(vtype, ValueType):
+            return vtype._to_tag() == tag_str
+        return str(vtype) == tag_str
+
     def _is_deque_expr(self, node: ast.expr) -> bool:
         """Check if an AST expression evaluates to a deque."""
         if isinstance(node, ast.Name) and node.id in self.variables:
-            _, type_tag = self.variables[node.id]
-            return (type_tag == "deque" if isinstance(type_tag, str)
-                    else type_tag._to_tag() == "deque")
+            return self._var_kind(node.id) == VKind.DEQUE
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
             native_imports = getattr(self, '_native_imports', {})
             if node.func.id in native_imports:
@@ -23165,10 +23179,7 @@ class CodeGen:
     def _is_counter_expr(self, node: ast.expr) -> bool:
         """Check if an AST expression evaluates to a Counter."""
         if isinstance(node, ast.Name) and node.id in self.variables:
-            # counter maps to VKind.DICT (shared struct), check string tag for specificity
-            _, type_tag = self.variables[node.id]
-            return (type_tag == "counter" if isinstance(type_tag, str)
-                    else type_tag._to_tag() == "counter")
+            return self._var_tag_eq(node.id, "counter")
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
             native_imports = getattr(self, '_native_imports', {})
             if node.func.id in native_imports:
@@ -23309,10 +23320,7 @@ class CodeGen:
     def _is_path_expr(self, node: ast.expr) -> bool:
         """Check if an AST expression evaluates to a pathlib.Path."""
         if isinstance(node, ast.Name) and node.id in self.variables:
-            # path maps to VKind.PYOBJ, so check string tag for specificity
-            _, type_tag = self.variables[node.id]
-            return (type_tag == "path" if isinstance(type_tag, str)
-                    else type_tag._to_tag() == "path")
+            return self._var_tag_eq(node.id, "path")
         # Direct Path(...) call via imported name
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
             native_imports = getattr(self, '_native_imports', {})
