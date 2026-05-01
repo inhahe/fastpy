@@ -5,6 +5,11 @@ Writes Python programs, their C++ equivalents, compiles both through
 fastpy and MSVC, then times all three and produces a report.
 """
 import subprocess, sys, os, time, tempfile
+
+# Ensure Python DLLs (python3XX.dll) are on PATH for compiled executables
+_python_dir = os.path.dirname(sys.executable)
+if _python_dir not in os.environ.get("PATH", ""):
+    os.environ["PATH"] = _python_dir + os.pathsep + os.environ.get("PATH", "")
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
