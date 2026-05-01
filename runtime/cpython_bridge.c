@@ -370,13 +370,16 @@ static PyObject* fpy_to_pyobject(int32_t tag, int64_t data) {
 
 static void pyobject_to_fpy(PyObject *obj, int32_t *out_tag, int64_t *out_data) {
     if (!obj) {
-        /* NULL from a failed bridge call (TypeError, etc.) — return None
-         * instead of tagging NULL as a real value and segfaulting later.
+        /* NULL means a Python exception occurred.  Propagate it so the
+         * fastpy exception handler can catch it, instead of silently
+         * returning None and masking the error.
          *
-         * NOTE: we intentionally do NOT propagate PyErr here because many
-         * callers already check !result and call bridge_propagate_exception()
-         * before reaching this function.  Propagating stale errors here
-         * can crash programs with no actual error. */
+         * bridge_propagate_exception() is safe to call even if no error
+         * is pending (it checks PyErr_Fetch and returns early).  Most
+         * callers already call it before reaching here, but some paths
+         * (fpy_cpython_to_fv, nested conversions) rely on this catch-all.
+         */
+        if (PyErr_Occurred()) bridge_propagate_exception();
         *out_tag = FPY_TAG_NONE;
         *out_data = 0;
         return;
@@ -554,8 +557,8 @@ void fpy_cpython_call(void *callable, int32_t argc,
  * converted to FpyValue{FLOAT, bits}. */
 void fpy_cpython_to_fv(void *obj, int32_t *out_tag, int64_t *out_data) {
     if (!obj) {
-        /* NULL safety: pyobject_to_fpy handles NULL and propagates any
-         * pending exception. Avoid Py_DECREF(NULL) crash below. */
+        /* NULL → PyErr was set.  pyobject_to_fpy propagates via
+         * bridge_propagate_exception().  Avoid Py_DECREF(NULL). */
         pyobject_to_fpy(NULL, out_tag, out_data);
         return;
     }
