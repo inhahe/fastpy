@@ -4106,11 +4106,11 @@ class CodeGen:
                     name = n.value.id
                     if name == "self":
                         continue
-                    if name in known_classes:
+                    elif name in known_classes:
                         continue
-                    if name in local_obj_vars:
+                    elif name in local_obj_vars:
                         continue
-                    if name in params:
+                    elif name in params:
                         # Function parameter — class may be inferable via
                         # call-site analysis, but SAFE default is to assume
                         # we need slot names. (Cheap conservative check.)
@@ -13761,12 +13761,12 @@ class CodeGen:
                 mod, fn = native_imports[node.func.id]
                 if fn == "loads" and "json" in mod:
                     return "dict"
-                if fn in ("getcwd", "path_join", "path_basename",
+                elif fn in ("getcwd", "path_join", "path_basename",
                            "path_dirname", "join", "basename", "dirname"):
                     return "str"
-                if fn in ("listdir",):
+                elif fn in ("listdir",):
                     return "list:str"
-                if fn in ("exists", "isfile", "isdir",
+                elif fn in ("exists", "isfile", "isdir",
                            "path_exists", "path_isfile", "path_isdir"):
                     return "bool"
         # str.encode() / int.to_bytes() returns bytes, bytes.decode() returns str
@@ -13858,15 +13858,15 @@ class CodeGen:
             if mod in ("collections", "_collections"):
                 if fn == "Counter":
                     return "counter"
-                if fn == "defaultdict":
+                elif fn == "defaultdict":
                     return "defaultdict"
-                if fn == "deque":
+                elif fn == "deque":
                     return "deque"
-                if fn == "OrderedDict":
+                elif fn == "OrderedDict":
                     return "dict"
-                if fn == "namedtuple":
+                elif fn == "namedtuple":
                     return "namedtuple_type"
-                if fn == "ChainMap":
+                elif fn == "ChainMap":
                     return "chainmap"
         # Collections module — from-import calls: Counter(), defaultdict(), deque()
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
@@ -13876,15 +13876,15 @@ class CodeGen:
                 if mod == "collections":
                     if fn == "Counter":
                         return "counter"
-                    if fn == "defaultdict":
+                    elif fn == "defaultdict":
                         return "defaultdict"
-                    if fn == "deque":
+                    elif fn == "deque":
                         return "deque"
-                    if fn == "OrderedDict":
+                    elif fn == "OrderedDict":
                         return "dict"
-                    if fn == "namedtuple":
+                    elif fn == "namedtuple":
                         return "namedtuple_type"
-                    if fn == "ChainMap":
+                    elif fn == "ChainMap":
                         return "chainmap"
                 if mod == "logging" and fn == "getLogger":
                     return "logger"
@@ -13964,13 +13964,13 @@ class CodeGen:
             if method in ("split", "rsplit", "splitlines", "partition",
                            "rpartition"):
                 return "list:str"
-            if method in ("keys", "values", "items"):
+            elif method in ("keys", "values", "items"):
                 return "list:str"
-            if method == "popitem" and self._is_dict_expr(node.func.value):
+            elif method == "popitem" and self._is_dict_expr(node.func.value):
                 return "tuple"
-            if method == "as_integer_ratio":
+            elif method == "as_integer_ratio":
                 return "tuple"
-            if method == "copy":
+            elif method == "copy":
                 if self._is_list_expr(node.func.value):
                     return "list:int"
                 if self._is_dict_expr(node.func.value):
@@ -13978,12 +13978,12 @@ class CodeGen:
                 if self._is_set_expr(node.func.value):
                     return "set"
             # Set methods that return sets
-            if method in ("union", "intersection", "difference",
+            elif method in ("union", "intersection", "difference",
                            "symmetric_difference"):
                 if self._is_set_expr(node.func.value):
                     return "set"
             # Collections module methods that return lists
-            if method in ("most_common", "elements"):
+            elif method in ("most_common", "elements"):
                 if self._is_counter_expr(node.func.value):
                     return "list:list"
             # User class method return: check method return type
@@ -14239,9 +14239,9 @@ class CodeGen:
                     return key_type
             if name in self._dict_var_list_values:
                 return "list:int"
-            if name in self._dict_var_dict_values:
+            elif name in self._dict_var_dict_values:
                 return "dict"
-            if name in self._dict_var_int_values:
+            elif name in self._dict_var_int_values:
                 return "int"
         # Slice on a list/tuple: returns a list (inherit elem type)
         if (isinstance(node, ast.Subscript)
@@ -15276,7 +15276,7 @@ class CodeGen:
             return
 
         # Closure cell: unchanged — stored via cell_set
-        if name in self.variables:
+        elif name in self.variables:
             alloca, old_tag = self.variables[name]
             # "cell" is a special storage tag for closure cells, not a type.
             # Works for both string "cell" and ValueType via __eq__ compat.
@@ -15286,7 +15286,7 @@ class CodeGen:
                 return
 
         # --typed fast path: store native value directly, no FpyValue wrapping.
-        if name in self._native_vars:
+        elif name in self._native_vars:
             alloca, kind = self._native_vars[name]
             native_type = self._VKIND_TO_LLVM[kind]
             # Coerce value to the expected native LLVM type
@@ -15830,9 +15830,9 @@ class CodeGen:
                 # Module-level dunder variables
                 if name == "__name__":
                     return self._make_string_constant("__main__")
-                if name == "__doc__":
+                elif name == "__doc__":
                     return self._make_string_constant("")
-                if name == "__file__":
+                elif name == "__file__":
                     return self._make_string_constant("")
                 return ir.Constant(i64, 0)
             else:
@@ -20666,11 +20666,11 @@ class CodeGen:
                 self._emit_print(node)
                 return
             # Builtin functions that modify state (handled in _emit_call_expr)
-            if name in ("setattr", "delattr"):
+            elif name in ("setattr", "delattr"):
                 self._emit_call_expr(node)
                 return
             # Check if it's a closure variable
-            if name in self.variables:
+            elif name in self.variables:
                 _, tag = self.variables[name]
                 if tag == "closure":
                     self._emit_closure_call(node)
@@ -20693,10 +20693,10 @@ class CodeGen:
             if name in self._singledispatch and node.args:
                 self._emit_singledispatch_call(node, name)
                 return
-            if name in self._user_functions:
+            elif name in self._user_functions:
                 self._emit_user_call(node)
                 return
-            if name in self._user_classes:
+            elif name in self._user_classes:
                 self._emit_constructor(node)
                 return
         if isinstance(node.func, ast.Attribute):
@@ -23289,7 +23289,7 @@ class CodeGen:
             name = node.func.id
             if name == "divmod":
                 return True
-            if name in self._user_functions:
+            elif name in self._user_functions:
                 info = self._user_functions[name]
                 if info.ret_tag == "ptr":
                     return True  # ptr return from user func = likely tuple
@@ -23356,7 +23356,7 @@ class CodeGen:
             name = node.func.id
             if name == "dict":
                 return True
-            if name in self._user_functions:
+            elif name in self._user_functions:
                 return ValueType.from_old_tag(
                     self._user_functions[name].ret_tag).kind == VKind.DICT
         # Object attribute access: obj.attr where attr is a dict
@@ -26982,7 +26982,7 @@ class CodeGen:
             tag, data = self._bare_to_tag_data(val, node.args[0])
             return self.builder.call(self.runtime["json_dumps"],
                                      [ir.Constant(i32, tag), data])
-        if func_name == "loads" and len(node.args) == 1:
+        elif func_name == "loads" and len(node.args) == 1:
             arg = self._emit_expr_value(node.args[0])
             arg = self._ensure_ptr(arg)
             out_tag = self._create_entry_alloca(i32, "json.tag")
@@ -27057,7 +27057,7 @@ class CodeGen:
         """typing.cast / typing.TypeVar (no-ops at runtime)"""
         if func_name == "cast" and len(node.args) == 2:
             return self._emit_expr_value(node.args[1])
-        if func_name == "TypeVar":
+        elif func_name == "TypeVar":
             return ir.Constant(i64, 0)
         return None
 
@@ -27089,12 +27089,12 @@ class CodeGen:
             b = self._emit_expr_value(node.args[1])
             return self.builder.call(
                 self.runtime[_op_funcs[func_name]], [a, b])
-        if func_name in ("itemgetter", "attrgetter"):
+        elif func_name in ("itemgetter", "attrgetter"):
             return ir.Constant(i64, 0)
-        if func_name == "neg" and len(node.args) == 1:
+        elif func_name == "neg" and len(node.args) == 1:
             a = self._emit_expr_value(node.args[0])
             return self.builder.neg(a)
-        if func_name == "abs" and len(node.args) == 1:
+        elif func_name == "abs" and len(node.args) == 1:
             return self._emit_expr_value(
                 ast.Call(func=ast.Name(id="abs", ctx=ast.Load()),
                          args=node.args, keywords=[]))
@@ -27106,7 +27106,7 @@ class CodeGen:
             arg = self._emit_expr_value(node.args[0])
             arg = self._ensure_ptr(arg)
             return self.builder.call(self.runtime["textwrap_dedent"], [arg])
-        if func_name == "indent" and len(node.args) == 2:
+        elif func_name == "indent" and len(node.args) == 2:
             text = self._emit_expr_value(node.args[0])
             prefix = self._emit_expr_value(node.args[1])
             text = self._ensure_ptr(text)
@@ -27124,7 +27124,7 @@ class CodeGen:
             dst = self._ensure_ptr(dst)
             self.builder.call(self.runtime["shutil_copy"], [src, dst])
             return ir.Constant(i64, 0)
-        if func_name == "rmtree" and len(node.args) == 1:
+        elif func_name == "rmtree" and len(node.args) == 1:
             path = self._emit_expr_value(node.args[0])
             path = self._ensure_ptr(path)
             self.builder.call(self.runtime["shutil_rmtree"], [path])
@@ -27143,7 +27143,7 @@ class CodeGen:
         """tempfile.gettempdir / tempfile.mkdtemp"""
         if func_name == "gettempdir" and len(node.args) == 0:
             return self.builder.call(self.runtime["tempfile_gettempdir"], [])
-        if func_name == "mkdtemp" and len(node.args) == 0:
+        elif func_name == "mkdtemp" and len(node.args) == 0:
             return self.builder.call(self.runtime["tempfile_mkdtemp"], [])
         return None
 
@@ -27180,12 +27180,12 @@ class CodeGen:
             lst = self._ensure_ptr(lst)
             x = self._emit_expr_value(node.args[1])
             return self.builder.call(self.runtime["bisect_left"], [lst, x])
-        if func_name == "bisect_right" and len(node.args) == 2:
+        elif func_name == "bisect_right" and len(node.args) == 2:
             lst = self._emit_expr_value(node.args[0])
             lst = self._ensure_ptr(lst)
             x = self._emit_expr_value(node.args[1])
             return self.builder.call(self.runtime["bisect_right"], [lst, x])
-        if func_name == "insort" and len(node.args) == 2:
+        elif func_name == "insort" and len(node.args) == 2:
             lst = self._emit_expr_value(node.args[0])
             lst = self._ensure_ptr(lst)
             x = self._emit_expr_value(node.args[1])
@@ -27233,7 +27233,7 @@ class CodeGen:
             arg = self._emit_expr_value(node.args[0])
             arg = self._ensure_ptr(arg)
             return self.builder.call(self.runtime["base64_b64encode"], [arg])
-        if func_name == "b64decode" and len(node.args) == 1:
+        elif func_name == "b64decode" and len(node.args) == 1:
             arg = self._emit_expr_value(node.args[0])
             arg = self._ensure_ptr(arg)
             return self.builder.call(self.runtime["base64_b64decode"], [arg])
@@ -28062,7 +28062,7 @@ class CodeGen:
             return ir.Constant(i64, 0)
 
         # --- logging.log(level, msg) ---
-        if func_name == "log" and len(node.args) >= 2:
+        elif func_name == "log" and len(node.args) >= 2:
             level = self._emit_expr_value(node.args[0])
             if isinstance(level.type, ir.IntType) and level.type.width != 32:
                 level = self.builder.trunc(level, i32) if level.type.width > 32 \
@@ -28074,7 +28074,7 @@ class CodeGen:
             return ir.Constant(i64, 0)
 
         # --- logging.getLogger(name) ---
-        if func_name == "getLogger":
+        elif func_name == "getLogger":
             if len(node.args) >= 1:
                 name = self._emit_expr_value(node.args[0])
                 name = self._ensure_ptr(name)
@@ -28118,10 +28118,10 @@ class CodeGen:
         if mod_name == "typing" and attr_name == "TYPE_CHECKING":
             return ir.Constant(i64, 0)
         # logging.DEBUG/INFO/WARNING/ERROR/CRITICAL constants
-        if mod_name == "logging" and attr_name in self._LOGGING_LEVELS:
+        elif mod_name == "logging" and attr_name in self._LOGGING_LEVELS:
             return ir.Constant(i64, self._LOGGING_LEVELS[attr_name])
         # sys module attributes
-        if mod_name == "sys":
+        elif mod_name == "sys":
             # If the attribute was reassigned (e.g. sys.stderr = io.StringIO()),
             # return None to fall through to the CPython bridge which will
             # read the actual current value from the sys module.
@@ -28789,21 +28789,21 @@ class CodeGen:
         if method == "append" and len(node.args) == 1:
             self._emit_list_append_expr(elem_ptr, node.args[0])
             return
-        if method == "extend" and len(node.args) == 1:
+        elif method == "extend" and len(node.args) == 1:
             other = self._emit_expr_value(node.args[0])
             self._rt_call("list_extend", [elem_ptr, other])
             return
-        if method == "pop" and len(node.args) == 0:
+        elif method == "pop" and len(node.args) == 0:
             self._rt_call("list_pop_int", [elem_ptr])
             return
-        if method == "insert" and len(node.args) == 2:
+        elif method == "insert" and len(node.args) == 2:
             idx = self._emit_expr_value(node.args[0])
             self._emit_list_append_expr(elem_ptr, node.args[1])
             return
-        if method == "sort" and len(node.args) == 0:
+        elif method == "sort" and len(node.args) == 0:
             self._rt_call("list_sort", [elem_ptr])
             return
-        if method == "reverse" and len(node.args) == 0:
+        elif method == "reverse" and len(node.args) == 0:
             self._rt_call("list_reverse_inplace", [elem_ptr])
             return
         # Fallback: convert element to pyobj and route through bridge
@@ -28839,29 +28839,29 @@ class CodeGen:
         if method in _path_props and len(node.args) == 0:
             return self.builder.call(self.runtime[_path_props[method]], [obj])
         # Method calls
-        if method == "exists" and len(node.args) == 0:
+        elif method == "exists" and len(node.args) == 0:
             return self.builder.call(self.runtime["path_exists"], [obj])
-        if method == "is_file" and len(node.args) == 0:
+        elif method == "is_file" and len(node.args) == 0:
             return self.builder.call(self.runtime["path_is_file"], [obj])
-        if method == "is_dir" and len(node.args) == 0:
+        elif method == "is_dir" and len(node.args) == 0:
             return self.builder.call(self.runtime["path_is_dir"], [obj])
-        if method == "resolve" and len(node.args) == 0:
+        elif method == "resolve" and len(node.args) == 0:
             return self.builder.call(self.runtime["path_resolve"], [obj])
-        if method == "read_text" and len(node.args) == 0:
+        elif method == "read_text" and len(node.args) == 0:
             return self.builder.call(self.runtime["path_read_text"], [obj])
-        if method == "write_text" and len(node.args) == 1:
+        elif method == "write_text" and len(node.args) == 1:
             content = self._emit_expr_value(node.args[0])
             content = self._ensure_ptr(content)
             self.builder.call(self.runtime["path_write_text"], [obj, content])
             return ir.Constant(i64, 0)
-        if method == "iterdir" and len(node.args) == 0:
+        elif method == "iterdir" and len(node.args) == 0:
             return self.builder.call(self.runtime["path_iterdir"], [obj])
-        if method == "with_suffix" and len(node.args) == 1:
+        elif method == "with_suffix" and len(node.args) == 1:
             suffix = self._emit_expr_value(node.args[0])
             suffix = self._ensure_ptr(suffix)
             return self.builder.call(self.runtime["path_with_suffix"],
                                       [obj, suffix])
-        if method == "joinpath" and len(node.args) >= 1:
+        elif method == "joinpath" and len(node.args) >= 1:
             result = obj
             for arg_node in node.args:
                 other = self._emit_expr_value(arg_node)
@@ -28870,7 +28870,7 @@ class CodeGen:
                                            [result, other])
             return result
         # __str__ / as_posix
-        if method in ("__str__", "as_posix", "__fspath__"):
+        elif method in ("__str__", "as_posix", "__fspath__"):
             return self.builder.call(self.runtime["path_str"], [obj])
         # Unrecognized path method: fall through to CPython bridge
         return self._emit_cpython_method_call(node)
@@ -28900,7 +28900,7 @@ class CodeGen:
                                ir.Constant(i32, _logger_levels[method]),
                                msg])
             return ir.Constant(i64, 0)
-        if method == "setLevel" and len(node.args) == 1:
+        elif method == "setLevel" and len(node.args) == 1:
             level = self._emit_expr_value(node.args[0])
             if isinstance(level.type, ir.IntType) and level.type.width != 32:
                 level = self.builder.trunc(level, i32) \
@@ -28909,7 +28909,7 @@ class CodeGen:
             self.builder.call(self.runtime["logging_setLevel"],
                               [logger_id, level])
             return ir.Constant(i64, 0)
-        if method == "log" and len(node.args) >= 2:
+        elif method == "log" and len(node.args) >= 2:
             level = self._emit_expr_value(node.args[0])
             if isinstance(level.type, ir.IntType) and level.type.width != 32:
                 level = self.builder.trunc(level, i32) \
@@ -28938,39 +28938,39 @@ class CodeGen:
             self.builder.call(self.runtime["deque_append"],
                               [obj, ir.Constant(i32, tag), data])
             return obj
-        if method == "appendleft" and len(node.args) == 1:
+        elif method == "appendleft" and len(node.args) == 1:
             val = self._emit_expr_value(node.args[0])
             tag, data = self._bare_to_tag_data(val, node.args[0])
             self.builder.call(self.runtime["deque_appendleft"],
                               [obj, ir.Constant(i32, tag), data])
             return obj
-        if method == "pop" and len(node.args) == 0:
+        elif method == "pop" and len(node.args) == 0:
             out_tag = self._create_entry_alloca(i32, "dq.pop.tag")
             out_data = self._create_entry_alloca(i64, "dq.pop.data")
             self.builder.call(self.runtime["deque_pop"],
                               [obj, out_tag, out_data])
             return self.builder.load(out_data)
-        if method == "popleft" and len(node.args) == 0:
+        elif method == "popleft" and len(node.args) == 0:
             out_tag = self._create_entry_alloca(i32, "dq.popleft.tag")
             out_data = self._create_entry_alloca(i64, "dq.popleft.data")
             self.builder.call(self.runtime["deque_popleft"],
                               [obj, out_tag, out_data])
             return self.builder.load(out_data)
-        if method == "rotate":
+        elif method == "rotate":
             n = ir.Constant(i64, 1)
             if len(node.args) == 1:
                 n = self._emit_expr_value(node.args[0])
             self.builder.call(self.runtime["deque_rotate"], [obj, n])
             return obj
-        if method == "clear" and len(node.args) == 0:
+        elif method == "clear" and len(node.args) == 0:
             self.builder.call(self.runtime["deque_clear"], [obj])
             return obj
-        if method == "extend" and len(node.args) == 1:
+        elif method == "extend" and len(node.args) == 1:
             other = self._emit_expr_value(node.args[0])
             other = self._ensure_ptr(other)
             self.builder.call(self.runtime["deque_extend"], [obj, other])
             return obj
-        if method == "extendleft" and len(node.args) == 1:
+        elif method == "extendleft" and len(node.args) == 1:
             other = self._emit_expr_value(node.args[0])
             other = self._ensure_ptr(other)
             self.builder.call(self.runtime["deque_extendleft"], [obj, other])
@@ -28992,20 +28992,20 @@ class CodeGen:
                 n = self._emit_expr_value(node.args[0])
             return self.builder.call(self.runtime["counter_most_common"],
                                       [obj, n])
-        if method == "elements" and len(node.args) == 0:
+        elif method == "elements" and len(node.args) == 0:
             return self.builder.call(self.runtime["counter_elements"], [obj])
-        if method == "update" and len(node.args) == 1:
+        elif method == "update" and len(node.args) == 1:
             other = self._emit_expr_value(node.args[0])
             other = self._ensure_ptr(other)
             self.builder.call(self.runtime["counter_update_list"],
                               [obj, other])
             return obj
         # Counter also supports dict methods (keys, values, items, get, etc.)
-        if method == "keys":
+        elif method == "keys":
             return self._rt_call("dict_keys", [obj])
-        if method == "values":
+        elif method == "values":
             return self._rt_call("dict_values", [obj])
-        if method == "items":
+        elif method == "items":
             return self._rt_call("dict_items", [obj])
         # Phase 4: fall through to runtime dispatch below
 
@@ -29020,9 +29020,9 @@ class CodeGen:
         obj = self._ensure_ptr(obj)
         if method == "keys":
             return self._rt_call("dict_keys", [obj])
-        if method == "values":
+        elif method == "values":
             return self._rt_call("dict_values", [obj])
-        if method == "items":
+        elif method == "items":
             return self._rt_call("dict_items", [obj])
         # Phase 4: fall through to runtime dispatch below
 
@@ -29037,12 +29037,12 @@ class CodeGen:
         if method == "append" and len(node.args) == 1:
             self._emit_list_append_expr(obj, node.args[0])
             return obj
-        if method == "pop" and len(node.args) == 0:
+        elif method == "pop" and len(node.args) == 0:
             return self._rt_call("list_pop_int", [obj])
-        if method == "pop" and len(node.args) == 1:
+        elif method == "pop" and len(node.args) == 1:
             idx = self._emit_expr_value(node.args[0])
             return self._rt_call("list_pop_at", [obj, idx])
-        if method == "index":
+        elif method == "index":
             if len(node.args) == 1:
                 val = self._emit_expr_value(node.args[0])
                 if isinstance(val.type, ir.PointerType):
@@ -29060,16 +29060,16 @@ class CodeGen:
                 stop = self._emit_expr_value(node.args[2])
                 return self._rt_call("list_index_range",
                                      [obj, val, start, stop])
-        if method == "count" and len(node.args) == 1:
+        elif method == "count" and len(node.args) == 1:
             val = self._emit_expr_value(node.args[0])
             if isinstance(val.type, ir.PointerType):
                 return self._rt_call("list_count_str", [obj, val])
             return self._rt_call("list_count", [obj, val])
-        if method == "extend" and len(node.args) == 1:
+        elif method == "extend" and len(node.args) == 1:
             other = self._emit_expr_value(node.args[0])
             self._rt_call("list_extend", [obj, other])
             return obj
-        if method == "sort" and len(node.args) == 0:
+        elif method == "sort" and len(node.args) == 0:
             # Check for key= keyword argument
             has_key = False
             has_reverse = False
@@ -29100,17 +29100,17 @@ class CodeGen:
                     self.builder.call(
                         self.runtime["list_reverse_inplace"], [obj])
                 return obj
-        if method == "reverse" and len(node.args) == 0:
+        elif method == "reverse" and len(node.args) == 0:
             self._rt_call("list_reverse_inplace", [obj])
             return obj
-        if method == "remove" and len(node.args) == 1:
+        elif method == "remove" and len(node.args) == 1:
             val = self._emit_expr_value(node.args[0])
             if isinstance(val.type, ir.PointerType):
                 self._rt_call("list_remove_str", [obj, val])
             else:
                 self._rt_call("list_remove", [obj, val])
             return obj
-        if method == "insert" and len(node.args) == 2:
+        elif method == "insert" and len(node.args) == 2:
             idx = self._emit_expr_value(node.args[0])
             val = self._emit_expr_value(node.args[1])
             if isinstance(val.type, ir.PointerType):
@@ -29118,12 +29118,12 @@ class CodeGen:
             else:
                 self._rt_call("list_insert_int", [obj, idx, val])
             return obj
-        if method == "copy" and len(node.args) == 0:
+        elif method == "copy" and len(node.args) == 0:
             return self._rt_call("list_copy", [obj])
-        if method == "clear" and len(node.args) == 0:
+        elif method == "clear" and len(node.args) == 0:
             self._rt_call("list_clear", [obj])
             return obj
-        if method == "discard" and len(node.args) == 1:
+        elif method == "discard" and len(node.args) == 1:
             val = self._emit_expr_value(node.args[0])
             if isinstance(val.type, ir.PointerType):
                 val = self.builder.ptrtoint(val, i64)
@@ -29146,59 +29146,59 @@ class CodeGen:
             self.builder.call(self.runtime["set_add_fv"],
                               [obj, ir.Constant(i32, tag), data])
             return obj
-        if method == "discard" and len(node.args) == 1:
+        elif method == "discard" and len(node.args) == 1:
             val = self._emit_expr_value(node.args[0])
             tag, data = self._bare_to_tag_data(val, node.args[0])
             self.builder.call(self.runtime["set_discard_fv"],
                               [obj, ir.Constant(i32, tag), data])
             return obj
-        if method == "remove" and len(node.args) == 1:
+        elif method == "remove" and len(node.args) == 1:
             val = self._emit_expr_value(node.args[0])
             tag, data = self._bare_to_tag_data(val, node.args[0])
             self.builder.call(self.runtime["set_discard_fv"],
                               [obj, ir.Constant(i32, tag), data])
             return obj
-        if method == "union" and len(node.args) == 1:
+        elif method == "union" and len(node.args) == 1:
             other = self._emit_expr_value(node.args[0])
             other = self._ensure_ptr(other)
             return self._rt_call("set_union", [obj, other])
-        if method == "intersection" and len(node.args) == 1:
+        elif method == "intersection" and len(node.args) == 1:
             other = self._emit_expr_value(node.args[0])
             other = self._ensure_ptr(other)
             return self._rt_call("set_intersection", [obj, other])
-        if method == "difference" and len(node.args) == 1:
+        elif method == "difference" and len(node.args) == 1:
             other = self._emit_expr_value(node.args[0])
             other = self._ensure_ptr(other)
             return self._rt_call("set_difference", [obj, other])
-        if method == "symmetric_difference" and len(node.args) == 1:
+        elif method == "symmetric_difference" and len(node.args) == 1:
             other = self._emit_expr_value(node.args[0])
             other = self._ensure_ptr(other)
             return self._rt_call("set_symmetric_diff", [obj, other])
-        if method == "issubset" and len(node.args) == 1:
+        elif method == "issubset" and len(node.args) == 1:
             other = self._emit_expr_value(node.args[0])
             other = self._ensure_ptr(other)
             return self._rt_call("set_issubset", [obj, other])
-        if method == "issuperset" and len(node.args) == 1:
+        elif method == "issuperset" and len(node.args) == 1:
             other = self._emit_expr_value(node.args[0])
             other = self._ensure_ptr(other)
             return self._rt_call("set_issuperset", [obj, other])
-        if method == "isdisjoint" and len(node.args) == 1:
+        elif method == "isdisjoint" and len(node.args) == 1:
             other = self._emit_expr_value(node.args[0])
             other = self._ensure_ptr(other)
             return self._rt_call("set_isdisjoint", [obj, other])
-        if method == "copy" and len(node.args) == 0:
+        elif method == "copy" and len(node.args) == 0:
             return self._rt_call("set_copy", [obj])
-        if method == "clear" and len(node.args) == 0:
+        elif method == "clear" and len(node.args) == 0:
             self._rt_call("set_clear", [obj])
             return obj
-        if method == "pop" and len(node.args) == 0:
+        elif method == "pop" and len(node.args) == 0:
             tag_slot = self._create_entry_alloca(i32, "spop.tag")
             data_slot = self._create_entry_alloca(i64, "spop.data")
             self.builder.call(self.runtime["set_pop_fv"],
                               [obj, tag_slot, data_slot])
             return self._fv_build_from_slots(
                 self.builder.load(tag_slot), self.builder.load(data_slot))
-        if method == "update" and len(node.args) == 1:
+        elif method == "update" and len(node.args) == 1:
             other = self._emit_expr_value(node.args[0])
             other = self._ensure_ptr(other)
             self._rt_call("set_update", [obj, other])
@@ -29215,11 +29215,11 @@ class CodeGen:
         obj = self._emit_expr_value(attr.value)
         if method == "keys":
             return self._rt_call("dict_keys", [obj])
-        if method == "values":
+        elif method == "values":
             return self._rt_call("dict_values", [obj])
-        if method == "items":
+        elif method == "items":
             return self._rt_call("dict_items", [obj])
-        if method == "get":
+        elif method == "get":
             if len(node.args) >= 1:
                 key = self._emit_expr_value(node.args[0])
                 # Use FV-ABI: return full FpyValue so runtime tag drives dispatch.
@@ -29281,12 +29281,12 @@ class CodeGen:
                 else:
                     default = self._make_string_constant("None")
                 return self._rt_call("dict_get_default", [obj, key, default])
-        if method == "update":
+        elif method == "update":
             if len(node.args) == 1:
                 other = self._emit_expr_value(node.args[0])
                 self._rt_call("dict_update", [obj, other])
                 return obj
-        if method == "pop":
+        elif method == "pop":
             if len(node.args) == 1:
                 key = self._emit_expr_value(node.args[0])
                 # Heuristic: use int pop if we can't tell; returning str by default
@@ -29304,7 +29304,7 @@ class CodeGen:
                 return self._fv_build_from_slots(
                     self.builder.load(out_tag),
                     self.builder.load(out_data))
-        if method == "setdefault":
+        elif method == "setdefault":
             if len(node.args) == 2:
                 key = self._emit_expr_value(node.args[0])
                 default = self._emit_expr_value(node.args[1])
@@ -29313,7 +29313,7 @@ class CodeGen:
                 else:
                     self._rt_call("dict_setdefault_int", [obj, key, default])
                 return obj
-        if method == "popitem" and len(node.args) == 0:
+        elif method == "popitem" and len(node.args) == 0:
             kt = self._create_entry_alloca(i32, "pi.kt")
             kd = self._create_entry_alloca(i64, "pi.kd")
             vt = self._create_entry_alloca(i32, "pi.vt")
@@ -29329,9 +29329,9 @@ class CodeGen:
                               [tup, self.builder.load(vt),
                                self.builder.load(vd)])
             return tup
-        if method == "copy" and len(node.args) == 0:
+        elif method == "copy" and len(node.args) == 0:
             return self._rt_call("dict_copy", [obj])
-        if method == "clear" and len(node.args) == 0:
+        elif method == "clear" and len(node.args) == 0:
             self._rt_call("dict_clear", [obj])
             return obj
         # Phase 4: fall through to runtime dispatch below
@@ -30090,7 +30090,7 @@ class CodeGen:
                 # and super().__new__() as no-ops; other methods raise.
                 if method in ("__init__", "__init_subclass__"):
                     return ir.Constant(i64, 0)
-                if method == "__new__":
+                elif method == "__new__":
                     # Already handled above for explicit parent=None
                     if node.args:
                         cls_arg = self._emit_expr_value(node.args[0])
