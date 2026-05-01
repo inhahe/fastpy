@@ -664,6 +664,10 @@ int32_t fastpy_fv_truthy(int32_t tag, int64_t data) {
             FpyDict *s = (FpyDict*)data;
             return s && s->length != 0;
         }
+        case FPY_TAG_BIGINT: {
+            FpyBigInt *bi = (FpyBigInt*)(intptr_t)data;
+            return bi && !fpy_bigint_is_zero(bi);
+        }
     }
     return 0;
 }

@@ -3251,6 +3251,19 @@ class CodeGen:
                     and isinstance(node.value.func, ast.Name)
                     and node.value.func.id in self._user_classes):
                 self._global_obj_classes[node.targets[0].id] = node.value.func.id
+        # Propagate Name-to-Name copies: `cur = head` where head is known.
+        for _ in range(5):
+            prev = len(self._global_obj_classes)
+            for node in tree.body:
+                if (isinstance(node, ast.Assign) and len(node.targets) == 1
+                        and isinstance(node.targets[0], ast.Name)
+                        and isinstance(node.value, ast.Name)
+                        and node.value.id in self._global_obj_classes
+                        and node.targets[0].id not in self._global_obj_classes):
+                    self._global_obj_classes[node.targets[0].id] = (
+                        self._global_obj_classes[node.value.id])
+            if len(self._global_obj_classes) == prev:
+                break
 
         # Pass 1.1: hoist simple inner functions (no captures) to module
         # level so call sites inside their outer function can find them.
@@ -5267,6 +5280,15 @@ class CodeGen:
                             # Genuine type conflict (e.g. int vs str)
                             existing[i] = "mixed"
 
+        # Pre-cleanup: "mixed" means incompatible types within the same
+        # category (e.g. str vs list vs dict — all pointers but not
+        # interchangeable).  Clear to None so the param uses generic
+        # FV-ABI runtime dispatch.
+        for fname, merged in self._call_site_param_types.items():
+            for i, mt in enumerate(merged):
+                if mt == "mixed":
+                    merged[i] = None
+
         # Post-merge: clear param types when CONCRETE call-site signatures
         # have incompatible type *categories* for the same position.
         # Categories: P=pointer (str, list, dict, obj, list:*, dict:*),
@@ -5303,13 +5325,17 @@ class CodeGen:
                         has_none = True
                     else:
                         concrete_cats.add(sc)
-                # Clear if: (1) merged is D/P (float/pointer) and there's an
-                # unknown caller (could be any type), OR (2) concrete types
-                # span multiple categories (genuine conflict like float+str).
+                # Clear if: (1) merged is D (float) and there's an unknown
+                # caller (int data would be bitcast-corrupted as double), OR
+                # (2) concrete types span multiple categories.
+                # Pointer types (P) are kept when at least one concrete caller
+                # confirms them — unknown callers (e.g. recursive calls with
+                # unresolvable attribute args) are handled by FV-ABI's runtime
+                # tag, so they can't corrupt the pointer interpretation.
                 if mc == "D" and has_none:
                     merged[i] = None
-                elif mc == "P" and has_none:
-                    merged[i] = None  # unknown callers might pass int/str/list
+                elif mc == "P" and has_none and not concrete_cats:
+                    merged[i] = None  # no concrete evidence at all
                 elif len(concrete_cats) > 1:
                     merged[i] = None
 
@@ -5391,6 +5417,20 @@ class CodeGen:
                     and isinstance(node.value.func, ast.Name)
                     and node.value.func.id in class_parents):
                 obj_classes[node.targets[0].id] = node.value.func.id
+
+        # Propagate Name-to-Name copies: `cur = head` where head is a known
+        # class instance.  Iterative fixpoint handles chains like a=B(); c=a; d=c.
+        for _ in range(5):
+            prev = len(obj_classes)
+            for node in ast.walk(tree):
+                if (isinstance(node, ast.Assign) and len(node.targets) == 1
+                        and isinstance(node.targets[0], ast.Name)
+                        and isinstance(node.value, ast.Name)
+                        and node.value.id in obj_classes
+                        and node.targets[0].id not in obj_classes):
+                    obj_classes[node.targets[0].id] = obj_classes[node.value.id]
+            if len(obj_classes) == prev:
+                break
 
         # Iterative fixpoint: also track assignments from function calls
         # whose return type we've inferred as obj. Scan function defs to
