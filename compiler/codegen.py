@@ -12344,7 +12344,19 @@ class CodeGen:
                          and self._var_kind(rhs.func.value.id) == VKind.PYOBJ
                          and rhs.func.value.id not in getattr(self, '_native_modules', set())
                          and not _is_path_var(rhs.func.value))
+        # Exclude chained native module calls: os.path.join(a,b,c)
+        # These should go through _emit_call_expr which has native handlers.
+        # For `os.path.join(...)`, the AST is Name("os").Attribute("path").Attribute("join")
+        # so the dotted module is "os.path", which is what's stored in _native_modules.
+        _is_chained_native = False
+        if (isinstance(rhs, ast.Call)
+                and isinstance(rhs.func, ast.Attribute)
+                and isinstance(rhs.func.value, ast.Attribute)
+                and isinstance(rhs.func.value.value, ast.Name)):
+            _dotted = rhs.func.value.value.id + "." + rhs.func.value.attr
+            _is_chained_native = _dotted in getattr(self, '_native_modules', set())
         is_pyobj_call_chain = (not is_pyobj_call
+                               and not _is_chained_native
                                and isinstance(rhs, ast.Call)
                                and isinstance(rhs.func, ast.Attribute)
                                and self._is_pyobj_receiver(rhs.func.value)
@@ -13194,7 +13206,12 @@ class CodeGen:
         obj = self._ensure_ptr(obj)
         index = self._emit_expr_value(target.slice)
         tag, data = self._bare_to_tag_data(value, value_node=value_node)
-        if (self._is_dict_expr(target.value)
+        if self._is_chainmap_expr(target.value):
+            # ChainMap set uses its own runtime function
+            key = self._ensure_ptr(index)
+            self.builder.call(self.runtime["chainmap_set"],
+                              [obj, key, ir.Constant(i32, tag), data])
+        elif (self._is_dict_expr(target.value)
                 or self._is_defaultdict_expr(target.value)
                 or self._is_counter_expr(target.value)):
             # Int keys use the int-keyed setter so the dict stores them
@@ -14398,6 +14415,10 @@ class CodeGen:
             elif method in ("most_common", "elements"):
                 if self._is_counter_expr(node.func.value):
                     return ValueType(VKind.LIST, elem_type=ValueType(VKind.LIST))
+            # ChainMap.new_child() returns a ChainMap
+            elif method == "new_child":
+                if self._is_chainmap_expr(node.func.value):
+                    return ValueType(VKind.CHAINMAP)
             # User class method return: check method return type
             ret_type = self._find_method_return_type(node.func.value, method)
             if ret_type is not None and isinstance(ret_type, ir.PointerType):
@@ -14609,14 +14630,11 @@ class CodeGen:
         # Attribute access on pyobj/native_mod that goes through bridge → pyobj
         if (isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name)
                 and node.value.id in self.variables
-                and self._var_kind(node.value.id) == VKind.PYOBJ):
-            # Check if we handle this attribute natively
-            if self._var_kind(node.value.id) == VKind.PYOBJ:
-                val = self._emit_native_module_attr(node.value.id, node.attr)
-                if val is None:
-                    return ValueType(VKind.PYOBJ)  # Falls through to bridge
-            else:
-                return ValueType(VKind.PYOBJ)
+                and self._var_kind(node.value.id) in (VKind.PYOBJ, VKind.NATIVE_MOD)):
+            # Check if we handle this attribute natively (e.g. math.pi)
+            val = self._emit_native_module_attr(node.value.id, node.attr)
+            if val is None:
+                return ValueType(VKind.PYOBJ)  # Falls through to CPython bridge
         # Chained pyobj attribute: foo.bar.baz where foo is pyobj
         # Exclude native module attributes (math.pi) and path attributes (p.name)
         if (isinstance(node, ast.Attribute) and self._is_pyobj_receiver(node.value)
@@ -15779,6 +15797,25 @@ class CodeGen:
                 self.builder.call(self.runtime["cell_set"], [cell_ptr, value])
                 return
 
+        # PYOBJ variables store raw PyObject* pointers (not FpyValue) so that
+        # all downstream operations (subscript, method calls, etc.) can use the
+        # CPython bridge directly.  FV wrapping would convert the PyObject* to
+        # a native tag+data pair, breaking bridge operations that expect PyObject*.
+        _new_kind = (type_tag.kind if isinstance(type_tag, ValueType)
+                     else self._tag_kind(type_tag))
+        if (_new_kind == VKind.PYOBJ
+                and not isinstance(value.type, ir.LiteralStructType)):
+            value = self._ensure_ptr(value)
+            if name in self.variables:
+                alloca, _ = self.variables[name]
+                if not isinstance(alloca.type, ir.PointerType) or alloca.type.pointee != i8_ptr:
+                    alloca = self._create_entry_alloca(i8_ptr, name)
+            else:
+                alloca = self._create_entry_alloca(i8_ptr, name)
+            self.variables[name] = (alloca, type_tag)
+            self.builder.store(value, alloca)
+            return
+
         if not self._USE_FV_LOCALS or self._current_fn_bare_abi:
             # Bare-type alloca: store native values directly (no FpyValue wrapping).
             # Used in both legacy mode (_USE_FV_LOCALS=False) and bare-ABI functions.
@@ -16849,6 +16886,10 @@ class CodeGen:
                 return
             if vtype.kind in (VKind.DICT, VKind.SET, VKind.DEFAULTDICT, VKind.COUNTER):
                 self._emit_for_dict(node)
+                return
+            if vtype.kind == VKind.CHAINMAP:
+                # ChainMap iteration: bridge fallback (no native iterator yet)
+                self._emit_for_pyobj(node)
                 return
             if vtype.kind == VKind.PYOBJ:
                 self._emit_for_pyobj(node)
@@ -20880,6 +20921,18 @@ class CodeGen:
                 result = self.builder.not_(result)
             return result
 
+        # ChainMap 'in': "key" in cm
+        if c_kind == VKind.CHAINMAP or self._is_chainmap_expr(container_node):
+            container = self._emit_expr_value(container_node)
+            container = self._ensure_ptr(container)
+            left_val = self._ensure_ptr(left_val)
+            result = self.builder.call(
+                self.runtime["chainmap_contains"], [container, left_val])
+            result_i1 = self.builder.icmp_signed("!=", result, ir.Constant(i32, 0))
+            if isinstance(op, ast.NotIn):
+                result_i1 = self.builder.not_(result_i1)
+            return result_i1
+
         # Dict 'in': "key" in dict/defaultdict/Counter
         if c_kind in _DICT_LIKE or self._is_dict_expr(container_node):
             container = self._emit_expr_value(container_node)
@@ -22868,7 +22921,12 @@ class CodeGen:
                 and self._is_pyobj_receiver(node.func.value)
                 and not (isinstance(node.func.value, ast.Name)
                          and node.func.value.id in getattr(
-                             self, '_native_modules', set()))):
+                             self, '_native_modules', set()))
+                # Also exclude chained native module calls: os.path.join(...)
+                and not (isinstance(node.func.value, ast.Attribute)
+                         and isinstance(node.func.value.value, ast.Name)
+                         and (node.func.value.value.id + "." + node.func.value.attr)
+                             in getattr(self, '_native_modules', set()))):
             ptr = self._emit_cpython_call_raw(node)
             ptr = self._ensure_ptr(ptr)
             self.builder.call(self.runtime["cpython_print_obj"], [ptr])
@@ -22971,15 +23029,32 @@ class CodeGen:
                 _nm = node.func.value.id
                 if _nm in getattr(self, '_native_modules', set()):
                     _has_native = True
+            # Chained native module: os.path.join(...) where "os.path" is native
+            elif (isinstance(node.func.value, ast.Attribute)
+                    and isinstance(node.func.value.value, ast.Name)):
+                _dotted = node.func.value.value.id + "." + node.func.value.attr
+                if _dotted in getattr(self, '_native_modules', set()):
+                    _has_native = True
             if not _has_native:
                 _is_pyobj_print = True
         if _is_pyobj_print:
             # For Call nodes on pyobj, use _emit_cpython_call_raw to get
             # a raw PyObject* (not an FpyValue-extracted i64).
+            # Exclude both flat native module calls (os.getcwd()) and chained
+            # native module calls (os.path.join()) — they return native types.
+            _is_native_call = False
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+                if (isinstance(node.func.value, ast.Name)
+                        and node.func.value.id in getattr(self, '_native_modules', set())):
+                    _is_native_call = True
+                elif (isinstance(node.func.value, ast.Attribute)
+                        and isinstance(node.func.value.value, ast.Name)
+                        and (node.func.value.value.id + "." + node.func.value.attr)
+                            in getattr(self, '_native_modules', set())):
+                    _is_native_call = True
             if (isinstance(node, ast.Call)
                     and isinstance(node.func, ast.Attribute)
-                    and not (isinstance(node.func.value, ast.Name)
-                             and node.func.value.id in getattr(self, '_native_modules', set()))):
+                    and not _is_native_call):
                 ptr = self._emit_cpython_call_raw(node)
             else:
                 ptr = self._emit_expr_value(node)
@@ -23167,6 +23242,13 @@ class CodeGen:
                     if method_func:
                         result = self.builder.call(method_func, [obj])
                         return self._wrap_for_print(result, node)
+        # Complex attribute access: z.real, z.imag — evaluate via
+        # _emit_expr_value which has the GEP-based field access handler.
+        if (isinstance(node, ast.Attribute)
+                and node.attr in ("real", "imag")
+                and self._is_complex_expr(node.value)):
+            val = self._emit_expr_value(node)
+            return self._wrap_for_print(val, node)
         # Path attribute access in FV context: evaluate the path expression
         # normally and wrap the result for the correct FpyValue tag.  Must come
         # before the generic obj handler which would call obj_get_fv on a PyObject*.
@@ -23255,6 +23337,10 @@ class CodeGen:
         Uses AST-level type checks for pointer disambiguation (str vs list
         vs dict vs tuple vs obj). Falls back to LLVM type for scalars.
         """
+        # Already an FpyValue struct — return as-is (e.g. json.loads() result)
+        if (isinstance(value.type, ir.LiteralStructType)
+                and value.type == fpy_val):
+            return value
         # Constants: inline the tag
         if isinstance(node, ast.Constant):
             if node.value is None:
@@ -26002,6 +26088,20 @@ class CodeGen:
                     tag = self.builder.load(tag_slot)
                     data = self.builder.load(data_slot)
                     return self._fv_build_from_slots(tag, data)
+            # Complex attribute access: z.real, z.imag
+            if node.attr in ("real", "imag") and self._is_complex_expr(node.value):
+                obj = self._emit_expr_value(node.value)
+                obj = self._ensure_ptr(obj)
+                # FpyComplex = { double real, double imag }
+                _complex_struct = ir.LiteralStructType([double, double])
+                typed_ptr = self.builder.bitcast(
+                    obj, ir.PointerType(_complex_struct))
+                idx = 0 if node.attr == "real" else 1
+                field_ptr = self.builder.gep(
+                    typed_ptr,
+                    [ir.Constant(i32, 0), ir.Constant(i32, idx)],
+                    name=f"complex.{node.attr}")
+                return self.builder.load(field_ptr)
             # Native module attribute (e.g. math.pi): return constant
             if isinstance(node.value, ast.Name):
                 _nm = node.value.id
@@ -27811,8 +27911,14 @@ class CodeGen:
             out_data = self._create_entry_alloca(i64, "json.data")
             self.builder.call(self.runtime["json_loads"],
                               [arg, out_tag, out_data])
+            tag_val = self.builder.load(out_tag)
             data_val = self.builder.load(out_data)
-            return self._ensure_ptr(data_val)
+            # Return FpyValue — json.loads can return any type (int, str,
+            # list, dict, bool, None) depending on the input JSON.
+            fv = ir.Constant(fpy_val, ir.Undefined)
+            fv = self.builder.insert_value(fv, tag_val, 0)
+            fv = self.builder.insert_value(fv, data_val, 1)
+            return fv
         return None
 
     def _emit_os_call(self, func_name, node):
@@ -27842,10 +27948,22 @@ class CodeGen:
         }
         if func_name in _os_path_fns:
             rt_key, n_args = _os_path_fns[func_name]
+            # os.path.join supports 2+ args: chain pairwise
+            if func_name == "join" and len(node.args) >= 2:
+                result = self._ensure_ptr(self._emit_expr_value(node.args[0]))
+                for i in range(1, len(node.args)):
+                    right = self._ensure_ptr(self._emit_expr_value(node.args[i]))
+                    result = self.builder.call(self.runtime[rt_key], [result, right])
+                # os.path.join returns a string path — wrap as STR
+                return self._fv_from_str(result)
             if len(node.args) == n_args:
                 args = [self._ensure_ptr(self._emit_expr_value(node.args[i]))
                         for i in range(n_args)]
-                return self.builder.call(self.runtime[rt_key], args)
+                result = self.builder.call(self.runtime[rt_key], args)
+                # Boolean-returning functions: wrap as BOOL FpyValue
+                if func_name in ("exists", "isfile", "isdir"):
+                    return self._fv_from_bool(result)
+                return result
         return None
 
     def _emit_asyncio_call(self, func_name, node):
@@ -29862,6 +29980,16 @@ class CodeGen:
         # Check if object is a Counter
         return None
 
+    def _emit_method_call_chainmap(self, node):
+        """Emit ChainMap method calls. Returns None if not recognized."""
+        method = node.func.attr
+        obj = self._emit_expr_value(node.func.value)
+        obj = self._ensure_ptr(obj)
+        if method == "new_child" and len(node.args) == 0:
+            return self.builder.call(
+                self.runtime["chainmap_new_child"], [obj])
+        return None
+
     def _emit_method_call_counter(self, node):
         """Emit Counter method calls. Returns None if not recognized."""
         attr = node.func
@@ -31570,6 +31698,11 @@ class CodeGen:
             if result is not None:
                 return result
 
+        if self._is_chainmap_expr(attr.value):
+            result = self._emit_method_call_chainmap(node)
+            if result is not None:
+                return result
+
         # --- List/tuple method calls ---
         if self._is_list_expr(attr.value) or self._is_tuple_expr(attr.value):
             result = self._emit_method_call_list(node)
@@ -32402,6 +32535,23 @@ class CodeGen:
             self.builder.call(self.runtime["deque_get"],
                               [obj, idx, out_tag, out_data])
             return self.builder.load(out_data)
+
+        # Check for ChainMap subscript access: cm["key"]
+        if self._is_chainmap_expr(node.value):
+            obj = self._emit_expr_value(node.value)
+            obj = self._ensure_ptr(obj)
+            key = self._emit_expr_value(node.slice)
+            key = self._ensure_ptr(key)
+            tag_slot = self._create_entry_alloca(i32, "cm.get.tag")
+            data_slot = self._create_entry_alloca(i64, "cm.get.data")
+            self.builder.call(self.runtime["chainmap_get"],
+                              [obj, key, tag_slot, data_slot])
+            tag = self.builder.load(tag_slot)
+            data = self.builder.load(data_slot)
+            fv = ir.Constant(fpy_val, ir.Undefined)
+            fv = self.builder.insert_value(fv, tag, 0)
+            fv = self.builder.insert_value(fv, data, 1)
+            return fv
 
         # Check for dict access
         if self._is_dict_expr(node.value):
