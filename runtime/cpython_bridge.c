@@ -181,9 +181,8 @@ static void bridge_propagate_exception(void) {
 void* fpy_cpython_getattr(void *obj, const char *attr_name) {
     PyObject *result = PyObject_GetAttrString((PyObject*)obj, attr_name);
     if (!result) {
-        PyErr_Print();
-        fprintf(stderr, "AttributeError: '%s'\n", attr_name);
-        exit(1);
+        bridge_propagate_exception();
+        Py_RETURN_NONE;
     }
     return (void*)result;
 }
@@ -193,8 +192,9 @@ void fpy_cpython_setattr(void *obj, const char *attr_name,
                          int32_t val_tag, int64_t val_data) {
     PyObject *value = fpy_to_pyobject(val_tag, val_data);
     if (PyObject_SetAttrString((PyObject*)obj, attr_name, value) < 0) {
-        PyErr_Print();
-        fprintf(stderr, "Error setting attribute '%s'\n", attr_name);
+        Py_DECREF(value);
+        bridge_propagate_exception();
+        return;
     }
     Py_DECREF(value);
 }
