@@ -22975,19 +22975,34 @@ class CodeGen:
                 return self._fv_build_from_slots(
                     self.builder.load(tag_slot),
                     self.builder.load(data_slot))
-        # CPython module attribute (e.g. math.pi) — must come BEFORE the
-        # generic Attribute handler which calls obj_get_fv.
-        # Native module attribute (math.pi): return constant as FpyValue
+        # CPython module attribute (e.g. math.pi, string.ascii_lowercase)
+        # — must come BEFORE the generic Attribute handler which calls
+        # obj_get_fv.  For natively-handled attrs, return the constant;
+        # for everything else, fall through to cpython_getattr bridge.
         if (isinstance(node, ast.Attribute)
                 and isinstance(node.value, ast.Name)):
             _nm = node.value.id
             _is_native = ((_nm in self.variables
-                          and self._var_kind(_nm) == VKind.PYOBJ)
+                          and self._var_kind(_nm) in (
+                              VKind.PYOBJ, VKind.NATIVE_MOD))
                          or _nm in getattr(self, '_native_modules', set()))
             if _is_native:
                 val = self._emit_native_module_attr(_nm, node.attr)
                 if val is not None:
                     return self._wrap_for_print(val, node)
+                # No native handler — fall through to CPython bridge
+                obj = self._load_variable(_nm, node)
+                obj = self._ensure_ptr(obj)
+                attr_name = self._make_string_constant(node.attr)
+                pyobj = self.builder.call(
+                    self.runtime["cpython_getattr"], [obj, attr_name])
+                tag_slot = self._create_entry_alloca(i32, "natmod.tag")
+                data_slot = self._create_entry_alloca(i64, "natmod.data")
+                self.builder.call(self.runtime["cpython_to_fv"],
+                                  [pyobj, tag_slot, data_slot])
+                return self._fv_build_from_slots(
+                    self.builder.load(tag_slot),
+                    self.builder.load(data_slot))
         # Native module call in print context (print(math.sqrt(x)))
         if (isinstance(node, ast.Call)
                 and isinstance(node.func, ast.Attribute)
@@ -23603,9 +23618,9 @@ class CodeGen:
     def _is_pyobj_receiver(self, node: ast.expr) -> bool:
         """Check if a receiver expression is a pyobj (bridge object).
         Handles: name, name.attr, name[key], call(...).attr, etc."""
-        # Direct variable: qs where qs is pyobj
+        # Direct variable: qs where qs is pyobj (or native module needing bridge)
         if isinstance(node, ast.Name) and node.id in self.variables:
-            return self._var_kind(node.id) == VKind.PYOBJ
+            return self._var_kind(node.id) in (VKind.PYOBJ, VKind.NATIVE_MOD)
         # Attribute on pyobj: User.objects where User is pyobj
         if isinstance(node, ast.Attribute):
             return self._is_pyobj_receiver(node.value)
@@ -25876,7 +25891,8 @@ class CodeGen:
             # resolved correctly inside functions, not just at module scope.
             _is_pyobj_var = (isinstance(node.value, ast.Name)
                              and node.value.id in self.variables
-                             and self._var_kind(node.value.id) == VKind.PYOBJ)
+                             and self._var_kind(node.value.id) in (
+                                 VKind.PYOBJ, VKind.NATIVE_MOD))
             _is_module_import = (isinstance(node.value, ast.Name)
                                  and node.value.id in self._cpython_modules)
             if _is_pyobj_var or _is_module_import:
