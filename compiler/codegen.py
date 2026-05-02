@@ -5006,14 +5006,22 @@ class CodeGen:
         # Propagate return types back to module-level var_types
         for node in ast.walk(tree):
             if (isinstance(node, ast.Assign) and len(node.targets) == 1
-                    and isinstance(node.targets[0], ast.Name)
                     and isinstance(node.value, ast.Call)
                     and isinstance(node.value.func, ast.Name)
                     and node.value.func.id in _func_ret_types):
                 rt = _func_ret_types[node.value.func.id]
                 _rtk = self._tag_kind(rt)
-                if _rtk in (VKind.LIST, VKind.DICT, VKind.STR):
-                    var_types[node.targets[0].id] = rt
+                tgt = node.targets[0]
+                if isinstance(tgt, ast.Name):
+                    if _rtk in (VKind.LIST, VKind.DICT, VKind.STR):
+                        var_types[tgt.id] = rt
+                elif isinstance(tgt, ast.Tuple) and rt == "tuple:float":
+                    # Tuple unpacking from a function that returns
+                    # tuple:float: h, l, s = rgb_to_hls(...) → each
+                    # variable is float.
+                    for elt in tgt.elts:
+                        if isinstance(elt, ast.Name):
+                            var_types[elt.id] = "float"
         return _func_ret_types
 
     def _csa_scan_and_merge(
