@@ -19201,7 +19201,22 @@ class CodeGen:
             if n >= 1:
                 types[0] = "int"
             if n >= 2 and iter_node.args:
-                types[1] = self._infer_list_elem_type(iter_node.args[0])
+                arg = iter_node.args[0]
+                # String iteration: enumerate("hello") or enumerate(str_var)
+                # yields individual characters, which are strings.
+                if (isinstance(arg, ast.Constant)
+                        and isinstance(arg.value, str)):
+                    types[1] = "str"
+                elif isinstance(arg, ast.JoinedStr):
+                    types[1] = "str"
+                elif (isinstance(arg, ast.Name)
+                      and arg.id in self.variables
+                      and self._var_kind(arg.id) == VKind.STR):
+                    types[1] = "str"
+                else:
+                    # Use _get_list_elem_type which handles Name lookups
+                    # (variable elem_type) as well as AST inference.
+                    types[1] = self._get_list_elem_type(arg)
             return types
         # zip(a, b): check each side's first element
         if (isinstance(iter_node, ast.Call) and isinstance(iter_node.func, ast.Name)
@@ -21309,7 +21324,7 @@ class CodeGen:
             if (isinstance(node.func.value, ast.Subscript)
                     and self._is_list_expr(node.func.value.value)
                     and self._get_list_elem_type(
-                        node.func.value.value) == "mixed"):
+                        node.func.value.value).kind == VKind.MIXED):
                 self._emit_mixed_elem_method(node)
                 return
             self._emit_method_call(node)
@@ -28973,7 +28988,7 @@ class CodeGen:
         # expressions where the static VKind is reliable).
         if kind in (VKind.LIST, VKind.TUPLE):
             return self._rt_call("list_length", [tv.as_ptr(self.builder)])
-        if kind in (VKind.DICT, VKind.SET):
+        if kind in (VKind.DICT, VKind.SET, VKind.DEFAULTDICT, VKind.COUNTER):
             return self._rt_call("dict_length", [tv.as_ptr(self.builder)])
         if kind == VKind.STR:
             return self._rt_call("str_len", [tv.as_ptr(self.builder)])
