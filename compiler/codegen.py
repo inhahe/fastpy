@@ -2803,7 +2803,7 @@ class CodeGen:
                         def _has_float(n):
                             if isinstance(n, ast.Constant) and isinstance(n.value, float):
                                 return True
-                            if isinstance(n, ast.Name) and global_types.get(n.id) == "float":
+                            if isinstance(n, ast.Name) and self._tag_kind(global_types.get(n.id)) == VKind.FLOAT:
                                 return True
                             if isinstance(n, ast.BinOp):
                                 return _has_float(n.left) or _has_float(n.right)
@@ -2823,7 +2823,7 @@ class CodeGen:
             if isinstance(node, ast.Assign) and len(node.targets) == 1:
                 if isinstance(node.targets[0], ast.Name):
                     name = node.targets[0].id
-                    if global_types.get(name) != "list":
+                    if self._tag_kind(global_types.get(name)) != VKind.LIST:
                         continue
                     et = ValueType(VKind.INT)  # default
                     if isinstance(node.value, (ast.List, ast.ListComp)):
@@ -2835,7 +2835,7 @@ class CodeGen:
                             for _elt in node.value.elts:
                                 if isinstance(_elt, ast.Name):
                                     ref_type = global_types.get(_elt.id)
-                                    if ref_type == "list":
+                                    if self._tag_kind(ref_type) == VKind.LIST:
                                         # Compound: include inner elem type
                                         _inner = global_list_elem_types.get(
                                             _elt.id, ValueType(VKind.INT))
@@ -2843,9 +2843,9 @@ class CodeGen:
                                             _inner = ValueType(VKind.INT)
                                         et = ValueType(VKind.LIST, elem_type=_inner)
                                         break
-                                    _REF_TYPE_MAP = {"dict": VKind.DICT, "str": VKind.STR, "float": VKind.FLOAT}
-                                    if ref_type in _REF_TYPE_MAP:
-                                        et = ValueType(_REF_TYPE_MAP[ref_type])
+                                    _rtk = self._tag_kind(ref_type)
+                                    if _rtk in (VKind.DICT, VKind.STR, VKind.FLOAT):
+                                        et = ValueType(_rtk)
                                         break
                     elif (isinstance(node.value, ast.Call)
                           and isinstance(node.value.func, ast.Name)
@@ -2885,8 +2885,8 @@ class CodeGen:
                             and call.func.attr == "append"
                             and isinstance(call.func.value, ast.Name)
                             and call.func.value.id in global_list_elem_types
-                            and global_list_elem_types[
-                                call.func.value.id] == "int"
+                            and self._tag_kind(global_list_elem_types.get(
+                                call.func.value.id)) == VKind.INT
                             and len(call.args) == 1):
                         arg = call.args[0]
                         vn = call.func.value.id
@@ -2905,20 +2905,21 @@ class CodeGen:
                         _GTYPE_VKIND = {"list": VKind.LIST, "dict": VKind.DICT,
                                         "str": VKind.STR, "set": VKind.SET,
                                         "tuple": VKind.TUPLE}
-                        if gtype in _GTYPE_VKIND:
+                        _gk = self._tag_kind(gtype) if gtype else None
+                        if _gk in _GTYPE_VKIND.values():
                             gvar = ir.GlobalVariable(self.module, i8_ptr,
                                                      name=f"fastpy.global.{name}")
                             gvar.initializer = ir.Constant(i8_ptr, None)
                             gvar.linkage = "private"
-                            if gtype == "list":
+                            if _gk == VKind.LIST:
                                 _elt = global_list_elem_types.get(name, ValueType(VKind.INT))
                                 if not isinstance(_elt, ValueType):
                                     _elt = ValueType(VKind.INT)
                                 tag = ValueType(VKind.LIST, elem_type=_elt)
                             else:
-                                tag = ValueType(_GTYPE_VKIND[gtype])
+                                tag = ValueType(_gk)
                             self._global_vars[name] = (gvar, tag)
-                        elif gtype == "float":
+                        elif _gk == VKind.FLOAT:
                             gvar = ir.GlobalVariable(self.module, double,
                                                      name=f"fastpy.global.{name}")
                             gvar.initializer = ir.Constant(double, 0.0)
@@ -2966,20 +2967,21 @@ class CodeGen:
                         _GTYPE_VKIND2 = {"list": VKind.LIST, "dict": VKind.DICT,
                                          "str": VKind.STR, "set": VKind.SET,
                                          "tuple": VKind.TUPLE}
-                        if gtype in _GTYPE_VKIND2:
+                        _gk2 = self._tag_kind(gtype) if gtype else None
+                        if _gk2 in _GTYPE_VKIND2.values():
                             gvar = ir.GlobalVariable(self.module, i8_ptr,
                                                      name=f"fastpy.global.{child.id}")
                             gvar.initializer = ir.Constant(i8_ptr, None)
                             gvar.linkage = "private"
-                            if gtype == "list":
+                            if _gk2 == VKind.LIST:
                                 _elt = global_list_elem_types.get(child.id, ValueType(VKind.INT))
                                 if not isinstance(_elt, ValueType):
                                     _elt = ValueType(VKind.INT)
                                 tag = ValueType(VKind.LIST, elem_type=_elt)
                             else:
-                                tag = ValueType(_GTYPE_VKIND2[gtype])
+                                tag = ValueType(_gk2)
                             self._global_vars[child.id] = (gvar, tag)
-                        elif gtype == "float":
+                        elif _gk2 == VKind.FLOAT:
                             gvar = ir.GlobalVariable(self.module, double,
                                                      name=f"fastpy.global.{child.id}")
                             gvar.initializer = ir.Constant(double, 0.0)
@@ -4311,7 +4313,7 @@ class CodeGen:
                                                 if isinstance(e, ast.Attribute) and isinstance(e.value, ast.Name) and e.value.id == "self":
                                                     # self.other_attr — check if that attr is float
                                                     other = self._infer_attr_type_from_init(cls_name, e.attr, class_parents)
-                                                    return other == "float"
+                                                    return self._tag_kind(other) == VKind.FLOAT
                                                 if isinstance(e, ast.BinOp):
                                                     return _has_float(e.left) or _has_float(e.right)
                                                 return False
@@ -6153,9 +6155,9 @@ class CodeGen:
                         _existing = var_types.get(tgt.id)
                         _rtk = self._tag_kind(_fn.ret_tag)
                         if _rtk == VKind.LIST:
-                            if not (_existing and
-                                    self._tag_kind(_existing) == VKind.LIST
-                                    and _existing != "list"):
+                            if not (_existing
+                                    and self._tag_kind(_existing) == VKind.LIST
+                                    and self._tag_elem_kind(_existing) is not None):
                                 var_types[tgt.id] = "list"
                         elif _rtk == VKind.DICT:
                             var_types[tgt.id] = "dict"
@@ -6432,23 +6434,22 @@ class CodeGen:
 
     def _mangle_sig(self, sig: tuple) -> str:
         """Encode a signature into a short suffix for specialized function names."""
+        _KIND_MANGLE = {
+            VKind.INT: "i", VKind.FLOAT: "d", VKind.BOOL: "b",
+            VKind.STR: "s", VKind.OBJ: "o",
+        }
         parts = []
         for t in sig:
-            if t == "int":
-                parts.append("i")
-            elif t == "float":
-                parts.append("d")
-            elif t == "bool":
-                parts.append("b")
-            elif t == "str":
-                parts.append("s")
-            elif t == "obj":
-                parts.append("o")
-            elif t is None:
+            if t is None:
                 parts.append("x")
             else:
-                # list:str, dict:int, etc. — encode as first letter + subtype
-                parts.append(t.replace(":", ""))
+                tk = self._tag_kind(t)
+                m = _KIND_MANGLE.get(tk)
+                if m:
+                    parts.append(m)
+                else:
+                    # list:str, dict:int, etc. — encode as kind + subtype
+                    parts.append(str(t).replace(":", ""))
         return "_".join(parts) if parts else "void"
 
     def _resolve_class_specialization(self, class_name: str, arg_nodes: list,
@@ -6623,9 +6624,9 @@ class CodeGen:
                 return "float"
             lt = self._infer_call_arg_type(node.left)
             rt = self._infer_call_arg_type(node.right)
-            if lt == "float" or rt == "float":
+            if self._tag_kind(lt) == VKind.FLOAT or self._tag_kind(rt) == VKind.FLOAT:
                 return "float"
-            if lt == "str" or rt == "str":
+            if self._tag_kind(lt) == VKind.STR or self._tag_kind(rt) == VKind.STR:
                 return "str"
             scalars = {"int", "bool"}
             if lt in scalars and (rt in scalars or rt is None):
@@ -6728,7 +6729,8 @@ class CodeGen:
         # tags to distinguish types at runtime. Check both the merged
         # call_types and the raw per-call-site signatures.
         _has_mixed_call_types = any(
-            ct == "mixed" for ct in call_types
+            ct is not None and self._tag_kind(ct) == VKind.MIXED
+            for ct in call_types
         )
         _SCALAR_CALL_TYPES = {"int", "float", "bool"}
         _sigs = self._function_signatures.get(node.name, [])
@@ -7196,12 +7198,12 @@ class CodeGen:
                         pidx = param_names.index(n.value.value.id)
                         if pidx < len(call_types) and call_types[pidx] is not None:
                             ct = call_types[pidx]
-                            if ct in ("list:str", "dict:str",
-                                      "list:list", "list:dict",
-                                      "dict:list", "dict:dict"):
+                            _ctk = self._tag_kind(ct)
+                            if (_ctk in (VKind.LIST, VKind.DICT)
+                                    and self._tag_elem_kind(ct) is not None):
                                 ret_type = i8_ptr
                                 break
-                            if (ct == "str"
+                            if (_ctk == VKind.STR
                                     and isinstance(n.value.slice, ast.Slice)):
                                 ret_type = i8_ptr
                                 break
@@ -7467,13 +7469,14 @@ class CodeGen:
                     pidx = param_names.index(n.value.value.id)
                     if pidx < len(call_types) and call_types[pidx] is not None:
                         ct = call_types[pidx]
-                        if ct in ("list:str", "dict:str"):
+                        _ek = self._tag_elem_kind(ct)
+                        if _ek == VKind.STR:
                             returns_str = True
-                        elif ct in ("list:dict", "dict:dict"):
+                        elif _ek == VKind.DICT:
                             returns_dict = True
-                        elif ct in ("list:list", "dict:list"):
+                        elif _ek == VKind.LIST:
                             returns_list = True
-                        elif (ct == "str"
+                        elif (self._tag_kind(ct) == VKind.STR
                                 and isinstance(n.value.slice, ast.Slice)):
                             returns_str = True
                 elif (isinstance(n.value, ast.Name)
@@ -7930,7 +7933,7 @@ class CodeGen:
                     call_types = self._call_site_param_types.get(
                         node.name, [])
                     pidx = param_names.index(n.value.id)
-                    if pidx < len(call_types) and call_types[pidx] == "str":
+                    if pidx < len(call_types) and self._tag_kind(call_types[pidx]) == VKind.STR:
                         string_params.add(n.value.id)
             if (isinstance(n, ast.Call)
                     and isinstance(n.func, ast.Attribute)
@@ -8036,12 +8039,12 @@ class CodeGen:
                         # unwrap to the right bare LLVM type.
                         tag = "dict"
                         _ct_str = str(call_tag)
-                        _dict_val = _ct_str.split(":", 1)[1] if ":" in _ct_str else None
-                        if _dict_val == "int":
+                        _dict_elem_k = self._tag_elem_kind(call_tag)
+                        if _dict_elem_k == VKind.INT:
                             self._dict_var_int_values.add(param.name)
-                        elif _dict_val == "list":
+                        elif _dict_elem_k == VKind.LIST:
                             self._dict_var_list_values.add(param.name)
-                        elif _dict_val == "dict":
+                        elif _dict_elem_k == VKind.DICT:
                             self._dict_var_dict_values.add(param.name)
                     elif _ctk is not None and _ctk.is_ptr:
                         # obj, str, set, bytes, tuple, pyobj, complex,
@@ -8087,9 +8090,10 @@ class CodeGen:
                     # function's (conflicting) signatures.
                     _ct = (call_types[param_idx]
                            if param_idx < len(call_types) else None)
-                    if _ct == "int":
+                    _ct_k = self._tag_kind(_ct) if _ct else None
+                    if _ct_k == VKind.INT:
                         tag = "int"
-                    elif _ct == "bool":
+                    elif _ct_k == VKind.BOOL:
                         tag = "bool"
                     elif _ct is not None:
                         tag = "int"  # default non-pointer, non-float
@@ -10086,7 +10090,7 @@ class CodeGen:
                         attr = n.value.value.attr
                         if attr in list_attrs:
                             etype = list_attr_elem_types.get(attr)
-                            if etype == "str":
+                            if self._tag_kind(etype) == VKind.STR:
                                 ret_type = i8_ptr
                                 break
                     # return str_method_call
@@ -10192,7 +10196,7 @@ class CodeGen:
                         dict_attr_name = n.value.value.attr
                         vtype = self._infer_dict_attr_value_type(
                             class_node, dict_attr_name)
-                        if vtype == "str":
+                        if self._tag_kind(vtype) == VKind.STR:
                             ret_type = i8_ptr
                             break
                     # return self.method() — inherit the method's
@@ -10634,7 +10638,7 @@ class CodeGen:
                         and _sig_override is None):
                     # Check if the base is a known imported name
                     if (parent_name in getattr(self, 'variables', {})
-                            and self.variables.get(parent_name, (None, None))[1] == "pyobj"):
+                            and self._tag_kind(self.variables.get(parent_name, (None, None))[1]) == VKind.PYOBJ):
                         if not hasattr(self, '_cpython_classes'):
                             self._cpython_classes = set()
                         self._cpython_classes.add(node.name)
@@ -10785,7 +10789,7 @@ class CodeGen:
                 m_call_types = self._call_site_param_types.get(
                     q_key, self._call_site_param_types.get(method_name, []))
                 for pi, pname in enumerate(params[1:]):  # skip self
-                    if pi < len(m_call_types) and m_call_types[pi] == "float":
+                    if pi < len(m_call_types) and self._tag_kind(m_call_types[pi]) == VKind.FLOAT:
                         float_method_params.add(pname)
                 # Also check float defaults
                 m_defaults = item.args.defaults
@@ -11169,7 +11173,7 @@ class CodeGen:
         # So arg 0 maps to __init__'s param 1 (name).
         string_param_indices = set()
         for i, t in enumerate(call_types):
-            if t == "str":
+            if self._tag_kind(t) == VKind.STR:
                 string_param_indices.add(i)
         for method in node.body:
             if not isinstance(method, ast.FunctionDef):
@@ -11257,7 +11261,7 @@ class CodeGen:
         call_types = self._call_site_param_types.get(lookup_name, [])
         float_param_indices = set()
         for i, t in enumerate(call_types):
-            if t == "float":
+            if self._tag_kind(t) == VKind.FLOAT:
                 float_param_indices.add(i)
 
         for method in node.body:
@@ -11401,7 +11405,7 @@ class CodeGen:
         call_types = self._call_site_param_types.get(lookup_name, [])
         bool_param_indices = set()
         for i, t in enumerate(call_types):
-            if t == "bool":
+            if self._tag_kind(t) == VKind.BOOL:
                 bool_param_indices.add(i)
 
         for method in node.body:
@@ -14649,13 +14653,14 @@ class CodeGen:
                 and self._is_defaultdict_expr(node.value)):
             factory = getattr(self, '_defaultdict_var_factories', {}).get(
                 node.value.id)
-            if factory == "list":
+            _fk = self._tag_kind(factory) if factory else VKind.UNKNOWN
+            if _fk == VKind.LIST:
                 return ValueType(VKind.LIST, elem_type=ValueType(VKind.INT))
-            if factory == "dict":
+            if _fk == VKind.DICT:
                 return ValueType(VKind.DICT)
-            if factory == "str":
+            if _fk == VKind.STR:
                 return ValueType(VKind.STR)
-            if factory == "float":
+            if _fk == VKind.FLOAT:
                 return ValueType(VKind.FLOAT)
             return ValueType(VKind.INT)
         # Dict subscript: infer value type from known dict-value-type sets
@@ -19332,7 +19337,7 @@ class CodeGen:
                 # e.g. list:list or list:obj — propagate inner type for all slots
                 inner = _vt.elem_type._to_tag()
                 for i in range(n):
-                    if types[i] == "str":
+                    if self._tag_kind(types[i]) == VKind.STR:
                         types[i] = inner
         return types
 
@@ -23573,9 +23578,10 @@ class CodeGen:
                 return False
             for elt in iter_node.elts:
                 if isinstance(elt, ast.Constant):
-                    if elem_type == "int" and not isinstance(elt.value, int):
+                    _et_k = self._tag_kind(elem_type)
+                    if _et_k == VKind.INT and not isinstance(elt.value, int):
                         return False
-                    if elem_type == "float" and not isinstance(elt.value, (int, float)):
+                    if _et_k == VKind.FLOAT and not isinstance(elt.value, (int, float)):
                         return False
                 elif isinstance(elt, ast.UnaryOp) and isinstance(elt.op, ast.USub):
                     pass  # negative literal — OK
@@ -23593,9 +23599,10 @@ class CodeGen:
         if isinstance(iter_node, ast.ListComp):
             elt = iter_node.elt
             if isinstance(elt, ast.Constant):
-                if elem_type == "float" and isinstance(elt.value, float):
+                _et_k2 = self._tag_kind(elem_type)
+                if _et_k2 == VKind.FLOAT and isinstance(elt.value, float):
                     return True
-                if elem_type == "int" and isinstance(elt.value, int):
+                if _et_k2 == VKind.INT and isinstance(elt.value, int):
                     return True
         return False
 
@@ -23927,7 +23934,7 @@ class CodeGen:
                     and self._is_defaultdict_expr(node.value)):
                 factory = getattr(self, '_defaultdict_var_factories', {}).get(
                     node.value.id)
-                if factory == "list":
+                if self._tag_kind(factory) == VKind.LIST:
                     return True
         # BinOp on lists (concatenation, set ops) returns a list
         if isinstance(node, ast.BinOp):
@@ -24168,7 +24175,7 @@ class CodeGen:
                     and isinstance(node.slice.value, str)):
                 kt = self._dict_var_key_types[node.value.id].get(
                     node.slice.value)
-                if kt == "dict":
+                if self._tag_kind(kt) == VKind.DICT:
                     return True
             # Recursive: d["a"]["b"] where d["a"] is itself a dict
             # Walk up the subscript chain to find the base Name variable.
@@ -29443,16 +29450,18 @@ class CodeGen:
                             result = self.builder.or_(result, check) if result is not None else check
                         return self.builder.zext(result, i32) if result else ir.Constant(i32, 0)
                 for tname in type_names:
-                    if tname == "int" and actual in ("int", "bool"):
+                    _ak = self._tag_kind(actual) if actual else VKind.UNKNOWN
+                    if tname == "int" and _ak in (VKind.INT, VKind.BOOL):
                         return ir.Constant(i32, 1)
-                    if tname == actual:
+                    if self._tag_kind(tname) == _ak:
                         return ir.Constant(i32, 1)
                 return ir.Constant(i32, 0)
             # Mixed or user-class types: runtime check
             result = None
             for tname in type_names:
                 if tname in builtin_types:
-                    if (tname == "int" and actual in ("int", "bool")) or tname == actual:
+                    _ak2 = self._tag_kind(actual) if actual else VKind.UNKNOWN
+                    if (tname == "int" and _ak2 in (VKind.INT, VKind.BOOL)) or self._tag_kind(tname) == _ak2:
                         return ir.Constant(i32, 1)
                     continue
                 if tname in self._user_classes:
@@ -33465,7 +33474,7 @@ class CodeGen:
                                 _str_attrs = self._per_class_string_attrs.get(obj_cls, set())
                                 if value.value.attr in _str_attrs:
                                     val_type = "str"
-                        if val_type == "str":
+                        if self._tag_kind(val_type) == VKind.STR:
                             str_val = self._rt_call("str_repr", [str_val])
                 parts.append(str_val)
             else:
