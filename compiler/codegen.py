@@ -26296,18 +26296,31 @@ class CodeGen:
 
     def _emit_builtin_range(self, node):
         # range(stop) / range(start, stop) / range(start, stop, step) -> list
+        def _range_to_i64(val):
+            """Coerce a range argument to bare i64."""
+            if (isinstance(val.type, ir.LiteralStructType)
+                    and val.type == fpy_val):
+                return self.builder.extract_value(val, 1)
+            if isinstance(val.type, ir.PointerType):
+                return self.builder.ptrtoint(val, i64)
+            if isinstance(val.type, ir.DoubleType):
+                return self.builder.fptosi(val, i64)
+            if isinstance(val.type, ir.IntType) and val.type.width != 64:
+                return self.builder.zext(val, i64)
+            return val
+
         if len(node.args) == 1:
             start = ir.Constant(i64, 0)
-            stop = self._emit_expr_value(node.args[0])
+            stop = _range_to_i64(self._emit_expr_value(node.args[0]))
             step = ir.Constant(i64, 1)
         elif len(node.args) == 2:
-            start = self._emit_expr_value(node.args[0])
-            stop = self._emit_expr_value(node.args[1])
+            start = _range_to_i64(self._emit_expr_value(node.args[0]))
+            stop = _range_to_i64(self._emit_expr_value(node.args[1]))
             step = ir.Constant(i64, 1)
         elif len(node.args) == 3:
-            start = self._emit_expr_value(node.args[0])
-            stop = self._emit_expr_value(node.args[1])
-            step = self._emit_expr_value(node.args[2])
+            start = _range_to_i64(self._emit_expr_value(node.args[0]))
+            stop = _range_to_i64(self._emit_expr_value(node.args[1]))
+            step = _range_to_i64(self._emit_expr_value(node.args[2]))
         else:
             raise CodeGenError("range() takes 1-3 arguments", node)
         return self.builder.call(self.runtime["range"], [start, stop, step])
