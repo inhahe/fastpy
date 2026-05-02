@@ -269,6 +269,8 @@ class ValueType:
             base = f"list:{self.elem_type._to_tag()}"
         elif self.kind == VKind.LIST:
             base = "list"
+        elif self.kind == VKind.TUPLE and self.elem_type:
+            base = f"tuple:{self.elem_type._to_tag()}"
         self._tag_cache = base
         return base
 
@@ -338,6 +340,9 @@ class ValueType:
             return ValueType(VKind.LIST)  # bare "list" — elem_type unknown
         if tag.startswith("dict:"):
             return ValueType(VKind.DICT)
+        if tag.startswith("tuple:"):
+            elem = tag.split(":", 1)[1]
+            return ValueType(VKind.TUPLE, elem_type=ValueType.from_old_tag(elem))
         kind = _map.get(tag, VKind.UNKNOWN)
         vt = ValueType(kind)
         # Preserve original tag for aliases (e.g. "bytes" -> VKind.STR)
@@ -4746,6 +4751,7 @@ class CodeGen:
         """
         _func_ret_types: dict[str, str] = {}
         self._func_ret_types = _func_ret_types  # expose for _infer_type_tag
+        _tk = self._tag_kind  # local alias for nested functions (C1)
         for fname, fnode in func_asts.items():
             # Collect function-local variable types
             local_types: dict[str, str] = {}
@@ -4756,7 +4762,7 @@ class CodeGen:
                     return True
                 if isinstance(bn, ast.BinOp):
                     return _binop_has_float(bn.left) or _binop_has_float(bn.right)
-                if isinstance(bn, ast.Name) and bn.id in local_types and local_types[bn.id] == "float":
+                if isinstance(bn, ast.Name) and bn.id in local_types and _tk(local_types[bn.id]) == VKind.FLOAT:
                     return True
                 return False
 
@@ -4782,7 +4788,7 @@ class CodeGen:
                             # max(a, b, c) / min(a, b, c) where any arg is float or parameter
                             if _call_name in ("max", "min") and n.value.args:
                                 for a in n.value.args:
-                                    if isinstance(a, ast.Name) and local_types.get(a.id) == "float":
+                                    if isinstance(a, ast.Name) and _tk(local_types.get(a.id)) == VKind.FLOAT:
                                         local_types[tgt] = "float"
                                         break
                                     if isinstance(a, ast.Name) and a.id in _param_names_set:
@@ -4800,7 +4806,7 @@ class CodeGen:
                                     local_types[tgt] = "float"
                             # Also check _func_ret_types (populated earlier in this pass)
                             if tgt not in local_types and _call_name in _func_ret_types:
-                                if _func_ret_types[_call_name] == "float":
+                                if _tk(_func_ret_types[_call_name]) == VKind.FLOAT:
                                     local_types[tgt] = "float"
             # Propagate float type through Name assignments (v = maxc → float)
             # and function calls to float-returning functions.
@@ -4813,7 +4819,7 @@ class CodeGen:
                         tgt = n.targets[0].id
                         if tgt in local_types:
                             continue
-                        if isinstance(n.value, ast.Name) and local_types.get(n.value.id) == "float":
+                        if isinstance(n.value, ast.Name) and _tk(local_types.get(n.value.id)) == VKind.FLOAT:
                             local_types[tgt] = "float"
                             _changed = True
                         elif isinstance(n.value, ast.BinOp) and _binop_has_float(n.value):
@@ -4828,7 +4834,7 @@ class CodeGen:
                                     ) == VKind.FLOAT):
                                 local_types[tgt] = "float"
                                 _changed = True
-                            elif _cn in _func_ret_types and _func_ret_types[_cn] == "float":
+                            elif _cn in _func_ret_types and _tk(_func_ret_types[_cn]) == VKind.FLOAT:
                                 local_types[tgt] = "float"
                                 _changed = True
             # Detect list element types from append patterns
@@ -4878,7 +4884,7 @@ class CodeGen:
                         local_types[var] = "list:str"
                     elif isinstance(arg, ast.Constant) and isinstance(arg.value, float):
                         local_types[var] = "list:float"
-                    elif isinstance(arg, ast.Name) and arg.id in local_types and local_types[arg.id] == "float":
+                    elif isinstance(arg, ast.Name) and arg.id in local_types and _tk(local_types[arg.id]) == VKind.FLOAT:
                         local_types[var] = "list:float"
             # Mini prescan: detect list-append element types within function
             # body. Needed so `return result` where `result.append(row)`
@@ -4912,7 +4918,7 @@ class CodeGen:
                         _fn_append_types[var] = "str"
                     elif isinstance(arg, ast.Constant) and isinstance(arg.value, float):
                         _fn_append_types[var] = "float"
-                    elif isinstance(arg, ast.Name) and arg.id in local_types and local_types[arg.id] == "float":
+                    elif isinstance(arg, ast.Name) and arg.id in local_types and _tk(local_types[arg.id]) == VKind.FLOAT:
                         _fn_append_types[var] = "float"
                     elif isinstance(arg, ast.Call) and isinstance(arg.func, ast.Name):
                         if arg.func.id in self._user_classes:
@@ -4948,7 +4954,7 @@ class CodeGen:
                         for elt in n.value.elts:
                             if isinstance(elt, ast.Constant) and isinstance(elt.value, float):
                                 continue
-                            elif isinstance(elt, ast.Name) and local_types.get(elt.id) == "float":
+                            elif isinstance(elt, ast.Name) and _tk(local_types.get(elt.id)) == VKind.FLOAT:
                                 continue
                             elif isinstance(elt, ast.Name) and elt.id in _param_names:
                                 # Parameter — assume float if body contains float ops
@@ -4966,7 +4972,7 @@ class CodeGen:
                                 if (_callee_info and self._tag_kind(
                                         _callee_info.ret_tag) == VKind.FLOAT):
                                     continue
-                                if _callee in _func_ret_types and _func_ret_types[_callee] == "float":
+                                if _callee in _func_ret_types and _tk(_func_ret_types[_callee]) == VKind.FLOAT:
                                     continue
                                 # Callee is in a float-heavy context (has float
                                 # constants) — assume float return
@@ -5015,7 +5021,9 @@ class CodeGen:
                 if isinstance(tgt, ast.Name):
                     if _rtk in (VKind.LIST, VKind.DICT, VKind.STR):
                         var_types[tgt.id] = rt
-                elif isinstance(tgt, ast.Tuple) and rt == "tuple:float":
+                elif (isinstance(tgt, ast.Tuple)
+                      and _tk(rt) == VKind.TUPLE
+                      and self._tag_elem_kind(rt) == VKind.FLOAT):
                     # Tuple unpacking from a function that returns
                     # tuple:float: h, l, s = rgb_to_hls(...) → each
                     # variable is float.
@@ -5210,7 +5218,7 @@ class CodeGen:
                         arg_types.append("pyobj")
                 elif (isinstance(arg, ast.Name)
                       and arg.id in var_types
-                      and var_types[arg.id] in ("path", "pyobj")):
+                      and self._tag_kind(var_types[arg.id]) in (VKind.PATH, VKind.PYOBJ)):
                     # Variable with known path/pyobj type
                     arg_types.append(var_types[arg.id])
                 elif isinstance(arg, (ast.BinOp, ast.UnaryOp)):
@@ -5267,7 +5275,8 @@ class CodeGen:
                                     and isinstance(node.args[pi], ast.Name)):
                                 caller_var = node.args[pi].id
                                 if (caller_var in var_types
-                                        and var_types[caller_var] == "dict"):
+                                        and self._tag_kind(var_types[caller_var]) == VKind.DICT
+                                        and ":" not in str(var_types[caller_var])):
                                     var_types[caller_var] = refinements[pname]
                                     arg_types[pi] = refinements[pname]
                         break
@@ -5419,7 +5428,9 @@ class CodeGen:
                     for i in range(len(existing), len(sig_arg_types)):
                         existing.append(sig_arg_types[i])
                     for i in range(min(len(existing), len(sig_arg_types))):
-                        if existing[i] == "mixed":
+                        _ek = self._tag_kind(existing[i]) if existing[i] else None
+                        _sk = self._tag_kind(sig_arg_types[i]) if sig_arg_types[i] else None
+                        if _ek == VKind.MIXED:
                             continue  # already mixed, can't refine further
                         if sig_arg_types[i] is None:
                             # Unknown call site + existing "float" is dangerous:
@@ -5427,7 +5438,7 @@ class CodeGen:
                             # corrupt data if the function expects double params.
                             # Reset to None so the function uses i64 (safe for
                             # both int and FpyValue-wrapped float).
-                            if existing[i] == "float":
+                            if _ek == VKind.FLOAT:
                                 existing[i] = None
                             continue  # unknown doesn't override known
                         if existing[i] is None:
@@ -5437,23 +5448,25 @@ class CodeGen:
                             continue  # same type, no conflict
                         # Types conflict — check if it's a safe refinement
                         # or a genuine conflict requiring "mixed"
-                        if (self._tag_kind(sig_arg_types[i]) == VKind.LIST
-                                and existing[i] == "list"):
+                        if (_sk == VKind.LIST
+                                and _ek == VKind.LIST
+                                and self._tag_elem_kind(existing[i]) is None):
                             existing[i] = sig_arg_types[i]  # refine list element type
-                        elif (self._tag_kind(existing[i]) == VKind.LIST
-                              and sig_arg_types[i] == "list"):
+                        elif (_ek == VKind.LIST
+                              and _sk == VKind.LIST
+                              and self._tag_elem_kind(sig_arg_types[i]) is None):
                             pass  # keep the more specific type
-                        elif (sig_arg_types[i] == "bool" and existing[i] == "int"):
+                        elif (_sk == VKind.BOOL and _ek == VKind.INT):
                             pass  # bool is a subtype of int, keep int
-                        elif (existing[i] == "bool" and sig_arg_types[i] == "int"):
+                        elif (_ek == VKind.BOOL and _sk == VKind.INT):
                             existing[i] = "int"  # widen to int
-                        elif (sig_arg_types[i] == "bigint" and existing[i] == "int"):
+                        elif (_sk == VKind.BIGINT and _ek == VKind.INT):
                             existing[i] = "bigint"  # widen to bigint
-                        elif (existing[i] == "bigint" and sig_arg_types[i] == "int"):
+                        elif (_ek == VKind.BIGINT and _sk == VKind.INT):
                             pass  # keep bigint (int is a subset)
-                        elif (sig_arg_types[i] == "bigint" and existing[i] == "bool"):
+                        elif (_sk == VKind.BIGINT and _ek == VKind.BOOL):
                             existing[i] = "bigint"  # widen to bigint
-                        elif (existing[i] == "bigint" and sig_arg_types[i] == "bool"):
+                        elif (_ek == VKind.BIGINT and _sk == VKind.BOOL):
                             pass  # keep bigint
                         else:
                             # Genuine type conflict (e.g. int vs str)
@@ -5465,7 +5478,7 @@ class CodeGen:
         # FV-ABI runtime dispatch.
         for fname, merged in self._call_site_param_types.items():
             for i, mt in enumerate(merged):
-                if mt == "mixed":
+                if mt is not None and self._tag_kind(mt) == VKind.MIXED:
                     merged[i] = None
 
         # Post-merge: clear param types when CONCRETE call-site signatures
@@ -5480,9 +5493,10 @@ class CodeGen:
         def _type_cat(t):
             if t is None:
                 return None  # unknown
-            if t in ("int", "bool", "bigint"):
+            tk = self._tag_kind(t)
+            if tk in (VKind.INT, VKind.BOOL, VKind.BIGINT):
                 return "I"  # numeric (i64 or BigInt pointer, both safe in FpyValue)
-            if t == "float":
+            if tk == VKind.FLOAT:
                 return "D"  # double
             return "P"  # pointer (str, list, dict, obj, list:*, dict:*)
 
@@ -5521,12 +5535,15 @@ class CodeGen:
         # Store refined module-level dict value types so codegen can
         # populate _dict_var_dict_values for nested subscript handling.
         for vname, vtype in var_types.items():
-            if vtype == "dict:dict":
-                self._dict_var_dict_values.add(vname)
-            elif vtype == "dict:list":
-                self._dict_var_list_values.add(vname)
-            elif vtype == "dict:int":
-                self._dict_var_int_values.add(vname)
+            if (self._tag_kind(vtype) == VKind.DICT
+                    and self._tag_elem_kind(vtype) is not None):
+                _ek = self._tag_elem_kind(vtype)
+                if _ek == VKind.DICT:
+                    self._dict_var_dict_values.add(vname)
+                elif _ek == VKind.LIST:
+                    self._dict_var_list_values.add(vname)
+                elif _ek == VKind.INT:
+                    self._dict_var_int_values.add(vname)
 
         # Post-scan: cls() calls inside classmethods → register types under class name
         for cls_node in tree.body:
@@ -5862,7 +5879,8 @@ class CodeGen:
                         elem_type = "str"
                 elif isinstance(list_node, ast.Name) and list_node.id in var_types:
                     vt = var_types[list_node.id]
-                    if vt == "list:str":
+                    if (self._tag_kind(vt) == VKind.LIST
+                            and self._tag_elem_kind(vt) == VKind.STR):
                         elem_type = "str"
                 if elem_type is not None:
                     existing = self._call_site_param_types.setdefault(
@@ -5978,7 +5996,7 @@ class CodeGen:
                                     elif (isinstance(sub, ast.Constant)
                                           and isinstance(sub.value, float)):
                                         t = "float"
-                                    if t == "float":
+                                    if t is not None and self._tag_kind(t) == VKind.FLOAT:
                                         has_float = True
                                         break
                                 if isinstance(arg.op, ast.Div) or has_float:
@@ -6027,9 +6045,11 @@ class CodeGen:
                                 changed = True
                             elif existing[i] != t:
                                 # Compatible bool/int? leave as int.
-                                if {existing[i], t} == {"int", "bool"}:
+                                _e_k = self._tag_kind(existing[i])
+                                _t_k = self._tag_kind(t)
+                                if {_e_k, _t_k} == {VKind.INT, VKind.BOOL}:
                                     existing[i] = "int"
-                                elif existing[i] == "mixed":
+                                elif _e_k == VKind.MIXED:
                                     pass  # keep mixed
                                 else:
                                     # Genuine conflict → "mixed" (will be
@@ -6193,7 +6213,7 @@ class CodeGen:
                     elif (isinstance(node.value, ast.Call)
                           and isinstance(node.value.func, ast.Attribute)
                           and isinstance(node.value.func.value, ast.Name)
-                          and var_types.get(node.value.func.value.id) == "pyobj"):
+                          and self._tag_kind(var_types.get(node.value.func.value.id)) == VKind.PYOBJ):
                         var_types[tgt] = "pyobj"
 
         obj_classes, self_attr_classes = self._csa_track_objects(
@@ -6215,11 +6235,14 @@ class CodeGen:
                 # for x in list_var → x gets the list's element type
                 elif isinstance(it, ast.Name) and it.id in var_types:
                     vt = var_types[it.id]
-                    if vt == "str":
+                    _vtk = self._tag_kind(vt)
+                    if _vtk == VKind.STR:
                         var_types[varname] = "str"
-                    elif vt == "list:str":
+                    elif (_vtk == VKind.LIST
+                          and self._tag_elem_kind(vt) == VKind.STR):
                         var_types[varname] = "str"
-                    elif vt == "list:float":
+                    elif (_vtk == VKind.LIST
+                          and self._tag_elem_kind(vt) == VKind.FLOAT):
                         var_types[varname] = "float"
 
         # Refine dict value types from subscript assignments: d[k] = {}
@@ -14874,7 +14897,8 @@ class CodeGen:
                             # User function with known return type
                             if _fn in self._user_functions:
                                 _rt = self._user_functions[_fn].ret_tag
-                                if _rt in ("float", "str"):
+                                _rtk = self._tag_kind(_rt)
+                                if _rtk in (VKind.FLOAT, VKind.STR):
                                     local_var_types[tgt] = _rt
                             # Builtin type conversions
                             elif _fn == "float":
@@ -14892,7 +14916,7 @@ class CodeGen:
                                 _is_float = True
                             elif (isinstance(_op, ast.Name)
                                   and _op.id in local_var_types
-                                  and local_var_types[_op.id] == "float"):
+                                  and self._tag_kind(local_var_types[_op.id]) == VKind.FLOAT):
                                 _is_float = True
                         if _is_float:
                             local_var_types[tgt] = "float"
@@ -14904,7 +14928,7 @@ class CodeGen:
                             local_var_types[tgt] = "float"
                         elif (isinstance(_inner, ast.Name)
                               and _inner.id in local_var_types
-                              and local_var_types[_inner.id] == "float"):
+                              and self._tag_kind(local_var_types[_inner.id]) == VKind.FLOAT):
                             local_var_types[tgt] = "float"
                 if isinstance(node, ast.For) and isinstance(node.target, ast.Name):
                     name = node.target.id
@@ -14915,17 +14939,17 @@ class CodeGen:
                         loop_var_types[name] = "str"
                     elif (isinstance(it, ast.Name)
                           and it.id in local_var_types
-                          and local_var_types[it.id] == "str"):
+                          and self._tag_kind(local_var_types[it.id]) == VKind.STR):
                         loop_var_types[name] = "str"
                     elif (isinstance(it, ast.Name)
                           and it.id in known_types
-                          and known_types[it.id] == "str"):
+                          and self._tag_kind(known_types[it.id]) == VKind.STR):
                         # for c in <str param>
                         loop_var_types[name] = "str"
                     # for c in a_list_of_str
                     elif (isinstance(it, ast.Name)
                           and it.id in self._list_append_types
-                          and self._list_append_types[it.id] == "str"):
+                          and self._list_append_types[it.id] == VKind.STR):
                         loop_var_types[name] = "str"
 
         if not empty_list_vars:
@@ -14976,9 +15000,9 @@ class CodeGen:
                         self._list_append_types[var_name] = ValueType(VKind.OBJ)
                     elif _fn in self._user_functions:
                         _rt = self._user_functions[_fn].ret_tag
-                        _RT_MAP = {"float": VKind.FLOAT, "str": VKind.STR}
-                        if _rt in _RT_MAP:
-                            self._list_append_types[var_name] = ValueType(_RT_MAP[_rt])
+                        _rtk = self._tag_kind(_rt)
+                        if _rtk in (VKind.FLOAT, VKind.STR):
+                            self._list_append_types[var_name] = ValueType(_rtk)
                     elif _fn == "float":
                         self._list_append_types[var_name] = ValueType(VKind.FLOAT)
                     elif _fn == "str":
@@ -15008,10 +15032,10 @@ class CodeGen:
                             _is_float_binop = True
                         elif isinstance(_operand, ast.Name):
                             if (_operand.id in local_var_types
-                                    and local_var_types[_operand.id] == "float"):
+                                    and self._tag_kind(local_var_types[_operand.id]) == VKind.FLOAT):
                                 _is_float_binop = True
                             elif (_operand.id in loop_var_types
-                                    and loop_var_types[_operand.id] == "float"):
+                                    and self._tag_kind(loop_var_types[_operand.id]) == VKind.FLOAT):
                                 _is_float_binop = True
                     if _is_float_binop:
                         self._list_append_types[var_name] = ValueType(VKind.FLOAT)
@@ -15023,19 +15047,22 @@ class CodeGen:
                         self._list_append_types[var_name] = ValueType(VKind.FLOAT)
                     elif (isinstance(_inner, ast.Name)
                           and _inner.id in local_var_types
-                          and local_var_types[_inner.id] == "float"):
+                          and self._tag_kind(local_var_types[_inner.id]) == VKind.FLOAT):
                         self._list_append_types[var_name] = ValueType(VKind.FLOAT)
                 elif isinstance(arg, ast.JoinedStr):
                     self._list_append_types[var_name] = ValueType(VKind.STR)
                 elif isinstance(arg, ast.Name):
                     # Appending a known-typed variable (loop var from str
                     # iteration, previously-assigned str var, etc.).
-                    _LVT_MAP = {"str": VKind.STR, "float": VKind.FLOAT,
-                                "pyobj": VKind.PYOBJ}
-                    if arg.id in loop_var_types and loop_var_types[arg.id] in _LVT_MAP:
-                        self._list_append_types[var_name] = ValueType(_LVT_MAP[loop_var_types[arg.id]])
-                    elif arg.id in local_var_types and local_var_types[arg.id] in _LVT_MAP:
-                        self._list_append_types[var_name] = ValueType(_LVT_MAP[local_var_types[arg.id]])
+                    _ELEM_KINDS = {VKind.STR, VKind.FLOAT, VKind.PYOBJ}
+                    if arg.id in loop_var_types:
+                        _lvk = self._tag_kind(loop_var_types[arg.id])
+                        if _lvk in _ELEM_KINDS:
+                            self._list_append_types[var_name] = ValueType(_lvk)
+                    elif arg.id in local_var_types:
+                        _lvk = self._tag_kind(local_var_types[arg.id])
+                        if _lvk in _ELEM_KINDS:
+                            self._list_append_types[var_name] = ValueType(_lvk)
                     elif arg.id in self.variables:
                         _vk = self._var_kind(arg.id)
                         if _vk == VKind.STR:
@@ -15931,6 +15958,18 @@ class CodeGen:
         if isinstance(tag, VKind):
             return tag
         return ValueType.from_old_tag(str(tag)).kind
+
+    @staticmethod
+    def _tag_elem_kind(tag) -> VKind | None:
+        """Get the element-type VKind from a compound tag (e.g. 'list:float' → FLOAT).
+
+        Returns None for simple tags, bare container tags ('list'), or
+        unknown inputs.  Works with both string tags and ValueType."""
+        if isinstance(tag, ValueType):
+            return tag.elem_type.kind if tag.elem_type else None
+        if isinstance(tag, str) and ":" in tag:
+            return CodeGen._tag_kind(tag.split(":", 1)[1])
+        return None
 
     def _has_var(self, name: str) -> bool:
         """Check if a variable exists in any scope (locals or globals)."""
