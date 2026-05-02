@@ -16408,7 +16408,7 @@ class CodeGen:
                 return self._fv_build_from_slots(tag, data)
             if kind == VKind.OBJ:
                 return self._fv_from_obj(value)
-            if kind == VKind.DICT:
+            if kind in _DICT_LIKE:
                 return self._fv_from_dict(value)
             if kind in (VKind.LIST, VKind.TUPLE):
                 return self._fv_from_list(value)
@@ -16847,7 +16847,7 @@ class CodeGen:
             if vtype.kind == VKind.STR:
                 self._emit_for_string(node)
                 return
-            if vtype.kind in (VKind.DICT, VKind.SET):
+            if vtype.kind in (VKind.DICT, VKind.SET, VKind.DEFAULTDICT, VKind.COUNTER):
                 self._emit_for_dict(node)
                 return
             if vtype.kind == VKind.PYOBJ:
@@ -20419,8 +20419,8 @@ class CodeGen:
                         truthy = self.builder.not_(truthy)
                     cmp = truthy
 
-                # DICT equality
-                elif (left_kind == VKind.DICT
+                # DICT equality (including defaultdict/Counter)
+                elif (left_kind in _DICT_LIKE
                         and isinstance(op, (ast.Eq, ast.NotEq))):
                     eq_result = self._rt_call("dict_equal",
                                               [tv_left.as_ptr(self.builder),
@@ -20880,8 +20880,8 @@ class CodeGen:
                 result = self.builder.not_(result)
             return result
 
-        # Dict 'in': "key" in dict
-        if c_kind == VKind.DICT or self._is_dict_expr(container_node):
+        # Dict 'in': "key" in dict/defaultdict/Counter
+        if c_kind in _DICT_LIKE or self._is_dict_expr(container_node):
             container = self._emit_expr_value(container_node)
             # Ensure container is i8* (global dicts may be stored as i64)
             container = self._ensure_ptr(container)
@@ -23346,7 +23346,7 @@ class CodeGen:
                     ir.Constant(i32, FPY_TAG_BIGINT), ptr_as_i64)
             if inf_kind in (VKind.LIST, VKind.TUPLE):
                 return self._fv_from_list(value)
-            if inf_kind == VKind.DICT:
+            if inf_kind in _DICT_LIKE:
                 return self._fv_from_dict(value)
             if inf_kind == VKind.SET:
                 return self._fv_build_from_slots(
@@ -24112,7 +24112,7 @@ class CodeGen:
                 _, _gt = self._global_vars[node.id]
                 _kind = (_gt.kind if isinstance(_gt, ValueType)
                          else self._tag_kind(_gt))
-            if _kind == VKind.DICT:
+            if _kind in _DICT_LIKE:
                 return True
         # Function calls that return dicts
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
@@ -29205,8 +29205,8 @@ class CodeGen:
             # Set → extract keys to list, then sort
             keys = self._rt_call("set_to_list", [tv.as_ptr(self.builder)])
             result = self._rt_call("list_sorted", [keys])
-        elif kind == VKind.DICT:
-            # Dict → sort its keys
+        elif kind in _DICT_LIKE:
+            # Dict/defaultdict/Counter → sort its keys
             keys = self._rt_call("dict_keys", [tv.as_ptr(self.builder)])
             result = self._rt_call("list_sorted", [keys])
         elif kind in (VKind.LIST, VKind.TUPLE):
