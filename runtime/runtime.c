@@ -1009,6 +1009,14 @@ int main(int argc, char *argv[]) {
     extern void fpy_cpython_flush(void);
     fpy_cpython_flush();
     fflush(stdout);
+    /* Finalize CPython interpreter before process exit.  Without this,
+     * Py_FinalizeEx() runs during CRT atexit cleanup, which can race
+     * with the Windows heap manager if fastpy objects holding PyObject*
+     * references have already been freed by fpy_gc_finalize() above.
+     * Calling it explicitly here, after GC and flush, ensures Python's
+     * internal state is torn down cleanly while the heap is consistent. */
+    extern void fpy_cpython_fini(void);
+    fpy_cpython_fini();
     if (fastpy_exc_pending()) {
         const char *name = "Exception";
         switch (fpy_exc_type) {
