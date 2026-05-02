@@ -15022,7 +15022,8 @@ class CodeGen:
                 elif isinstance(arg, ast.Name):
                     # Appending a known-typed variable (loop var from str
                     # iteration, previously-assigned str var, etc.).
-                    _LVT_MAP = {"str": VKind.STR, "float": VKind.FLOAT}
+                    _LVT_MAP = {"str": VKind.STR, "float": VKind.FLOAT,
+                                "pyobj": VKind.PYOBJ}
                     if arg.id in loop_var_types and loop_var_types[arg.id] in _LVT_MAP:
                         self._list_append_types[var_name] = ValueType(_LVT_MAP[loop_var_types[arg.id]])
                     elif arg.id in local_var_types and local_var_types[arg.id] in _LVT_MAP:
@@ -15033,6 +15034,8 @@ class CodeGen:
                             self._list_append_types[var_name] = ValueType(VKind.STR)
                         elif _vk == VKind.FLOAT:
                             self._list_append_types[var_name] = ValueType(VKind.FLOAT)
+                        elif _vk == VKind.PYOBJ:
+                            self._list_append_types[var_name] = ValueType(VKind.PYOBJ)
 
     def _infer_list_elem_type(self, node: ast.expr) -> 'ValueType':
         """Infer the element type of a list expression.
