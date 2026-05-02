@@ -24969,7 +24969,7 @@ class CodeGen:
                 return self._rt_call(_set_ops[op], [ltv, rtv])
 
         # ── Fast path: Path / str → path join ─────────────────────────
-        if lk == VKind.STR and op == ast.Div and self._is_path_expr(node.left):
+        if op == ast.Div and (lk == VKind.PATH or self._is_path_expr(node.left)):
             return self._rt_call("path_join", [ltv, rtv])
 
         # ── Fast path: Decimal arithmetic ──────────────────────────────
@@ -29719,11 +29719,14 @@ class CodeGen:
             return self.builder.call(self.runtime[_path_props[method]], [obj])
         # Method calls
         elif method == "exists" and len(node.args) == 0:
-            return self.builder.call(self.runtime["path_exists"], [obj])
+            result = self.builder.call(self.runtime["path_exists"], [obj])
+            return self._fv_from_bool(result)
         elif method == "is_file" and len(node.args) == 0:
-            return self.builder.call(self.runtime["path_is_file"], [obj])
+            result = self.builder.call(self.runtime["path_is_file"], [obj])
+            return self._fv_from_bool(result)
         elif method == "is_dir" and len(node.args) == 0:
-            return self.builder.call(self.runtime["path_is_dir"], [obj])
+            result = self.builder.call(self.runtime["path_is_dir"], [obj])
+            return self._fv_from_bool(result)
         elif method == "resolve" and len(node.args) == 0:
             return self.builder.call(self.runtime["path_resolve"], [obj])
         elif method == "read_text" and len(node.args) == 0:
