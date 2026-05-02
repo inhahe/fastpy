@@ -12561,6 +12561,156 @@ class CodeGen:
 
         return False
 
+    # ── D4: _emit_assign helper methods ──
+
+    def _assign_try_int_constructor(self, node: ast.Assign) -> bool:
+        """Handle unchecked_int/checked_int/int32 constructor calls. Returns True if handled."""
+        _INT_CONSTRUCTORS = {
+            'unchecked_int': 'unchecked', 'checked_int': 'checked',
+            'unchecked_int32': 'unchecked32', 'checked_int32': 'checked32',
+        }
+        if not (len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+                and isinstance(node.value, ast.Call)
+                and isinstance(node.value.func, ast.Name)
+                and node.value.func.id in _INT_CONSTRUCTORS):
+            return False
+        varname = node.targets[0].id
+        mode = _INT_CONSTRUCTORS[node.value.func.id]
+        self._int_mode_vars[varname] = mode
+        if node.value.args:
+            value = self._emit_expr_value(node.value.args[0])
+        else:
+            value = ir.Constant(i64, 0)
+        if isinstance(value.type, ir.PointerType):
+            value = self.builder.ptrtoint(value, i64)
+        elif isinstance(value.type, ir.DoubleType):
+            value = self.builder.fptosi(value, i64)
+        if mode.endswith('32'):
+            value = self.builder.sext(
+                self.builder.trunc(value, ir.IntType(32)), i64)
+        self._store_variable(varname, value, ValueType(VKind.INT))
+        return True
+
+    def _assign_track_special_calls(self, node: ast.Assign) -> None:
+        """Track defaultdict factories and weakref variables from call assignments."""
+        if not (len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+                and isinstance(node.value, ast.Call)):
+            return
+        # Defaultdict factory: d = defaultdict(list)
+        if (isinstance(node.value.func, ast.Name) and node.value.args):
+            _dd_func = node.value.func.id
+            _ni = getattr(self, '_native_imports', {})
+            _is_dd = (_dd_func == "defaultdict"
+                      or (_dd_func in _ni
+                          and _ni[_dd_func] == ("collections", "defaultdict")))
+            if _is_dd and isinstance(node.value.args[0], ast.Name):
+                if not hasattr(self, '_defaultdict_var_factories'):
+                    self._defaultdict_var_factories = {}
+                self._defaultdict_var_factories[
+                    node.targets[0].id] = node.value.args[0].id
+        # Weakref: r = weakref.ref(obj) or r = ref(obj)
+        _wr_rhs = node.value
+        _is_weakref_call = False
+        if (isinstance(_wr_rhs.func, ast.Attribute)
+                and isinstance(_wr_rhs.func.value, ast.Name)
+                and _wr_rhs.func.value.id in ("weakref", "_weakref")
+                and _wr_rhs.func.attr == "ref"):
+            _is_weakref_call = True
+        elif isinstance(_wr_rhs.func, ast.Name):
+            _ni = getattr(self, '_native_imports', {})
+            if _wr_rhs.func.id in _ni:
+                _mod, _attr = _ni[_wr_rhs.func.id]
+                if _mod in ("weakref", "_weakref") and _attr == "ref":
+                    _is_weakref_call = True
+        if _is_weakref_call:
+            if not hasattr(self, '_weakref_vars'):
+                self._weakref_vars = set()
+            self._weakref_vars.add(node.targets[0].id)
+
+    _BOUND_METHOD_SETS = {
+        VKind.LIST: {"append", "extend", "insert", "pop", "remove", "sort",
+                     "reverse", "clear", "copy", "index", "count"},
+        VKind.DICT: {"get", "keys", "values", "items", "pop", "update",
+                     "setdefault", "clear", "copy"},
+        VKind.STR: {"split", "join", "strip", "lstrip", "rstrip", "replace",
+                    "find", "rfind", "startswith", "endswith", "lower", "upper",
+                    "count", "index", "format", "encode"},
+    }
+
+    def _assign_try_bound_method(self, node: ast.Assign) -> bool:
+        """Track bound method alias (f = lst.insert). Returns True if handled."""
+        if not (len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+                and isinstance(node.value, ast.Attribute)
+                and isinstance(node.value.value, ast.Name)):
+            return False
+        obj_name = node.value.value.id
+        method = node.value.attr
+        if obj_name not in self.variables:
+            return False
+        kind = self._var_kind(obj_name)
+        method_set = self._BOUND_METHOD_SETS.get(kind)
+        if method_set and method in method_set:
+            self._bound_method_aliases[node.targets[0].id] = (obj_name, method)
+            return True
+        return False
+
+    def _assign_infer_class_name(self, node: ast.Assign) -> str | None:
+        """Infer the class name for an object variable from the RHS expression."""
+        if isinstance(node.value, ast.Call) and isinstance(node.value.func, ast.Name):
+            if node.value.func.id in self._user_classes:
+                cn = node.value.func.id
+                if cn in self._monomorphized_classes:
+                    cn = self._resolve_class_specialization(
+                        cn, node.value.args, node.value.keywords)
+                return cn
+        if (isinstance(node.value, ast.Call)
+                and isinstance(node.value.func, ast.Attribute)
+                and isinstance(node.value.func.value, ast.Name)
+                and node.value.func.value.id in self._user_classes
+                and node.value.func.attr in self._user_classes):
+            return node.value.func.attr
+        if isinstance(node.value, ast.Call):
+            return self._infer_object_class(node.value)
+        if isinstance(node.value, ast.Name):
+            if node.value.id in self._obj_var_class:
+                return self._obj_var_class[node.value.id]
+        if isinstance(node.value, ast.Attribute):
+            return self._infer_object_class(node.value) or None
+        return None
+
+    def _assign_detect_dict_value_types(
+        self, node: ast.Assign
+    ) -> tuple[bool, bool, bool, bool]:
+        """Detect homogeneous dict value types. Returns (has_list, has_int, has_dict, has_obj)."""
+        hl = hi = hd = ho = False
+        if isinstance(node.value, ast.Dict) and node.value.values:
+            hl = all(isinstance(v, (ast.List, ast.ListComp))
+                     for v in node.value.values)
+            hd = all(isinstance(v, (ast.Dict, ast.DictComp))
+                     for v in node.value.values)
+            hi = all(isinstance(v, ast.Constant)
+                     and isinstance(v.value, (int, bool))
+                     and not isinstance(v.value, bool)
+                     for v in node.value.values)
+            ho = all(self._is_obj_expr(v) for v in node.value.values)
+        elif (isinstance(node.value, ast.Call)
+                and isinstance(node.value.func, ast.Name)
+                and node.value.func.id in self._user_functions):
+            fn_def = self._function_def_nodes.get(node.value.func.id)
+            if fn_def is not None:
+                ret_dict = self._find_returned_dict_literal(fn_def)
+                if ret_dict is not None and ret_dict.values:
+                    hl = all(isinstance(v, (ast.List, ast.ListComp))
+                             for v in ret_dict.values)
+                    hi = all(isinstance(v, ast.Constant)
+                             and isinstance(v.value, (int, bool))
+                             and not isinstance(v.value, bool)
+                             for v in ret_dict.values)
+        return hl, hi, hd, ho
+
     def _emit_assign(self, node: ast.Assign) -> None:
         """Emit a variable assignment: x = expr, or tuple unpacking: a, b = 1, 2"""
         # Handle tuple unpacking: a, b, c = expr
@@ -12579,125 +12729,18 @@ class CodeGen:
                 and node.value.value is ...):
             self._ellipsis_vars.add(node.targets[0].id)
 
-        # Track unchecked_int() / checked_int() / *_int32() constructor calls
-        _INT_CONSTRUCTORS = {
-            'unchecked_int': 'unchecked',
-            'checked_int': 'checked',
-            'unchecked_int32': 'unchecked32',
-            'checked_int32': 'checked32',
-        }
-        if (len(node.targets) == 1
-                and isinstance(node.targets[0], ast.Name)
-                and isinstance(node.value, ast.Call)
-                and isinstance(node.value.func, ast.Name)
-                and node.value.func.id in _INT_CONSTRUCTORS):
-            varname = node.targets[0].id
-            mode = _INT_CONSTRUCTORS[node.value.func.id]
-            self._int_mode_vars[varname] = mode
-            # Evaluate the argument (or default 0) and store as int
-            if node.value.args:
-                value = self._emit_expr_value(node.value.args[0])
-            else:
-                value = ir.Constant(i64, 0)
-            if isinstance(value.type, ir.PointerType):
-                value = self.builder.ptrtoint(value, i64)
-            elif isinstance(value.type, ir.DoubleType):
-                value = self.builder.fptosi(value, i64)
-            # For i32 modes, truncate to 32-bit range and sign-extend back
-            if mode.endswith('32'):
-                value = self.builder.sext(
-                    self.builder.trunc(value, ir.IntType(32)), i64)
-            self._store_variable(varname, value, ValueType(VKind.INT))
+        # Early-exit handlers for special assignment patterns
+        if self._assign_try_int_constructor(node):
             return
-
-        # Track defaultdict factory type: d = defaultdict(list)
-        # Records the factory name so _is_list_expr can detect that
-        # d["key"] returns a list (not int) for append/len dispatch.
-        if (len(node.targets) == 1
-                and isinstance(node.targets[0], ast.Name)
-                and isinstance(node.value, ast.Call)
-                and isinstance(node.value.func, ast.Name)
-                and node.value.args):
-            _dd_func = node.value.func.id
-            _ni = getattr(self, '_native_imports', {})
-            _is_dd = (_dd_func == "defaultdict"
-                      or (_dd_func in _ni
-                          and _ni[_dd_func] == ("collections", "defaultdict")))
-            if _is_dd and isinstance(node.value.args[0], ast.Name):
-                if not hasattr(self, '_defaultdict_var_factories'):
-                    self._defaultdict_var_factories = {}
-                self._defaultdict_var_factories[
-                    node.targets[0].id] = node.value.args[0].id
-
-        # Track weakref variables: r = weakref.ref(obj) or r = ref(obj)
-        # where ref was imported from weakref/_weakref. Mark target as a
-        # weakref variable so r() emits deref, not closure call.
-        if (len(node.targets) == 1
-                and isinstance(node.targets[0], ast.Name)
-                and isinstance(node.value, ast.Call)):
-            _wr_rhs = node.value
-            _is_weakref_call = False
-            # weakref.ref(obj) or _weakref.ref(obj)
-            if (isinstance(_wr_rhs.func, ast.Attribute)
-                    and isinstance(_wr_rhs.func.value, ast.Name)
-                    and _wr_rhs.func.value.id in ("weakref", "_weakref")
-                    and _wr_rhs.func.attr == "ref"):
-                _is_weakref_call = True
-            # from weakref import ref; r = ref(obj)
-            elif isinstance(_wr_rhs.func, ast.Name):
-                _ni = getattr(self, '_native_imports', {})
-                if _wr_rhs.func.id in _ni:
-                    _mod, _attr = _ni[_wr_rhs.func.id]
-                    if _mod in ("weakref", "_weakref") and _attr == "ref":
-                        _is_weakref_call = True
-            if _is_weakref_call:
-                if not hasattr(self, '_weakref_vars'):
-                    self._weakref_vars = set()
-                self._weakref_vars.add(node.targets[0].id)
-
-        # Bound method alias: `f = lst.insert` — track alias instead of
-        # emitting code, so `f(i, v)` compiles as `lst.insert(i, v)`.
-        _NATIVE_LIST_METHODS = {
-            "append", "extend", "insert", "pop", "remove", "sort",
-            "reverse", "clear", "copy", "index", "count",
-        }
-        _NATIVE_DICT_METHODS = {
-            "get", "keys", "values", "items", "pop", "update",
-            "setdefault", "clear", "copy",
-        }
-        _NATIVE_STR_METHODS = {
-            "split", "join", "strip", "lstrip", "rstrip", "replace",
-            "find", "rfind", "startswith", "endswith", "lower", "upper",
-            "count", "index", "format", "encode",
-        }
-        if (len(node.targets) == 1
-                and isinstance(node.targets[0], ast.Name)
-                and isinstance(node.value, ast.Attribute)
-                and isinstance(node.value.value, ast.Name)):
-            _bm_obj = node.value.value.id
-            _bm_method = node.value.attr
-            _bm_is_native = False
-            if _bm_obj in self.variables:
-                _bm_kind = self._var_kind(_bm_obj)
-                if _bm_kind == VKind.LIST:
-                    _bm_is_native = _bm_method in _NATIVE_LIST_METHODS
-                elif _bm_kind == VKind.DICT:
-                    _bm_is_native = _bm_method in _NATIVE_DICT_METHODS
-                elif _bm_kind == VKind.STR:
-                    _bm_is_native = _bm_method in _NATIVE_STR_METHODS
-            if _bm_is_native:
-                self._bound_method_aliases[node.targets[0].id] = (
-                    _bm_obj, _bm_method)
-                return
+        self._assign_track_special_calls(node)
+        if self._assign_try_bound_method(node):
+            return
 
         # FV-ABI fast paths: pyobj, native module, user fn, obj attr, subscript
         if self._USE_FV_LOCALS and self._assign_fv_fast_path(node):
             return
 
         # Early-out: in-place prefix reverse  a[:N] = a[M::-1]
-        # Must be detected BEFORE evaluating the RHS, otherwise
-        # list_slice_step allocates a temporary reversed list that we
-        # never use (and never free), causing O(n²) memory growth.
         for target in node.targets:
             if isinstance(target, ast.Subscript) and isinstance(target.slice, ast.Slice):
                 rev = self._match_prefix_reverse(target, node.value)
@@ -12712,23 +12755,15 @@ class CodeGen:
 
         value = self._emit_expr_value(node.value)
 
-        # FpyValue struct with runtime tag (e.g. from BigInt overflow):
-        # store directly — the FpyValue path in _store_variable preserves
-        # the runtime tag without re-wrapping.
+        # FpyValue struct with runtime tag: store directly
         if (isinstance(value.type, ir.LiteralStructType)
                 and value.type == fpy_val
                 and len(node.targets) == 1
                 and isinstance(node.targets[0], ast.Name)):
-            # Bridge import call (e.g. t = Template(...) inside a function
-            # where Template is from `from django.template import Template`):
-            # tag as PYOBJ so downstream method calls (t.render(...)) route
-            # through the CPython bridge instead of the native method path.
             _bridge = getattr(self, '_bridge_imports', {})
             _is_bridge_rhs = (isinstance(node.value, ast.Call)
                               and isinstance(node.value.func, ast.Name)
                               and node.value.func.id in _bridge)
-            # Method call on a pyobj receiver (e.g. out = t.render(ctx)
-            # where t is a bridge object): result is also PYOBJ.
             _is_pyobj_method = (not _is_bridge_rhs
                                 and isinstance(node.value, ast.Call)
                                 and isinstance(node.value.func, ast.Attribute)
@@ -12742,12 +12777,7 @@ class CodeGen:
 
         type_tag = self._infer_type_tag(node.value, value)
 
-        # CPython bridge builtin result: tag as "pyobj" so downstream
-        # ops (len, in, for) route through the bridge.
-        # EXCEPTION: when the value is already an FpyValue struct (from
-        # bridge calls that return {tag, data}), the runtime tag is correct
-        # and overriding to "pyobj" would cause _load_or_wrap_fv to call
-        # cpython_to_fv on non-PyObject data, causing crashes.
+        # CPython bridge builtin result: tag as "pyobj"
         if (isinstance(node.value, ast.Call)
                 and isinstance(node.value.func, ast.Name)
                 and node.value.func.id not in self._user_functions
@@ -12759,7 +12789,6 @@ class CodeGen:
                 and not (isinstance(value.type, ir.LiteralStructType)
                          and value.type == fpy_val)):
             builtin_name = node.value.func.id
-            # Known fastpy builtins that return native types — don't tag as pyobj
             native_builtins = {
                 "len", "int", "float", "str", "bool", "abs", "sum",
                 "min", "max", "range", "sorted", "reversed", "list",
@@ -12775,14 +12804,7 @@ class CodeGen:
             if builtin_name not in native_builtins:
                 type_tag = ValueType(VKind.PYOBJ)
 
-        # When a closure returns a value that will be called later,
-        # we need to detect whether it's a closure or raw function pointer.
-        # For now, closures that capture variables (from _emit_nested_funcdef)
-        # are tagged "closure". Hoisted functions (no captures) remain as
-        # "int" (raw function pointer) and are called via call_ptr0.
-
-        # If assigning an empty list and pre-scan detected the actual element type,
-        # override the default "list:int" tag
+        # Override empty-list element type from pre-scan
         if (type_tag.kind == VKind.LIST
                 and (not type_tag.elem_type or type_tag.elem_type.kind == VKind.INT)
                 and len(node.targets) == 1
@@ -12791,7 +12813,7 @@ class CodeGen:
             if target_name in self._list_append_types:
                 _et = self._list_append_types[target_name]
                 if not isinstance(_et, ValueType):
-                    _et = ValueType(VKind.INT)  # fallback; all new paths produce ValueType
+                    _et = ValueType(VKind.INT)
                 type_tag = ValueType(VKind.LIST, elem_type=_et)
 
         # Track tuple element types for subscript dispatch
@@ -12804,114 +12826,33 @@ class CodeGen:
             elif all(isinstance(e, ast.Constant) and isinstance(e.value, float) for e in elts):
                 self._tuple_elem_types[node.targets[0].id] = ValueType(VKind.FLOAT)
 
-        # Track class name for object variables
-        class_name = None
-        if isinstance(node.value, ast.Call) and isinstance(node.value.func, ast.Name):
-            if node.value.func.id in self._user_classes:
-                class_name = node.value.func.id
-                # Resolve to variant if the class is monomorphized so
-                # downstream method dispatch finds the right variant.
-                if class_name in self._monomorphized_classes:
-                    class_name = self._resolve_class_specialization(
-                        class_name, node.value.args, node.value.keywords)
-        # Nested class constructor: Outer.Inner(args)
-        elif (isinstance(node.value, ast.Call)
-              and isinstance(node.value.func, ast.Attribute)
-              and isinstance(node.value.func.value, ast.Name)
-              and node.value.func.value.id in self._user_classes
-              and node.value.func.attr in self._user_classes):
-            class_name = node.value.func.attr
-        elif isinstance(node.value, ast.Call):
-            class_name = self._infer_object_class(node.value)
-        elif isinstance(node.value, ast.Name):
-            # Propagate obj class through `cur = head` aliases.
-            if node.value.id in self._obj_var_class:
-                class_name = self._obj_var_class[node.value.id]
-        elif isinstance(node.value, ast.Attribute):
-            # `cur = cur.next` — propagate class from attr type.
-            attr_cls = self._infer_object_class(node.value)
-            if attr_cls:
-                class_name = attr_cls
+        class_name = self._assign_infer_class_name(node)
+        has_list_values, has_int_values, has_dict_values, has_obj_values = \
+            self._assign_detect_dict_value_types(node)
 
-        # Track dict variables whose values are all lists / all ints /
-        # all dicts / all objects. Used by _emit_subscript to choose how
-        # to unwrap `d[k]` to a bare LLVM type.
-        has_list_values = False
-        has_int_values = False
-        has_dict_values = False
-        has_obj_values = False
-        if isinstance(node.value, ast.Dict) and node.value.values:
-            has_list_values = all(
-                isinstance(v, (ast.List, ast.ListComp)) for v in node.value.values
-            )
-            has_dict_values = all(
-                isinstance(v, (ast.Dict, ast.DictComp)) for v in node.value.values
-            )
-            has_int_values = all(
-                isinstance(v, ast.Constant) and isinstance(v.value, (int, bool))
-                and not isinstance(v.value, bool)  # exclude bool specifically
-                for v in node.value.values
-            )
-            has_obj_values = all(
-                self._is_obj_expr(v) for v in node.value.values
-            )
-        # Propagate dict-value-type flag through function returns: if the
-        # callee returns a dict literal with all-int / all-list values,
-        # treat the assignment target the same way.
-        elif (isinstance(node.value, ast.Call)
-                and isinstance(node.value.func, ast.Name)
-                and node.value.func.id in self._user_functions):
-            fn_def = self._function_def_nodes.get(node.value.func.id)
-            if fn_def is not None:
-                ret_dict = self._find_returned_dict_literal(fn_def)
-                if ret_dict is not None and ret_dict.values:
-                    has_list_values = all(
-                        isinstance(v, (ast.List, ast.ListComp)) for v in ret_dict.values
-                    )
-                    has_int_values = all(
-                        isinstance(v, ast.Constant)
-                        and isinstance(v.value, (int, bool))
-                        and not isinstance(v.value, bool)
-                        for v in ret_dict.values
-                    )
-
-        # For dict literals with string keys and mixed values, build a
-        # per-key type map so `d["age"]` returns an int while `d["name"]`
-        # returns a string. Enables mixed-type dict filtering in list
-        # comprehensions and similar idioms.
+        # Per-key type map for dict literals with string keys
         dict_key_types: dict[str, str] = {}
         if isinstance(node.value, ast.Dict):
             for k_node, v_node in zip(node.value.keys, node.value.values):
-                if not (isinstance(k_node, ast.Constant)
+                if (isinstance(k_node, ast.Constant)
                         and isinstance(k_node.value, str)):
-                    continue
-                t = self._infer_constant_value_type(v_node)
-                if t is not None:
-                    dict_key_types[k_node.value] = t
+                    t = self._infer_constant_value_type(v_node)
+                    if t is not None:
+                        dict_key_types[k_node.value] = t
 
         for target in node.targets:
             if isinstance(target, ast.Name):
-                # Phase 4: track function aliases (f = my_func → f calls my_func)
-                # Also handles chains: g = f where f is already an alias
                 if (isinstance(node.value, ast.Name)
                         and (node.value.id in self._user_functions
                              or node.value.id in self._func_aliases)):
                     self._func_aliases[target.id] = node.value.id
-                # Steal references from creation expressions — they
-                # already have refcount=1 from creation; increfing again
-                # would double-count and prevent freeing in loops.
-                # NOTE: Do NOT steal from arbitrary ast.Call — method calls
-                # and user-function calls may return borrowed references
-                # (e.g. `self.link` from hold()).  Only steal from known
-                # creation calls: constructors and container literals.
                 _steal = isinstance(node.value, (
                     ast.List, ast.ListComp,
                     ast.Dict, ast.DictComp, ast.Set, ast.SetComp))
                 if (not _steal and isinstance(node.value, ast.Call)
                         and isinstance(node.value.func, ast.Name)
                         and node.value.func.id in self._user_classes):
-                    _steal = True  # constructor call → new object
-                # Phase 3: embed class_name in ValueType for constructor results
+                    _steal = True
                 if class_name:
                     self._store_variable(target.id, value,
                                          ValueType(VKind.OBJ, class_name=class_name),
@@ -12935,8 +12876,6 @@ class CodeGen:
             elif isinstance(target, ast.Attribute):
                 self._emit_attr_store(target, value, node, value_node=node.value)
             elif isinstance(target, ast.Subscript):
-                # Track dict value types through subscript assignments so
-                # nested access like d["a"]["x"] knows d["a"] returns a dict.
                 if (isinstance(target.value, ast.Name)
                         and self._is_dict_expr(target.value)):
                     base_name = target.value.id
