@@ -29813,88 +29813,132 @@ class CodeGen:
         # Check if object is a list (or tuple — same FpyList struct)
         return None
 
+    # ---- List method dispatch table (B3) ----
+    _LIST_METHOD_DISPATCH = {
+        "append": "_emit_list_method_append",
+        "pop": "_emit_list_method_pop",
+        "index": "_emit_list_method_index",
+        "count": "_emit_list_method_count",
+        "extend": "_emit_list_method_extend",
+        "sort": "_emit_list_method_sort",
+        "reverse": "_emit_list_method_reverse",
+        "remove": "_emit_list_method_remove",
+        "insert": "_emit_list_method_insert",
+        "copy": "_emit_list_method_copy",
+        "clear": "_emit_list_method_clear",
+        "discard": "_emit_list_method_discard",
+    }
+
     def _emit_method_call_list(self, node):
-        """Emit list/tuple method calls. Returns None if not recognized."""
-        attr = node.func
+        """Emit list/tuple method calls via dispatch table. Returns None if not recognized."""
         method = node.func.attr
-        obj = self._emit_expr_value(attr.value)
-        if method == "append" and len(node.args) == 1:
+        handler_name = self._LIST_METHOD_DISPATCH.get(method)
+        if handler_name is None:
+            return None
+        obj = self._emit_expr_value(node.func.value)
+        return getattr(self, handler_name)(node, obj)
+
+    # ---- List method handlers (B3) ----
+
+    def _emit_list_method_append(self, node, obj):
+        if len(node.args) == 1:
             self._emit_list_append_expr(obj, node.args[0])
             return obj
-        elif method == "pop" and len(node.args) == 0:
+        return None
+
+    def _emit_list_method_pop(self, node, obj):
+        if len(node.args) == 0:
             return self._rt_call("list_pop_int", [obj])
-        elif method == "pop" and len(node.args) == 1:
+        if len(node.args) == 1:
             idx = self._emit_expr_value(node.args[0])
             return self._rt_call("list_pop_at", [obj, idx])
-        elif method == "index":
-            if len(node.args) == 1:
-                val = self._emit_expr_value(node.args[0])
-                if isinstance(val.type, ir.PointerType):
-                    return self._rt_call("list_index_str", [obj, val])
-                return self._rt_call("list_index", [obj, val])
-            if len(node.args) == 2:
-                val = self._emit_expr_value(node.args[0])
-                start = self._emit_expr_value(node.args[1])
-                length = self._rt_call("list_length", [obj])
-                return self._rt_call("list_index_range",
-                                     [obj, val, start, length])
-            if len(node.args) == 3:
-                val = self._emit_expr_value(node.args[0])
-                start = self._emit_expr_value(node.args[1])
-                stop = self._emit_expr_value(node.args[2])
-                return self._rt_call("list_index_range",
-                                     [obj, val, start, stop])
-        elif method == "count" and len(node.args) == 1:
+        return None
+
+    def _emit_list_method_index(self, node, obj):
+        if len(node.args) == 1:
+            val = self._emit_expr_value(node.args[0])
+            if isinstance(val.type, ir.PointerType):
+                return self._rt_call("list_index_str", [obj, val])
+            return self._rt_call("list_index", [obj, val])
+        if len(node.args) == 2:
+            val = self._emit_expr_value(node.args[0])
+            start = self._emit_expr_value(node.args[1])
+            length = self._rt_call("list_length", [obj])
+            return self._rt_call("list_index_range",
+                                 [obj, val, start, length])
+        if len(node.args) == 3:
+            val = self._emit_expr_value(node.args[0])
+            start = self._emit_expr_value(node.args[1])
+            stop = self._emit_expr_value(node.args[2])
+            return self._rt_call("list_index_range",
+                                 [obj, val, start, stop])
+        return None
+
+    def _emit_list_method_count(self, node, obj):
+        if len(node.args) == 1:
             val = self._emit_expr_value(node.args[0])
             if isinstance(val.type, ir.PointerType):
                 return self._rt_call("list_count_str", [obj, val])
             return self._rt_call("list_count", [obj, val])
-        elif method == "extend" and len(node.args) == 1:
+        return None
+
+    def _emit_list_method_extend(self, node, obj):
+        if len(node.args) == 1:
             other = self._emit_expr_value(node.args[0])
             self._rt_call("list_extend", [obj, other])
             return obj
-        elif method == "sort" and len(node.args) == 0:
-            # Check for key= keyword argument
-            has_key = False
-            has_reverse = False
+        return None
+
+    def _emit_list_method_sort(self, node, obj):
+        if len(node.args) != 0:
+            return None
+        has_key = False
+        has_reverse = False
+        for kw in node.keywords:
+            if kw.arg == "key" and kw.value is not None:
+                if not (isinstance(kw.value, ast.Constant)
+                        and kw.value.value is None):
+                    has_key = True
+            if kw.arg == "reverse":
+                if (isinstance(kw.value, ast.Constant)
+                        and kw.value.value is True):
+                    has_reverse = True
+        if has_key:
+            key_node = None
             for kw in node.keywords:
-                if kw.arg == "key" and kw.value is not None:
-                    if not (isinstance(kw.value, ast.Constant)
-                            and kw.value.value is None):
-                        has_key = True
-                if kw.arg == "reverse":
-                    if (isinstance(kw.value, ast.Constant)
-                            and kw.value.value is True):
-                        has_reverse = True
-            if has_key:
-                # Native list.sort(key=func) — get key function pointer
-                key_node = None
-                for kw in node.keywords:
-                    if kw.arg == "key":
-                        key_node = kw.value
-                        break
-                fn_ptr = self._get_unary_func_ptr(key_node, node)
-                rev_flag = ir.Constant(i32, 1 if has_reverse else 0)
-                self.builder.call(self.runtime["list_sort_by_key_int"],
-                                  [obj, fn_ptr, rev_flag])
-                return obj
-            else:
-                self._rt_call("list_sort", [obj])
-                if has_reverse:
-                    self.builder.call(
-                        self.runtime["list_reverse_inplace"], [obj])
-                return obj
-        elif method == "reverse" and len(node.args) == 0:
+                if kw.arg == "key":
+                    key_node = kw.value
+                    break
+            fn_ptr = self._get_unary_func_ptr(key_node, node)
+            rev_flag = ir.Constant(i32, 1 if has_reverse else 0)
+            self.builder.call(self.runtime["list_sort_by_key_int"],
+                              [obj, fn_ptr, rev_flag])
+            return obj
+        else:
+            self._rt_call("list_sort", [obj])
+            if has_reverse:
+                self.builder.call(
+                    self.runtime["list_reverse_inplace"], [obj])
+            return obj
+
+    def _emit_list_method_reverse(self, node, obj):
+        if len(node.args) == 0:
             self._rt_call("list_reverse_inplace", [obj])
             return obj
-        elif method == "remove" and len(node.args) == 1:
+        return None
+
+    def _emit_list_method_remove(self, node, obj):
+        if len(node.args) == 1:
             val = self._emit_expr_value(node.args[0])
             if isinstance(val.type, ir.PointerType):
                 self._rt_call("list_remove_str", [obj, val])
             else:
                 self._rt_call("list_remove", [obj, val])
             return obj
-        elif method == "insert" and len(node.args) == 2:
+        return None
+
+    def _emit_list_method_insert(self, node, obj):
+        if len(node.args) == 2:
             idx = self._emit_expr_value(node.args[0])
             val = self._emit_expr_value(node.args[1])
             if isinstance(val.type, ir.PointerType):
@@ -29902,226 +29946,328 @@ class CodeGen:
             else:
                 self._rt_call("list_insert_int", [obj, idx, val])
             return obj
-        elif method == "copy" and len(node.args) == 0:
+        return None
+
+    def _emit_list_method_copy(self, node, obj):
+        if len(node.args) == 0:
             return self._rt_call("list_copy", [obj])
-        elif method == "clear" and len(node.args) == 0:
+        return None
+
+    def _emit_list_method_clear(self, node, obj):
+        if len(node.args) == 0:
             self._rt_call("list_clear", [obj])
             return obj
-        elif method == "discard" and len(node.args) == 1:
+        return None
+
+    def _emit_list_method_discard(self, node, obj):
+        if len(node.args) == 1:
             val = self._emit_expr_value(node.args[0])
             if isinstance(val.type, ir.PointerType):
                 val = self.builder.ptrtoint(val, i64)
             self.builder.call(self.runtime["set_discard"], [obj, val])
             return obj
-        # Phase 4: fall through to runtime dispatch below
-
-        # Check if object is a set (dict-backed)
         return None
+
+    # ---- Set method dispatch table (B3) ----
+    _SET_METHOD_DISPATCH = {
+        "add": "_emit_set_method_add",
+        "discard": "_emit_set_method_discard",
+        "remove": "_emit_set_method_remove",
+        "union": "_emit_set_method_union",
+        "intersection": "_emit_set_method_intersection",
+        "difference": "_emit_set_method_difference",
+        "symmetric_difference": "_emit_set_method_symmdiff",
+        "issubset": "_emit_set_method_issubset",
+        "issuperset": "_emit_set_method_issuperset",
+        "isdisjoint": "_emit_set_method_isdisjoint",
+        "copy": "_emit_set_method_copy",
+        "clear": "_emit_set_method_clear",
+        "pop": "_emit_set_method_pop",
+        "update": "_emit_set_method_update",
+    }
 
     def _emit_method_call_set(self, node):
-        """Emit set method calls. Returns None if not recognized."""
-        attr = node.func
+        """Emit set method calls via dispatch table. Returns None if not recognized."""
         method = node.func.attr
-        obj = self._emit_expr_value(attr.value)
+        handler_name = self._SET_METHOD_DISPATCH.get(method)
+        if handler_name is None:
+            return None
+        obj = self._emit_expr_value(node.func.value)
         obj = self._ensure_ptr(obj)
-        if method == "add" and len(node.args) == 1:
-            val = self._emit_expr_value(node.args[0])
-            tag, data = self._bare_to_tag_data(val, node.args[0])
-            self.builder.call(self.runtime["set_add_fv"],
-                              [obj, ir.Constant(i32, tag), data])
-            return obj
-        elif method == "discard" and len(node.args) == 1:
-            val = self._emit_expr_value(node.args[0])
-            tag, data = self._bare_to_tag_data(val, node.args[0])
-            self.builder.call(self.runtime["set_discard_fv"],
-                              [obj, ir.Constant(i32, tag), data])
-            return obj
-        elif method == "remove" and len(node.args) == 1:
-            val = self._emit_expr_value(node.args[0])
-            tag, data = self._bare_to_tag_data(val, node.args[0])
-            self.builder.call(self.runtime["set_discard_fv"],
-                              [obj, ir.Constant(i32, tag), data])
-            return obj
-        elif method == "union" and len(node.args) == 1:
-            other = self._emit_expr_value(node.args[0])
-            other = self._ensure_ptr(other)
-            return self._rt_call("set_union", [obj, other])
-        elif method == "intersection" and len(node.args) == 1:
-            other = self._emit_expr_value(node.args[0])
-            other = self._ensure_ptr(other)
-            return self._rt_call("set_intersection", [obj, other])
-        elif method == "difference" and len(node.args) == 1:
-            other = self._emit_expr_value(node.args[0])
-            other = self._ensure_ptr(other)
-            return self._rt_call("set_difference", [obj, other])
-        elif method == "symmetric_difference" and len(node.args) == 1:
-            other = self._emit_expr_value(node.args[0])
-            other = self._ensure_ptr(other)
-            return self._rt_call("set_symmetric_diff", [obj, other])
-        elif method == "issubset" and len(node.args) == 1:
-            other = self._emit_expr_value(node.args[0])
-            other = self._ensure_ptr(other)
-            return self._rt_call("set_issubset", [obj, other])
-        elif method == "issuperset" and len(node.args) == 1:
-            other = self._emit_expr_value(node.args[0])
-            other = self._ensure_ptr(other)
-            return self._rt_call("set_issuperset", [obj, other])
-        elif method == "isdisjoint" and len(node.args) == 1:
-            other = self._emit_expr_value(node.args[0])
-            other = self._ensure_ptr(other)
-            return self._rt_call("set_isdisjoint", [obj, other])
-        elif method == "copy" and len(node.args) == 0:
-            return self._rt_call("set_copy", [obj])
-        elif method == "clear" and len(node.args) == 0:
-            self._rt_call("set_clear", [obj])
-            return obj
-        elif method == "pop" and len(node.args) == 0:
-            tag_slot = self._create_entry_alloca(i32, "spop.tag")
-            data_slot = self._create_entry_alloca(i64, "spop.data")
-            self.builder.call(self.runtime["set_pop_fv"],
-                              [obj, tag_slot, data_slot])
-            return self._fv_build_from_slots(
-                self.builder.load(tag_slot), self.builder.load(data_slot))
-        elif method == "update" and len(node.args) == 1:
-            other = self._emit_expr_value(node.args[0])
-            other = self._ensure_ptr(other)
-            self._rt_call("set_update", [obj, other])
-            return obj
-        # Phase 4: fall through to runtime dispatch below
+        return getattr(self, handler_name)(node, obj)
 
-        # Check if object is a dict
-        return None
+    # ---- Set method handlers (B3) ----
+
+    def _emit_set_method_add(self, node, obj):
+        if len(node.args) != 1:
+            return None
+        val = self._emit_expr_value(node.args[0])
+        tag, data = self._bare_to_tag_data(val, node.args[0])
+        self.builder.call(self.runtime["set_add_fv"],
+                          [obj, ir.Constant(i32, tag), data])
+        return obj
+
+    def _emit_set_method_discard(self, node, obj):
+        if len(node.args) != 1:
+            return None
+        val = self._emit_expr_value(node.args[0])
+        tag, data = self._bare_to_tag_data(val, node.args[0])
+        self.builder.call(self.runtime["set_discard_fv"],
+                          [obj, ir.Constant(i32, tag), data])
+        return obj
+
+    def _emit_set_method_remove(self, node, obj):
+        if len(node.args) != 1:
+            return None
+        val = self._emit_expr_value(node.args[0])
+        tag, data = self._bare_to_tag_data(val, node.args[0])
+        self.builder.call(self.runtime["set_discard_fv"],
+                          [obj, ir.Constant(i32, tag), data])
+        return obj
+
+    def _emit_set_method_union(self, node, obj):
+        if len(node.args) != 1:
+            return None
+        other = self._emit_expr_value(node.args[0])
+        other = self._ensure_ptr(other)
+        return self._rt_call("set_union", [obj, other])
+
+    def _emit_set_method_intersection(self, node, obj):
+        if len(node.args) != 1:
+            return None
+        other = self._emit_expr_value(node.args[0])
+        other = self._ensure_ptr(other)
+        return self._rt_call("set_intersection", [obj, other])
+
+    def _emit_set_method_difference(self, node, obj):
+        if len(node.args) != 1:
+            return None
+        other = self._emit_expr_value(node.args[0])
+        other = self._ensure_ptr(other)
+        return self._rt_call("set_difference", [obj, other])
+
+    def _emit_set_method_symmdiff(self, node, obj):
+        if len(node.args) != 1:
+            return None
+        other = self._emit_expr_value(node.args[0])
+        other = self._ensure_ptr(other)
+        return self._rt_call("set_symmetric_diff", [obj, other])
+
+    def _emit_set_method_issubset(self, node, obj):
+        if len(node.args) != 1:
+            return None
+        other = self._emit_expr_value(node.args[0])
+        other = self._ensure_ptr(other)
+        return self._rt_call("set_issubset", [obj, other])
+
+    def _emit_set_method_issuperset(self, node, obj):
+        if len(node.args) != 1:
+            return None
+        other = self._emit_expr_value(node.args[0])
+        other = self._ensure_ptr(other)
+        return self._rt_call("set_issuperset", [obj, other])
+
+    def _emit_set_method_isdisjoint(self, node, obj):
+        if len(node.args) != 1:
+            return None
+        other = self._emit_expr_value(node.args[0])
+        other = self._ensure_ptr(other)
+        return self._rt_call("set_isdisjoint", [obj, other])
+
+    def _emit_set_method_copy(self, node, obj):
+        if len(node.args) != 0:
+            return None
+        return self._rt_call("set_copy", [obj])
+
+    def _emit_set_method_clear(self, node, obj):
+        if len(node.args) != 0:
+            return None
+        self._rt_call("set_clear", [obj])
+        return obj
+
+    def _emit_set_method_pop(self, node, obj):
+        if len(node.args) != 0:
+            return None
+        tag_slot = self._create_entry_alloca(i32, "spop.tag")
+        data_slot = self._create_entry_alloca(i64, "spop.data")
+        self.builder.call(self.runtime["set_pop_fv"],
+                          [obj, tag_slot, data_slot])
+        return self._fv_build_from_slots(
+            self.builder.load(tag_slot), self.builder.load(data_slot))
+
+    def _emit_set_method_update(self, node, obj):
+        if len(node.args) != 1:
+            return None
+        other = self._emit_expr_value(node.args[0])
+        other = self._ensure_ptr(other)
+        self._rt_call("set_update", [obj, other])
+        return obj
+
+    # ---- Dict method dispatch table (B3) ----
+    _DICT_METHOD_DISPATCH = {
+        "keys": "_emit_dict_method_keys",
+        "values": "_emit_dict_method_values",
+        "items": "_emit_dict_method_items",
+        "get": "_emit_dict_method_get",
+        "update": "_emit_dict_method_update",
+        "pop": "_emit_dict_method_pop",
+        "setdefault": "_emit_dict_method_setdefault",
+        "popitem": "_emit_dict_method_popitem",
+        "copy": "_emit_dict_method_copy",
+        "clear": "_emit_dict_method_clear",
+    }
 
     def _emit_method_call_dict(self, node):
-        """Emit dict method calls. Returns None if not recognized."""
-        attr = node.func
+        """Emit dict method calls via dispatch table. Returns None if not recognized."""
         method = node.func.attr
-        obj = self._emit_expr_value(attr.value)
-        if method == "keys":
-            return self._rt_call("dict_keys", [obj])
-        elif method == "values":
-            return self._rt_call("dict_values", [obj])
-        elif method == "items":
-            return self._rt_call("dict_items", [obj])
-        elif method == "get":
-            if len(node.args) >= 1:
-                key = self._emit_expr_value(node.args[0])
-                # Use FV-ABI: return full FpyValue so runtime tag drives dispatch.
-                # This handles mixed-type dicts (kwargs pattern) correctly.
-                is_str_key = isinstance(key.type, ir.PointerType)
-                is_int_key = (isinstance(key.type, ir.IntType)
-                              and key.type.width == 64)
+        handler_name = self._DICT_METHOD_DISPATCH.get(method)
+        if handler_name is None:
+            return None
+        obj = self._emit_expr_value(node.func.value)
+        return getattr(self, handler_name)(node, obj)
 
-                if is_str_key or is_int_key:
-                    # Check if key exists
-                    if is_str_key:
-                        has = self._rt_call("dict_has_key", [obj, key])
-                    else:
-                        has = self._rt_call("dict_has_int_key", [obj, key])
-                    has_bool = self.builder.icmp_unsigned("!=", has, ir.Constant(i32, 0))
-                    tag_slot = self._create_entry_alloca(i32, "dget.tag")
-                    data_slot = self._create_entry_alloca(i64, "dget.data")
-                    found_block = self._new_block("dget.found")
-                    default_block = self._new_block("dget.default")
-                    merge_block = self._new_block("dget.merge")
-                    self.builder.cbranch(has_bool, found_block, default_block)
-                    # Found path: load the FpyValue from dict
-                    self.builder.position_at_end(found_block)
-                    if is_str_key:
-                        self.builder.call(self.runtime["dict_get_fv"],
-                                          [obj, key, tag_slot, data_slot])
-                    else:
-                        self.builder.call(self.runtime["dict_get_int_fv"],
-                                          [obj, key, tag_slot, data_slot])
-                    found_tag = self.builder.load(tag_slot)
-                    found_data = self.builder.load(data_slot)
-                    found_fv = self._fv_build_from_slots(found_tag, found_data)
-                    self.builder.branch(merge_block)
-                    found_end = self.builder.block
-                    # Default path: wrap the default value as FpyValue
-                    self.builder.position_at_end(default_block)
-                    if len(node.args) >= 2:
-                        default = self._emit_expr_value(node.args[1])
-                        if isinstance(default.type, ir.LiteralStructType):
-                            default_fv = default
-                        else:
-                            default_tag = self._infer_type_tag(node.args[1], default)
-                            default_fv = self._wrap_bare_to_fv(default, default_tag)
-                    else:
-                        default_fv = self._fv_none()
-                    self.builder.branch(merge_block)
-                    default_end = self.builder.block
-                    # Merge: phi on FpyValue
-                    self.builder.position_at_end(merge_block)
-                    phi = self.builder.phi(fpy_val, "dget.fv")
-                    phi.add_incoming(found_fv, found_end)
-                    phi.add_incoming(default_fv, default_end)
-                    return phi
-                # Unknown key type fallback: use string conversion path
-                if len(node.args) >= 2:
-                    default = self._emit_expr_value(node.args[1])
-                    if not isinstance(default.type, ir.PointerType):
-                        default = self.builder.call(self.runtime["int_to_str"], [default])
-                else:
-                    default = self._make_string_constant("None")
-                return self._rt_call("dict_get_default", [obj, key, default])
-        elif method == "update":
-            if len(node.args) == 1:
-                other = self._emit_expr_value(node.args[0])
-                self._rt_call("dict_update", [obj, other])
-                return obj
-        elif method == "pop":
-            if len(node.args) == 1:
-                key = self._emit_expr_value(node.args[0])
-                # Heuristic: use int pop if we can't tell; returning str by default
-                return self._rt_call("dict_pop_int", [obj, key])
-            if len(node.args) == 2:
-                key = self._emit_expr_value(node.args[0])
-                default_val = self._emit_expr_value(node.args[1])
-                def_tag, def_data = self._to_tag_data_ir(
-                    default_val, node.args[1])
-                out_tag = self._create_entry_alloca(i32, "dpop.tag")
-                out_data = self._create_entry_alloca(i64, "dpop.data")
-                self.builder.call(self.runtime["dict_pop_fv"],
-                                  [obj, key, def_tag, def_data,
-                                   out_tag, out_data])
-                return self._fv_build_from_slots(
-                    self.builder.load(out_tag),
-                    self.builder.load(out_data))
-        elif method == "setdefault":
-            if len(node.args) == 2:
-                key = self._emit_expr_value(node.args[0])
+    # ---- Dict method handlers (B3) ----
+
+    def _emit_dict_method_keys(self, node, obj):
+        return self._rt_call("dict_keys", [obj])
+
+    def _emit_dict_method_values(self, node, obj):
+        return self._rt_call("dict_values", [obj])
+
+    def _emit_dict_method_items(self, node, obj):
+        return self._rt_call("dict_items", [obj])
+
+    def _emit_dict_method_get(self, node, obj):
+        if len(node.args) < 1:
+            return None
+        key = self._emit_expr_value(node.args[0])
+        is_str_key = isinstance(key.type, ir.PointerType)
+        is_int_key = (isinstance(key.type, ir.IntType)
+                      and key.type.width == 64)
+        if is_str_key or is_int_key:
+            if is_str_key:
+                has = self._rt_call("dict_has_key", [obj, key])
+            else:
+                has = self._rt_call("dict_has_int_key", [obj, key])
+            has_bool = self.builder.icmp_unsigned(
+                "!=", has, ir.Constant(i32, 0))
+            tag_slot = self._create_entry_alloca(i32, "dget.tag")
+            data_slot = self._create_entry_alloca(i64, "dget.data")
+            found_block = self._new_block("dget.found")
+            default_block = self._new_block("dget.default")
+            merge_block = self._new_block("dget.merge")
+            self.builder.cbranch(has_bool, found_block, default_block)
+            # Found path
+            self.builder.position_at_end(found_block)
+            if is_str_key:
+                self.builder.call(self.runtime["dict_get_fv"],
+                                  [obj, key, tag_slot, data_slot])
+            else:
+                self.builder.call(self.runtime["dict_get_int_fv"],
+                                  [obj, key, tag_slot, data_slot])
+            found_tag = self.builder.load(tag_slot)
+            found_data = self.builder.load(data_slot)
+            found_fv = self._fv_build_from_slots(found_tag, found_data)
+            self.builder.branch(merge_block)
+            found_end = self.builder.block
+            # Default path
+            self.builder.position_at_end(default_block)
+            if len(node.args) >= 2:
                 default = self._emit_expr_value(node.args[1])
-                if isinstance(default.type, ir.PointerType):
-                    self._rt_call("dict_setdefault_list", [obj, key, default])
+                if isinstance(default.type, ir.LiteralStructType):
+                    default_fv = default
                 else:
-                    self._rt_call("dict_setdefault_int", [obj, key, default])
-                return obj
-        elif method == "popitem" and len(node.args) == 0:
-            kt = self._create_entry_alloca(i32, "pi.kt")
-            kd = self._create_entry_alloca(i64, "pi.kd")
-            vt = self._create_entry_alloca(i32, "pi.vt")
-            vd = self._create_entry_alloca(i64, "pi.vd")
-            self.builder.call(self.runtime["dict_popitem"],
-                              [obj, kt, kd, vt, vd])
-            # Return as a 2-element tuple (key, value)
-            tup = self._rt_call("tuple_new", [])
-            self.builder.call(self.runtime["list_append_fv"],
-                              [tup, self.builder.load(kt),
-                               self.builder.load(kd)])
-            self.builder.call(self.runtime["list_append_fv"],
-                              [tup, self.builder.load(vt),
-                               self.builder.load(vd)])
-            return tup
-        elif method == "copy" and len(node.args) == 0:
-            return self._rt_call("dict_copy", [obj])
-        elif method == "clear" and len(node.args) == 0:
-            self._rt_call("dict_clear", [obj])
-            return obj
-        # Phase 4: fall through to runtime dispatch below
+                    default_tag = self._infer_type_tag(
+                        node.args[1], default)
+                    default_fv = self._wrap_bare_to_fv(
+                        default, default_tag)
+            else:
+                default_fv = self._fv_none()
+            self.builder.branch(merge_block)
+            default_end = self.builder.block
+            # Merge
+            self.builder.position_at_end(merge_block)
+            phi = self.builder.phi(fpy_val, "dget.fv")
+            phi.add_incoming(found_fv, found_end)
+            phi.add_incoming(default_fv, default_end)
+            return phi
+        # Unknown key type fallback
+        if len(node.args) >= 2:
+            default = self._emit_expr_value(node.args[1])
+            if not isinstance(default.type, ir.PointerType):
+                default = self.builder.call(
+                    self.runtime["int_to_str"], [default])
+        else:
+            default = self._make_string_constant("None")
+        return self._rt_call("dict_get_default", [obj, key, default])
 
-        # Check if object is a known user-class instance
+    def _emit_dict_method_update(self, node, obj):
+        if len(node.args) == 1:
+            other = self._emit_expr_value(node.args[0])
+            self._rt_call("dict_update", [obj, other])
+            return obj
         return None
+
+    def _emit_dict_method_pop(self, node, obj):
+        if len(node.args) == 1:
+            key = self._emit_expr_value(node.args[0])
+            return self._rt_call("dict_pop_int", [obj, key])
+        if len(node.args) == 2:
+            key = self._emit_expr_value(node.args[0])
+            default_val = self._emit_expr_value(node.args[1])
+            def_tag, def_data = self._to_tag_data_ir(
+                default_val, node.args[1])
+            out_tag = self._create_entry_alloca(i32, "dpop.tag")
+            out_data = self._create_entry_alloca(i64, "dpop.data")
+            self.builder.call(self.runtime["dict_pop_fv"],
+                              [obj, key, def_tag, def_data,
+                               out_tag, out_data])
+            return self._fv_build_from_slots(
+                self.builder.load(out_tag),
+                self.builder.load(out_data))
+        return None
+
+    def _emit_dict_method_setdefault(self, node, obj):
+        if len(node.args) == 2:
+            key = self._emit_expr_value(node.args[0])
+            default = self._emit_expr_value(node.args[1])
+            if isinstance(default.type, ir.PointerType):
+                self._rt_call("dict_setdefault_list",
+                              [obj, key, default])
+            else:
+                self._rt_call("dict_setdefault_int",
+                              [obj, key, default])
+            return obj
+        return None
+
+    def _emit_dict_method_popitem(self, node, obj):
+        if len(node.args) != 0:
+            return None
+        kt = self._create_entry_alloca(i32, "pi.kt")
+        kd = self._create_entry_alloca(i64, "pi.kd")
+        vt = self._create_entry_alloca(i32, "pi.vt")
+        vd = self._create_entry_alloca(i64, "pi.vd")
+        self.builder.call(self.runtime["dict_popitem"],
+                          [obj, kt, kd, vt, vd])
+        tup = self._rt_call("tuple_new", [])
+        self.builder.call(self.runtime["list_append_fv"],
+                          [tup, self.builder.load(kt),
+                           self.builder.load(kd)])
+        self.builder.call(self.runtime["list_append_fv"],
+                          [tup, self.builder.load(vt),
+                           self.builder.load(vd)])
+        return tup
+
+    def _emit_dict_method_copy(self, node, obj):
+        if len(node.args) != 0:
+            return None
+        return self._rt_call("dict_copy", [obj])
+
+    def _emit_dict_method_clear(self, node, obj):
+        if len(node.args) != 0:
+            return None
+        self._rt_call("dict_clear", [obj])
+        return obj
 
     def _emit_method_call_userobj(self, node):
         """Emit user-class instance method calls (with direct dispatch optimization)."""
@@ -30664,283 +30810,302 @@ class CodeGen:
                  call_args[0], call_args[1], call_args[2], call_args[3]])
         return None  # unsupported arg count
 
+    # ---- String method dispatch table (B3) ----
+    _STR_METHOD_DISPATCH = {
+        # Zero-arg methods (no arg-count check, just pass [obj])
+        "lower": ("str_lower",),
+        "upper": ("str_upper",),
+        "isdigit": ("str_isdigit",),
+        "isalpha": ("str_isalpha",),
+        "isalnum": ("str_isalnum",),
+        "isspace": ("str_isspace",),
+        "capitalize": ("str_capitalize",),
+        "title": ("str_title",),
+        "swapcase": ("str_swapcase",),
+        "splitlines": ("str_splitlines",),
+        "encode": ("str_encode",),
+        # Zero-arg methods (with arg-count check)
+        "isupper": ("str_isupper", 0),
+        "islower": ("str_islower", 0),
+        "istitle": ("str_istitle", 0),
+        "isidentifier": ("str_isidentifier", 0),
+        "isprintable": ("str_isprintable", 0),
+        "isdecimal": ("str_isdecimal", 0),
+        "isnumeric": ("str_isnumeric", 0),
+        "casefold": ("str_casefold", 0),
+        # One-arg methods (check exactly 1 arg)
+        "join": ("str_join", 1),
+        "partition": ("str_partition", 1),
+        "rpartition": ("str_rpartition", 1),
+        "zfill": ("str_zfill", 1),
+        "removeprefix": ("str_removeprefix", 1),
+        "removesuffix": ("str_removesuffix", 1),
+        "translate": ("str_translate", 1),
+        # Complex methods -> handler
+        "strip": "_emit_str_method_strip",
+        "lstrip": "_emit_str_method_lstrip",
+        "rstrip": "_emit_str_method_rstrip",
+        "center": "_emit_str_method_center",
+        "ljust": "_emit_str_method_ljust",
+        "rjust": "_emit_str_method_rjust",
+        "expandtabs": "_emit_str_method_expandtabs",
+        "split": "_emit_str_method_split",
+        "rsplit": "_emit_str_method_rsplit",
+        "replace": "_emit_str_method_replace",
+        "startswith": "_emit_str_method_startswith",
+        "endswith": "_emit_str_method_endswith",
+        "find": "_emit_str_method_find",
+        "rfind": "_emit_str_method_rfind",
+        "index": "_emit_str_method_index",
+        "rindex": "_emit_str_method_rindex",
+        "count": "_emit_str_method_count",
+        "format": "_emit_str_format",
+    }
+
     def _emit_method_call_str(self, node, obj):
-        """Emit string method calls. Returns None if not recognized."""
+        """Emit string method calls via dispatch table. Returns None if not recognized."""
         method = node.func.attr
-        # String methods
-        if method == "lower":
-            return self._rt_call("str_lower", [obj])
-        elif method == "upper":
-            return self._rt_call("str_upper", [obj])
-        elif method == "strip":
-            if len(node.args) == 1:
-                chars = self._emit_expr_value(node.args[0])
-                return self._rt_call("str_strip_chars", [obj, chars])
-            return self._rt_call("str_strip", [obj])
-        elif method == "lstrip":
-            if len(node.args) == 1:
-                chars = self._emit_expr_value(node.args[0])
-                return self._rt_call("str_lstrip_chars", [obj, chars])
-            return self._rt_call("str_lstrip", [obj])
-        elif method == "rstrip":
-            if len(node.args) == 1:
-                chars = self._emit_expr_value(node.args[0])
-                return self._rt_call("str_rstrip_chars", [obj, chars])
-            return self._rt_call("str_rstrip", [obj])
-        elif method == "isdigit":
-            return self._rt_call("str_isdigit", [obj])
-        elif method == "isalpha":
-            return self._rt_call("str_isalpha", [obj])
-        elif method == "isalnum":
-            return self._rt_call("str_isalnum", [obj])
-        elif method == "isspace":
-            return self._rt_call("str_isspace", [obj])
-        elif method == "capitalize":
-            return self._rt_call("str_capitalize", [obj])
-        elif method == "title":
-            return self._rt_call("str_title", [obj])
-        elif method == "swapcase":
-            return self._rt_call("str_swapcase", [obj])
-        elif method == "center":
-            if len(node.args) == 1:
-                w = self._emit_expr_value(node.args[0])
-                return self._rt_call("str_center", [obj, w])
-            if len(node.args) == 2:
-                w = self._emit_expr_value(node.args[0])
-                fill = self._emit_expr_value(node.args[1])
-                return self._rt_call("str_center_fill", [obj, w, fill])
-        elif method == "ljust":
-            if len(node.args) == 1:
-                w = self._emit_expr_value(node.args[0])
-                return self._rt_call("str_ljust", [obj, w])
-            if len(node.args) == 2:
-                w = self._emit_expr_value(node.args[0])
-                fill = self._emit_expr_value(node.args[1])
-                return self._rt_call("str_ljust_fill", [obj, w, fill])
-        elif method == "rjust":
-            if len(node.args) == 1:
-                w = self._emit_expr_value(node.args[0])
-                return self._rt_call("str_rjust", [obj, w])
-            if len(node.args) == 2:
-                w = self._emit_expr_value(node.args[0])
-                fill = self._emit_expr_value(node.args[1])
-                return self._rt_call("str_rjust_fill", [obj, w, fill])
-        elif method == "isupper":
-            if len(node.args) == 0:
-                return self._rt_call("str_isupper", [obj])
-        elif method == "islower":
-            if len(node.args) == 0:
-                return self._rt_call("str_islower", [obj])
-        elif method == "istitle":
-            if len(node.args) == 0:
-                return self._rt_call("str_istitle", [obj])
-        elif method == "isidentifier":
-            if len(node.args) == 0:
-                return self._rt_call("str_isidentifier", [obj])
-        elif method == "isprintable":
-            if len(node.args) == 0:
-                return self._rt_call("str_isprintable", [obj])
-        elif method == "isdecimal":
-            if len(node.args) == 0:
-                return self._rt_call("str_isdecimal", [obj])
-        elif method == "isnumeric":
-            if len(node.args) == 0:
-                return self._rt_call("str_isnumeric", [obj])
-        elif method == "casefold":
-            if len(node.args) == 0:
-                return self._rt_call("str_casefold", [obj])
-        elif method == "expandtabs":
-            if len(node.args) == 0:
-                return self._rt_call("str_expandtabs",
-                                      [obj, ir.Constant(i64, 8)])
-            if len(node.args) == 1:
-                ts = self._emit_expr_value(node.args[0])
-                return self._rt_call("str_expandtabs", [obj, ts])
-        elif method == "partition":
-            if len(node.args) == 1:
-                sep = self._emit_expr_value(node.args[0])
-                return self._rt_call("str_partition", [obj, sep])
-        elif method == "rpartition":
-            if len(node.args) == 1:
-                sep = self._emit_expr_value(node.args[0])
-                return self._rt_call("str_rpartition", [obj, sep])
-        elif method == "zfill":
-            if len(node.args) == 1:
-                w = self._emit_expr_value(node.args[0])
-                return self._rt_call("str_zfill", [obj, w])
-        elif method == "splitlines":
-            return self._rt_call("str_splitlines", [obj])
-        elif method == "split":
-            if len(node.args) == 2:
-                sep = self._emit_expr_value(node.args[0])
-                maxsplit = self._emit_expr_value(node.args[1])
-                return self._rt_call("str_split_max", [obj, sep, maxsplit])
-            if len(node.args) == 1:
-                sep = self._emit_expr_value(node.args[0])
-                return self._rt_call("str_split_max", [obj, sep, ir.Constant(i64, -1)])
-            return self._rt_call("str_split", [obj])
-        elif method == "rsplit":
-            if len(node.args) == 2:
-                sep = self._emit_expr_value(node.args[0])
-                maxsplit = self._emit_expr_value(node.args[1])
-                return self._rt_call("str_rsplit", [obj, sep, maxsplit])
-            if len(node.args) == 1:
-                sep = self._emit_expr_value(node.args[0])
-                return self._rt_call("str_rsplit",
-                                      [obj, sep, ir.Constant(i64, -1)])
-            return self._rt_call("str_rsplit_ws", [obj])
-        elif method == "join":
-            if len(node.args) == 1:
-                lst = self._emit_expr_value(node.args[0])
-                return self._rt_call("str_join", [obj, lst])
-        elif method == "replace":
-            if len(node.args) == 3:
-                old = self._emit_expr_value(node.args[0])
-                new = self._emit_expr_value(node.args[1])
-                count = self._emit_expr_value(node.args[2])
-                return self._rt_call("str_replace_count",
-                                      [obj, old, new, count])
-            if len(node.args) == 2:
-                old = self._emit_expr_value(node.args[0])
-                new = self._emit_expr_value(node.args[1])
-                return self._rt_call("str_replace", [obj, old, new])
-        elif method == "startswith":
-            if len(node.args) == 1:
-                arg = node.args[0]
-                val = self._emit_expr_value(arg)
-                # Check if arg is a tuple → tuple version
-                if self._is_tuple_expr(arg) or self._is_list_expr(arg):
-                    return self._rt_call("str_startswith_tuple", [obj, val])
-                return self._rt_call("str_startswith", [obj, val])
-            if len(node.args) == 2:
-                prefix = self._emit_expr_value(node.args[0])
-                start = self._emit_expr_value(node.args[1])
-                slen = self._rt_call("str_len", [obj])
-                return self._rt_call("str_startswith_range",
-                                     [obj, prefix, start, slen])
-            if len(node.args) == 3:
-                prefix = self._emit_expr_value(node.args[0])
-                start = self._emit_expr_value(node.args[1])
-                end = self._emit_expr_value(node.args[2])
-                return self._rt_call("str_startswith_range",
-                                     [obj, prefix, start, end])
-        elif method == "endswith":
-            if len(node.args) == 1:
-                arg = node.args[0]
-                val = self._emit_expr_value(arg)
-                if self._is_tuple_expr(arg) or self._is_list_expr(arg):
-                    return self._rt_call("str_endswith_tuple", [obj, val])
-                return self._rt_call("str_endswith", [obj, val])
-            if len(node.args) == 2:
-                suffix = self._emit_expr_value(node.args[0])
-                start = self._emit_expr_value(node.args[1])
-                slen = self._rt_call("str_len", [obj])
-                return self._rt_call("str_endswith_range",
-                                     [obj, suffix, start, slen])
-            if len(node.args) == 3:
-                suffix = self._emit_expr_value(node.args[0])
-                start = self._emit_expr_value(node.args[1])
-                end = self._emit_expr_value(node.args[2])
-                return self._rt_call("str_endswith_range",
-                                     [obj, suffix, start, end])
-        elif method == "removeprefix":
-            if len(node.args) == 1:
-                prefix = self._emit_expr_value(node.args[0])
-                return self._rt_call("str_removeprefix", [obj, prefix])
-        elif method == "removesuffix":
-            if len(node.args) == 1:
-                suffix = self._emit_expr_value(node.args[0])
-                return self._rt_call("str_removesuffix", [obj, suffix])
-        elif method == "find":
-            if len(node.args) == 1:
-                sub = self._emit_expr_value(node.args[0])
-                return self._rt_call("str_find", [obj, sub])
-            if len(node.args) == 2:
-                sub = self._emit_expr_value(node.args[0])
-                start = self._emit_expr_value(node.args[1])
-                slen = self._rt_call("str_len", [obj])
-                return self._rt_call("str_find_range",
-                                     [obj, sub, start, slen])
-            if len(node.args) == 3:
-                sub = self._emit_expr_value(node.args[0])
-                start = self._emit_expr_value(node.args[1])
-                end = self._emit_expr_value(node.args[2])
-                return self._rt_call("str_find_range",
-                                     [obj, sub, start, end])
-        elif method == "rfind":
-            if len(node.args) == 1:
-                sub = self._emit_expr_value(node.args[0])
-                return self._rt_call("str_rfind", [obj, sub])
-            if len(node.args) == 2:
-                sub = self._emit_expr_value(node.args[0])
-                start = self._emit_expr_value(node.args[1])
-                slen = self._rt_call("str_len", [obj])
-                return self._rt_call("str_rfind_range",
-                                     [obj, sub, start, slen])
-            if len(node.args) == 3:
-                sub = self._emit_expr_value(node.args[0])
-                start = self._emit_expr_value(node.args[1])
-                end = self._emit_expr_value(node.args[2])
-                return self._rt_call("str_rfind_range",
-                                     [obj, sub, start, end])
-        elif method == "index":
-            if len(node.args) == 1:
-                sub = self._emit_expr_value(node.args[0])
-                return self._rt_call("str_index_sub", [obj, sub])
-            if len(node.args) == 2:
-                sub = self._emit_expr_value(node.args[0])
-                start = self._emit_expr_value(node.args[1])
-                slen = self._rt_call("str_len", [obj])
-                return self._rt_call("str_index_sub_range",
-                                     [obj, sub, start, slen])
-            if len(node.args) == 3:
-                sub = self._emit_expr_value(node.args[0])
-                start = self._emit_expr_value(node.args[1])
-                end = self._emit_expr_value(node.args[2])
-                return self._rt_call("str_index_sub_range",
-                                     [obj, sub, start, end])
-        elif method == "rindex":
-            if len(node.args) == 1:
-                sub = self._emit_expr_value(node.args[0])
-                return self._rt_call("str_rindex_sub", [obj, sub])
-            if len(node.args) == 2:
-                sub = self._emit_expr_value(node.args[0])
-                start = self._emit_expr_value(node.args[1])
-                slen = self._rt_call("str_len", [obj])
-                return self._rt_call("str_rindex_sub_range",
-                                     [obj, sub, start, slen])
-            if len(node.args) == 3:
-                sub = self._emit_expr_value(node.args[0])
-                start = self._emit_expr_value(node.args[1])
-                end = self._emit_expr_value(node.args[2])
-                return self._rt_call("str_rindex_sub_range",
-                                     [obj, sub, start, end])
-        elif method == "count":
-            if len(node.args) == 1:
-                sub = self._emit_expr_value(node.args[0])
-                return self._rt_call("str_count", [obj, sub])
-            if len(node.args) == 2:
-                sub = self._emit_expr_value(node.args[0])
-                start = self._emit_expr_value(node.args[1])
-                slen = self._rt_call("str_len", [obj])
-                return self._rt_call("str_count_range",
-                                     [obj, sub, start, slen])
-            if len(node.args) == 3:
-                sub = self._emit_expr_value(node.args[0])
-                start = self._emit_expr_value(node.args[1])
-                end = self._emit_expr_value(node.args[2])
-                return self._rt_call("str_count_range",
-                                     [obj, sub, start, end])
-        elif method == "format":
-            return self._emit_str_format(node, obj)
-        elif method == "translate":
-            if len(node.args) == 1:
-                table = self._emit_expr_value(node.args[0])
-                return self._rt_call("str_translate", [obj, table])
-        elif method == "encode":
-            # str.encode() → bytes (same UTF-8 content, tagged as BYTES)
-            return self._rt_call("str_encode", [obj])
-        # bytes methods
+        entry = self._STR_METHOD_DISPATCH.get(method)
+        if entry is None:
+            return None
+        if isinstance(entry, str):
+            return getattr(self, entry)(node, obj)
+        # Data entry: (rt_func,) or (rt_func, nargs)
+        rt_func = entry[0]
+        if len(entry) > 1:
+            nargs = entry[1]
+            if len(node.args) != nargs:
+                return None
+            args = [obj] + [self._emit_expr_value(node.args[i])
+                            for i in range(nargs)]
+        else:
+            args = [obj]
+        return self._rt_call(rt_func, args)
+
+    # ---- String method handlers (B3) ----
+
+    def _emit_str_method_strip(self, node, obj):
+        if len(node.args) == 1:
+            chars = self._emit_expr_value(node.args[0])
+            return self._rt_call("str_strip_chars", [obj, chars])
+        return self._rt_call("str_strip", [obj])
+
+    def _emit_str_method_lstrip(self, node, obj):
+        if len(node.args) == 1:
+            chars = self._emit_expr_value(node.args[0])
+            return self._rt_call("str_lstrip_chars", [obj, chars])
+        return self._rt_call("str_lstrip", [obj])
+
+    def _emit_str_method_rstrip(self, node, obj):
+        if len(node.args) == 1:
+            chars = self._emit_expr_value(node.args[0])
+            return self._rt_call("str_rstrip_chars", [obj, chars])
+        return self._rt_call("str_rstrip", [obj])
+
+    def _emit_str_method_center(self, node, obj):
+        if len(node.args) == 1:
+            w = self._emit_expr_value(node.args[0])
+            return self._rt_call("str_center", [obj, w])
+        if len(node.args) == 2:
+            w = self._emit_expr_value(node.args[0])
+            fill = self._emit_expr_value(node.args[1])
+            return self._rt_call("str_center_fill", [obj, w, fill])
+        return None
+
+    def _emit_str_method_ljust(self, node, obj):
+        if len(node.args) == 1:
+            w = self._emit_expr_value(node.args[0])
+            return self._rt_call("str_ljust", [obj, w])
+        if len(node.args) == 2:
+            w = self._emit_expr_value(node.args[0])
+            fill = self._emit_expr_value(node.args[1])
+            return self._rt_call("str_ljust_fill", [obj, w, fill])
+        return None
+
+    def _emit_str_method_rjust(self, node, obj):
+        if len(node.args) == 1:
+            w = self._emit_expr_value(node.args[0])
+            return self._rt_call("str_rjust", [obj, w])
+        if len(node.args) == 2:
+            w = self._emit_expr_value(node.args[0])
+            fill = self._emit_expr_value(node.args[1])
+            return self._rt_call("str_rjust_fill", [obj, w, fill])
+        return None
+
+    def _emit_str_method_expandtabs(self, node, obj):
+        if len(node.args) == 0:
+            return self._rt_call("str_expandtabs",
+                                  [obj, ir.Constant(i64, 8)])
+        if len(node.args) == 1:
+            ts = self._emit_expr_value(node.args[0])
+            return self._rt_call("str_expandtabs", [obj, ts])
+        return None
+
+    def _emit_str_method_split(self, node, obj):
+        if len(node.args) == 2:
+            sep = self._emit_expr_value(node.args[0])
+            maxsplit = self._emit_expr_value(node.args[1])
+            return self._rt_call("str_split_max", [obj, sep, maxsplit])
+        if len(node.args) == 1:
+            sep = self._emit_expr_value(node.args[0])
+            return self._rt_call("str_split_max",
+                                  [obj, sep, ir.Constant(i64, -1)])
+        return self._rt_call("str_split", [obj])
+
+    def _emit_str_method_rsplit(self, node, obj):
+        if len(node.args) == 2:
+            sep = self._emit_expr_value(node.args[0])
+            maxsplit = self._emit_expr_value(node.args[1])
+            return self._rt_call("str_rsplit", [obj, sep, maxsplit])
+        if len(node.args) == 1:
+            sep = self._emit_expr_value(node.args[0])
+            return self._rt_call("str_rsplit",
+                                  [obj, sep, ir.Constant(i64, -1)])
+        return self._rt_call("str_rsplit_ws", [obj])
+
+    def _emit_str_method_replace(self, node, obj):
+        if len(node.args) == 3:
+            old = self._emit_expr_value(node.args[0])
+            new = self._emit_expr_value(node.args[1])
+            count = self._emit_expr_value(node.args[2])
+            return self._rt_call("str_replace_count",
+                                  [obj, old, new, count])
+        if len(node.args) == 2:
+            old = self._emit_expr_value(node.args[0])
+            new = self._emit_expr_value(node.args[1])
+            return self._rt_call("str_replace", [obj, old, new])
+        return None
+
+    def _emit_str_method_startswith(self, node, obj):
+        if len(node.args) == 1:
+            arg = node.args[0]
+            val = self._emit_expr_value(arg)
+            if self._is_tuple_expr(arg) or self._is_list_expr(arg):
+                return self._rt_call("str_startswith_tuple", [obj, val])
+            return self._rt_call("str_startswith", [obj, val])
+        if len(node.args) == 2:
+            prefix = self._emit_expr_value(node.args[0])
+            start = self._emit_expr_value(node.args[1])
+            slen = self._rt_call("str_len", [obj])
+            return self._rt_call("str_startswith_range",
+                                 [obj, prefix, start, slen])
+        if len(node.args) == 3:
+            prefix = self._emit_expr_value(node.args[0])
+            start = self._emit_expr_value(node.args[1])
+            end = self._emit_expr_value(node.args[2])
+            return self._rt_call("str_startswith_range",
+                                 [obj, prefix, start, end])
+        return None
+
+    def _emit_str_method_endswith(self, node, obj):
+        if len(node.args) == 1:
+            arg = node.args[0]
+            val = self._emit_expr_value(arg)
+            if self._is_tuple_expr(arg) or self._is_list_expr(arg):
+                return self._rt_call("str_endswith_tuple", [obj, val])
+            return self._rt_call("str_endswith", [obj, val])
+        if len(node.args) == 2:
+            suffix = self._emit_expr_value(node.args[0])
+            start = self._emit_expr_value(node.args[1])
+            slen = self._rt_call("str_len", [obj])
+            return self._rt_call("str_endswith_range",
+                                 [obj, suffix, start, slen])
+        if len(node.args) == 3:
+            suffix = self._emit_expr_value(node.args[0])
+            start = self._emit_expr_value(node.args[1])
+            end = self._emit_expr_value(node.args[2])
+            return self._rt_call("str_endswith_range",
+                                 [obj, suffix, start, end])
+        return None
+
+    def _emit_str_method_find(self, node, obj):
+        if len(node.args) == 1:
+            sub = self._emit_expr_value(node.args[0])
+            return self._rt_call("str_find", [obj, sub])
+        if len(node.args) == 2:
+            sub = self._emit_expr_value(node.args[0])
+            start = self._emit_expr_value(node.args[1])
+            slen = self._rt_call("str_len", [obj])
+            return self._rt_call("str_find_range",
+                                 [obj, sub, start, slen])
+        if len(node.args) == 3:
+            sub = self._emit_expr_value(node.args[0])
+            start = self._emit_expr_value(node.args[1])
+            end = self._emit_expr_value(node.args[2])
+            return self._rt_call("str_find_range",
+                                 [obj, sub, start, end])
+        return None
+
+    def _emit_str_method_rfind(self, node, obj):
+        if len(node.args) == 1:
+            sub = self._emit_expr_value(node.args[0])
+            return self._rt_call("str_rfind", [obj, sub])
+        if len(node.args) == 2:
+            sub = self._emit_expr_value(node.args[0])
+            start = self._emit_expr_value(node.args[1])
+            slen = self._rt_call("str_len", [obj])
+            return self._rt_call("str_rfind_range",
+                                 [obj, sub, start, slen])
+        if len(node.args) == 3:
+            sub = self._emit_expr_value(node.args[0])
+            start = self._emit_expr_value(node.args[1])
+            end = self._emit_expr_value(node.args[2])
+            return self._rt_call("str_rfind_range",
+                                 [obj, sub, start, end])
+        return None
+
+    def _emit_str_method_index(self, node, obj):
+        if len(node.args) == 1:
+            sub = self._emit_expr_value(node.args[0])
+            return self._rt_call("str_index_sub", [obj, sub])
+        if len(node.args) == 2:
+            sub = self._emit_expr_value(node.args[0])
+            start = self._emit_expr_value(node.args[1])
+            slen = self._rt_call("str_len", [obj])
+            return self._rt_call("str_index_sub_range",
+                                 [obj, sub, start, slen])
+        if len(node.args) == 3:
+            sub = self._emit_expr_value(node.args[0])
+            start = self._emit_expr_value(node.args[1])
+            end = self._emit_expr_value(node.args[2])
+            return self._rt_call("str_index_sub_range",
+                                 [obj, sub, start, end])
+        return None
+
+    def _emit_str_method_rindex(self, node, obj):
+        if len(node.args) == 1:
+            sub = self._emit_expr_value(node.args[0])
+            return self._rt_call("str_rindex_sub", [obj, sub])
+        if len(node.args) == 2:
+            sub = self._emit_expr_value(node.args[0])
+            start = self._emit_expr_value(node.args[1])
+            slen = self._rt_call("str_len", [obj])
+            return self._rt_call("str_rindex_sub_range",
+                                 [obj, sub, start, slen])
+        if len(node.args) == 3:
+            sub = self._emit_expr_value(node.args[0])
+            start = self._emit_expr_value(node.args[1])
+            end = self._emit_expr_value(node.args[2])
+            return self._rt_call("str_rindex_sub_range",
+                                 [obj, sub, start, end])
+        return None
+
+    def _emit_str_method_count(self, node, obj):
+        if len(node.args) == 1:
+            sub = self._emit_expr_value(node.args[0])
+            return self._rt_call("str_count", [obj, sub])
+        if len(node.args) == 2:
+            sub = self._emit_expr_value(node.args[0])
+            start = self._emit_expr_value(node.args[1])
+            slen = self._rt_call("str_len", [obj])
+            return self._rt_call("str_count_range",
+                                 [obj, sub, start, slen])
+        if len(node.args) == 3:
+            sub = self._emit_expr_value(node.args[0])
+            start = self._emit_expr_value(node.args[1])
+            end = self._emit_expr_value(node.args[2])
+            return self._rt_call("str_count_range",
+                                 [obj, sub, start, end])
         return None
 
     def _emit_method_call_bytes(self, node, obj):
