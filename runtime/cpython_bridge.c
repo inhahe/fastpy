@@ -1070,15 +1070,14 @@ void* fastpy_path_cwd(void) {
 
 void* fastpy_path_join(void *self, void *other) {
     fpy_cpython_init();
-    /* Try Path / other (truediv). If other is a C string, wrap first. */
-    PyObject *r = PyNumber_TrueDivide((PyObject*)self, (PyObject*)other);
-    if (!r) {
-        PyErr_Clear();
-        PyObject *ostr = PyUnicode_FromString((const char*)other);
-        if (!ostr) { bridge_propagate_exception(); return NULL; }
-        r = PyNumber_TrueDivide((PyObject*)self, ostr);
-        Py_DECREF(ostr);
-    }
+    /* other is a C string from compiled code — wrap to PyUnicode first.
+     * The old code tried PyNumber_TrueDivide(self, (PyObject*)other)
+     * directly, but passing a raw const char* as a PyObject* causes
+     * hangs or segfaults when CPython tries to read ob_type. */
+    PyObject *ostr = PyUnicode_FromString((const char*)other);
+    if (!ostr) { bridge_propagate_exception(); return NULL; }
+    PyObject *r = PyNumber_TrueDivide((PyObject*)self, ostr);
+    Py_DECREF(ostr);
     if (!r) { bridge_propagate_exception(); return NULL; }
     return (void*)r;
 }

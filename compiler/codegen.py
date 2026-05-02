@@ -12684,8 +12684,25 @@ class CodeGen:
                 and value.type == fpy_val
                 and len(node.targets) == 1
                 and isinstance(node.targets[0], ast.Name)):
+            # Bridge import call (e.g. t = Template(...) inside a function
+            # where Template is from `from django.template import Template`):
+            # tag as PYOBJ so downstream method calls (t.render(...)) route
+            # through the CPython bridge instead of the native method path.
+            _bridge = getattr(self, '_bridge_imports', {})
+            _is_bridge_rhs = (isinstance(node.value, ast.Call)
+                              and isinstance(node.value.func, ast.Name)
+                              and node.value.func.id in _bridge)
+            # Method call on a pyobj receiver (e.g. out = t.render(ctx)
+            # where t is a bridge object): result is also PYOBJ.
+            _is_pyobj_method = (not _is_bridge_rhs
+                                and isinstance(node.value, ast.Call)
+                                and isinstance(node.value.func, ast.Attribute)
+                                and self._is_pyobj_receiver(
+                                    node.value.func.value))
+            _vkind = (VKind.PYOBJ if (_is_bridge_rhs or _is_pyobj_method)
+                      else VKind.FVALUE)
             self._store_variable(node.targets[0].id, value,
-                                 ValueType(VKind.FVALUE))
+                                 ValueType(_vkind))
             return
 
         type_tag = self._infer_type_tag(node.value, value)
@@ -15904,6 +15921,10 @@ class CodeGen:
             return tag
         return ValueType.from_old_tag(str(tag)).kind
 
+    def _has_var(self, name: str) -> bool:
+        """Check if a variable exists in any scope (locals or globals)."""
+        return name in self.variables or name in self._global_vars
+
     def _var_kind(self, name: str) -> VKind:
         """Get the VKind for a variable. Returns UNKNOWN if not found.
 
@@ -16359,6 +16380,8 @@ class CodeGen:
             if kind in (VKind.LIST, VKind.TUPLE):
                 return self._fv_from_list(value)
             if kind == VKind.PYOBJ:
+                return self._fv_from_obj(value)
+            if kind == VKind.PATH:
                 return self._fv_from_obj(value)
             if kind == VKind.CLOSURE:
                 return self._fv_from_obj(value)
@@ -21265,7 +21288,7 @@ class CodeGen:
             # Native module call (asyncio.run, json.dumps, etc.)
             if isinstance(node.func.value, ast.Name):
                 _nm = node.func.value.id
-                _is_native = ((_nm in self.variables
+                _is_native = ((self._has_var(_nm)
                               and self._var_kind(_nm) == VKind.PYOBJ)
                              or _nm in getattr(self, '_native_modules', set()))
                 if _is_native:
@@ -23012,7 +23035,7 @@ class CodeGen:
         if (isinstance(node, ast.Attribute)
                 and isinstance(node.value, ast.Name)):
             _nm = node.value.id
-            _is_native = ((_nm in self.variables
+            _is_native = ((self._has_var(_nm)
                           and self._var_kind(_nm) in (
                               VKind.PYOBJ, VKind.NATIVE_MOD))
                          or _nm in getattr(self, '_native_modules', set()))
@@ -23038,7 +23061,7 @@ class CodeGen:
                 and isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)):
             _nm = node.func.value.id
-            _is_native = ((_nm in self.variables
+            _is_native = ((self._has_var(_nm)
                           and self._var_kind(_nm) == VKind.PYOBJ)
                          or _nm in getattr(self, '_native_modules', set()))
             if _is_native:
@@ -23649,7 +23672,8 @@ class CodeGen:
         """Check if a receiver expression is a pyobj (bridge object).
         Handles: name, name.attr, name[key], call(...).attr, etc."""
         # Direct variable: qs where qs is pyobj (or native module needing bridge)
-        if isinstance(node, ast.Name) and node.id in self.variables:
+        # Check both local scope and globals — bridge imports land in globals.
+        if isinstance(node, ast.Name) and self._has_var(node.id):
             return self._var_kind(node.id) in (VKind.PYOBJ, VKind.NATIVE_MOD)
         # Attribute on pyobj: User.objects where User is pyobj
         if isinstance(node, ast.Attribute):
@@ -25911,7 +25935,7 @@ class CodeGen:
             # Native module attribute (e.g. math.pi): return constant
             if isinstance(node.value, ast.Name):
                 _nm = node.value.id
-                _is_native = ((_nm in self.variables
+                _is_native = ((self._has_var(_nm)
                               and self._var_kind(_nm) == VKind.PYOBJ)
                              or _nm in getattr(self, '_native_modules', set()))
                 if _is_native:
@@ -27287,7 +27311,7 @@ class CodeGen:
         if (isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)):
             _nm = node.func.value.id
-            _is_native = ((_nm in self.variables
+            _is_native = ((self._has_var(_nm)
                           and self._var_kind(_nm) == VKind.PYOBJ)
                          or _nm in getattr(self, '_native_modules', set()))
             if _is_native:
@@ -27305,7 +27329,7 @@ class CodeGen:
             _nm = node.func.value.value.id
             _sub = node.func.value.attr
             _fn = node.func.attr
-            _is_native = ((_nm in self.variables
+            _is_native = ((self._has_var(_nm)
                           and self._var_kind(_nm) == VKind.PYOBJ)
                          or _nm in getattr(self, '_native_modules', set()))
             if _is_native:
@@ -27488,19 +27512,12 @@ class CodeGen:
             receiver_is_pyobj = self._is_pyobj_receiver(node.func.value)
             if receiver_is_pyobj:
                 fv = self._emit_cpython_method_call(node)
-                # Unwrap the FpyValue to a bare type based on the tag
-                tag = self.builder.extract_value(fv, 0)
-                data = self.builder.extract_value(fv, 1)
-                # For expression context, return the data as the most
-                # likely type. Check tag at runtime for float vs int.
-                is_float = self.builder.icmp_signed(
-                    "==", tag, ir.Constant(i32, FPY_TAG_FLOAT))
-                float_val = self.builder.bitcast(data, double)
-                int_val = data
-                # If the caller needs a specific type, they'll cast.
-                # Default: return as double if float, else i64.
-                return self.builder.select(
-                    is_float, self.builder.bitcast(float_val, i64), int_val)
+                # Return the full FpyValue so the runtime tag is preserved.
+                # Callers that need a bare type (print, assignment, len, etc.)
+                # can dispatch on the tag.  The old code stripped the tag and
+                # returned raw i64 — wrong for STR/LIST/DICT results from
+                # bridge method calls like platform.system() or t.render(ctx).
+                return fv
             return self._emit_method_call(node)
         # Direct pyobj call: func(args) where func is pyobj-tagged
         if (isinstance(node.func, ast.Name)
