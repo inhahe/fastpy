@@ -10636,9 +10636,22 @@ class CodeGen:
                         and parent_name != "type"
                         and parent_name not in ("object",)
                         and _sig_override is None):
-                    # Check if the base is a known imported name
-                    if (parent_name in getattr(self, 'variables', {})
-                            and self._tag_kind(self.variables.get(parent_name, (None, None))[1]) == VKind.PYOBJ):
+                    # Check if the base is a known imported name.
+                    # Three sources: (a) variables already populated with
+                    # PYOBJ tag, (b) _bridge_imports from the pre-scan
+                    # (available before variables are populated),
+                    # (c) _native_imports from bridge-only modules (e.g.,
+                    # "from enum import Enum" — enum is in _NATIVE_MODULES
+                    # but _BRIDGE_ONLY_MODULES, so Enum must inherit via bridge).
+                    _ni = getattr(self, '_native_imports', {})
+                    _is_bridge_base = (
+                        (parent_name in getattr(self, 'variables', {})
+                         and self._tag_kind(self.variables.get(parent_name, (None, None))[1]) == VKind.PYOBJ)
+                        or parent_name in getattr(self, '_bridge_imports', {})
+                        or (parent_name in _ni
+                            and _ni[parent_name][0] in self._BRIDGE_ONLY_MODULES)
+                    )
+                    if _is_bridge_base:
                         if not hasattr(self, '_cpython_classes'):
                             self._cpython_classes = set()
                         self._cpython_classes.add(node.name)
@@ -12754,6 +12767,32 @@ class CodeGen:
                     return
 
         value = self._emit_expr_value(node.value)
+
+        # Track namedtuple type assignments: P = namedtuple("P", ["x", "y"])
+        # The namedtuple() call sets _last_namedtuple_info; we connect it
+        # to the target variable name so P(3, 4) can be intercepted later.
+        _nt_info = getattr(self, '_last_namedtuple_info', None)
+        if _nt_info is not None:
+            self._last_namedtuple_info = None
+            if (len(node.targets) == 1
+                    and isinstance(node.targets[0], ast.Name)):
+                var_name = node.targets[0].id
+                if not hasattr(self, '_namedtuple_types'):
+                    self._namedtuple_types = {}
+                self._namedtuple_types[var_name] = _nt_info
+
+        # Track namedtuple instance assignments: p = P(3, 4)
+        # _emit_namedtuple_construct sets _last_namedtuple_construct_info;
+        # we connect it to the target variable so p.x resolves to p[0].
+        _nt_construct = getattr(self, '_last_namedtuple_construct_info', None)
+        if _nt_construct is not None:
+            self._last_namedtuple_construct_info = None
+            if (len(node.targets) == 1
+                    and isinstance(node.targets[0], ast.Name)):
+                var_name = node.targets[0].id
+                if not hasattr(self, '_namedtuple_instances'):
+                    self._namedtuple_instances = {}
+                self._namedtuple_instances[var_name] = _nt_construct
 
         # FpyValue struct with runtime tag: store directly
         if (isinstance(value.type, ir.LiteralStructType)
@@ -25943,6 +25982,26 @@ class CodeGen:
                 # Fallback: static type analysis
                 display = self._static_type_of(arg_node)
                 return self._make_string_constant(display)
+            # Namedtuple field access: p.x → p[index]
+            # Must come before native module check because the namedtuple
+            # variable is a plain local, not a pyobj or native module.
+            if isinstance(node.value, ast.Name):
+                _nt_instances = getattr(self, '_namedtuple_instances', {})
+                _nt_info = _nt_instances.get(node.value.id)
+                if _nt_info is not None and node.attr in _nt_info["fields"]:
+                    idx = _nt_info["fields"].index(node.attr)
+                    tup = self._emit_expr_value(node.value)
+                    tup = self._ensure_ptr(tup)
+                    tag_slot = self._create_entry_alloca(
+                        i32, f"nt.{node.attr}.tag")
+                    data_slot = self._create_entry_alloca(
+                        i64, f"nt.{node.attr}.data")
+                    self._rt_call("list_get_fv", [
+                        tup, ir.Constant(i64, idx),
+                        tag_slot, data_slot])
+                    tag = self.builder.load(tag_slot)
+                    data = self.builder.load(data_slot)
+                    return self._fv_build_from_slots(tag, data)
             # Native module attribute (e.g. math.pi): return constant
             if isinstance(node.value, ast.Name):
                 _nm = node.value.id
@@ -27285,6 +27344,11 @@ class CodeGen:
 
     def _emit_call_expr(self, node: ast.Call) -> ir.Value:
         """Emit a function call as an expression (return value is used)."""
+        # Namedtuple instance construction: P(3, 4) where P = namedtuple(...)
+        if isinstance(node.func, ast.Name):
+            _nt = getattr(self, '_namedtuple_types', {}).get(node.func.id)
+            if _nt is not None:
+                return self._emit_namedtuple_construct(node, _nt)
         # Rewrite bound-method aliases: f = lst.pop → f(0) becomes lst.pop(0)
         _bm_rewrite = self._rewrite_bound_method(node)
         if _bm_rewrite is not None:
@@ -28150,6 +28214,37 @@ class CodeGen:
     _DEFAULTDICT_FACTORY = {
         "list": 0, "int": 1, "str": 2, "float": 3, "dict": 4,
     }
+
+    def _emit_namedtuple_construct(self, node: ast.Call,
+                                     nt_info: dict) -> ir.Value:
+        """Emit namedtuple instance construction: P(val1, val2, ...).
+
+        Creates a new tuple via namedtuple_new and populates its fields
+        from the call arguments.  Field count is validated against the
+        type definition; excess/missing args are silently handled (the
+        runtime sets missing fields to None, excess are ignored).
+        """
+        fields = nt_info["fields"]
+        n_fields = len(fields)
+        # Load the type_id from the variable
+        type_id = self._emit_expr_value(node.func)
+        if isinstance(type_id.type, ir.IntType) and type_id.type.width == 64:
+            type_id = self.builder.trunc(type_id, i32)
+        # Create the tuple with namedtuple_new(type_id, n_fields)
+        tup = self.builder.call(
+            self.runtime["namedtuple_new"],
+            [type_id, ir.Constant(i32, n_fields)])
+        # Append each field value to the tuple
+        for i, arg in enumerate(node.args[:n_fields]):
+            val = self._emit_expr_value(arg)
+            tag, data = self._bare_to_tag_data(val, arg)
+            self.builder.call(
+                self.runtime["list_append_fv"],
+                [tup, ir.Constant(i32, tag), data])
+        # Mark for instance tracking (picked up by _emit_assign)
+        self._last_namedtuple_construct_info = nt_info
+        # Wrap as FpyValue(LIST) — tuples use the list tag
+        return self._fv_from_list(tup)
 
     def _emit_collections_call(self, func_name: str, node: ast.Call) -> ir.Value | None:
         """Emit a collections module constructor/function call."""
