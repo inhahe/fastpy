@@ -11691,7 +11691,12 @@ class CodeGen:
                 ptr_val = self._ensure_ptr(param)
                 tag = "obj"
                 bare = ptr_val
-            elif pname in obj_params and isinstance(param.type, ir.IntType):
+            elif (pname in obj_params and isinstance(param.type, ir.IntType)
+                  and (call_tag is None or self._tag_kind(call_tag).is_ptr)):
+                # Only force "obj" tag when call-site analysis doesn't
+                # indicate a concrete scalar type. When call_tag is "int"
+                # (or float/bool), the param truly carries scalars and must
+                # NOT be reinterpreted as a pointer (inttoptr would crash).
                 ptr_val = self._ensure_ptr(param)
                 tag = "obj"
                 bare = ptr_val
@@ -13864,6 +13869,9 @@ class CodeGen:
                     fv = self.builder.load(alloca_var, name=f"{value_node.id}.fv")
                     tag_val = self.builder.extract_value(fv, 0)
                     data_val = self.builder.extract_value(fv, 1)
+                    # Decref old slot value before overwriting.
+                    old_tag, old_data = self._emit_slot_get_direct(
+                        obj, slot_idx)
                     # Incref the value being stored — the variable's
                     # alloca holds a borrowed reference; the slot needs
                     # its own.  rc_incref is a no-op for scalars (INT,
@@ -13872,6 +13880,11 @@ class CodeGen:
                                       [tag_val, data_val])
                     self._emit_slot_set_direct(
                         obj, slot_idx, tag_val, data_val)
+                    # Decref old after store (safe order: incref-new →
+                    # store → decref-old avoids premature free when
+                    # old and new are the same object).
+                    self.builder.call(self.runtime["rc_decref"],
+                                      [old_tag, old_data])
                     return
 
         # Runtime-tag-preserving path for attribute-to-attribute stores:
@@ -13902,13 +13915,24 @@ class CodeGen:
                 src_slot = self._get_attr_slot(value_node)
                 tgt_slot = self._get_attr_slot(target)
                 if src_slot is not None and tgt_slot is not None:
-                    # Both slots known — direct copy
+                    # Both slots known — direct copy with refcounting.
                     rhs_obj = self._emit_expr_value(value_node.value)
                     rhs_obj = self._ensure_ptr(rhs_obj)
                     tag_val, data_val = self._emit_slot_get_direct(
                         rhs_obj, src_slot)
+                    # Load old target value before overwriting.
+                    old_tag, old_data = self._emit_slot_get_direct(
+                        obj, tgt_slot)
+                    # Incref new value (slot needs its own reference).
+                    self.builder.call(self.runtime["rc_incref"],
+                                      [tag_val, data_val])
                     self._emit_slot_set_direct(
                         obj, tgt_slot, tag_val, data_val)
+                    # Decref old after store (safe order: incref-new →
+                    # store → decref-old avoids premature free when
+                    # old and new are the same object).
+                    self.builder.call(self.runtime["rc_decref"],
+                                      [old_tag, old_data])
                     return
                 else:
                     # Slot unknown (class not resolved) — use runtime
@@ -13926,8 +13950,14 @@ class CodeGen:
                     data_val = self.builder.load(_data_s)
                     tgt_slot2 = self._get_attr_slot(target)
                     if tgt_slot2 is not None:
+                        old_tag2, old_data2 = self._emit_slot_get_direct(
+                            obj, tgt_slot2)
+                        self.builder.call(self.runtime["rc_incref"],
+                                          [tag_val, data_val])
                         self._emit_slot_set_direct(
                             obj, tgt_slot2, tag_val, data_val)
+                        self.builder.call(self.runtime["rc_decref"],
+                                          [old_tag2, old_data2])
                     else:
                         self.builder.call(
                             self.runtime["obj_set_fv"],
@@ -25000,6 +25030,19 @@ class CodeGen:
                 return self._fv_build_from_slots(
                     self.builder.load(out_tag),
                     self.builder.load(out_data))
+            # Bitwise/shift ops on FpyValue: extract the i64 data and
+            # dispatch through _emit_int_binop.  This handles the common
+            # case where an earlier checked_* (BigInt-capable) arithmetic
+            # result feeds a bitwise/shift operator — the FpyValue struct
+            # must not reach cpython_binop (which treats it as PyObject*).
+            _BITWISE_OPS = (ast.BitAnd, ast.BitOr, ast.BitXor,
+                            ast.LShift, ast.RShift)
+            if op in _BITWISE_OPS:
+                l_i64 = (self.builder.extract_value(ltv.val, 1)
+                         if _l_is_fv else ltv.as_i64(self.builder))
+                r_i64 = (self.builder.extract_value(rtv.val, 1)
+                         if _r_is_fv else rtv.as_i64(self.builder))
+                return self._emit_int_binop(node.op, l_i64, r_i64, node)
 
         # ── Fast path: PYOBJ binary ops — dispatch to CPython ──────────
         if lk == VKind.PYOBJ or rk == VKind.PYOBJ:
@@ -25396,7 +25439,10 @@ class CodeGen:
         # No BigInt, no function calls — lets LLVM constant-fold, inline,
         # and vectorize exactly as C++ would.  Bare-ABI functions are
         # guaranteed to have only i64/double locals.
-        if self._current_fn_bare_abi:
+        # Exception: when _program_uses_bigint is True, the program contains
+        # values that could overflow i64 — must use checked arithmetic even
+        # in bare-ABI mode to avoid silent wraparound.
+        if self._current_fn_bare_abi and not self._program_uses_bigint:
             plain = {
                 ast.Add: self.builder.add,
                 ast.Sub: self.builder.sub,

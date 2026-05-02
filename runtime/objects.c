@@ -922,8 +922,23 @@ void fastpy_fv_binop(int32_t lt, int64_t ld, int32_t rt, int64_t rd,
             default: break;
         }
         if (result) {
-            *out_tag = FPY_TAG_BIGINT;
-            *out_data = (int64_t)(intptr_t)result;
+            /* Demote to INT if the result fits in i64 — this avoids
+             * leaving a BigInt pointer in the data field when
+             * downstream code (range, print, icmp) extracts it as
+             * a bare i64 integer. */
+            extern int fpy_bigint_fits_i64(FpyBigInt*);
+            extern int64_t fpy_bigint_to_i64(FpyBigInt*, int*);
+            extern void fpy_bigint_free(FpyBigInt*);
+            if (fpy_bigint_fits_i64(result)) {
+                int ov = 0;
+                int64_t iv = fpy_bigint_to_i64(result, &ov);
+                fpy_bigint_free(result);
+                *out_tag = FPY_TAG_INT;
+                *out_data = iv;
+            } else {
+                *out_tag = FPY_TAG_BIGINT;
+                *out_data = (int64_t)(intptr_t)result;
+            }
             return;
         }
         /* truediv falls through (BigInt / BigInt → float not implemented yet) */
@@ -979,14 +994,22 @@ void fastpy_fv_binop(int32_t lt, int64_t ld, int32_t rt, int64_t rd,
         *out_tag = FPY_TAG_NONE; *out_data = 0;
         return;
     }
-    /* Int/Bool arithmetic */
+    /* Int/Bool arithmetic — use overflow-checked add/sub/mul so that
+     * results that don't fit in i64 promote to BigInt instead of
+     * silently wrapping.  This matters when fv_binop is called on
+     * values that started as INT but could produce large results
+     * (e.g. LCG multipliers: v * 6364136223846793005). */
+    extern int64_t fpy_checked_add(int64_t, int64_t, FpyBigInt**);
+    extern int64_t fpy_checked_sub(int64_t, int64_t, FpyBigInt**);
+    extern int64_t fpy_checked_mul(int64_t, int64_t, FpyBigInt**);
     int64_t li = (lt == FPY_TAG_BOOL) ? (int64_t)(ld != 0) : ld;
     int64_t ri = (rt == FPY_TAG_BOOL) ? (int64_t)(rd != 0) : rd;
     int64_t result;
+    FpyBigInt *big = NULL;
     switch (op) {
-        case 0: result = li + ri; break;
-        case 1: result = li - ri; break;
-        case 2: result = li * ri; break;
+        case 0: result = fpy_checked_add(li, ri, &big); break;
+        case 1: result = fpy_checked_sub(li, ri, &big); break;
+        case 2: result = fpy_checked_mul(li, ri, &big); break;
         case 3: /* truediv returns float */ {
             double d = ri != 0 ? (double)li / (double)ri : 0.0;
             *out_tag = FPY_TAG_FLOAT;
@@ -997,8 +1020,13 @@ void fastpy_fv_binop(int32_t lt, int64_t ld, int32_t rt, int64_t rd,
         case 5: result = ri != 0 ? li % ri : 0; break;
         default: result = 0; break;
     }
-    *out_tag = FPY_TAG_INT;
-    *out_data = result;
+    if (big) {
+        *out_tag = FPY_TAG_BIGINT;
+        *out_data = (int64_t)(intptr_t)big;
+    } else {
+        *out_tag = FPY_TAG_INT;
+        *out_data = result;
+    }
 }
 
 void fpy_value_write(FpyValue val) {
