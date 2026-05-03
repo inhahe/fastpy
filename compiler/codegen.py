@@ -15246,6 +15246,11 @@ class CodeGen:
                 # Determine element type (default "int"; "float" for
                 # tuple-of-floats from user functions like colorsys).
                 elem_type = self._get_list_elem_type(value_node)
+                # For user functions returning tuples, analyze the return
+                # statement to get per-position types.  This correctly handles
+                # heterogeneous returns like `return 1, "hello", 3.14`.
+                _ret_pos_types = self._infer_tuple_return_pos_types(
+                    value_node, len(target.elts))
                 # Per-position type map for heterogeneous tuples.
                 # dict.popitem() → (str_key, value), dict.items() elem → (str_key, value).
                 _pos_types = {}
@@ -15254,6 +15259,12 @@ class CodeGen:
                         and value_node.func.attr == "popitem"
                         and self._is_dict_expr(value_node.func.value)):
                     _pos_types[0] = "str"  # key is always a string
+                # Merge return-analysis position types (lower priority than
+                # explicit _pos_types like popitem).
+                if _ret_pos_types:
+                    for i, rt in _ret_pos_types.items():
+                        if i not in _pos_types:
+                            _pos_types[i] = rt
                 for i, tgt in enumerate(target.elts):
                     _et = _pos_types.get(i, elem_type)
                     if isinstance(tgt, ast.Name):
@@ -15294,9 +15305,11 @@ class CodeGen:
                                   [val_ptr, ir.Constant(i64, i), tag_s, data_s])
                     elem_tag = self.builder.load(tag_s)
                     elem_data = self.builder.load(data_s)
-                    # Build FpyValue directly from runtime tag+data
+                    # Build FpyValue directly from runtime tag+data.
+                    # Use MIXED type — the runtime tag determines the actual
+                    # type (could be int, str, float, etc. in a heterogeneous tuple).
                     fv = self._fv_build_from_slots(elem_tag, elem_data)
-                    self._store_variable(tgt.id, fv, ValueType(VKind.INT))
+                    self._store_variable(tgt.id, fv, ValueType(VKind.MIXED))
                 elif isinstance(tgt, (ast.Tuple, ast.List)):
                     # Nested unpack from general RHS
                     sub_list = self._list_get_as_bare(
@@ -22999,6 +23012,15 @@ class CodeGen:
             return self._fv_build_from_slots(
                 self.builder.load(tag_slot),
                 self.builder.load(data_slot))
+        # Mixed-type variables (e.g. unpacked from heterogeneous tuple return):
+        # the stored FpyValue has the correct runtime tag, load it directly
+        # to preserve the type for print/comparison dispatch.
+        if (isinstance(node, ast.Name)
+                and node.id in self.variables
+                and self._var_kind(node.id) == VKind.MIXED):
+            fv = self._load_fv_raw(node.id)
+            if fv is not None:
+                return fv
         # pyobj subscript/attribute/call expressions: convert raw PyObject*
         # result to native FpyValue via cpython_to_fv for printing.
         _is_pyobj_print = False
@@ -23375,6 +23397,16 @@ class CodeGen:
         # Named variables: use the variable's stored type_tag (survives load/unwrap)
         if isinstance(node, ast.Name) and node.id in self.variables:
             vk = self._var_kind(node.id)
+            if vk == VKind.MIXED:
+                # Mixed-type: runtime tag determines actual type.
+                # If value is already an fpy_val struct, return as-is.
+                if (isinstance(value.type, ir.LiteralStructType)
+                        and value.type == fpy_val):
+                    return value
+                # Otherwise load the raw FpyValue from the alloca.
+                fv = self._load_fv_raw(node.id)
+                if fv is not None:
+                    return fv
             if vk == VKind.NONE:
                 return self._fv_none()
             if vk == VKind.BOOL:
@@ -23497,6 +23529,159 @@ class CodeGen:
         # Fallback
         return self._fv_from_int(value)
 
+    def _infer_tuple_return_pos_types(
+            self, call_node: ast.expr, n_targets: int
+    ) -> 'dict[int, ValueType]':
+        """Analyze a function call returning a tuple to get per-position types.
+
+        For `a, b, c = f()`, inspects `f`'s return statement to determine the
+        type of each tuple position.  Returns a dict mapping position index to
+        ValueType.  Returns empty dict if the call is not a user function or the
+        return is not a simple tuple literal.
+        """
+        if not (isinstance(call_node, ast.Call)
+                and isinstance(call_node.func, ast.Name)
+                and call_node.func.id in self._user_functions):
+            return {}
+        fname = call_node.func.id
+        info = self._user_functions[fname]
+        # Look up the function's AST from CSA analysis
+        _csa_funcs = getattr(self, '_csa_func_asts', {})
+        func_ast = _csa_funcs.get(fname)
+        if func_ast is None:
+            return {}
+        # Find the return statement with a tuple literal
+        ret_tuple = None
+        for node in ast.walk(func_ast):
+            if isinstance(node, ast.Return) and isinstance(node.value, ast.Tuple):
+                ret_tuple = node.value
+                break
+        if ret_tuple is None or len(ret_tuple.elts) != n_targets:
+            return {}
+        # Build param_name → call_arg_index mapping for the call site
+        param_names = [a.arg for a in func_ast.args.args]
+        # Map param_name → call-site argument AST node
+        param_to_arg: dict[str, ast.expr] = {}
+        for pi, pname in enumerate(param_names):
+            if pi < len(call_node.args):
+                param_to_arg[pname] = call_node.args[pi]
+        # Infer type per position
+        pos_types: dict[int, ValueType] = {}
+        all_same = True
+        first_kind = None
+        for i, elt in enumerate(ret_tuple.elts):
+            kind = self._infer_elt_kind(elt, func_ast, param_to_arg)
+            if first_kind is None:
+                first_kind = kind
+            elif kind != first_kind:
+                all_same = False
+            pos_types[i] = ValueType(kind)
+        # If all positions have the same type, no per-position override needed
+        if all_same:
+            return {}
+        return pos_types
+
+    @staticmethod
+    def _infer_elt_kind(elt: ast.expr,
+                        func_ast: ast.FunctionDef,
+                        param_to_arg: 'dict[str, ast.expr]') -> 'VKind':
+        """Infer the VKind of a tuple element from its AST node.
+
+        Uses constants directly, type annotations, and call-site argument
+        types (param_to_arg maps parameter names to the Call's arg AST nodes).
+        """
+        if isinstance(elt, ast.Constant):
+            if isinstance(elt.value, bool):
+                return VKind.BOOL
+            if isinstance(elt.value, int):
+                return VKind.INT
+            if isinstance(elt.value, float):
+                return VKind.FLOAT
+            if isinstance(elt.value, str):
+                return VKind.STR
+            if elt.value is None:
+                return VKind.NONE
+        if isinstance(elt, (ast.List, ast.ListComp)):
+            return VKind.LIST
+        if isinstance(elt, ast.Tuple):
+            return VKind.TUPLE
+        if isinstance(elt, (ast.Dict, ast.DictComp)):
+            return VKind.DICT
+        if isinstance(elt, (ast.Set, ast.SetComp)):
+            return VKind.SET
+        if isinstance(elt, ast.JoinedStr):
+            return VKind.STR
+        if isinstance(elt, (ast.Compare, ast.BoolOp)):
+            return VKind.BOOL
+        if isinstance(elt, ast.Call) and isinstance(elt.func, ast.Name):
+            _builtin_ret = {
+                "str": VKind.STR, "int": VKind.INT, "float": VKind.FLOAT,
+                "bool": VKind.BOOL, "list": VKind.LIST, "dict": VKind.DICT,
+                "set": VKind.SET, "tuple": VKind.TUPLE, "len": VKind.INT,
+                "abs": VKind.INT, "ord": VKind.INT, "chr": VKind.STR,
+                "hex": VKind.STR, "oct": VKind.STR, "bin": VKind.STR,
+                "repr": VKind.STR, "round": VKind.INT,
+            }
+            if elt.func.id in _builtin_ret:
+                return _builtin_ret[elt.func.id]
+        if isinstance(elt, ast.BinOp):
+            # String concat: "a" + "b" → STR
+            if isinstance(elt.op, ast.Add):
+                if (isinstance(elt.left, ast.Constant)
+                        and isinstance(elt.left.value, str)):
+                    return VKind.STR
+                if (isinstance(elt.right, ast.Constant)
+                        and isinstance(elt.right.value, str)):
+                    return VKind.STR
+            # Float arithmetic
+            if (isinstance(elt.left, ast.Constant)
+                    and isinstance(elt.left.value, float)):
+                return VKind.FLOAT
+            if (isinstance(elt.right, ast.Constant)
+                    and isinstance(elt.right.value, float)):
+                return VKind.FLOAT
+        if isinstance(elt, ast.Name):
+            # Check parameter types by looking for type annotations
+            for arg in func_ast.args.args:
+                if arg.arg == elt.id and arg.annotation:
+                    if isinstance(arg.annotation, ast.Name):
+                        _ann = arg.annotation.id
+                        if _ann == "str":
+                            return VKind.STR
+                        if _ann == "float":
+                            return VKind.FLOAT
+                        if _ann == "int":
+                            return VKind.INT
+                        if _ann == "bool":
+                            return VKind.BOOL
+            # Infer from call-site argument type
+            if elt.id in param_to_arg:
+                arg_node = param_to_arg[elt.id]
+                if isinstance(arg_node, ast.Constant):
+                    if isinstance(arg_node.value, bool):
+                        return VKind.BOOL
+                    if isinstance(arg_node.value, int):
+                        return VKind.INT
+                    if isinstance(arg_node.value, float):
+                        return VKind.FLOAT
+                    if isinstance(arg_node.value, str):
+                        return VKind.STR
+            # Check local variable assignment in function body
+            for stmt in ast.walk(func_ast):
+                if (isinstance(stmt, ast.Assign)
+                        and len(stmt.targets) == 1
+                        and isinstance(stmt.targets[0], ast.Name)
+                        and stmt.targets[0].id == elt.id):
+                    # Recurse on the RHS to determine type
+                    rhs_kind = CodeGen._infer_elt_kind(
+                        stmt.value, func_ast, param_to_arg)
+                    if rhs_kind != VKind.INT:
+                        return rhs_kind
+                    # INT might be the default — keep looking
+                    break
+        # Default: unknown → INT
+        return VKind.INT
+
     def _get_list_elem_type(self, node: ast.expr) -> 'ValueType':
         """Get the element type of a list expression."""
         # self.attr on the current class: resolve through __init__ AST
@@ -23570,8 +23755,11 @@ class CodeGen:
         # items() returns tuples (list with is_tuple=1).
         # keys() returns strings (or ints for int-keyed dicts).
         # values() returns mixed FpyValues (default "str" for compatibility).
+        # ONLY match dict receivers — user-class methods named "values"/"keys"
+        # should not be intercepted here.
         if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-                and node.func.attr in ("values", "items", "keys")):
+                and node.func.attr in ("values", "items", "keys")
+                and self._is_dict_expr(node.func.value)):
             if node.func.attr == "items":
                 return ValueType(VKind.LIST)  # items() returns list of tuples (stored as FpyList)
             if (node.func.attr == "keys"
@@ -26657,13 +26845,41 @@ class CodeGen:
                     int_from_str = self._rt_call("str_to_int", [str_ptr])
                     self.builder.store(int_from_str, result_alloca)
                     self.builder.branch(merge_bb)
-                    # Else path (already int/bool)
+                    # Else path: check for None/unsupported types → TypeError
                     self.builder.position_at_end(else_bb)
+                    is_none = self.builder.icmp_unsigned(
+                        "==", fv_tag, ir.Constant(i32, FPY_TAG_NONE))
+                    none_bb = self._new_block("int.none")
+                    ok_bb = self._new_block("int.ok")
+                    self.builder.cbranch(is_none, none_bb, ok_bb)
+                    # None → TypeError
+                    self.builder.position_at_end(none_bb)
+                    exc_name = self._make_string_constant("TypeError")
+                    exc_id = self.builder.call(
+                        self.runtime["exc_name_to_id"], [exc_name])
+                    msg_ptr = self._make_string_constant(
+                        "int() argument must be a string, a bytes-like "
+                        "object or a real number, not 'NoneType'")
+                    self.builder.call(self.runtime["raise"], [exc_id, msg_ptr])
+                    self.builder.store(ir.Constant(i64, 0), result_alloca)
+                    self.builder.branch(merge_bb)
+                    # OK path (already int/bool)
+                    self.builder.position_at_end(ok_bb)
                     self.builder.store(fv_data, result_alloca)
                     self.builder.branch(merge_bb)
                     # Merge
                     self.builder.position_at_end(merge_bb)
                     return self.builder.load(result_alloca)
+            # int(None) → TypeError at compile time
+            if isinstance(arg_node, ast.Constant) and arg_node.value is None:
+                exc_name = self._make_string_constant("TypeError")
+                exc_id = self.builder.call(
+                    self.runtime["exc_name_to_id"], [exc_name])
+                msg_ptr = self._make_string_constant(
+                    "int() argument must be a string, a bytes-like "
+                    "object or a real number, not 'NoneType'")
+                self.builder.call(self.runtime["raise"], [exc_id, msg_ptr])
+                return ir.Constant(i64, 0)
             val = self._emit_expr_value(arg_node)
             if isinstance(val.type, ir.DoubleType):
                 return self.builder.fptosi(val, i64)
@@ -32119,6 +32335,15 @@ class CodeGen:
             # return self — returns the object itself
             if isinstance(ret, ast.Name) and ret.id == "self":
                 return FPY_TAG_OBJ
+            # return expr1, expr2, ... — tuple literal return
+            if isinstance(ret, ast.Tuple):
+                return FPY_TAG_LIST
+            # return [expr, ...] — list literal return
+            if isinstance(ret, (ast.List, ast.ListComp)):
+                return FPY_TAG_LIST
+            # return {key: val, ...} — dict literal return
+            if isinstance(ret, (ast.Dict, ast.DictComp)):
+                return FPY_TAG_DICT
         # Default for pointer return with no recognizable pattern
         return FPY_TAG_STR
 
