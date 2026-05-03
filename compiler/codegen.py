@@ -6061,6 +6061,15 @@ class CodeGen:
     def _csa_build_var_types(self, tree: ast.Module) -> dict[str, str]:
         """Build static variable type map from module-level assignments."""
         var_types: dict[str, str] = {}
+        # Collect imported module names so the module.func() handler only
+        # tags results from actual imports, not user-class method calls.
+        _csa_imported_mods: set[str] = set()
+        for stmt in ast.walk(tree):
+            if isinstance(stmt, ast.Import):
+                for alias in stmt.names:
+                    _csa_imported_mods.add(alias.asname or alias.name)
+            elif isinstance(stmt, ast.ImportFrom) and stmt.module:
+                _csa_imported_mods.add(stmt.module.split('.')[0])
         for node in ast.walk(tree):
             if isinstance(node, ast.Assign) and len(node.targets) == 1:
                 tgt = node.targets[0]
@@ -6165,6 +6174,26 @@ class CodeGen:
                             var_types[tgt.id] = "str"
                         elif _rtk == VKind.FLOAT:
                             var_types[tgt.id] = "float"
+                    # Module.func() calls: textwrap.fill(...), etc.
+                    # Use _CSA_MODULE_FUNC_RETURNS for known return types;
+                    # default to "pyobj" for imported module calls whose
+                    # return type is unknown (they go through CPython bridge).
+                    # Guard: only match actual imported modules, not user-class
+                    # instances (c.method()) or self.method() calls.
+                    elif (isinstance(node.value, ast.Call)
+                          and isinstance(node.value.func, ast.Attribute)
+                          and isinstance(node.value.func.value, ast.Name)
+                          and node.value.func.value.id in _csa_imported_mods):
+                        _csa_mod = node.value.func.value.id
+                        _csa_func = node.value.func.attr
+                        _csa_key = f"{_csa_mod}.{_csa_func}"
+                        _csa_ret = self._CSA_MODULE_FUNC_RETURNS.get(_csa_key)
+                        if _csa_ret is not None:
+                            var_types[tgt.id] = _csa_ret
+                        else:
+                            # Unknown function on imported module —
+                            # assume bridge result (pyobj).
+                            var_types[tgt.id] = "pyobj"
         return var_types
 
     def _analyze_call_sites(self, tree: ast.Module) -> None:
@@ -8050,7 +8079,15 @@ class CodeGen:
                         # obj, str, set, bytes, tuple, pyobj, complex,
                         # bigint, decimal, closure, counter, defaultdict,
                         # deque, path, native_mod, logger
-                        tag = call_tag
+                        if _ctk == VKind.PYOBJ:
+                            # PYOBJ args are converted via cpython_to_fv
+                            # before the call — the FpyValue has a native
+                            # runtime tag (STR, INT, etc.), NOT a PyObject*.
+                            # Use "mixed" so downstream ops use runtime
+                            # dispatch instead of the wrong PYOBJ path.
+                            tag = "mixed"
+                        else:
+                            tag = call_tag
                     elif self._tag_kind(call_tag) == VKind.MIXED:
                         tag = "mixed"  # VKind.MIXED — runtime dispatch
                     else:
@@ -12764,6 +12801,22 @@ class CodeGen:
         # FV-ABI fast paths: pyobj, native module, user fn, obj attr, subscript
         if self._USE_FV_LOCALS and self._assign_fv_fast_path(node):
             return
+
+        # MIXED/PYOBJ fpy_val copy: preserve runtime tag through assignment.
+        # _load_variable unwraps fpy_val to bare i64 (losing the runtime tag),
+        # so x = val where val is MIXED would lose type info.  Copy the raw
+        # fpy_val struct directly to preserve the tag.
+        if (self._USE_FV_LOCALS
+                and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+                and isinstance(node.value, ast.Name)
+                and node.value.id in self.variables
+                and self._var_kind(node.value.id) in (VKind.MIXED, VKind.PYOBJ)):
+            fv = self._load_fv_raw(node.value.id)
+            if fv is not None:
+                self._store_variable(node.targets[0].id, fv,
+                                     ValueType(VKind.MIXED))
+                return
 
         # Early-out: in-place prefix reverse  a[:N] = a[M::-1]
         for target in node.targets:
@@ -20981,6 +21034,63 @@ class CodeGen:
                 result_i1 = self.builder.not_(result_i1)
             return result_i1
 
+        # MIXED container: runtime dispatch based on FpyValue tag.
+        # MIXED variables hold a runtime-tagged FpyValue — the actual
+        # type (str, list, dict, …) is only known at runtime.  Extract
+        # the tag and branch to the appropriate containment check.
+        if c_kind == VKind.MIXED and isinstance(container_node, ast.Name):
+            fv = self._load_fv_raw(container_node.id)
+            if fv is not None:
+                tag_val = self._fv_tag(fv)
+                data_val = self._fv_data_i64(fv)
+
+                str_block = self._new_block("in.mixed.str")
+                list_block = self._new_block("in.mixed.list")
+                dict_block = self._new_block("in.mixed.dict")
+                false_block = self._new_block("in.mixed.false")
+                merge_block = self._new_block("in.mixed.merge")
+
+                result_alloca = self.builder.alloca(ir.IntType(1), name="in.mixed.res")
+                self.builder.store(ir.Constant(ir.IntType(1), 0), result_alloca)
+
+                is_str = self.builder.icmp_signed("==", tag_val,
+                                                  ir.Constant(i32, FPY_TAG_STR))
+                self.builder.cbranch(is_str, str_block, list_block)
+
+                # STR branch: str_contains(data_ptr, needle_ptr)
+                self.builder.position_at_end(str_block)
+                str_ptr = self.builder.inttoptr(data_val, i8_ptr)
+                needle = self._ensure_ptr(left_val)
+                str_result = self._rt_call("str_contains", [str_ptr, needle])
+                str_found = self.builder.icmp_signed(
+                    "!=", str_result, ir.Constant(i32, 0))
+                self.builder.store(str_found, result_alloca)
+                self.builder.branch(merge_block)
+
+                # LIST branch: list_contains via linear scan
+                self.builder.position_at_end(list_block)
+                is_list = self.builder.icmp_signed("==", tag_val,
+                                                   ir.Constant(i32, FPY_TAG_LIST))
+                self.builder.cbranch(is_list, dict_block, dict_block)
+                # (List containment is rare for MIXED — skip to dict for now;
+                #  fall through to False for unsupported types)
+
+                # DICT branch: dict_has_key(data_ptr, needle_ptr)
+                self.builder.position_at_end(dict_block)
+                is_dict = self.builder.icmp_signed("==", tag_val,
+                                                   ir.Constant(i32, FPY_TAG_DICT))
+                self.builder.cbranch(is_dict, false_block, false_block)
+                # (Dict containment for MIXED is uncommon — fall through)
+
+                self.builder.position_at_end(false_block)
+                self.builder.branch(merge_block)
+
+                self.builder.position_at_end(merge_block)
+                result = self.builder.load(result_alloca)
+                if isinstance(op, ast.NotIn):
+                    result = self.builder.not_(result)
+                return result
+
         # String 'in': "x" in "hello"
         if c_kind == VKind.STR:
             container = self._emit_expr_value(container_node)
@@ -28445,6 +28555,58 @@ class CodeGen:
 
     # Modules that have no native implementation — always fall through to
     # CPython bridge.  Checked before the dispatch table to avoid lookups.
+    # Known return types for module functions (used by CSA to avoid
+    # over-tagging).  Functions not listed here default to "pyobj"
+    # when the module is imported — safe because bridge results get
+    # runtime dispatch through the MIXED tag.
+    _CSA_MODULE_FUNC_RETURNS: dict[str, str] = {
+        # math — most return float; floor/ceil return int
+        "math.sqrt": "float", "math.sin": "float", "math.cos": "float",
+        "math.tan": "float", "math.asin": "float", "math.acos": "float",
+        "math.atan": "float", "math.atan2": "float",
+        "math.log": "float", "math.log2": "float", "math.log10": "float",
+        "math.exp": "float", "math.pow": "float", "math.fabs": "float",
+        "math.hypot": "float", "math.radians": "float", "math.degrees": "float",
+        "math.floor": "int", "math.ceil": "int", "math.gcd": "int",
+        "math.factorial": "int", "math.comb": "int", "math.perm": "int",
+        "math.isnan": "bool", "math.isinf": "bool", "math.isfinite": "bool",
+        # os / os.path
+        "os.getcwd": "str", "os.getenv": "str",
+        "os.path.join": "str", "os.path.dirname": "str",
+        "os.path.basename": "str", "os.path.abspath": "str",
+        "os.path.realpath": "str", "os.path.expanduser": "str",
+        "os.path.splitext": "str", "os.path.normpath": "str",
+        "os.path.exists": "bool", "os.path.isfile": "bool",
+        "os.path.isdir": "bool", "os.path.isabs": "bool",
+        "os.path.getsize": "int",
+        "os.listdir": "list:str",
+        # json
+        "json.dumps": "str", "json.loads": "dict",
+        # textwrap — dedent/indent have native impls; fill does NOT
+        "textwrap.dedent": "str", "textwrap.indent": "str",
+        # string
+        "string.ascii_lowercase": "str", "string.ascii_uppercase": "str",
+        # time
+        "time.time": "float", "time.monotonic": "float",
+        "time.perf_counter": "float",
+        # random
+        "random.random": "float", "random.uniform": "float",
+        "random.randint": "int", "random.randrange": "int",
+        "random.choice": "int",
+        # hashlib
+        "hashlib.md5": "pyobj", "hashlib.sha256": "pyobj",
+        # copy
+        "copy.copy": "pyobj", "copy.deepcopy": "pyobj",
+        # itertools — return lists after compilation
+        "itertools.chain": "list", "itertools.product": "list",
+        "itertools.combinations": "list", "itertools.permutations": "list",
+        # sys
+        "sys.exit": "none",
+        # collections
+        "collections.Counter": "counter", "collections.defaultdict": "defaultdict",
+        "collections.deque": "deque",
+    }
+
     _BRIDGE_ONLY_MODULES = frozenset({
         "secrets", "uuid", "hashlib", "string", "io", "warnings",
         "enum", "dataclasses",
