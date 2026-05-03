@@ -3336,6 +3336,9 @@ class CodeGen:
 
     def generate(self, tree: ast.Module) -> str:
         """Generate LLVM IR from a Python AST. Returns IR as string."""
+        import os as _os
+        if _os.environ.get("FASTPY_COERCION_DEBUG"):
+            _SafeIRBuilder.enable_coercion_debug()
         self._gen_prescan(tree)
 
         # Pass 1: forward-declare all user functions and class methods
@@ -3625,6 +3628,13 @@ class CodeGen:
             if not self._current_fn_bare_abi:
                 self.builder.call(self.runtime["shadow_pop"], [])
             self.builder.ret_void()
+
+        # E1 audit: report coercion count if env flag set
+        import os as _os
+        if (_SafeIRBuilder.coercion_count > 0
+                and _os.environ.get("FASTPY_COERCION_DEBUG")):
+            import sys
+            print(_SafeIRBuilder.coercion_report(), file=sys.stderr)
 
         return str(self.module)
 
