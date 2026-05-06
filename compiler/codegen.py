@@ -2120,6 +2120,9 @@ class CodeGen:
         # Convert CPython iterable (PyObject*) to native FpyList*
         ft = ir.FunctionType(i8_ptr, [i8_ptr])
         self.runtime["cpython_to_list"] = ir.Function(self.module, ft, name="fpy_cpython_to_list")
+        # Convert any FpyValue (tag, data) to native FpyList* (dispatches by tag)
+        ft = ir.FunctionType(i8_ptr, [i32, i64])
+        self.runtime["fv_to_list"] = ir.Function(self.module, ft, name="fastpy_fv_to_list")
         # Convert CPython dict (PyObject*) to native FpyDict*
         self.runtime["cpython_to_dict"] = ir.Function(self.module, ft, name="fpy_cpython_to_dict")
         # pyobj subscript: getitem(obj, key_tag, key_data) → PyObject*
@@ -17053,6 +17056,20 @@ class CodeGen:
             return self.builder.inttoptr(data, i8_ptr, name=name)
         return self.builder.inttoptr(self.builder.bitcast(val, i64), i8_ptr, name=name)
 
+    def _pyobj_to_list(self, val: 'ir.Value') -> 'ir.Value':
+        """Convert a value from a PYOBJ expression to a native FpyList*.
+
+        If `val` is an FpyValue struct (from a PYOBJ call whose result was
+        auto-converted by pyobject_to_fpy), dispatches via fv_to_list which
+        handles any tag correctly.  If `val` is a raw pointer (direct PYOBJ
+        variable), calls cpython_to_list directly."""
+        if isinstance(val.type, ir.LiteralStructType) and val.type == fpy_val:
+            tag = self.builder.extract_value(val, 0)
+            data = self.builder.extract_value(val, 1)
+            return self.builder.call(self.runtime["fv_to_list"], [tag, data])
+        val = self._ensure_ptr(val)
+        return self._rt_call("cpython_to_list", [val])
+
     def _rt_call(self, name: str, args: list) -> 'ir.Value':
         """Call a runtime function with automatic type coercion.
         Args can be bare ir.Value or TypedValue — both are handled."""
@@ -18177,9 +18194,11 @@ class CodeGen:
         if isinstance(source.type, ir.PointerType):
             # If the source is a bridge PyObject, convert to native list
             # before extending (list_extend expects FpyList*).
+            # Exclude NATIVE_MOD — their calls already return native lists.
             if (self._is_pyobj_var(node.value)
-                    or self._is_pyobj_receiver(node.value)):
-                source = self._rt_call("cpython_to_list", [source])
+                    or self._is_pyobj_receiver(
+                        node.value, include_native_mod=False)):
+                source = self._pyobj_to_list(source)
             self._rt_call("list_extend", [gen_list, source])
         else:
             self._bridge_fallback_stmt(node, "yield from requires an iterable")
@@ -24621,22 +24640,33 @@ class CodeGen:
             return self._var_kind(node.id) == VKind.LOGGER
         return False
 
-    def _is_pyobj_receiver(self, node: ast.expr) -> bool:
+    def _is_pyobj_receiver(self, node: ast.expr, *,
+                           include_native_mod: bool = True) -> bool:
         """Check if a receiver expression is a pyobj (bridge object).
-        Handles: name, name.attr, name[key], call(...).attr, etc."""
+        Handles: name, name.attr, name[key], call(...).attr, etc.
+
+        When *include_native_mod* is False, NATIVE_MOD modules (itertools,
+        sys, etc.) are excluded.  Use this in builtin handlers like list()
+        where NATIVE_MOD calls compile natively and their results are native
+        pointers, not PyObject*."""
         # Direct variable: qs where qs is pyobj (or native module needing bridge)
         # Check both local scope and globals — bridge imports land in globals.
         if isinstance(node, ast.Name) and self._has_var(node.id):
-            return self._var_kind(node.id) in (VKind.PYOBJ, VKind.NATIVE_MOD)
+            if include_native_mod:
+                return self._var_kind(node.id) in (VKind.PYOBJ, VKind.NATIVE_MOD)
+            return self._var_kind(node.id) == VKind.PYOBJ
         # Attribute on pyobj: User.objects where User is pyobj
         if isinstance(node, ast.Attribute):
-            return self._is_pyobj_receiver(node.value)
+            return self._is_pyobj_receiver(node.value,
+                                           include_native_mod=include_native_mod)
         # Subscript on pyobj: data["key"] where data is pyobj
         if isinstance(node, ast.Subscript):
-            return self._is_pyobj_receiver(node.value)
+            return self._is_pyobj_receiver(node.value,
+                                           include_native_mod=include_native_mod)
         # Call result on pyobj chain: User.objects.filter(...) where User is pyobj
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
-            return self._is_pyobj_receiver(node.func.value)
+            return self._is_pyobj_receiver(node.func.value,
+                                           include_native_mod=include_native_mod)
         return False
 
     def _match_prefix_reverse(self, target: ast.Subscript,
@@ -27352,16 +27382,18 @@ class CodeGen:
             if isinstance(arg, ast.Name) and arg.id in self.variables:
                 _is_pyobj = self._var_kind(arg.id) == VKind.PYOBJ
             if not _is_pyobj:
-                _is_pyobj = self._is_pyobj_receiver(arg)
+                # Exclude NATIVE_MOD — their calls compile natively
+                _is_pyobj = self._is_pyobj_receiver(
+                    arg, include_native_mod=False)
             if not _is_pyobj and isinstance(arg, ast.Call):
                 # Call result from a bridge function (e.g. ts.static_order())
                 if (isinstance(arg.func, ast.Attribute)
-                        and self._is_pyobj_receiver(arg.func.value)):
+                        and self._is_pyobj_receiver(
+                            arg.func.value, include_native_mod=False)):
                     _is_pyobj = True
             if _is_pyobj:
                 val = self._emit_expr_value(arg)
-                val = self._ensure_ptr(val)
-                return self._rt_call("cpython_to_list", [val])
+                return self._pyobj_to_list(val)
         # list(list) / list(tuple) — shallow copy
         if len(node.args) == 1:
             arg = node.args[0]
@@ -27369,9 +27401,14 @@ class CodeGen:
                 lst = self._emit_expr_value(arg)
                 lst = self._ensure_ptr(lst)
                 return self.builder.call(self.runtime["list_copy"], [lst])
-        # list(x) — unhandled type, return the arg (may be wrong for some types)
+        # list(x) — fallback: if result is FpyValue, dispatch at runtime
         if len(node.args) == 1:
-            return self._emit_expr_value(node.args[0])
+            val = self._emit_expr_value(node.args[0])
+            if isinstance(val.type, ir.LiteralStructType) and val.type == fpy_val:
+                tag = self.builder.extract_value(val, 0)
+                data = self.builder.extract_value(val, 1)
+                return self.builder.call(self.runtime["fv_to_list"], [tag, data])
+            return val
         if len(node.args) == 0:
             return self.builder.call(self.runtime["list_new"], [])
         raise CodeGenError("list() with wrong number of args", node)
@@ -27432,15 +27469,16 @@ class CodeGen:
             if isinstance(arg, ast.Name) and arg.id in self.variables:
                 _is_pyobj = self._var_kind(arg.id) == VKind.PYOBJ
             if not _is_pyobj:
-                _is_pyobj = self._is_pyobj_receiver(arg)
+                _is_pyobj = self._is_pyobj_receiver(
+                    arg, include_native_mod=False)
             if not _is_pyobj and isinstance(arg, ast.Call):
                 if (isinstance(arg.func, ast.Attribute)
-                        and self._is_pyobj_receiver(arg.func.value)):
+                        and self._is_pyobj_receiver(
+                            arg.func.value, include_native_mod=False)):
                     _is_pyobj = True
             if _is_pyobj:
                 val = self._emit_expr_value(arg)
-                val = self._ensure_ptr(val)
-                result = self._rt_call("cpython_to_list", [val])
+                result = self._pyobj_to_list(val)
                 result = self._ensure_ptr(result)
                 self.builder.call(self.runtime["list_mark_tuple"], [result])
                 return result
@@ -27449,12 +27487,14 @@ class CodeGen:
             if self._is_list_expr(arg) or self._is_tuple_expr(arg):
                 result = self._ensure_ptr(result)
                 result = self.builder.call(self.runtime["list_copy"], [result])
+            # FpyValue fallback: dispatch at runtime, then mark as tuple
+            if isinstance(result.type, ir.LiteralStructType) and result.type == fpy_val:
+                tag = self.builder.extract_value(result, 0)
+                data = self.builder.extract_value(result, 1)
+                result = self.builder.call(self.runtime["fv_to_list"], [tag, data])
             # Ensure the result is a list pointer, then mark as tuple
-            if isinstance(result.type, ir.PointerType) or result.type == i8_ptr:
-                self.builder.call(self.runtime["list_mark_tuple"], [result])
-            else:
-                ptr = self._ensure_ptr(result)
-                self.builder.call(self.runtime["list_mark_tuple"], [ptr])
+            result = self._ensure_ptr(result)
+            self.builder.call(self.runtime["list_mark_tuple"], [result])
             return result
         if len(node.args) == 0:
             return self.builder.call(self.runtime["tuple_new"], [])
@@ -28207,13 +28247,17 @@ class CodeGen:
             if isinstance(arg_node, ast.Name) and arg_node.id in self.variables:
                 _is_pyobj = self._var_kind(arg_node.id) == VKind.PYOBJ
             if not _is_pyobj:
-                _is_pyobj = self._is_pyobj_receiver(arg_node)
+                _is_pyobj = self._is_pyobj_receiver(
+                    arg_node, include_native_mod=False)
             if _is_pyobj:
                 val = self._emit_expr_value(arg_node)
-                val = self._ensure_ptr(val)
-                lst = self._rt_call("cpython_to_list", [val])
+                lst = self._pyobj_to_list(val)
                 return self._rt_call("set_from_list", [lst])
             arg = self._emit_expr_value(arg_node)
+            if isinstance(arg.type, ir.LiteralStructType) and arg.type == fpy_val:
+                tag = self.builder.extract_value(arg, 0)
+                data = self.builder.extract_value(arg, 1)
+                arg = self.builder.call(self.runtime["fv_to_list"], [tag, data])
             return self._rt_call("set_from_list", [arg])
         if len(node.args) == 0:
             return self.builder.call(self.runtime["dict_new"], [])
@@ -30844,8 +30888,9 @@ class CodeGen:
         elif method == "extend" and len(node.args) == 1:
             other = self._emit_expr_value(node.args[0])
             if (self._is_pyobj_var(node.args[0])
-                    or self._is_pyobj_receiver(node.args[0])):
-                other = self._rt_call("cpython_to_list", [other])
+                    or self._is_pyobj_receiver(
+                        node.args[0], include_native_mod=False)):
+                other = self._pyobj_to_list(other)
             self._rt_call("list_extend", [elem_ptr, other])
             return
         elif method == "pop" and len(node.args) == 0:
@@ -31195,9 +31240,11 @@ class CodeGen:
             # from a CPython method call), convert it to a native list
             # first.  fastpy_list_extend expects FpyList*, so passing a
             # raw PyObject* reads garbage for length/items and crashes.
+            # Exclude NATIVE_MOD — their calls already return native lists.
             if (self._is_pyobj_var(node.args[0])
-                    or self._is_pyobj_receiver(node.args[0])):
-                other = self._rt_call("cpython_to_list", [other])
+                    or self._is_pyobj_receiver(
+                        node.args[0], include_native_mod=False)):
+                other = self._pyobj_to_list(other)
             self._rt_call("list_extend", [obj, other])
             return obj
         return None
@@ -31520,8 +31567,10 @@ class CodeGen:
             # If the argument is a bridge PyObject (e.g. dict returned from
             # a CPython call), convert to native FpyDict first.
             # fastpy_dict_update expects FpyDict*, not raw PyObject*.
+            # Exclude NATIVE_MOD — their calls already return native dicts.
             if (self._is_pyobj_var(node.args[0])
-                    or self._is_pyobj_receiver(node.args[0])):
+                    or self._is_pyobj_receiver(
+                        node.args[0], include_native_mod=False)):
                 other = self._rt_call("cpython_to_dict", [other])
             self._rt_call("dict_update", [obj, other])
             return obj
@@ -34067,7 +34116,8 @@ class CodeGen:
             return
         # PyObject* values (bridge objects): store with OBJ tag so runtime
         # code that inspects FpyValues sees the correct type.
-        if self._is_pyobj_receiver(node):
+        # Exclude NATIVE_MOD — their calls return native types, not PyObject*.
+        if self._is_pyobj_receiver(node, include_native_mod=False):
             value = self._emit_expr_value(node)
             if isinstance(value.type, ir.PointerType):
                 data = self.builder.ptrtoint(value, i64)
@@ -34530,8 +34580,10 @@ class CodeGen:
                 other = self._emit_expr_value(val_node)
                 # If the unpacked value is a bridge PyObject, convert to
                 # native FpyDict first. dict_update expects FpyDict*.
+                # Exclude NATIVE_MOD — their calls already return native types.
                 if (self._is_pyobj_var(val_node)
-                        or self._is_pyobj_receiver(val_node)):
+                        or self._is_pyobj_receiver(
+                            val_node, include_native_mod=False)):
                     other = self._rt_call("cpython_to_dict", [other])
                 # Use dict_update to copy all entries from other into dict_ptr
                 self._rt_call("dict_update", [dict_ptr, other])

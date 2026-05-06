@@ -322,6 +322,42 @@ FpyList* fastpy_str_to_list(const char *s) {
     return result;
 }
 
+/* Forward declarations for functions in other TUs used by fv_to_list */
+extern FpyList* fastpy_list_copy(FpyList*);
+extern FpyList* fastpy_dict_keys(FpyDict*);
+extern FpyList* fpy_cpython_to_list(void*);
+
+/* Convert any FpyValue (tag + data) to a list.
+ * OBJ-tagged values are iterated via CPython protocol; native types
+ * are converted directly. Used by list()/tuple()/set() builtins when
+ * the argument is a PYOBJ expression whose runtime result may have
+ * been auto-converted to a native type by pyobject_to_fpy. */
+FpyList* fastpy_fv_to_list(int32_t tag, int64_t data) {
+    switch (tag) {
+    case FPY_TAG_LIST:
+        return fastpy_list_copy((FpyList*)(intptr_t)data);
+    case FPY_TAG_STR:
+        return fastpy_str_to_list((const char*)(intptr_t)data);
+    case FPY_TAG_DICT:
+        return fastpy_dict_keys((FpyDict*)(intptr_t)data);
+    case FPY_TAG_SET:
+        return fastpy_dict_keys((FpyDict*)(intptr_t)data);
+    case FPY_TAG_BYTES:
+        return fastpy_bytes_to_list((const char*)(intptr_t)data);
+    case FPY_TAG_OBJ:
+        return fpy_cpython_to_list((void*)(intptr_t)data);
+    default: {
+        /* Scalar or unknown — wrap as single-element list */
+        FpyList *lst = fpy_list_new(1);
+        FpyValue v;
+        v.tag = tag;
+        v.data.i = data;
+        fpy_list_append(lst, v);
+        return lst;
+    }
+    }
+}
+
 /* Convert int to string (for f-string formatting) */
 const char* fastpy_int_to_str(int64_t value) {
     FpyString *s = fpy_str_alloc(32);
@@ -834,6 +870,7 @@ extern int64_t fastpy_bytes_get(const char*, int64_t);
 extern int64_t fastpy_bytes_len(const char*);
 extern FpyList* fastpy_bytes_to_list(const char*);
 extern FpyList* fastpy_str_to_list(const char*);
+extern FpyList* fastpy_fv_to_list(int32_t, int64_t);
 extern void fastpy_list_mark_tuple(FpyList*);
 extern void fastpy_list_mark_list(FpyList*);
 extern FpyDict* fastpy_dict_fromkeys(FpyList*, int32_t, int64_t);
@@ -948,7 +985,7 @@ static FpySymEntry fpy_jit_symbols[] = {
     SYM(fastpy_bytes_decode),
     SYM(fastpy_bytes_get),
     SYM(fastpy_bytes_len),
-    SYM(fastpy_bytes_to_list), SYM(fastpy_str_to_list),
+    SYM(fastpy_bytes_to_list), SYM(fastpy_str_to_list), SYM(fastpy_fv_to_list),
     SYM(fastpy_list_mark_tuple),
     SYM(fastpy_list_mark_list),
     SYM(fastpy_dict_fromkeys), SYM(fastpy_dict_fromkeys_none),
