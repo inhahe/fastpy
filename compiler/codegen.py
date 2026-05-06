@@ -27328,6 +27328,26 @@ class CodeGen:
             obj = self._emit_expr_value(node.args[0])
             obj = self._ensure_ptr(obj)
             return self._rt_call("list_from_obj_iter", [obj])
+        # list(pyobj) — iterate a CPython iterable (generator, map, filter,
+        # etc.) into a native FpyList via the bridge.  Without this, the
+        # raw PyObject* is returned as-is, producing a broken single-element
+        # list instead of iterating the contents.
+        if len(node.args) == 1:
+            arg = node.args[0]
+            _is_pyobj = False
+            if isinstance(arg, ast.Name) and arg.id in self.variables:
+                _is_pyobj = self._var_kind(arg.id) == VKind.PYOBJ
+            if not _is_pyobj:
+                _is_pyobj = self._is_pyobj_receiver(arg)
+            if not _is_pyobj and isinstance(arg, ast.Call):
+                # Call result from a bridge function (e.g. ts.static_order())
+                if (isinstance(arg.func, ast.Attribute)
+                        and self._is_pyobj_receiver(arg.func.value)):
+                    _is_pyobj = True
+            if _is_pyobj:
+                val = self._emit_expr_value(arg)
+                val = self._ensure_ptr(val)
+                return self._rt_call("cpython_to_list", [val])
         # list(x) — for now, just return the arg (shallow copy would be better)
         if len(node.args) == 1:
             return self._emit_expr_value(node.args[0])
