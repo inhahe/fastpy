@@ -5253,6 +5253,40 @@ class CodeGen:
                             arg_types.append("float" if has_float else None)
                     except Exception:
                         arg_types.append(None)
+                elif isinstance(arg, ast.Subscript):
+                    # Subscript on a known-type variable: infer result type
+                    # so CSA correctly detects type conflicts (e.g. str
+                    # subscript vs int from another call site → mixed).
+                    _sub_type = None
+                    if (isinstance(arg.value, ast.Name)
+                            and arg.value.id in var_types
+                            and var_types[arg.value.id] is not None):
+                        _base_kind = self._tag_kind(var_types[arg.value.id])
+                        if _base_kind == VKind.STR:
+                            _sub_type = "str"  # str[i] and str[i:j] → str
+                        elif _base_kind == VKind.BYTES:
+                            if isinstance(arg.slice, ast.Slice):
+                                _sub_type = "bytes"
+                            else:
+                                _sub_type = "int"  # bytes[i] → int
+                        elif _base_kind == VKind.LIST:
+                            if isinstance(arg.slice, ast.Slice):
+                                _sub_type = var_types[arg.value.id]  # slice → same list type
+                            else:
+                                # list[i] → element type
+                                _ek = self._tag_elem_kind(var_types[arg.value.id])
+                                if _ek is not None:
+                                    _ELEM_TO_STR = {
+                                        VKind.STR: "str", VKind.INT: "int",
+                                        VKind.FLOAT: "float", VKind.BOOL: "bool",
+                                        VKind.LIST: "list", VKind.DICT: "dict",
+                                        VKind.OBJ: "obj", VKind.TUPLE: "tuple",
+                                    }
+                                    _sub_type = _ELEM_TO_STR.get(_ek)
+                        elif _base_kind == VKind.TUPLE:
+                            if isinstance(arg.slice, ast.Slice):
+                                _sub_type = "tuple"
+                    arg_types.append(_sub_type)
                 else:
                     # Check if expression contains float constants (e.g. 2.0 * 3.0)
                     # but NOT if it contains a class constructor (those would
@@ -5518,7 +5552,32 @@ class CodeGen:
             merged = self._call_site_param_types[fname]
             for i, mt in enumerate(merged):
                 mc = _type_cat(mt)
-                if mc is None or mc == "I":
+                if mc is None:
+                    continue
+                # "I" (int) is normally safe as the default i64 type.
+                # HOWEVER, if any signature has a None (unknown) for this
+                # position AND any OTHER position in the function has a
+                # concrete pointer or mixed type, the unknown caller may
+                # actually be passing a pointer (str/list/obj).  In that
+                # case the function will use FV-ABI, and unwrapping the
+                # param as bare i64 would discard the runtime tag.
+                if mc == "I":
+                    _has_none_at_i = any(
+                        _type_cat(sig[i] if i < len(sig) else None) is None
+                        for sig in sigs
+                    )
+                    if _has_none_at_i:
+                        # Check if ANY other position has a pointer-category
+                        # concrete type — indicating the function is
+                        # polymorphic and will use FV-ABI.
+                        _func_has_ptr = any(
+                            _type_cat(s) == "P"
+                            for sig in sigs
+                            for s in sig
+                        )
+                        if _func_has_ptr:
+                            merged[i] = None  # must use FV dispatch
+                            continue
                     continue  # i64 is the default, always safe
                 # Collect concrete (non-None) categories from all sigs
                 concrete_cats = set()
@@ -12883,8 +12942,21 @@ class CodeGen:
                                 and isinstance(node.value.func, ast.Attribute)
                                 and self._is_pyobj_receiver(
                                     node.value.func.value))
-            _vkind = (VKind.PYOBJ if (_is_bridge_rhs or _is_pyobj_method)
-                      else VKind.FVALUE)
+            # Subscript on a MIXED list: the element could be any type,
+            # so tag as MIXED to enable isinstance narrowing and correct
+            # method call dispatch (not FVALUE which lacks those paths).
+            _is_mixed_list_sub = (
+                isinstance(node.value, ast.Subscript)
+                and (self._is_list_expr(node.value.value)
+                     or self._is_tuple_expr(node.value.value))
+                and self._get_list_elem_type(
+                    node.value.value).kind == VKind.MIXED)
+            if _is_mixed_list_sub:
+                _vkind = VKind.MIXED
+            elif _is_bridge_rhs or _is_pyobj_method:
+                _vkind = VKind.PYOBJ
+            else:
+                _vkind = VKind.FVALUE
             self._store_variable(node.targets[0].id, value,
                                  ValueType(_vkind))
             return
@@ -14342,10 +14414,6 @@ class CodeGen:
                 return ValueType(VKind.TUPLE)
             if mod == "decimal" and fn == "Decimal":
                 return ValueType(VKind.DECIMAL)
-            if mod == "glob" and fn == "glob":
-                return ValueType(VKind.LIST, elem_type=ValueType(VKind.STR))
-            if mod == "heapq" and fn == "nsmallest":
-                return ValueType(VKind.LIST, elem_type=ValueType(VKind.INT))
             # collections.deque(), _collections.Counter(), etc.
             if mod in ("collections", "_collections"):
                 if fn == "Counter":
@@ -15145,6 +15213,42 @@ class CodeGen:
         if isinstance(node, (ast.List, ast.Tuple)):
             if not node.elts:
                 return ValueType(VKind.INT)
+            # --- Mixed-type detection (must run BEFORE first-element fast
+            # paths, which would early-return before reaching this check) ---
+            if len(node.elts) > 1:
+                _has_int = _has_str = _has_float = False
+                _has_container = _has_other = False
+                for e in node.elts:
+                    if isinstance(e, ast.Constant):
+                        if isinstance(e.value, str):
+                            _has_str = True
+                        elif isinstance(e.value, float):
+                            _has_float = True
+                        elif isinstance(e.value, bool):
+                            _has_int = True  # bools are ints
+                        elif isinstance(e.value, int):
+                            _has_int = True
+                        else:
+                            _has_other = True
+                    elif isinstance(e, (ast.List, ast.ListComp, ast.Tuple,
+                                        ast.Dict, ast.DictComp)):
+                        _has_container = True
+                    elif isinstance(e, ast.UnaryOp):
+                        if (isinstance(e.op, ast.USub)
+                                and isinstance(e.operand, ast.Constant)):
+                            if isinstance(e.operand.value, float):
+                                _has_float = True
+                            else:
+                                _has_int = True
+                        else:
+                            _has_other = True
+                    else:
+                        _has_other = True
+                _type_count = sum([_has_int, _has_str, _has_float,
+                                   _has_container, _has_other])
+                if _type_count > 1:
+                    return ValueType(VKind.MIXED)
+            # --- First-element fast paths (homogeneous lists) ---
             first = node.elts[0]
             if isinstance(first, ast.Constant):
                 if isinstance(first.value, str):
@@ -15186,14 +15290,6 @@ class CodeGen:
                     return ValueType(VKind.LIST)
                 if self._is_dict_expr(first):
                     return ValueType(VKind.DICT)
-            # Mixed-type list: first element is scalar but list contains
-            # containers (lists, dicts, tuples). E.g., [1, [2, 3], 4].
-            # The FpyList stores correct per-element tags at runtime, but
-            # the codegen needs to know it can't assume all elements are int.
-            if any(isinstance(e, (ast.List, ast.ListComp, ast.Tuple,
-                                  ast.Dict, ast.DictComp))
-                   for e in node.elts):
-                return ValueType(VKind.MIXED)
             return ValueType(VKind.INT)
         if isinstance(node, ast.ListComp):
             # Infer from the element expression
@@ -16611,13 +16707,15 @@ class CodeGen:
             # Returning a constant 0 would ignore the runtime value and
             # silently discard the reassigned pointer on every iteration.
             return self._fv_as_int(fv)
-        # FVALUE: return the full fpy_val struct so the runtime tag is
-        # preserved.  All downstream operations (binop, subscript, print,
-        # len, compare) have explicit fpy_val-struct handling that dispatches
-        # correctly based on the runtime tag.  Stripping to bare i64 here
-        # causes the tag to be lost, making downstream code treat int data
-        # as a pointer (crash) or use the wrong operation.
-        if kind == VKind.FVALUE:
+        # FVALUE / MIXED: return the full fpy_val struct so the runtime
+        # tag is preserved.  All downstream operations (binop, subscript,
+        # print, len, compare, method calls) have explicit fpy_val-struct
+        # handling that dispatches correctly based on the runtime tag.
+        # Stripping to bare i64 here causes the tag to be lost, making
+        # downstream code treat int data as a pointer (crash) or use the
+        # wrong operation.  MIXED has the same semantics as FVALUE: the
+        # compile-time type is unknown and the runtime tag must be preserved.
+        if kind in (VKind.FVALUE, VKind.MIXED):
             return fv
         # INT, UNKNOWN -> return as i64
         return self._fv_as_int(fv)
@@ -16864,6 +16962,62 @@ class CodeGen:
     # Control flow
     # -----------------------------------------------------------------
 
+    # -- isinstance type narrowing ----------------------------------
+    _ISINSTANCE_NARROW_MAP: dict[str, 'VKind'] = {
+        "str": VKind.STR, "int": VKind.INT, "float": VKind.FLOAT,
+        "bool": VKind.BOOL, "list": VKind.LIST, "dict": VKind.DICT,
+        "tuple": VKind.TUPLE, "set": VKind.SET,
+    }
+
+    def _detect_isinstance_narrowing(self, test: ast.expr):
+        """Collect isinstance narrowings from *test*.
+
+        Handles:
+        - Simple: ``isinstance(x, T)``
+        - Conjunctive: ``isinstance(x, T) and isinstance(y, U)``
+
+        Returns a list of ``(var_name, alloca, original_tag, target_kind)``
+        tuples, or ``None`` if no narrowing applies.
+        """
+        results: list[tuple] = []
+        if isinstance(test, ast.BoolOp) and isinstance(test.op, ast.And):
+            for val in test.values:
+                n = self._detect_single_isinstance(val)
+                if n is not None:
+                    results.append(n)
+        else:
+            n = self._detect_single_isinstance(test)
+            if n is not None:
+                results.append(n)
+        return results if results else None
+
+    def _detect_single_isinstance(self, test: ast.expr):
+        """Check a single ``isinstance(var, T)`` call for narrowing."""
+        if not isinstance(test, ast.Call):
+            return None
+        if not (isinstance(test.func, ast.Name)
+                and test.func.id == "isinstance"):
+            return None
+        if len(test.args) != 2:
+            return None
+        var_node, type_node = test.args
+        if not isinstance(var_node, ast.Name):
+            return None
+        if not isinstance(type_node, ast.Name):
+            return None
+        target_kind = self._ISINSTANCE_NARROW_MAP.get(type_node.id)
+        if target_kind is None:
+            return None
+        var_name = var_node.id
+        if var_name not in self.variables:
+            return None
+        alloca, current_tag = self.variables[var_name]
+        ck = (current_tag.kind if isinstance(current_tag, ValueType)
+              else self._tag_kind(current_tag))
+        if ck != VKind.MIXED:
+            return None
+        return (var_name, alloca, current_tag, target_kind)
+
     def _emit_if(self, node: ast.If) -> None:
         """Emit if/elif/else."""
         cond = self._emit_condition(node.test)
@@ -16876,9 +17030,21 @@ class CodeGen:
         else:
             self.builder.cbranch(cond, then_block, merge_block)
 
+        # isinstance narrowing: temporarily change the variable's
+        # compile-time type inside the guarded branch so that all
+        # downstream operations (method calls, binops, print, …)
+        # dispatch through the correct native path.
+        narrowing = self._detect_isinstance_narrowing(node.test)
+
         # Then branch
         self.builder.position_at_end(then_block)
+        if narrowing:
+            for _nv, _na, _ot, _tk in narrowing:
+                self.variables[_nv] = (_na, ValueType(_tk))
         self._emit_stmts(node.body)
+        if narrowing:
+            for _nv, _na, _ot, _tk in narrowing:
+                self.variables[_nv] = (_na, _ot)
         if not self.builder.block.is_terminated:
             self.builder.branch(merge_block)
 
@@ -31871,7 +32037,8 @@ class CodeGen:
         _use_fv_dispatch = False
         if isinstance(node.func.value, ast.Name) and node.func.value.id in self.variables:
             _rcv_kind = self._var_kind(node.func.value.id)
-            if _rcv_kind in (VKind.PATH, VKind.PYOBJ):
+            if _rcv_kind in (VKind.PATH, VKind.PYOBJ, VKind.MIXED,
+                            VKind.FVALUE):
                 _use_fv_dispatch = True
 
         if _use_fv_dispatch:
@@ -32138,6 +32305,39 @@ class CodeGen:
             result = self._emit_method_call_float(node, obj)
             if result is not None:
                 return result
+
+        # FpyValue struct (e.g. subscript on a MIXED list): the receiver
+        # is a runtime-tagged value that can't be dispatched statically.
+        # Use fv_call_method* which converts to PyObject* via the runtime
+        # tag and calls the method through CPython.
+        if (isinstance(obj.type, ir.LiteralStructType)
+                and obj.type == fpy_val):
+            rcv_tag = self._fv_tag(obj)
+            rcv_data = self._fv_data_i64(obj)
+            name_ptr = self._make_string_constant(method)
+            out_tag = self._create_entry_alloca(i32, "fvcall.tag")
+            out_data = self._create_entry_alloca(i64, "fvcall.data")
+            n_args = len(node.args)
+            if n_args == 0:
+                self.builder.call(self.runtime["fv_call_method0"],
+                                  [rcv_tag, rcv_data, name_ptr,
+                                   out_tag, out_data])
+            elif n_args == 1:
+                a1t, a1d = self._expr_to_tag_data(node.args[0])
+                self.builder.call(self.runtime["fv_call_method1"],
+                                  [rcv_tag, rcv_data, name_ptr,
+                                   a1t, a1d, out_tag, out_data])
+            elif n_args == 2:
+                a1t, a1d = self._expr_to_tag_data(node.args[0])
+                a2t, a2d = self._expr_to_tag_data(node.args[1])
+                self.builder.call(self.runtime["fv_call_method2"],
+                                  [rcv_tag, rcv_data, name_ptr,
+                                   a1t, a1d, a2t, a2d, out_tag, out_data])
+            else:
+                return self._emit_cpython_method_call(node)
+            result_tag = self.builder.load(out_tag)
+            result_data = self.builder.load(out_data)
+            return self._fv_build_from_slots(result_tag, result_data)
 
         return self._emit_method_call_fallback(node)
 
@@ -33048,6 +33248,12 @@ class CodeGen:
                               [obj, index, tag_slot, data_slot])
             data = self.builder.load(data_slot)
             elem_type = self._get_list_elem_type(node.value)
+            # MIXED element types: return full FpyValue so the runtime
+            # tag is preserved for downstream dispatch (isinstance,
+            # method calls, print, etc.).
+            if elem_type.kind == VKind.MIXED:
+                tag = self.builder.load(tag_slot)
+                return self._fv_build_from_slots(tag, data)
             if elem_type.kind.is_ptr:
                 return self._ensure_ptr(data)
             if elem_type.kind == VKind.FLOAT:

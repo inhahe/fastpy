@@ -572,6 +572,7 @@ void fpy_cpython_to_fv(void *obj, int32_t *out_tag, int64_t *out_data) {
 /* Convert an FpyValue (tag, data) to a PyObject*.
  * Exported wrapper around the static fpy_to_pyobject. */
 void* fpy_cpython_to_pyobj(int32_t tag, int64_t data) {
+    fpy_cpython_init();
     return (void*)fpy_to_pyobject(tag, data);
 }
 
@@ -585,6 +586,7 @@ void* fpy_cpython_to_pyobj(int32_t tag, int64_t data) {
 void fpy_fv_call_method0(int32_t rcv_tag, int64_t rcv_data,
                          const char *name,
                          int32_t *out_tag, int64_t *out_data) {
+    fpy_cpython_init();
     PyObject *py_rcv = fpy_to_pyobject(rcv_tag, rcv_data);
     PyObject *method = PyObject_GetAttrString(py_rcv, name);
     if (!method) {
@@ -610,6 +612,7 @@ void fpy_fv_call_method1(int32_t rcv_tag, int64_t rcv_data,
                          const char *name,
                          int32_t a1_tag, int64_t a1_data,
                          int32_t *out_tag, int64_t *out_data) {
+    fpy_cpython_init();
     PyObject *py_rcv = fpy_to_pyobject(rcv_tag, rcv_data);
     PyObject *method = PyObject_GetAttrString(py_rcv, name);
     if (!method) {
@@ -638,6 +641,7 @@ void fpy_fv_call_method2(int32_t rcv_tag, int64_t rcv_data,
                          int32_t a1_tag, int64_t a1_data,
                          int32_t a2_tag, int64_t a2_data,
                          int32_t *out_tag, int64_t *out_data) {
+    fpy_cpython_init();
     PyObject *py_rcv = fpy_to_pyobject(rcv_tag, rcv_data);
     PyObject *method = PyObject_GetAttrString(py_rcv, name);
     if (!method) {
@@ -669,6 +673,7 @@ void fpy_fv_call_method3(int32_t rcv_tag, int64_t rcv_data,
                          int32_t a2_tag, int64_t a2_data,
                          int32_t a3_tag, int64_t a3_data,
                          int32_t *out_tag, int64_t *out_data) {
+    fpy_cpython_init();
     PyObject *py_rcv = fpy_to_pyobject(rcv_tag, rcv_data);
     PyObject *method = PyObject_GetAttrString(py_rcv, name);
     if (!method) {
@@ -701,6 +706,7 @@ void fpy_fv_call_method3(int32_t rcv_tag, int64_t rcv_data,
 void fpy_fv_getattr(int32_t rcv_tag, int64_t rcv_data,
                     const char *name,
                     int32_t *out_tag, int64_t *out_data) {
+    fpy_cpython_init();
     PyObject *py_rcv = fpy_to_pyobject(rcv_tag, rcv_data);
     PyObject *result = PyObject_GetAttrString(py_rcv, name);
     Py_DECREF(py_rcv);
