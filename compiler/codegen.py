@@ -12588,7 +12588,18 @@ class CodeGen:
             native_result = self._emit_native_module_call(
                 mod_name, func_name, rhs)
             if native_result is not None:
-                type_tag = self._infer_type_tag(rhs, native_result)
+                # If the native implementation returned an fpy_val struct,
+                # the result type is only known at runtime (e.g. json.loads
+                # can return dict, list, str, int, etc.).  Tag as FVALUE
+                # to preserve the runtime tag through load/store.  Static
+                # type inference would lie (e.g. claiming DICT) and cause
+                # _unwrap_fv_for_tag to strip the runtime tag, leading to
+                # wrong dispatch for len(), subscript, binop, etc.
+                if (isinstance(native_result.type, ir.LiteralStructType)
+                        and native_result.type == fpy_val):
+                    type_tag = ValueType(VKind.FVALUE)
+                else:
+                    type_tag = self._infer_type_tag(rhs, native_result)
                 self._store_variable(target_name, native_result, type_tag)
                 return True
             pyobj_ptr = self._emit_cpython_call_raw(rhs)
@@ -14374,7 +14385,7 @@ class CodeGen:
             if node.func.id in native_imports:
                 mod, fn = native_imports[node.func.id]
                 if fn == "loads" and "json" in mod:
-                    return ValueType(VKind.DICT)
+                    return None  # json.loads returns any type; runtime tag decides
                 elif fn in ("getcwd", "path_join", "path_basename",
                            "path_dirname", "join", "basename", "dirname"):
                     return ValueType(VKind.STR)
@@ -14421,7 +14432,7 @@ class CodeGen:
             mod = node.func.value.id
             fn = node.func.attr
             if mod == "json" and fn == "loads":
-                return ValueType(VKind.DICT)
+                return None  # json.loads returns any type; runtime tag decides
             if mod == "dict" and fn == "fromkeys":
                 return ValueType(VKind.DICT)
             if mod == "json" and fn == "dumps":
@@ -25662,6 +25673,13 @@ class CodeGen:
         # ── Fast path: list + list → concat, list * int → repeat ───────
         if lk == VKind.LIST and rk == VKind.LIST and op == ast.Add:
             return self._rt_call("list_concat", [ltv, rtv])
+        # list + pyobj or pyobj + list: convert pyobj to native list first
+        if lk == VKind.LIST and rk == VKind.PYOBJ and op == ast.Add:
+            r_native = self._rt_call("cpython_to_list", [rtv])
+            return self._rt_call("list_concat", [ltv, r_native])
+        if lk == VKind.PYOBJ and rk == VKind.LIST and op == ast.Add:
+            l_native = self._rt_call("cpython_to_list", [ltv])
+            return self._rt_call("list_concat", [l_native, rtv])
         if lk == VKind.LIST and rk in (VKind.INT, VKind.BOOL) and op == ast.Mult:
             return self._rt_call("list_repeat", [ltv, rtv])
         if lk in (VKind.INT, VKind.BOOL) and rk == VKind.LIST and op == ast.Mult:
@@ -25670,6 +25688,13 @@ class CodeGen:
         # ── Fast path: dict | dict → merge ─────────────────────────────
         if lk == VKind.DICT and rk == VKind.DICT and op == ast.BitOr:
             return self._rt_call("dict_merge", [ltv, rtv])
+        # dict | pyobj or pyobj | dict: convert pyobj to native dict first
+        if lk == VKind.DICT and rk == VKind.PYOBJ and op == ast.BitOr:
+            r_native = self._rt_call("cpython_to_dict", [rtv])
+            return self._rt_call("dict_merge", [ltv, r_native])
+        if lk == VKind.PYOBJ and rk == VKind.DICT and op == ast.BitOr:
+            l_native = self._rt_call("cpython_to_dict", [ltv])
+            return self._rt_call("dict_merge", [l_native, rtv])
 
         # ── Fast path: set operations ──────────────────────────────────
         if lk == VKind.SET or rk == VKind.SET:
@@ -28918,7 +28943,7 @@ class CodeGen:
         "os.path.getsize": "int",
         "os.listdir": "list:str",
         # json
-        "json.dumps": "str", "json.loads": "dict",
+        "json.dumps": "str", "json.loads": "pyobj",
         # textwrap — dedent/indent have native impls; fill does NOT
         "textwrap.dedent": "str", "textwrap.indent": "str",
         # string
@@ -28929,7 +28954,7 @@ class CodeGen:
         # random
         "random.random": "float", "random.uniform": "float",
         "random.randint": "int", "random.randrange": "int",
-        "random.choice": "int",
+        "random.choice": "pyobj",
         # hashlib
         "hashlib.md5": "pyobj", "hashlib.sha256": "pyobj",
         # copy
