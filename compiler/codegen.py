@@ -27405,9 +27405,50 @@ class CodeGen:
             return self._bridge_fallback_expr(node, "dict() with non-literal argument")
 
     def _emit_builtin_tuple(self, node):
-        # tuple(iter) — build list, then mark as tuple for correct repr
+        # tuple(iter) — build a list from the iterable, then mark as tuple
         if len(node.args) == 1:
-            result = self._emit_expr_value(node.args[0])
+            arg = node.args[0]
+            # tuple(str) → tuple of single-char strings
+            _is_str = False
+            if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+                _is_str = True
+            elif isinstance(arg, ast.Name) and arg.id in self.variables:
+                _is_str = (self._var_kind(arg.id) == VKind.STR)
+            if _is_str:
+                s = self._emit_expr_value(arg)
+                s = self._ensure_ptr(s)
+                result = self.builder.call(self.runtime["str_to_list"], [s])
+                self.builder.call(self.runtime["list_mark_tuple"], [result])
+                return result
+            # tuple(dict) → tuple of keys
+            if self._is_dict_expr(arg):
+                result = self._emit_expr_value(arg)
+                result = self._rt_call("dict_keys", [result])
+                result = self._ensure_ptr(result)
+                self.builder.call(self.runtime["list_mark_tuple"], [result])
+                return result
+            # tuple(pyobj) → iterate CPython iterable
+            _is_pyobj = False
+            if isinstance(arg, ast.Name) and arg.id in self.variables:
+                _is_pyobj = self._var_kind(arg.id) == VKind.PYOBJ
+            if not _is_pyobj:
+                _is_pyobj = self._is_pyobj_receiver(arg)
+            if not _is_pyobj and isinstance(arg, ast.Call):
+                if (isinstance(arg.func, ast.Attribute)
+                        and self._is_pyobj_receiver(arg.func.value)):
+                    _is_pyobj = True
+            if _is_pyobj:
+                val = self._emit_expr_value(arg)
+                val = self._ensure_ptr(val)
+                result = self._rt_call("cpython_to_list", [val])
+                result = self._ensure_ptr(result)
+                self.builder.call(self.runtime["list_mark_tuple"], [result])
+                return result
+            # tuple(list/tuple) — copy and mark as tuple
+            result = self._emit_expr_value(arg)
+            if self._is_list_expr(arg) or self._is_tuple_expr(arg):
+                result = self._ensure_ptr(result)
+                result = self.builder.call(self.runtime["list_copy"], [result])
             # Ensure the result is a list pointer, then mark as tuple
             if isinstance(result.type, ir.PointerType) or result.type == i8_ptr:
                 self.builder.call(self.runtime["list_mark_tuple"], [result])
@@ -28149,7 +28190,30 @@ class CodeGen:
 
     def _emit_builtin_set(self, node):
         if len(node.args) == 1:
-            arg = self._emit_expr_value(node.args[0])
+            arg_node = node.args[0]
+            # set(str) → set of single-char strings: convert str→list first
+            _is_str = False
+            if isinstance(arg_node, ast.Constant) and isinstance(arg_node.value, str):
+                _is_str = True
+            elif isinstance(arg_node, ast.Name) and arg_node.id in self.variables:
+                _is_str = (self._var_kind(arg_node.id) == VKind.STR)
+            if _is_str:
+                s = self._emit_expr_value(arg_node)
+                s = self._ensure_ptr(s)
+                lst = self.builder.call(self.runtime["str_to_list"], [s])
+                return self._rt_call("set_from_list", [lst])
+            # set(pyobj) → iterate CPython iterable into list, then to set
+            _is_pyobj = False
+            if isinstance(arg_node, ast.Name) and arg_node.id in self.variables:
+                _is_pyobj = self._var_kind(arg_node.id) == VKind.PYOBJ
+            if not _is_pyobj:
+                _is_pyobj = self._is_pyobj_receiver(arg_node)
+            if _is_pyobj:
+                val = self._emit_expr_value(arg_node)
+                val = self._ensure_ptr(val)
+                lst = self._rt_call("cpython_to_list", [val])
+                return self._rt_call("set_from_list", [lst])
+            arg = self._emit_expr_value(arg_node)
             return self._rt_call("set_from_list", [arg])
         if len(node.args) == 0:
             return self.builder.call(self.runtime["dict_new"], [])
