@@ -2252,6 +2252,43 @@ FpyList* fpy_cpython_to_list(void *obj) {
     return result;
 }
 
+/* Convert a CPython dict (PyObject*) to a native FpyDict*.
+ * Iterates via PyDict_Next, converting keys and values to FpyValue.
+ * Non-dict iterables are treated as iterables of (key, value) pairs.
+ * Returns an empty dict on error. */
+FpyDict* fpy_cpython_to_dict(void *obj) {
+    FpyDict *result = fpy_dict_new(4);
+    if (!obj) return result;
+    PyObject *pyobj = (PyObject*)obj;
+    if (PyDict_Check(pyobj)) {
+        PyObject *key, *value;
+        Py_ssize_t pos = 0;
+        while (PyDict_Next(pyobj, &pos, &key, &value)) {
+            FpyValue fk, fv;
+            pyobject_to_fpy(key, &fk.tag, &fk.data.i);
+            pyobject_to_fpy(value, &fv.tag, &fv.data.i);
+            fpy_dict_set(result, fk, fv);
+        }
+        return result;
+    }
+    /* For non-dicts, try iterating as (key, value) pairs */
+    PyObject *iter = PyObject_GetIter(pyobj);
+    if (!iter) { PyErr_Clear(); return result; }
+    PyObject *item;
+    while ((item = PyIter_Next(iter)) != NULL) {
+        if (PyTuple_Check(item) && PyTuple_GET_SIZE(item) == 2) {
+            FpyValue fk, fv;
+            pyobject_to_fpy(PyTuple_GET_ITEM(item, 0), &fk.tag, &fk.data.i);
+            pyobject_to_fpy(PyTuple_GET_ITEM(item, 1), &fv.tag, &fv.data.i);
+            fpy_dict_set(result, fk, fv);
+        }
+        Py_DECREF(item);
+    }
+    if (PyErr_Occurred()) PyErr_Clear();
+    Py_DECREF(iter);
+    return result;
+}
+
 /* Arithmetic on pyobj: call a binary operator via Python C API.
  * op: 0=add, 1=sub, 2=mul, 3=truediv, 4=floordiv, 5=mod, 6=pow
  * Returns result as FpyValue. */

@@ -2100,6 +2100,8 @@ class CodeGen:
         # Convert CPython iterable (PyObject*) to native FpyList*
         ft = ir.FunctionType(i8_ptr, [i8_ptr])
         self.runtime["cpython_to_list"] = ir.Function(self.module, ft, name="fpy_cpython_to_list")
+        # Convert CPython dict (PyObject*) to native FpyDict*
+        self.runtime["cpython_to_dict"] = ir.Function(self.module, ft, name="fpy_cpython_to_dict")
         # pyobj subscript: getitem(obj, key_tag, key_data) → PyObject*
         ft = ir.FunctionType(i8_ptr, [i8_ptr, i32, i64])
         self.runtime["cpython_getitem"] = ir.Function(self.module, ft, name="fpy_cpython_getitem")
@@ -31152,6 +31154,12 @@ class CodeGen:
     def _emit_dict_method_update(self, node, obj):
         if len(node.args) == 1:
             other = self._emit_expr_value(node.args[0])
+            # If the argument is a bridge PyObject (e.g. dict returned from
+            # a CPython call), convert to native FpyDict first.
+            # fastpy_dict_update expects FpyDict*, not raw PyObject*.
+            if (self._is_pyobj_var(node.args[0])
+                    or self._is_pyobj_receiver(node.args[0])):
+                other = self._rt_call("cpython_to_dict", [other])
             self._rt_call("dict_update", [obj, other])
             return obj
         return None
@@ -34116,6 +34124,11 @@ class CodeGen:
             # **dict unpacking: key is None in the AST
             if key_node is None:
                 other = self._emit_expr_value(val_node)
+                # If the unpacked value is a bridge PyObject, convert to
+                # native FpyDict first. dict_update expects FpyDict*.
+                if (self._is_pyobj_var(val_node)
+                        or self._is_pyobj_receiver(val_node)):
+                    other = self._rt_call("cpython_to_dict", [other])
                 # Use dict_update to copy all entries from other into dict_ptr
                 self._rt_call("dict_update", [dict_ptr, other])
                 continue
