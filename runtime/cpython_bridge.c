@@ -552,9 +552,10 @@ void fpy_cpython_call(void *callable, int32_t argc,
     Py_DECREF(result);
 }
 
-/* Convert a PyObject* to FpyValue (tag + data). Used for attribute
- * access on modules: `math.pi` returns a PyFloat which needs to be
- * converted to FpyValue{FLOAT, bits}. */
+/* Convert a PyObject* to FpyValue (tag + data).  CONSUMING: decrefs
+ * the input.  Use only for one-shot values (e.g. return values from
+ * bridge calls) that the caller wants to release after extraction.
+ * For variables that may be accessed again, use fpy_cpython_peek_fv. */
 void fpy_cpython_to_fv(void *obj, int32_t *out_tag, int64_t *out_data) {
     if (!obj) {
         /* NULL → PyErr was set.  pyobject_to_fpy propagates via
@@ -567,6 +568,19 @@ void fpy_cpython_to_fv(void *obj, int32_t *out_tag, int64_t *out_data) {
      * (since we're giving the caller a raw pointer) */
     if (*out_tag == FPY_TAG_OBJ) Py_INCREF((PyObject*)obj);
     Py_DECREF((PyObject*)obj);
+}
+
+/* Convert a PyObject* to FpyValue (tag + data).  BORROWING: does NOT
+ * decref the input.  Safe to call on stored variable references that
+ * will be accessed again later.  Use this instead of cpython_to_fv
+ * whenever the caller does not own the sole reference (e.g. loading
+ * from a variable, printing a value that remains live). */
+void fpy_cpython_peek_fv(void *obj, int32_t *out_tag, int64_t *out_data) {
+    if (!obj) {
+        pyobject_to_fpy(NULL, out_tag, out_data);
+        return;
+    }
+    pyobject_to_fpy((PyObject*)obj, out_tag, out_data);
 }
 
 /* Convert an FpyValue (tag, data) to a PyObject*.

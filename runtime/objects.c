@@ -228,7 +228,20 @@ void fpy_rc_decref(int32_t tag, int64_t data) {
                         while (wr) {
                             FpyWeakRef *next = wr->next;
                             wr->target = NULL;
-                            /* TODO: invoke callbacks if set */
+                            /* Invoke callback if set.  The callback is stored
+                             * as an FpyValue (tag + data).  Tag 0 (NONE) means
+                             * no callback.  Otherwise it should be a closure
+                             * pointer we can call with the weakref as argument. */
+                            if (wr->callback_tag != 0 && wr->callback != 0) {
+                                /* callback(weakref) — call with the weakref
+                                 * itself as the single argument, per CPython
+                                 * weakref semantics. */
+                                extern int64_t fastpy_closure_call1(
+                                    void*, int64_t);
+                                fastpy_closure_call1(
+                                    (void*)(intptr_t)wr->callback,
+                                    (int64_t)(intptr_t)wr);
+                            }
                             wr = next;
                         }
                         /* Free slots (decref each), dynamic_attrs, and the obj */

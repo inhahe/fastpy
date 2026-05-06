@@ -2044,9 +2044,12 @@ class CodeGen:
         ft = ir.FunctionType(void, [i8_ptr, i32, i64, i32, i64, i32, i64,
                                      ir.PointerType(i32), ir.PointerType(i64)])
         self.runtime["cpython_call3"] = ir.Function(self.module, ft, name="fpy_cpython_call3")
-        # to_fv(pyobj, &out_tag, &out_data) — convert PyObject* to FpyValue
+        # to_fv(pyobj, &out_tag, &out_data) — CONSUMING convert: decrefs input
         ft = ir.FunctionType(void, [i8_ptr, ir.PointerType(i32), ir.PointerType(i64)])
         self.runtime["cpython_to_fv"] = ir.Function(self.module, ft, name="fpy_cpython_to_fv")
+        # peek_fv(pyobj, &out_tag, &out_data) — BORROWING convert: no decref
+        # Safe for stored variable refs that may be accessed again.
+        self.runtime["cpython_peek_fv"] = ir.Function(self.module, ft, name="fpy_cpython_peek_fv")
         # to_pyobj(tag, data) → PyObject* — convert FpyValue to PyObject*
         ft = ir.FunctionType(i8_ptr, [i32, i64])
         self.runtime["cpython_to_pyobj"] = ir.Function(self.module, ft, name="fpy_cpython_to_pyobj")
@@ -23430,7 +23433,9 @@ class CodeGen:
             ptr = self._ensure_ptr(ptr)
             tag_slot = self._create_entry_alloca(i32, "pyvar.tag")
             data_slot = self._create_entry_alloca(i64, "pyvar.data")
-            self.builder.call(self.runtime["cpython_to_fv"],
+            # Use peek_fv (borrow, no decref) — the variable still holds
+            # the PyObject* reference and may be accessed again later.
+            self.builder.call(self.runtime["cpython_peek_fv"],
                               [ptr, tag_slot, data_slot])
             return self._fv_build_from_slots(
                 self.builder.load(tag_slot),
@@ -24968,10 +24973,13 @@ class CodeGen:
         Returns a double (converting int→double via sitofp, float→double
         via bitcast from the FpyValue data)."""
         if isinstance(val.type, ir.PointerType):
-            # pyobj variable — convert through bridge to FpyValue
+            # pyobj variable — convert through bridge to FpyValue.
+            # Use peek_fv (borrow) since the variable still holds the
+            # PyObject* reference and may be accessed again in the same
+            # scope (e.g. inside a loop or used in multiple expressions).
             tag_a = self._create_entry_alloca(i32, "py2num.tag")
             data_a = self._create_entry_alloca(i64, "py2num.data")
-            self.builder.call(self.runtime["cpython_to_fv"],
+            self.builder.call(self.runtime["cpython_peek_fv"],
                               [val, tag_a, data_a])
             tag = self.builder.load(tag_a)
             data = self.builder.load(data_a)
@@ -27316,9 +27324,10 @@ class CodeGen:
                 if (isinstance(arg_node, ast.Name)
                         and arg_node.id in self.variables
                         and self._var_kind(arg_node.id) == VKind.PYOBJ):
+                    # Use peek_fv (borrow) — the variable may be reused.
                     tag_a = self._create_entry_alloca(i32, "int.tag")
                     data_a = self._create_entry_alloca(i64, "int.data")
-                    self.builder.call(self.runtime["cpython_to_fv"],
+                    self.builder.call(self.runtime["cpython_peek_fv"],
                                       [val, tag_a, data_a])
                     return self.builder.load(data_a)
                 return self._rt_call("str_to_int", [val])
