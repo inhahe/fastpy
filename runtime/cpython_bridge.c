@@ -2197,6 +2197,47 @@ void* fpy_cpython_iter_next_raw(void *iter) {
     return (void*)item;
 }
 
+/* Convert a CPython iterable (PyObject*) to a native FpyList*.
+ * Iterates via PyObject_GetIter + PyIter_Next, converting each element
+ * to an FpyValue via pyobject_to_fpy.  Returns an empty list on error. */
+FpyList* fpy_cpython_to_list(void *obj) {
+    FpyList *result = fpy_list_new(8);
+    if (!obj) return result;
+    /* Fast path for lists and tuples — avoid iterator overhead */
+    PyObject *pyobj = (PyObject*)obj;
+    if (PyList_Check(pyobj)) {
+        Py_ssize_t n = PyList_GET_SIZE(pyobj);
+        for (Py_ssize_t i = 0; i < n; i++) {
+            FpyValue v;
+            pyobject_to_fpy(PyList_GET_ITEM(pyobj, i), &v.tag, &v.data.i);
+            fpy_list_append(result, v);
+        }
+        return result;
+    }
+    if (PyTuple_Check(pyobj)) {
+        Py_ssize_t n = PyTuple_GET_SIZE(pyobj);
+        for (Py_ssize_t i = 0; i < n; i++) {
+            FpyValue v;
+            pyobject_to_fpy(PyTuple_GET_ITEM(pyobj, i), &v.tag, &v.data.i);
+            fpy_list_append(result, v);
+        }
+        return result;
+    }
+    /* General path: use iterator protocol */
+    PyObject *iter = PyObject_GetIter(pyobj);
+    if (!iter) { PyErr_Clear(); return result; }
+    PyObject *item;
+    while ((item = PyIter_Next(iter)) != NULL) {
+        FpyValue v;
+        pyobject_to_fpy(item, &v.tag, &v.data.i);
+        Py_DECREF(item);
+        fpy_list_append(result, v);
+    }
+    if (PyErr_Occurred()) PyErr_Clear();
+    Py_DECREF(iter);
+    return result;
+}
+
 /* Arithmetic on pyobj: call a binary operator via Python C API.
  * op: 0=add, 1=sub, 2=mul, 3=truediv, 4=floordiv, 5=mod, 6=pow
  * Returns result as FpyValue. */

@@ -2094,6 +2094,9 @@ class CodeGen:
         # raw next(iterator) → PyObject* or NULL
         ft = ir.FunctionType(i8_ptr, [i8_ptr])
         self.runtime["cpython_iter_next_raw"] = ir.Function(self.module, ft, name="fpy_cpython_iter_next_raw")
+        # Convert CPython iterable (PyObject*) to native FpyList*
+        ft = ir.FunctionType(i8_ptr, [i8_ptr])
+        self.runtime["cpython_to_list"] = ir.Function(self.module, ft, name="fpy_cpython_to_list")
         # pyobj subscript: getitem(obj, key_tag, key_data) → PyObject*
         ft = ir.FunctionType(i8_ptr, [i8_ptr, i32, i64])
         self.runtime["cpython_getitem"] = ir.Function(self.module, ft, name="fpy_cpython_getitem")
@@ -18028,6 +18031,11 @@ class CodeGen:
             return  # yield from in non-generator — skip
         source = self._emit_expr_value(node.value)
         if isinstance(source.type, ir.PointerType):
+            # If the source is a bridge PyObject, convert to native list
+            # before extending (list_extend expects FpyList*).
+            if (self._is_pyobj_var(node.value)
+                    or self._is_pyobj_receiver(node.value)):
+                source = self._rt_call("cpython_to_list", [source])
             self._rt_call("list_extend", [gen_list, source])
         else:
             self._bridge_fallback_stmt(node, "yield from requires an iterable")
@@ -30001,15 +30009,14 @@ class CodeGen:
         tv = self._emit_expr(node.args[0])
         kind = tv.vtype.kind
 
-        # PyObj: convert to native list via bridge, then sort natively
+        # PyObj: convert to native list via bridge, then sort natively.
+        # IMPORTANT: must use cpython_to_list (not cpython_to_fv) because
+        # cpython_to_fv Py_DECREFs the input, which frees the PyObject
+        # while the variable still holds a pointer to it — subsequent
+        # accesses through that variable crash with access violation.
         if kind == VKind.PYOBJ:
             ptr = tv.as_ptr(self.builder)
-            tag_slot = self._create_entry_alloca(i32, "sort.cvt.tag")
-            data_slot = self._create_entry_alloca(i64, "sort.cvt.data")
-            self.builder.call(self.runtime["cpython_to_fv"],
-                              [ptr, tag_slot, data_slot])
-            data = self.builder.load(data_slot)
-            native_list = self._ensure_ptr(data)
+            native_list = self._rt_call("cpython_to_list", [ptr])
             result = self._rt_call("list_sorted", [native_list])
             if reverse:
                 result = self._rt_call("list_reversed", [result])
@@ -30484,6 +30491,9 @@ class CodeGen:
             return
         elif method == "extend" and len(node.args) == 1:
             other = self._emit_expr_value(node.args[0])
+            if (self._is_pyobj_var(node.args[0])
+                    or self._is_pyobj_receiver(node.args[0])):
+                other = self._rt_call("cpython_to_list", [other])
             self._rt_call("list_extend", [elem_ptr, other])
             return
         elif method == "pop" and len(node.args) == 0:
@@ -30807,6 +30817,13 @@ class CodeGen:
     def _emit_list_method_extend(self, node, obj):
         if len(node.args) == 1:
             other = self._emit_expr_value(node.args[0])
+            # If the argument is a bridge PyObject (e.g. tuple returned
+            # from a CPython method call), convert it to a native list
+            # first.  fastpy_list_extend expects FpyList*, so passing a
+            # raw PyObject* reads garbage for length/items and crashes.
+            if (self._is_pyobj_var(node.args[0])
+                    or self._is_pyobj_receiver(node.args[0])):
+                other = self._rt_call("cpython_to_list", [other])
             self._rt_call("list_extend", [obj, other])
             return obj
         return None

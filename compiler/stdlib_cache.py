@@ -542,6 +542,14 @@ def _get_native_modules() -> set[str]:
         }
 
 
+# Guard against re-entrant calls during transitive resolution.
+# When test_compilability("A") triggers resolution of A's deps, which
+# tests B, which imports A again — without this guard we'd recurse
+# infinitely.  Treating in-progress modules as "not compilable" is safe:
+# the dep simply falls back to bridge import during the test.
+_testing_in_progress: set[str] = set()
+
+
 def test_compilability(module_name: str, source_path: Path,
                        expanded_source: str | None = None) -> tuple[bool, str | None, str | None]:
     """Test whether a stdlib module can be compiled by fastpy.
@@ -549,28 +557,94 @@ def test_compilability(module_name: str, source_path: Path,
     When *expanded_source* is provided (from star-import expansion), use
     it instead of reading from *source_path*.
 
+    The test mirrors the real compilation pipeline: transitive stdlib
+    imports are resolved and merged (so the test covers the same code
+    the user will actually run), and after successful compilation the
+    resulting executable is test-run to catch runtime crashes (segfaults,
+    access violations, etc.) that static compilation alone can't detect.
+
     Returns (compilable, prefixed_source_or_none, error_or_none).
     """
-    from compiler.pipeline import _strip_main_block, _prefix_module_defs
+    # Re-entrancy guard: if this module is already being tested (a
+    # transitive dependency brought us back here), treat it as not
+    # compilable to break the cycle.  The real pipeline handles this
+    # via _visited; here we just need to prevent infinite recursion.
+    if module_name in _testing_in_progress:
+        return False, None, "circular dependency during test"
+    _testing_in_progress.add(module_name)
+    try:
+        return _test_compilability_inner(
+            module_name, source_path, expanded_source)
+    finally:
+        _testing_in_progress.discard(module_name)
+
+
+def _test_compilability_inner(
+        module_name: str, source_path: Path,
+        expanded_source: str | None = None,
+) -> tuple[bool, str | None, str | None]:
+    from compiler.pipeline import (_strip_main_block, _prefix_module_defs,
+                                   compile_source)
 
     source = expanded_source or source_path.read_text(encoding="utf-8")
     source = _strip_main_block(source)
     prefix = module_name.replace(".", "_")
     prefixed = _prefix_module_defs(source, prefix)
 
+    # Resolve transitive stdlib imports the same way the real pipeline
+    # does.  Without this, the test compiles the module in isolation
+    # (transitive imports use the CPython bridge), but the real pipeline
+    # inlines them — a module may pass the isolated test yet crash when
+    # its merged dependencies contain patterns the compiler can't handle
+    # (e.g. graphlib merges `types`, which uses `type(lambda: None)`).
+    try:
+        from compiler.pipeline import _resolve_and_merge
+        import sys as _sys
+        _pyver = (_sys.version_info.major, _sys.version_info.minor)
+        _resolver = StdlibResolver(python_version=_pyver)
+        _cache = StdlibCache(python_version=_pyver)
+        merged_source = _resolve_and_merge(
+            source, source_path.parent,
+            _stdlib_resolver=_resolver,
+            _stdlib_cache=_cache)
+        merged_source = _strip_main_block(merged_source)
+        merged_prefixed = _prefix_module_defs(merged_source, prefix)
+    except Exception:
+        # If transitive resolution fails, fall back to isolated test
+        merged_prefixed = prefixed
+
     # Wrap in a minimal program that the compiler can handle
     # (the prefixed source is just function/class defs + assignments —
     # it needs a top-level statement to be valid for compile_source)
-    test_source = prefixed + "\npass\n"
+    test_source = merged_prefixed + "\npass\n"
 
     try:
-        from compiler.pipeline import compile_source
         result = compile_source(test_source)
-        if result.success:
-            return True, prefixed, None
-        else:
+        if not result.success:
             err = "; ".join(str(e) for e in result.errors[:3])
             return False, None, err
+
+        # Test-run the compiled executable to catch runtime crashes
+        # (segfaults, access violations) that static compilation misses.
+        # Results are cached, so this cost is paid only once per module.
+        if result.executable and result.executable.exists():
+            import subprocess
+            try:
+                proc = subprocess.run(
+                    [str(result.executable)],
+                    capture_output=True, timeout=10)
+                if proc.returncode != 0:
+                    return (False, None,
+                            f"runtime crash (exit {proc.returncode})")
+            except subprocess.TimeoutExpired:
+                return False, None, "runtime timeout"
+            except Exception:
+                pass  # can't test-run (e.g. cross-compile) — trust compile
+
+        # Return the ORIGINAL prefixed source (without transitive merges)
+        # for caching.  The real pipeline handles transitive resolution
+        # at merge time; the cache only stores this module's own code.
+        return True, prefixed, None
     except Exception as e:
         return False, None, str(e)[:200]
 

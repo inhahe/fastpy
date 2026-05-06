@@ -856,6 +856,7 @@ extern int64_t fpy_cpython_bool(void*);
 extern void fpy_cpython_flush(void);
 extern void* fpy_cpython_iter(void*);
 extern int32_t fpy_cpython_iter_next(void*, int32_t*, int64_t*);
+extern FpyList* fpy_cpython_to_list(void*);
 extern void fpy_jit_exec(const char*);
 extern void* fpy_jit_import(const char*);
 extern void fpy_rc_incref(int32_t, int64_t);
@@ -949,6 +950,7 @@ static FpySymEntry fpy_jit_symbols[] = {
     SYM(fpy_fv_getattr),
     SYM(fpy_cpython_len), SYM(fpy_cpython_bool),
     SYM(fpy_cpython_flush), SYM(fpy_cpython_iter), SYM(fpy_cpython_iter_next),
+    SYM(fpy_cpython_to_list),
     SYM(fpy_jit_exec), SYM(fpy_jit_import),
     SYM(fpy_rc_incref), SYM(fpy_rc_decref),
     SYM(fpy_cpython_binop), SYM(fpy_cpython_rbinop),
