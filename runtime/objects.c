@@ -129,8 +129,10 @@ static void fpy_dict_destroy(FpyDict *dict) {
 void fpy_rc_incref(int32_t tag, int64_t data) {
     if (data == 0) return;  /* NULL pointer guard */
     switch (tag) {
-        case FPY_TAG_LIST: case FPY_TAG_SET:
+        case FPY_TAG_LIST:
             fpy_incref(&((FpyList*)(intptr_t)data)->refcount); break;
+        case FPY_TAG_SET:
+            fpy_incref(&((FpyDict*)(intptr_t)data)->refcount); break;
         case FPY_TAG_DICT:
             fpy_incref(&((FpyDict*)(intptr_t)data)->refcount); break;
         case FPY_TAG_OBJ: {
@@ -179,9 +181,13 @@ void fpy_rc_decref(int32_t tag, int64_t data) {
                 if (h) free(h);
             }
             break;
-        case FPY_TAG_LIST: case FPY_TAG_SET:
+        case FPY_TAG_LIST:
             if (fpy_decref(&((FpyList*)(intptr_t)data)->refcount))
                 fpy_list_destroy((FpyList*)(intptr_t)data);
+            break;
+        case FPY_TAG_SET:
+            if (fpy_decref(&((FpyDict*)(intptr_t)data)->refcount))
+                fpy_dict_destroy((FpyDict*)(intptr_t)data);
             break;
         case FPY_TAG_DICT:
             if (fpy_decref(&((FpyDict*)(intptr_t)data)->refcount))
