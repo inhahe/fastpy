@@ -27944,6 +27944,165 @@ class CodeGen:
         return self._bridge_fallback_expr(node, f"{name}() with unsupported args")
 
 
+    # -- _emit_call_expr helpers ------------------------------------
+
+    def _emit_static_method_call(self, node: ast.Call):
+        """Handle static method calls: str.maketrans, int.from_bytes,
+        dict.fromkeys.  Returns the result or None if not matched."""
+        cls_name = node.func.value.id
+        method = node.func.attr
+        if cls_name == "str" and method == "maketrans" and len(node.args) == 2:
+            from_chars = self._emit_expr_value(node.args[0])
+            to_chars = self._emit_expr_value(node.args[1])
+            return self._rt_call("str_maketrans", [from_chars, to_chars])
+        if cls_name == "int" and method == "from_bytes" and len(node.args) >= 2:
+            b = self._emit_expr_value(node.args[0])
+            byteorder = self._emit_expr_value(node.args[1])
+            blen = self._rt_call("str_len", [b])
+            return self._rt_call("int_from_bytes", [b, blen, byteorder])
+        if cls_name == "dict" and method == "fromkeys":
+            if len(node.args) == 1:
+                keys = self._emit_expr_value(node.args[0])
+                return self._rt_call("dict_fromkeys_none", [keys])
+            if len(node.args) == 2:
+                keys = self._emit_expr_value(node.args[0])
+                val = self._emit_expr_value(node.args[1])
+                tag_ir, data_ir = self._to_tag_data_ir(val, node.args[1])
+                return self._rt_call("dict_fromkeys", [keys, tag_ir, data_ir])
+        return None
+
+    def _emit_unknown_builtin_call(self, node: ast.Call,
+                                   name: str) -> ir.Value:
+        """Route an unknown builtin (bytearray, frozenset, slice, complex,
+        etc.) through the CPython bridge."""
+        builtin_name = self._make_string_constant("builtins")
+        builtins_mod = self.builder.call(
+            self.runtime["cpython_import"], [builtin_name])
+        func_name = self._make_string_constant(name)
+        callable_ptr = self.builder.call(
+            self.runtime["cpython_getattr"],
+            [builtins_mod, func_name])
+        out_tag = self._create_entry_alloca(i32, "pyblt.tag")
+        out_data = self._create_entry_alloca(i64, "pyblt.data")
+        n_args = len(node.args)
+        if n_args == 0:
+            self.builder.call(self.runtime["cpython_call0"],
+                              [callable_ptr, out_tag, out_data])
+        elif n_args == 1:
+            arg = self._emit_expr_value(node.args[0])
+            t_ir, d_ir = self._to_tag_data_ir(arg, node.args[0])
+            self.builder.call(self.runtime["cpython_call1"],
+                              [callable_ptr,
+                               t_ir, d_ir,
+                               out_tag, out_data])
+        elif n_args == 2:
+            a1 = self._emit_expr_value(node.args[0])
+            t1_ir, d1_ir = self._to_tag_data_ir(a1, node.args[0])
+            a2 = self._emit_expr_value(node.args[1])
+            t2_ir, d2_ir = self._to_tag_data_ir(a2, node.args[1])
+            self.builder.call(self.runtime["cpython_call2"],
+                              [callable_ptr,
+                               t1_ir, d1_ir,
+                               t2_ir, d2_ir,
+                               out_tag, out_data])
+        elif n_args == 3:
+            a1 = self._emit_expr_value(node.args[0])
+            t1_ir, d1_ir = self._to_tag_data_ir(a1, node.args[0])
+            a2 = self._emit_expr_value(node.args[1])
+            t2_ir, d2_ir = self._to_tag_data_ir(a2, node.args[1])
+            a3 = self._emit_expr_value(node.args[2])
+            t3_ir, d3_ir = self._to_tag_data_ir(a3, node.args[2])
+            self.builder.call(self.runtime["cpython_call3"],
+                              [callable_ptr,
+                               t1_ir, d1_ir,
+                               t2_ir, d2_ir,
+                               t3_ir, d3_ir,
+                               out_tag, out_data])
+        else:
+            # 4+ args: use call_kw with 0 kwargs
+            tags_alloca = self.builder.alloca(ir.ArrayType(i32, n_args))
+            data_alloca = self.builder.alloca(ir.ArrayType(i64, n_args))
+            for i, arg_node in enumerate(node.args):
+                val = self._emit_expr_value(arg_node)
+                t_ir, d_ir = self._to_tag_data_ir(val, arg_node)
+                tp = self.builder.gep(tags_alloca, [ir.Constant(i64, 0), ir.Constant(i32, i)])
+                self.builder.store(t_ir, tp)
+                dp = self.builder.gep(data_alloca, [ir.Constant(i64, 0), ir.Constant(i32, i)])
+                self.builder.store(d_ir, dp)
+            t_ptr = self.builder.gep(tags_alloca, [ir.Constant(i64, 0), ir.Constant(i32, 0)])
+            d_ptr = self.builder.gep(data_alloca, [ir.Constant(i64, 0), ir.Constant(i32, 0)])
+            kn = ir.Constant(ir.PointerType(i8_ptr), None)
+            kt = ir.Constant(ir.PointerType(i32), None)
+            kd = ir.Constant(ir.PointerType(i64), None)
+            self.builder.call(self.runtime["cpython_call_kw"],
+                              [callable_ptr, ir.Constant(i32, n_args),
+                               t_ptr, d_ptr, ir.Constant(i32, 0),
+                               kn, kt, kd, out_tag, out_data])
+        ret_tag = self.builder.load(out_tag)
+        ret_data = self.builder.load(out_data)
+        return self._fv_build_from_slots(ret_tag, ret_data)
+
+    def _emit_call_on_call(self, node: ast.Call):
+        """Handle Call-on-Call patterns: f(3)(5), C()(5), etc.
+        The inner call might return a closure or an object with __call__.
+        Returns the result or None if not matched."""
+        callee = self._emit_expr_value(node.func)
+        callee = self._ensure_ptr(callee)
+        if not isinstance(callee.type, ir.PointerType):
+            return None
+        # Check if the inner call returns a closure
+        inner_returns_closure = False
+        if isinstance(node.func.func, ast.Name):
+            inner_name = node.func.func.id
+            for full_name in self._closure_info:
+                if full_name.startswith(f"{inner_name}."):
+                    inner_returns_closure = True
+                    break
+            if (inner_name in self.variables
+                    and self._var_kind(inner_name) == VKind.CLOSURE):
+                inner_returns_closure = True
+
+        if inner_returns_closure:
+            # Use call_ptr dispatch (handles closures and raw func ptrs)
+            n_args = len(node.args)
+            if n_args == 0:
+                return self.builder.call(
+                    self.runtime["call_ptr0"], [callee])
+            elif n_args == 1:
+                a = self._emit_expr_value(node.args[0])
+                if isinstance(a.type, ir.PointerType):
+                    a = self.builder.ptrtoint(a, i64)
+                elif isinstance(a.type, ir.IntType) and a.type.width != 64:
+                    a = self.builder.zext(a, i64)
+                return self.builder.call(
+                    self.runtime["call_ptr1"], [callee, a])
+            elif n_args == 2:
+                a1 = self._emit_expr_value(node.args[0])
+                a2 = self._emit_expr_value(node.args[1])
+                if isinstance(a1.type, ir.PointerType):
+                    a1 = self.builder.ptrtoint(a1, i64)
+                if isinstance(a2.type, ir.PointerType):
+                    a2 = self.builder.ptrtoint(a2, i64)
+                return self.builder.call(
+                    self.runtime["call_ptr2"], [callee, a1, a2])
+        else:
+            # Object with __call__
+            name_ptr = self._make_string_constant("__call__")
+            if len(node.args) == 0:
+                return self.builder.call(
+                    self.runtime["obj_call_method0"],
+                    [callee, name_ptr])
+            elif len(node.args) == 1:
+                a = self._emit_expr_value(node.args[0])
+                if isinstance(a.type, ir.PointerType):
+                    a = self.builder.ptrtoint(a, i64)
+                elif isinstance(a.type, ir.IntType) and a.type.width != 64:
+                    a = self.builder.zext(a, i64)
+                return self.builder.call(
+                    self.runtime["obj_call_method1"],
+                    [callee, name_ptr, a])
+        return None
+
     def _emit_call_expr(self, node: ast.Call) -> ir.Value:
         """Emit a function call as an expression (return value is used)."""
         # Namedtuple instance construction: P(3, 4) where P = namedtuple(...)
@@ -27965,38 +28124,12 @@ class CodeGen:
                 func=ast.Name(id=node.func.attr, ctx=ast.Load()),
                 args=node.args, keywords=node.keywords)
             return self._emit_constructor(synth)
-        # str.maketrans(from, to) — static method on str class
+        # Static method calls: str.maketrans, int.from_bytes, dict.fromkeys
         if (isinstance(node.func, ast.Attribute)
-                and isinstance(node.func.value, ast.Name)
-                and node.func.value.id == "str"
-                and node.func.attr == "maketrans"
-                and len(node.args) == 2):
-            from_chars = self._emit_expr_value(node.args[0])
-            to_chars = self._emit_expr_value(node.args[1])
-            return self._rt_call("str_maketrans", [from_chars, to_chars])
-        # int.from_bytes(bytes, byteorder)
-        if (isinstance(node.func, ast.Attribute)
-                and isinstance(node.func.value, ast.Name)
-                and node.func.value.id == "int"
-                and node.func.attr == "from_bytes"
-                and len(node.args) >= 2):
-            b = self._emit_expr_value(node.args[0])
-            byteorder = self._emit_expr_value(node.args[1])
-            blen = self._rt_call("str_len", [b])
-            return self._rt_call("int_from_bytes", [b, blen, byteorder])
-        # dict.fromkeys(keys) / dict.fromkeys(keys, value)
-        if (isinstance(node.func, ast.Attribute)
-                and isinstance(node.func.value, ast.Name)
-                and node.func.value.id == "dict"
-                and node.func.attr == "fromkeys"):
-            if len(node.args) == 1:
-                keys = self._emit_expr_value(node.args[0])
-                return self._rt_call("dict_fromkeys_none", [keys])
-            if len(node.args) == 2:
-                keys = self._emit_expr_value(node.args[0])
-                val = self._emit_expr_value(node.args[1])
-                tag_ir, data_ir = self._to_tag_data_ir(val, node.args[1])
-                return self._rt_call("dict_fromkeys", [keys, tag_ir, data_ir])
+                and isinstance(node.func.value, ast.Name)):
+            result = self._emit_static_method_call(node)
+            if result is not None:
+                return result
         # Native module method call: asyncio.run(), json.loads(), etc.
         if (isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)):
@@ -28110,80 +28243,13 @@ class CodeGen:
 
         # Unknown builtins: route through CPython bridge
         # This handles bytearray(), frozenset(), slice(), complex(), etc.
-        # Only for names that aren't local variables, user functions, or classes.
         if isinstance(node.func, ast.Name):
             name = node.func.id
             if (name not in self._user_functions
                     and name not in self._user_classes
                     and name not in self.variables
                     and name not in getattr(self, '_bridge_imports', {})):
-                # Not a user function or class — try CPython bridge
-                builtin_name = self._make_string_constant("builtins")
-                builtins_mod = self.builder.call(
-                    self.runtime["cpython_import"], [builtin_name])
-                func_name = self._make_string_constant(name)
-                callable_ptr = self.builder.call(
-                    self.runtime["cpython_getattr"],
-                    [builtins_mod, func_name])
-                out_tag = self._create_entry_alloca(i32, "pyblt.tag")
-                out_data = self._create_entry_alloca(i64, "pyblt.data")
-                n_args = len(node.args)
-                if n_args == 0:
-                    self.builder.call(self.runtime["cpython_call0"],
-                                      [callable_ptr, out_tag, out_data])
-                elif n_args == 1:
-                    arg = self._emit_expr_value(node.args[0])
-                    t_ir, d_ir = self._to_tag_data_ir(arg, node.args[0])
-                    self.builder.call(self.runtime["cpython_call1"],
-                                      [callable_ptr,
-                                       t_ir, d_ir,
-                                       out_tag, out_data])
-                elif n_args == 2:
-                    a1 = self._emit_expr_value(node.args[0])
-                    t1_ir, d1_ir = self._to_tag_data_ir(a1, node.args[0])
-                    a2 = self._emit_expr_value(node.args[1])
-                    t2_ir, d2_ir = self._to_tag_data_ir(a2, node.args[1])
-                    self.builder.call(self.runtime["cpython_call2"],
-                                      [callable_ptr,
-                                       t1_ir, d1_ir,
-                                       t2_ir, d2_ir,
-                                       out_tag, out_data])
-                elif n_args == 3:
-                    a1 = self._emit_expr_value(node.args[0])
-                    t1_ir, d1_ir = self._to_tag_data_ir(a1, node.args[0])
-                    a2 = self._emit_expr_value(node.args[1])
-                    t2_ir, d2_ir = self._to_tag_data_ir(a2, node.args[1])
-                    a3 = self._emit_expr_value(node.args[2])
-                    t3_ir, d3_ir = self._to_tag_data_ir(a3, node.args[2])
-                    self.builder.call(self.runtime["cpython_call3"],
-                                      [callable_ptr,
-                                       t1_ir, d1_ir,
-                                       t2_ir, d2_ir,
-                                       t3_ir, d3_ir,
-                                       out_tag, out_data])
-                else:
-                    # 4+ args: use call_kw with 0 kwargs
-                    tags_alloca = self.builder.alloca(ir.ArrayType(i32, n_args))
-                    data_alloca = self.builder.alloca(ir.ArrayType(i64, n_args))
-                    for i, arg_node in enumerate(node.args):
-                        val = self._emit_expr_value(arg_node)
-                        t_ir, d_ir = self._to_tag_data_ir(val, arg_node)
-                        tp = self.builder.gep(tags_alloca, [ir.Constant(i64, 0), ir.Constant(i32, i)])
-                        self.builder.store(t_ir, tp)
-                        dp = self.builder.gep(data_alloca, [ir.Constant(i64, 0), ir.Constant(i32, i)])
-                        self.builder.store(d_ir, dp)
-                    t_ptr = self.builder.gep(tags_alloca, [ir.Constant(i64, 0), ir.Constant(i32, 0)])
-                    d_ptr = self.builder.gep(data_alloca, [ir.Constant(i64, 0), ir.Constant(i32, 0)])
-                    kn = ir.Constant(ir.PointerType(i8_ptr), None)
-                    kt = ir.Constant(ir.PointerType(i32), None)
-                    kd = ir.Constant(ir.PointerType(i64), None)
-                    self.builder.call(self.runtime["cpython_call_kw"],
-                                      [callable_ptr, ir.Constant(i32, n_args),
-                                       t_ptr, d_ptr, ir.Constant(i32, 0),
-                                       kn, kt, kd, out_tag, out_data])
-                ret_tag = self.builder.load(out_tag)
-                ret_data = self.builder.load(out_data)
-                return self._fv_build_from_slots(ret_tag, ret_data)
+                return self._emit_unknown_builtin_call(node, name)
 
         # Method calls like s.lower(), obj.speak()
         if isinstance(node.func, ast.Attribute):
@@ -28239,66 +28305,10 @@ class CodeGen:
                             direct_args.append(self._emit_expr_value(arg_node))
                         return self.builder.call(call_func, direct_args)
         # Call-on-Call: f(3)(5), C()(5), etc.
-        # The inner call might return a closure or an object with __call__.
-        # Use call_ptr dispatch (auto-detects closures via magic number)
-        # for the common case; fall back to obj_call_method for __call__.
         if isinstance(node.func, ast.Call):
-            callee = self._emit_expr_value(node.func)
-            callee = self._ensure_ptr(callee)
-            if isinstance(callee.type, ir.PointerType):
-                # Check if the inner call returns a closure
-                inner_returns_closure = False
-                if isinstance(node.func.func, ast.Name):
-                    inner_name = node.func.func.id
-                    # Function that contains closures returns a closure
-                    for full_name in self._closure_info:
-                        if full_name.startswith(f"{inner_name}."):
-                            inner_returns_closure = True
-                            break
-                    # Variable tagged as closure
-                    if (inner_name in self.variables
-                            and self._var_kind(inner_name) == VKind.CLOSURE):
-                        inner_returns_closure = True
-
-                if inner_returns_closure:
-                    # Use call_ptr dispatch (handles closures and raw func ptrs)
-                    n_args = len(node.args)
-                    if n_args == 0:
-                        return self.builder.call(
-                            self.runtime["call_ptr0"], [callee])
-                    elif n_args == 1:
-                        a = self._emit_expr_value(node.args[0])
-                        if isinstance(a.type, ir.PointerType):
-                            a = self.builder.ptrtoint(a, i64)
-                        elif isinstance(a.type, ir.IntType) and a.type.width != 64:
-                            a = self.builder.zext(a, i64)
-                        return self.builder.call(
-                            self.runtime["call_ptr1"], [callee, a])
-                    elif n_args == 2:
-                        a1 = self._emit_expr_value(node.args[0])
-                        a2 = self._emit_expr_value(node.args[1])
-                        if isinstance(a1.type, ir.PointerType):
-                            a1 = self.builder.ptrtoint(a1, i64)
-                        if isinstance(a2.type, ir.PointerType):
-                            a2 = self.builder.ptrtoint(a2, i64)
-                        return self.builder.call(
-                            self.runtime["call_ptr2"], [callee, a1, a2])
-                else:
-                    # Object with __call__
-                    name_ptr = self._make_string_constant("__call__")
-                    if len(node.args) == 0:
-                        return self.builder.call(
-                            self.runtime["obj_call_method0"],
-                            [callee, name_ptr])
-                    elif len(node.args) == 1:
-                        a = self._emit_expr_value(node.args[0])
-                        if isinstance(a.type, ir.PointerType):
-                            a = self.builder.ptrtoint(a, i64)
-                        elif isinstance(a.type, ir.IntType) and a.type.width != 64:
-                            a = self.builder.zext(a, i64)
-                        return self.builder.call(
-                            self.runtime["obj_call_method1"],
-                            [callee, name_ptr, a])
+            result = self._emit_call_on_call(node)
+            if result is not None:
+                return result
         # Try indirect function pointer call
         if isinstance(node.func, ast.Name) and node.func.id in self.variables:
             result = self._try_indirect_func_call(node)
