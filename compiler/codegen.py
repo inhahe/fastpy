@@ -126,6 +126,7 @@ FPY_TAG_SET = 9
 FPY_TAG_BIGINT = 10
 FPY_TAG_COMPLEX = 11
 FPY_TAG_DECIMAL = 12
+FPY_TAG_UNDEF = -1       # sentinel: variable alloca exists but never assigned
 
 
 # ── Phase 1 of refactor: TypedValue foundation ───────────────────────
@@ -12985,6 +12986,14 @@ class CodeGen:
 
         value = self._emit_expr_value(node.value)
 
+        # If the RHS raised an exception (e.g. 10 / 0 in a try block),
+        # bail before storing — the variable should remain UNDEF so that
+        # accessing it later correctly raises NameError, matching CPython.
+        if not self.builder.block.is_terminated:
+            self._emit_try_bail_if_exc()
+        if self.builder.block.is_terminated:
+            return
+
         # Track namedtuple type assignments: P = namedtuple("P", ["x", "y"])
         # The namedtuple() call sets _last_namedtuple_info; we connect it
         # to the target variable name so P(3, 4) can be intercepted later.
@@ -16003,11 +16012,14 @@ class CodeGen:
         return alloca
 
     def _entry_store_fv_none(self, alloca: ir.AllocaInstr) -> None:
-        """Store a zeroed FpyValue (tag=NONE, data=0) into `alloca` in the
-        entry block, after all allocas.
+        """Store an undefined-sentinel FpyValue (tag=UNDEF, data=0) into
+        `alloca` in the entry block, after all allocas.
 
-        Used to initialize FV-locals so that decref on the first loop
-        iteration is safe (loads a valid NONE tag instead of garbage).
+        Used to initialize FV-locals so that:
+        1. decref on the first store is safe (tag=UNDEF, data=0 → rc_decref
+           hits the NULL-pointer guard and returns immediately), and
+        2. loading an uninitialized variable at runtime raises NameError
+           (detected in _load_variable by checking tag == UNDEF).
         Uses ir.Constant to avoid creating instructions that would violate
         dominance when placed in the entry block.
         """
@@ -16025,9 +16037,12 @@ class CodeGen:
             self.builder.position_at_end(entry_block)
         # Use ir.Constant (not _fv_none() which creates insertvalue
         # instructions) to avoid dominance violations.
-        zero_fv = ir.Constant(fpy_val, (ir.Constant(i32, FPY_TAG_NONE),
-                                         ir.Constant(i64, 0)))
-        self.builder.store(zero_fv, alloca)
+        # Tag = UNDEF (-1): signals "never assigned."  _load_variable
+        # checks this and emits NameError.  rc_decref is safe because
+        # data=0 triggers the NULL-pointer early return.
+        undef_fv = ir.Constant(fpy_val, (ir.Constant(i32, FPY_TAG_UNDEF),
+                                          ir.Constant(i64, 0)))
+        self.builder.store(undef_fv, alloca)
         self.builder.position_at_end(saved_block)
 
     # Flip this to True to store locals as FpyValue. Globals and closure
@@ -16618,6 +16633,42 @@ class CodeGen:
             return self._ensure_ptr(data)
         return data
 
+    def _check_fv_undef(self, fv: ir.Value, name: str) -> ir.Value:
+        """Check if a loaded FpyValue has the UNDEF tag (never assigned).
+
+        Emits a runtime NameError if so, matching CPython semantics for
+        accessing a variable that was never defined (or whose assignment
+        was interrupted by an exception in a try block).  Returns the
+        original fpy_val struct unchanged — the caller proceeds only if
+        the ok-block is reached.  The cost is one icmp + one predicted-
+        not-taken branch per load.
+        """
+        rt_tag = self.builder.extract_value(fv, 0, name=f"{name}.rtag")
+        is_undef = self.builder.icmp_signed(
+            "==", rt_tag, ir.Constant(i32, FPY_TAG_UNDEF))
+        undef_block = self._new_block(f"{name}.undef")
+        ok_block = self._new_block(f"{name}.ok")
+        self.builder.cbranch(is_undef, undef_block, ok_block)
+
+        self.builder.position_at_end(undef_block)
+        ne_name_ptr = self._make_string_constant("NameError")
+        ne_exc_id = self.builder.call(
+            self.runtime["exc_name_to_id"], [ne_name_ptr])
+        ne_msg_ptr = self._make_string_constant(
+            f"name '{name}' is not defined")
+        self.builder.call(self.runtime["raise"],
+                          [ne_exc_id, ne_msg_ptr])
+        if not self._in_try_block:
+            self.builder.call(self.runtime["exc_unhandled"], [])
+        # Must terminate the block — branch to ok_block.  In the
+        # non-try case exc_unhandled already exited, so this is
+        # dead code.  In the try case the exception is pending and
+        # the next exc_pending check will catch it.
+        self.builder.branch(ok_block)
+
+        self.builder.position_at_end(ok_block)
+        return fv
+
     def _load_variable(self, name: str, node: ast.AST) -> ir.Value:
         """Load a variable's value. Returns a bare LLVM value (not FpyValue)
         of the type dictated by the variable's current type_tag."""
@@ -16742,6 +16793,7 @@ class CodeGen:
         # (determined by the variable's current type_tag)
         if isinstance(alloca.type, ir.PointerType) and alloca.type.pointee is fpy_val:
             fv = self.builder.load(alloca, name=f"{name}.fv")
+            self._check_fv_undef(fv, name)
             return self._unwrap_fv_for_tag(fv, type_tag)
         # Legacy alloca (not yet migrated) — load directly
         return self.builder.load(alloca, name=name)
@@ -23665,7 +23717,9 @@ class CodeGen:
             if (self._tag_kind(type_tag) != VKind.CELL
                     and isinstance(alloca.type, ir.PointerType)
                     and alloca.type.pointee is fpy_val):
-                return self.builder.load(alloca, name=f"{node.id}.fv")
+                fv = self.builder.load(alloca, name=f"{node.id}.fv")
+                self._check_fv_undef(fv, node.id)
+                return fv
         # defaultdict subscript: must use defaultdict_get for auto-default
         if (isinstance(node, ast.Subscript)
                 and self._is_defaultdict_expr(node.value)
