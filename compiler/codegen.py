@@ -1653,6 +1653,8 @@ class CodeGen:
         # bytes → list of int (byte values)
         ft = ir.FunctionType(i8_ptr, [i8_ptr])
         self.runtime["bytes_to_list"] = ir.Function(self.module, ft, name="fastpy_bytes_to_list")
+        # str → list of single-char strings: list("hello") → ['h','e','l','l','o']
+        self.runtime["str_to_list"] = ir.Function(self.module, ft, name="fastpy_str_to_list")
         # bytes length (FpyBytes-aware, handles embedded null bytes)
         ft = ir.FunctionType(i64, [i8_ptr])
         self.runtime["bytes_len"] = ir.Function(self.module, ft, name="fastpy_bytes_len")
@@ -27323,6 +27325,18 @@ class CodeGen:
                 b = self._emit_expr_value(arg)
                 b = self._ensure_ptr(b)
                 return self.builder.call(self.runtime["bytes_to_list"], [b])
+        # list(str) — split into list of single-character strings
+        if len(node.args) == 1:
+            arg = node.args[0]
+            _is_str = False
+            if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+                _is_str = True
+            elif isinstance(arg, ast.Name) and arg.id in self.variables:
+                _is_str = (self._var_kind(arg.id) == VKind.STR)
+            if _is_str:
+                s = self._emit_expr_value(arg)
+                s = self._ensure_ptr(s)
+                return self.builder.call(self.runtime["str_to_list"], [s])
         # list(obj) — iterate via __iter__/__next__ protocol
         if len(node.args) == 1 and self._is_obj_expr(node.args[0]):
             obj = self._emit_expr_value(node.args[0])
