@@ -867,6 +867,51 @@ void fastpy_fv_subscript(int32_t c_tag, int64_t c_data,
     *out_data = 0;
 }
 
+/* FpyValue containment check — runtime dispatch for `x in container`.
+ * Returns 1 if found, 0 if not found. */
+int32_t fastpy_fv_contains(int32_t c_tag, int64_t c_data,
+                             int32_t v_tag, int64_t v_data) {
+    switch (c_tag) {
+        case FPY_TAG_LIST: {
+            FpyList *lst = (FpyList*)(intptr_t)c_data;
+            if (!lst) return 0;
+            for (int64_t i = 0; i < lst->length; i++) {
+                FpyValue elem = lst->items[i];
+                if (elem.tag != v_tag) continue;
+                if (v_tag == FPY_TAG_STR) {
+                    if (strcmp(elem.data.s, (const char*)(intptr_t)v_data) == 0)
+                        return 1;
+                } else if (v_tag == FPY_TAG_INT || v_tag == FPY_TAG_BOOL) {
+                    if (elem.data.i == v_data) return 1;
+                } else if (v_tag == FPY_TAG_FLOAT) {
+                    double a, b;
+                    memcpy(&a, &elem.data.i, sizeof(double));
+                    memcpy(&b, &v_data, sizeof(double));
+                    if (a == b) return 1;
+                }
+            }
+            return 0;
+        }
+        case FPY_TAG_DICT:
+        case FPY_TAG_SET: {
+            FpyDict *d = (FpyDict*)(intptr_t)c_data;
+            if (!d) return 0;
+            if (v_tag == FPY_TAG_STR) {
+                return fastpy_dict_has_key(d, (const char*)(intptr_t)v_data);
+            } else {
+                return fastpy_dict_has_int_key(d, v_data);
+            }
+        }
+        case FPY_TAG_STR: {
+            const char *haystack = (const char*)(intptr_t)c_data;
+            if (!haystack || v_tag != FPY_TAG_STR) return 0;
+            const char *needle = (const char*)(intptr_t)v_data;
+            return strstr(haystack, needle) != NULL ? 1 : 0;
+        }
+    }
+    return 0;
+}
+
 /* FpyValue binary operation — runtime dispatch for Add/Sub/Mul/etc.
  * op: 0=add, 1=sub, 2=mul, 3=div, 4=floordiv, 5=mod
  * Results are written to *out_tag, *out_data. */

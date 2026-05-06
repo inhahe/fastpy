@@ -1298,6 +1298,9 @@ class CodeGen:
         # void fastpy_fv_subscript(i32 c_tag, i64 c_data, i32 k_tag, i64 k_data, i32* out_tag, i64* out_data)
         ft = ir.FunctionType(void, [i32, i64, i32, i64, ir.PointerType(i32), ir.PointerType(i64)])
         self.runtime["fv_subscript"] = ir.Function(self.module, ft, name="fastpy_fv_subscript")
+        # i32 fastpy_fv_contains(i32 c_tag, i64 c_data, i32 v_tag, i64 v_data)
+        ft = ir.FunctionType(i32, [i32, i64, i32, i64])
+        self.runtime["fv_contains"] = ir.Function(self.module, ft, name="fastpy_fv_contains")
         # void fastpy_fv_binop(i32 lt, i64 ld, i32 rt, i64 rd, i32 op, i32* out_tag, i64* out_data)
         ft = ir.FunctionType(void, [i32, i64, i32, i64, i32, ir.PointerType(i32), ir.PointerType(i64)])
         self.runtime["fv_binop"] = ir.Function(self.module, ft, name="fastpy_fv_binop")
@@ -12946,20 +12949,25 @@ class CodeGen:
         if self._USE_FV_LOCALS and self._assign_fv_fast_path(node):
             return
 
-        # MIXED/PYOBJ fpy_val copy: preserve runtime tag through assignment.
-        # _load_variable unwraps fpy_val to bare i64 (losing the runtime tag),
-        # so x = val where val is MIXED would lose type info.  Copy the raw
-        # fpy_val struct directly to preserve the tag.
+        # MIXED/FVALUE/PYOBJ fpy_val copy: preserve runtime tag through
+        # assignment.  _load_variable unwraps fpy_val to bare i64 (losing
+        # the runtime tag), so x = val where val is MIXED/FVALUE would lose
+        # type info.  Copy the raw fpy_val struct directly to preserve the tag.
         if (self._USE_FV_LOCALS
                 and len(node.targets) == 1
                 and isinstance(node.targets[0], ast.Name)
                 and isinstance(node.value, ast.Name)
                 and node.value.id in self.variables
-                and self._var_kind(node.value.id) in (VKind.MIXED, VKind.PYOBJ)):
+                and self._var_kind(node.value.id) in (VKind.MIXED, VKind.FVALUE, VKind.PYOBJ)):
             fv = self._load_fv_raw(node.value.id)
             if fv is not None:
+                # Preserve the source variable's kind: FVALUE stays FVALUE,
+                # MIXED stays MIXED, PYOBJ stays PYOBJ.
+                _src_kind = self._var_kind(node.value.id)
+                _copy_kind = (_src_kind if _src_kind in (VKind.FVALUE, VKind.PYOBJ)
+                              else VKind.MIXED)
                 self._store_variable(node.targets[0].id, fv,
-                                     ValueType(VKind.MIXED))
+                                     ValueType(_copy_kind))
                 return
 
         # Early-out: in-place prefix reverse  a[:N] = a[M::-1]
@@ -14770,7 +14778,13 @@ class CodeGen:
                     # compiler emit native int ops for values that might
                     # actually be floats (causing e.g. bm_nbody regressions).
                     return ValueType(VKind.UNKNOWN)
-                elif var_tag.kind not in (VKind.UNKNOWN, VKind.FVALUE):
+                elif var_tag.kind != VKind.UNKNOWN:
+                    # Return the stored type — including FVALUE and MIXED.
+                    # FVALUE means "runtime-typed FpyValue"; callers that
+                    # dispatch on FVALUE/MIXED (e.g. _emit_in_compare,
+                    # _emit_subscript) need this to select runtime-dispatch
+                    # paths.  Callers that don't handle FVALUE treat it
+                    # like UNKNOWN (no specific-type match), which is safe.
                     return var_tag
         if isinstance(node, (ast.List, ast.ListComp, ast.GeneratorExp)):
             elem_type = self._infer_list_elem_type(node)
@@ -14833,6 +14847,13 @@ class CodeGen:
                 return ValueType(VKind.PYOBJ)
             if self._is_pyobj_receiver(node.value):
                 return ValueType(VKind.PYOBJ)
+        # Subscript on FVALUE/MIXED: result type is only known at runtime.
+        # Return FVALUE so callers (for-loop dispatch, in-operator, print)
+        # use runtime dispatch instead of assuming a specific type.
+        if isinstance(node, ast.Subscript) and not isinstance(node.slice, ast.Slice):
+            _sub_base_kind = self._infer_type_tag(node.value, None).kind
+            if _sub_base_kind in (VKind.FVALUE, VKind.MIXED):
+                return ValueType(VKind.FVALUE)
         # Attribute access on pyobj/native_mod that goes through bridge → pyobj
         if (isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name)
                 and node.value.id in self.variables
@@ -17304,6 +17325,14 @@ class CodeGen:
         # Also handle deque iteration (convert to list first)
         if self._is_deque_expr(node.iter):
             self._emit_for_deque(node)
+            return
+        # FVALUE/MIXED expression iteration: for x in expr where expr
+        # evaluates to an FVALUE (e.g. for score in user["scores"]
+        # where user is MIXED from json iteration).  Must go through
+        # runtime dispatch since the actual container type is unknown.
+        _iter_inferred = self._infer_type_tag(node.iter, None)
+        if _iter_inferred.kind in (VKind.FVALUE, VKind.MIXED):
+            self._emit_for_fvalue(node)
             return
 
         # Parse range() call
@@ -20244,10 +20273,19 @@ class CodeGen:
         tag-based dispatch at runtime (list→items[i], dict→keys[i], str→char[i]).
         """
         var_name = node.target.id
-        iter_name = node.iter.id  # always a Name node (checked by caller)
 
-        # Load the raw fpy_val to get the runtime tag + data
-        fv = self._load_fv_raw(iter_name)
+        # Load the raw fpy_val to get the runtime tag + data.
+        # Supports both Name nodes (direct variable) and general expressions
+        # (e.g. user["scores"] where user is MIXED from json iteration).
+        if isinstance(node.iter, ast.Name):
+            fv = self._load_fv_raw(node.iter.id)
+        else:
+            fv = self._emit_expr_value(node.iter)
+            # If the expression didn't return an fpy_val struct (shouldn't
+            # happen but guard defensively), wrap it as one.
+            if not (isinstance(fv.type, ir.LiteralStructType)
+                    and fv.type == fpy_val):
+                fv = self._wrap_bare_to_fv(fv, ValueType(VKind.FVALUE))
         tag = self._fv_tag(fv)
         data = self._fv_data_i64(fv)
 
@@ -21422,62 +21460,34 @@ class CodeGen:
                 result_i1 = self.builder.not_(result_i1)
             return result_i1
 
-        # MIXED container: runtime dispatch based on FpyValue tag.
-        # MIXED variables hold a runtime-tagged FpyValue — the actual
-        # type (str, list, dict, …) is only known at runtime.  Extract
-        # the tag and branch to the appropriate containment check.
-        if c_kind == VKind.MIXED and isinstance(container_node, ast.Name):
-            fv = self._load_fv_raw(container_node.id)
-            if fv is not None:
-                tag_val = self._fv_tag(fv)
-                data_val = self._fv_data_i64(fv)
-
-                str_block = self._new_block("in.mixed.str")
-                list_block = self._new_block("in.mixed.list")
-                dict_block = self._new_block("in.mixed.dict")
-                false_block = self._new_block("in.mixed.false")
-                merge_block = self._new_block("in.mixed.merge")
-
-                result_alloca = self.builder.alloca(ir.IntType(1), name="in.mixed.res")
-                self.builder.store(ir.Constant(ir.IntType(1), 0), result_alloca)
-
-                is_str = self.builder.icmp_signed("==", tag_val,
-                                                  ir.Constant(i32, FPY_TAG_STR))
-                self.builder.cbranch(is_str, str_block, list_block)
-
-                # STR branch: str_contains(data_ptr, needle_ptr)
-                self.builder.position_at_end(str_block)
-                str_ptr = self.builder.inttoptr(data_val, i8_ptr)
-                needle = self._ensure_ptr(left_val)
-                str_result = self._rt_call("str_contains", [str_ptr, needle])
-                str_found = self.builder.icmp_signed(
-                    "!=", str_result, ir.Constant(i32, 0))
-                self.builder.store(str_found, result_alloca)
-                self.builder.branch(merge_block)
-
-                # LIST branch: list_contains via linear scan
-                self.builder.position_at_end(list_block)
-                is_list = self.builder.icmp_signed("==", tag_val,
-                                                   ir.Constant(i32, FPY_TAG_LIST))
-                self.builder.cbranch(is_list, dict_block, dict_block)
-                # (List containment is rare for MIXED — skip to dict for now;
-                #  fall through to False for unsupported types)
-
-                # DICT branch: dict_has_key(data_ptr, needle_ptr)
-                self.builder.position_at_end(dict_block)
-                is_dict = self.builder.icmp_signed("==", tag_val,
-                                                   ir.Constant(i32, FPY_TAG_DICT))
-                self.builder.cbranch(is_dict, false_block, false_block)
-                # (Dict containment for MIXED is uncommon — fall through)
-
-                self.builder.position_at_end(false_block)
-                self.builder.branch(merge_block)
-
-                self.builder.position_at_end(merge_block)
-                result = self.builder.load(result_alloca)
-                if isinstance(op, ast.NotIn):
-                    result = self.builder.not_(result)
-                return result
+        # MIXED/FVALUE container: runtime dispatch via fv_contains.
+        # The container holds a runtime-tagged FpyValue — the actual
+        # type (str, list, dict, …) is only known at runtime.
+        # Handles both Name variables and general expressions (e.g.
+        # subscript results like user["scores"]).
+        if c_kind in (VKind.MIXED, VKind.FVALUE):
+            fv = None
+            if isinstance(container_node, ast.Name):
+                fv = self._load_fv_raw(container_node.id)
+            if fv is None:
+                # General expression: evaluate and check for fpy_val
+                fv = self._emit_expr_value(container_node)
+                if not (isinstance(fv.type, ir.LiteralStructType)
+                        and fv.type == fpy_val):
+                    fv = self._wrap_bare_to_fv(fv, ValueType(VKind.FVALUE))
+            c_tag = self._fv_tag(fv)
+            c_data = self._fv_data_i64(fv)
+            v_tag, v_data = self._to_tag_data_ir(left_val, node.left
+                                                  if hasattr(node, 'left')
+                                                  else None)
+            result_i32 = self.builder.call(
+                self.runtime["fv_contains"],
+                [c_tag, c_data, v_tag, v_data])
+            result = self.builder.icmp_signed(
+                "!=", result_i32, ir.Constant(i32, 0))
+            if isinstance(op, ast.NotIn):
+                result = self.builder.not_(result)
+            return result
 
         # String 'in': "x" in "hello"
         if c_kind == VKind.STR:
@@ -23715,7 +23725,7 @@ class CodeGen:
                 and node.value.id in self.variables
                 and not isinstance(node.slice, ast.Slice)):
             _unk_alloca, _unk_tag = self.variables[node.value.id]
-            if (self._tag_kind(_unk_tag) == VKind.UNKNOWN
+            if (self._tag_kind(_unk_tag) in (VKind.UNKNOWN, VKind.FVALUE, VKind.MIXED)
                     and isinstance(_unk_alloca.type, ir.PointerType)
                     and _unk_alloca.type.pointee is fpy_val):
                 # Load the container's runtime tag and data
@@ -25207,7 +25217,7 @@ class CodeGen:
         Uses ``select`` so no extra basic blocks are needed."""
         if isinstance(node, ast.Name) and node.id in self.variables:
             alloca, tag = self.variables[node.id]
-            if (self._tag_kind(tag) == VKind.UNKNOWN
+            if (self._tag_kind(tag) in (VKind.UNKNOWN, VKind.FVALUE, VKind.MIXED)
                     and isinstance(alloca.type, ir.PointerType)
                     and alloca.type.pointee is fpy_val):
                 fv = self.builder.load(alloca, name=f"{node.id}.fv.arith")
@@ -25234,7 +25244,7 @@ class CodeGen:
             l_tag = r_tag = None
             if isinstance(l_fv.type, ir.LiteralStructType):
                 l_tag = self.builder.extract_value(l_fv, 0)
-            elif lk == VKind.UNKNOWN and isinstance(node.left, ast.Name):
+            elif lk in (VKind.UNKNOWN, VKind.FVALUE, VKind.MIXED) and isinstance(node.left, ast.Name):
                 alloca, _ = self.variables.get(node.left.id, (None, None))
                 if (alloca and isinstance(alloca.type, ir.PointerType)
                         and alloca.type.pointee is fpy_val):
@@ -25242,7 +25252,7 @@ class CodeGen:
                     l_tag = self.builder.extract_value(fv, 0)
             if isinstance(r_fv.type, ir.LiteralStructType):
                 r_tag = self.builder.extract_value(r_fv, 0)
-            elif rk == VKind.UNKNOWN and isinstance(node.right, ast.Name):
+            elif rk in (VKind.UNKNOWN, VKind.FVALUE, VKind.MIXED) and isinstance(node.right, ast.Name):
                 alloca, _ = self.variables.get(node.right.id, (None, None))
                 if (alloca and isinstance(alloca.type, ir.PointerType)
                         and alloca.type.pointee is fpy_val):
@@ -33655,7 +33665,7 @@ class CodeGen:
                 and node.value.id in self.variables
                 and not isinstance(node.slice, ast.Slice)):
             _unk_alloca, _unk_tag = self.variables[node.value.id]
-            if (self._tag_kind(_unk_tag) in (VKind.UNKNOWN, VKind.FVALUE)
+            if (self._tag_kind(_unk_tag) in (VKind.UNKNOWN, VKind.FVALUE, VKind.MIXED)
                     and isinstance(_unk_alloca.type, ir.PointerType)
                     and _unk_alloca.type.pointee is fpy_val):
                 # Load the container's runtime tag and data
@@ -33701,6 +33711,31 @@ class CodeGen:
             return fv
 
         obj = self._emit_expr_value(node.value)
+
+        # General FpyValue result: the value expression returned a runtime-
+        # tagged FpyValue (e.g. chained subscripts on json.loads results
+        # like data["users"][0]["name"]).  Route through fv_subscript for
+        # runtime dispatch — the actual container type is only known at
+        # runtime.  This catches all intermediate FpyValue results, not
+        # just direct Name lookups (handled above at the Name-only check).
+        if (isinstance(obj.type, ir.LiteralStructType)
+                and obj.type == fpy_val
+                and not isinstance(node.slice, ast.Slice)):
+            _c_tag = self._fv_tag(obj)
+            _c_data = self._fv_data_i64(obj)
+            _k_tag_ir, _k_data_ir = self._expr_to_tag_data(node.slice)
+            tag_slot = self._create_entry_alloca(i32, "fvsub.tag")
+            data_slot = self._create_entry_alloca(i64, "fvsub.data")
+            self.builder.call(self.runtime["fv_subscript"],
+                              [_c_tag, _c_data,
+                               _k_tag_ir, _k_data_ir,
+                               tag_slot, data_slot])
+            _out_tag = self.builder.load(tag_slot)
+            _out_data = self.builder.load(data_slot)
+            fv = ir.Constant(fpy_val, ir.Undefined)
+            fv = self.builder.insert_value(fv, _out_tag, 0)
+            fv = self.builder.insert_value(fv, _out_data, 1)
+            return fv
 
         if isinstance(obj.type, ir.PointerType):
             # Bytes subscript: b"hello"[0] → int (byte value), not char

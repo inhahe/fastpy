@@ -752,6 +752,7 @@ extern int64_t fastpy_str_rfind(const char*, const char*);
 extern int64_t fastpy_str_count(const char*, const char*);
 extern int fastpy_str_startswith(const char*, const char*);
 extern int fastpy_str_endswith(const char*, const char*);
+extern int32_t fastpy_fv_contains(int32_t, int64_t, int32_t, int64_t);
 extern void fastpy_list_pop_fv(FpyList*, int32_t*, int64_t*);
 extern void fastpy_list_pop_at_fv(FpyList*, int64_t, int32_t*, int64_t*);
 extern int64_t fastpy_list_index(FpyList*, int64_t);
@@ -881,7 +882,7 @@ static FpySymEntry fpy_jit_symbols[] = {
     SYM(fastpy_print_newline),
     SYM(fastpy_fv_print), SYM(fastpy_fv_write),
     SYM(fastpy_fv_repr), SYM(fastpy_fv_str), SYM(fastpy_fv_truthy), SYM(fastpy_fv_compare),
-    SYM(fastpy_fv_len), SYM(fastpy_fv_iter_get), SYM(fastpy_fv_subscript), SYM(fastpy_fv_binop),
+    SYM(fastpy_fv_len), SYM(fastpy_fv_iter_get), SYM(fastpy_fv_subscript), SYM(fastpy_fv_contains), SYM(fastpy_fv_binop),
     SYM(fastpy_raise), SYM(fastpy_exc_pending), SYM(fastpy_exc_clear),
     SYM(fastpy_exc_get_type), SYM(fastpy_exc_get_msg), SYM(fastpy_exc_name_to_id),
     SYM(fastpy_list_new), SYM(fastpy_list_append_fv),
