@@ -1292,6 +1292,9 @@ class CodeGen:
         # int64_t fastpy_fv_len(i32 tag, i64 data)
         ft = ir.FunctionType(i64, [i32, i64])
         self.runtime["fv_len"] = ir.Function(self.module, ft, name="fastpy_fv_len")
+        # void fastpy_fv_iter_get(i32 tag, i64 data, i64 index, i32* out_tag, i64* out_data)
+        ft = ir.FunctionType(void, [i32, i64, i64, ir.PointerType(i32), ir.PointerType(i64)])
+        self.runtime["fv_iter_get"] = ir.Function(self.module, ft, name="fastpy_fv_iter_get")
         # void fastpy_fv_subscript(i32 c_tag, i64 c_data, i32 k_tag, i64 k_data, i32* out_tag, i64* out_data)
         ft = ir.FunctionType(void, [i32, i64, i32, i64, ir.PointerType(i32), ir.PointerType(i64)])
         self.runtime["fv_subscript"] = ir.Function(self.module, ft, name="fastpy_fv_subscript")
@@ -15871,6 +15874,34 @@ class CodeGen:
                 self._store_variable(target_name, result, tag)
                 return
 
+        # FVALUE/MIXED operands: use runtime dispatch (fv_binop) which
+        # handles all type combinations correctly.  The old code promoted
+        # everything to double when it saw an fpy_val struct, which was
+        # wrong when both operands were actually integers at runtime.
+        _cur_is_fv = (isinstance(current.type, ir.LiteralStructType)
+                       and current.type == fpy_val)
+        _rhs_is_fv = (isinstance(rhs.type, ir.LiteralStructType)
+                       and rhs.type == fpy_val)
+        if (_cur_is_fv or _rhs_is_fv
+                or left_kind in (VKind.FVALUE, VKind.MIXED)):
+            _AUG_OP_MAP = {ast.Add: 0, ast.Sub: 1, ast.Mult: 2,
+                           ast.Div: 3, ast.FloorDiv: 4, ast.Mod: 5,
+                           ast.Pow: 6}
+            op_code = _AUG_OP_MAP.get(type(node.op), 0)
+            # Convert both operands to tag+data pairs
+            lt, ld = self._to_tag_data_ir(current, node.target)
+            rt, rd = self._to_tag_data_ir(rhs, node.value)
+            out_tag = self._create_entry_alloca(i32, "aug.tag")
+            out_data = self._create_entry_alloca(i64, "aug.data")
+            self.builder.call(self.runtime["fv_binop"],
+                              [lt, ld, rt, rd, ir.Constant(i32, op_code),
+                               out_tag, out_data])
+            r_tag = self.builder.load(out_tag)
+            r_data = self.builder.load(out_data)
+            fv = self._fv_build_from_slots(r_tag, r_data)
+            self._store_variable(target_name, fv, ValueType(VKind.FVALUE))
+            return
+
         # Unwrap FpyValue structs before type promotion.  UNKNOWN-typed
         # intermediates (e.g. from tuple unpacking) arrive as {i32, i64}.
         # Use tag-aware conversion: float tag → bitcast to double,
@@ -17223,6 +17254,9 @@ class CodeGen:
                 return
             if vtype.kind == VKind.PYOBJ:
                 self._emit_for_pyobj(node)
+                return
+            if vtype.kind in (VKind.FVALUE, VKind.MIXED):
+                self._emit_for_fvalue(node)
                 return
 
         # Check for `for x in <list>` or `for x in <tuple>`. Tuples are
@@ -20188,6 +20222,78 @@ class CodeGen:
             _tag = ir.Constant(i32, FPY_TAG_LIST)
             _data = self.builder.ptrtoint(lst, i64)
             self.builder.call(self.runtime["rc_decref"], [_tag, _data])
+
+    def _emit_for_fvalue(self, node: ast.For) -> None:
+        """Emit for x in <fvalue>: runtime-dispatched iteration for FVALUE/MIXED.
+
+        The iterable's type is only known at runtime (e.g. json.loads result).
+        Uses fv_len for length and fv_iter_get for element access — both do
+        tag-based dispatch at runtime (list→items[i], dict→keys[i], str→char[i]).
+        """
+        var_name = node.target.id
+        iter_name = node.iter.id  # always a Name node (checked by caller)
+
+        # Load the raw fpy_val to get the runtime tag + data
+        fv = self._load_fv_raw(iter_name)
+        tag = self._fv_tag(fv)
+        data = self._fv_data_i64(fv)
+
+        # Length via runtime dispatch (handles list/dict/set/str/bytes)
+        iter_len = self.builder.call(self.runtime["fv_len"], [tag, data])
+
+        # Index variable
+        idx_name = f"__idx_{var_name}"
+        self._store_variable(idx_name, ir.Constant(i64, 0), ValueType(VKind.INT))
+
+        cond_block = self._new_block("forfv.cond")
+        body_block = self._new_block("forfv.body")
+        incr_block = self._new_block("forfv.incr")
+        else_block = self._new_block("forfv.else") if node.orelse else None
+        end_block = self._new_block("forfv.end")
+
+        self.builder.branch(cond_block)
+
+        self.builder.position_at_end(cond_block)
+        idx = self._load_variable(idx_name, node)
+        cond = self.builder.icmp_signed("<", idx, iter_len)
+        after_loop = else_block if else_block else end_block
+        self.builder.cbranch(cond, body_block, after_loop)
+
+        self.builder.position_at_end(body_block)
+        idx = self._load_variable(idx_name, node)
+
+        # Element via runtime dispatch — fv_iter_get handles all container types
+        out_tag_slot = self._create_entry_alloca(i32, "forfv.elem.tag")
+        out_data_slot = self._create_entry_alloca(i64, "forfv.elem.data")
+        self.builder.call(self.runtime["fv_iter_get"],
+                          [tag, data, idx, out_tag_slot, out_data_slot])
+        elem_tag = self.builder.load(out_tag_slot)
+        elem_data = self.builder.load(out_data_slot)
+        fv_elem = self._fv_build_from_slots(elem_tag, elem_data)
+        self._store_variable(var_name, fv_elem, ValueType(VKind.MIXED))
+
+        self._loop_stack.append((end_block, incr_block))
+        _prev_hot = self._in_hot_loop
+        self._in_hot_loop = True
+        self._emit_stmts(node.body)
+        self._in_hot_loop = _prev_hot
+        self._loop_stack.pop()
+        if not self.builder.block.is_terminated:
+            self.builder.branch(incr_block)
+
+        self.builder.position_at_end(incr_block)
+        idx = self._load_variable(idx_name, node)
+        incremented = self.builder.add(idx, ir.Constant(i64, 1))
+        self._store_variable(idx_name, incremented, ValueType(VKind.INT))
+        self.builder.branch(cond_block)
+
+        if else_block:
+            self.builder.position_at_end(else_block)
+            self._emit_stmts(node.orelse)
+            if not self.builder.block.is_terminated:
+                self.builder.branch(end_block)
+
+        self.builder.position_at_end(end_block)
 
     def _emit_for_list(self, node: ast.For) -> None:
         """Emit for x in <list>: iterate over list elements by index."""

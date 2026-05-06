@@ -730,6 +730,65 @@ int64_t fastpy_fv_len(int32_t tag, int64_t data) {
     return 0;
 }
 
+/* FpyValue iteration element — runtime dispatch for for-loops on
+ * runtime-typed values (FVALUE/MIXED).  Given a container (tag+data)
+ * and a positional index, returns the iteration element.
+ *   LIST/TUPLE: list->items[idx]  (same as list_get_fv)
+ *   DICT/SET:   dict->keys[idx]   (same as dict_key_fv)
+ *   STR:        str[idx] as single-char string
+ * This avoids duplicating the tag-dispatch logic in the compiler. */
+extern const char* fastpy_str_index(const char*, int64_t);
+void fastpy_fv_iter_get(int32_t tag, int64_t data, int64_t index,
+                         int32_t *out_tag, int64_t *out_data) {
+    switch (tag) {
+        case FPY_TAG_LIST: {
+            FpyList *lst = (FpyList*)(intptr_t)data;
+            if (!lst || index < 0 || index >= lst->length) {
+                *out_tag = FPY_TAG_NONE;
+                *out_data = 0;
+                return;
+            }
+            *out_tag = lst->items[index].tag;
+            *out_data = lst->items[index].data.i;
+            return;
+        }
+        case FPY_TAG_DICT:
+        case FPY_TAG_SET: {
+            FpyDict *d = (FpyDict*)(intptr_t)data;
+            if (!d || index < 0 || index >= d->length) {
+                *out_tag = FPY_TAG_NONE;
+                *out_data = 0;
+                return;
+            }
+            *out_tag = d->keys[index].tag;
+            *out_data = d->keys[index].data.i;
+            return;
+        }
+        case FPY_TAG_STR: {
+            const char *s = (const char*)(intptr_t)data;
+            const char *ch = fastpy_str_index(s, index);
+            *out_tag = FPY_TAG_STR;
+            *out_data = (int64_t)(intptr_t)ch;
+            return;
+        }
+        case FPY_TAG_BYTES: {
+            const char *b = (const char*)(intptr_t)data;
+            int64_t len = b ? (int64_t)strlen(b) : 0;
+            if (index < 0) index += len;
+            if (index < 0 || index >= len) {
+                *out_tag = FPY_TAG_NONE;
+                *out_data = 0;
+                return;
+            }
+            *out_tag = FPY_TAG_INT;
+            *out_data = (int64_t)(unsigned char)b[index];
+            return;
+        }
+    }
+    *out_tag = FPY_TAG_NONE;
+    *out_data = 0;
+}
+
 /* FpyValue subscript — runtime dispatch for container[key].
  * Handles list (int key), dict (str or int key), and string (int key).
  * Results are written to *out_tag, *out_data. */
