@@ -131,7 +131,12 @@ void fastpy_format_float(double value, char *buf, int bufsize) {
     /* Ensure there's a dot or 'e' so it looks like a float */
     if (!strchr(buf, '.') && !strchr(buf, 'e') && !strchr(buf, 'E')
         && !strchr(buf, 'n') && !strchr(buf, 'i')) {
-        strcat(buf, ".0");
+        size_t len = strlen(buf);
+        if ((int)(len + 2) < bufsize) {
+            buf[len] = '.';
+            buf[len + 1] = '0';
+            buf[len + 2] = '\0';
+        }
     }
 }
 
@@ -747,6 +752,8 @@ extern int64_t fastpy_str_rfind(const char*, const char*);
 extern int64_t fastpy_str_count(const char*, const char*);
 extern int fastpy_str_startswith(const char*, const char*);
 extern int fastpy_str_endswith(const char*, const char*);
+extern void fastpy_list_pop_fv(FpyList*, int32_t*, int64_t*);
+extern void fastpy_list_pop_at_fv(FpyList*, int64_t, int32_t*, int64_t*);
 extern int64_t fastpy_list_index(FpyList*, int64_t);
 extern int64_t fastpy_list_index_str(FpyList*, const char*);
 extern int64_t fastpy_list_count_str(FpyList*, const char*);
@@ -771,6 +778,7 @@ extern const char* fastpy_str_casefold(const char*);
 extern const char* fastpy_str_expandtabs(const char*, int64_t);
 extern FpyList* fastpy_str_partition(const char*, const char*);
 extern FpyList* fastpy_str_rpartition(const char*, const char*);
+extern void fastpy_dict_pop_nodefault_fv(FpyDict*, const char*, int32_t*, int64_t*);
 extern void fastpy_dict_pop_fv(FpyDict*, const char*, int32_t, int64_t, int32_t*, int64_t*);
 extern FpyList* fastpy_str_rsplit(const char*, const char*, int64_t);
 extern FpyDict* fastpy_set_union(FpyDict*, FpyDict*);
@@ -902,7 +910,7 @@ static FpySymEntry fpy_jit_symbols[] = {
     SYM(fastpy_str_isdecimal), SYM(fastpy_str_isnumeric),
     SYM(fastpy_str_casefold), SYM(fastpy_str_expandtabs),
     SYM(fastpy_str_partition), SYM(fastpy_str_rpartition),
-    SYM(fastpy_dict_pop_fv), SYM(fastpy_str_rsplit),
+    SYM(fastpy_dict_pop_nodefault_fv), SYM(fastpy_dict_pop_fv), SYM(fastpy_str_rsplit),
     SYM(fastpy_set_union), SYM(fastpy_set_intersection),
     SYM(fastpy_set_difference), SYM(fastpy_set_symmetric_diff),
     SYM(fastpy_set_contains_fv), SYM(fastpy_set_add_fv),
@@ -929,6 +937,7 @@ static FpySymEntry fpy_jit_symbols[] = {
     SYM(fastpy_dict_fromkeys), SYM(fastpy_dict_fromkeys_none),
     SYM(fastpy_str_rfind), SYM(fastpy_str_count),
     SYM(fastpy_str_startswith), SYM(fastpy_str_endswith),
+    SYM(fastpy_list_pop_fv), SYM(fastpy_list_pop_at_fv),
     SYM(fastpy_list_index),
     SYM(fastpy_float_as_integer_ratio),
     SYM(fastpy_int_to_bytes), SYM(fastpy_int_from_bytes),
@@ -1385,12 +1394,12 @@ const char* fastpy_uuid_uuid4(void) {
     /* Set version (4) and variant (10xx) bits */
     r1 = (r1 & 0xFFFFFFFFFFFF0FFFULL) | 0x0000000000004000ULL;  /* version 4 */
     r2 = (r2 & 0x3FFFFFFFFFFFFFFFULL) | 0x8000000000000000ULL;  /* variant 10 */
-    sprintf(buf, "%08x-%04x-%04x-%04x-%012llx",
-            (uint32_t)(r1 >> 32),
-            (uint16_t)(r1 >> 16),
-            (uint16_t)(r1),
-            (uint16_t)(r2 >> 48),
-            (unsigned long long)(r2 & 0x0000FFFFFFFFFFFFULL));
+    snprintf(buf, 37, "%08x-%04x-%04x-%04x-%012llx",
+             (uint32_t)(r1 >> 32),
+             (uint16_t)(r1 >> 16),
+             (uint16_t)(r1),
+             (uint16_t)(r2 >> 48),
+             (unsigned long long)(r2 & 0x0000FFFFFFFFFFFFULL));
     return buf;
 }
 

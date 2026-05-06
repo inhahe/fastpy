@@ -1555,6 +1555,11 @@ class CodeGen:
         self.runtime["dict_pop"] = ir.Function(self.module, ft, name="fastpy_dict_pop")
         ft = ir.FunctionType(i64, [i8_ptr, i8_ptr])
         self.runtime["dict_pop_int"] = ir.Function(self.module, ft, name="fastpy_dict_pop_int")
+        # dict_pop_nodefault_fv(dict, key, out_tag*, out_data*) — 1-arg pop, KeyError on miss
+        ft = ir.FunctionType(void, [i8_ptr, i8_ptr,
+                                     ir.PointerType(i32), ir.PointerType(i64)])
+        self.runtime["dict_pop_nodefault_fv"] = ir.Function(
+            self.module, ft, name="fastpy_dict_pop_nodefault_fv")
         # dict_pop_fv(dict, key, def_tag, def_data, out_tag*, out_data*)
         ft = ir.FunctionType(void, [i8_ptr, i8_ptr, i32, i64,
                                      ir.PointerType(i32), ir.PointerType(i64)])
@@ -1580,6 +1585,12 @@ class CodeGen:
         self.runtime["list_pop_int"] = ir.Function(self.module, ft, name="fastpy_list_pop_int")
         ft = ir.FunctionType(i64, [i8_ptr, i64])
         self.runtime["list_pop_at"] = ir.Function(self.module, ft, name="fastpy_list_pop_at")
+        # list_pop_fv(list, out_tag*, out_data*) — type-preserving pop
+        ft = ir.FunctionType(void, [i8_ptr, ir.PointerType(i32), ir.PointerType(i64)])
+        self.runtime["list_pop_fv"] = ir.Function(self.module, ft, name="fastpy_list_pop_fv")
+        # list_pop_at_fv(list, index, out_tag*, out_data*) — type-preserving pop at index
+        ft = ir.FunctionType(void, [i8_ptr, i64, ir.PointerType(i32), ir.PointerType(i64)])
+        self.runtime["list_pop_at_fv"] = ir.Function(self.module, ft, name="fastpy_list_pop_at_fv")
         ft = ir.FunctionType(i64, [i8_ptr, i64])
         self.runtime["list_index"] = ir.Function(self.module, ft, name="fastpy_list_index")
         ft = ir.FunctionType(i64, [i8_ptr, i8_ptr])
@@ -20200,8 +20211,10 @@ class CodeGen:
         data_slot = self._create_entry_alloca(i64, "dqfor.data")
         self._rt_call("list_get_fv",
                           [lst, idx, tag_slot, data_slot])
-        elem = self.builder.load(data_slot)
-        self._store_variable(var_name, elem, ValueType(VKind.INT))
+        elem_tag = self.builder.load(tag_slot)
+        elem_data = self.builder.load(data_slot)
+        fv_elem = self._fv_build_from_slots(elem_tag, elem_data)
+        self._store_variable(var_name, fv_elem, ValueType(VKind.MIXED))
 
         self._loop_stack.append((end_block, cond_block))
         _prev_hot = self._in_hot_loop
@@ -28727,10 +28740,20 @@ class CodeGen:
             v = self._emit_expr_value(node.args[0])
             v = self._ensure_ptr(v)
             result = self.builder.call(self.runtime["os_getenv"], [v])
+            # os.getenv returns NULL when the env var doesn't exist (None
+            # in Python).  Build an fpy_val with runtime tag so downstream
+            # code (is None check, print, etc.) dispatches correctly.
             is_null = self.builder.icmp_unsigned(
                 "==", result, ir.Constant(i8_ptr, None))
-            return self.builder.select(
-                is_null, ir.Constant(i8_ptr, None), result)
+            tag = self.builder.select(
+                is_null,
+                ir.Constant(i32, FPY_TAG_NONE),
+                ir.Constant(i32, FPY_TAG_STR))
+            data = self.builder.ptrtoint(result, i64)
+            fv = ir.Constant(fpy_val, ir.Undefined)
+            fv = self.builder.insert_value(fv, tag, 0)
+            fv = self.builder.insert_value(fv, data, 1)
+            return fv
         # os.path functions
         _os_path_fns = {
             "exists": ("os_path_exists", 1),
@@ -28805,11 +28828,22 @@ class CodeGen:
             rt_key = "copy_copy" if func_name == "copy" else "copy_deepcopy"
             self.builder.call(self.runtime[rt_key],
                               [ir.Constant(i32, tag), data, out_tag, out_data])
-            result = self.builder.load(out_data)
+            # The output type matches the input type (copy preserves type).
+            # If we know the input type at compile time, return the bare
+            # value so downstream code can use native list/dict/str paths.
+            # Only fall back to fpy_val for truly unknown input types.
             inferred = self._infer_type_tag(node.args[0], val)
-            if inferred.kind not in (VKind.INT, VKind.FLOAT, VKind.BOOL, VKind.NONE, VKind.UNKNOWN):
-                result = self._ensure_ptr(result)
-            return result
+            data_val = self.builder.load(out_data)
+            if inferred.kind in (VKind.FVALUE, VKind.MIXED, VKind.UNKNOWN):
+                tag_val = self.builder.load(out_tag)
+                fv = ir.Constant(fpy_val, ir.Undefined)
+                fv = self.builder.insert_value(fv, tag_val, 0)
+                fv = self.builder.insert_value(fv, data_val, 1)
+                return fv
+            if inferred.kind not in (VKind.INT, VKind.FLOAT, VKind.BOOL,
+                                      VKind.NONE):
+                data_val = self._ensure_ptr(data_val)
+            return data_val
         return None
 
     def _emit_operator_call(self, func_name, node):
@@ -29039,11 +29073,11 @@ class CodeGen:
         "math.factorial": "int", "math.comb": "int", "math.perm": "int",
         "math.isnan": "bool", "math.isinf": "bool", "math.isfinite": "bool",
         # os / os.path
-        "os.getcwd": "str", "os.getenv": "str",
+        "os.getcwd": "str", "os.getenv": "pyobj",
         "os.path.join": "str", "os.path.dirname": "str",
         "os.path.basename": "str", "os.path.abspath": "str",
         "os.path.realpath": "str", "os.path.expanduser": "str",
-        "os.path.splitext": "str", "os.path.normpath": "str",
+        "os.path.splitext": "tuple", "os.path.normpath": "str",
         "os.path.exists": "bool", "os.path.isfile": "bool",
         "os.path.isdir": "bool", "os.path.isabs": "bool",
         "os.path.getsize": "int",
@@ -29693,7 +29727,14 @@ class CodeGen:
             out_data = self._create_entry_alloca(i64, "rch.data")
             self.builder.call(self.runtime["random_choice"],
                               [lst, out_tag, out_data])
-            return self.builder.load(out_data)
+            # Build fpy_val so the runtime tag is preserved — random.choice
+            # can return any element type (int, str, float, etc.)
+            tag = self.builder.load(out_tag)
+            data = self.builder.load(out_data)
+            fv = ir.Constant(fpy_val, ir.Undefined)
+            fv = self.builder.insert_value(fv, tag, 0)
+            fv = self.builder.insert_value(fv, data, 1)
+            return fv
 
         elif func_name == "shuffle" and len(node.args) == 1:
             lst = self._emit_expr_value(node.args[0])
@@ -30797,13 +30838,23 @@ class CodeGen:
             out_data = self._create_entry_alloca(i64, "dq.pop.data")
             self.builder.call(self.runtime["deque_pop"],
                               [obj, out_tag, out_data])
-            return self.builder.load(out_data)
+            tag = self.builder.load(out_tag)
+            data = self.builder.load(out_data)
+            fv = ir.Constant(fpy_val, ir.Undefined)
+            fv = self.builder.insert_value(fv, tag, 0)
+            fv = self.builder.insert_value(fv, data, 1)
+            return fv
         elif method == "popleft" and len(node.args) == 0:
             out_tag = self._create_entry_alloca(i32, "dq.popleft.tag")
             out_data = self._create_entry_alloca(i64, "dq.popleft.data")
             self.builder.call(self.runtime["deque_popleft"],
                               [obj, out_tag, out_data])
-            return self.builder.load(out_data)
+            tag = self.builder.load(out_tag)
+            data = self.builder.load(out_data)
+            fv = ir.Constant(fpy_val, ir.Undefined)
+            fv = self.builder.insert_value(fv, tag, 0)
+            fv = self.builder.insert_value(fv, data, 1)
+            return fv
         elif method == "rotate":
             n = ir.Constant(i64, 1)
             if len(node.args) == 1:
@@ -30922,10 +30973,22 @@ class CodeGen:
 
     def _emit_list_method_pop(self, node, obj):
         if len(node.args) == 0:
-            return self._rt_call("list_pop_int", [obj])
+            out_tag = self._create_entry_alloca(i32, "lpop.tag")
+            out_data = self._create_entry_alloca(i64, "lpop.data")
+            self.builder.call(self.runtime["list_pop_fv"],
+                              [obj, out_tag, out_data])
+            tag = self.builder.load(out_tag)
+            data = self.builder.load(out_data)
+            return self._fv_build_from_slots(tag, data)
         if len(node.args) == 1:
             idx = self._emit_expr_value(node.args[0])
-            return self._rt_call("list_pop_at", [obj, idx])
+            out_tag = self._create_entry_alloca(i32, "lpopat.tag")
+            out_data = self._create_entry_alloca(i64, "lpopat.data")
+            self.builder.call(self.runtime["list_pop_at_fv"],
+                              [obj, idx, out_tag, out_data])
+            tag = self.builder.load(out_tag)
+            data = self.builder.load(out_data)
+            return self._fv_build_from_slots(tag, data)
         return None
 
     def _emit_list_method_index(self, node, obj):
@@ -31298,7 +31361,13 @@ class CodeGen:
     def _emit_dict_method_pop(self, node, obj):
         if len(node.args) == 1:
             key = self._emit_expr_value(node.args[0])
-            return self._rt_call("dict_pop_int", [obj, key])
+            out_tag = self._create_entry_alloca(i32, "dpop1.tag")
+            out_data = self._create_entry_alloca(i64, "dpop1.data")
+            self.builder.call(self.runtime["dict_pop_nodefault_fv"],
+                              [obj, key, out_tag, out_data])
+            tag = self.builder.load(out_tag)
+            data = self.builder.load(out_data)
+            return self._fv_build_from_slots(tag, data)
         if len(node.args) == 2:
             key = self._emit_expr_value(node.args[0])
             default_val = self._emit_expr_value(node.args[1])
@@ -33427,7 +33496,12 @@ class CodeGen:
                 self.builder.call(self.runtime["defaultdict_get_fv"],
                                   [obj, ir.Constant(i32, tag_c), data_c,
                                    out_tag, out_data])
-            return self.builder.load(out_data)
+            tag = self.builder.load(out_tag)
+            data = self.builder.load(out_data)
+            fv = ir.Constant(fpy_val, ir.Undefined)
+            fv = self.builder.insert_value(fv, tag, 0)
+            fv = self.builder.insert_value(fv, data, 1)
+            return fv
 
         # Check for deque subscript access
         if self._is_deque_expr(node.value):
@@ -33438,7 +33512,12 @@ class CodeGen:
             out_data = self._create_entry_alloca(i64, "dq.get.data")
             self.builder.call(self.runtime["deque_get"],
                               [obj, idx, out_tag, out_data])
-            return self.builder.load(out_data)
+            tag = self.builder.load(out_tag)
+            data = self.builder.load(out_data)
+            fv = ir.Constant(fpy_val, ir.Undefined)
+            fv = self.builder.insert_value(fv, tag, 0)
+            fv = self.builder.insert_value(fv, data, 1)
+            return fv
 
         # Check for ChainMap subscript access: cm["key"]
         if self._is_chainmap_expr(node.value):

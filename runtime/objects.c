@@ -2640,6 +2640,45 @@ int64_t fastpy_list_pop_at(FpyList *list, int64_t index) {
     return result;
 }
 
+/* list.pop() — returns FpyValue via out params, preserving element type */
+void fastpy_list_pop_fv(FpyList *list, int32_t *out_tag, int64_t *out_data) {
+    FPY_LOCK(list);
+    if (list->length == 0) {
+        FPY_UNLOCK(list);
+        fastpy_raise(FPY_EXC_INDEXERROR, "pop from empty list");
+        *out_tag = FPY_TAG_NONE;
+        *out_data = 0;
+        return;
+    }
+    list->length--;
+    FpyValue v = list->items[list->length];
+    *out_tag = v.tag;
+    *out_data = v.data.i;
+    FPY_UNLOCK(list);
+}
+
+/* list.pop(index) — returns FpyValue via out params, preserving element type */
+void fastpy_list_pop_at_fv(FpyList *list, int64_t index,
+                            int32_t *out_tag, int64_t *out_data) {
+    FPY_LOCK(list);
+    if (index < 0) index += list->length;
+    if (index < 0 || index >= list->length) {
+        FPY_UNLOCK(list);
+        fastpy_raise(FPY_EXC_INDEXERROR, "pop index out of range");
+        *out_tag = FPY_TAG_NONE;
+        *out_data = 0;
+        return;
+    }
+    FpyValue v = list->items[index];
+    *out_tag = v.tag;
+    *out_data = v.data.i;
+    for (int64_t i = index; i < list->length - 1; i++) {
+        list->items[i] = list->items[i + 1];
+    }
+    list->length--;
+    FPY_UNLOCK(list);
+}
+
 void fastpy_list_delete_at(FpyList *list, int64_t index) {
     FPY_LOCK(list);
     if (index < 0) index += list->length;
@@ -2827,6 +2866,41 @@ int64_t fastpy_dict_pop_int(FpyDict *dict, const char *key) {
     FPY_UNLOCK(dict);
     fastpy_raise(FPY_EXC_KEYERROR, key);
     return 0;
+}
+
+/* dict.pop(key) — 1-arg version, returns FpyValue via out params.
+ * Raises KeyError if key is not found. */
+void fastpy_dict_pop_nodefault_fv(FpyDict *dict, const char *key,
+                                   int32_t *out_tag, int64_t *out_data) {
+    FPY_LOCK(dict);
+    FpyValue k = fpy_str(key);
+    uint64_t h = fpy_hash_value(k);
+    int64_t mask = dict->table_size - 1;
+    int64_t slot = (int64_t)(h & (uint64_t)mask);
+    while (1) {
+        int64_t idx = dict->indices[slot];
+        if (idx == FPY_DICT_EMPTY) break;
+        if (idx != FPY_DICT_DELETED && fpy_key_equal(dict->keys[idx], k)) {
+            FpyValue v = dict->values[idx];
+            *out_tag = v.tag;
+            *out_data = v.data.i;
+            FPY_VAL_DECREF(dict->keys[idx]);
+            dict->indices[slot] = FPY_DICT_DELETED;
+            for (int64_t j = idx; j < dict->length - 1; j++) {
+                dict->keys[j] = dict->keys[j + 1];
+                dict->values[j] = dict->values[j + 1];
+            }
+            dict->length--;
+            fpy_dict_rebuild_indices(dict);
+            FPY_UNLOCK(dict);
+            return;
+        }
+        slot = (slot + 1) & mask;
+    }
+    FPY_UNLOCK(dict);
+    fastpy_raise(FPY_EXC_KEYERROR, key);
+    *out_tag = FPY_TAG_NONE;
+    *out_data = 0;
 }
 
 /* dict.pop(key, default) — returns FpyValue via out params */
@@ -6266,7 +6340,7 @@ char* fpy_decimal_to_str(FpyDecimal *d) {
     if (d->sign == 0) return fpy_strdup("0");
 
     char coeff_buf[32];
-    sprintf(coeff_buf, "%lld", (long long)d->coefficient);
+    snprintf(coeff_buf, sizeof(coeff_buf), "%lld", (long long)d->coefficient);
     int clen = (int)strlen(coeff_buf);
 
     char *buf = (char*)malloc(clen + 32);
@@ -7782,6 +7856,8 @@ const char* fastpy_logging_format_msg(const char *fmt, FpyList *args) {
     for (int64_t i = 0; i < args->length; i++) {
         if (args->items[i].tag == FPY_TAG_STR)
             buf_size += (int64_t)strlen(args->items[i].data.s);
+        else if (args->items[i].tag == FPY_TAG_FLOAT)
+            buf_size += 350;  /* %f on extreme doubles can be 300+ chars */
         else
             buf_size += 32;
     }
