@@ -2476,6 +2476,21 @@ class CodeGen:
         """Build FpyValue(NONE)."""
         return self._fv_build(FPY_TAG_NONE, ir.Constant(i64, 0))
 
+    def _wrap_scalar_to_fv(self, val: ir.Value) -> ir.Value:
+        """Wrap a bare scalar (i64/double/i8*/i32) into an FpyValue with
+        the correct compile-time tag.  Used when a bare value must be
+        passed to a function expecting fpy_val (FV-ABI)."""
+        if isinstance(val.type, ir.DoubleType):
+            return self._fv_from_float(val)
+        if isinstance(val.type, ir.PointerType):
+            return self._fv_from_str(val)  # default: pointer → STR
+        if isinstance(val.type, ir.IntType):
+            if val.type.width == 1:
+                return self._fv_from_bool(val)
+            return self._fv_from_int(val)
+        # Already an fpy_val or unknown — return as-is
+        return val
+
     def _fv_tag(self, fv: ir.Value) -> ir.Value:
         """Extract the i32 tag from an FpyValue."""
         return self.builder.extract_value(fv, 0)
@@ -7826,12 +7841,39 @@ class CodeGen:
             ret_type = i8_ptr
             ret_tag = "ptr:list"
 
-        # Float-returning functions: if a parameter's type wasn't determined
+        # Float-body promotion: if a parameter's type wasn't determined
         # by call-site analysis or defaults, and the function body uses
-        # floats, promote the parameter to double. This ensures FV-ABI
-        # unwrapping uses bitcast (correct for float data) instead of
-        # sitofp (correct only for integer data).
-        if ret_type == double:
+        # float constants, promote the parameter to double.  This applies
+        # to both float-returning functions (ret_type == double) and
+        # tuple-returning functions whose body is float-heavy (e.g.
+        # colorsys.rgb_to_hls returns a tuple of floats).  For FV-ABI
+        # functions this ensures unwrapping uses bitcast (correct for
+        # float data) instead of sitofp (correct only for integer data).
+        # For bare-ABI functions this changes the declared param type;
+        # the call-site coercion in _emit_user_call handles fpy_val→double
+        # unwrapping with a runtime tag check (int→sitofp, float→bitcast).
+        # GUARD: only promote when CSA actually observed call sites for
+        # this function.  If there are no signatures (function is only
+        # called via higher-order patterns CSA can't trace), leave the
+        # default i64 — the function will use FV-ABI and the unwrap
+        # logic handles the int/float distinction at runtime.
+        _fn_name = _name_override if _name_override else node.name
+        _has_csa_sigs = bool(
+            self._function_signatures.get(_fn_name)
+            # For monomorphized variants (e.g. _v__x_x_d), CSA stores
+            # signatures under the original name (_v).  Check both.
+            or (_name_override and self._function_signatures.get(node.name))
+        )
+        # Eligible for float promotion: double return, OR tuple/list
+        # return whose _func_ret_types says "tuple:float".
+        _frt = (getattr(self, '_func_ret_types', {}).get(_fn_name, "")
+                or getattr(self, '_func_ret_types', {}).get(node.name, ""))
+        _is_float_ret = (ret_type == double)
+        _is_float_tuple_ret = (
+            ret_type == i8_ptr
+            and self._tag_kind(_frt) == VKind.TUPLE
+            and self._tag_elem_kind(_frt) == VKind.FLOAT)
+        if (_is_float_ret or _is_float_tuple_ret) and _has_csa_sigs:
             _body_has_float = any(
                 isinstance(_c, ast.Constant) and isinstance(_c.value, float)
                 for _c in ast.walk(node)
@@ -15242,6 +15284,33 @@ class CodeGen:
                                 _has_int = True
                         else:
                             _has_other = True
+                    elif isinstance(e, ast.BinOp):
+                        # Numeric BinOp (1e15 + 1.0, 2 * 3, etc.):
+                        # infer result type from operand types.
+                        _bo_float = False
+                        _bo_num = True
+                        for _op in (e.left, e.right):
+                            if isinstance(_op, ast.Constant):
+                                if isinstance(_op.value, float):
+                                    _bo_float = True
+                                elif not isinstance(_op.value, (int, bool)):
+                                    _bo_num = False
+                            elif (isinstance(_op, ast.UnaryOp)
+                                  and isinstance(_op.op, ast.USub)
+                                  and isinstance(_op.operand, ast.Constant)
+                                  and isinstance(_op.operand.value,
+                                                 (int, float))):
+                                if isinstance(_op.operand.value, float):
+                                    _bo_float = True
+                            else:
+                                _bo_num = False
+                        if _bo_num:
+                            if _bo_float:
+                                _has_float = True
+                            else:
+                                _has_int = True
+                        else:
+                            _has_other = True
                     else:
                         _has_other = True
                 _type_count = sum([_has_int, _has_str, _has_float,
@@ -22571,10 +22640,39 @@ class CodeGen:
                         val = self.builder.inttoptr(val, param.type)
                     elif isinstance(param.type, ir.IntType) and isinstance(val.type, ir.PointerType):
                         val = self.builder.ptrtoint(val, param.type)
+                    elif isinstance(param.type, ir.DoubleType) and isinstance(val.type, ir.IntType):
+                        val = self.builder.sitofp(val, param.type)
+                    elif isinstance(param.type, ir.IntType) and isinstance(val.type, ir.DoubleType):
+                        val = self.builder.fptosi(val, param.type)
                     elif param.type == fpy_val and isinstance(val.type, ir.IntType):
                         val = self._fv_from_int(val)
                     elif param.type == fpy_val and isinstance(val.type, ir.PointerType):
                         val = self._fv_from_str(val)
+                    elif (isinstance(val.type, ir.LiteralStructType)
+                          and val.type == fpy_val):
+                        # fpy_val → scalar (caller has MIXED var, callee
+                        # is bare-ABI)
+                        _fv_tag = self.builder.extract_value(val, 0)
+                        _fv_data = self.builder.extract_value(val, 1)
+                        if isinstance(param.type, ir.DoubleType):
+                            _is_fl = self.builder.icmp_unsigned(
+                                "==", _fv_tag,
+                                ir.Constant(i32, FPY_TAG_FLOAT))
+                            _bc = self.builder.bitcast(_fv_data, double)
+                            _si = self.builder.sitofp(_fv_data, double)
+                            val = self.builder.select(_is_fl, _bc, _si)
+                        elif isinstance(param.type, ir.IntType):
+                            if param.type.width < 64:
+                                val = self.builder.trunc(
+                                    _fv_data, param.type)
+                            else:
+                                val = _fv_data
+                        elif isinstance(param.type, ir.PointerType):
+                            val = self.builder.inttoptr(
+                                _fv_data, param.type)
+                    elif (isinstance(param.type, ir.LiteralStructType)
+                          and param.type == fpy_val):
+                        val = self._wrap_scalar_to_fv(val)
                 coerced.append(val)
             result = self.builder.call(info.func, coerced)
             return result if info.ret_tag != "void" else None
@@ -22731,6 +22829,37 @@ class CodeGen:
                         val = self.builder.ptrtoint(val, param.type)
                     elif isinstance(param.type, ir.PointerType) and isinstance(val.type, ir.IntType):
                         val = self.builder.inttoptr(val, param.type)
+                    # fpy_val → scalar: unwrap the FpyValue to the
+                    # expected scalar type.  This happens when the caller
+                    # is FV-ABI (variables stored as fpy_val) but the
+                    # callee is bare-ABI (params are i64/double/i32).
+                    elif (isinstance(val.type, ir.LiteralStructType)
+                          and val.type == fpy_val):
+                        _fv_tag = self.builder.extract_value(val, 0)
+                        _fv_data = self.builder.extract_value(val, 1)
+                        if isinstance(param.type, ir.DoubleType):
+                            # Could be int (sitofp) or float (bitcast).
+                            _is_fl = self.builder.icmp_unsigned(
+                                "==", _fv_tag,
+                                ir.Constant(i32, FPY_TAG_FLOAT))
+                            _bc = self.builder.bitcast(_fv_data, double)
+                            _si = self.builder.sitofp(_fv_data, double)
+                            val = self.builder.select(_is_fl, _bc, _si)
+                        elif isinstance(param.type, ir.IntType):
+                            if param.type.width < 64:
+                                val = self.builder.trunc(
+                                    _fv_data, param.type)
+                            else:
+                                val = _fv_data
+                        elif isinstance(param.type, ir.PointerType):
+                            val = self.builder.inttoptr(
+                                _fv_data, param.type)
+                    # double/i64/ptr → fpy_val: wrap as FpyValue with
+                    # correct tag so FV-ABI functions receive the runtime
+                    # tag instead of just the bare scalar.
+                    elif (isinstance(param.type, ir.LiteralStructType)
+                          and param.type == fpy_val):
+                        val = self._wrap_scalar_to_fv(val)
                 coerced.append(val)
 
         result = self.builder.call(info.func, coerced)
@@ -23919,12 +24048,11 @@ class CodeGen:
                 if (isinstance(elt.right, ast.Constant)
                         and isinstance(elt.right.value, str)):
                     return VKind.STR
-            # Float arithmetic
-            if (isinstance(elt.left, ast.Constant)
-                    and isinstance(elt.left.value, float)):
-                return VKind.FLOAT
-            if (isinstance(elt.right, ast.Constant)
-                    and isinstance(elt.right.value, float)):
+            # Float arithmetic: check if ANY sub-expression in the
+            # BinOp tree contains a float constant.  This catches
+            # `a / (2.0 - b - c)` where 2.0 is in a nested BinOp.
+            if any(isinstance(n, ast.Constant) and isinstance(n.value, float)
+                   for n in ast.walk(elt)):
                 return VKind.FLOAT
         if isinstance(elt, ast.Name):
             # Check parameter types by looking for type annotations
@@ -23952,7 +24080,11 @@ class CodeGen:
                         return VKind.FLOAT
                     if isinstance(arg_node.value, str):
                         return VKind.STR
-            # Check local variable assignment in function body
+            # Check local variable assignment in function body.
+            # A variable may be assigned in multiple branches
+            # (e.g. `s = a / b` in one branch, `s = a / (2.0 - c)`
+            # in another).  Continue past INT (the default) so that a
+            # branch with an explicit float constant is found.
             for stmt in ast.walk(func_ast):
                 if (isinstance(stmt, ast.Assign)
                         and len(stmt.targets) == 1
@@ -23963,8 +24095,8 @@ class CodeGen:
                         stmt.value, func_ast, param_to_arg)
                     if rhs_kind != VKind.INT:
                         return rhs_kind
-                    # INT might be the default — keep looking
-                    break
+                    # INT might be the default — keep looking at
+                    # other assignments (e.g. in else branches).
         # Default: unknown → INT
         return VKind.INT
 
