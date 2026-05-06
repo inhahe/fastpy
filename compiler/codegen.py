@@ -27362,7 +27362,14 @@ class CodeGen:
                 val = self._emit_expr_value(arg)
                 val = self._ensure_ptr(val)
                 return self._rt_call("cpython_to_list", [val])
-        # list(x) — for now, just return the arg (shallow copy would be better)
+        # list(list) / list(tuple) — shallow copy
+        if len(node.args) == 1:
+            arg = node.args[0]
+            if (self._is_list_expr(arg) or self._is_tuple_expr(arg)):
+                lst = self._emit_expr_value(arg)
+                lst = self._ensure_ptr(lst)
+                return self.builder.call(self.runtime["list_copy"], [lst])
+        # list(x) — unhandled type, return the arg (may be wrong for some types)
         if len(node.args) == 1:
             return self._emit_expr_value(node.args[0])
         if len(node.args) == 0:
