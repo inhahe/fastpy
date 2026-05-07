@@ -180,15 +180,20 @@ int64_t fastpy_str_len(const char *s) {
 }
 
 const char* fastpy_str_index(const char *s, int64_t index) {
-    int64_t len = (int64_t)strlen(s);
+    int64_t len = fastpy_str_len(s);  /* code point count */
     if (index < 0) index += len;
     if (index < 0 || index >= len) {
         fprintf(stderr, "IndexError: string index out of range\n");
         exit(1);
     }
-    FpyString *r = fpy_str_alloc(1);
-    r->data[0] = s[index];
-    r->data[1] = '\0';
+    const unsigned char *p = (const unsigned char *)s;
+    for (int64_t i = 0; i < index; i++) {
+        p += fpy_utf8_cplen(p);
+    }
+    int clen = fpy_utf8_cplen(p);
+    FpyString *r = fpy_str_alloc(clen);
+    memcpy(r->data, p, clen);
+    r->data[clen] = '\0';
     return r->data;
 }
 
@@ -209,7 +214,7 @@ int64_t fastpy_bytes_get(const char *b, int64_t index) {
 }
 
 const char* fastpy_str_slice(const char *s, int64_t start, int64_t stop, int64_t has_start, int64_t has_stop) {
-    int64_t len = (int64_t)strlen(s);
+    int64_t len = fastpy_str_len(s);  /* code point count */
     if (!has_start) start = 0;
     if (!has_stop) stop = len;
     if (start < 0) start += len;
@@ -217,20 +222,30 @@ const char* fastpy_str_slice(const char *s, int64_t start, int64_t stop, int64_t
     if (start < 0) start = 0;
     if (stop > len) stop = len;
     if (start >= stop) {
-        char *result = (char*)malloc(1);
-        result[0] = '\0';
-        return result;
+        FpyString *r = fpy_str_alloc(0);
+        r->data[0] = '\0';
+        return r->data;
     }
-    int64_t rlen = stop - start;
-    char *result = (char*)malloc(rlen + 1);
-    memcpy(result, s + start, rlen);
-    result[rlen] = '\0';
-    return result;
+    /* Walk to start code point */
+    const unsigned char *p = (const unsigned char *)s;
+    for (int64_t i = 0; i < start; i++) {
+        p += fpy_utf8_cplen(p);
+    }
+    /* Walk from start to stop, measuring byte span */
+    const unsigned char *q = p;
+    for (int64_t i = start; i < stop; i++) {
+        q += fpy_utf8_cplen(q);
+    }
+    int64_t byte_len = q - p;
+    FpyString *r = fpy_str_alloc(byte_len);
+    memcpy(r->data, p, byte_len);
+    r->data[byte_len] = '\0';
+    return r->data;
 }
 
 const char* fastpy_str_slice_step(const char *s, int64_t start, int64_t stop,
                                    int64_t step, int64_t has_start, int64_t has_stop) {
-    int64_t len = (int64_t)strlen(s);
+    int64_t len = fastpy_str_len(s);  /* code point count */
     if (step == 0) step = 1;
     if (step > 0) {
         if (!has_start) start = 0;
@@ -246,21 +261,42 @@ const char* fastpy_str_slice_step(const char *s, int64_t start, int64_t stop,
         if (start < 0) start += len;
         if (start >= len) start = len - 1;
     }
+    /* Build byte-offset table: offsets[i] = byte offset of code point i */
+    int64_t *offsets = (int64_t *)malloc((len + 1) * sizeof(int64_t));
+    const unsigned char *p = (const unsigned char *)s;
+    for (int64_t i = 0; i < len; i++) {
+        offsets[i] = (int64_t)(p - (const unsigned char *)s);
+        p += fpy_utf8_cplen(p);
+    }
+    offsets[len] = (int64_t)(p - (const unsigned char *)s);
+    /* First pass: count result bytes */
     int64_t rlen = 0;
     if (step > 0) {
-        for (int64_t i = start; i < stop; i += step) rlen++;
+        for (int64_t i = start; i < stop; i += step)
+            rlen += offsets[i + 1] - offsets[i];
     } else {
-        for (int64_t i = start; i > stop; i += step) rlen++;
+        for (int64_t i = start; i > stop; i += step)
+            rlen += offsets[i + 1] - offsets[i];
     }
-    char *result = (char*)malloc(rlen + 1);
+    /* Second pass: copy code points */
+    FpyString *r = fpy_str_alloc(rlen);
     int64_t out = 0;
     if (step > 0) {
-        for (int64_t i = start; i < stop; i += step) result[out++] = s[i];
+        for (int64_t i = start; i < stop; i += step) {
+            int64_t cb = offsets[i + 1] - offsets[i];
+            memcpy(r->data + out, s + offsets[i], cb);
+            out += cb;
+        }
     } else {
-        for (int64_t i = start; i > stop; i += step) result[out++] = s[i];
+        for (int64_t i = start; i > stop; i += step) {
+            int64_t cb = offsets[i + 1] - offsets[i];
+            memcpy(r->data + out, s + offsets[i], cb);
+            out += cb;
+        }
     }
-    result[out] = '\0';
-    return result;
+    r->data[out] = '\0';
+    free(offsets);
+    return r->data;
 }
 
 const char* fastpy_str_repeat(const char *s, int64_t n) {
@@ -314,17 +350,19 @@ FpyList* fastpy_bytes_to_list(const char *b) {
     return result;
 }
 
-/* Convert string to list of single-character strings: list("hello") → ['h','e','l','l','o'] */
+/* Convert string to list of single-character strings: list("café") → ['c','a','f','é'] */
 FpyList* fastpy_str_to_list(const char *s) {
     if (!s) return fpy_list_new(0);
-    int64_t len = (int64_t)strlen(s);
+    int64_t len = fastpy_str_len(s);  /* code point count */
     FpyList *result = fpy_list_new(len > 0 ? len : 4);
-    for (int64_t i = 0; i < len; i++) {
-        /* Allocate a 1-char string for each character */
-        FpyString *ch = fpy_str_alloc(2);
-        ch->data[0] = s[i];
-        ch->data[1] = '\0';
+    const unsigned char *p = (const unsigned char *)s;
+    while (*p) {
+        int clen = fpy_utf8_cplen(p);
+        FpyString *ch = fpy_str_alloc(clen);
+        memcpy(ch->data, p, clen);
+        ch->data[clen] = '\0';
         fpy_list_append(result, fpy_str(ch->data));
+        p += clen;
     }
     return result;
 }
@@ -906,6 +944,7 @@ extern int64_t fastpy_closure_call0(void*);
 extern int64_t fastpy_closure_call1(void*, int64_t);
 extern int64_t fastpy_closure_call2(void*, int64_t, int64_t);
 extern void* fastpy_cell_new(int64_t);
+extern void fastpy_cell_incref(void*);
 extern void fastpy_cell_set(void*, int64_t);
 extern int64_t fastpy_cell_get(void*);
 extern void* fpy_cpython_import(const char*);
@@ -1013,7 +1052,7 @@ static FpySymEntry fpy_jit_symbols[] = {
     SYM(fastpy_closure_new), SYM(fastpy_closure_set_capture), SYM(fastpy_closure_set_vararg),
     SYM(fastpy_closure_set_defaults), SYM(fastpy_closure_set_default),
     SYM(fastpy_closure_call0), SYM(fastpy_closure_call1), SYM(fastpy_closure_call2),
-    SYM(fastpy_cell_new), SYM(fastpy_cell_set), SYM(fastpy_cell_get),
+    SYM(fastpy_cell_new), SYM(fastpy_cell_incref), SYM(fastpy_cell_set), SYM(fastpy_cell_get),
     SYM(fpy_cpython_import), SYM(fpy_cpython_getattr),
     SYM(fpy_cpython_call0), SYM(fpy_cpython_call1), SYM(fpy_cpython_call2),
     SYM(fpy_cpython_call3), SYM(fpy_cpython_call_kw),

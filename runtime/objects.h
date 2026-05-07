@@ -271,6 +271,35 @@ static inline int64_t fpy_bytes_len(const char *s) {
     return (int64_t)strlen(s);  /* fallback for plain char* */
 }
 
+/* Return the byte-length of the UTF-8 code point starting at *p.
+ * p must point to a leading byte (not a continuation byte). */
+static inline int fpy_utf8_cplen(const unsigned char *p) {
+    if (*p < 0x80) return 1;
+    if ((*p & 0xE0) == 0xC0) return 2;
+    if ((*p & 0xF0) == 0xE0) return 3;
+    if ((*p & 0xF8) == 0xF0) return 4;
+    return 1;  /* invalid leading byte — advance 1 to avoid infinite loops */
+}
+
+/* Convert byte offset → code-point index (count leading bytes before offset). */
+static inline int64_t fpy_byte_to_cp(const char *s, int64_t byte_off) {
+    int64_t cp = 0;
+    for (const unsigned char *p = (const unsigned char *)s;
+         p < (const unsigned char *)s + byte_off; p++) {
+        if ((*p & 0xC0) != 0x80) cp++;
+    }
+    return cp;
+}
+
+/* Convert code-point index → byte offset (walk n code points). */
+static inline int64_t fpy_cp_to_byte(const char *s, int64_t cp_idx) {
+    const unsigned char *p = (const unsigned char *)s;
+    for (int64_t i = 0; i < cp_idx && *p; i++) {
+        p += fpy_utf8_cplen(p);
+    }
+    return (int64_t)(p - (const unsigned char *)s);
+}
+
 /* --- Value constructors --- */
 
 static inline FpyValue fpy_int(int64_t v) {

@@ -2175,6 +2175,8 @@ class CodeGen:
         # Mutable closure cells
         ft = ir.FunctionType(i8_ptr, [i64])
         self.runtime["cell_new"] = ir.Function(self.module, ft, name="fastpy_cell_new")
+        ft = ir.FunctionType(void, [i8_ptr])
+        self.runtime["cell_incref"] = ir.Function(self.module, ft, name="fastpy_cell_incref")
         ft = ir.FunctionType(void, [i8_ptr, i64])
         self.runtime["cell_set"] = ir.Function(self.module, ft, name="fastpy_cell_set")
         ft = ir.FunctionType(i64, [i8_ptr])
@@ -4007,24 +4009,46 @@ class CodeGen:
                 cell_allocas: dict[str, ir.AllocaInstr] = {}
                 for i, var_name in enumerate(captures):
                     if var_name in nonlocals:
-                        # Mutable capture: create a cell and pass cell pointer
-                        current_val = self._load_variable(var_name, node)
-                        cell = self.builder.call(self.runtime["cell_new"], [current_val])
-                        cell_as_i64 = self.builder.ptrtoint(cell, i64)
-                        self.builder.call(self.runtime["closure_set_capture"], [
-                            closure, ir.Constant(i32, i), cell_as_i64])
-                        # Mark this capture as a cell so the closure destructor
-                        # can free it properly
-                        self.builder.call(self.runtime["closure_mark_cell"], [
-                            closure, ir.Constant(i32, i)])
-                        # Save cell pointer for read-back after closure call
-                        cell_alloca = self._create_entry_alloca(i8_ptr,
-                                                                f"cell.{var_name}")
-                        self.builder.store(cell, cell_alloca)
-                        cell_allocas[var_name] = cell_alloca
-                        # Also mark the outer variable as cell-backed so
-                        # inline calls to g() will read from the cell
-                        self.variables[var_name] = (cell_alloca, ValueType(VKind.CELL))
+                        # Check if this variable is already cell-backed
+                        # (chained nonlocal from an enclosing closure).
+                        # If so, share the existing cell pointer instead of
+                        # creating a new one — otherwise nested nonlocal
+                        # writes won't propagate to the outermost scope.
+                        _already_cell = False
+                        if var_name in self.variables:
+                            _va, _vt = self.variables[var_name]
+                            if self._tag_kind(_vt) == VKind.CELL:
+                                _already_cell = True
+                        if _already_cell:
+                            # Reuse existing cell pointer (bump refcount
+                            # since two closures now share the same cell)
+                            cell = self.builder.load(_va, name=f"{var_name}.cell.shared")
+                            self.builder.call(self.runtime["cell_incref"], [cell])
+                            cell_as_i64 = self.builder.ptrtoint(cell, i64)
+                            self.builder.call(self.runtime["closure_set_capture"], [
+                                closure, ir.Constant(i32, i), cell_as_i64])
+                            self.builder.call(self.runtime["closure_mark_cell"], [
+                                closure, ir.Constant(i32, i)])
+                            cell_allocas[var_name] = _va
+                        else:
+                            # First-level nonlocal: create a new cell
+                            current_val = self._load_variable(var_name, node)
+                            cell = self.builder.call(self.runtime["cell_new"], [current_val])
+                            cell_as_i64 = self.builder.ptrtoint(cell, i64)
+                            self.builder.call(self.runtime["closure_set_capture"], [
+                                closure, ir.Constant(i32, i), cell_as_i64])
+                            # Mark this capture as a cell so the closure destructor
+                            # can free it properly
+                            self.builder.call(self.runtime["closure_mark_cell"], [
+                                closure, ir.Constant(i32, i)])
+                            # Save cell pointer for read-back after closure call
+                            cell_alloca = self._create_entry_alloca(i8_ptr,
+                                                                    f"cell.{var_name}")
+                            self.builder.store(cell, cell_alloca)
+                            cell_allocas[var_name] = cell_alloca
+                            # Also mark the outer variable as cell-backed so
+                            # inline calls to g() will read from the cell
+                            self.variables[var_name] = (cell_alloca, ValueType(VKind.CELL))
                     else:
                         val = self._load_variable(var_name, node)
                         if isinstance(val.type, ir.PointerType):
@@ -28047,12 +28071,26 @@ class CodeGen:
         raise CodeGenError("enumerate() requires at least one argument", node)
 
     def _emit_builtin_zip(self, node):
+        def _is_str_arg(arg_node):
+            """Check if a zip argument is a string (needs str_to_list)."""
+            if isinstance(arg_node, ast.Constant) and isinstance(arg_node.value, str):
+                return True
+            if isinstance(arg_node, ast.Name) and arg_node.id in self.variables:
+                kind = self._var_kind(arg_node.id)
+                if kind == VKind.STR:
+                    return True
+            if isinstance(arg_node, ast.JoinedStr):  # f-string
+                return True
+            return False
         def _zip_arg(arg_node):
-            """Emit a zip argument, materializing generators to lists."""
+            """Emit a zip argument, materializing generators/strings to lists."""
             val = self._emit_expr_value(arg_node)
             if self._is_obj_expr(arg_node):
                 val = self._ensure_ptr(val)
                 val = self._rt_call("list_from_obj_iter", [val])
+            elif _is_str_arg(arg_node):
+                val = self._ensure_ptr(val)
+                val = self.builder.call(self.runtime["str_to_list"], [val])
             return val
         if len(node.args) == 2:
             a = _zip_arg(node.args[0])
