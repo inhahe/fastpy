@@ -3309,41 +3309,50 @@ const char* fastpy_str_casefold(const char *s) {
     return result;
 }
 
-/* str.expandtabs(tabsize) */
+/* str.expandtabs(tabsize) — column counter uses code points, not bytes */
 const char* fastpy_str_expandtabs(const char *s, int64_t tabsize) {
     if (!s) return fpy_strdup("");
-    /* First pass: count output length */
+    const unsigned char *p;
+    /* First pass: count output byte length */
     size_t out_len = 0;
     size_t col = 0;
-    for (const char *p = s; *p; p++) {
+    for (p = (const unsigned char *)s; *p; ) {
         if (*p == '\t') {
             int64_t spaces = tabsize - (int64_t)(col % (size_t)tabsize);
             if (tabsize <= 0) spaces = 0;
             out_len += (size_t)spaces;
             col += (size_t)spaces;
+            p++;
         } else if (*p == '\n' || *p == '\r') {
             out_len++;
             col = 0;
+            p++;
         } else {
-            out_len++;
-            col++;
+            int cplen = fpy_utf8_cplen(p);
+            out_len += cplen;   /* copy all bytes of the code point */
+            col++;              /* but only advance column by 1 */
+            p += cplen;
         }
     }
     char *result = (char*)malloc(out_len + 1);
     size_t i = 0;
     col = 0;
-    for (const char *p = s; *p; p++) {
+    for (p = (const unsigned char *)s; *p; ) {
         if (*p == '\t') {
             int64_t spaces = tabsize - (int64_t)(col % (size_t)tabsize);
             if (tabsize <= 0) spaces = 0;
             for (int64_t j = 0; j < spaces; j++) result[i++] = ' ';
             col += (size_t)spaces;
+            p++;
         } else if (*p == '\n' || *p == '\r') {
-            result[i++] = *p;
+            result[i++] = (char)*p;
             col = 0;
+            p++;
         } else {
-            result[i++] = *p;
+            int cplen = fpy_utf8_cplen(p);
+            for (int k = 0; k < cplen; k++) result[i++] = (char)p[k];
             col++;
+            p += cplen;
         }
     }
     result[i] = '\0';

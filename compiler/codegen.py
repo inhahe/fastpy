@@ -450,6 +450,11 @@ class FuncInfo:
     # Number of keyword-only params (after *args) — used by _emit_user_call
     # to correctly partition args vs kwonly when calling vararg functions.
     n_kwonly: int = 0
+    # Pre-evaluated globals for mutable defaults (list, dict, set literals).
+    # Parallel to `defaults` — entry is ir.GlobalVariable or None.
+    # Python evaluates defaults once at def-time; without caching, mutable
+    # defaults like `def f(x=[])` would create a fresh object each call.
+    default_globals: list = None
 
 
 @dataclass
@@ -461,6 +466,7 @@ class ClassInfo:
     parent_name: str | None             # parent class name or None
     init_arg_count: int                 # number of __init__ args (excluding self)
     init_defaults: list = None          # AST nodes for __init__ default values (right-aligned)
+    init_default_globals: list = None   # Pre-evaluated globals for mutable __init__ defaults
     method_asts: dict = None            # method_name -> ast.FunctionDef for return-type inference
     classmethods: set = None            # set of method names marked @classmethod
     staticmethods: set = None           # set of method names marked @staticmethod
@@ -3645,7 +3651,14 @@ class CodeGen:
                               [main_name_ptr, main_file_ptr, ir.Constant(i32, 1)])
 
         for node in tree.body:
-            if not isinstance(node, (ast.FunctionDef, ast.ClassDef)):
+            if isinstance(node, ast.FunctionDef):
+                # Initialize mutable default values (Python evaluates
+                # defaults once at def-time, so list/dict/set literals
+                # must be created here and reused across calls).
+                self._init_mutable_defaults(node)
+            elif isinstance(node, ast.ClassDef):
+                self._init_class_mutable_defaults(node)
+            else:
                 self._emit_stmt(node)
                 # Module-level exception check: if a runtime function raised
                 # an exception (e.g. TypeError from `list + int`) and we're
@@ -3685,6 +3698,33 @@ class CodeGen:
             print(_SafeIRBuilder.coercion_report(), file=sys.stderr)
 
         return str(self.module)
+
+    def _init_mutable_defaults(self, node: ast.FunctionDef) -> None:
+        """Evaluate and cache mutable defaults (list/dict/set literals) for
+        a module-level function.  Called from Pass 3 so the values are created
+        during module initialisation (matching Python's def-time semantics)."""
+        info = self._user_functions.get(node.name)
+        if not info or not info.default_globals:
+            return
+        for di, gvar in enumerate(info.default_globals):
+            if gvar is not None:
+                val = self._emit_expr_value(info.defaults[di])
+                if not isinstance(val.type, ir.PointerType):
+                    val = self.builder.inttoptr(val, i8_ptr)
+                self.builder.store(val, gvar)
+
+    def _init_class_mutable_defaults(self, node: ast.ClassDef) -> None:
+        """Evaluate and cache mutable __init__ defaults for a module-level
+        class.  Called from Pass 3 during module initialisation."""
+        cls_info = self._user_classes.get(node.name)
+        if not cls_info or not cls_info.init_default_globals:
+            return
+        for di, gvar in enumerate(cls_info.init_default_globals):
+            if gvar is not None:
+                val = self._emit_expr_value(cls_info.init_defaults[di])
+                if not isinstance(val.type, ir.PointerType):
+                    val = self.builder.inttoptr(val, i8_ptr)
+                self.builder.store(val, gvar)
 
     def _scan_for_closures(self, outer_func: ast.FunctionDef,
                             _name_prefix: str | None = None,
@@ -7208,6 +7248,20 @@ class CodeGen:
             float_vars = set(float_params)
             list_vars = set()
             dict_vars = set()
+            # Parameters with list/dict/set defaults are typed at def-time
+            _n_params = len(node.args.args)
+            _n_defs = len(node.args.defaults)
+            for _di, _def in enumerate(node.args.defaults):
+                _pidx = _n_params - _n_defs + _di
+                _pname = node.args.args[_pidx].arg if _pidx < _n_params else None
+                if _pname:
+                    if isinstance(_def, (ast.List, ast.ListComp, ast.Set, ast.SetComp)):
+                        list_vars.add(_pname)
+                    elif isinstance(_def, (ast.Dict, ast.DictComp)):
+                        list_vars.add(_pname)
+                        dict_vars.add(_pname)
+                    elif isinstance(_def, ast.Constant) and isinstance(_def.value, str):
+                        str_vars.add(_pname)
             for n in ast.walk(node):
                 if isinstance(n, ast.Assign):
                     for tgt in n.targets:
@@ -7660,6 +7714,16 @@ class CodeGen:
                             returns_dict = True
                         elif _ctk == VKind.LIST:
                             returns_list = True
+                    else:
+                        # Fallback: use local type tracking (from defaults,
+                        # assignments, or .append calls) for param variables.
+                        _vid = n.value.id
+                        if _vid in list_vars:
+                            returns_list = True
+                        elif _vid in dict_vars:
+                            returns_dict = True
+                        elif _vid in str_vars:
+                            returns_str = True
 
         # Detect obj-valued returns (variable tracked in obj_vars from the
         # local type-tracking scan above) so ret_tag is "obj" rather than
@@ -8027,6 +8091,25 @@ class CodeGen:
             uses_bare_abi=uses_bare,
             n_kwonly=len(node.args.kwonlyargs),
         )
+        # Create globals for mutable defaults (list/dict/set literals).
+        # Python evaluates defaults once at def-time; without caching,
+        # `def f(x=[])` would create a fresh list on every call.
+        if defaults:
+            dg = []
+            has_any = False
+            for di, dnode in enumerate(defaults):
+                if isinstance(dnode, (ast.List, ast.Dict, ast.Set)):
+                    gvar = ir.GlobalVariable(self.module, i8_ptr,
+                                             name=f"fastpy.defval.{effective_name}.{di}")
+                    gvar.initializer = ir.Constant(i8_ptr, None)
+                    gvar.linkage = "private"
+                    dg.append(gvar)
+                    has_any = True
+                else:
+                    dg.append(None)
+            if has_any:
+                self._user_functions[effective_name].default_globals = dg
+
         # Track the function's AST so callers can inspect what it returns
         # (used to propagate dict-value-type flags to assignment targets).
         if not hasattr(self, "_function_def_nodes"):
@@ -11110,6 +11193,24 @@ class CodeGen:
                 ]
                 break
 
+        # Create globals for mutable __init__ defaults
+        _init_dg = None
+        if init_defaults:
+            dg = []
+            has_any = False
+            for di, dnode in enumerate(init_defaults):
+                if isinstance(dnode, (ast.List, ast.Dict, ast.Set)):
+                    gvar = ir.GlobalVariable(self.module, i8_ptr,
+                                             name=f"fastpy.defval.{class_name}.__init__.{di}")
+                    gvar.initializer = ir.Constant(i8_ptr, None)
+                    gvar.linkage = "private"
+                    dg.append(gvar)
+                    has_any = True
+                else:
+                    dg.append(None)
+            if has_any:
+                _init_dg = dg
+
         self._user_classes[class_name] = ClassInfo(
             name=class_name,
             class_id_global=class_id_global,
@@ -11117,6 +11218,7 @@ class CodeGen:
             parent_name=parent_name,
             init_arg_count=init_arg_count,
             init_defaults=init_defaults,
+            init_default_globals=_init_dg,
             method_asts=method_asts,
             classmethods=classmethods,
             staticmethods=staticmethods,
@@ -22757,7 +22859,8 @@ class CodeGen:
                     else:
                         default_idx = idx - (cls_info.init_arg_count - len(defaults))
                         if default_idx >= 0 and default_idx < len(defaults):
-                            v = self._emit_expr_value(defaults[default_idx])
+                            cached = self._load_cached_default(cls_info.init_default_globals, default_idx)
+                            v = cached if cached is not None else self._emit_expr_value(defaults[default_idx])
                             init_args.append(coerce_to_i64(v))
                         else:
                             raise CodeGenError(
@@ -22774,8 +22877,10 @@ class CodeGen:
                 raise CodeGenError(
                     f"{class_name}() missing required argument(s)", node,
                 )
-            for default_node in defaults[defaults_start:]:
-                v = self._emit_expr_value(default_node)
+            for di_off, default_node in enumerate(defaults[defaults_start:]):
+                di = defaults_start + di_off
+                cached = self._load_cached_default(cls_info.init_default_globals, di)
+                v = cached if cached is not None else self._emit_expr_value(default_node)
                 init_args.append(coerce_to_i64(v))
 
         # Direct __init__ dispatch: since the class is known statically, we
@@ -23238,6 +23343,13 @@ class CodeGen:
             val = self._emit_expr_value(arg_node)
             args.append(val)
 
+        # Track indices that hold cached mutable defaults (from globals).
+        # These must NOT be re-evaluated via _load_or_wrap_fv in the FV
+        # wrapping loop below — the already-loaded pointer is the value.
+        _cached_default_indices: set[int] = set()
+        # Map arg index → default AST node (for type inference during FV wrap)
+        _default_node_at: dict[int, ast.expr] = {}
+
         # Handle keyword arguments by mapping them to positional slots
         if node.keywords:
             fn_def = getattr(self, '_function_def_nodes', {}).get(name)
@@ -23265,8 +23377,14 @@ class CodeGen:
                         # Use default for this position
                         default_idx = idx - (info.param_count - len(info.defaults))
                         if default_idx >= 0 and default_idx < len(info.defaults):
-                            val = self._emit_expr_value(info.defaults[default_idx])
-                            args.append(val)
+                            cached = self._load_cached_default(info.default_globals, default_idx)
+                            if cached is not None:
+                                args.append(cached)
+                                _cached_default_indices.add(idx)
+                                _default_node_at[idx] = info.defaults[default_idx]
+                            else:
+                                val = self._emit_expr_value(info.defaults[default_idx])
+                                args.append(val)
                         else:
                             raise CodeGenError(
                                 f"{name}() missing required argument at position {idx}",
@@ -23289,14 +23407,24 @@ class CodeGen:
         # Append default values for unprovided parameters.
         # Track their AST nodes so the FV coercion loop can use
         # _load_or_wrap_fv (preserves None tag for `default=None`).
+        # For mutable defaults with cached globals, mark the index so the
+        # FV wrapping loop below loads the cached value instead of re-evaluating.
         default_ast_nodes: list[ast.expr] = []
         if n_provided < info.param_count:
             # defaults are right-aligned: defaults[0] is for param[param_count - len(defaults)]
             n_defaults_to_use = info.param_count - n_provided
             defaults_start = len(info.defaults) - n_defaults_to_use
-            for default_node in info.defaults[defaults_start:]:
-                val = self._emit_expr_value(default_node)
-                args.append(val)
+            for di_off, default_node in enumerate(info.defaults[defaults_start:]):
+                di = defaults_start + di_off
+                arg_idx = n_provided + di_off
+                cached = self._load_cached_default(info.default_globals, di)
+                if cached is not None:
+                    args.append(cached)
+                    _cached_default_indices.add(arg_idx)
+                    _default_node_at[arg_idx] = default_node
+                else:
+                    val = self._emit_expr_value(default_node)
+                    args.append(val)
                 default_ast_nodes.append(default_node)
 
         # Coerce arguments to function signature
@@ -23307,6 +23435,13 @@ class CodeGen:
             # are more args than AST nodes (starred unpack / defaults), use
             # the tracked default AST node.
             for i, val in enumerate(args):
+                # For cached mutable defaults, wrap the already-loaded
+                # pointer directly instead of re-evaluating via
+                # _load_or_wrap_fv (which would create a fresh object).
+                if i in _cached_default_indices:
+                    fv = self._wrap_for_print(val, _default_node_at[i])
+                    coerced.append(fv)
+                    continue
                 if i < len(node.args) and not isinstance(node.args[i], ast.Starred):
                     arg_node = node.args[i]
                 elif i >= n_provided and (i - n_provided) < len(default_ast_nodes):
@@ -23524,6 +23659,10 @@ class CodeGen:
             args.append(val)
             arg_source_nodes.append(arg_node)
 
+        # Track cached mutable defaults across both kw-fill and positional-fill paths
+        _cached_fv_indices: set[int] = set()
+        _cached_fv_nodes: dict[int, ast.expr] = {}
+
         # Handle keyword arguments by mapping them to positional slots
         if node.keywords:
             fn_def = getattr(self, '_function_def_nodes', {}).get(name)
@@ -23548,9 +23687,16 @@ class CodeGen:
                     else:
                         default_idx = idx - (info.param_count - len(info.defaults))
                         if default_idx >= 0 and default_idx < len(info.defaults):
-                            val = self._emit_expr_value(info.defaults[default_idx])
-                            args.append(val)
-                            arg_source_nodes.append(info.defaults[default_idx])
+                            cached = self._load_cached_default(info.default_globals, default_idx)
+                            if cached is not None:
+                                args.append(cached)
+                                _cached_fv_indices.add(idx)
+                                _cached_fv_nodes[idx] = info.defaults[default_idx]
+                                arg_source_nodes.append(info.defaults[default_idx])
+                            else:
+                                val = self._emit_expr_value(info.defaults[default_idx])
+                                args.append(val)
+                                arg_source_nodes.append(info.defaults[default_idx])
                         else:
                             raise CodeGenError(
                                 f"{name}() missing required argument at position {idx}",
@@ -23561,13 +23707,27 @@ class CodeGen:
         if n_provided < info.param_count:
             n_defaults_to_use = info.param_count - n_provided
             defaults_start = len(info.defaults) - n_defaults_to_use
-            for default_node in info.defaults[defaults_start:]:
-                val = self._emit_expr_value(default_node)
-                args.append(val)
+            for di_off, default_node in enumerate(info.defaults[defaults_start:]):
+                di = defaults_start + di_off
+                arg_idx = n_provided + di_off
+                cached = self._load_cached_default(info.default_globals, di)
+                if cached is not None:
+                    args.append(cached)
+                    _cached_fv_indices.add(arg_idx)
+                    _cached_fv_nodes[arg_idx] = default_node
+                else:
+                    val = self._emit_expr_value(default_node)
+                    args.append(val)
                 arg_source_nodes.append(default_node)
 
         coerced = []
         for i, val in enumerate(args):
+            # For cached mutable defaults, wrap the already-loaded pointer
+            # directly instead of re-evaluating via _load_or_wrap_fv.
+            if i in _cached_fv_indices:
+                fv = self._wrap_for_print(val, _cached_fv_nodes[i])
+                coerced.append(fv)
+                continue
             arg_node = arg_source_nodes[i] if i < len(arg_source_nodes) else None
             # Use _load_or_wrap_fv for all AST-backed args to preserve
             # runtime tags (None, obj, etc.) through the FV-ABI boundary.
@@ -23580,6 +23740,16 @@ class CodeGen:
 
         # Call the function — return the raw FpyValue, no unwrap
         return self.builder.call(info.func, coerced)
+
+    def _load_cached_default(self, default_globals, default_idx):
+        """Load a mutable default from its cached global, if available.
+        Returns the loaded i8* value or None if no cache exists for this
+        default index."""
+        if (default_globals is not None
+                and default_idx < len(default_globals)
+                and default_globals[default_idx] is not None):
+            return self.builder.load(default_globals[default_idx])
+        return None
 
     def _wrap_arg_value(self, val: ir.Value, arg_node: ast.expr | None) -> ir.Value:
         """Wrap a bare argument value into an FpyValue for the FV-ABI call.
