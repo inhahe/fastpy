@@ -3281,13 +3281,18 @@ class CodeGen:
                             self.runtime["call_ptr1"],
                             [actual_deco, func_ptr])
 
-                # Store the final decorated result
+                # Store the final decorated result, preserving original return type
                 if isinstance(func_ptr.type, ir.PointerType):
                     self._store_variable(node.name, func_ptr, ValueType(VKind.CLOSURE))
                 else:
                     self._store_variable(
                         node.name,
                         self._ensure_ptr(func_ptr), ValueType(VKind.CLOSURE))
+                # Track original function's return type so call sites can
+                # correctly interpret the i64 return from call_ptr/closure_call
+                if not hasattr(self, '_decorated_ret_tags'):
+                    self._decorated_ret_tags = {}
+                self._decorated_ret_tags[node.name] = info.ret_tag
 
     def _gen_compile_cpython(self, tree: ast.Module) -> None:
         """Compile CPython-bridge generators, classes, and function groups.
@@ -4264,8 +4269,11 @@ class CodeGen:
                         and n.id not in dir(__builtins__)):
                     free_vars.append(n.id)
 
-        if free_vars:
-            # Lambda captures variables — create a closure
+        if free_vars or node.args.defaults:
+            # Lambda captures variables or has defaults — create a closure
+            # Defaults MUST be captured at definition time (not call time)
+            # so that e.g. `lambda x, i=i: x+i` inside a loop captures
+            # the current value of `i`, not the final value.
             self._lambda_counter += 1
             name = f"__lambda_closure_{self._lambda_counter}"
             param_names = [arg.arg for arg in node.args.args] + free_vars
@@ -13312,6 +13320,20 @@ class CodeGen:
                     t = self._infer_constant_value_type(v_node)
                     if t is not None:
                         dict_key_types[k_node.value] = t
+
+        # Track variables assigned from closure/function-pointer calls.
+        # Used to detect str + closure_result patterns in decorator wrappers.
+        _is_closure_call = (
+            isinstance(node.value, ast.Call)
+            and isinstance(node.value.func, ast.Name)
+            and node.value.func.id in self.variables
+            and self._var_kind(node.value.func.id) in (VKind.CLOSURE, VKind.INT))
+        if _is_closure_call:
+            if not hasattr(self, '_closure_call_vars'):
+                self._closure_call_vars = set()
+            for tgt in node.targets:
+                if isinstance(tgt, ast.Name):
+                    self._closure_call_vars.add(tgt.id)
 
         for target in node.targets:
             if isinstance(target, ast.Name):
@@ -22794,15 +22816,32 @@ class CodeGen:
         # (from a decorator that returns a nested function) or a raw
         # function pointer (from an identity-style decorator).
         ptr = self._ensure_ptr(val)
+        # Check if we know the return type (e.g., from decorator application)
+        _drt = getattr(self, '_decorated_ret_tags', {}).get(name)
         if n_args == 0:
-            return self.builder.call(self.runtime["call_ptr0"], [ptr])
+            result = self.builder.call(self.runtime["call_ptr0"], [ptr])
         elif n_args == 1:
             a = self._emit_expr_value(node.args[0])
-            return self.builder.call(self.runtime["call_ptr1"], [ptr, a])
+            if isinstance(a.type, ir.PointerType):
+                a = self.builder.ptrtoint(a, i64)
+            result = self.builder.call(self.runtime["call_ptr1"], [ptr, a])
         elif n_args == 2:
             a = self._emit_expr_value(node.args[0])
             b = self._emit_expr_value(node.args[1])
-            return self.builder.call(self.runtime["call_ptr2"], [ptr, a, b])
+            if isinstance(a.type, ir.PointerType):
+                a = self.builder.ptrtoint(a, i64)
+            if isinstance(b.type, ir.PointerType):
+                b = self.builder.ptrtoint(b, i64)
+            result = self.builder.call(self.runtime["call_ptr2"], [ptr, a, b])
+        else:
+            result = None  # handled below in 3+ args path
+        if result is not None:
+            # Convert raw i64 result based on known return type
+            if _drt == "str":
+                return self.builder.inttoptr(result, i8_ptr)
+            if _drt == "float":
+                return self.builder.bitcast(result, double)
+            return result
 
         # 3+ args: pack into list and use closure_call_list
         if n_args >= 3:
@@ -26392,7 +26431,38 @@ class CodeGen:
             return self._rt_call("str_repeat", [ltv, rtv])
         if lk in (VKind.INT, VKind.BOOL) and rk == VKind.STR and op == ast.Mult:
             return self._rt_call("str_repeat", [rtv, ltv])
-        # NOTE: str + int and int + str are NOT valid in Python (TypeError).
+        # str + i64 or i64 + str from a closure/function-pointer call:
+        # the i64 is likely a string pointer whose type tag was lost through
+        # the closure calling convention (common in decorator wrappers doing
+        # "<b>" + fn(*args) + "</b>"). Coerce to string pointer.
+        # Matches: direct closure call results AND variables assigned from
+        # closure calls (the result = fn(*args); "x" + result pattern).
+        _ccv = getattr(self, '_closure_call_vars', set())
+        if op == ast.Add and lk == VKind.STR and rk == VKind.INT:
+            _is_closure_result = (
+                (isinstance(node.right, ast.Call)
+                 and isinstance(node.right.func, ast.Name)
+                 and node.right.func.id in self.variables)
+                or (isinstance(node.right, ast.Name)
+                    and node.right.id in _ccv))
+            if _is_closure_result:
+                r_ptr = self.builder.inttoptr(
+                    rtv.as_i64(self.builder), i8_ptr)
+                return self._rt_call("str_concat",
+                                     [ltv.as_ptr(self.builder), r_ptr])
+        if op == ast.Add and lk == VKind.INT and rk == VKind.STR:
+            _is_closure_result = (
+                (isinstance(node.left, ast.Call)
+                 and isinstance(node.left.func, ast.Name)
+                 and node.left.func.id in self.variables)
+                or (isinstance(node.left, ast.Name)
+                    and node.left.id in _ccv))
+            if _is_closure_result:
+                l_ptr = self.builder.inttoptr(
+                    ltv.as_i64(self.builder), i8_ptr)
+                return self._rt_call("str_concat",
+                                     [l_ptr, rtv.as_ptr(self.builder)])
+        # NOTE: true str + int and int + str are NOT valid in Python (TypeError).
         # These fall through to the container guard → fv_binop → TypeError.
 
         # ── Fast path: list + list → concat, list * int → repeat ───────
@@ -29452,6 +29522,42 @@ class CodeGen:
             result = self._emit_call_on_call(node)
             if result is not None:
                 return result
+        # Subscript call: funcs[0](10), callbacks[i](x), etc.
+        # The subscript evaluates to a function pointer or closure pointer;
+        # dispatch through call_ptr which auto-detects closures.
+        if isinstance(node.func, ast.Subscript):
+            callee = self._emit_expr_value(node.func)
+            callee = self._ensure_ptr(callee)
+            n_args = len(node.args)
+            if n_args == 0:
+                return self.builder.call(self.runtime["call_ptr0"], [callee])
+            elif n_args == 1:
+                a = self._emit_expr_value(node.args[0])
+                if isinstance(a.type, ir.PointerType):
+                    a = self.builder.ptrtoint(a, i64)
+                elif isinstance(a.type, ir.IntType) and a.type.width != 64:
+                    a = self.builder.zext(a, i64)
+                return self.builder.call(
+                    self.runtime["call_ptr1"], [callee, a])
+            elif n_args == 2:
+                a1 = self._emit_expr_value(node.args[0])
+                a2 = self._emit_expr_value(node.args[1])
+                if isinstance(a1.type, ir.PointerType):
+                    a1 = self.builder.ptrtoint(a1, i64)
+                if isinstance(a2.type, ir.PointerType):
+                    a2 = self.builder.ptrtoint(a2, i64)
+                return self.builder.call(
+                    self.runtime["call_ptr2"], [callee, a1, a2])
+            else:
+                # 3+ args: pack into list
+                args_list = self.builder.call(self.runtime["list_new"], [])
+                for arg_node in node.args:
+                    v = self._emit_expr_value(arg_node)
+                    tag, data = self._bare_to_tag_data(v, arg_node)
+                    self._rt_call("list_append_fv",
+                                  [args_list, ir.Constant(i32, tag), data])
+                return self.builder.call(
+                    self.runtime["closure_call_list"], [callee, args_list])
         # Try indirect function pointer call
         if isinstance(node.func, ast.Name) and node.func.id in self.variables:
             result = self._try_indirect_func_call(node)
