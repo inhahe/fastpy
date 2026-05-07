@@ -29524,6 +29524,29 @@ class CodeGen:
                 if (isinstance(body, ast.Compare)
                         or isinstance(body, ast.BoolOp)):
                     tag = FPY_TAG_BOOL
+                elif isinstance(body, ast.JoinedStr):
+                    tag = FPY_TAG_STR
+                elif (isinstance(body, ast.Constant)
+                      and isinstance(body.value, str)):
+                    tag = FPY_TAG_STR
+                elif (isinstance(body, ast.Constant)
+                      and isinstance(body.value, float)):
+                    tag = FPY_TAG_FLOAT
+                elif (isinstance(body, ast.Call)
+                      and isinstance(body.func, ast.Attribute)):
+                    # Method call: check if it's a known string method
+                    _str_ret_methods = {
+                        "upper", "lower", "strip", "lstrip", "rstrip",
+                        "replace", "capitalize", "title", "swapcase",
+                        "join", "center", "ljust", "rjust", "zfill",
+                        "encode", "format", "removeprefix", "removesuffix",
+                    }
+                    if body.func.attr in _str_ret_methods:
+                        tag = FPY_TAG_STR
+                    elif body.func.attr in ("split", "sorted"):
+                        tag = FPY_TAG_LIST
+                    else:
+                        tag = FPY_TAG_INT
                 else:
                     tag = FPY_TAG_INT
             elif (isinstance(fn_node, ast.Name)
