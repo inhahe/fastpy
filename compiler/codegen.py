@@ -34628,6 +34628,10 @@ class CodeGen:
         gen = node.generators[0]
         result_list = self.builder.call(self.runtime["list_new"], [])
 
+        if isinstance(gen.target, ast.Tuple):
+            # Tuple unpacking: [expr for a, b in iterable]
+            return self._emit_list_comp_tuple_unpack(node, gen, result_list)
+
         if not isinstance(gen.target, ast.Name):
             return self._bridge_fallback_expr(node, "complex variable target in comprehension")
 
@@ -34779,6 +34783,69 @@ class CodeGen:
 
         self._emit_list_append_expr(result_list, node.elt)
         self.builder.branch(incr_block)
+
+    def _emit_list_comp_tuple_unpack(self, node: ast.ListComp,
+                                      gen, result_list) -> ir.Value:
+        """Emit [expr for a, b, ... in iterable] with tuple unpacking."""
+        n_targets = len(gen.target.elts)
+        pos_tags = self._infer_for_tuple_elem_types(gen.iter, n_targets)
+        pos_tags = [t if t != "unknown" else "int" for t in pos_tags]
+
+        iter_val = self._emit_expr_value(gen.iter)
+        if self._is_obj_expr(gen.iter):
+            iter_val = self._ensure_ptr(iter_val)
+            iter_val = self._rt_call("list_from_obj_iter", [iter_val])
+        iter_len = self._rt_call("list_length", [iter_val])
+
+        idx_alloca = self._create_entry_alloca(i64, "lc_tu.idx")
+        self.builder.store(ir.Constant(i64, 0), idx_alloca)
+
+        cond_block = self._new_block("lc_tu.cond")
+        body_block = self._new_block("lc_tu.body")
+        incr_block = self._new_block("lc_tu.incr")
+        end_block = self._new_block("lc_tu.end")
+
+        self.builder.branch(cond_block)
+        self.builder.position_at_end(cond_block)
+        idx = self.builder.load(idx_alloca)
+        self.builder.cbranch(
+            self.builder.icmp_signed("<", idx, iter_len),
+            body_block, end_block)
+
+        self.builder.position_at_end(body_block)
+        idx = self.builder.load(idx_alloca)
+        # Get the tuple element from the outer list
+        tag_s = self._create_entry_alloca(i32, "lc_tu.tag")
+        data_s = self._create_entry_alloca(i64, "lc_tu.data")
+        self._rt_call("list_get_fv", [iter_val, idx, tag_s, data_s])
+        elem_ptr = self._ensure_ptr(self.builder.load(data_s))
+        # Unpack tuple into individual variables
+        for ti, tgt in enumerate(gen.target.elts):
+            if isinstance(tgt, ast.Name):
+                t2 = self._create_entry_alloca(i32, f"lc_tu.t{ti}")
+                d2 = self._create_entry_alloca(i64, f"lc_tu.d{ti}")
+                self._rt_call("list_get_fv", [elem_ptr, ir.Constant(i64, ti), t2, d2])
+                _var_tag = pos_tags[ti] if ti < len(pos_tags) else "int"
+                _vt_tag = (_var_tag if isinstance(_var_tag, ValueType)
+                           else ValueType.from_old_tag(_var_tag))
+                if _vt_tag.kind.is_ptr:
+                    self._store_variable(
+                        tgt.id,
+                        self._ensure_ptr(self.builder.load(d2)),
+                        _var_tag)
+                else:
+                    self._store_variable(tgt.id, self.builder.load(d2), _var_tag)
+
+        # Emit body (conditions + append)
+        self._emit_lc_body(gen, node, result_list, incr_block)
+
+        self.builder.position_at_end(incr_block)
+        idx = self.builder.load(idx_alloca)
+        self.builder.store(self.builder.add(idx, ir.Constant(i64, 1)), idx_alloca)
+        self.builder.branch(cond_block)
+
+        self.builder.position_at_end(end_block)
+        return result_list
 
     def _emit_list_comprehension_multi(self, node: ast.ListComp) -> ir.Value:
         """Emit [expr for x in a for y in b for z in c ...] with 3+ generators."""
