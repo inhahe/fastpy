@@ -8871,7 +8871,7 @@ class CodeGen:
         func = ast.FunctionDef(
             name="__init__",
             args=ast.arguments(posonlyargs=[], args=args, vararg=None,
-                               kwonlyargs=[], kw_defaults=[], kwargs=None,
+                               kwonlyargs=[], kw_defaults=[], kwarg=None,
                                defaults=defaults),
             body=body, decorator_list=[], returns=None)
         ast.copy_location(func, loc)
@@ -8897,7 +8897,7 @@ class CodeGen:
             name="__repr__",
             args=ast.arguments(posonlyargs=[], args=[ast.arg(arg="self")],
                                vararg=None, kwonlyargs=[], kw_defaults=[],
-                               kwargs=None, defaults=[]),
+                               kwarg=None, defaults=[]),
             body=[ast.Return(value=ast.JoinedStr(values=parts))],
             decorator_list=[], returns=None)
         ast.copy_location(func, loc)
@@ -8938,7 +8938,7 @@ class CodeGen:
                 posonlyargs=[],
                 args=[ast.arg(arg="self"), ast.arg(arg="other")],
                 vararg=None, kwonlyargs=[], kw_defaults=[],
-                kwargs=None, defaults=[]),
+                kwarg=None, defaults=[]),
             body=[ast.Return(value=ret_val)],
             decorator_list=[], returns=None)
         ast.copy_location(func, loc)
@@ -8971,7 +8971,7 @@ class CodeGen:
             name="__hash__",
             args=ast.arguments(posonlyargs=[], args=[ast.arg(arg="self")],
                                vararg=None, kwonlyargs=[], kw_defaults=[],
-                               kwargs=None, defaults=[]),
+                               kwarg=None, defaults=[]),
             body=[ast.Return(value=ret_val)],
             decorator_list=[], returns=None)
         ast.copy_location(func, loc)
@@ -9805,6 +9805,8 @@ class CodeGen:
         body.append(self._gen_self_assign("_state", ast.Constant(value=0)))
         # self._finished = False
         body.append(self._gen_self_assign("_finished", ast.Constant(value=False)))
+        # self._no_send = 0 — flag for __next__/send() disambiguation
+        body.append(self._gen_self_assign("_no_send", ast.Constant(value=0)))
 
         # Store parameters: self._<param> = <param>
         for name in param_names:
@@ -9812,17 +9814,22 @@ class CodeGen:
                 f"_{name}",
                 ast.Name(id=name, ctx=ast.Load())))
 
-        # Initialize all local variables to None: self._<var> = None
+        # Initialize all local variables to 0 (sentinel).
+        # Using 0 instead of None avoids type inference issues: the compiler
+        # infers attribute types from __init__ assignments, and None causes
+        # incorrect type expectations when the attribute is later assigned
+        # an int/str/list in send().  The actual assignment always happens
+        # in send() before any read, so the init value is irrelevant.
         for var in sorted(all_vars - set(param_names)):
             body.append(self._gen_self_assign(
                 f"_{var}",
-                ast.Constant(value=None)))
+                ast.Constant(value=0)))
 
         func = ast.FunctionDef(
             name="__init__",
             args=ast.arguments(
                 posonlyargs=[], args=init_args, vararg=None,
-                kwonlyargs=[], kw_defaults=[], kwargs=None,
+                kwonlyargs=[], kw_defaults=[], kwarg=None,
                 defaults=list(defaults)),
             body=body, decorator_list=[], returns=None)
         ast.copy_location(func, loc)
@@ -9835,7 +9842,7 @@ class CodeGen:
             name="__iter__",
             args=ast.arguments(
                 posonlyargs=[], args=[ast.arg(arg="self")], vararg=None,
-                kwonlyargs=[], kw_defaults=[], kwargs=None, defaults=[]),
+                kwonlyargs=[], kw_defaults=[], kwarg=None, defaults=[]),
             body=[ast.Return(value=ast.Name(id="self", ctx=ast.Load()))],
             decorator_list=[], returns=None)
         ast.copy_location(func, loc)
@@ -9843,19 +9850,30 @@ class CodeGen:
         return func
 
     def _gen_build_next(self, loc: ast.AST) -> ast.FunctionDef:
-        """Build __next__(self): return self.send(None)"""
+        """Build __next__(self): self._no_send = 1; return self.send(0)
+
+        Sets the _no_send flag before calling send so the state machine
+        can distinguish next() (val=None) from send(value).  Uses 0 as a
+        dummy argument since the compiler infers _sent as int; the flag
+        ensures the yield variable gets None, not 0.
+        """
+        body: list[ast.stmt] = []
+        # self._no_send = 1
+        body.append(self._gen_self_assign("_no_send", ast.Constant(value=1)))
+        # return self.send(0)
         call = ast.Call(
             func=ast.Attribute(
                 value=ast.Name(id="self", ctx=ast.Load()),
                 attr="send", ctx=ast.Load()),
-            args=[ast.Constant(value=None)],
+            args=[ast.Constant(value=0)],
             keywords=[])
+        body.append(ast.Return(value=call))
         func = ast.FunctionDef(
             name="__next__",
             args=ast.arguments(
                 posonlyargs=[], args=[ast.arg(arg="self")], vararg=None,
-                kwonlyargs=[], kw_defaults=[], kwargs=None, defaults=[]),
-            body=[ast.Return(value=call)],
+                kwonlyargs=[], kw_defaults=[], kwarg=None, defaults=[]),
+            body=body,
             decorator_list=[], returns=None)
         ast.copy_location(func, loc)
         ast.fix_missing_locations(func)
@@ -9884,6 +9902,11 @@ class CodeGen:
         The while-True loop allows pass-through and loop-continue segments
         (which set self._state but don't return) to naturally re-dispatch
         to the correct state on the next iteration.
+
+        The _no_send flag is set to 1 by __next__() before calling send(0).
+        State bodies with assign_var check this flag: if set, the yield
+        variable gets None (not the _sent parameter).  The flag is reset
+        to 0 after use so direct send() calls work correctly.
         """
         body: list[ast.stmt] = []
 
@@ -9927,7 +9950,7 @@ class CodeGen:
                 posonlyargs=[],
                 args=[ast.arg(arg="self"), ast.arg(arg="_sent")],
                 vararg=None, kwonlyargs=[], kw_defaults=[],
-                kwargs=None, defaults=[]),
+                kwarg=None, defaults=[]),
             body=body, decorator_list=[], returns=None)
         ast.copy_location(func, loc)
         ast.fix_missing_locations(func)
@@ -9954,13 +9977,34 @@ class CodeGen:
         """
         body: list[ast.stmt] = []
 
-        # Assign _sent to the variable from the previous segment's yield
+        # Assign _sent to the variable from the previous segment's yield.
+        # Use _no_send flag to distinguish next() (val=None) from send(val).
+        # The compiler coerces None to 0 for int-typed parameters, so we
+        # cannot pass None through _sent directly.
         if state_idx > 0:
             prev_seg = all_segments[state_idx - 1]
             if prev_seg.assign_var:
-                body.append(self._gen_self_assign(
+                # if self._no_send:
+                #     self._<var> = None
+                # else:
+                #     self._<var> = _sent
+                # self._no_send = 0  (reset for next direct send())
+                assign_none = self._gen_self_assign(
                     f"_{prev_seg.assign_var}",
-                    ast.Name(id="_sent", ctx=ast.Load())))
+                    ast.Constant(value=None))
+                assign_sent = self._gen_self_assign(
+                    f"_{prev_seg.assign_var}",
+                    ast.Name(id="_sent", ctx=ast.Load()))
+                flag_check = ast.If(
+                    test=ast.Attribute(
+                        value=ast.Name(id="self", ctx=ast.Load()),
+                        attr="_no_send", ctx=ast.Load()),
+                    body=[assign_none],
+                    orelse=[assign_sent])
+                body.append(flag_check)
+                # Reset flag for next call (direct send() should have flag=0)
+                body.append(self._gen_self_assign(
+                    "_no_send", ast.Constant(value=0)))
 
         # While-cond loop: check the condition at the start of each iteration.
         # If the condition is False, transition to break_state (post-loop code).
@@ -10050,7 +10094,7 @@ class CodeGen:
             name="close",
             args=ast.arguments(
                 posonlyargs=[], args=[ast.arg(arg="self")], vararg=None,
-                kwonlyargs=[], kw_defaults=[], kwargs=None, defaults=[]),
+                kwonlyargs=[], kw_defaults=[], kwarg=None, defaults=[]),
             body=body, decorator_list=[], returns=None)
         ast.copy_location(func, loc)
         ast.fix_missing_locations(func)
@@ -10068,7 +10112,7 @@ class CodeGen:
                 posonlyargs=[],
                 args=[ast.arg(arg="self"), ast.arg(arg="exc_type")],
                 vararg=None, kwonlyargs=[], kw_defaults=[],
-                kwargs=None, defaults=[]),
+                kwarg=None, defaults=[]),
             body=body, decorator_list=[], returns=None)
         ast.copy_location(func, loc)
         ast.fix_missing_locations(func)
@@ -10095,7 +10139,7 @@ class CodeGen:
             name=func_name,
             args=ast.arguments(
                 posonlyargs=[], args=wrapper_args, vararg=None,
-                kwonlyargs=[], kw_defaults=[], kwargs=None,
+                kwonlyargs=[], kw_defaults=[], kwarg=None,
                 defaults=list(defaults)),
             body=body, decorator_list=[], returns=None)
         ast.copy_location(func, loc)
@@ -18140,21 +18184,31 @@ class CodeGen:
     def _generator_needs_cpython(self, node: ast.FunctionDef) -> bool:
         """Check if a generator function needs the state-machine expansion
         (as opposed to the simple list-collection approach).
-        Returns True for: yield-as-expression, yield from, yield inside try/with."""
+
+        All generators benefit from the state machine for correct lazy
+        semantics: the list-collection approach eagerly evaluates the
+        entire body, which breaks infinite generators and next().
+
+        The only exception is yield-as-expression (val = yield x) which
+        triggers a type-inference bug when the sent value (possibly None)
+        is stored in an instance attribute.  These stay on CPython bridge.
+        """
+        # Check for yield-as-expression (send pattern) — these must go
+        # through CPython bridge due to a type-inference limitation with
+        # None-vs-int parameter passing.
         for child in ast.walk(node):
-            # yield used as an expression in an assignment
             if isinstance(child, ast.Assign) and isinstance(child.value, ast.Yield):
+                # yield-as-expression: use CPython bridge
                 return True
-            # yield used as expression in augmented assignment
             if isinstance(child, ast.AugAssign) and isinstance(child.value, ast.Yield):
                 return True
-            # yield from (delegation protocol)
             if isinstance(child, ast.YieldFrom):
                 return True
-        # yield inside try/with also needs state machine
         if self._yield_inside_try_or_with(node):
             return True
-        return False
+        # All other generators: use the native state-machine expansion.
+        # This includes simple sequential yields AND while-loop yields.
+        return True
 
     def _emit_cpython_generator(self, node: ast.FunctionDef, effective_name: str) -> None:
         """Compile a generator function through CPython bridge.
@@ -19856,6 +19910,94 @@ class CodeGen:
                     return sub.value
         return None
 
+    def _emit_for_enumerate_obj(self, node: ast.For) -> None:
+        """Emit `for idx, val in enumerate(obj):` using the iterator protocol.
+
+        For objects with __iter__/__next__ (generators, custom iterators),
+        we cannot materialize the iterable into a list (it may be infinite).
+        Instead, use the iterator protocol with a manual counter.
+        """
+        targets = node.target.elts
+        call = node.iter  # Call(func=Name('enumerate'), args=[obj], ...)
+        obj_node = call.args[0]
+
+        # Optional start value
+        start_val = ir.Constant(i64, 0)
+        if len(call.args) >= 2:
+            start_val = self._emit_expr_value(call.args[1])
+        else:
+            for kw in call.keywords:
+                if kw.arg == "start":
+                    start_val = self._emit_expr_value(kw.value)
+                    break
+
+        # Evaluate the object and call __iter__()
+        obj = self._emit_expr_value(obj_node)
+        obj = self._ensure_ptr(obj)
+        iter_name_ptr = self._make_string_constant("__iter__")
+        iterator = self.builder.call(
+            self.runtime["obj_call_method0"], [obj, iter_name_ptr])
+        iter_ptr = self._ensure_ptr(iterator)
+        next_name_ptr = self._make_string_constant("__next__")
+
+        # Counter variable
+        self._block_counter += 1
+        cnt_name = f"__enum_cnt_{self._block_counter}"
+        self._store_variable(cnt_name, start_val, ValueType(VKind.INT))
+
+        cond_block = self._new_block("forenum_obj.cond")
+        body_block = self._new_block("forenum_obj.body")
+        else_block = self._new_block("forenum_obj.else") if node.orelse else None
+        end_block = self._new_block("forenum_obj.end")
+
+        self.builder.branch(cond_block)
+        self.builder.position_at_end(cond_block)
+
+        # Call __next__() — StopIteration signals end
+        result = self.builder.call(
+            self.runtime["obj_call_method0"], [iter_ptr, next_name_ptr])
+        pending = self.builder.call(self.runtime["exc_pending"], [])
+        has_exc = self.builder.icmp_signed(
+            "!=", pending, ir.Constant(i32, 0))
+        after_loop = else_block if else_block else end_block
+        self.builder.cbranch(has_exc, after_loop, body_block)
+
+        self.builder.position_at_end(body_block)
+        cnt = self._load_variable(cnt_name, node)
+
+        # Assign counter to first target
+        idx_target = targets[0]
+        if isinstance(idx_target, ast.Name):
+            self._store_variable(idx_target.id, cnt, ValueType(VKind.INT))
+
+        # Assign value to second target
+        val_target = targets[1]
+        if isinstance(val_target, ast.Name):
+            self._store_variable(val_target.id, result, ValueType(VKind.INT))
+
+        # Increment counter
+        new_cnt = self.builder.add(cnt, ir.Constant(i64, 1))
+        self._store_variable(cnt_name, new_cnt, ValueType(VKind.INT))
+
+        self._loop_stack.append((end_block, cond_block))
+        _prev_hot = self._in_hot_loop
+        self._in_hot_loop = True
+        self._emit_stmts(node.body)
+        self._in_hot_loop = _prev_hot
+        self._loop_stack.pop()
+        if not self.builder.block.is_terminated:
+            self.builder.branch(cond_block)
+
+        if else_block:
+            self.builder.position_at_end(else_block)
+            self.builder.call(self.runtime["exc_clear"], [])
+            self._emit_stmts(node.orelse)
+            if not self.builder.block.is_terminated:
+                self.builder.branch(end_block)
+
+        self.builder.position_at_end(end_block)
+        self.builder.call(self.runtime["exc_clear"], [])
+
     def _emit_for_enumerate_inline(self, node: ast.For) -> None:
         """Optimized `for idx, val in enumerate(lst):` — no tuple allocation.
 
@@ -19994,12 +20136,25 @@ class CodeGen:
         targets = node.target.elts
 
         # Optimization: for i, val in enumerate(lst) — avoid tuple allocation
+        # Skip for objects with __iter__ protocol (generators etc.) which
+        # need lazy iteration via __next__ — materializing them hangs for
+        # infinite iterators.
         if (len(targets) == 2
                 and isinstance(node.iter, ast.Call)
                 and isinstance(node.iter.func, ast.Name)
                 and node.iter.func.id == "enumerate"
-                and len(node.iter.args) >= 1):
+                and len(node.iter.args) >= 1
+                and not self._is_obj_expr(node.iter.args[0])):
             self._emit_for_enumerate_inline(node)
+            return
+        # for i, val in enumerate(obj) — use iterator protocol with counter
+        if (len(targets) == 2
+                and isinstance(node.iter, ast.Call)
+                and isinstance(node.iter.func, ast.Name)
+                and node.iter.func.id == "enumerate"
+                and len(node.iter.args) >= 1
+                and self._is_obj_expr(node.iter.args[0])):
+            self._emit_for_enumerate_obj(node)
             return
 
         # F2 optimization: for k, v in dict.items() — zero-copy iteration.
@@ -27734,7 +27889,6 @@ class CodeGen:
 
     def _emit_builtin_enumerate(self, node):
         if len(node.args) >= 1:
-            lst = self._emit_expr_value(node.args[0])
             start = None
             if len(node.args) > 1:
                 start = self._emit_expr_value(node.args[1])
@@ -27755,7 +27909,16 @@ class CodeGen:
                 if self._var_kind(_arg0.id) == VKind.STR:
                     _arg_is_str = True
             if _arg_is_str:
+                lst = self._emit_expr_value(node.args[0])
                 return self._rt_call("enumerate_str", [lst, start])
+            # Object with __iter__ protocol (e.g. generator class instance):
+            # collect to list first, then enumerate.
+            if self._is_obj_expr(_arg0):
+                obj = self._emit_expr_value(_arg0)
+                obj = self._ensure_ptr(obj)
+                lst = self._rt_call("list_from_obj_iter", [obj])
+                return self._rt_call("enumerate", [lst, start])
+            lst = self._emit_expr_value(node.args[0])
             return self._rt_call("enumerate", [lst, start])
         raise CodeGenError("enumerate() requires at least one argument", node)
 
