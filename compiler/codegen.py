@@ -1362,6 +1362,12 @@ class CodeGen:
         ft = ir.FunctionType(void, [i8_ptr, i8_ptr, ir.PointerType(i32), ir.PointerType(i64)])
         self.runtime["dict_get_fv"] = ir.Function(self.module, ft, name="fastpy_dict_get_fv")
         self.runtime["dict_get_fv_safe"] = ir.Function(self.module, ft, name="fastpy_dict_get_fv_safe")
+        ft = ir.FunctionType(void, [i8_ptr, i32, i64, i32, i64])
+        self.runtime["dict_set_kv_fv"] = ir.Function(self.module, ft, name="fastpy_dict_set_kv_fv")
+        ft = ir.FunctionType(void, [i8_ptr, i32, i64, ir.PointerType(i32), ir.PointerType(i64)])
+        self.runtime["dict_get_kv_fv"] = ir.Function(self.module, ft, name="fastpy_dict_get_kv_fv")
+        ft = ir.FunctionType(i32, [i8_ptr, i32, i64])
+        self.runtime["dict_has_kv_key"] = ir.Function(self.module, ft, name="fastpy_dict_has_kv_key")
         ft = ir.FunctionType(i64, [i8_ptr])
         self.runtime["list_length"] = ir.Function(self.module, ft, name="fastpy_list_length")
         ft = ir.FunctionType(i8_ptr, [i8_ptr])
@@ -1374,6 +1380,10 @@ class CodeGen:
         self.runtime["list_max_fv"] = ir.Function(self.module, ft, name="fastpy_list_max_fv")
         ft = ir.FunctionType(i8_ptr, [i8_ptr])
         self.runtime["list_reversed"] = ir.Function(self.module, ft, name="fastpy_list_reversed")
+        ft = ir.FunctionType(i8_ptr, [i8_ptr])
+        self.runtime["str_reversed"] = ir.Function(self.module, ft, name="fastpy_str_reversed")
+        ft = ir.FunctionType(i64, [i32, i64])
+        self.runtime["hash_fv"] = ir.Function(self.module, ft, name="fastpy_hash_fv")
         ft = ir.FunctionType(i8_ptr, [i8_ptr])
         self.runtime["list_set"] = ir.Function(self.module, ft, name="fastpy_list_set")
         ft = ir.FunctionType(i8_ptr, [i8_ptr, i8_ptr])
@@ -1581,12 +1591,17 @@ class CodeGen:
         self.runtime["dict_popitem"] = ir.Function(self.module, ft, name="fastpy_dict_popitem")
         ft = ir.FunctionType(i8_ptr, [i8_ptr])
         self.runtime["dict_copy"] = ir.Function(self.module, ft, name="fastpy_dict_copy")
+        ft = ir.FunctionType(i8_ptr, [i8_ptr])
+        self.runtime["dict_from_pairs"] = ir.Function(self.module, ft, name="fastpy_dict_from_pairs")
         ft = ir.FunctionType(void, [i8_ptr])
         self.runtime["dict_clear"] = ir.Function(self.module, ft, name="fastpy_dict_clear")
         ft = ir.FunctionType(void, [i8_ptr, i8_ptr, i8_ptr])
         self.runtime["dict_setdefault_list"] = ir.Function(self.module, ft, name="fastpy_dict_setdefault_list")
         ft = ir.FunctionType(void, [i8_ptr, i8_ptr, i64])
         self.runtime["dict_setdefault_int"] = ir.Function(self.module, ft, name="fastpy_dict_setdefault_int")
+        ft = ir.FunctionType(void, [i8_ptr, i8_ptr, i32, i64,
+                                     ir.PointerType(i32), ir.PointerType(i64)])
+        self.runtime["dict_setdefault_fv"] = ir.Function(self.module, ft, name="fastpy_dict_setdefault_fv")
 
         # divmod
         ft = ir.FunctionType(void, [i64, i64, ir.PointerType(i64), ir.PointerType(i64)])
@@ -13636,10 +13651,23 @@ class CodeGen:
         elif (self._is_dict_expr(target.value)
                 or self._is_defaultdict_expr(target.value)
                 or self._is_counter_expr(target.value)):
+            # Tuple/list keys: use generic FpyValue-keyed setter
+            _key_is_tuple = (isinstance(target.slice, (ast.Tuple, ast.List))
+                             or (isinstance(target.slice, ast.Name)
+                                 and target.slice.id in self.variables
+                                 and self._var_kind(target.slice.id)
+                                 in (VKind.LIST, VKind.TUPLE)))
+            if _key_is_tuple:
+                key_tag, key_data = self._bare_to_tag_data(index, target.slice)
+                if not isinstance(key_data, ir.Constant) and isinstance(key_data.type, ir.PointerType):
+                    key_data = self.builder.ptrtoint(key_data, i64)
+                self.builder.call(self.runtime["dict_set_kv_fv"],
+                                  [obj, ir.Constant(i32, key_tag), key_data,
+                                   ir.Constant(i32, tag), data])
             # Int keys use the int-keyed setter so the dict stores them
             # natively (vs converting to strings, which would affect
             # printed representation).
-            if isinstance(index.type, ir.IntType):
+            elif isinstance(index.type, ir.IntType):
                 self.builder.call(self.runtime["dict_set_int_fv"],
                                   [obj, index, ir.Constant(i32, tag), data])
             else:
@@ -15685,7 +15713,8 @@ class CodeGen:
 
     def _emit_tuple_unpack(self, target: ast.Tuple, value_node: ast.expr, node: ast.AST) -> None:
         """Emit tuple unpacking: a, b, c = 1, 2, 3 or a, b, c = some_tuple."""
-        if isinstance(value_node, ast.Tuple):
+        _has_star = any(isinstance(t, ast.Starred) for t in target.elts)
+        if isinstance(value_node, ast.Tuple) and not _has_star:
             # Direct unpacking: a, b, c = 1, 2, 3
             # Evaluate ALL values first, then assign (Python semantics)
             if len(target.elts) != len(value_node.elts):
@@ -15711,7 +15740,9 @@ class CodeGen:
                     self._emit_tuple_unpack(tgt, val_elt, node)
                 else:
                     self._bridge_fallback_stmt(node, "unsupported unpack target")
-        elif self._is_list_expr(value_node) or self._is_tuple_expr(value_node) or isinstance(value_node, ast.List):
+            return
+        elif (isinstance(value_node, ast.Tuple)  # starred tuple literal
+              or self._is_list_expr(value_node) or self._is_tuple_expr(value_node) or isinstance(value_node, ast.List)):
             # Unpacking from a list/tuple variable
             val = self._emit_expr_value(value_node)
             # Check for starred target
@@ -21898,7 +21929,20 @@ class CodeGen:
                 if l_vt.kind == VKind.STR:
                     left_is_str = True
 
-            if left_is_str:
+            # Tuple/list key: use generic FpyValue-keyed contains
+            _left_is_tuple = (isinstance(node.left, (ast.Tuple, ast.List))
+                              or (isinstance(node.left, ast.Name)
+                                  and node.left.id in self.variables
+                                  and self._var_kind(node.left.id)
+                                  in (VKind.LIST, VKind.TUPLE)))
+            if _left_is_tuple:
+                kt, kd = self._bare_to_tag_data(left_val, node.left)
+                if not isinstance(kd, ir.Constant) and isinstance(kd.type, ir.PointerType):
+                    kd = self.builder.ptrtoint(kd, i64)
+                result = self.builder.call(
+                    self.runtime["dict_has_kv_key"],
+                    [container, ir.Constant(i32, kt), kd])
+            elif left_is_str:
                 # String key — convert i64 → i8* if needed
                 left_val = self._ensure_ptr(left_val)
                 result = self.builder.call(
@@ -27905,6 +27949,15 @@ class CodeGen:
                             return self._bridge_fallback_expr(
                                 node, f"dict() with unsupported key type {k_val.type}")
                 return d
+            # dict(list_variable) or dict(zip(...)) — build from pairs at runtime
+            if (self._is_list_expr(arg_node) or self._is_tuple_expr(arg_node)
+                    or (isinstance(arg_node, ast.Call)
+                        and isinstance(arg_node.func, ast.Name)
+                        and arg_node.func.id in ("zip", "sorted", "reversed",
+                                                  "list", "tuple"))):
+                pairs = self._emit_expr_value(arg_node)
+                pairs = self._ensure_ptr(pairs)
+                return self.builder.call(self.runtime["dict_from_pairs"], [pairs])
             return self._bridge_fallback_expr(node, "dict() with non-literal argument")
 
     def _emit_builtin_tuple(self, node):
@@ -27998,7 +28051,21 @@ class CodeGen:
 
     def _emit_builtin_reversed(self, node):
         if len(node.args) == 1:
-            arg = self._emit_expr_value(node.args[0])
+            arg_node = node.args[0]
+            # String argument: use str_reversed to get list of chars in
+            # reverse order (avoids passing char* to list_reversed which
+            # expects FpyList*).
+            if (isinstance(arg_node, ast.Constant) and isinstance(arg_node.value, str)):
+                arg = self._emit_expr_value(arg_node)
+                return self._rt_call("str_reversed", [arg])
+            if isinstance(arg_node, ast.Name) and arg_node.id in self.variables:
+                if self._var_kind(arg_node.id) == VKind.STR:
+                    arg = self._emit_expr_value(arg_node)
+                    return self._rt_call("str_reversed", [arg])
+            if isinstance(arg_node, ast.JoinedStr):
+                arg = self._emit_expr_value(arg_node)
+                return self._rt_call("str_reversed", [arg])
+            arg = self._emit_expr_value(arg_node)
             return self._rt_call("list_reversed", [arg])
         raise CodeGenError("reversed() takes exactly one argument", node)
 
@@ -28527,9 +28594,12 @@ class CodeGen:
                     return self.builder.call(
                         self.runtime["obj_call_method0"],
                         [obj, name_ptr])
-            # Default: return id-like hash
+            # Emit value and resolve (tag, data) for the runtime hash function
             val = self._emit_expr_value(arg_node)
-            return val
+            tag, data = self._bare_to_tag_data(val, arg_node)
+            return self.builder.call(
+                self.runtime["hash_fv"],
+                [ir.Constant(i32, tag), data])
         raise CodeGenError("hash() takes exactly one argument", node)
 
     def _emit_builtin_next(self, node):
@@ -32145,6 +32215,24 @@ class CodeGen:
                         node.args[0], include_native_mod=False)):
                 other = self._rt_call("cpython_to_dict", [other])
             self._rt_call("dict_update", [obj, other])
+        # dict.update(key=val, ...) keyword form: build a temp dict, merge it
+        if node.keywords:
+            tmp = self.builder.call(self.runtime["dict_new"], [])
+            for kw in node.keywords:
+                if kw.arg is None:
+                    # **kwargs unpacking
+                    other = self._emit_expr_value(kw.value)
+                    other = self._ensure_ptr(other)
+                    self._rt_call("dict_update", [tmp, other])
+                else:
+                    key_str = self._make_string_constant(kw.arg)
+                    val = self._emit_expr_value(kw.value)
+                    tag, data = self._bare_to_tag_data(val, kw.value)
+                    self.builder.call(self.runtime["dict_set_fv"],
+                                      [tmp, key_str,
+                                       ir.Constant(i32, tag), data])
+            self._rt_call("dict_update", [obj, tmp])
+        if len(node.args) <= 1:
             return obj
         return None
 
@@ -32177,13 +32265,15 @@ class CodeGen:
         if len(node.args) == 2:
             key = self._emit_expr_value(node.args[0])
             default = self._emit_expr_value(node.args[1])
-            if isinstance(default.type, ir.PointerType):
-                self._rt_call("dict_setdefault_list",
-                              [obj, key, default])
-            else:
-                self._rt_call("dict_setdefault_int",
-                              [obj, key, default])
-            return obj
+            tag, data = self._bare_to_tag_data(default, node.args[1])
+            out_tag = self._create_entry_alloca(i32, "sd.tag")
+            out_data = self._create_entry_alloca(i64, "sd.data")
+            self.builder.call(self.runtime["dict_setdefault_fv"],
+                              [obj, key, ir.Constant(i32, tag), data,
+                               out_tag, out_data])
+            r_tag = self.builder.load(out_tag)
+            r_data = self.builder.load(out_data)
+            return self._fv_build_from_slots(r_tag, r_data)
         return None
 
     def _emit_dict_method_popitem(self, node, obj):
@@ -34362,8 +34452,21 @@ class CodeGen:
 
             tag_slot = self._create_entry_alloca(i32, "dget.tag")
             data_slot = self._create_entry_alloca(i64, "dget.data")
+            # Tuple/list keys: use generic FpyValue-keyed getter
+            _key_is_tuple = (isinstance(node.slice, (ast.Tuple, ast.List))
+                             or (isinstance(node.slice, ast.Name)
+                                 and node.slice.id in self.variables
+                                 and self._var_kind(node.slice.id)
+                                 in (VKind.LIST, VKind.TUPLE)))
+            if _key_is_tuple:
+                kt, kd = self._bare_to_tag_data(key, node.slice)
+                if not isinstance(kd, ir.Constant) and isinstance(kd.type, ir.PointerType):
+                    kd = self.builder.ptrtoint(kd, i64)
+                self.builder.call(self.runtime["dict_get_kv_fv"],
+                                  [obj, ir.Constant(i32, kt), kd,
+                                   tag_slot, data_slot])
             # Int keys use the int-keyed getter (native int keys in dict).
-            if isinstance(key.type, ir.IntType):
+            elif isinstance(key.type, ir.IntType):
                 self.builder.call(self.runtime["dict_get_int_fv"],
                                   [obj, key, tag_slot, data_slot])
             elif isinstance(key.type, ir.PointerType):
@@ -35271,7 +35374,21 @@ class CodeGen:
             key = self._emit_expr_value(key_node)
             val = self._emit_expr_value(val_node)
             tag, data = self._bare_to_tag_data(val, val_node)
-            if isinstance(key.type, ir.IntType):
+            # Tuple/list keys: use generic FpyValue-keyed setter
+            _key_is_tuple = isinstance(key_node, (ast.Tuple, ast.List))
+            if not _key_is_tuple and isinstance(key_node, ast.Name):
+                if (key_node.id in self.variables
+                        and self._var_kind(key_node.id)
+                        in (VKind.LIST, VKind.TUPLE)):
+                    _key_is_tuple = True
+            if _key_is_tuple:
+                kt, kd = self._bare_to_tag_data(key, key_node)
+                if not isinstance(kd, ir.Constant) and isinstance(kd.type, ir.PointerType):
+                    kd = self.builder.ptrtoint(kd, i64)
+                self.builder.call(self.runtime["dict_set_kv_fv"],
+                                  [dict_ptr, ir.Constant(i32, kt), kd,
+                                   ir.Constant(i32, tag), data])
+            elif isinstance(key.type, ir.IntType):
                 # Int-keyed dict — native int-key storage
                 self.builder.call(self.runtime["dict_set_int_fv"],
                                   [dict_ptr, key,
@@ -35545,13 +35662,70 @@ class CodeGen:
 
         Phase 4: when branches produce different LLVM types, both are
         normalized to i64 in their own blocks (avoiding cross-block
-        dominance errors). When types match, the original type is kept."""
+        dominance errors). When types match, the original type is kept.
+
+        When one branch is None, the result is wrapped as an FpyValue so
+        the runtime tag (NONE vs INT/STR/etc.) is preserved — required for
+        `x is None` checks on the result."""
+        # Detect if either branch is None — if so, we need FpyValue output
+        # to preserve the NONE tag at runtime.
+        body_is_none = (isinstance(node.body, ast.Constant) and node.body.value is None)
+        else_is_none = (isinstance(node.orelse, ast.Constant) and node.orelse.value is None)
+        has_none_branch = body_is_none or else_is_none
+
         cond = self._emit_condition(node.test)
         then_block = self._new_block("ifexp.then")
         else_block = self._new_block("ifexp.else")
         merge_block = self._new_block("ifexp.merge")
 
         self.builder.cbranch(cond, then_block, else_block)
+
+        if has_none_branch:
+            # Return a full FpyValue so the tag (NONE vs other) is preserved.
+            # Then branch
+            self.builder.position_at_end(then_block)
+            then_val = self._emit_expr_value(node.body)
+            then_tag, then_data = self._bare_to_tag_data(then_val, node.body)
+            if isinstance(then_val.type, ir.LiteralStructType) and then_val.type == fpy_val:
+                then_tag_ir = self.builder.extract_value(then_val, 0)
+                then_data = self.builder.extract_value(then_val, 1)
+            else:
+                then_tag_ir = ir.Constant(i32, then_tag)
+                if isinstance(then_data.type, ir.PointerType):
+                    then_data = self.builder.ptrtoint(then_data, i64)
+                elif isinstance(then_data.type, ir.DoubleType):
+                    then_data = self.builder.bitcast(then_data, i64)
+                elif isinstance(then_data.type, ir.IntType) and then_data.type.width != 64:
+                    then_data = self.builder.zext(then_data, i64)
+            then_block_end = self.builder.block
+            self.builder.branch(merge_block)
+
+            # Else branch
+            self.builder.position_at_end(else_block)
+            else_val = self._emit_expr_value(node.orelse)
+            else_tag, else_data = self._bare_to_tag_data(else_val, node.orelse)
+            if isinstance(else_val.type, ir.LiteralStructType) and else_val.type == fpy_val:
+                else_tag_ir = self.builder.extract_value(else_val, 0)
+                else_data = self.builder.extract_value(else_val, 1)
+            else:
+                else_tag_ir = ir.Constant(i32, else_tag)
+                if isinstance(else_data.type, ir.PointerType):
+                    else_data = self.builder.ptrtoint(else_data, i64)
+                elif isinstance(else_data.type, ir.DoubleType):
+                    else_data = self.builder.bitcast(else_data, i64)
+                elif isinstance(else_data.type, ir.IntType) and else_data.type.width != 64:
+                    else_data = self.builder.zext(else_data, i64)
+            else_block_end = self.builder.block
+            self.builder.branch(merge_block)
+
+            self.builder.position_at_end(merge_block)
+            phi_tag = self.builder.phi(i32, "ifexp.tag")
+            phi_tag.add_incoming(then_tag_ir, then_block_end)
+            phi_tag.add_incoming(else_tag_ir, else_block_end)
+            phi_data = self.builder.phi(i64, "ifexp.data")
+            phi_data.add_incoming(then_data, then_block_end)
+            phi_data.add_incoming(else_data, else_block_end)
+            return self._fv_build_from_slots(phi_tag, phi_data)
 
         # Then branch
         self.builder.position_at_end(then_block)

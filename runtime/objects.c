@@ -1498,6 +1498,30 @@ FpyList* fastpy_list_reversed(FpyList *list) {
     return result;
 }
 
+/* Return a reversed list of single-character strings from a string.
+ * reversed("abc") → ['c', 'b', 'a'] (each element is a 1-char str). */
+FpyList* fastpy_str_reversed(const char *s) {
+    /* Count code points */
+    const unsigned char *p = (const unsigned char *)s;
+    int64_t n = 0;
+    while (*p) { p += fpy_utf8_cplen(p); n++; }
+
+    FpyList *result = fpy_list_new(n);
+    result->length = n;
+
+    /* Walk forward, store chars in reverse order */
+    p = (const unsigned char *)s;
+    for (int64_t i = 0; i < n; i++) {
+        int cplen = fpy_utf8_cplen(p);
+        FpyString *ch = fpy_str_alloc(cplen);
+        memcpy(ch->data, p, cplen);
+        ch->data[cplen] = '\0';
+        result->items[n - 1 - i] = fpy_str(ch->data);
+        p += cplen;
+    }
+    return result;
+}
+
 /* --- String methods that return lists / take lists --- */
 
 /* Split a string by whitespace, return list of strings */
@@ -1669,6 +1693,8 @@ static uint64_t fpy_hash_string(const char *s) {
     return h;
 }
 
+static uint64_t fpy_hash_int(int64_t key);  /* forward declaration */
+
 static uint64_t fpy_hash_value(FpyValue v) {
     if (v.tag == FPY_TAG_STR) return fpy_hash_string(v.data.s);
     if (v.tag == FPY_TAG_INT) {
@@ -1678,6 +1704,43 @@ static uint64_t fpy_hash_value(FpyValue v) {
         x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
         return x ^ (x >> 31);
     }
+    if (v.tag == FPY_TAG_BOOL) {
+        return fpy_hash_int((int64_t)v.data.b);
+    }
+    if (v.tag == FPY_TAG_NONE) {
+        return 0x345678ULL;  /* stable sentinel */
+    }
+    if (v.tag == FPY_TAG_FLOAT) {
+        /* Hash doubles: if it's an exact integer, hash like the int.
+         * Otherwise use raw bits. This matches Python semantics where
+         * hash(1) == hash(1.0). */
+        double d = v.data.f;
+        if (d == (double)(int64_t)d && d >= -9.007199254740992e15
+                && d <= 9.007199254740992e15) {
+            return fpy_hash_int((int64_t)d);
+        }
+        uint64_t bits;
+        memcpy(&bits, &d, sizeof(bits));
+        bits = (bits ^ (bits >> 30)) * 0xbf58476d1ce4e5b9ULL;
+        bits = (bits ^ (bits >> 27)) * 0x94d049bb133111ebULL;
+        return bits ^ (bits >> 31);
+    }
+    if (v.tag == FPY_TAG_LIST) {
+        /* Tuple hash (Python's tuple hash algorithm — tuplehash).
+         * Lists use the same tag; we hash element-wise for tuples used as
+         * dict keys. */
+        FpyList *list = v.data.list;
+        if (!list) return 0;
+        uint64_t h = 0x345678ULL;
+        uint64_t mult = 1000003ULL;
+        for (int64_t i = 0; i < list->length; i++) {
+            uint64_t elem_h = fpy_hash_value(list->items[i]);
+            h = (h ^ elem_h) * mult;
+            mult += 82520ULL + (uint64_t)(list->length - i - 1) * 2ULL;
+        }
+        h += 97531ULL;
+        return h;
+    }
     return (uint64_t)v.data.i;  /* fallback for other types */
 }
 
@@ -1686,6 +1749,17 @@ static int fpy_key_equal(FpyValue a, FpyValue b) {
     if (a.tag == FPY_TAG_INT) return a.data.i == b.data.i;
     if (a.tag == FPY_TAG_STR) {
         return a.data.s == b.data.s || strcmp(a.data.s, b.data.s) == 0;
+    }
+    if (a.tag == FPY_TAG_LIST) {
+        /* Tuple equality: element-wise comparison */
+        FpyList *la = a.data.list, *lb = b.data.list;
+        if (la == lb) return 1;
+        if (!la || !lb) return 0;
+        if (la->length != lb->length) return 0;
+        for (int64_t i = 0; i < la->length; i++) {
+            if (!fpy_key_equal(la->items[i], lb->items[i])) return 0;
+        }
+        return 1;
     }
     return a.data.i == b.data.i;  /* fallback */
 }
@@ -1913,6 +1987,15 @@ static uint64_t fpy_hash_int(int64_t key) {
     return x ^ (x >> 31);
 }
 
+/* Exported hash function for the compiler's hash() builtin.
+ * Takes (tag, data) to match the FpyValue ABI. */
+int64_t fastpy_hash_fv(int32_t tag, int64_t data) {
+    FpyValue v;
+    v.tag = tag;
+    v.data.i = data;
+    return (int64_t)fpy_hash_value(v);
+}
+
 void fastpy_dict_set_int_int(FpyDict *dict, int64_t key, int64_t value) {
     FpyValue k = fpy_int(key);
     FpyValue v = fpy_int(value);
@@ -2028,6 +2111,81 @@ int64_t fastpy_dict_get_int_val(FpyDict *dict, int64_t key) {
     return 0;
 }
 
+/* ---- Generic FpyValue-keyed dict operations ----
+ * These use fpy_hash_value + fpy_key_equal so they handle any key type
+ * (string, int, tuple, etc.) passed as (tag, data). */
+void fastpy_dict_set_kv_fv(FpyDict *dict,
+                            int32_t key_tag, int64_t key_data,
+                            int32_t val_tag, int64_t val_data) {
+    FpyValue k; k.tag = key_tag; k.data.i = key_data;
+    FpyValue v; v.tag = val_tag; v.data.i = val_data;
+    uint64_t h = fpy_hash_value(k);
+    int64_t mask = dict->table_size - 1;
+    int64_t slot = (int64_t)(h & (uint64_t)mask);
+    int64_t first_deleted = -1;
+    while (1) {
+        int64_t idx = dict->indices[slot];
+        if (idx == FPY_DICT_EMPTY) break;
+        if (idx == FPY_DICT_DELETED) {
+            if (first_deleted < 0) first_deleted = slot;
+        } else if (fpy_key_equal(dict->keys[idx], k)) {
+            dict->values[idx] = v;
+            return;
+        }
+        slot = (slot + 1) & mask;
+    }
+    int64_t insert_slot = (first_deleted >= 0) ? first_deleted : slot;
+    if (dict->length >= dict->capacity) {
+        dict->capacity *= 2;
+        dict->keys = (FpyValue*)realloc(dict->keys, sizeof(FpyValue) * dict->capacity);
+        dict->values = (FpyValue*)realloc(dict->values, sizeof(FpyValue) * dict->capacity);
+    }
+    dict->keys[dict->length] = k;
+    dict->values[dict->length] = v;
+    dict->indices[insert_slot] = dict->length;
+    dict->length++;
+    if (dict->length * 3 > dict->table_size * 2) {
+        dict->table_size *= 2;
+        dict->indices = (int64_t*)realloc(dict->indices, sizeof(int64_t) * dict->table_size);
+        fpy_dict_rebuild_indices(dict);
+    }
+}
+
+void fastpy_dict_get_kv_fv(FpyDict *dict,
+                            int32_t key_tag, int64_t key_data,
+                            int32_t *out_tag, int64_t *out_data) {
+    FpyValue k; k.tag = key_tag; k.data.i = key_data;
+    uint64_t h = fpy_hash_value(k);
+    int64_t mask = dict->table_size - 1;
+    int64_t slot = (int64_t)(h & (uint64_t)mask);
+    while (1) {
+        int64_t idx = dict->indices[slot];
+        if (idx == FPY_DICT_EMPTY) break;
+        if (idx != FPY_DICT_DELETED && fpy_key_equal(dict->keys[idx], k)) {
+            *out_tag = dict->values[idx].tag;
+            *out_data = dict->values[idx].data.i;
+            return;
+        }
+        slot = (slot + 1) & mask;
+    }
+    fastpy_raise(FPY_EXC_KEYERROR, "KeyError");
+    *out_tag = FPY_TAG_NONE; *out_data = 0; return;
+}
+
+int32_t fastpy_dict_has_kv_key(FpyDict *dict, int32_t key_tag, int64_t key_data) {
+    FpyValue k; k.tag = key_tag; k.data.i = key_data;
+    uint64_t h = fpy_hash_value(k);
+    int64_t mask = dict->table_size - 1;
+    int64_t slot = (int64_t)(h & (uint64_t)mask);
+    while (1) {
+        int64_t idx = dict->indices[slot];
+        if (idx == FPY_DICT_EMPTY) return 0;
+        if (idx != FPY_DICT_DELETED && fpy_key_equal(dict->keys[idx], k))
+            return 1;
+        slot = (slot + 1) & mask;
+    }
+}
+
 int32_t fastpy_dict_has_int_key(FpyDict *dict, int64_t key) {
     uint64_t h = fpy_hash_int(key);
     int64_t mask = dict->table_size - 1;
@@ -2056,6 +2214,23 @@ FpyDict* fastpy_dict_copy(FpyDict *dict) {
     FpyDict *result = fpy_dict_new(dict->length > 4 ? dict->length : 4);
     for (int64_t i = 0; i < dict->length; i++) {
         fpy_dict_set(result, dict->keys[i], dict->values[i]);
+    }
+    return result;
+}
+
+/* Build a dict from a list of (key, value) pairs.
+ * Each element of `pairs` must be a 2-element tuple/list.
+ * dict([(1, "a"), (2, "b")])  →  {1: "a", 2: "b"} */
+FpyDict* fastpy_dict_from_pairs(FpyList *pairs) {
+    FpyDict *result = fpy_dict_new(pairs->length > 4 ? pairs->length : 4);
+    for (int64_t i = 0; i < pairs->length; i++) {
+        FpyValue item = pairs->items[i];
+        if (item.tag == FPY_TAG_LIST) {
+            FpyList *pair = item.data.list;
+            if (pair && pair->length >= 2) {
+                fpy_dict_set(result, pair->items[0], pair->items[1]);
+            }
+        }
     }
     return result;
 }
@@ -3001,13 +3176,43 @@ void fastpy_dict_pop_fv(FpyDict *dict, const char *key,
 
 void fastpy_dict_setdefault_list(FpyDict *dict, const char *key, FpyList *default_val) {
     if (fastpy_dict_has_key(dict, key)) return;
-    FpyValue v = { .tag = FPY_TAG_STR, .data.s = (const char*)default_val };
-    fpy_dict_set(dict, fpy_str(key), v);
+    fpy_dict_set(dict, fpy_str(key), fpy_list(default_val));
 }
 
 void fastpy_dict_setdefault_int(FpyDict *dict, const char *key, int64_t default_val) {
     if (fastpy_dict_has_key(dict, key)) return;
     fpy_dict_set(dict, fpy_str(key), fpy_int(default_val));
+}
+
+/* dict.setdefault(key, default) → value. Returns the existing value if key
+ * is present, otherwise inserts default and returns it. Uses FpyValue ABI
+ * for both the default and the return value. */
+void fastpy_dict_setdefault_fv(FpyDict *dict, const char *key,
+                                int32_t def_tag, int64_t def_data,
+                                int32_t *out_tag, int64_t *out_data) {
+    /* Look up the key first */
+    uint64_t h = fpy_hash_string(key);
+    int64_t mask = dict->table_size - 1;
+    int64_t slot = (int64_t)(h & (uint64_t)mask);
+    while (1) {
+        int64_t idx = dict->indices[slot];
+        if (idx == FPY_DICT_EMPTY) break;
+        if (idx != FPY_DICT_DELETED
+                && dict->keys[idx].tag == FPY_TAG_STR
+                && (dict->keys[idx].data.s == key
+                    || strcmp(dict->keys[idx].data.s, key) == 0)) {
+            /* Key found — return existing value */
+            *out_tag = dict->values[idx].tag;
+            *out_data = dict->values[idx].data.i;
+            return;
+        }
+        slot = (slot + 1) & mask;
+    }
+    /* Key not found — insert default and return it */
+    FpyValue v; v.tag = def_tag; v.data.i = def_data;
+    fpy_dict_set(dict, fpy_str(key), v);
+    *out_tag = def_tag;
+    *out_data = def_data;
 }
 
 /* dict.popitem() — remove and return the last inserted key-value pair */
