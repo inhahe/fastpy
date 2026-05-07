@@ -1502,14 +1502,15 @@ FpyList* fastpy_list_reversed(FpyList *list) {
 /* Split a string by whitespace, return list of strings */
 FpyList* fastpy_str_split(const char *s) {
     FpyList *result = fpy_list_new(8);
-    const char *p = s;
+    const unsigned char *p = (const unsigned char *)s;
+    int n;
     while (*p) {
-        /* Skip whitespace */
-        while (*p && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')) p++;
+        /* Skip whitespace (UTF-8 aware) */
+        while (*p && (n = _fpy_ws_fwd(p)) > 0) p += n;
         if (!*p) break;
         /* Find end of word */
-        const char *start = p;
-        while (*p && *p != ' ' && *p != '\t' && *p != '\n' && *p != '\r') p++;
+        const unsigned char *start = p;
+        while (*p && _fpy_ws_fwd(p) == 0) p++;
         /* Copy word */
         int64_t len = p - start;
         char *word = (char*)malloc(len + 1);
