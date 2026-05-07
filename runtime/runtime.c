@@ -169,7 +169,14 @@ const char* fastpy_str_concat(const char *a, const char *b) {
 }
 
 int64_t fastpy_str_len(const char *s) {
-    return (int64_t)strlen(s);
+    /* Count UTF-8 code points, not bytes.  A continuation byte has the
+     * form 10xxxxxx (top bits == 0x80, masked with 0xC0).  We skip those
+     * and count only leading bytes. */
+    int64_t count = 0;
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        if ((*p & 0xC0) != 0x80) count++;
+    }
+    return count;
 }
 
 const char* fastpy_str_index(const char *s, int64_t index) {

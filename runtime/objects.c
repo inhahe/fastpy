@@ -3730,13 +3730,43 @@ int64_t fastpy_list_count_str(FpyList *list, const char *value) {
     return count;
 }
 
+/* Python whitespace helpers (UTF-8 aware).
+ * Python's definition of whitespace for str.strip/isspace:
+ *   ASCII: \t(09) \n(0A) \x0b(0B) \x0c(0C) \r(0D) \x1c(1C) \x1d(1D) \x1e(1E) \x1f(1F) space(20)
+ *   Non-ASCII (2-byte UTF-8): U+0085 NEL (C2 85), U+00A0 NBSP (C2 A0)
+ */
+static int _fpy_ws_fwd(const unsigned char *p) {
+    unsigned char c = *p;
+    if (c == ' ' || c == '\t' || c == '\n' || c == '\r' ||
+        c == 0x0b || c == 0x0c ||
+        c == 0x1c || c == 0x1d || c == 0x1e || c == 0x1f)
+        return 1;
+    if (c == 0xc2 && (p[1] == 0x85 || p[1] == 0xa0))
+        return 2;
+    return 0;
+}
+
+/* Check for whitespace ending at position (end points one past last byte). */
+static int _fpy_ws_back(const unsigned char *start, const unsigned char *end) {
+    if (end <= start) return 0;
+    unsigned char last = end[-1];
+    if (last == ' ' || last == '\t' || last == '\n' || last == '\r' ||
+        last == 0x0b || last == 0x0c ||
+        last == 0x1c || last == 0x1d || last == 0x1e || last == 0x1f)
+        return 1;
+    if (end - start >= 2 && end[-2] == 0xc2 && (last == 0x85 || last == 0xa0))
+        return 2;
+    return 0;
+}
+
 /* String strip */
 const char* fastpy_str_strip(const char *s) {
-    const char *start = s;
-    while (*start == ' ' || *start == '\t' || *start == '\n' || *start == '\r') start++;
-    const char *end = s + strlen(s) - 1;
-    while (end > start && (*end == ' ' || *end == '\t' || *end == '\n' || *end == '\r')) end--;
-    size_t len = end - start + 1;
+    const unsigned char *start = (const unsigned char *)s;
+    int n;
+    while ((n = _fpy_ws_fwd(start)) > 0) start += n;
+    const unsigned char *end = (const unsigned char *)s + strlen(s);
+    while ((n = _fpy_ws_back(start, end)) > 0) end -= n;
+    size_t len = end - start;
     char *result = (char*)malloc(len + 1);
     memcpy(result, start, len);
     result[len] = '\0';
@@ -3744,18 +3774,21 @@ const char* fastpy_str_strip(const char *s) {
 }
 
 const char* fastpy_str_lstrip(const char *s) {
-    const char *start = s;
-    while (*start == ' ' || *start == '\t' || *start == '\n' || *start == '\r') start++;
-    return fpy_strdup(start);
+    const unsigned char *start = (const unsigned char *)s;
+    int n;
+    while ((n = _fpy_ws_fwd(start)) > 0) start += n;
+    return fpy_strdup((const char *)start);
 }
 
 const char* fastpy_str_rstrip(const char *s) {
     size_t slen = strlen(s);
-    const char *end = s + slen - 1;
-    while (end >= s && (*end == ' ' || *end == '\t' || *end == '\n' || *end == '\r')) end--;
-    size_t len = end - s + 1;
+    const unsigned char *start = (const unsigned char *)s;
+    const unsigned char *end = start + slen;
+    int n;
+    while ((n = _fpy_ws_back(start, end)) > 0) end -= n;
+    size_t len = end - start;
     char *result = (char*)malloc(len + 1);
-    memcpy(result, s, len);
+    memcpy(result, start, len);
     result[len] = '\0';
     return result;
 }
@@ -3820,9 +3853,11 @@ int32_t fastpy_str_isalnum(const char *s) {
 
 int32_t fastpy_str_isspace(const char *s) {
     if (!*s) return 0;
-    for (const char *p = s; *p; p++) {
-        char c = *p;
-        if (c != ' ' && c != '\t' && c != '\n' && c != '\r') return 0;
+    const unsigned char *p = (const unsigned char *)s;
+    while (*p) {
+        int n = _fpy_ws_fwd(p);
+        if (n == 0) return 0;
+        p += n;
     }
     return 1;
 }

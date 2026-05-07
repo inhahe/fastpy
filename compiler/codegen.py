@@ -9366,19 +9366,24 @@ class CodeGen:
             targets=[ast.Name(id="_yf_done", ctx=ast.Store())],
             value=ast.Constant(value=False)))
 
-        send_call = ast.Call(
-            func=ast.Attribute(
-                value=ast.Name(id="_yf_sub", ctx=ast.Load()),
-                attr="send", ctx=ast.Load()),
-            args=[ast.Name(id="_yf_sent", ctx=ast.Load())],
+        # Use next() instead of send() for the loop iteration.
+        # next() has get_ret_tag() recovery so it returns FpyValue with
+        # the correct runtime tag — critical for generators that yield
+        # mixed types (INT/STR/etc.).  The send() path would go through
+        # obj_call_method1 which returns raw i64 and loses the tag.
+        # This means we don't forward sent values (an advanced coroutine
+        # feature), but covers the vast majority of yield-from usage.
+        next_call = ast.Call(
+            func=ast.Name(id="next", ctx=ast.Load()),
+            args=[ast.Name(id="_yf_sub", ctx=ast.Load())],
             keywords=[])
 
-        # try: _yf_val = _sub.send(_yf_sent)
+        # try: _yf_val = next(_yf_sub)
         # except StopIteration: _yf_done = True
         try_send = ast.Try(
             body=[ast.Assign(
                 targets=[ast.Name(id="_yf_val", ctx=ast.Store())],
-                value=send_call)],
+                value=next_call)],
             handlers=[ast.ExceptHandler(
                 type=ast.Name(id="StopIteration", ctx=ast.Load()),
                 name=None,
@@ -14301,6 +14306,28 @@ class CodeGen:
                             self.runtime["obj_set_fv"],
                             [obj, attr_name, tag_val, data_val])
                     return
+
+        # FpyValue struct: the RHS already carries tag + data (e.g. from
+        # next() on a generator which returns _fv_build_from_slots).  Extract
+        # the components and store directly — without this, the struct type
+        # falls through to the fallback and the store is silently dropped.
+        if value.type is fpy_val:
+            tag_val = self.builder.extract_value(value, 0, name="fv.tag")
+            data_val = self.builder.extract_value(value, 1, name="fv.data")
+            slot_idx = self._get_attr_slot(target)
+            if slot_idx is not None:
+                old_tag, old_data = self._emit_slot_get_direct(
+                    obj, slot_idx)
+                self.builder.call(self.runtime["rc_incref"],
+                                  [tag_val, data_val])
+                self._emit_slot_set_direct(
+                    obj, slot_idx, tag_val, data_val)
+                self.builder.call(self.runtime["rc_decref"],
+                                  [old_tag, old_data])
+            else:
+                self.builder.call(self.runtime["obj_set_fv"],
+                                  [obj, attr_name, tag_val, data_val])
+            return
 
         # Consult the local variable's static tag when the RHS is a Name.
         # This lets us disambiguate e.g. a string param stored as i64 (as
@@ -19694,9 +19721,47 @@ class CodeGen:
                     (_is_closure and isinstance(expected, ir.IntType))
                     or _is_method)
                 if _needs_ret_tag:
-                    tag = self._infer_ret_tag_for_value(value, node.value)
-                    self.builder.call(self.runtime["set_ret_tag"],
-                                      [ir.Constant(i32, tag)])
+                    # Prefer the runtime tag from the slot when returning a
+                    # self-attribute.  The static inference
+                    # (_infer_ret_tag_for_value) can't determine the correct
+                    # tag for mixed-type attributes like generator _yf_val
+                    # (init'd to 0 but may hold STR/OBJ at runtime).
+                    _used_slot_tag = False
+                    if (_is_method
+                            and isinstance(node.value, ast.Attribute)
+                            and isinstance(node.value.value, ast.Name)
+                            and node.value.value.id == "self"):
+                        _slot_idx = self._get_attr_slot(node.value)
+                        if _slot_idx is not None:
+                            _self_ptr = self._emit_expr_value(
+                                node.value.value)
+                            _self_ptr = self._ensure_ptr(_self_ptr)
+                            _slot_tag, _ = self._emit_slot_get_direct(
+                                _self_ptr, _slot_idx)
+                            self.builder.call(
+                                self.runtime["set_ret_tag"],
+                                [_slot_tag])
+                            _used_slot_tag = True
+                    # Method call on self: the called method already set
+                    # ret_tag — forward it via get_ret_tag() so the
+                    # caller chain preserves the runtime type.  Covers
+                    # __next__() returning self.send(0) in generators.
+                    if (not _used_slot_tag
+                            and _is_method
+                            and isinstance(node.value, ast.Call)
+                            and isinstance(getattr(node.value, 'func', None),
+                                           ast.Attribute)
+                            and isinstance(node.value.func.value, ast.Name)
+                            and node.value.func.value.id == "self"):
+                        _fwd_tag = self.builder.call(
+                            self.runtime["get_ret_tag"], [])
+                        self.builder.call(
+                            self.runtime["set_ret_tag"], [_fwd_tag])
+                        _used_slot_tag = True
+                    if not _used_slot_tag:
+                        tag = self._infer_ret_tag_for_value(value, node.value)
+                        self.builder.call(self.runtime["set_ret_tag"],
+                                          [ir.Constant(i32, tag)])
                 self.builder.ret(value)
 
     def _flush_rc_temps(self) -> None:
