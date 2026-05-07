@@ -9076,10 +9076,10 @@ class CodeGen:
         for i, node in enumerate(tree.body):
             if not isinstance(node, ast.FunctionDef):
                 continue
-            # Only target generators that _generator_needs_cpython would flag
-            # (i.e., those with yield-as-expression / send pattern).
-            # Simple yield-only generators already compile natively via the
-            # list-collection approach.
+            # All generators need native expansion (list-collection is broken
+            # for infinite generators and next()). _generator_needs_cpython
+            # returns True for all of them; _generator_can_expand filters
+            # which ones we can actually transform (excludes nested yield).
             has_yield = any(isinstance(n, (ast.Yield, ast.YieldFrom))
                            for n in ast.walk(node))
             if not has_yield:
@@ -13226,6 +13226,21 @@ class CodeGen:
         determined by AST-level container-attribute detection. Since obj_get_fv
         stores the exact tag, this works without the old pointer-heuristic.
         """
+        # Exception variable attribute: e.args → tuple (msg,)
+        # Exception variables are stored as strings (the message), so
+        # attribute access needs special handling for the common .args pattern.
+        if (isinstance(node.value, ast.Name)
+                and node.value.id in self._exc_vars
+                and node.attr == "args"):
+            # Synthesize the tuple (e,) through the normal tuple literal path
+            # so all type-dispatch and tagging logic is handled correctly.
+            synth_tuple = ast.Tuple(
+                elts=[ast.Name(id=node.value.id, ctx=ast.Load())],
+                ctx=ast.Load())
+            ast.copy_location(synth_tuple, node)
+            ast.fix_missing_locations(synth_tuple)
+            return self._emit_tuple_literal(synth_tuple)
+
         # Module attribute: if the receiver is a CPython-imported module,
         # resolve via cpython_getattr.  This catches `ast.Constant`,
         # `os.path`, etc. inside function bodies where the import is a
@@ -14784,6 +14799,11 @@ class CodeGen:
         # Attribute access: detect container (list/dict) and object attrs
         # so len(), print, and binops dispatch correctly.
         if isinstance(node, ast.Attribute):
+            # Exception variable .args → tuple type
+            if (isinstance(node.value, ast.Name)
+                    and node.value.id in self._exc_vars
+                    and node.attr == "args"):
+                return ValueType(VKind.TUPLE)
             # Path attribute types: .name/.stem/.suffix return str,
             # .parent/.resolve() return path (PyObject*)
             if self._is_path_expr(node.value):
@@ -17207,6 +17227,12 @@ class CodeGen:
             return TypedValue(val, ValueType(VKind.DICT))
         if isinstance(node, ast.Tuple):
             return TypedValue(val, ValueType(VKind.TUPLE))
+        # Exception variable .args → tuple
+        if (isinstance(node, ast.Attribute)
+                and isinstance(node.value, ast.Name)
+                and node.value.id in self._exc_vars
+                and node.attr == "args"):
+            return TypedValue(val, ValueType(VKind.TUPLE))
         # Default: infer type
         vtype = self._infer_type_tag(node, val)
         return TypedValue(val, vtype)
@@ -18206,8 +18232,11 @@ class CodeGen:
                 return True
         if self._yield_inside_try_or_with(node):
             return True
-        # All other generators: use the native state-machine expansion.
-        # This includes simple sequential yields AND while-loop yields.
+        # All other generators need state-machine expansion (the old
+        # list-collection approach breaks infinite generators and next()).
+        # _expand_generators will intercept expandable ones at the AST level;
+        # anything left over (nested generators, class methods) falls through
+        # to CPython bridge at function-visit time.
         return True
 
     def _emit_cpython_generator(self, node: ast.FunctionDef, effective_name: str) -> None:
@@ -23770,6 +23799,16 @@ class CodeGen:
             self.builder.call(self.runtime["write_str"], [str_ptr])
             self.builder.call(self.runtime["print_newline"], [])
             return
+        # Exception variable .args → print as tuple
+        if (isinstance(node, ast.Attribute) and node.attr == "args"
+                and isinstance(node.value, ast.Name)
+                and node.value.id in self._exc_vars):
+            tup = self._emit_expr_value(node)
+            tup = self._ensure_ptr(tup)
+            tag = ir.Constant(i32, FPY_TAG_LIST)
+            data = self.builder.ptrtoint(tup, i64)
+            self.builder.call(self.runtime["fv_print"], [tag, data])
+            return
         fv = self._load_or_wrap_fv(node)
         self._emit_try_bail_if_exc()
         tag, data = self._fv_unpack(fv)
@@ -25125,6 +25164,11 @@ class CodeGen:
 
     def _is_tuple_expr(self, node: ast.expr) -> bool:
         if isinstance(node, ast.Tuple):
+            return True
+        # Exception variable .args → tuple
+        if (isinstance(node, ast.Attribute) and node.attr == "args"
+                and isinstance(node.value, ast.Name)
+                and node.value.id in self._exc_vars):
             return True
         if isinstance(node, ast.Name):
             _entry = None
@@ -28332,6 +28376,18 @@ class CodeGen:
     def _emit_builtin_repr(self, node):
         if len(node.args) == 1:
             arg_node = node.args[0]
+            # Exception variable: repr(e) → "ExcName('msg')"
+            if (isinstance(arg_node, ast.Name)
+                    and arg_node.id in self._exc_vars):
+                cls_name = self._exc_vars[arg_node.id]
+                msg = self._emit_expr_value(arg_node)
+                msg = self._ensure_ptr(msg)
+                prefix = self._make_string_constant(f"{cls_name}('")
+                suffix = self._make_string_constant("')")
+                tmp = self.builder.call(
+                    self.runtime["str_concat"], [prefix, msg])
+                return self.builder.call(
+                    self.runtime["str_concat"], [tmp, suffix])
             # OBJ fast path: use obj_to_repr which handles
             # __repr__ → __str__ → default fallback safely
             if self._is_obj_expr(arg_node):
