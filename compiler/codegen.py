@@ -19999,10 +19999,13 @@ class CodeGen:
         if isinstance(idx_target, ast.Name):
             self._store_variable(idx_target.id, cnt, ValueType(VKind.INT))
 
-        # Assign value to second target
+        # Assign value to second target — recover the runtime tag from
+        # the method call so mixed-type generators work correctly.
         val_target = targets[1]
         if isinstance(val_target, ast.Name):
-            self._store_variable(val_target.id, result, ValueType(VKind.INT))
+            ret_tag = self.builder.call(self.runtime["get_ret_tag"], [])
+            fv = self._fv_build_from_slots(ret_tag, result)
+            self._store_variable(val_target.id, fv, ValueType(VKind.FVALUE))
 
         # Increment counter
         new_cnt = self.builder.add(cnt, ir.Constant(i64, 1))
@@ -20391,8 +20394,13 @@ class CodeGen:
         self.builder.cbranch(has_exc, after_loop, body_block)
 
         self.builder.position_at_end(body_block)
-        # Store the result as the loop variable
-        self._store_variable(var_name, result, ValueType(VKind.INT))
+        # Store the result as the loop variable.
+        # obj_call_method0 returns i64 (bare data); recover the runtime
+        # tag via get_ret_tag() and build a proper FpyValue so the loop
+        # variable preserves type info (generators may yield any type).
+        ret_tag = self.builder.call(self.runtime["get_ret_tag"], [])
+        fv = self._fv_build_from_slots(ret_tag, result)
+        self._store_variable(var_name, fv, ValueType(VKind.FVALUE))
 
         self._loop_stack.append((end_block, cond_block))
         _prev_hot = self._in_hot_loop
@@ -27681,6 +27689,13 @@ class CodeGen:
                 result = self._ensure_ptr(result)
                 self.builder.call(self.runtime["list_mark_tuple"], [result])
                 return result
+            # tuple(obj) — materialize via __iter__/__next__
+            if self._is_obj_expr(arg):
+                obj = self._emit_expr_value(arg)
+                obj = self._ensure_ptr(obj)
+                result = self._rt_call("list_from_obj_iter", [obj])
+                self.builder.call(self.runtime["list_mark_tuple"], [result])
+                return result
             # tuple(list/tuple) — copy and mark as tuple
             result = self._emit_expr_value(arg)
             if self._is_list_expr(arg) or self._is_tuple_expr(arg):
@@ -27967,20 +27982,35 @@ class CodeGen:
         raise CodeGenError("enumerate() requires at least one argument", node)
 
     def _emit_builtin_zip(self, node):
+        def _zip_arg(arg_node):
+            """Emit a zip argument, materializing generators to lists."""
+            val = self._emit_expr_value(arg_node)
+            if self._is_obj_expr(arg_node):
+                val = self._ensure_ptr(val)
+                val = self._rt_call("list_from_obj_iter", [val])
+            return val
         if len(node.args) == 2:
-            a = self._emit_expr_value(node.args[0])
-            b = self._emit_expr_value(node.args[1])
+            a = _zip_arg(node.args[0])
+            b = _zip_arg(node.args[1])
             return self._rt_call("zip", [a, b])
         if len(node.args) == 3:
-            a = self._emit_expr_value(node.args[0])
-            b = self._emit_expr_value(node.args[1])
-            c = self._emit_expr_value(node.args[2])
+            a = _zip_arg(node.args[0])
+            b = _zip_arg(node.args[1])
+            c = _zip_arg(node.args[2])
             return self._rt_call("zip3", [a, b, c])
         return self._bridge_fallback_expr(node, "zip() with 1 or >3 args")
 
     def _emit_builtin_any(self, node):
-        if len(node.args) == 1 and self._is_list_expr(node.args[0]):
-            lst = self._emit_expr_value(node.args[0])
+        _any_ok = (len(node.args) == 1
+                   and (self._is_list_expr(node.args[0])
+                        or self._is_obj_expr(node.args[0])))
+        if _any_ok:
+            if self._is_obj_expr(node.args[0]):
+                obj = self._emit_expr_value(node.args[0])
+                obj = self._ensure_ptr(obj)
+                lst = self._rt_call("list_from_obj_iter", [obj])
+            else:
+                lst = self._emit_expr_value(node.args[0])
             length = self._rt_call("list_length", [lst])
             result_alloca = self._create_entry_alloca(ir.IntType(1), "any.result")
             self.builder.store(ir.Constant(ir.IntType(1), 0), result_alloca)
@@ -28011,8 +28041,16 @@ class CodeGen:
         return self._bridge_fallback_expr(node, "any() with non-list argument")
 
     def _emit_builtin_all(self, node):
-        if len(node.args) == 1 and self._is_list_expr(node.args[0]):
-            lst = self._emit_expr_value(node.args[0])
+        _all_ok = (len(node.args) == 1
+                   and (self._is_list_expr(node.args[0])
+                        or self._is_obj_expr(node.args[0])))
+        if _all_ok:
+            if self._is_obj_expr(node.args[0]):
+                obj = self._emit_expr_value(node.args[0])
+                obj = self._ensure_ptr(obj)
+                lst = self._rt_call("list_from_obj_iter", [obj])
+            else:
+                lst = self._emit_expr_value(node.args[0])
             length = self._rt_call("list_length", [lst])
             result_alloca = self._create_entry_alloca(ir.IntType(1), "all.result")
             self.builder.store(ir.Constant(ir.IntType(1), 1), result_alloca)
@@ -28227,9 +28265,14 @@ class CodeGen:
             obj = self._emit_expr_value(arg_node)
             obj = self._ensure_ptr(obj)
             name_ptr = self._make_string_constant("__next__")
-            return self.builder.call(
+            result = self.builder.call(
                 self.runtime["obj_call_method0"],
                 [obj, name_ptr])
+            # Recover the runtime tag so the return value preserves type
+            # info (generators may yield str/int/float/etc.; raw i64 loses
+            # the tag and downstream code mistreats strings as ints).
+            ret_tag = self.builder.call(self.runtime["get_ret_tag"], [])
+            return self._fv_build_from_slots(ret_tag, result)
         raise CodeGenError("next() takes exactly one argument", node)
 
     def _emit_builtin_iter(self, node):
@@ -28403,8 +28446,19 @@ class CodeGen:
 
     def _emit_builtin_sum(self, node):
         # Phase 2: use TypedValue to accept lists, tuples, and sets
-        tv_sum = self._emit_expr(node.args[0]) if node.args else None
-        sum_kind = tv_sum.vtype.kind if tv_sum else VKind.UNKNOWN
+        # Object expression (e.g. generator call) — materialize to list
+        # first so the index-based sum loop works correctly.
+        if (len(node.args) >= 1
+                and self._is_obj_expr(node.args[0])):
+            obj = self._emit_expr_value(node.args[0])
+            obj = self._ensure_ptr(obj)
+            lst = self._rt_call("list_from_obj_iter", [obj])
+            # Wrap as a list-typed TypedValue so the sum path works
+            tv_sum = TypedValue(lst, ValueType(VKind.LIST))
+            sum_kind = VKind.LIST
+        else:
+            tv_sum = self._emit_expr(node.args[0]) if node.args else None
+            sum_kind = tv_sum.vtype.kind if tv_sum else VKind.UNKNOWN
         is_iterable = (sum_kind in (VKind.LIST, VKind.TUPLE, VKind.SET)
                        or self._is_list_expr(node.args[0]) if node.args else False)
         if len(node.args) >= 1 and is_iterable:
@@ -28472,6 +28526,12 @@ class CodeGen:
                 val = self._emit_expr_value(arg_node)
                 lst = self._pyobj_to_list(val)
                 return self._rt_call("set_from_list", [lst])
+            # set(obj) — materialize via __iter__/__next__
+            if self._is_obj_expr(arg_node):
+                obj = self._emit_expr_value(arg_node)
+                obj = self._ensure_ptr(obj)
+                lst = self._rt_call("list_from_obj_iter", [obj])
+                return self._rt_call("set_from_list", [lst])
             arg = self._emit_expr_value(arg_node)
             if isinstance(arg.type, ir.LiteralStructType) and arg.type == fpy_val:
                 tag = self.builder.extract_value(arg, 0)
@@ -28497,9 +28557,18 @@ class CodeGen:
                     # Compile lambda as i64(i64) function pointer
                     key_func_ptr = self._get_unary_func_ptr(kw.value, node)
                     key_func_name = "__lambda__"
-        # Phase 2: use TypedValue to also accept tuples and sets
-        tv_mm = self._emit_expr(node.args[0]) if len(node.args) == 1 else None
-        mm_kind = tv_mm.vtype.kind if tv_mm else VKind.UNKNOWN
+        # Object expression (e.g. generator call): materialize to list
+        if (len(node.args) == 1
+                and self._is_obj_expr(node.args[0])):
+            obj = self._emit_expr_value(node.args[0])
+            obj = self._ensure_ptr(obj)
+            lst = self._rt_call("list_from_obj_iter", [obj])
+            tv_mm = TypedValue(lst, ValueType(VKind.LIST))
+            mm_kind = VKind.LIST
+        else:
+            # Phase 2: use TypedValue to also accept tuples and sets
+            tv_mm = self._emit_expr(node.args[0]) if len(node.args) == 1 else None
+            mm_kind = tv_mm.vtype.kind if tv_mm else VKind.UNKNOWN
         mm_ok = (mm_kind in (VKind.LIST, VKind.TUPLE, VKind.SET)
                  or (len(node.args) == 1 and self._is_list_expr(node.args[0])))
         if len(node.args) == 1 and mm_ok:
@@ -30589,8 +30658,16 @@ class CodeGen:
             elif kw.arg == "key":
                 key_func = kw.value
 
+        # Object expression (e.g. generator call): materialize to list first
+        _sorted_obj = (self._is_obj_expr(node.args[0])
+                       if len(node.args) == 1 else False)
+        if _sorted_obj:
+            _obj_val = self._emit_expr_value(node.args[0])
+            _obj_val = self._ensure_ptr(_obj_val)
+            _materialized = self._rt_call("list_from_obj_iter", [_obj_val])
+
         if key_func is not None:
-            arg = self._emit_expr_value(node.args[0])
+            arg = _materialized if _sorted_obj else self._emit_expr_value(node.args[0])
             fn_ptr = self._get_unary_func_ptr(key_func, node)
             # Determine if key function returns strings (e.g. lambda x: x[0]
             # on a list of strings). Use string comparison sort in that case.
@@ -30621,7 +30698,10 @@ class CodeGen:
             return result
 
         # Phase 2: use TypedValue to dispatch sorted() by container kind
-        tv = self._emit_expr(node.args[0])
+        if _sorted_obj:
+            tv = TypedValue(_materialized, ValueType(VKind.LIST))
+        else:
+            tv = self._emit_expr(node.args[0])
         kind = tv.vtype.kind
 
         # PyObj: convert to native list via bridge, then sort natively.
@@ -32458,6 +32538,13 @@ class CodeGen:
     def _emit_method_call_str(self, node, obj):
         """Emit string method calls via dispatch table. Returns None if not recognized."""
         method = node.func.attr
+        # str.join(obj_iter): materialize generator/iterator to list first
+        if (method == "join" and len(node.args) == 1
+                and self._is_obj_expr(node.args[0])):
+            _jobj = self._emit_expr_value(node.args[0])
+            _jobj = self._ensure_ptr(_jobj)
+            lst = self._rt_call("list_from_obj_iter", [_jobj])
+            return self._rt_call("str_join", [obj, lst])
         entry = self._STR_METHOD_DISPATCH.get(method)
         if entry is None:
             return None
@@ -32733,7 +32820,12 @@ class CodeGen:
                 return self._rt_call("str_split_max", [obj, sep, maxsplit])
             return self._rt_call("str_split_max", [obj, sep, ir.Constant(i64, -1)])
         elif method == "join" and len(node.args) == 1:
-            lst = self._emit_expr_value(node.args[0])
+            if self._is_obj_expr(node.args[0]):
+                _jobj = self._emit_expr_value(node.args[0])
+                _jobj = self._ensure_ptr(_jobj)
+                lst = self._rt_call("list_from_obj_iter", [_jobj])
+            else:
+                lst = self._emit_expr_value(node.args[0])
             return self._rt_call("str_join", [obj, lst])
         elif method == "find" and len(node.args) >= 1:
             sub = self._emit_expr_value(node.args[0])
@@ -34484,6 +34576,13 @@ class CodeGen:
         else:
             # Iterate over a list/tuple/set expression
             iter_val = self._emit_expr_value(gen.iter)
+            # Object expression (e.g. generator call) — materialize
+            # to a flat FpyList* via __iter__/__next__ so that the
+            # index-based iteration below works correctly.
+            _iter_is_obj = self._is_obj_expr(gen.iter)
+            if _iter_is_obj:
+                iter_val = self._ensure_ptr(iter_val)
+                iter_val = self._rt_call("list_from_obj_iter", [iter_val])
             iter_len = self._rt_call("list_length", [iter_val])
 
             idx_name = f"__lc_idx_{var_name}"
@@ -34502,7 +34601,11 @@ class CodeGen:
 
             self.builder.position_at_end(body_block)
             idx = self._load_variable(idx_name, node)
-            lc_elem_type = self._get_list_elem_type(gen.iter)
+            # Generator-materialized lists contain mixed-type FpyValues;
+            # use FVALUE so the runtime tag is preserved through the loop
+            # variable (str/int/float dispatch at use-site, not compile-time).
+            lc_elem_type = (ValueType(VKind.FVALUE) if _iter_is_obj
+                            else self._get_list_elem_type(gen.iter))
             self._fv_store_from_list(var_name, iter_val, idx, lc_elem_type)
             # If iterating over a list of dicts whose values are all ints
             # (or all lists / dicts), propagate to the loop var so
@@ -34602,6 +34705,10 @@ class CodeGen:
                 self._store_variable(var, start, ValueType(VKind.INT))
             else:
                 iter_val = self._emit_expr_value(gen.iter)
+                _iter_is_obj = self._is_obj_expr(gen.iter)
+                if _iter_is_obj:
+                    iter_val = self._ensure_ptr(iter_val)
+                    iter_val = self._rt_call("list_from_obj_iter", [iter_val])
                 iter_len = self._rt_call("list_length", [iter_val])
                 self._store_variable(idx_name, ir.Constant(i64, 0), ValueType(VKind.INT))
 
@@ -34622,7 +34729,9 @@ class CodeGen:
             self.builder.position_at_end(body_b)
             if not is_range:
                 idx = self._load_variable(idx_name, node)
-                self._fv_store_from_list(var, iter_val, idx, "int")
+                _mlc_elem = (ValueType(VKind.FVALUE) if _iter_is_obj
+                             else ValueType.from_old_tag("int"))
+                self._fv_store_from_list(var, iter_val, idx, _mlc_elem)
 
             # Apply 'if' conditions for this generator
             if gen.ifs:
@@ -34682,6 +34791,10 @@ class CodeGen:
             self._store_variable(var0, start0, ValueType(VKind.INT))
         else:
             outer_list = self._emit_expr_value(gen0.iter)
+            _outer_is_obj = self._is_obj_expr(gen0.iter)
+            if _outer_is_obj:
+                outer_list = self._ensure_ptr(outer_list)
+                outer_list = self._rt_call("list_from_obj_iter", [outer_list])
             outer_len = self._rt_call("list_length", [outer_list])
             self._store_variable(idx0_name, ir.Constant(i64, 0), ValueType(VKind.INT))
 
@@ -34703,9 +34816,11 @@ class CodeGen:
         if not is_range0:
             # Load element from outer list into var0
             idx0 = self._load_variable(idx0_name, node)
-            # Get as list pointer (for nested list iteration like [[...], [...]])
-            # Outer list contains list pointers — store as list-typed variable
-            self._fv_store_from_list(var0, outer_list, idx0, "list:int")
+            # Generator-materialized lists: use FVALUE to preserve runtime tag.
+            # Regular lists: outer contains list pointers (nested [[...], [...]]).
+            _nlc_outer_elem = (ValueType(VKind.FVALUE) if _outer_is_obj
+                               else ValueType.from_old_tag("list:int"))
+            self._fv_store_from_list(var0, outer_list, idx0, _nlc_outer_elem)
 
         # Inner loop
         is_range1 = (isinstance(gen1.iter, ast.Call) and isinstance(gen1.iter.func, ast.Name)
@@ -34721,6 +34836,10 @@ class CodeGen:
         else:
             # Iterate over list/variable
             inner_list = self._emit_expr_value(gen1.iter)
+            _inner_is_obj = self._is_obj_expr(gen1.iter)
+            if _inner_is_obj:
+                inner_list = self._ensure_ptr(inner_list)
+                inner_list = self._rt_call("list_from_obj_iter", [inner_list])
             inner_len = self._rt_call("list_length", [inner_list])
             idx1_name = f"__nlc_idx_{var1}"
             self._store_variable(idx1_name, ir.Constant(i64, 0), ValueType(VKind.INT))
@@ -34742,7 +34861,9 @@ class CodeGen:
         self.builder.position_at_end(inner_body)
         if not is_range1:
             idx1 = self._load_variable(idx1_name, node)
-            self._fv_store_from_list(var1, inner_list, idx1, "int")
+            _nlc_inner_elem = (ValueType(VKind.FVALUE) if _inner_is_obj
+                               else ValueType.from_old_tag("int"))
+            self._fv_store_from_list(var1, inner_list, idx1, _nlc_inner_elem)
 
         # Apply conditions and append
         self._emit_lc_body(gen1, node, result_list, inner_incr)
