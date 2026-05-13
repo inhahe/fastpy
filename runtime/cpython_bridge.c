@@ -148,6 +148,10 @@ static PyObject* fpy_to_pyobject(int32_t tag, int64_t data);
  * in bridge call functions.  Returns the fastpy exc-type id.         */
 extern void  fastpy_raise(int, const char*);
 extern int   fastpy_exc_name_to_id(const char*);
+extern int   fastpy_exc_pending(void);
+extern int   fastpy_exc_get_type(void);
+extern const char* fastpy_exc_get_msg(void);
+extern const char* fastpy_exc_get_class_name(void);
 extern char* fpy_strdup(const char*);
 
 static void bridge_propagate_exception(void) {
@@ -609,6 +613,69 @@ void fpy_cpython_peek_fv(void *obj, int32_t *out_tag, int64_t *out_data) {
 void* fpy_cpython_to_pyobj(int32_t tag, int64_t data) {
     fpy_cpython_init();
     return (void*)fpy_to_pyobject(tag, data);
+}
+
+/* ── Exception info for __exit__ ──────────────────────────────────
+ * Build Python exception objects (type, value) from fastpy's pending
+ * exception state.  Used by the with-statement's __exit__ call so
+ * CPython context managers (especially contextlib.contextmanager)
+ * receive proper exception info instead of (None, None, None).
+ *
+ * Returns two PyObject* (new references) via output pointers.
+ * If no exception pending, both are Py_None.  Caller must Py_DECREF. */
+void fpy_cpython_exc_info_for_exit(void **out_type, void **out_value) {
+    fpy_cpython_init();
+
+    if (!fastpy_exc_pending()) {
+        Py_INCREF(Py_None);
+        Py_INCREF(Py_None);
+        *out_type = (void*)Py_None;
+        *out_value = (void*)Py_None;
+        return;
+    }
+
+    const char *name = fastpy_exc_get_class_name();
+    if (!name || !name[0]) name = "Exception";
+
+    /* Look up the Python exception class from builtins */
+    PyObject *builtins = PyImport_ImportModule("builtins");
+    PyObject *exc_class = NULL;
+    if (builtins) {
+        exc_class = PyObject_GetAttrString(builtins, name);
+        Py_DECREF(builtins);
+    }
+    if (!exc_class) {
+        /* Unknown exception class — fall back to Exception */
+        PyErr_Clear();
+        builtins = PyImport_ImportModule("builtins");
+        if (builtins) {
+            exc_class = PyObject_GetAttrString(builtins, "Exception");
+            Py_DECREF(builtins);
+        }
+    }
+    if (!exc_class) {
+        PyErr_Clear();
+        Py_INCREF(Py_None);
+        Py_INCREF(Py_None);
+        *out_type = (void*)Py_None;
+        *out_value = (void*)Py_None;
+        return;
+    }
+
+    /* Create exception instance with the message */
+    const char *msg = fastpy_exc_get_msg();
+    PyObject *py_msg = PyUnicode_FromString(msg ? msg : "");
+    PyObject *exc_value = PyObject_CallOneArg(exc_class, py_msg);
+    Py_DECREF(py_msg);
+
+    if (!exc_value) {
+        PyErr_Clear();
+        Py_INCREF(Py_None);
+        exc_value = Py_None;
+    }
+
+    *out_type = (void*)exc_class;   /* new reference */
+    *out_value = (void*)exc_value;  /* new reference */
 }
 
 /* ── FpyValue method dispatch ─────────────────────────────────────

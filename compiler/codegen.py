@@ -2131,6 +2131,10 @@ class CodeGen:
         # to_pyobj(tag, data) → PyObject* — convert FpyValue to PyObject*
         ft = ir.FunctionType(i8_ptr, [i32, i64])
         self.runtime["cpython_to_pyobj"] = ir.Function(self.module, ft, name="fpy_cpython_to_pyobj")
+        # exc_info_for_exit(&out_type, &out_value) — get exc type+value as PyObject*
+        ft = ir.FunctionType(void, [ir.PointerType(i8_ptr), ir.PointerType(i8_ptr)])
+        self.runtime["cpython_exc_info_for_exit"] = ir.Function(
+            self.module, ft, name="fpy_cpython_exc_info_for_exit")
         # FpyValue method dispatch — call method on any FpyValue type
         # fv_call_method0(rcv_tag, rcv_data, name, &out_tag, &out_data)
         ft = ir.FunctionType(void, [i32, i64, i8_ptr,
@@ -2166,6 +2170,9 @@ class CodeGen:
         # print a PyObject* via CPython's str() — preserves IntEnum names etc.
         ft = ir.FunctionType(ir.VoidType(), [i8_ptr])
         self.runtime["cpython_print_obj"] = ir.Function(self.module, ft, name="fpy_cpython_print_obj")
+        # flush Python's stdout — sync output ordering with native printf
+        ft = ir.FunctionType(ir.VoidType(), [])
+        self.runtime["cpython_flush"] = ir.Function(self.module, ft, name="fpy_cpython_flush")
         # iter(pyobj) → PyObject* iterator
         ft = ir.FunctionType(i8_ptr, [i8_ptr])
         self.runtime["cpython_iter"] = ir.Function(self.module, ft, name="fpy_cpython_iter")
@@ -20828,6 +20835,16 @@ class CodeGen:
                                   self, '_native_modules', set()))
                 if not _is_native:
                     _is_pyobj_ctx = True
+            # Native module functions that return PyObject* context managers
+            # (e.g. contextlib.suppress) — detected via _native_imports.
+            elif (isinstance(ctx_expr, ast.Call)
+                    and isinstance(ctx_expr.func, ast.Name)
+                    and ctx_expr.func.id in getattr(
+                        self, '_native_imports', {})
+                    and getattr(self, '_native_imports', {}).get(
+                        ctx_expr.func.id, (None, None))[1]
+                    in ("suppress",)):
+                _is_pyobj_ctx = True
 
             if _is_pyobj_ctx:
                 # Ensure Python stdout is configured for correct output ordering
@@ -20954,21 +20971,70 @@ class CodeGen:
                 _is_pyobj_rt, pyobj_exit_block, native_exit_block)
 
             # PyObject* path: use bridge getattr + call3
+            # Pass actual exception info to __exit__ when an exception
+            # is pending, so contextlib.contextmanager can throw it into
+            # the generator.  When no exception, pass (None, None, None).
             self.builder.position_at_end(pyobj_exit_block)
             exit_attr = self._make_string_constant("__exit__")
             exit_method = self.builder.call(
                 self.runtime["cpython_getattr"], [saved_mgr, exit_attr])
             none_tag = ir.Constant(i32, FPY_TAG_NONE)
             none_data = ir.Constant(i64, 0)
+            obj_tag = ir.Constant(i32, FPY_TAG_OBJ)
             _exit_tag_slot = self._create_entry_alloca(i32, "exit.tag")
             _exit_data_slot = self._create_entry_alloca(i64, "exit.data")
+            # Allocas for __exit__ arg1 (exc_type) and arg2 (exc_value)
+            _arg1_tag = self._create_entry_alloca(i32, "exit.a1.tag")
+            _arg1_data = self._create_entry_alloca(i64, "exit.a1.data")
+            _arg2_tag = self._create_entry_alloca(i32, "exit.a2.tag")
+            _arg2_data = self._create_entry_alloca(i64, "exit.a2.data")
+            # Check if exception is pending
+            _pend_for_exit = self.builder.call(
+                self.runtime["exc_pending"], [])
+            _has_exc_for_exit = self.builder.icmp_signed(
+                "!=", _pend_for_exit, ir.Constant(i32, 0))
+            _exc_info_block = self._new_block("with.exc_info")
+            _no_exc_block = self._new_block("with.no_exc")
+            _call_exit_block = self._new_block("with.call_exit")
+            self.builder.cbranch(
+                _has_exc_for_exit, _exc_info_block, _no_exc_block)
+            # Exception pending: get Python exception objects
+            self.builder.position_at_end(_exc_info_block)
+            _exc_type_slot = self._create_entry_alloca(i8_ptr, "exc.type.pyobj")
+            _exc_val_slot = self._create_entry_alloca(i8_ptr, "exc.val.pyobj")
+            self.builder.call(
+                self.runtime["cpython_exc_info_for_exit"],
+                [_exc_type_slot, _exc_val_slot])
+            _exc_type_pyobj = self.builder.load(_exc_type_slot)
+            _exc_val_pyobj = self.builder.load(_exc_val_slot)
+            self.builder.store(obj_tag, _arg1_tag)
+            self.builder.store(
+                self.builder.ptrtoint(_exc_type_pyobj, i64), _arg1_data)
+            self.builder.store(obj_tag, _arg2_tag)
+            self.builder.store(
+                self.builder.ptrtoint(_exc_val_pyobj, i64), _arg2_data)
+            self.builder.branch(_call_exit_block)
+            # No exception: use (None, None, None)
+            self.builder.position_at_end(_no_exc_block)
+            self.builder.store(none_tag, _arg1_tag)
+            self.builder.store(none_data, _arg1_data)
+            self.builder.store(none_tag, _arg2_tag)
+            self.builder.store(none_data, _arg2_data)
+            self.builder.branch(_call_exit_block)
+            # Call __exit__(arg1, arg2, None)  — tb is always None
+            self.builder.position_at_end(_call_exit_block)
             self.builder.call(
                 self.runtime["cpython_call3"],
                 [exit_method,
-                 none_tag, none_data,
-                 none_tag, none_data,
+                 self.builder.load(_arg1_tag),
+                 self.builder.load(_arg1_data),
+                 self.builder.load(_arg2_tag),
+                 self.builder.load(_arg2_data),
                  none_tag, none_data,
                  _exit_tag_slot, _exit_data_slot])
+            # Flush Python stdout — __exit__ may have printed via CPython
+            # (e.g. contextmanager generator's except block doing print())
+            self.builder.call(self.runtime["cpython_flush"], [])
             # Check if __exit__ returned truthy → suppress exception
             _exit_tag_v = self.builder.load(_exit_tag_slot)
             _exit_data_v = self.builder.load(_exit_data_slot)
@@ -22423,9 +22489,32 @@ class CodeGen:
                 self.runtime["cpython_call2_raw"],
                 [callable_ptr, t1_ir, d1_ir, t2_ir, d2_ir])
         else:
-            fv = self._emit_cpython_method_call(node)
-            data = self.builder.extract_value(fv, 1)
-            return self._ensure_ptr(data)
+            # 3+ positional args: use keyword call path with 0 keywords
+            tags_alloca = self.builder.alloca(
+                ir.ArrayType(i32, n_args), name="raw.tags")
+            data_alloca = self.builder.alloca(
+                ir.ArrayType(i64, n_args), name="raw.data")
+            for i, arg_node in enumerate(node.args):
+                val = self._emit_expr_value(arg_node)
+                t_ir, d_ir = self._to_bridge_tag_data_ir(val, arg_node)
+                self.builder.store(t_ir, self.builder.gep(
+                    tags_alloca,
+                    [ir.Constant(i32, 0), ir.Constant(i32, i)]))
+                self.builder.store(d_ir, self.builder.gep(
+                    data_alloca,
+                    [ir.Constant(i32, 0), ir.Constant(i32, i)]))
+            return self.builder.call(
+                self.runtime["cpython_call_kw_raw"],
+                [callable_ptr,
+                 ir.Constant(i32, n_args),
+                 self.builder.gep(tags_alloca,
+                    [ir.Constant(i32, 0), ir.Constant(i32, 0)]),
+                 self.builder.gep(data_alloca,
+                    [ir.Constant(i32, 0), ir.Constant(i32, 0)]),
+                 ir.Constant(i32, 0),
+                 ir.Constant(ir.PointerType(i8_ptr), None),
+                 ir.Constant(ir.PointerType(i32), None),
+                 ir.Constant(ir.PointerType(i64), None)])
 
     def _emit_cpython_call_with_ptr(self, callable_ptr: 'ir.Value',
                                      node: ast.Call) -> 'ir.Value':
@@ -35136,7 +35225,64 @@ class CodeGen:
                 return self._emit_expr_value(node.args[0])
             return ir.Constant(i64, 0)
         elif func_name == "suppress":
-            return ir.Constant(i64, 0)
+            # suppress(ExcType1, ...) returns a Python context manager.
+            # Must go through CPython bridge since the result is a Python
+            # object with __enter__/__exit__.
+            mod_gvar = self._cpython_modules.get("contextlib")
+            if mod_gvar is not None:
+                mod_ptr = self.builder.load(mod_gvar)
+            else:
+                mod_ptr = self.builder.call(
+                    self.runtime["cpython_import"],
+                    [self._make_string_constant("contextlib")])
+            suppress_func = self.builder.call(
+                self.runtime["cpython_getattr"],
+                [mod_ptr, self._make_string_constant("suppress")])
+            if not node.args:
+                return self.builder.call(
+                    self.runtime["cpython_call0_raw"], [suppress_func])
+            # Get builtins module for resolving exception class names
+            builtins_mod = self.builder.call(
+                self.runtime["cpython_import"],
+                [self._make_string_constant("builtins")])
+            # Build argument arrays for the variadic call
+            n = len(node.args)
+            tags_alloca = self.builder.alloca(
+                ir.ArrayType(i32, n), name="suppress.tags")
+            data_alloca = self.builder.alloca(
+                ir.ArrayType(i64, n), name="suppress.data")
+            for i, arg_node in enumerate(node.args):
+                if (isinstance(arg_node, ast.Name)
+                        and arg_node.id in self._BUILTIN_NAMES):
+                    exc_name_ptr = self._make_string_constant(arg_node.id)
+                    pyobj = self.builder.call(
+                        self.runtime["cpython_getattr"],
+                        [builtins_mod, exc_name_ptr])
+                    tag_ir = ir.Constant(i32, FPY_TAG_OBJ)
+                    data_ir = self.builder.ptrtoint(pyobj, i64)
+                else:
+                    val = self._emit_expr_value(arg_node)
+                    tag_ir, data_ir = self._to_bridge_tag_data_ir(
+                        val, arg_node)
+                self.builder.store(tag_ir, self.builder.gep(
+                    tags_alloca,
+                    [ir.Constant(i32, 0), ir.Constant(i32, i)]))
+                self.builder.store(data_ir, self.builder.gep(
+                    data_alloca,
+                    [ir.Constant(i32, 0), ir.Constant(i32, i)]))
+            # Use cpython_call_kw_raw with 0 kwargs for variadic positional call
+            t_ptr = self.builder.gep(
+                tags_alloca, [ir.Constant(i32, 0), ir.Constant(i32, 0)])
+            d_ptr = self.builder.gep(
+                data_alloca, [ir.Constant(i32, 0), ir.Constant(i32, 0)])
+            return self.builder.call(
+                self.runtime["cpython_call_kw_raw"],
+                [suppress_func,
+                 ir.Constant(i32, n), t_ptr, d_ptr,
+                 ir.Constant(i32, 0),
+                 ir.Constant(ir.PointerType(i8_ptr), None),
+                 ir.Constant(ir.PointerType(i32), None),
+                 ir.Constant(ir.PointerType(i64), None)])
         elif func_name == "closing":
             if len(node.args) == 1:
                 return self._emit_expr_value(node.args[0])
