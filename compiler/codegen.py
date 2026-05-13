@@ -33117,13 +33117,15 @@ class CodeGen:
 
 
     def _emit_builtin_hasattr(self, node):
-        # Check if the object is a PYOBJ before evaluating args
+        # Check if the object is a PYOBJ/NATIVE_MOD before evaluating args
         obj_kind = VKind.UNKNOWN
-        if (isinstance(node.args[0], ast.Name)
-                and node.args[0].id in self.variables):
-            obj_kind = self._var_kind(node.args[0].id)
-        # For PYOBJ (bridge objects), call CPython's hasattr
-        if obj_kind == VKind.PYOBJ:
+        if isinstance(node.args[0], ast.Name):
+            name = node.args[0].id
+            if name in self.variables or name in self._global_vars:
+                obj_kind = self._var_kind(name)
+        # For PYOBJ/NATIVE_MOD (bridge objects and native modules that
+        # hold real PyObject*), call CPython's hasattr
+        if obj_kind in (VKind.PYOBJ, VKind.NATIVE_MOD):
             obj = self._emit_expr_value(node.args[0])
             obj = self._ensure_ptr(obj)
             attr_name = self._emit_expr_value(node.args[1])
@@ -33131,6 +33133,22 @@ class CodeGen:
             result = self.builder.call(
                 self.runtime["cpython_hasattr"], [obj, attr_name])
             return self.builder.zext(result, i64)
+        # For LOGGER objects (i32 logger_id, not a real pointer), resolve
+        # at compile-time when the attr is a string constant.
+        if obj_kind == VKind.LOGGER:
+            _logger_attrs = {"debug", "info", "warning", "warn", "error",
+                             "critical", "fatal", "setLevel", "addHandler",
+                             "removeHandler", "getChild", "isEnabledFor",
+                             "log", "name", "level", "handlers", "disabled",
+                             "propagate", "parent", "manager", "filters"}
+            if (len(node.args) >= 2
+                    and isinstance(node.args[1], ast.Constant)
+                    and isinstance(node.args[1].value, str)):
+                attr = node.args[1].value
+                return ir.Constant(i64, 1 if attr in _logger_attrs else 0)
+            # Dynamic attr name: conservatively return True (most Logger
+            # attrs exist; this avoids passing i32 as ptr → segfault).
+            return ir.Constant(i64, 1)
         # For native objects, call obj_has_attr which checks both
         # static slots and dynamic attrs at runtime.
         obj = self._emit_expr_value(node.args[0])
