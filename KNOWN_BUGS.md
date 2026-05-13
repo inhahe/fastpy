@@ -87,31 +87,17 @@ value via a phi node.
 
 ---
 
-## Bug 10 — `contextlib.contextmanager` doesn't work
+## ~~Bug 10 — `contextlib.contextmanager` doesn't work~~
 
-**Severity:** Crash (exit code 1)  
-**Status:** OPEN  
-**Pattern:**
-```python
-from contextlib import contextmanager
-
-@contextmanager
-def ctx(name):
-    print("enter", name)
-    yield name
-    print("exit", name)
-
-with ctx("test") as val:
-    print("inside", val)
-# CPython: enter test / inside test / exit test
-# Fastpy:  AttributeError: 'ctx' object has no method '__exit__'
-```
-
-**Root cause:** The `@contextmanager` decorator wraps the generator in
-a CPython `_GeneratorContextManager` object. The `with` statement
-dispatches to native `__enter__`/`__exit__`, but the wrapper object's
-methods exist only in CPython. Fixing requires the `with` statement to
-detect bridge-wrapped objects and dispatch through the CPython protocol.
+**Status:** FIXED  
+**Fix:** Functions decorated with `@contextmanager` (from bridge imports) are
+now detected during pre-scan and compiled through the CPython bridge via
+`exec_get`. The `with` statement's existing PYOBJ path handles
+`__enter__`/`__exit__` through `cpython_getattr`/`cpython_call0_raw`.
+`_emit_cpython_call_raw` extended to handle `Call(func=Name(...))` (direct
+PYOBJ variable calls). `_is_pyobj_receiver` extended for same. Python's
+stdout is reconfigured to `write_through=True, newline='\n'` to sync output
+ordering between native printf and bridge print.
 
 ---
 

@@ -3257,6 +3257,26 @@ class CodeGen:
         # Pass 0.8 so slot allocation sees self.attr in the synthesized __init__.
         self._expand_dataclasses(tree)
 
+        # Pass 0.765: detect functions with bridge-wrapper decorators
+        # (e.g. @contextmanager) BEFORE generator expansion. These functions
+        # must be compiled through CPython bridge, not expanded natively.
+        if not hasattr(self, '_cpython_functions'):
+            self._cpython_functions = set()
+        _wrapper_decorators = {"contextmanager"}  # decorators that wrap via bridge
+        _imported_deco_names: set[str] = set()
+        for stmt in tree.body:
+            if isinstance(stmt, ast.ImportFrom):
+                for alias in stmt.names:
+                    name = alias.asname if alias.asname else alias.name
+                    _imported_deco_names.add(name)
+        for node in tree.body:
+            if isinstance(node, ast.FunctionDef):
+                for deco in node.decorator_list:
+                    if (isinstance(deco, ast.Name)
+                            and deco.id in _wrapper_decorators
+                            and deco.id in _imported_deco_names):
+                        self._cpython_functions.add(node.name)
+
         # Pass 0.77: expand generators that use yield-as-expression (send
         # pattern) into state-machine classes. Must run before Pass 0.8 so
         # slot allocation sees self._attr in the generated __init__/send
@@ -10407,6 +10427,9 @@ class CodeGen:
                 else:
                     continue
             if not isinstance(node, ast.FunctionDef):
+                continue
+            # Skip functions routed through CPython bridge (e.g. @contextmanager)
+            if node.name in getattr(self, '_cpython_functions', set()):
                 continue
             # All generators need native expansion (list-collection is broken
             # for infinite generators and next()). _generator_needs_cpython
@@ -20666,6 +20689,9 @@ class CodeGen:
                     _is_pyobj_ctx = True
 
             if _is_pyobj_ctx:
+                # Ensure Python stdout is configured for correct output ordering
+                # BEFORE __enter__ runs (it may print through Python's sys.stdout).
+                self._emit_bridge_stdout_flush()
                 # PyObject* context manager — use bridge calls
                 mgr = self._emit_cpython_call_raw(ctx_expr) \
                     if isinstance(ctx_expr, ast.Call) \
@@ -20677,6 +20703,8 @@ class CodeGen:
                     self.runtime["cpython_getattr"], [mgr, enter_attr])
                 enter_result = self.builder.call(
                     self.runtime["cpython_call0_raw"], [enter_method])
+                # Flush after __enter__ to ensure its output is visible
+                self._emit_bridge_stdout_flush()
                 # Bind `as var` as pyobj
                 if opt_var is not None and isinstance(opt_var, ast.Name):
                     self._store_variable(opt_var.id, enter_result, ValueType(VKind.PYOBJ))
@@ -22105,10 +22133,53 @@ class CodeGen:
         # For now, return as FpyValue and let the caller handle it
         return self._fv_build_from_slots(tag_val, data_val)
 
+    def _emit_bridge_stdout_flush(self) -> None:
+        """Flush Python's sys.stdout to sync bridge output with native output.
+
+        When mixing native printf (fastpy_fv_print) with Python's print()
+        (inside bridge-compiled functions like @contextmanager), output order
+        can be wrong because Python's stdout is fully buffered when piped.
+        This creates a flush function via exec_get and calls it.
+
+        Also reconfigures Python's stdout to avoid double-newline issues on
+        Windows (Python TextIOWrapper's \\r\\n + C _O_TEXT \\r\\n = \\r\\r\\n)."""
+        if not hasattr(self, '_bridge_flush_gvar'):
+            code = (
+                "import sys, os\n"
+                "def _fpy_flush():\n"
+                "    sys.stdout.flush()\n"
+                "# Reconfigure stdout: write_through for immediate output,\n"
+                "# newline='\\n' to avoid double \\r\\n on Windows.\n"
+                "try:\n"
+                "    sys.stdout.reconfigure(write_through=True, newline='\\n')\n"
+                "except (AttributeError, OSError):\n"
+                "    pass\n"
+            )
+            code_ptr = self._make_string_constant(code)
+            name_ptr = self._make_string_constant("_fpy_flush")
+            flush_fn = self.builder.call(
+                self.runtime["cpython_exec_get"], [code_ptr, name_ptr])
+            # Store in a global so we can reuse it
+            gvar = ir.GlobalVariable(
+                self.module, i8_ptr, name="fastpy.bridge_flush")
+            gvar.initializer = ir.Constant(i8_ptr, None)
+            gvar.linkage = "private"
+            self.builder.store(flush_fn, gvar)
+            self._bridge_flush_gvar = gvar
+        flush_fn = self.builder.load(self._bridge_flush_gvar)
+        self.builder.call(
+            self.runtime["cpython_call0_raw"], [flush_fn])
+
     def _emit_cpython_call_raw(self, node: ast.Call) -> ir.Value:
         """Emit a CPython method call that returns the raw PyObject* (i8_ptr).
         Used when the result will be stored as pyobj for downstream operations."""
-        attr = node.func  # ast.Attribute
+        attr = node.func  # ast.Attribute or ast.Name
+        # Handle direct PYOBJ function calls: ctx("test") where ctx is pyobj.
+        # The callable is already a PyObject*, just call it directly.
+        if isinstance(attr, ast.Name):
+            callable_ptr = self._emit_expr_value(attr)
+            callable_ptr = self._ensure_ptr(callable_ptr)
+            return self._emit_cpython_call_raw_with_callable(node, callable_ptr)
         # inspect.signature(func) where func is a user function:
         # Create a dummy Python function with the right signature via
         # bridge exec so inspect.signature() sees correct parameters.
@@ -22138,8 +22209,16 @@ class CodeGen:
         attr_name = self._make_string_constant(attr.attr)
         callable_ptr = self.builder.call(
             self.runtime["cpython_getattr"], [obj, attr_name])
+        return self._emit_cpython_call_raw_with_callable(node, callable_ptr)
 
-        # If there are keyword arguments, use the general call_kw_raw path
+    def _emit_cpython_call_raw_with_callable(self, node: ast.Call,
+                                               callable_ptr: 'ir.Value') -> 'ir.Value':
+        """Call a known PyObject* callable and return the raw PyObject* result.
+
+        Shared implementation for _emit_cpython_call_raw when the callable
+        is already resolved (either from getattr on an object or from a
+        direct PYOBJ variable like @contextmanager-decorated functions).
+        """
         if node.keywords:
             n_pos = len(node.args)
             n_kw = len(node.keywords)
@@ -22184,7 +22263,6 @@ class CodeGen:
                  self.builder.gep(names_alloca, [ir.Constant(i32, 0), ir.Constant(i32, 0)]),
                  self.builder.gep(kt_alloca, [ir.Constant(i32, 0), ir.Constant(i32, 0)]),
                  self.builder.gep(kd_alloca, [ir.Constant(i32, 0), ir.Constant(i32, 0)])])
-
         n_args = len(node.args)
         if n_args == 0:
             return self.builder.call(
@@ -22204,7 +22282,6 @@ class CodeGen:
                 self.runtime["cpython_call2_raw"],
                 [callable_ptr, t1_ir, d1_ir, t2_ir, d2_ir])
         else:
-            # Fall back to FV path for 3+ args
             fv = self._emit_cpython_method_call(node)
             data = self.builder.extract_value(fv, 1)
             return self._ensure_ptr(data)
@@ -29246,6 +29323,14 @@ class CodeGen:
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
             return self._is_pyobj_receiver(node.func.value,
                                            include_native_mod=include_native_mod)
+        # Call on pyobj variable: ctx("test") where ctx is pyobj (e.g. @contextmanager)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            if self._has_var(node.func.id):
+                kind = self._var_kind(node.func.id)
+                if kind == VKind.PYOBJ:
+                    return True
+                if include_native_mod and kind == VKind.NATIVE_MOD:
+                    return True
         return False
 
     def _match_prefix_reverse(self, target: ast.Subscript,
