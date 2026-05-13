@@ -112,6 +112,8 @@ typedef struct {
     int arg_count;       /* number of args (excluding self) */
     int returns_value;   /* 1 if returns a value, 0 if void */
     int return_tag;      /* FPY_TAG_* for the return value, -1 = unknown */
+    int is_vararg;       /* 1 if method accepts *args (last param is list ptr) */
+    int n_positional;    /* number of positional params before *args */
 } FpyMethodDef;
 
 /* Class definition */
@@ -385,5 +387,13 @@ FpyWeakRef* fpy_weakref_new(FpyObj *target);
 FpyObj* fpy_weakref_deref(FpyWeakRef *wr);
 int32_t fpy_weakref_alive(FpyWeakRef *wr);
 void fpy_weakref_destroy(FpyWeakRef *wr);
+
+/* Extended-slice assignment: list[start:stop:step] = values */
+void fastpy_list_slice_step_assign(FpyList *list, int64_t start, int64_t stop,
+                                    int64_t step, int64_t has_start,
+                                    int64_t has_stop, FpyList *new_values);
+
+/* --- Built-in list/tuple iterator --- */
+FpyObj* fastpy_list_iter_new(FpyList *list);
 
 #endif /* FASTPY_OBJECTS_H */

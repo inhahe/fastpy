@@ -379,8 +379,12 @@ extern FpyList* fpy_cpython_to_list(void*);
  * been auto-converted to a native type by pyobject_to_fpy. */
 FpyList* fastpy_fv_to_list(int32_t tag, int64_t data) {
     switch (tag) {
-    case FPY_TAG_LIST:
-        return fastpy_list_copy((FpyList*)(intptr_t)data);
+    case FPY_TAG_LIST: {
+        FpyList *copy = fastpy_list_copy((FpyList*)(intptr_t)data);
+        /* list() always returns a list, even if the source was a tuple */
+        copy->is_tuple = 0;
+        return copy;
+    }
     case FPY_TAG_STR:
         return fastpy_str_to_list((const char*)(intptr_t)data);
     case FPY_TAG_DICT:
@@ -473,6 +477,8 @@ double fastpy_pow_float(double base, double exp) {
 FPY_THREAD_LOCAL int fpy_exc_type = FPY_EXC_NONE;
 FPY_THREAD_LOCAL const char *fpy_exc_msg = "";
 FPY_THREAD_LOCAL int fpy_exc_group_inner = FPY_EXC_NONE;
+FPY_THREAD_LOCAL void *fpy_exc_obj = NULL;  /* exception object for user-defined exceptions */
+FPY_THREAD_LOCAL const char *fpy_exc_class_name = "";  /* actual class name for type(e).__name__ */
 
 /* Per-thread return tag for closure calls. The closure body stores
  * the value's runtime tag here before returning the i64 data. The
@@ -482,6 +488,21 @@ FPY_THREAD_LOCAL int32_t fpy_ret_tag = 0;  /* FPY_TAG_INT */
 
 void fastpy_set_ret_tag(int32_t tag) { fpy_ret_tag = tag; }
 int32_t fastpy_get_ret_tag(void) { return fpy_ret_tag; }
+
+/* --- Argument tag side-channel for closure dispatch ---
+ * When calling a function through closure_call_list / call_ptr, the
+ * raw i64 calling convention loses type tags.  The compiler and runtime
+ * store argument tags here before the call; the i64 wrapper reads them
+ * to reconstruct FpyValues with correct runtime tags. */
+FPY_THREAD_LOCAL int32_t fpy_arg_tags[8] = {0};
+
+void fastpy_set_arg_tag(int32_t index, int32_t tag) {
+    if (index >= 0 && index < 8) fpy_arg_tags[index] = tag;
+}
+int32_t fastpy_get_arg_tag(int32_t index) {
+    if (index >= 0 && index < 8) return fpy_arg_tags[index];
+    return 0;  /* FPY_TAG_INT */
+}
 
 /* --- Shadow call stack (for traceback on unhandled exceptions) --- */
 
@@ -649,6 +670,30 @@ static void fpy_shadow_print_traceback(void) {
 void fastpy_raise(int exc_type, const char *msg) {
     fpy_exc_type = exc_type;
     fpy_exc_msg = msg;
+    /* Auto-set the class name for builtin exception types so that
+     * type(e).__name__ works even for runtime-raised exceptions (1/0,
+     * d["missing"], lst[999], etc.) where the compiler doesn't emit
+     * an explicit exc_set_class_name call. */
+    {
+        static const char *builtin_names[] = {
+            "Exception",        /* 0 — shouldn't be raised, but safe */
+            "ZeroDivisionError",/* 1 */
+            "ValueError",       /* 2 */
+            "TypeError",        /* 3 */
+            "IndexError",       /* 4 */
+            "KeyError",         /* 5 */
+            "RuntimeError",     /* 6 */
+            "StopIteration",    /* 7 */
+            "ExceptionGroup",   /* 8 */
+            "NameError",        /* 9 */
+            "OverflowError",    /* 10 */
+            "AttributeError"    /* 11 */
+        };
+        if (exc_type >= 1 && exc_type <= 11)
+            fpy_exc_class_name = builtin_names[exc_type];
+        /* For FPY_EXC_GENERIC (99), the compiler sets the name explicitly
+         * via fastpy_exc_set_class_name — don't overwrite it here. */
+    }
     /* Update the current frame's line number from the compiler-set global
      * before snapshotting — fpy_current_line is updated by the compiler
      * before every statement via a direct store (no function call). */
@@ -659,6 +704,31 @@ void fastpy_raise(int exc_type, const char *msg) {
     if (fpy_shadow_depth > 0)
         memcpy(fpy_traceback, fpy_shadow_stack,
                sizeof(FpyShadowFrame) * fpy_shadow_depth);
+}
+
+/* Raise with an object pointer (for user-defined exception classes) */
+extern void fastpy_obj_set_fv(void*, const char*, int32_t, int64_t);
+void fastpy_raise_with_obj(int exc_type, const char *msg, void *obj) {
+    fpy_exc_type = exc_type;
+    fpy_exc_msg = msg;
+    fpy_exc_obj = obj;
+    /* Store the message on the object so str(e) works after exc_clear().
+     * Uses a dynamic attribute "__exc_msg__" that obj_to_str checks. */
+    if (obj) {
+        fastpy_obj_set_fv(obj, "__exc_msg__", 2 /*FPY_TAG_STR*/,
+                          (int64_t)(intptr_t)msg);
+    }
+    if (fpy_shadow_depth > 0)
+        fpy_shadow_stack[fpy_shadow_depth - 1].lineno = fpy_current_line;
+    fpy_traceback_depth = fpy_shadow_depth;
+    if (fpy_shadow_depth > 0)
+        memcpy(fpy_traceback, fpy_shadow_stack,
+               sizeof(FpyShadowFrame) * fpy_shadow_depth);
+}
+
+/* Get the exception object pointer (NULL if not a user-class exception) */
+void* fastpy_exc_get_obj(void) {
+    return fpy_exc_obj;
 }
 
 /* Check if an exception is pending */
@@ -681,7 +751,19 @@ void fastpy_exc_clear(void) {
     fpy_exc_type = FPY_EXC_NONE;
     fpy_exc_msg = "";
     fpy_exc_group_inner = FPY_EXC_NONE;
+    fpy_exc_obj = NULL;
+    fpy_exc_class_name = "";
     fpy_traceback_depth = 0;
+}
+
+/* Set the actual exception class name (for type(e).__name__) */
+void fastpy_exc_set_class_name(const char *name) {
+    fpy_exc_class_name = name;
+}
+
+/* Get the actual exception class name */
+const char* fastpy_exc_get_class_name(void) {
+    return fpy_exc_class_name;
 }
 
 /* Set the inner exception type for ExceptionGroup */
@@ -710,6 +792,48 @@ int fastpy_exc_name_to_id(const char *name) {
     return FPY_EXC_GENERIC;
 }
 
+/* ---- Exception class hierarchy registry ---- */
+#define FPY_MAX_EXC_CLASSES 64
+typedef struct {
+    const char *name;
+    const char *parent;  /* NULL for base Exception */
+} FpyExcClassEntry;
+static FpyExcClassEntry fpy_exc_classes[FPY_MAX_EXC_CLASSES];
+static int fpy_exc_class_count = 0;
+
+/* Register a user-defined exception class with its parent.
+ * Called at module init time for each class that inherits from Exception. */
+void fastpy_exc_register_class(const char *name, const char *parent) {
+    if (fpy_exc_class_count >= FPY_MAX_EXC_CLASSES) return;
+    fpy_exc_classes[fpy_exc_class_count].name = name;
+    fpy_exc_classes[fpy_exc_class_count].parent = parent;
+    fpy_exc_class_count++;
+}
+
+/* Check if raised_name matches handler_name via inheritance.
+ * Returns 1 if raised_name IS handler_name, or if raised_name inherits
+ * from handler_name through the registered class hierarchy. */
+int fastpy_exc_class_matches(const char *raised_name, const char *handler_name) {
+    /* Direct match */
+    if (strcmp(raised_name, handler_name) == 0) return 1;
+    /* Walk up the inheritance chain */
+    const char *current = raised_name;
+    for (int depth = 0; depth < FPY_MAX_EXC_CLASSES; depth++) {
+        /* Find the parent of current */
+        const char *parent = NULL;
+        for (int i = 0; i < fpy_exc_class_count; i++) {
+            if (strcmp(fpy_exc_classes[i].name, current) == 0) {
+                parent = fpy_exc_classes[i].parent;
+                break;
+            }
+        }
+        if (!parent) break;
+        if (strcmp(parent, handler_name) == 0) return 1;
+        current = parent;
+    }
+    return 0;
+}
+
 /* Print unhandled exception with traceback and exit */
 void fastpy_exc_unhandled(void) {
     if (fpy_exc_type == FPY_EXC_NONE) return;
@@ -718,8 +842,13 @@ void fastpy_exc_unhandled(void) {
         "IndexError", "KeyError", "RuntimeError", "StopIteration",
         "ExceptionGroup", "NameError", "OverflowError", "AttributeError"
     };
-    const char *name = (fpy_exc_type >= 1 && fpy_exc_type <= 11)
-        ? names[fpy_exc_type] : "Exception";
+    const char *name;
+    if (fpy_exc_class_name[0] != '\0') {
+        name = fpy_exc_class_name;
+    } else {
+        name = (fpy_exc_type >= 1 && fpy_exc_type <= 11)
+            ? names[fpy_exc_type] : "Exception";
+    }
     fpy_shadow_print_traceback();
     fprintf(stderr, "%s: %s\n", name, fpy_exc_msg);
     exit(1);
@@ -809,6 +938,7 @@ extern FpyList* fastpy_list_sorted(FpyList*);
 extern FpyList* fastpy_list_from_obj_iter(void*);
 extern FpyList* fastpy_list_reversed(FpyList*);
 extern void fastpy_list_reverse_prefix(FpyList*, int64_t);
+extern void fastpy_list_reverse(FpyList*);
 extern FpyList* fastpy_list_copy(FpyList*);
 extern void fastpy_list_clear(FpyList*);
 extern void fastpy_list_extend(FpyList*, FpyList*);
@@ -982,12 +1112,15 @@ static FpySymEntry fpy_jit_symbols[] = {
     SYM(fastpy_fv_print), SYM(fastpy_fv_write),
     SYM(fastpy_fv_repr), SYM(fastpy_fv_str), SYM(fastpy_fv_truthy), SYM(fastpy_fv_compare),
     SYM(fastpy_fv_len), SYM(fastpy_fv_iter_get), SYM(fastpy_fv_subscript), SYM(fastpy_fv_contains), SYM(fastpy_fv_binop),
-    SYM(fastpy_raise), SYM(fastpy_exc_pending), SYM(fastpy_exc_clear),
-    SYM(fastpy_exc_get_type), SYM(fastpy_exc_get_msg), SYM(fastpy_exc_name_to_id),
+    SYM(fastpy_raise), SYM(fastpy_raise_with_obj),
+    SYM(fastpy_exc_pending), SYM(fastpy_exc_clear),
+    SYM(fastpy_exc_get_type), SYM(fastpy_exc_get_msg), SYM(fastpy_exc_get_obj),
+    SYM(fastpy_exc_name_to_id), SYM(fastpy_exc_set_class_name), SYM(fastpy_exc_get_class_name),
+    SYM(fastpy_exc_register_class), SYM(fastpy_exc_class_matches),
     SYM(fastpy_list_new), SYM(fastpy_list_append_fv),
     SYM(fastpy_list_get_fv), SYM(fastpy_list_set_fv),
     SYM(fastpy_list_length), SYM(fastpy_list_sorted), SYM(fastpy_list_from_obj_iter), SYM(fastpy_list_reversed),
-    SYM(fastpy_list_reverse_prefix),
+    SYM(fastpy_list_reverse_prefix), SYM(fastpy_list_reverse),
     SYM(fastpy_list_copy), SYM(fastpy_list_clear),
     SYM(fastpy_list_extend), SYM(fastpy_list_sort), SYM(fastpy_list_concat),
     SYM(fastpy_dict_new), SYM(fastpy_dict_set_fv), SYM(fastpy_dict_get_fv), SYM(fastpy_dict_get_fv_safe),
@@ -1123,14 +1256,17 @@ int main(int argc, char *argv[]) {
     extern void fpy_cpython_flush(void);
     fpy_cpython_flush();
     fflush(stdout);
-    /* Finalize CPython interpreter before process exit.  Without this,
-     * Py_FinalizeEx() runs during CRT atexit cleanup, which can race
-     * with the Windows heap manager if fastpy objects holding PyObject*
-     * references have already been freed by fpy_gc_finalize() above.
-     * Calling it explicitly here, after GC and flush, ensures Python's
-     * internal state is torn down cleanly while the heap is consistent. */
-    extern void fpy_cpython_fini(void);
-    fpy_cpython_fini();
+    /* Skip Py_FinalizeEx().  The GC finalize above may have freed fastpy
+     * objects that still hold raw PyObject* references (OBJ-tagged FpyValues
+     * storing real CPython pointers).  Calling Py_FinalizeEx() after that
+     * can trigger heap corruption on Windows (STATUS_HEAP_CORRUPTION /
+     * 0xC0000374) because Python's internal bookkeeping finds dangling or
+     * double-freed objects.  Since we're about to exit anyway, let the OS
+     * reclaim all process memory — this is safe and avoids the ordering
+     * problem entirely.  Python's atexit handlers that flush I/O are
+     * covered by fpy_cpython_flush() above. */
+    /* extern void fpy_cpython_fini(void); */
+    /* fpy_cpython_fini(); */
     if (fastpy_exc_pending()) {
         const char *name = "Exception";
         switch (fpy_exc_type) {

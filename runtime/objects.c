@@ -35,6 +35,10 @@ extern int64_t fastpy_str_len(const char *);
 #define FPY_EXC_INDEXERROR     4
 #define FPY_EXC_KEYERROR       5
 #define FPY_EXC_ATTRIBUTEERROR 11
+#define FPY_EXC_STOPITERATION  7
+
+/* External: return-tag side channel (defined in runtime.c) */
+extern void fastpy_set_ret_tag(int32_t tag);
 
 /* Thread-local buffer for formatted error messages. Only one exception
  * can be pending per thread, so a single buffer is safe. */
@@ -590,8 +594,68 @@ const char* fastpy_fv_str(int32_t tag, int64_t data) {
 
 /* FpyValue comparison — op: 0=eq, 1=ne, 2=lt, 3=le, 4=gt, 5=ge.
  * Returns 1 if the comparison is true, 0 otherwise. */
+static const char *_fpy_tag_typename(int32_t tag) {
+    switch (tag) {
+        case FPY_TAG_INT:   return "int";
+        case FPY_TAG_FLOAT: return "float";
+        case FPY_TAG_STR:   return "str";
+        case FPY_TAG_BOOL:  return "bool";
+        case FPY_TAG_NONE:  return "NoneType";
+        case FPY_TAG_LIST:  return "list";
+        case FPY_TAG_OBJ:   return "object";
+        case FPY_TAG_DICT:  return "dict";
+        case FPY_TAG_BYTES: return "bytes";
+        case FPY_TAG_SET:   return "set";
+        case FPY_TAG_BIGINT: return "int";
+        case FPY_TAG_COMPLEX: return "complex";
+        case FPY_TAG_DECIMAL: return "Decimal";
+        default: return "object";
+    }
+}
+
+/* Check if two tags are compatible for ordering comparisons.
+ * Compatible pairs: INT/BOOL (integer subtypes), and any + FLOAT
+ * (promoted to float comparison). Everything else is incompatible. */
+static int _fpy_tags_order_compatible(int32_t tag1, int32_t tag2) {
+    if (tag1 == tag2) return 1;
+    /* INT and BOOL are interchangeable for ordering */
+    if ((tag1 == FPY_TAG_INT || tag1 == FPY_TAG_BOOL) &&
+        (tag2 == FPY_TAG_INT || tag2 == FPY_TAG_BOOL)) return 1;
+    /* FLOAT compares with INT/BOOL */
+    if (tag1 == FPY_TAG_FLOAT &&
+        (tag2 == FPY_TAG_INT || tag2 == FPY_TAG_BOOL)) return 1;
+    if (tag2 == FPY_TAG_FLOAT &&
+        (tag1 == FPY_TAG_INT || tag1 == FPY_TAG_BOOL)) return 1;
+    /* BIGINT with INT/BOOL */
+    if (tag1 == FPY_TAG_BIGINT &&
+        (tag2 == FPY_TAG_INT || tag2 == FPY_TAG_BOOL)) return 1;
+    if (tag2 == FPY_TAG_BIGINT &&
+        (tag1 == FPY_TAG_INT || tag1 == FPY_TAG_BOOL)) return 1;
+    return 0;
+}
+
 int32_t fastpy_fv_compare(int32_t tag1, int64_t data1,
                            int32_t tag2, int64_t data2, int32_t op) {
+    /* Cross-type check: for ordering ops (< <= > >=), incompatible
+     * types must raise TypeError just like CPython.  Equality (== !=)
+     * between different types always returns False/True. */
+    if (tag1 != tag2) {
+        int is_ordering = (op >= 2);  /* 2=Lt 3=LtE 4=Gt 5=GtE */
+        if (is_ordering && !_fpy_tags_order_compatible(tag1, tag2)) {
+            static char _cmp_err[256];
+            const char *ops[] = {"==","!=","<","<=",">",">="};
+            snprintf(_cmp_err, sizeof(_cmp_err),
+                     "'%s' not supported between instances of '%s' and '%s'",
+                     ops[op], _fpy_tag_typename(tag1), _fpy_tag_typename(tag2));
+            fastpy_raise(FPY_EXC_TYPEERROR, _cmp_err);
+            return 0;
+        }
+        /* Equality between incompatible types → always unequal */
+        if (!is_ordering && !_fpy_tags_order_compatible(tag1, tag2)) {
+            return (op == 1);  /* NotEq → 1, Eq → 0 */
+        }
+    }
+
     /* String comparison: both are STR → use strcmp */
     if (tag1 == FPY_TAG_STR && tag2 == FPY_TAG_STR) {
         const char *s1 = (const char*)(intptr_t)data1;
@@ -2542,23 +2606,30 @@ void fastpy_closure_set_capture(FpyClosure *c, int index, int64_t value) {
 int64_t fastpy_closure_call1(FpyClosure *c, int64_t a);
 int64_t fastpy_closure_call2(FpyClosure *c, int64_t a, int64_t b);
 
-/* Helper: pack N i64 args into an FpyList for *args closures */
+/* Helper: pack N i64 args into an FpyList for *args closures.
+ * Uses the arg tag side-channel (fpy_arg_tags) to preserve the
+ * runtime type of each argument, so forwarding patterns like
+ * func(*args) in decorators don't lose type information. */
 static FpyList* _pack_args0(void) {
     FpyList *lst = fpy_list_new(0);
     lst->is_tuple = 1;
     return lst;
 }
+extern int32_t fastpy_get_arg_tag(int32_t);
 static FpyList* _pack_args1(int64_t a) {
     FpyList *lst = fpy_list_new(1);
     lst->is_tuple = 1;
-    fpy_list_append(lst, fpy_int(a));
+    FpyValue fv = {.tag = fastpy_get_arg_tag(0), .data = {.i = a}};
+    fpy_list_append(lst, fv);
     return lst;
 }
 static FpyList* _pack_args2(int64_t a, int64_t b) {
     FpyList *lst = fpy_list_new(2);
     lst->is_tuple = 1;
-    fpy_list_append(lst, fpy_int(a));
-    fpy_list_append(lst, fpy_int(b));
+    FpyValue fva = {.tag = fastpy_get_arg_tag(0), .data = {.i = a}};
+    FpyValue fvb = {.tag = fastpy_get_arg_tag(1), .data = {.i = b}};
+    fpy_list_append(lst, fva);
+    fpy_list_append(lst, fvb);
     return lst;
 }
 
@@ -2686,8 +2757,13 @@ int64_t fastpy_closure_call_list(void *closure, void *args_list) {
     if (!fpy_is_closure(closure)) {
         int64_t n = args ? args->length : 0;
         int64_t a[8] = {0};
-        for (int64_t i = 0; i < n && i < 8; i++)
+        /* Store arg tags in the side-channel so i64 wrappers (for FV-ABI
+         * functions) can reconstruct FpyValues with correct runtime tags. */
+        extern void fastpy_set_arg_tag(int32_t, int32_t);
+        for (int64_t i = 0; i < n && i < 8; i++) {
             a[i] = args->items[i].data.i;
+            fastpy_set_arg_tag((int32_t)i, args->items[i].tag);
+        }
         typedef int64_t (*fn0_t)(void);
         typedef int64_t (*fn1_t)(int64_t);
         typedef int64_t (*fn2_t)(int64_t, int64_t);
@@ -2965,6 +3041,39 @@ void fastpy_dict_delete(FpyDict *dict, const char *key) {
     return;
 }
 
+void fastpy_dict_delete_int(FpyDict *dict, int64_t key) {
+    FPY_LOCK(dict);
+    uint64_t h = fpy_hash_int(key);
+    int64_t mask = dict->table_size - 1;
+    int64_t slot = (int64_t)(h & (uint64_t)mask);
+
+    while (1) {
+        int64_t idx = dict->indices[slot];
+        if (idx == FPY_DICT_EMPTY) break;
+        if (idx != FPY_DICT_DELETED
+            && dict->keys[idx].tag == FPY_TAG_INT
+            && dict->keys[idx].data.i == key) {
+            FPY_VAL_DECREF(dict->keys[idx]);
+            FPY_VAL_DECREF(dict->values[idx]);
+            dict->indices[slot] = FPY_DICT_DELETED;
+            for (int64_t j = idx; j < dict->length - 1; j++) {
+                dict->keys[j] = dict->keys[j + 1];
+                dict->values[j] = dict->values[j + 1];
+            }
+            dict->length--;
+            fpy_dict_rebuild_indices(dict);
+            FPY_UNLOCK(dict);
+            return;
+        }
+        slot = (slot + 1) & mask;
+    }
+    FPY_UNLOCK(dict);
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%lld", (long long)key);
+    fastpy_raise(FPY_EXC_KEYERROR, buf);
+    return;
+}
+
 void fastpy_list_remove(FpyList *list, int64_t value) {
     /* Remove first occurrence of value; if not found, raise ValueError (for int tag) */
     FPY_LOCK(list);
@@ -3174,6 +3283,76 @@ void fastpy_dict_pop_fv(FpyDict *dict, const char *key,
     *out_data = def_data;
 }
 
+/* dict.pop(key) with generic key type — no default, raises KeyError on miss */
+void fastpy_dict_pop_nodefault_generic(FpyDict *dict,
+                                        int32_t key_tag, int64_t key_data,
+                                        int32_t *out_tag, int64_t *out_data) {
+    FPY_LOCK(dict);
+    FpyValue k; k.tag = key_tag; k.data.i = key_data;
+    uint64_t h = fpy_hash_value(k);
+    int64_t mask = dict->table_size - 1;
+    int64_t slot = (int64_t)(h & (uint64_t)mask);
+    while (1) {
+        int64_t idx = dict->indices[slot];
+        if (idx == FPY_DICT_EMPTY) break;
+        if (idx != FPY_DICT_DELETED && fpy_key_equal(dict->keys[idx], k)) {
+            FpyValue v = dict->values[idx];
+            *out_tag = v.tag;
+            *out_data = v.data.i;
+            FPY_VAL_DECREF(dict->keys[idx]);
+            dict->indices[slot] = FPY_DICT_DELETED;
+            for (int64_t j = idx; j < dict->length - 1; j++) {
+                dict->keys[j] = dict->keys[j + 1];
+                dict->values[j] = dict->values[j + 1];
+            }
+            dict->length--;
+            fpy_dict_rebuild_indices(dict);
+            FPY_UNLOCK(dict);
+            return;
+        }
+        slot = (slot + 1) & mask;
+    }
+    FPY_UNLOCK(dict);
+    fastpy_raise(FPY_EXC_KEYERROR, "key not found");
+    *out_tag = FPY_TAG_NONE;
+    *out_data = 0;
+}
+
+/* dict.pop(key, default) with generic key type */
+void fastpy_dict_pop_generic(FpyDict *dict,
+                              int32_t key_tag, int64_t key_data,
+                              int32_t def_tag, int64_t def_data,
+                              int32_t *out_tag, int64_t *out_data) {
+    FPY_LOCK(dict);
+    FpyValue k; k.tag = key_tag; k.data.i = key_data;
+    uint64_t h = fpy_hash_value(k);
+    int64_t mask = dict->table_size - 1;
+    int64_t slot = (int64_t)(h & (uint64_t)mask);
+    while (1) {
+        int64_t idx = dict->indices[slot];
+        if (idx == FPY_DICT_EMPTY) break;
+        if (idx != FPY_DICT_DELETED && fpy_key_equal(dict->keys[idx], k)) {
+            FpyValue v = dict->values[idx];
+            *out_tag = v.tag;
+            *out_data = v.data.i;
+            FPY_VAL_DECREF(dict->keys[idx]);
+            dict->indices[slot] = FPY_DICT_DELETED;
+            for (int64_t j = idx; j < dict->length - 1; j++) {
+                dict->keys[j] = dict->keys[j + 1];
+                dict->values[j] = dict->values[j + 1];
+            }
+            dict->length--;
+            fpy_dict_rebuild_indices(dict);
+            FPY_UNLOCK(dict);
+            return;
+        }
+        slot = (slot + 1) & mask;
+    }
+    FPY_UNLOCK(dict);
+    *out_tag = def_tag;
+    *out_data = def_data;
+}
+
 void fastpy_dict_setdefault_list(FpyDict *dict, const char *key, FpyList *default_val) {
     if (fastpy_dict_has_key(dict, key)) return;
     fpy_dict_set(dict, fpy_str(key), fpy_list(default_val));
@@ -3211,6 +3390,34 @@ void fastpy_dict_setdefault_fv(FpyDict *dict, const char *key,
     /* Key not found — insert default and return it */
     FpyValue v; v.tag = def_tag; v.data.i = def_data;
     fpy_dict_set(dict, fpy_str(key), v);
+    *out_tag = def_tag;
+    *out_data = def_data;
+}
+
+/* dict.setdefault(key, default) → value with generic key type.
+ * Accepts tag+data for the key so it handles int, str, bool, tuple, etc. */
+void fastpy_dict_setdefault_generic(FpyDict *dict,
+                                     int32_t key_tag, int64_t key_data,
+                                     int32_t def_tag, int64_t def_data,
+                                     int32_t *out_tag, int64_t *out_data) {
+    FpyValue key; key.tag = key_tag; key.data.i = key_data;
+    uint64_t h = fpy_hash_value(key);
+    int64_t mask = dict->table_size - 1;
+    int64_t slot = (int64_t)(h & (uint64_t)mask);
+    while (1) {
+        int64_t idx = dict->indices[slot];
+        if (idx == FPY_DICT_EMPTY) break;
+        if (idx != FPY_DICT_DELETED && fpy_key_equal(dict->keys[idx], key)) {
+            /* Key found — return existing value */
+            *out_tag = dict->values[idx].tag;
+            *out_data = dict->values[idx].data.i;
+            return;
+        }
+        slot = (slot + 1) & mask;
+    }
+    /* Key not found — insert default and return it */
+    FpyValue v; v.tag = def_tag; v.data.i = def_data;
+    fpy_dict_set(dict, key, v);
     *out_tag = def_tag;
     *out_data = def_data;
 }
@@ -4955,6 +5162,80 @@ void fastpy_list_slice_assign(FpyList *list, int64_t start, int64_t stop,
     FPY_UNLOCK(list);
 }
 
+/* Extended-slice assignment: list[start:stop:step] = new_values.
+ * CPython requires len(new_values) == len(selected_indices), raises
+ * ValueError otherwise.  Unlike contiguous slice assignment, extended
+ * slices cannot change the list length. */
+void fastpy_list_slice_step_assign(FpyList *list, int64_t start, int64_t stop,
+                                    int64_t step, int64_t has_start,
+                                    int64_t has_stop, FpyList *new_values) {
+    FPY_LOCK(list);
+    int64_t len = list->length;
+
+    if (step == 0) {
+        FPY_UNLOCK(list);
+        fastpy_raise(FPY_EXC_VALUEERROR, "slice step cannot be zero");
+        return;
+    }
+
+    /* Normalize start/stop like CPython */
+    if (step > 0) {
+        if (!has_start) start = 0;
+        if (!has_stop) stop = len;
+    } else {
+        if (!has_start) start = len - 1;
+        if (!has_stop) stop = -len - 1;
+    }
+    if (start < 0) start += len;
+    if (stop < 0) stop += len;
+    if (start < 0) start = 0;
+    if (start > len) start = len;
+    if (stop < -1) stop = -1;
+    if (stop > len) stop = len;
+
+    /* Count how many indices the slice selects */
+    int64_t slice_len = 0;
+    if (step > 0) {
+        for (int64_t i = start; i < stop; i += step) slice_len++;
+    } else {
+        for (int64_t i = start; i > stop; i += step)
+            if (i >= 0 && i < len) slice_len++;
+    }
+
+    /* CPython: extended slice assignment requires exact size match */
+    if (new_values->length != slice_len) {
+        FPY_UNLOCK(list);
+        char *msg = (char*)malloc(128);
+        snprintf(msg, 128,
+                 "attempt to assign sequence of size %lld "
+                 "to extended slice of size %lld",
+                 (long long)new_values->length, (long long)slice_len);
+        fastpy_raise(FPY_EXC_VALUEERROR, msg);
+        return;
+    }
+
+    /* Assign values to the selected indices */
+    int64_t vi = 0;
+    if (step > 0) {
+        for (int64_t i = start; i < stop && vi < new_values->length; i += step) {
+            FPY_VAL_DECREF(list->items[i]);
+            FPY_VAL_INCREF(new_values->items[vi]);
+            list->items[i] = new_values->items[vi];
+            vi++;
+        }
+    } else {
+        for (int64_t i = start; i > stop && vi < new_values->length; i += step) {
+            if (i >= 0 && i < len) {
+                FPY_VAL_DECREF(list->items[i]);
+                FPY_VAL_INCREF(new_values->items[vi]);
+                list->items[i] = new_values->items[vi];
+                vi++;
+            }
+        }
+    }
+    FPY_UNLOCK(list);
+}
+
 /* Set discard — remove element if present, no error if absent */
 void fastpy_set_discard(FpyList *set, int64_t value) {
     for (int64_t i = 0; i < set->length; i++) {
@@ -5419,6 +5700,50 @@ void fastpy_list_sort_by_key_int(FpyList *lst, void *key_fn, int reverse) {
     FPY_UNLOCK(lst);
 }
 
+/* In-place sort by key function returning string: key values compared
+   with strcmp. The key_fn returns a char* (as int64_t). */
+void fastpy_list_sort_by_key_str(FpyList *lst, void *key_fn, int reverse) {
+    typedef int64_t (*keyfn_t)(int64_t);
+    keyfn_t fn = (keyfn_t)key_fn;
+    int64_t n = lst->length;
+    if (n <= 1) return;
+    FPY_LOCK(lst);
+    const char **keys = (const char**)malloc(sizeof(const char*) * n);
+    int64_t *order = (int64_t*)malloc(sizeof(int64_t) * n);
+    for (int64_t i = 0; i < n; i++) {
+        order[i] = i;
+        keys[i] = (const char*)(intptr_t)fn(lst->items[i].data.i);
+    }
+    /* Stable insertion sort on order by strcmp */
+    for (int64_t i = 1; i < n; i++) {
+        int64_t cur = order[i];
+        const char *cur_key = keys[cur];
+        int64_t j = i - 1;
+        if (reverse) {
+            while (j >= 0 && strcmp(keys[order[j]], cur_key) < 0) {
+                order[j + 1] = order[j];
+                j--;
+            }
+        } else {
+            while (j >= 0 && strcmp(keys[order[j]], cur_key) > 0) {
+                order[j + 1] = order[j];
+                j--;
+            }
+        }
+        order[j + 1] = cur;
+    }
+    /* Rearrange items in-place using temporary copy */
+    FpyValue *tmp = (FpyValue*)malloc(sizeof(FpyValue) * n);
+    for (int64_t i = 0; i < n; i++) {
+        tmp[i] = lst->items[order[i]];
+    }
+    memcpy(lst->items, tmp, sizeof(FpyValue) * n);
+    free(tmp);
+    free(keys);
+    free(order);
+    FPY_UNLOCK(lst);
+}
+
 /* List sorted by key function: key_fn is a function pointer int64_t(int64_t) */
 FpyList* fastpy_list_sorted_by_key_int(FpyList *lst, void *key_fn) {
     typedef int64_t (*keyfn_t)(int64_t);
@@ -5428,9 +5753,12 @@ FpyList* fastpy_list_sorted_by_key_int(FpyList *lst, void *key_fn) {
     /* Copy elements and compute keys */
     int64_t *keys = (int64_t*)malloc(sizeof(int64_t) * n);
     int64_t *order = (int64_t*)malloc(sizeof(int64_t) * n);
+    extern void fastpy_set_arg_tag(int32_t, int32_t);
     for (int64_t i = 0; i < n; i++) {
         order[i] = i;
-        /* Pass element data (int value or pointer-as-int) to key function */
+        /* Set the arg tag side-channel so FV-ABI shims can reconstruct
+         * the correct FpyValue type (e.g., LIST tag for tuple elements). */
+        fastpy_set_arg_tag(0, lst->items[i].tag);
         keys[i] = fn(lst->items[i].data.i);
     }
     /* Simple insertion sort on order by keys (stable) */
@@ -5462,8 +5790,10 @@ FpyList* fastpy_list_sorted_by_key_str(FpyList *lst, void *key_fn) {
     FpyList *result = fpy_list_new(n);
     const char **keys = (const char**)malloc(sizeof(const char*) * n);
     int64_t *order = (int64_t*)malloc(sizeof(int64_t) * n);
+    extern void fastpy_set_arg_tag(int32_t, int32_t);
     for (int64_t i = 0; i < n; i++) {
         order[i] = i;
+        fastpy_set_arg_tag(0, lst->items[i].tag);
         keys[i] = (const char*)(intptr_t)fn(lst->items[i].data.i);
     }
     /* Stable insertion sort by strcmp */
@@ -5472,6 +5802,42 @@ FpyList* fastpy_list_sorted_by_key_str(FpyList *lst, void *key_fn) {
         const char *cur_key = keys[cur];
         int64_t j = i - 1;
         while (j >= 0 && strcmp(keys[order[j]], cur_key) > 0) {
+            order[j + 1] = order[j];
+            j--;
+        }
+        order[j + 1] = cur;
+    }
+    for (int64_t i = 0; i < n; i++) {
+        fpy_list_append(result, lst->items[order[i]]);
+    }
+    free(keys);
+    free(order);
+    return result;
+}
+
+/* List sorted by key function returning tuple/list: key values are
+   compared lexicographically via fastpy_list_compare. The key_fn
+   returns a FpyList* (as int64_t). */
+FpyList* fastpy_list_sorted_by_key_tuple(FpyList *lst, void *key_fn) {
+    typedef int64_t (*keyfn_t)(int64_t);
+    keyfn_t fn = (keyfn_t)key_fn;
+    int64_t n = lst->length;
+    FpyList *result = fpy_list_new(n);
+    FpyList **keys = (FpyList**)malloc(sizeof(FpyList*) * n);
+    int64_t *order = (int64_t*)malloc(sizeof(int64_t) * n);
+    extern void fastpy_set_arg_tag(int32_t, int32_t);
+    for (int64_t i = 0; i < n; i++) {
+        order[i] = i;
+        fastpy_set_arg_tag(0, lst->items[i].tag);
+        keys[i] = (FpyList*)(intptr_t)fn(lst->items[i].data.i);
+    }
+    /* Stable insertion sort by lexicographic comparison */
+    extern int64_t fastpy_list_compare(FpyList*, FpyList*);
+    for (int64_t i = 1; i < n; i++) {
+        int64_t cur = order[i];
+        FpyList *cur_key = keys[cur];
+        int64_t j = i - 1;
+        while (j >= 0 && fastpy_list_compare(keys[order[j]], cur_key) > 0) {
             order[j + 1] = order[j];
             j--;
         }
@@ -5842,6 +6208,25 @@ void fastpy_register_method(int class_id, const char *name, void *func,
     m->arg_count = arg_count;
     m->returns_value = returns_value;
     m->return_tag = -1;  /* unknown until set */
+    m->is_vararg = 0;
+    m->n_positional = arg_count;
+}
+
+/* Mark a method as accepting *args.  n_positional is the number of regular
+ * positional parameters (excluding self) before the *args parameter.
+ * The method's LLVM function receives those positionals as i64, followed
+ * by a single i8* (FpyList*) containing the collected *args. */
+void fastpy_set_method_vararg(int class_id, const char *name,
+                              int n_positional) {
+    FpyClassDef *cls = &fpy_classes[class_id];
+    for (int i = 0; i < cls->method_count; i++) {
+        if (cls->methods[i].name == name
+                || strcmp(cls->methods[i].name, name) == 0) {
+            cls->methods[i].is_vararg = 1;
+            cls->methods[i].n_positional = n_positional;
+            return;
+        }
+    }
 }
 
 /* Set the return type tag for a method (called after register_method) */
@@ -5880,13 +6265,20 @@ void fastpy_obj_call_method1_fv(FpyObj *obj, const char *name, int64_t a,
         *out_data = 0;
         return;
     }
-    int64_t result = ((FpyMethod1Func)m->func)(obj, a);
-    if (m->return_tag >= 0) {
-        *out_tag = m->return_tag;
+    if (m->return_tag == FPY_TAG_FLOAT) {
+        typedef double (*FpyM1DoubleFunc)(FpyObj*, int64_t);
+        double d = ((FpyM1DoubleFunc)m->func)(obj, a);
+        *out_tag = FPY_TAG_FLOAT;
+        memcpy(out_data, &d, sizeof(double));
     } else {
-        *out_tag = FPY_TAG_INT;  /* fallback: raw i64 as int */
+        int64_t result = ((FpyMethod1Func)m->func)(obj, a);
+        if (m->return_tag >= 0) {
+            *out_tag = m->return_tag;
+        } else {
+            *out_tag = FPY_TAG_INT;  /* fallback: raw i64 as int */
+        }
+        *out_data = result;
     }
-    *out_data = result;
 }
 
 /* Native type.__new__ equivalent: create a class from a namespace dict.
@@ -6222,7 +6614,57 @@ void fastpy_obj_get_fv(FpyObj *obj, const char *name, int32_t *out_tag, int64_t 
 
 /* Get attribute as string representation (works for any type).
  * Still used by the f-string path for `{self.attr}` expansion. */
-/* Call a method on an object — returns i64 */
+/* ---- Vararg method helpers ----
+ * When a method is registered as vararg, obj_call_methodN packs the
+ * extra arguments (those beyond the positional count) into a FpyList
+ * and passes the list pointer as the final parameter.
+ *
+ * Signature of a vararg method with P positional params:
+ *   int64_t method(FpyObj *self, i64 p0, ..., i64 p_{P-1}, FpyList *args)
+ *
+ * When P == 0:  int64_t method(FpyObj *self, FpyList *args)
+ */
+extern int32_t fastpy_get_arg_tag(int32_t index);
+
+static int64_t _call_vararg_method(FpyMethodDef *m, FpyObj *obj,
+                                   int n_call_args, int64_t *args) {
+    int n_pos = m->n_positional;  /* positional params before *args */
+    /* Build the *args list from extra arguments */
+    FpyList *varlist = fastpy_list_new();
+    for (int i = n_pos; i < n_call_args; i++) {
+        int32_t tag = fastpy_get_arg_tag(i);
+        fastpy_list_append_fv(varlist, tag, args[i]);
+    }
+    int64_t list_as_i64 = (int64_t)(intptr_t)varlist;
+    /* Dispatch based on positional count */
+    switch (n_pos) {
+    case 0: {
+        typedef int64_t (*VA0)(FpyObj*, int64_t);
+        return ((VA0)m->func)(obj, list_as_i64);
+    }
+    case 1: {
+        typedef int64_t (*VA1)(FpyObj*, int64_t, int64_t);
+        return ((VA1)m->func)(obj, args[0], list_as_i64);
+    }
+    case 2: {
+        typedef int64_t (*VA2)(FpyObj*, int64_t, int64_t, int64_t);
+        return ((VA2)m->func)(obj, args[0], args[1], list_as_i64);
+    }
+    case 3: {
+        typedef int64_t (*VA3)(FpyObj*, int64_t, int64_t, int64_t, int64_t);
+        return ((VA3)m->func)(obj, args[0], args[1], args[2], list_as_i64);
+    }
+    default: {
+        /* Fallback: 4+ positional not expected but handle it */
+        typedef int64_t (*VA4)(FpyObj*, int64_t, int64_t, int64_t, int64_t, int64_t);
+        return ((VA4)m->func)(obj, args[0], args[1], args[2], args[3], list_as_i64);
+    }
+    }
+}
+
+/* Call a method on an object — returns i64.
+ * If the method returns double (return_tag == FPY_TAG_FLOAT), uses the
+ * correct calling convention (reads XMM0) and bitcasts to i64. */
 int64_t fastpy_obj_call_method0(FpyObj *obj, const char *name) {
     FpyMethodDef *m = fastpy_find_method(obj->class_id, name);
     if (!m) {
@@ -6230,6 +6672,16 @@ int64_t fastpy_obj_call_method0(FpyObj *obj, const char *name) {
                  fpy_classes[obj->class_id].name, name);
         fastpy_raise(FPY_EXC_ATTRIBUTEERROR, _err_buf);
         return 0;
+    }
+    if (m->is_vararg) {
+        return _call_vararg_method(m, obj, 0, NULL);
+    }
+    if (m->return_tag == FPY_TAG_FLOAT) {
+        typedef double (*FpyM0DoubleFunc)(FpyObj*);
+        double d = ((FpyM0DoubleFunc)m->func)(obj);
+        int64_t r;
+        memcpy(&r, &d, sizeof(double));
+        return r;
     }
     return ((FpyMethodFunc)m->func)(obj);
 }
@@ -6250,6 +6702,17 @@ int64_t fastpy_obj_call_method1(FpyObj *obj, const char *name, int64_t a) {
         fastpy_raise(FPY_EXC_ATTRIBUTEERROR, _err_buf);
         return 0;
     }
+    if (m->is_vararg) {
+        int64_t args_arr[1] = {a};
+        return _call_vararg_method(m, obj, 1, args_arr);
+    }
+    if (m->return_tag == FPY_TAG_FLOAT) {
+        typedef double (*FpyM1DoubleFunc)(FpyObj*, int64_t);
+        double d = ((FpyM1DoubleFunc)m->func)(obj, a);
+        int64_t r;
+        memcpy(&r, &d, sizeof(double));
+        return r;
+    }
     return ((FpyMethod1Func)m->func)(obj, a);
 }
 
@@ -6260,6 +6723,10 @@ int64_t fastpy_obj_call_method2(FpyObj *obj, const char *name, int64_t a, int64_
                  fpy_classes[obj->class_id].name, name);
         fastpy_raise(FPY_EXC_ATTRIBUTEERROR, _err_buf);
         return 0;
+    }
+    if (m->is_vararg) {
+        int64_t args_arr[2] = {a, b};
+        return _call_vararg_method(m, obj, 2, args_arr);
     }
     return ((FpyMethod2Func)m->func)(obj, a, b);
 }
@@ -6272,6 +6739,10 @@ int64_t fastpy_obj_call_method3(FpyObj *obj, const char *name, int64_t a, int64_
         fastpy_raise(FPY_EXC_ATTRIBUTEERROR, _err_buf);
         return 0;
     }
+    if (m->is_vararg) {
+        int64_t args_arr[3] = {a, b, c};
+        return _call_vararg_method(m, obj, 3, args_arr);
+    }
     return ((FpyMethod3Func)m->func)(obj, a, b, c);
 }
 
@@ -6282,6 +6753,10 @@ int64_t fastpy_obj_call_method4(FpyObj *obj, const char *name, int64_t a, int64_
                  fpy_classes[obj->class_id].name, name);
         fastpy_raise(FPY_EXC_ATTRIBUTEERROR, _err_buf);
         return 0;
+    }
+    if (m->is_vararg) {
+        int64_t args_arr[4] = {a, b, c, d};
+        return _call_vararg_method(m, obj, 4, args_arr);
     }
     return ((FpyMethod4Func)m->func)(obj, a, b, c, d);
 }
@@ -6310,6 +6785,74 @@ double fastpy_obj_call_method1_double(FpyObj *obj, const char *name, int64_t a) 
         return 0.0;
     }
     return ((FpyMethodDouble1Func)m->func)(obj, a);
+}
+
+/* ================================================================
+ * Built-in list/tuple iterator
+ *
+ * iter() on a list or tuple creates a lightweight FpyObj wrapping the
+ * list pointer and a current-index counter.  The __next__ method reads
+ * list->items[idx], increments idx, and raises StopIteration when done.
+ * The class is lazily registered on first use.
+ *
+ * Slot layout:
+ *   slot 0 = list pointer (FPY_TAG_LIST)
+ *   slot 1 = current index (FPY_TAG_INT)
+ * ================================================================ */
+static int fpy_listiter_class_id = -1;
+
+/* Forward declare — full definition below. */
+static int64_t fpy_listiter_next(FpyObj *self);
+static int64_t fpy_listiter_iter(FpyObj *self);
+
+static void fpy_listiter_ensure_class(void) {
+    if (fpy_listiter_class_id >= 0) return;
+    fpy_listiter_class_id = fastpy_register_class("list_iterator", -1);
+    fastpy_set_class_slot_count(fpy_listiter_class_id, 2);
+    fastpy_register_slot_name(fpy_listiter_class_id, 0, "_list");
+    fastpy_register_slot_name(fpy_listiter_class_id, 1, "_index");
+    /* __next__: 0 extra args (self only), returns value, dynamic tag */
+    fastpy_register_method(fpy_listiter_class_id, "__next__",
+                           (void*)fpy_listiter_next, 0, 1);
+    fastpy_set_method_ret_tag(fpy_listiter_class_id, "__next__", -1);
+    /* __iter__: returns self (OBJ tag) */
+    fastpy_register_method(fpy_listiter_class_id, "__iter__",
+                           (void*)fpy_listiter_iter, 0, 1);
+    fastpy_set_method_ret_tag(fpy_listiter_class_id, "__iter__", FPY_TAG_OBJ);
+}
+
+static int64_t fpy_listiter_next(FpyObj *self) {
+    FpyValue *slots = FPY_OBJ_SLOTS(self);
+    FpyList *list = slots[0].data.list;
+    int64_t idx = slots[1].data.i;
+    if (!list || idx >= list->length) {
+        fastpy_raise(FPY_EXC_STOPITERATION, "");
+        fastpy_set_ret_tag(FPY_TAG_NONE);
+        return 0;
+    }
+    FpyValue elem = list->items[idx];
+    slots[1].data.i = idx + 1;
+    fastpy_set_ret_tag(elem.tag);
+    return elem.data.i;
+}
+
+static int64_t fpy_listiter_iter(FpyObj *self) {
+    fpy_incref(&self->refcount);
+    fastpy_set_ret_tag(FPY_TAG_OBJ);
+    return (int64_t)(intptr_t)self;
+}
+
+/* Public: create a list iterator wrapping `list`.  Increfs the list. */
+FpyObj* fastpy_list_iter_new(FpyList *list) {
+    fpy_listiter_ensure_class();
+    FpyObj *obj = fastpy_obj_new(fpy_listiter_class_id);
+    FpyValue *slots = FPY_OBJ_SLOTS(obj);
+    slots[0].tag = FPY_TAG_LIST;
+    slots[0].data.list = list;
+    fpy_rc_incref(FPY_TAG_LIST, (int64_t)(intptr_t)list);
+    slots[1].tag = FPY_TAG_INT;
+    slots[1].data.i = 0;
+    return obj;
 }
 
 /* Call __init__ (void return) */
@@ -6389,6 +6932,18 @@ const char* fastpy_obj_to_str(FpyObj *obj) {
     if (m) {
         int64_t result = ((FpyMethodFunc)m->func)(obj);
         return (const char*)result;
+    }
+    /* Exception objects: check for __exc_msg__ stored by raise_with_obj.
+     * This gives str(e) the same behavior as Python's Exception.__str__. */
+    if (obj->dynamic_attrs) {
+        FpyObjAttrs *a = obj->dynamic_attrs;
+        for (int i = 0; i < a->count; i++) {
+            if (strcmp(a->names[i], "__exc_msg__") == 0
+                    && a->values[i].tag == FPY_TAG_STR
+                    && a->values[i].data.i != 0) {
+                return (const char*)a->values[i].data.i;
+            }
+        }
     }
     /* Default: <ClassName object> */
     char *buf = (char*)malloc(256);
@@ -7186,6 +7741,123 @@ FpyList* fastpy_counter_elements(FpyDict *counter) {
         int64_t count = counter->values[i].data.i;
         for (int64_t j = 0; j < count; j++) {
             fpy_list_append(result, counter->keys[i]);
+        }
+    }
+    return result;
+}
+
+/* Helper: find the index (in keys[]/values[]) of a key, or -1 if absent. */
+static int64_t fpy_dict_find_index(FpyDict *dict, FpyValue key) {
+    uint64_t h = fpy_hash_value(key);
+    int64_t mask = dict->table_size - 1;
+    int64_t slot = (int64_t)(h & (uint64_t)mask);
+    while (1) {
+        int64_t idx = dict->indices[slot];
+        if (idx == FPY_DICT_EMPTY) return -1;
+        if (idx != FPY_DICT_DELETED && fpy_key_equal(dict->keys[idx], key))
+            return idx;
+        slot = (slot + 1) & mask;
+    }
+}
+
+/* --- Counter arithmetic ---
+ * Counter + Counter: adds counts, keeps only positive counts
+ * Counter - Counter: subtracts counts, keeps only positive counts
+ */
+FpyDict* fastpy_counter_add(FpyDict *a, FpyDict *b) {
+    FpyDict *result = fpy_dict_new(a->length + b->length);
+    /* Copy all entries from a */
+    for (int64_t i = 0; i < a->length; i++) {
+        fpy_dict_set(result, a->keys[i], a->values[i]);
+    }
+    /* Add entries from b */
+    for (int64_t i = 0; i < b->length; i++) {
+        FpyValue key = b->keys[i];
+        int64_t b_count = b->values[i].data.i;
+        /* Look up existing count in result */
+        int64_t idx = fpy_dict_find_index(result, key);
+        if (idx >= 0) {
+            result->values[idx].data.i += b_count;
+        } else {
+            FpyValue val = {.tag = FPY_TAG_INT, .data.i = b_count};
+            fpy_dict_set(result, key, val);
+        }
+    }
+    /* Remove non-positive counts (Python Counter keeps only positive) */
+    FpyDict *filtered = fpy_dict_new(result->length);
+    for (int64_t i = 0; i < result->length; i++) {
+        if (result->values[i].data.i > 0) {
+            fpy_dict_set(filtered, result->keys[i], result->values[i]);
+        }
+    }
+    return filtered;
+}
+
+FpyDict* fastpy_counter_sub(FpyDict *a, FpyDict *b) {
+    FpyDict *result = fpy_dict_new(a->length);
+    /* Copy all entries from a */
+    for (int64_t i = 0; i < a->length; i++) {
+        fpy_dict_set(result, a->keys[i], a->values[i]);
+    }
+    /* Subtract entries from b */
+    for (int64_t i = 0; i < b->length; i++) {
+        FpyValue key = b->keys[i];
+        int64_t b_count = b->values[i].data.i;
+        int64_t idx = fpy_dict_find_index(result, key);
+        if (idx >= 0) {
+            result->values[idx].data.i -= b_count;
+        } else {
+            FpyValue val = {.tag = FPY_TAG_INT, .data.i = -b_count};
+            fpy_dict_set(result, key, val);
+        }
+    }
+    /* Remove non-positive counts */
+    FpyDict *filtered = fpy_dict_new(result->length);
+    for (int64_t i = 0; i < result->length; i++) {
+        if (result->values[i].data.i > 0) {
+            fpy_dict_set(filtered, result->keys[i], result->values[i]);
+        }
+    }
+    return filtered;
+}
+
+/* Counter | Counter: union (max counts) */
+FpyDict* fastpy_counter_union(FpyDict *a, FpyDict *b) {
+    FpyDict *result = fpy_dict_new(a->length + b->length);
+    /* Copy all entries from a */
+    for (int64_t i = 0; i < a->length; i++) {
+        fpy_dict_set(result, a->keys[i], a->values[i]);
+    }
+    /* Union: take max of each key */
+    for (int64_t i = 0; i < b->length; i++) {
+        FpyValue key = b->keys[i];
+        int64_t b_count = b->values[i].data.i;
+        int64_t idx = fpy_dict_find_index(result, key);
+        if (idx >= 0) {
+            if (b_count > result->values[idx].data.i)
+                result->values[idx].data.i = b_count;
+        } else {
+            FpyValue val = {.tag = FPY_TAG_INT, .data.i = b_count};
+            fpy_dict_set(result, key, val);
+        }
+    }
+    return result;
+}
+
+/* Counter & Counter: intersection (min counts) */
+FpyDict* fastpy_counter_intersection(FpyDict *a, FpyDict *b) {
+    FpyDict *result = fpy_dict_new(a->length < b->length ? a->length : b->length);
+    for (int64_t i = 0; i < a->length; i++) {
+        FpyValue key = a->keys[i];
+        int64_t a_count = a->values[i].data.i;
+        int64_t idx = fpy_dict_find_index(b, key);
+        if (idx >= 0) {
+            int64_t b_count = b->values[idx].data.i;
+            int64_t min_count = a_count < b_count ? a_count : b_count;
+            if (min_count > 0) {
+                FpyValue val = {.tag = FPY_TAG_INT, .data.i = min_count};
+                fpy_dict_set(result, key, val);
+            }
         }
     }
     return result;
