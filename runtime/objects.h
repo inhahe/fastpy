@@ -396,4 +396,10 @@ void fastpy_list_slice_step_assign(FpyList *list, int64_t start, int64_t stop,
 /* --- Built-in list/tuple iterator --- */
 FpyObj* fastpy_list_iter_new(FpyList *list);
 
+/* --- Attribute access helpers (hasattr/getattr with default) --- */
+int32_t fastpy_obj_has_attr(FpyObj *obj, const char *name);
+int32_t fastpy_obj_getattr_default(FpyObj *obj, const char *name,
+                                    int32_t def_tag, int64_t def_data,
+                                    int32_t *out_tag, int64_t *out_data);
+
 #endif /* FASTPY_OBJECTS_H */

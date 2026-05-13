@@ -10,6 +10,7 @@ yet covered by the test suite.
 ## Bug 1 — `yield` in nested for-loop (inner iterates outer variable)
 
 **Severity:** Wrong output  
+**Status:** OPEN  
 **Pattern:**
 ```python
 def g():
@@ -37,6 +38,7 @@ if-guard), so the state machine can see and handle nested while-loops.
 ## Bug 2 — `yield from` inside for-loop produces empty output
 
 **Severity:** Wrong output  
+**Status:** OPEN  
 **Pattern:**
 ```python
 def g():
@@ -56,145 +58,71 @@ the state machine.
 
 ---
 
-## Bug 3 — Multiple `except*` clauses: only first runs
+## ~~Bug 3 — Multiple `except*` clauses: only first runs~~
 
-**Severity:** Wrong output  
-**Pattern:**
-```python
-try:
-    raise ExceptionGroup("e", [ValueError("a"), TypeError("b")])
-except* ValueError:
-    print("caught ValueError")
-except* TypeError:
-    print("caught TypeError")
-# CPython: prints both
-# Fastpy:  only prints "caught ValueError"
-```
-
-**Root cause:** The `except*` (TryStar) handler implementation processes
-exception groups but only matches the first handler, then exits the
-try-block instead of continuing to match remaining unhandled exceptions
-against subsequent handlers.
+**Status:** FIXED  
+**Fix:** Pre-compute all handler match results while exception state is live,
+clear exception, then run ALL matching handler bodies sequentially.
+Runtime expanded to track multiple inner exception types per ExceptionGroup.
 
 ---
 
-## Bug 4 — Match statement: second list-pattern case crashes
+## ~~Bug 4 — Match statement: second list-pattern case crashes~~
 
-**Severity:** Crash (exit code 1)  
-**Pattern:**
-```python
-x = ["b", "hello"]
-match x:
-    case ["a", y]:
-        print(y)
-    case ["b", y]:
-        print(y + "!")
-# CPython: hello!
-# Fastpy:  crash (exit 1)
-```
-
-**Root cause:** When a match statement has multiple cases with sequence
-(list) patterns, falling through from a non-matching first case to the
-second case fails.  The pattern matching variables or list unpacking state
-from the first case likely corrupts the state needed for the second case.
+**Status:** FIXED  
+**Fix:** Match capture patterns (MatchAs) now store variables with
+`VKind.FVALUE` instead of `VKind.INT`, preserving the runtime type tag
+so captured values dispatch correctly in operations like `y + "!"`.
 
 ---
 
-## Bug 5 — `with` statement with comma-separated contexts segfaults
+## ~~Bug 5 — `with` statement with comma-separated contexts segfaults~~
 
-**Severity:** Segfault (access violation)  
-**Pattern:**
-```python
-with Ctx(1) as a, Ctx(2) as b:
-    print(a.n, b.n)
-# CPython: works
-# Fastpy:  segfault (exit 3221225477)
-```
-
-**Root cause:** Multiple context managers in a single `with` statement
-(`with A as a, B as b:`) are likely not handled — only the first context
-manager is processed.
+**Status:** FIXED  
+**Fix:** Multiple context managers (`with A as a, B as b:`) are now desugared
+into nested `with` statements before processing, matching Python semantics.
 
 ---
 
-## Bug 6 — `hasattr()` returns True for missing attributes
+## ~~Bug 6 — `hasattr()` returns True for missing attributes~~
 
-**Severity:** Wrong output  
-**Pattern:**
-```python
-class Obj:
-    def __init__(self):
-        self.x = 1
-o = Obj()
-print(hasattr(o, "y"))
-# CPython: False
-# Fastpy:  True
-```
-
-**Root cause:** `hasattr()` implementation doesn't properly catch
-`AttributeError` when the attribute doesn't exist — it always returns True.
+**Status:** FIXED  
+**Fix:** Added `fastpy_obj_has_attr` runtime function that checks both static
+slots and dynamic attrs without raising. Codegen now calls this instead of
+returning constant `True`.
 
 ---
 
-## Bug 7 — `getattr()` with default crashes on missing attribute
+## ~~Bug 7 — `getattr()` with default crashes on missing attribute~~
 
-**Severity:** Crash (exit code 1)  
-**Pattern:**
-```python
-class Obj:
-    pass
-o = Obj()
-print(getattr(o, "x", "default"))
-# CPython: default
-# Fastpy:  crash
-```
-
-**Root cause:** The 3-argument form of `getattr(obj, name, default)` doesn't
-catch `AttributeError` and return the default — it lets the error propagate.
+**Status:** FIXED  
+**Fix:** Added `fastpy_obj_getattr_default` runtime function. Codegen handles
+the 3-argument form of `getattr(obj, name, default)` by calling this function.
 
 ---
 
-## Bug 8 — `issubclass()` crashes for user-defined classes
+## ~~Bug 8 — `issubclass()` crashes for user-defined classes~~
 
-**Severity:** Crash (exit code 1)  
-**Pattern:**
-```python
-class A:
-    pass
-class B(A):
-    pass
-print(issubclass(B, A))
-# CPython: True
-# Fastpy:  crash
-```
-
-**Root cause:** `issubclass()` works for builtin types (`issubclass(bool,
-int)`) but not for user-defined classes.  The class hierarchy traversal
-likely doesn't handle user class objects.
+**Status:** FIXED  
+**Fix:** Implemented native `issubclass()` that resolves at compile time by
+walking the `parent_name` chain in ClassInfo. Also handles builtin type
+relationships like `issubclass(bool, int)`.
 
 ---
 
-## Bug 9 — `next()` with default crashes when iterator exhausted
+## ~~Bug 9 — `next()` with default crashes when iterator exhausted~~
 
-**Severity:** Crash (exit code 1)  
-**Pattern:**
-```python
-it = iter([1])
-print(next(it))
-print(next(it, "done"))
-# CPython: 1, done
-# Fastpy:  1, crash
-```
-
-**Root cause:** The 2-argument form of `next(iterator, default)` doesn't
-catch `StopIteration` and return the default — it lets the exception
-propagate.
+**Status:** FIXED  
+**Fix:** The 2-argument `next(iterator, default)` now checks for pending
+StopIteration after `__next__()` call, clears it, and returns the default
+value via a phi node.
 
 ---
 
 ## Bug 10 — `contextlib.contextmanager` doesn't work
 
 **Severity:** Crash (exit code 1)  
+**Status:** OPEN (depends on Bugs 1-2)  
 **Pattern:**
 ```python
 from contextlib import contextmanager
@@ -216,32 +144,18 @@ how the contextmanager decorator interacts with the generator protocol.
 
 ---
 
-## Bug 11 — Property deleter causes compiler crash
+## ~~Bug 11 — Property deleter causes compiler crash~~
 
-**Severity:** Compiler crash (DuplicatedNameError)  
-**Pattern:**
-```python
-class C:
-    @property
-    def x(self):
-        return self._x
-    @x.setter
-    def x(self, val):
-        self._x = val
-    @x.deleter
-    def x(self):
-        self._x = None
-```
-
-**Root cause:** The `@x.deleter` decorator causes the compiler to try to
-register a function named `fastpy.class.C.x` twice — the property getter
-and deleter collide on the same LLVM function name.
+**Status:** FIXED  
+**Fix:** Property deleters are now compiled as `x__del` functions (like
+setters use `x__set`). `del obj.prop` dispatches to the deleter method.
 
 ---
 
 ## Bug 12 — `__mro__` access segfaults
 
 **Severity:** Segfault  
+**Status:** OPEN  
 **Pattern:**
 ```python
 class D(B, C):
@@ -259,6 +173,7 @@ invalid pointer or unsupported type, causing a segfault when iterated.
 ## Bug 13 — `namedtuple` repr shows plain tuple
 
 **Severity:** Wrong output  
+**Status:** OPEN  
 **Pattern:**
 ```python
 from collections import namedtuple
@@ -277,6 +192,7 @@ object is treated as a plain tuple for string conversion.
 ## Bug 14 — Abstract class instantiation doesn't raise TypeError
 
 **Severity:** Wrong output (missing error)  
+**Status:** OPEN  
 **Pattern:**
 ```python
 from abc import ABC, abstractmethod
@@ -297,6 +213,7 @@ classes can be instantiated without implementing abstract methods.
 ## Bug 15 — Async generator segfaults
 
 **Severity:** Segfault  
+**Status:** OPEN  
 **Pattern:**
 ```python
 async def agen():
@@ -311,3 +228,30 @@ async def main():
 **Root cause:** Async generators (`async def` with `yield`) aren't fully
 supported.  The `async for` protocol likely doesn't handle the async
 generator object correctly.
+
+---
+
+## Bug 16 — `self.attr = None` corrupts type inference when attr was int
+
+**Severity:** Segfault / wrong output  
+**Status:** OPEN  
+**Pattern:**
+```python
+class C:
+    def __init__(self):
+        self._x = 10
+    def reset(self):
+        self._x = None
+
+c = C()
+c._x = 42
+print(c._x)
+# CPython: 42
+# Fastpy:  segfault
+```
+
+**Root cause:** When any method assigns `None` to an attribute that was
+initialized as `int` in `__init__`, the static type inference for that
+attribute's slot may be corrupted (slot type changes from int to
+None/mixed), causing the setter to write to the wrong slot type or the
+getter to misinterpret the stored value.

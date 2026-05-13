@@ -477,6 +477,9 @@ double fastpy_pow_float(double base, double exp) {
 FPY_THREAD_LOCAL int fpy_exc_type = FPY_EXC_NONE;
 FPY_THREAD_LOCAL const char *fpy_exc_msg = "";
 FPY_THREAD_LOCAL int fpy_exc_group_inner = FPY_EXC_NONE;
+#define FPY_MAX_GROUP_INNERS 16
+FPY_THREAD_LOCAL int fpy_exc_group_inner_types[FPY_MAX_GROUP_INNERS];
+FPY_THREAD_LOCAL int fpy_exc_group_inner_count = 0;
 FPY_THREAD_LOCAL void *fpy_exc_obj = NULL;  /* exception object for user-defined exceptions */
 FPY_THREAD_LOCAL const char *fpy_exc_class_name = "";  /* actual class name for type(e).__name__ */
 
@@ -751,6 +754,7 @@ void fastpy_exc_clear(void) {
     fpy_exc_type = FPY_EXC_NONE;
     fpy_exc_msg = "";
     fpy_exc_group_inner = FPY_EXC_NONE;
+    fpy_exc_group_inner_count = 0;
     fpy_exc_obj = NULL;
     fpy_exc_class_name = "";
     fpy_traceback_depth = 0;
@@ -766,7 +770,7 @@ const char* fastpy_exc_get_class_name(void) {
     return fpy_exc_class_name;
 }
 
-/* Set the inner exception type for ExceptionGroup */
+/* Set the inner exception type for ExceptionGroup (legacy single-type) */
 void fastpy_exc_set_group_inner(int inner_type) {
     fpy_exc_group_inner = inner_type;
 }
@@ -774,6 +778,25 @@ void fastpy_exc_set_group_inner(int inner_type) {
 /* Get the inner exception type for ExceptionGroup */
 int fastpy_exc_get_group_inner(void) {
     return fpy_exc_group_inner;
+}
+
+/* Add an inner exception type to the ExceptionGroup's type set */
+void fastpy_exc_group_add_inner(int32_t type_id) {
+    if (fpy_exc_group_inner_count < FPY_MAX_GROUP_INNERS) {
+        fpy_exc_group_inner_types[fpy_exc_group_inner_count++] = type_id;
+    }
+    /* Also set the legacy single-type field to the first type */
+    if (fpy_exc_group_inner_count == 1) {
+        fpy_exc_group_inner = type_id;
+    }
+}
+
+/* Check if the ExceptionGroup contains a specific inner type */
+int32_t fastpy_exc_group_has_type(int32_t type_id) {
+    for (int i = 0; i < fpy_exc_group_inner_count; i++) {
+        if (fpy_exc_group_inner_types[i] == type_id) return 1;
+    }
+    return 0;
 }
 
 /* Map exception name to type id */

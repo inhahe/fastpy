@@ -2261,6 +2261,14 @@ class CodeGen:
         ft = ir.FunctionType(void, [i8_ptr, i8_ptr,
                                      ir.PointerType(i32), ir.PointerType(i64)])
         self.runtime["obj_get_fv"] = ir.Function(self.module, ft, name="fastpy_obj_get_fv")
+        # obj_has_attr: returns i32 1/0 without raising
+        ft = ir.FunctionType(i32, [i8_ptr, i8_ptr])
+        self.runtime["obj_has_attr"] = ir.Function(self.module, ft, name="fastpy_obj_has_attr")
+        # obj_getattr_default: returns attr or default; i32 return = found(1)/not(0)
+        ft = ir.FunctionType(i32, [i8_ptr, i8_ptr, i32, i64,
+                                    ir.PointerType(i32), ir.PointerType(i64)])
+        self.runtime["obj_getattr_default"] = ir.Function(
+            self.module, ft, name="fastpy_obj_getattr_default")
         # Static-slot fast paths — bypass name lookup
         ft = ir.FunctionType(void, [i8_ptr, i32, i32, i64])
         self.runtime["obj_set_slot"] = ir.Function(self.module, ft, name="fastpy_obj_set_slot")
@@ -2365,6 +2373,11 @@ class CodeGen:
         self.runtime["exc_set_group_inner"] = ir.Function(self.module, ft, name="fastpy_exc_set_group_inner")
         ft = ir.FunctionType(i32, [])
         self.runtime["exc_get_group_inner"] = ir.Function(self.module, ft, name="fastpy_exc_get_group_inner")
+        # Multi-type ExceptionGroup support
+        ft = ir.FunctionType(void, [i32])
+        self.runtime["exc_group_add_inner"] = ir.Function(self.module, ft, name="fastpy_exc_group_add_inner")
+        ft = ir.FunctionType(i32, [i32])
+        self.runtime["exc_group_has_type"] = ir.Function(self.module, ft, name="fastpy_exc_group_has_type")
         # Shadow call stack for runtime tracebacks
         # void fpy_shadow_push(const char *func, const char *file, i32 line)
         ft = ir.FunctionType(void, [i8_ptr, i8_ptr, i32])
@@ -12814,6 +12827,9 @@ class CodeGen:
                 is_setter = any(
                     isinstance(d, ast.Attribute) and d.attr == "setter"
                     for d in item.decorator_list)
+                is_deleter = any(
+                    isinstance(d, ast.Attribute) and d.attr == "deleter"
+                    for d in item.decorator_list)
                 # __new__ and __init_subclass__ are always classmethods
                 if method_name in ("__new__", "__init_subclass__",
                                     "__class_getitem__"):
@@ -12828,6 +12844,10 @@ class CodeGen:
                     # @x.setter: compile as a separate function named x__set
                     # so it doesn't collide with the getter
                     method_name = f"{method_name}__set"
+                elif is_deleter:
+                    # @x.deleter: compile as a separate function named x__del
+                    # so it doesn't collide with the getter
+                    method_name = f"{method_name}__del"
                 params = [arg.arg for arg in item.args.args]
                 _method_has_vararg = item.args.vararg is not None
 
@@ -13764,8 +13784,13 @@ class CodeGen:
                 is_setter = any(
                     isinstance(d, ast.Attribute) and d.attr == "setter"
                     for d in item.decorator_list)
+                is_deleter = any(
+                    isinstance(d, ast.Attribute) and d.attr == "deleter"
+                    for d in item.decorator_list)
                 if is_setter:
                     method_key = f"{item.name}__set"
+                elif is_deleter:
+                    method_key = f"{item.name}__del"
                 if method_key in cls_info.methods:
                     func = cls_info.methods[method_key]
                     self._emit_method_body(func, item)
@@ -14788,6 +14813,31 @@ class CodeGen:
                     pass  # del on unknown type — skip (no-op)
             else:
                 self._bridge_fallback_stmt(node, "del on unsupported container type")
+        elif isinstance(target, ast.Attribute):
+            # del obj.attr — dispatch to @property deleter if present
+            obj_cls = self._infer_object_class(target.value)
+            if obj_cls:
+                cls_info = self._user_classes.get(obj_cls)
+                if (cls_info and cls_info.properties
+                        and target.attr in cls_info.properties):
+                    deleter_name = f"{target.attr}__del"
+                    deleter_func = cls_info.methods.get(deleter_name)
+                    if deleter_func:
+                        obj = self._emit_expr_value(target.value)
+                        obj = self._ensure_ptr(obj)
+                        self.builder.call(deleter_func, [obj])
+                        return
+            # Fallback: del obj.attr on a non-property → set to None
+            if self._is_obj_expr(target.value):
+                obj = self._emit_expr_value(target.value)
+                obj = self._ensure_ptr(obj)
+                attr_name = self._make_string_constant(target.attr)
+                self.builder.call(self.runtime["obj_set_fv"],
+                                  [obj, attr_name,
+                                   ir.Constant(i32, FPY_TAG_NONE),
+                                   ir.Constant(i64, 0)])
+            else:
+                self._bridge_fallback_stmt(node, "del on attribute")
         elif isinstance(target, ast.Name):
             # del variable — remove from scope so subsequent access raises NameError.
             # This handles the static case (del x; print(x) → NameError).
@@ -20471,7 +20521,24 @@ class CodeGen:
 
         If __exit__ returns a truthy value and there is a pending
         exception, the exception is suppressed (cleared).
+
+        Multiple context managers (`with A as a, B as b:`) are desugared
+        into nested with statements before processing.
         """
+        # Desugar multiple context managers into nested with statements.
+        # `with A as a, B as b: body` → `with A as a: with B as b: body`
+        if len(node.items) > 1:
+            inner = ast.With(
+                items=node.items[1:],
+                body=node.body)
+            ast.copy_location(inner, node)
+            outer = ast.With(
+                items=[node.items[0]],
+                body=[inner])
+            ast.copy_location(outer, node)
+            self._emit_with(outer)
+            return
+
         for item in node.items:
             ctx_expr = item.context_expr
             opt_var = item.optional_vars  # ast.Name or None
@@ -20799,13 +20866,13 @@ class CodeGen:
                     subject_fv, subject_tag, subject_data,
                     pattern.pattern, node)
                 if pattern.name:
-                    self._store_variable(pattern.name, subject_fv, ValueType(VKind.INT))
+                    self._store_variable(pattern.name, subject_fv, ValueType(VKind.FVALUE))
                 return inner
             if pattern.name is None:
                 # case _ → wildcard, always matches
                 return None
             # case name → capture, always matches, binds subject
-            self._store_variable(pattern.name, subject_fv, ValueType(VKind.INT))
+            self._store_variable(pattern.name, subject_fv, ValueType(VKind.FVALUE))
             return None
 
         # ── MatchOr: case 1 | 2 | 3 ──────────────────────────────────
@@ -21551,7 +21618,10 @@ class CodeGen:
             else:
                 self.builder.branch(end_block)
 
-        # Except* handlers — match against inner exception types for groups
+        # Except* handlers — match against inner exception types for groups.
+        # Unlike regular except, ALL matching except* handlers run (not just first).
+        # Strategy: pre-compute all match results while exception is live,
+        # store them in allocas, clear exception, then run matched handlers.
         if has_except:
             self.builder.position_at_end(except_block)
             exc_type = self.builder.call(self.runtime["exc_get_type"], [])
@@ -21563,69 +21633,94 @@ class CodeGen:
             self._saved_exc_type = saved_exc_type_alloca
             self._saved_exc_msg = saved_exc_msg_alloca
 
-            # For except*, also check the group's inner type.
-            # The inner type is stored via exc_get_group_inner_type().
-            # If the exception IS an ExceptionGroup, we match handlers
-            # against the inner type; otherwise fall back to normal matching.
+            # Check if this is an ExceptionGroup
             exc_group_name = self._make_string_constant("ExceptionGroup")
             expected_group_id = self.builder.call(
                 self.runtime["exc_name_to_id"], [exc_group_name])
             is_group = self.builder.icmp_signed("==", exc_type, expected_group_id)
-            inner_type = self.builder.call(self.runtime["exc_get_group_inner"], [])
-            # Use inner type if this is a group, otherwise use the exception type itself
-            effective_type = self.builder.select(is_group, inner_type, exc_type)
 
-            for handler in node.handlers:
+            # Phase 1: pre-compute match results for each handler
+            # while exception state is still live (exc_group_has_type reads globals)
+            handler_match_allocas = []
+            for hi, handler in enumerate(node.handlers):
+                match_alloca = self._create_entry_alloca(
+                    ir.IntType(1), f"estarMatch.{hi}")
+                match_result = ir.Constant(ir.IntType(1), 0)
+
+                def _compute_match(type_node):
+                    if isinstance(type_node, ast.Name):
+                        n = self._make_string_constant(type_node.id)
+                        eid = self.builder.call(
+                            self.runtime["exc_name_to_id"], [n])
+                        gm = self.builder.call(
+                            self.runtime["exc_group_has_type"], [eid])
+                        gm_bool = self.builder.icmp_signed(
+                            "!=", gm, ir.Constant(i32, 0))
+                        g_res = self.builder.and_(is_group, gm_bool)
+                        d_match = self.builder.icmp_signed("==", exc_type, eid)
+                        ng = self.builder.not_(is_group)
+                        d_res = self.builder.and_(ng, d_match)
+                        return self.builder.or_(g_res, d_res)
+                    elif isinstance(type_node, ast.Attribute):
+                        n = self._make_string_constant(type_node.attr)
+                        eid = self.builder.call(
+                            self.runtime["exc_name_to_id"], [n])
+                        gm = self.builder.call(
+                            self.runtime["exc_group_has_type"], [eid])
+                        gm_bool = self.builder.icmp_signed(
+                            "!=", gm, ir.Constant(i32, 0))
+                        g_res = self.builder.and_(is_group, gm_bool)
+                        d_match = self.builder.icmp_signed("==", exc_type, eid)
+                        ng = self.builder.not_(is_group)
+                        d_res = self.builder.and_(ng, d_match)
+                        return self.builder.or_(g_res, d_res)
+                    return None
+
+                if handler.type is not None:
+                    if isinstance(handler.type, ast.Tuple):
+                        for elt in handler.type.elts:
+                            m = _compute_match(elt)
+                            if m is not None:
+                                match_result = self.builder.or_(match_result, m)
+                    else:
+                        m = _compute_match(handler.type)
+                        if m is not None:
+                            match_result = m
+                        else:
+                            match_result = ir.Constant(ir.IntType(1), 1)
+                else:
+                    match_result = ir.Constant(ir.IntType(1), 1)
+
+                self.builder.store(match_result, match_alloca)
+                handler_match_allocas.append(match_alloca)
+
+            # Phase 2: clear exception so handler bodies can execute normally
+            self.builder.call(self.runtime["exc_clear"], [])
+
+            # Phase 3: run all matched handlers
+            for hi, handler in enumerate(node.handlers):
                 handler_block = self._new_block("exceptstar.handler")
                 next_handler = self._new_block("exceptstar.next")
 
-                if handler.type is not None and isinstance(handler.type, ast.Name):
-                    exc_name = self._make_string_constant(handler.type.id)
-                    expected_id = self.builder.call(
-                        self.runtime["exc_name_to_id"], [exc_name])
-                    matches = self.builder.icmp_signed("==", effective_type, expected_id)
-                    self.builder.cbranch(matches, handler_block, next_handler)
-                elif handler.type is not None and isinstance(handler.type, ast.Tuple):
-                    # except* (TypeError, ValueError): — OR chain of type checks
-                    any_match = ir.Constant(ir.IntType(1), 0)
-                    for elt in handler.type.elts:
-                        if isinstance(elt, ast.Name):
-                            elt_name = self._make_string_constant(elt.id)
-                            elt_id = self.builder.call(
-                                self.runtime["exc_name_to_id"], [elt_name])
-                            elt_match = self.builder.icmp_signed(
-                                "==", effective_type, elt_id)
-                            any_match = self.builder.or_(any_match, elt_match)
-                        elif isinstance(elt, ast.Attribute):
-                            elt_name = self._make_string_constant(elt.attr)
-                            elt_id = self.builder.call(
-                                self.runtime["exc_name_to_id"], [elt_name])
-                            elt_match = self.builder.icmp_signed(
-                                "==", effective_type, elt_id)
-                            any_match = self.builder.or_(any_match, elt_match)
-                    self.builder.cbranch(any_match, handler_block, next_handler)
-                elif handler.type is not None and isinstance(handler.type, ast.Attribute):
-                    exc_name = self._make_string_constant(handler.type.attr)
-                    expected_id = self.builder.call(
-                        self.runtime["exc_name_to_id"], [exc_name])
-                    matches = self.builder.icmp_signed("==", effective_type, expected_id)
-                    self.builder.cbranch(matches, handler_block, next_handler)
-                else:
-                    self.builder.branch(handler_block)
+                matched = self.builder.load(handler_match_allocas[hi])
+                self.builder.cbranch(matched, handler_block, next_handler)
 
                 self.builder.position_at_end(handler_block)
                 if handler.name:
-                    msg = self.builder.call(self.runtime["exc_get_msg"], [])
+                    msg = self.builder.load(saved_exc_msg_alloca)
                     self._store_variable(handler.name, msg, ValueType(VKind.STR))
-                self.builder.call(self.runtime["exc_clear"], [])
                 self._emit_stmts(handler.body)
                 if not self.builder.block.is_terminated:
-                    if finally_block:
-                        self.builder.branch(finally_block)
-                    else:
-                        self.builder.branch(end_block)
+                    self.builder.branch(next_handler)
 
                 self.builder.position_at_end(next_handler)
+
+            # After all handlers, continue
+            if not self.builder.block.is_terminated:
+                if finally_block:
+                    self.builder.branch(finally_block)
+                else:
+                    self.builder.branch(end_block)
 
             if not self.builder.block.is_terminated:
                 if finally_block:
@@ -22407,20 +22502,31 @@ class CodeGen:
             name_ptr = self._make_string_constant(exc_name)
             exc_id = self.builder.call(self.runtime["exc_name_to_id"], [name_ptr])
 
-            # ExceptionGroup("g", [ValueError("a"), ...]) — store inner type
+            # ExceptionGroup("g", [ValueError("a"), ...]) — store inner types
             if exc_name == "ExceptionGroup" and len(node.exc.args) >= 2:
                 group_msg = self._emit_expr_value(node.exc.args[0])
                 if not isinstance(group_msg.type, ir.PointerType):
                     group_msg = self._value_to_str(group_msg, node)
                 self.builder.call(self.runtime["raise"], [exc_id, group_msg])
                 self.builder.call(self.runtime["exc_set_class_name"], [name_ptr])
-                # Extract inner exception type from the list literal
+                # Extract ALL inner exception types from the list literal
                 inner_list = node.exc.args[1]
                 if isinstance(inner_list, ast.List) and inner_list.elts:
+                    for inner_exc in inner_list.elts:
+                        if (isinstance(inner_exc, ast.Call)
+                                and isinstance(inner_exc.func, ast.Name)):
+                            inner_name = self._make_string_constant(
+                                inner_exc.func.id)
+                            inner_id = self.builder.call(
+                                self.runtime["exc_name_to_id"], [inner_name])
+                            self.builder.call(
+                                self.runtime["exc_group_add_inner"], [inner_id])
+                    # Also set the legacy single-type field for backward compat
                     first_exc = inner_list.elts[0]
                     if (isinstance(first_exc, ast.Call)
                             and isinstance(first_exc.func, ast.Name)):
-                        inner_name = self._make_string_constant(first_exc.func.id)
+                        inner_name = self._make_string_constant(
+                            first_exc.func.id)
                         inner_id = self.builder.call(
                             self.runtime["exc_name_to_id"], [inner_name])
                         self.builder.call(
@@ -31852,6 +31958,8 @@ class CodeGen:
 
         "isinstance": "_emit_builtin_isinstance",
 
+        "issubclass": "_emit_builtin_issubclass",
+
         "iter": "_emit_builtin_iter",
 
         "len": "_emit_builtin_len",
@@ -32851,9 +32959,22 @@ class CodeGen:
         attr_name = self._ensure_ptr(attr_name)
         tag_slot = self._create_entry_alloca(i32, "ga.tag")
         data_slot = self._create_entry_alloca(i64, "ga.data")
-        self.builder.call(self.runtime["obj_get_fv"],
-                          [obj, attr_name, tag_slot, data_slot])
-        return self.builder.load(data_slot)
+        if len(node.args) == 3:
+            # getattr(obj, name, default) — use obj_getattr_default
+            default_val = self._emit_expr_value(node.args[2])
+            def_tag, def_data = self._bare_to_tag_data(default_val, node.args[2])
+            self.builder.call(self.runtime["obj_getattr_default"],
+                              [obj, attr_name, ir.Constant(i32, def_tag),
+                               def_data, tag_slot, data_slot])
+            tag = self.builder.load(tag_slot)
+            data = self.builder.load(data_slot)
+            return self._fv_build_from_slots(tag, data)
+        else:
+            # getattr(obj, name) — raises AttributeError if missing
+            # Returns bare i64 (data only) for backward compat
+            self.builder.call(self.runtime["obj_get_fv"],
+                              [obj, attr_name, tag_slot, data_slot])
+            return self.builder.load(data_slot)
 
 
     def _emit_builtin_hasattr(self, node):
@@ -32871,11 +32992,15 @@ class CodeGen:
             result = self.builder.call(
                 self.runtime["cpython_hasattr"], [obj, attr_name])
             return self.builder.zext(result, i64)
-        # For native objects with known slots, always return True
-        # (our slot system pre-allocates all used attrs).
-        # Don't evaluate args — avoids potential side effects from
-        # _emit_expr_value on non-PYOBJ objects.
-        return ir.Constant(i64, 1)  # True
+        # For native objects, call obj_has_attr which checks both
+        # static slots and dynamic attrs at runtime.
+        obj = self._emit_expr_value(node.args[0])
+        obj = self._ensure_ptr(obj)
+        attr_name = self._emit_expr_value(node.args[1])
+        attr_name = self._ensure_ptr(attr_name)
+        result = self.builder.call(
+            self.runtime["obj_has_attr"], [obj, attr_name])
+        return self.builder.zext(result, i64)
 
 
     def _emit_builtin_setattr(self, node):
@@ -32923,8 +33048,49 @@ class CodeGen:
             # info (generators may yield str/int/float/etc.; raw i64 loses
             # the tag and downstream code mistreats strings as ints).
             ret_tag = self.builder.call(self.runtime["get_ret_tag"], [])
+
+            if len(node.args) == 2:
+                # next(iterator, default) — catch StopIteration, return default
+                # Check if __next__ raised StopIteration
+                pending = self.builder.call(self.runtime["exc_pending"], [])
+                is_exc = self.builder.icmp_signed(
+                    "!=", pending, ir.Constant(i32, 0))
+                exc_type = self.builder.call(self.runtime["exc_get_type"], [])
+                _EXC_STOP = ir.Constant(i32, 7)  # FPY_EXC_STOPITERATION
+                is_stop = self.builder.icmp_signed("==", exc_type, _EXC_STOP)
+                use_default = self.builder.and_(is_exc, is_stop)
+
+                default_block = self._new_block("next.default")
+                normal_block = self._new_block("next.normal")
+                merge_block = self._new_block("next.merge")
+                self.builder.cbranch(use_default, default_block, normal_block)
+
+                # Default path: clear exception, emit default value
+                self.builder.position_at_end(default_block)
+                self.builder.call(self.runtime["exc_clear"], [])
+                default_val = self._emit_expr_value(node.args[1])
+                def_tag, def_data = self._bare_to_tag_data(
+                    default_val, node.args[1])
+                def_fv = self._fv_build_from_slots(
+                    ir.Constant(i32, def_tag), def_data)
+                def_bb = self.builder.block
+                self.builder.branch(merge_block)
+
+                # Normal path: use the result from __next__
+                self.builder.position_at_end(normal_block)
+                normal_fv = self._fv_build_from_slots(ret_tag, result)
+                normal_bb = self.builder.block
+                self.builder.branch(merge_block)
+
+                # Merge
+                self.builder.position_at_end(merge_block)
+                phi = self.builder.phi(fpy_val, "next.result")
+                phi.add_incoming(def_fv, def_bb)
+                phi.add_incoming(normal_fv, normal_bb)
+                return phi
+
             return self._fv_build_from_slots(ret_tag, result)
-        raise CodeGenError("next() takes exactly one argument", node)
+        raise CodeGenError("next() takes at least one argument", node)
 
     def _emit_builtin_iter(self, node):
         if len(node.args) == 1:
@@ -36311,6 +36477,63 @@ class CodeGen:
         result = self.builder.call(self.runtime["isinstance"], [obj, class_id])
         # result is i32 (0 or 1), use it as our bool type
         return result
+
+    def _emit_builtin_issubclass(self, node: ast.Call) -> ir.Value:
+        """Emit issubclass(cls, parent) — resolved at compile time for
+        user-defined classes by walking the parent_name chain.
+
+        Falls back to the CPython bridge for unknown/builtin types.
+        """
+        if len(node.args) != 2:
+            raise CodeGenError("issubclass() takes exactly 2 arguments", node)
+        child_node = node.args[0]
+        parent_node = node.args[1]
+        # Both args must be class names we can resolve
+        if (isinstance(child_node, ast.Name)
+                and isinstance(parent_node, ast.Name)):
+            child_name = child_node.id
+            parent_name = parent_node.id
+            # Both user classes: resolve statically by walking MRO
+            if (child_name in self._user_classes
+                    and parent_name in self._user_classes):
+                # Walk the parent chain from child to see if we reach parent
+                cursor = child_name
+                while cursor is not None:
+                    if cursor == parent_name:
+                        return ir.Constant(i32, 1)
+                    ci = self._user_classes.get(cursor)
+                    cursor = ci.parent_name if ci else None
+                return ir.Constant(i32, 0)
+            # Child is user class, parent is "object" → always True
+            if child_name in self._user_classes and parent_name == "object":
+                return ir.Constant(i32, 1)
+            # Parent is user class, child is builtin → False
+            if (parent_name in self._user_classes
+                    and child_name not in self._user_classes):
+                return ir.Constant(i32, 0)
+            # Both builtin: handle common cases
+            _builtin_subclass_map = {
+                ("bool", "int"): 1,
+                ("bool", "object"): 1,
+                ("int", "object"): 1,
+                ("str", "object"): 1,
+                ("float", "object"): 1,
+                ("list", "object"): 1,
+                ("dict", "object"): 1,
+                ("bool", "float"): 0,
+                ("bool", "str"): 0,
+                ("int", "str"): 0,
+                ("int", "float"): 0,
+                ("str", "int"): 0,
+            }
+            key = (child_name, parent_name)
+            if key in _builtin_subclass_map:
+                return ir.Constant(i32, _builtin_subclass_map[key])
+            # Same type → True
+            if child_name == parent_name:
+                return ir.Constant(i32, 1)
+        # Fallback: bridge call
+        return self._bridge_fallback_expr(node, "issubclass with dynamic args")
 
     def _static_type_of(self, node: ast.expr) -> str:
         """Best-effort static type determination for isinstance().

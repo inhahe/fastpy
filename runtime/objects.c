@@ -6612,6 +6612,55 @@ void fastpy_obj_get_fv(FpyObj *obj, const char *name, int32_t *out_tag, int64_t 
     *out_tag = FPY_TAG_NONE; *out_data = 0; return;
 }
 
+/* hasattr(obj, name) — returns 1 if the attribute exists, 0 otherwise.
+ * Does NOT raise; simply checks slot table and dynamic attrs. */
+int32_t fastpy_obj_has_attr(FpyObj *obj, const char *name) {
+    int slot = fpy_find_slot(obj->class_id, name);
+    if (slot >= 0) {
+        return 1;
+    }
+    FpyObjAttrs *a = obj->dynamic_attrs;
+    if (a != NULL) {
+        for (int i = 0; i < a->count; i++) {
+            if (a->names[i] == name
+                    || strcmp(a->names[i], name) == 0) {
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+/* getattr(obj, name, default) — returns attribute value, or default if
+ * the attribute doesn't exist. Sets out_tag/out_data. Returns 1 if found,
+ * 0 if default was used. */
+int32_t fastpy_obj_getattr_default(FpyObj *obj, const char *name,
+                                    int32_t def_tag, int64_t def_data,
+                                    int32_t *out_tag, int64_t *out_data) {
+    int slot = fpy_find_slot(obj->class_id, name);
+    if (slot >= 0) {
+        FpyValue *slots = FPY_OBJ_SLOTS(obj);
+        *out_tag = slots[slot].tag;
+        *out_data = slots[slot].data.i;
+        return 1;
+    }
+    FpyObjAttrs *a = obj->dynamic_attrs;
+    if (a != NULL) {
+        for (int i = 0; i < a->count; i++) {
+            if (a->names[i] == name
+                    || strcmp(a->names[i], name) == 0) {
+                *out_tag = a->values[i].tag;
+                *out_data = a->values[i].data.i;
+                return 1;
+            }
+        }
+    }
+    /* Not found — use default */
+    *out_tag = def_tag;
+    *out_data = def_data;
+    return 0;
+}
+
 /* Get attribute as string representation (works for any type).
  * Still used by the f-string path for `{self.attr}` expansion. */
 /* ---- Vararg method helpers ----
