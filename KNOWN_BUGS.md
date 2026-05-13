@@ -7,54 +7,22 @@ yet covered by the test suite.
 
 ---
 
-## Bug 1 — `yield` in nested for-loop (inner iterates outer variable)
+## ~~Bug 1 — `yield` in nested for-loop (inner iterates outer variable)~~
 
-**Severity:** Wrong output  
-**Status:** OPEN  
-**Pattern:**
-```python
-def g():
-    data = [[1,2],[3,4]]
-    for sub in data:
-        for x in sub:
-            yield x
-print(list(g()))
-# CPython: [1, 2, 3, 4]
-# Fastpy:  [1, 3]  (only first element per outer iteration)
-```
-
-**Root cause:** `_gen_for_to_while` wraps the preprocessed for-loop body in
-an `if not _done:` guard.  When the body contains a nested while-loop with
-yield (from the inner for-loop's conversion), the state machine in
-`_gen_split_stmts` doesn't recurse into the if-body to handle the inner
-while-loop.  The inner loop's iterator state isn't saved across yields.
-
-**Fix plan:** Restructure `_gen_for_to_while` to use a "lookahead" pattern
-that keeps the loop body at the top level of the while-loop body (no
-if-guard), so the state machine can see and handle nested while-loops.
+**Status:** FIXED  
+**Fix:** Restructured `_gen_for_to_while` to use a "lookahead" pattern —
+fetch first value before the loop, body directly at while-body level (no
+if-guard), next fetch at end. The state machine now sees and handles nested
+while-loops from inner for-loop conversions.
 
 ---
 
-## Bug 2 — `yield from` inside for-loop produces empty output
+## ~~Bug 2 — `yield from` inside for-loop produces empty output~~
 
-**Severity:** Wrong output  
-**Status:** OPEN  
-**Pattern:**
-```python
-def g():
-    data = [[1,2],[3,4]]
-    for sub in data:
-        yield from sub
-print(list(g()))
-# CPython: [1, 2, 3, 4]
-# Fastpy:  []
-```
-
-**Root cause:** Same as Bug 1.  The `yield from` expansion creates a
-while-loop with yield, which gets wrapped in the if-guard and hidden from
-the state machine.
-
-**Fix plan:** Same as Bug 1 — the lookahead pattern fix resolves both.
+**Status:** FIXED  
+**Fix:** Same lookahead pattern fix as Bug 1. Also added `ast.YieldFrom`
+to `_gen_body_has_yield` so for-loops containing `yield from` are properly
+recognized and converted.
 
 ---
 
@@ -122,7 +90,7 @@ value via a phi node.
 ## Bug 10 — `contextlib.contextmanager` doesn't work
 
 **Severity:** Crash (exit code 1)  
-**Status:** OPEN (depends on Bugs 1-2)  
+**Status:** OPEN  
 **Pattern:**
 ```python
 from contextlib import contextmanager
@@ -136,11 +104,14 @@ def ctx(name):
 with ctx("test") as val:
     print("inside", val)
 # CPython: enter test / inside test / exit test
-# Fastpy:  crash
+# Fastpy:  AttributeError: 'ctx' object has no method '__exit__'
 ```
 
-**Root cause:** Likely related to the generator bugs (Bugs 1-2) and/or
-how the contextmanager decorator interacts with the generator protocol.
+**Root cause:** The `@contextmanager` decorator wraps the generator in
+a CPython `_GeneratorContextManager` object. The `with` statement
+dispatches to native `__enter__`/`__exit__`, but the wrapper object's
+methods exist only in CPython. Fixing requires the `with` statement to
+detect bridge-wrapped objects and dispatch through the CPython protocol.
 
 ---
 
@@ -170,88 +141,39 @@ invalid pointer or unsupported type, causing a segfault when iterated.
 
 ---
 
-## Bug 13 — `namedtuple` repr shows plain tuple
+## ~~Bug 13 — `namedtuple` repr shows plain tuple~~
 
-**Severity:** Wrong output  
-**Status:** OPEN  
-**Pattern:**
-```python
-from collections import namedtuple
-Point = namedtuple("Point", ["x", "y"])
-p = Point(3, 4)
-print(p)
-# CPython: Point(x=3, y=4)
-# Fastpy:  (3, 4)
-```
-
-**Root cause:** The namedtuple's custom `__repr__` isn't invoked — the
-object is treated as a plain tuple for string conversion.
+**Status:** FIXED  
+**Fix:** Registered `fastpy_namedtuple_print` runtime function and added
+namedtuple instance detection in `_emit_print_single`. Known namedtuple
+instances are printed via `namedtuple_print(tuple, type_id)` which outputs
+`TypeName(field1=val1, ...)` format using the type registry.
 
 ---
 
-## Bug 14 — Abstract class instantiation doesn't raise TypeError
+## ~~Bug 14 — Abstract class instantiation doesn't raise TypeError~~
 
-**Severity:** Wrong output (missing error)  
-**Status:** OPEN  
-**Pattern:**
-```python
-from abc import ABC, abstractmethod
-class Shape(ABC):
-    @abstractmethod
-    def area(self):
-        pass
-Shape()  # Should raise TypeError
-# CPython: TypeError: Can't instantiate abstract class ...
-# Fastpy:  no error
-```
-
-**Root cause:** The ABC metaclass enforcement isn't implemented — abstract
-classes can be instantiated without implementing abstract methods.
+**Status:** FIXED  
+**Fix:** `@abstractmethod` decorators are now tracked per class in `ClassInfo.abstract_methods`.
+Abstract methods are inherited from parents unless the child provides a concrete override.
+`_emit_constructor` checks for unimplemented abstract methods and raises TypeError.
 
 ---
 
-## Bug 15 — Async generator segfaults
+## ~~Bug 15 — Async generator segfaults~~
 
-**Severity:** Segfault  
-**Status:** OPEN  
-**Pattern:**
-```python
-async def agen():
-    for i in range(3):
-        yield i
-
-async def main():
-    async for x in agen():
-        print(x)
-```
-
-**Root cause:** Async generators (`async def` with `yield`) aren't fully
-supported.  The `async for` protocol likely doesn't handle the async
-generator object correctly.
+**Status:** FIXED  
+**Fix:** `_expand_generators` now detects `AsyncFunctionDef` nodes containing
+yield and converts them to sync via `_async_to_sync` before generator expansion.
+The resulting regular generator function goes through the normal state-machine
+pipeline, and `async for` is stripped to regular `for` during async-to-sync.
 
 ---
 
-## Bug 16 — `self.attr = None` corrupts type inference when attr was int
+## ~~Bug 16 — `self.attr = None` corrupts type inference when attr was int~~
 
-**Severity:** Segfault / wrong output  
-**Status:** OPEN  
-**Pattern:**
-```python
-class C:
-    def __init__(self):
-        self._x = 10
-    def reset(self):
-        self._x = None
-
-c = C()
-c._x = 42
-print(c._x)
-# CPython: 42
-# Fastpy:  segfault
-```
-
-**Root cause:** When any method assigns `None` to an attribute that was
-initialized as `int` in `__init__`, the static type inference for that
-attribute's slot may be corrupted (slot type changes from int to
-None/mixed), causing the setter to write to the wrong slot type or the
-getter to misinterpret the stored value.
+**Status:** FIXED  
+**Fix:** Rule 1 in `_detect_class_container_attrs` (which marks attrs as
+`obj_attr` when assigned None) now skips attrs that also receive scalar
+literal assignments (int/float) in any method. This prevents the attr read
+path from misinterpreting scalar values as pointers (inttoptr segfault).

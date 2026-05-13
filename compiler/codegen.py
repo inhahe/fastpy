@@ -476,6 +476,7 @@ class ClassInfo:
     properties: set = None              # set of method names marked @property
     match_args: list = None             # __match_args__ tuple entries (list[str])
     own_method_names: set = None        # methods defined in this class body (not inherited)
+    abstract_methods: set = None        # methods decorated with @abstractmethod
 
 # Type tag constants for our tagged value system (future use)
 TAG_INT = 0
@@ -1853,6 +1854,8 @@ class CodeGen:
         self.runtime["namedtuple_register"] = ir.Function(self.module, ft, name="fastpy_namedtuple_register")
         ft = ir.FunctionType(i8_ptr, [i32, i32])  # namedtuple_new(type_id, n_fields) -> tuple
         self.runtime["namedtuple_new"] = ir.Function(self.module, ft, name="fastpy_namedtuple_new")
+        ft = ir.FunctionType(void, [i8_ptr, i32])  # namedtuple_print(tuple, type_id) -> void
+        self.runtime["namedtuple_print"] = ir.Function(self.module, ft, name="fastpy_namedtuple_print")
         # ChainMap
         ft = ir.FunctionType(i8_ptr, [])  # chainmap_new() -> chainmap
         self.runtime["chainmap_new"] = ir.Function(self.module, ft, name="fastpy_chainmap_new")
@@ -10392,6 +10395,17 @@ class CodeGen:
         """
         to_expand: list[tuple[int, ast.FunctionDef]] = []
         for i, node in enumerate(tree.body):
+            # Handle async generator functions: convert to sync first so
+            # the generator expansion can process them (Bug 15).
+            if isinstance(node, ast.AsyncFunctionDef):
+                has_yield = any(isinstance(n, (ast.Yield, ast.YieldFrom))
+                                for n in ast.walk(node))
+                if has_yield:
+                    sync_node = self._async_to_sync(node)
+                    tree.body[i] = sync_node
+                    node = sync_node
+                else:
+                    continue
             if not isinstance(node, ast.FunctionDef):
                 continue
             # All generators need native expansion (list-collection is broken
@@ -11067,6 +11081,11 @@ class CodeGen:
         #     try: target = next(...)
         #     except StopIteration: _done = True
         preprocessed_for_body = self._gen_preprocess_body(node.body)
+        # Rewrite `continue` in the body to first fetch the next element.
+        # Without this, `continue` skips the trailing _make_try_next(),
+        # causing an infinite loop on the same element.
+        preprocessed_for_body = self._gen_rewrite_continue_with_fetch(
+            preprocessed_for_body, _make_try_next)
         while_body = preprocessed_for_body + [_make_try_next()]
 
         while_node = ast.While(
@@ -11086,6 +11105,66 @@ class CodeGen:
             ast.copy_location(s, loc)
         ast.fix_missing_locations(stmts[0])
         return stmts
+
+    def _gen_rewrite_continue_with_fetch(
+        self,
+        body: list[ast.stmt],
+        make_try_next: callable,
+    ) -> list[ast.stmt]:
+        """Replace `continue` statements in the body with a sequence that
+        fetches the next iterator element before continuing. This prevents
+        infinite loops when `continue` is used in the lookahead-pattern
+        iter-based for-to-while conversion.
+
+        The replacement is: [try_next_stmt, continue].
+        Only replaces at the current loop level (does not descend into
+        nested while/for loops which have their own continue targets).
+        """
+        result: list[ast.stmt] = []
+        for stmt in body:
+            if isinstance(stmt, ast.Continue):
+                # Insert fetch-next before the continue
+                result.append(make_try_next())
+                result.append(stmt)
+            elif isinstance(stmt, ast.If):
+                # Recurse into if/elif/else branches (same loop level)
+                new_if = ast.If(
+                    test=stmt.test,
+                    body=self._gen_rewrite_continue_with_fetch(
+                        stmt.body, make_try_next),
+                    orelse=self._gen_rewrite_continue_with_fetch(
+                        stmt.orelse, make_try_next))
+                ast.copy_location(new_if, stmt)
+                result.append(new_if)
+            elif isinstance(stmt, (ast.Try, ast.TryStar)):
+                # Recurse into try body and handlers (same loop level)
+                new_try = ast.Try(
+                    body=self._gen_rewrite_continue_with_fetch(
+                        stmt.body, make_try_next),
+                    handlers=[
+                        ast.ExceptHandler(
+                            type=h.type, name=h.name,
+                            body=self._gen_rewrite_continue_with_fetch(
+                                h.body, make_try_next))
+                        for h in stmt.handlers],
+                    orelse=self._gen_rewrite_continue_with_fetch(
+                        stmt.orelse, make_try_next),
+                    finalbody=stmt.finalbody)
+                ast.copy_location(new_try, stmt)
+                result.append(new_try)
+            elif isinstance(stmt, ast.With):
+                # Recurse into with body (same loop level)
+                new_with = ast.With(
+                    items=stmt.items,
+                    body=self._gen_rewrite_continue_with_fetch(
+                        stmt.body, make_try_next))
+                ast.copy_location(new_with, stmt)
+                result.append(new_with)
+            else:
+                # While/For are nested loops — don't recurse (their
+                # continues target their own loop, not ours)
+                result.append(stmt)
+        return result
 
     def _gen_for_range_to_while(
         self,
@@ -12769,6 +12848,7 @@ class CodeGen:
         classmethods: set = set()
         staticmethods: set = set()
         properties: set = set()
+        abstract_methods: set = set()
         init_arg_count = 0
         init_defaults: list = []
 
@@ -12826,6 +12906,8 @@ class CodeGen:
                     staticmethods.add(method_name)
                 if is_property:
                     properties.add(method_name)
+                if "abstractmethod" in dec_names:
+                    abstract_methods.add(method_name)
                 if is_setter:
                     # @x.setter: compile as a separate function named x__set
                     # so it doesn't collide with the getter
@@ -12945,6 +13027,16 @@ class CodeGen:
             if has_any:
                 _init_dg = dg
 
+        # Inherit abstract methods from parent: if parent has abstract methods,
+        # inherit them UNLESS this class provides a concrete override.
+        _effective_abstract = set(abstract_methods)
+        if parent_name and parent_name in self._user_classes:
+            parent_abs = self._user_classes[parent_name].abstract_methods
+            if parent_abs:
+                for am in parent_abs:
+                    if am not in methods or am in abstract_methods:
+                        _effective_abstract.add(am)
+
         self._user_classes[class_name] = ClassInfo(
             name=class_name,
             class_id_global=class_id_global,
@@ -12959,6 +13051,7 @@ class CodeGen:
             properties=properties,
             match_args=match_args,
             own_method_names=_own_method_names,
+            abstract_methods=_effective_abstract,
         )
 
         # Monomorphized variants: propagate class-level dicts from the
@@ -13170,6 +13263,28 @@ class CodeGen:
                                     and pp not in param_classes):
                                 param_classes[pp] = sub_pc[carg.id]
 
+        # Pre-scan: collect attrs that receive scalar literal assignments
+        # (int, float, bool) in any method.  Used by Rule 1 to avoid
+        # marking an attr as obj_attr when it's primarily a scalar that
+        # sometimes gets set to None (e.g. self._val = 10 in __init__,
+        # self._val = None in deleter).  Without this, the attr read path
+        # returns the data as a pointer which segfaults for scalar values.
+        _scalar_assigned_attrs: set[str] = set()
+        for _sa_method in node.body:
+            if not isinstance(_sa_method, ast.FunctionDef):
+                continue
+            for _sa_n in ast.walk(_sa_method):
+                if isinstance(_sa_n, ast.Assign):
+                    for _sa_tgt in _sa_n.targets:
+                        if (isinstance(_sa_tgt, ast.Attribute)
+                                and isinstance(_sa_tgt.value, ast.Name)
+                                and _sa_tgt.value.id == "self"
+                                and isinstance(_sa_n.value, ast.Constant)
+                                and isinstance(_sa_n.value.value, (int, float))
+                                and _sa_n.value.value is not True
+                                and _sa_n.value.value is not False):
+                            _scalar_assigned_attrs.add(_sa_tgt.attr)
+
         # Scan ALL methods (not just __init__) for `self.attr = <typed>`
         # assignments. Covers patterns like `n.next = other_node` where
         # `next` is later set outside __init__.
@@ -13234,8 +13349,14 @@ class CodeGen:
                                 obj_attrs.add(tgt.attr)
                                 obj_attr_types[tgt.attr] = param_classes[n.value.id]
                             # Rule 1: self.attr = None → nullable obj ref
+                            # Skip when the attr also receives scalar literals
+                            # (int/float) — the attr is primarily a scalar with
+                            # None as a sentinel, not an object reference.
+                            # Treating it as obj_attr would cause the read path
+                            # to inttoptr the scalar data → segfault (Bug 16).
                             elif (isinstance(n.value, ast.Constant)
-                                  and n.value.value is None):
+                                  and n.value.value is None
+                                  and tgt.attr not in _scalar_assigned_attrs):
                                 obj_attrs.add(tgt.attr)
                             # Rule 2: self.attr = param where param has attr
                             # access in the same method body (param is obj)
@@ -26295,6 +26416,15 @@ class CodeGen:
                 class_name, node.args, node.keywords)
         cls_info = self._user_classes[class_name]
 
+        # ABC enforcement: raise TypeError when instantiating a class
+        # with unimplemented abstract methods (Bug 14).
+        if cls_info.abstract_methods:
+            abs_names = sorted(cls_info.abstract_methods)
+            msg = (f"Can't instantiate abstract class {class_name} "
+                   f"with abstract method{'s' if len(abs_names) > 1 else ''} "
+                   f"{', '.join(abs_names)}")
+            return self._emit_type_error(msg, node)
+
         # Create new object — call __new__ if the class defines one,
         # otherwise use the default obj_new allocator.
         class_id = self.builder.load(cls_info.class_id_global)
@@ -27696,6 +27826,29 @@ class CodeGen:
             data = self.builder.ptrtoint(tup, i64)
             self.builder.call(self.runtime["fv_print"], [tag, data])
             return
+        # Namedtuple instance: print with field names (Bug 13 fix).
+        # Check if the variable is a known namedtuple instance; if so,
+        # use namedtuple_print which includes the type name and field names.
+        _nt_instances = getattr(self, '_namedtuple_instances', {})
+        if (isinstance(node, ast.Name) and node.id in _nt_instances):
+            _nt_info = _nt_instances[node.id]
+            tup = self._emit_expr_value(node)
+            tup = self._ensure_ptr(tup)
+            # Find the variable holding the type_id: it's the key in
+            # _namedtuple_types whose value matches this _nt_info.
+            _nt_types = getattr(self, '_namedtuple_types', {})
+            _type_var = None
+            for _tv, _ti in _nt_types.items():
+                if _ti is _nt_info or _ti.get("type_name") == _nt_info.get("type_name"):
+                    _type_var = _tv
+                    break
+            if _type_var and _type_var in self.variables:
+                type_id = self._load_variable(_type_var, node)
+                if isinstance(type_id.type, ir.IntType) and type_id.type.width == 64:
+                    type_id = self.builder.trunc(type_id, i32)
+                self.builder.call(
+                    self.runtime["namedtuple_print"], [tup, type_id])
+                return
         fv = self._load_or_wrap_fv(node)
         self._emit_try_bail_if_exc()
         tag, data = self._fv_unpack(fv)
