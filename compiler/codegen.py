@@ -10995,7 +10995,24 @@ class CodeGen:
         return stmts
 
     def _gen_for_to_while(self, node: ast.For) -> list[ast.stmt]:
-        """Convert a for-loop with yield into equivalent while-loop statements."""
+        """Convert a for-loop with yield into equivalent while-loop statements.
+
+        Uses a "lookahead" pattern: fetch the first value BEFORE the loop,
+        then fetch the next value at the END of the loop body. This puts
+        the for-loop body directly at the while-body level (no if-guard),
+        allowing the state machine to see and handle nested while-loops
+        (from inner for-loops with yield).
+
+        Pattern:
+            _iter = iter(iterable)
+            _done = False
+            try: target = next(_iter)
+            except StopIteration: _done = True
+            while not _done:
+                <body>              # directly at while-body level
+                try: target = next(_iter)
+                except StopIteration: _done = True
+        """
         target_name = node.target.id
         idx_name = f"_idx_{target_name}"
         loc = node  # for copy_location
@@ -11007,8 +11024,6 @@ class CodeGen:
             return self._gen_for_range_to_while(node, target_name, idx_name, loc)
 
         # General iterable: use iter()/next() with try/except StopIteration.
-        # This handles generators, sets, dicts, and custom iterators — not
-        # just lists/tuples that support len() and subscript.
         iter_name = f"_iter_{target_name}"
         done_name = f"_done_{target_name}"
         stmts: list[ast.stmt] = []
@@ -11026,63 +11041,34 @@ class CodeGen:
             targets=[ast.Name(id=done_name, ctx=ast.Store())],
             value=ast.Constant(value=False)))
 
-        # while not _done_<target>:
-        #     try:
-        #         <target> = next(_iter_<target>)
-        #     except StopIteration:
-        #         _done_<target> = True
-        #     if not _done_<target>:
-        #         <body>
-        #
-        try_next = ast.Try(
-            body=[ast.Assign(
-                targets=[ast.Name(id=target_name, ctx=ast.Store())],
-                value=ast.Call(
-                    func=ast.Name(id="next", ctx=ast.Load()),
-                    args=[ast.Name(id=iter_name, ctx=ast.Load())],
-                    keywords=[]))],
-            handlers=[ast.ExceptHandler(
-                type=ast.Name(id="StopIteration", ctx=ast.Load()),
-                name=None,
+        def _make_try_next():
+            """Create: try: target = next(_iter) / except StopIteration: _done = True"""
+            return ast.Try(
                 body=[ast.Assign(
-                    targets=[ast.Name(id=done_name, ctx=ast.Store())],
-                    value=ast.Constant(value=True))])],
-            orelse=[],
-            finalbody=[])
+                    targets=[ast.Name(id=target_name, ctx=ast.Store())],
+                    value=ast.Call(
+                        func=ast.Name(id="next", ctx=ast.Load()),
+                        args=[ast.Name(id=iter_name, ctx=ast.Load())],
+                        keywords=[]))],
+                handlers=[ast.ExceptHandler(
+                    type=ast.Name(id="StopIteration", ctx=ast.Load()),
+                    name=None,
+                    body=[ast.Assign(
+                        targets=[ast.Name(id=done_name, ctx=ast.Store())],
+                        value=ast.Constant(value=True))])],
+                orelse=[],
+                finalbody=[])
 
-        # Split the for-loop body at the first top-level yield.
-        # Statements before and including the yield go inside the
-        # `if not done:` guard.  Statements AFTER the yield go at
-        # the while-body level — they become part of the post-yield
-        # segment (next state) in the state machine.  Without this
-        # split, post-yield code is unreachable because
-        # _gen_yields_to_returns turns the yield into a `return`.
+        # Lookahead: fetch first value BEFORE the loop
+        stmts.append(_make_try_next())
+
+        # while not _done:
+        #     <body>                  # at while-body level — visible to state machine
+        #     try: target = next(...)
+        #     except StopIteration: _done = True
         preprocessed_for_body = self._gen_preprocess_body(node.body)
-        _yield_idx = None
-        for _bi, _bs in enumerate(preprocessed_for_body):
-            if (isinstance(_bs, ast.Expr)
-                    and isinstance(_bs.value, ast.Yield)):
-                _yield_idx = _bi
-                break
-            if (isinstance(_bs, ast.Assign)
-                    and isinstance(_bs.value, ast.Yield)):
-                _yield_idx = _bi
-                break
-        if _yield_idx is not None and _yield_idx < len(preprocessed_for_body) - 1:
-            guard_body = preprocessed_for_body[:_yield_idx + 1]
-            post_yield = preprocessed_for_body[_yield_idx + 1:]
-        else:
-            guard_body = preprocessed_for_body
-            post_yield = []
+        while_body = preprocessed_for_body + [_make_try_next()]
 
-        body_guard = ast.If(
-            test=ast.UnaryOp(
-                op=ast.Not(),
-                operand=ast.Name(id=done_name, ctx=ast.Load())),
-            body=guard_body,
-            orelse=[])
-
-        while_body = [try_next, body_guard] + post_yield
         while_node = ast.While(
             test=ast.UnaryOp(
                 op=ast.Not(),
@@ -11425,10 +11411,10 @@ class CodeGen:
                 and node.test.value is True)
 
     def _gen_body_has_yield(self, stmts: list[ast.stmt]) -> bool:
-        """Check if any statement in the list (recursively) contains a yield."""
+        """Check if any statement in the list (recursively) contains a yield or yield from."""
         for stmt in stmts:
             for child in ast.walk(stmt):
-                if isinstance(child, ast.Yield):
+                if isinstance(child, (ast.Yield, ast.YieldFrom)):
                     return True
         return False
 
