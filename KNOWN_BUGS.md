@@ -109,21 +109,18 @@ setters use `x__set`). `del obj.prop` dispatches to the deleter method.
 
 ---
 
-## Bug 12 — `__mro__` access segfaults
+## ~~Bug 12 — `__mro__` access segfaults~~
 
-**Severity:** Segfault  
-**Status:** OPEN  
-**Pattern:**
-```python
-class D(B, C):
-    pass
-print([cls.__name__ for cls in D.__mro__])
-# CPython: ['D', 'B', 'C', 'A', 'object']
-# Fastpy:  segfault
-```
-
-**Root cause:** Accessing `__mro__` on a class object likely returns an
-invalid pointer or unsupported type, causing a segfault when iterated.
+**Status:** FIXED  
+**Fix:** Implemented type proxy system for MRO representation. A lightweight
+`_TypeProxy` meta-class (single `__name__` slot) is lazy-registered once per
+module. `Class.__mro__` returns a cached tuple of type proxy objects with
+correct C3-linearized order (including `object` root). All type inference paths
+(`_infer_type_tag`, `_emit_expr`, `_get_list_elem_type`, `_is_tuple_expr`)
+recognize `__mro__` as TUPLE with OBJ elements. `__name__` handler excludes
+VKind.FVALUE from compile-time constant path to allow runtime dispatch on
+type proxy objects. FV-aware attribute access added to list append for
+OBJ/FVALUE variables.
 
 ---
 

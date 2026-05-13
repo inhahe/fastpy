@@ -14443,6 +14443,128 @@ class CodeGen:
                 self.runtime["exc_register_class"],
                 [name_ptr, parent_ptr])
 
+    # ------------------------------------------------------------------
+    # __mro__ support: type proxy class + MRO tuple builder
+    # ------------------------------------------------------------------
+
+    def _ensure_type_proxy_class(self) -> None:
+        """Register the _TypeProxy meta-class (once per module, lazy).
+
+        Creates a lightweight class with a single ``__name__`` slot so
+        that ``ClassName.__mro__`` can return a tuple of real FpyObj*
+        instances whose ``.__name__`` attribute is accessible at runtime.
+        The class is registered lazily at runtime (guarded by a -1
+        sentinel) so it costs nothing for programs that never access
+        ``__mro__``.
+        """
+        if hasattr(self, '_type_proxy_class_id_global'):
+            return
+
+        gvar = ir.GlobalVariable(self.module, i32,
+                                 name="fastpy.type_proxy_class_id")
+        gvar.initializer = ir.Constant(i32, -1)
+        gvar.linkage = "private"
+        self._type_proxy_class_id_global = gvar
+
+        # Guard: register only once even if _emit_mro_tuple is called
+        # from a function invoked multiple times.
+        loaded = self.builder.load(gvar)
+        is_registered = self.builder.icmp_signed(
+            ">=", loaded, ir.Constant(i32, 0))
+
+        reg_block = self._new_block("type_proxy.reg")
+        done_block = self._new_block("type_proxy.done")
+        self.builder.cbranch(is_registered, done_block, reg_block)
+
+        self.builder.position_at_end(reg_block)
+        name_ptr = self._make_string_constant("type")
+        class_id = self.builder.call(
+            self.runtime["register_class"],
+            [name_ptr, ir.Constant(i32, -1)])
+        self.builder.store(class_id, gvar)
+        self.builder.call(
+            self.runtime["set_class_slot_count"],
+            [class_id, ir.Constant(i32, 1)])
+        slot_name = self._make_string_constant("__name__")
+        self.builder.call(
+            self.runtime["register_slot_name"],
+            [class_id, ir.Constant(i32, 0), slot_name])
+        self.builder.branch(done_block)
+
+        self.builder.position_at_end(done_block)
+
+    def _emit_mro_tuple(self, class_name: str) -> ir.Value:
+        """Build a tuple of type proxy objects representing the class MRO.
+
+        Each element is a lightweight FpyObj with a ``__name__`` slot
+        holding the class name string.  The result is cached in a global
+        so repeated accesses return the same tuple.
+        """
+        # Resolve MRO names (compile-time data)
+        mro_names = getattr(self, '_class_mro', {}).get(class_name)
+        if mro_names is None:
+            # Fallback: walk single-inheritance parent chain
+            mro_names = [class_name]
+            cn = class_name
+            while (cn in self._user_classes
+                   and self._user_classes[cn].parent_name):
+                cn = self._user_classes[cn].parent_name
+                mro_names.append(cn)
+
+        # Append "object" as the MRO root (matches CPython behavior).
+        if not mro_names or mro_names[-1] != "object":
+            mro_names = list(mro_names)  # don't mutate cached list
+            mro_names.append("object")
+
+        # Ensure the _TypeProxy meta-class is set up
+        self._ensure_type_proxy_class()
+
+        # Per-class global to cache the MRO tuple (built once at runtime)
+        if not hasattr(self, '_mro_globals'):
+            self._mro_globals: dict[str, ir.GlobalVariable] = {}
+
+        if class_name not in self._mro_globals:
+            gvar = ir.GlobalVariable(
+                self.module, i8_ptr,
+                name=f"fastpy.mro.{class_name}")
+            gvar.initializer = ir.Constant(i8_ptr, None)
+            gvar.linkage = "private"
+            self._mro_globals[class_name] = gvar
+
+        gvar = self._mro_globals[class_name]
+
+        # Lazy init: build only on first access
+        cached = self.builder.load(gvar)
+        is_null = self.builder.icmp_unsigned(
+            "==", cached, ir.Constant(i8_ptr, None))
+        build_block = self._new_block(f"mro.build.{class_name}")
+        done_block = self._new_block(f"mro.done.{class_name}")
+        self.builder.cbranch(is_null, build_block, done_block)
+
+        # Build block: create tuple of type proxy objects
+        self.builder.position_at_end(build_block)
+        tup = self.builder.call(self.runtime["tuple_new"], [])
+
+        proxy_id = self.builder.load(self._type_proxy_class_id_global)
+        for name in mro_names:
+            obj = self.builder.call(self.runtime["obj_new"], [proxy_id])
+            name_ptr = self._make_string_constant(name)
+            data = self.builder.ptrtoint(name_ptr, i64)
+            self.builder.call(self.runtime["obj_set_slot"], [
+                obj, ir.Constant(i32, 0),
+                ir.Constant(i32, FPY_TAG_STR), data])
+            obj_data = self.builder.ptrtoint(obj, i64)
+            self.builder.call(self.runtime["list_append_fv"], [
+                tup,
+                ir.Constant(i32, FPY_TAG_OBJ), obj_data])
+
+        self.builder.store(tup, gvar)
+        self.builder.branch(done_block)
+
+        # Done block: return the (cached or just-built) tuple
+        self.builder.position_at_end(done_block)
+        return self.builder.load(gvar)
+
     def _emit_class_registration(self, cls_info: ClassInfo) -> None:
         """Emit runtime calls to register a class and its methods."""
         # Get parent class_id
@@ -15924,6 +16046,9 @@ class CodeGen:
             # __name__ / __qualname__ → return class name as string constant
             if node.attr in ("__name__", "__qualname__"):
                 return self._make_string_constant(class_name)
+            # __mro__ → return a tuple of type proxy objects
+            if node.attr == "__mro__":
+                return self._emit_mro_tuple(class_name)
             # Mutable class var — load from the LLVM global
             key = (class_name, node.attr)
             if key in getattr(self, "_class_var_globals", {}):
@@ -15997,10 +16122,13 @@ class CodeGen:
                 return self._make_string_constant(_resolved)
             # Variable holding a callable: NOT an FpyObj, so obj_get_fv
             # would segfault.  Return the resolved name as a string.
+            # Exclude types that may hold real objects at runtime (OBJ,
+            # FVALUE, etc.) — those need runtime attribute access.
             if _fname in self.variables:
                 _vk = self._var_kind(_fname)
                 if _vk not in (VKind.OBJ, VKind.DICT, VKind.LIST,
-                               VKind.TUPLE, VKind.SET, VKind.PYOBJ):
+                               VKind.TUPLE, VKind.SET, VKind.PYOBJ,
+                               VKind.FVALUE):
                     return self._make_string_constant(_resolved)
 
         obj = self._emit_expr_value(node.value)
@@ -17655,6 +17783,12 @@ class CodeGen:
         # Attribute access: detect container (list/dict) and object attrs
         # so len(), print, and binops dispatch correctly.
         if isinstance(node, ast.Attribute):
+            # ClassName.__mro__ → tuple of type proxy objects
+            if (isinstance(node.value, ast.Name)
+                    and node.value.id in self._user_classes
+                    and node.attr == "__mro__"):
+                return ValueType(VKind.TUPLE,
+                                 elem_type=ValueType(VKind.OBJ))
             # Exception variable .args → tuple type
             if (isinstance(node.value, ast.Name)
                     and node.value.id in self._exc_vars
@@ -20270,6 +20404,13 @@ class CodeGen:
                 and node.value.id in self._exc_vars
                 and node.attr == "args"):
             return TypedValue(val, ValueType(VKind.TUPLE))
+        # ClassName.__mro__ → tuple of type proxy objects
+        if (isinstance(node, ast.Attribute)
+                and node.attr == "__mro__"
+                and isinstance(node.value, ast.Name)
+                and node.value.id in self._user_classes):
+            return TypedValue(val, ValueType(VKind.TUPLE,
+                                             elem_type=ValueType(VKind.OBJ)))
         # Default: infer type
         vtype = self._infer_type_tag(node, val)
         return TypedValue(val, vtype)
@@ -28344,12 +28485,22 @@ class CodeGen:
             # captured function parameter).  These are NOT FpyObj instances,
             # so obj_get_fv would segfault.  Return the resolved name (or
             # variable name as fallback) as a compile-time string.
+            # Exclude types that may hold real objects at runtime (OBJ,
+            # FVALUE, etc.) — those need runtime attribute access.
             if _dunder_name in self.variables:
                 _vk = self._var_kind(_dunder_name)
                 if _vk not in (VKind.OBJ, VKind.DICT, VKind.LIST,
-                               VKind.TUPLE, VKind.SET, VKind.PYOBJ):
+                               VKind.TUPLE, VKind.SET, VKind.PYOBJ,
+                               VKind.FVALUE):
                     s = self._make_string_constant(_resolved)
                     return self._fv_from_str(s)
+        # Class.__mro__ → return a tuple of type proxy objects as FV(LIST)
+        if (isinstance(node, ast.Attribute)
+                and node.attr == "__mro__"
+                and isinstance(node.value, ast.Name)
+                and node.value.id in self._user_classes):
+            tup = self._emit_mro_tuple(node.value.id)
+            return self._fv_from_list(tup)
         # Object attribute access: load the FV directly via obj_get_slot
         # (or obj_get_fv as fallback) so the runtime tag is preserved.
         if (isinstance(node, ast.Attribute)
@@ -28941,6 +29092,12 @@ class CodeGen:
 
     def _get_list_elem_type(self, node: ast.expr) -> 'ValueType':
         """Get the element type of a list expression."""
+        # ClassName.__mro__ → elements are type proxy FpyObj instances
+        if (isinstance(node, ast.Attribute)
+                and node.attr == "__mro__"
+                and isinstance(node.value, ast.Name)
+                and node.value.id in self._user_classes):
+            return ValueType(VKind.OBJ)
         # self.attr on the current class: resolve through __init__ AST
         # to find the assignment `self.attr = [...]` and infer elem type
         # from the literal.  Also walks parent classes.
@@ -29645,6 +29802,11 @@ class CodeGen:
 
     def _is_tuple_expr(self, node: ast.expr) -> bool:
         if isinstance(node, ast.Tuple):
+            return True
+        # ClassName.__mro__ → tuple of type proxy objects
+        if (isinstance(node, ast.Attribute) and node.attr == "__mro__"
+                and isinstance(node.value, ast.Name)
+                and node.value.id in self._user_classes):
             return True
         # Exception variable .args → tuple
         if (isinstance(node, ast.Attribute) and node.attr == "args"
@@ -40744,6 +40906,22 @@ class CodeGen:
             self.builder.call(self.runtime["list_append_fv"],
                               [list_ptr, ir.Constant(i32, FPY_TAG_OBJ), data])
             return
+
+        # Attribute access on OBJ-typed variable: the slot may hold any
+        # type (STR, INT, OBJ, etc.).  Use the FV path to preserve the
+        # runtime tag.  Without this, obj_get_fv's data (e.g. a string
+        # pointer) would be misidentified as INT by the i64 fallback.
+        if (isinstance(node, ast.Attribute)
+                and isinstance(node.value, ast.Name)
+                and self._has_var(node.value.id)
+                and self._var_kind(node.value.id) in (VKind.OBJ, VKind.FVALUE)):
+            fv = self._load_or_wrap_fv(node)
+            if hasattr(fv.type, 'elements') and fv.type == fpy_val:
+                tag = self.builder.extract_value(fv, 0)
+                data = self.builder.extract_value(fv, 1)
+                self.builder.call(self.runtime["list_append_fv"],
+                                  [list_ptr, tag, data])
+                return
 
         # BigInt constants / expressions — tag as BIGINT, not INT
         if self._is_bigint_expr(node):
