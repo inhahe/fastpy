@@ -418,18 +418,30 @@ def _find_msvc_cl() -> str | None:
     """Find cl.exe by setting up MSVC environment via vcvars64.bat.
 
     Returns a bat preamble string that sets up the environment, or None
-    if MSVC cannot be found. Searches VS 2026 down to 2019 so the newest
-    available version is preferred.
+    if MSVC cannot be found. Enumerates all VS installations under both
+    Program Files directories (handles year-named and version-named
+    folders like '2022', '18', etc.) and falls back to vswhere.exe.
     """
-    for year in ["2026", "2025", "2024", "2022", "2019"]:
-        for edition in ["Community", "Enterprise", "Professional", "BuildTools"]:
-            vcvars = (
-                f"C:\\Program Files\\Microsoft Visual Studio\\{year}\\{edition}"
-                f"\\VC\\Auxiliary\\Build\\vcvars64.bat"
-            )
-            if Path(vcvars).exists():
-                return f'call "{vcvars}" 1>NUL 2>NUL'
-    # Last resort: use vswhere.exe (handles any edition/year)
+    editions = ["Community", "Enterprise", "Professional", "BuildTools"]
+    bases = [
+        Path(r"C:\Program Files\Microsoft Visual Studio"),
+        Path(r"C:\Program Files (x86)\Microsoft Visual Studio"),
+    ]
+    for base in bases:
+        if not base.is_dir():
+            continue
+        # Enumerate version/year subdirectories, newest first
+        subdirs = sorted(
+            [d for d in base.iterdir() if d.is_dir() and d.name != "Installer"],
+            key=lambda d: d.name,
+            reverse=True,
+        )
+        for subdir in subdirs:
+            for edition in editions:
+                vcvars = subdir / edition / "VC" / "Auxiliary" / "Build" / "vcvars64.bat"
+                if vcvars.exists():
+                    return f'call "{vcvars}" 1>NUL 2>NUL'
+    # Last resort: use vswhere.exe (handles any edition/year/path)
     vswhere = Path(
         r"C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe"
     )
