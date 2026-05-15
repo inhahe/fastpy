@@ -99,7 +99,7 @@ result = compile_source('print("hello world")')
 
 ## What's supported
 
-### Language features (66/66 audit, 405/405 tests, 101/101 regressions)
+### Language features (66/66 audit, 836 tests passing)
 
 **Error reporting:**
 - **Syntax errors**: CPython-quality display with source line, caret, and column position (via `traceback.format_exception_only`)
@@ -113,7 +113,7 @@ result = compile_source('print("hello world")')
 - **Strings**: f-strings (with `=`, `!r`, format specs), all common methods (split, join, replace, strip, find, upper, lower, etc.), `%` formatting, `.format()`
 - **Generators**: yield, yield from, generator expressions, native send/close/throw (state-machine compilation)
 - **Async**: async def, await, `asyncio.run()`, `asyncio.gather()`, `asyncio.sleep()` — all compiled natively (sequential execution, no CPython bridge)
-- **Pattern matching**: match/case with literal, capture, guard, or, wildcard, sequence, singleton (None/True/False) patterns (missing: star/mapping/class patterns — see [UNIMPLEMENTED.md](UNIMPLEMENTED.md))
+- **Pattern matching**: match/case with literal, capture, guard, or, wildcard, sequence, singleton (None/True/False), star (`[first, *rest]`), mapping (`{"key": val}`), class (`Point(x=1)`) patterns
 - **Exceptions**: try/except/finally/else, except* (ExceptionGroup), bare raise, raise from
 - **Multi-file compilation**: `from mymodule import func` resolves local `.py` files and packages (`mylib/module.py`), compiles them inline. Recursive import resolution with circular import detection.
 - **Imports**: native math/json/os/asyncio/weakref, local `.py` modules compiled inline, `.pyd` modules via CPython bridge
@@ -193,7 +193,7 @@ Under CPython: markers are ignored by `Annotated`; i64 constructors return `int(
 source.py  -->  ast.parse()  -->  CodeGen  -->  LLVM IR  -->  .obj  -->  .exe/.elf
                                     |                          |
                               compiler/codegen.py     MSVC (Windows) / gcc/clang (Linux/macOS)
-                              (Python, ~21k lines)            |
+                              (Python, ~40k lines)            |
                                                      runtime/*.c (linked in)
 ```
 
@@ -214,7 +214,7 @@ source.py  -->  ast.parse()  -->  CodeGen  -->  LLVM IR  -->  .obj  -->  .exe/.e
 | `fastpy/` | CPython-compatible shim package: `Unchecked`/`Checked`/`Unchecked32`/`Checked32` markers, `unchecked_int()`/`checked_int()`/`unchecked_int32()`/`checked_int32()`, `Int32`/`UInt32`/`Int64`/`UInt64` |
 | `fastpy/_fastints.c` | CPython C extension for `Int32`/`UInt32`/`Int64`/`UInt64` fixed-width types (replaces pure-Python `ints.py` for speed) |
 | `setup.py` | Build script for the C extension (`python setup.py build_ext --inplace`) |
-| `tests/` | Differential test suite (405 tests, compared against CPython) + 96 regression tests |
+| `tests/` | Differential test suite (836 tests, compared against CPython) |
 | `audit_features.py` | Python 3.14 feature coverage audit (66 features) |
 | `benchmarks/` | Performance benchmarks vs C++ and CPython |
 
@@ -257,7 +257,7 @@ python -m compiler myprogram.py -o myprogram.exe
 - **`re` module** routes through CPython bridge (full regex engine is impractical to reimplement natively)
 - **.pyd/.so imports** (numpy, etc.) use CPython bridge for bindings — the extension's C code runs natively, only the PyObject* marshalling goes through the bridge
 
-See [UNIMPLEMENTED.md](UNIMPLEMENTED.md) for the full list.
+See [MODULE_SUPPORT.md](MODULE_SUPPORT.md) for the full module support matrix.
 
 ## License
 

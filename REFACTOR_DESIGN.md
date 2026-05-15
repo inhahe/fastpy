@@ -2,10 +2,10 @@
 
 ## Problem Statement
 
-The current codegen (codegen.py, ~21K lines) grew organically to support Python
-features as they were needed. It works — Django/Wagtail runs, 104/104 stdlib files
-compile natively, 405/405 tests pass — but had accumulated architectural debt
-that made further progress increasingly expensive:
+The current codegen (codegen.py, ~40K lines) grew organically to support Python
+features as they were needed. It works — 104/104 stdlib files compile natively,
+836 tests pass — but had accumulated architectural debt that made further
+progress increasingly expensive:
 
 1. **Type information is lost between stages.** A value starts as a known list pointer,
    gets stored as i64 in an FpyValue, gets loaded and unwrapped to i64, then crashes
@@ -348,40 +348,40 @@ def _emit_native_module_call(self, mod, func, node) -> TypedValue | None:
 
 The rewrite doesn't need to happen all at once. The plan:
 
-### Phase 1: TypedValue foundation -- COMPLETE
+### Phase 1: TypedValue foundation — ✅ COMPLETE
 - Defined `VKind`, `ValueType`, `TypedValue` classes in codegen.py
 - Added `_emit_expr()` as a wrapper around `_emit_expr_value()` that infers type
 - Added `_rt_call_typed()` alongside existing `_rt_call`
 - No behavior changes, just new parallel API
 
-### Phase 2: Expression emitters -- COMPLETE
+### Phase 2: Expression emitters — ✅ COMPLETE
 - Converted `_emit_expr_value` callers to use `_emit_expr` with TypedValue
 - Each conversion independently tested
 - Leaf nodes (constants, variables), then operators, then calls
 
-### Phase 3: Variable storage -- COMPLETE
+### Phase 3: Variable storage — ✅ COMPLETE
 - Replaced string tags with `ValueType` in `self.variables`
 - `_store_variable` and `_load_variable` use `ValueType`
 
-### Phase 4: Bridge fallbacks -- COMPLETE
+### Phase 4: Bridge fallbacks — ✅ COMPLETE
 - Added bridge fallback to every operation that previously raised CodeGenError
-- Deleted "Unsupported X" error paths -- replaced with bridge calls
+- Deleted "Unsupported X" error paths — replaced with bridge calls
 - SafeIRBuilder auto-coerces all LLVM type mismatches (call, icmp, fadd,
   store, ret, phi, select)
 - Result: 104/104 stdlib files compile (up from 17/104)
 
-### Phase 5: Module registry -- PENDING
+### Phase 5: Module registry — PENDING
 - Convert the if/elif chain to a dispatch dict
 - Each module handler becomes a small function or lambda
 
-### Phase 6: Cleanup -- PENDING
+### Phase 6: Cleanup — PENDING
 - Remove old `_emit_expr_value` (replaced by `_emit_expr`)
 - Remove old `_bare_to_tag_data` (replaced by `TypedValue.as_fv`)
 - Remove old `_infer_type_tag` (replaced by `TypedValue.vtype`)
 - Remove all scattered inttoptr/ptrtoint/bitcast (handled by coercion layer)
 
-Each phase is a commit that passes all regression tests. If any phase breaks
-something, we can revert to the previous phase.
+Each phase is a commit that passes all tests. If any phase breaks something,
+we can revert to the previous phase.
 
 ## Performance Considerations
 
@@ -399,8 +399,6 @@ the correct tradeoff: correctness for unknown types, speed for known types.
 ## Testing
 
 After each phase:
-1. All 405 differential tests pass
-2. All 94 regression tests pass
-3. Django+Wagtail test passes
-4. Stdlib compilation count: 104/104 (baseline after Phase 4)
-5. Benchmark numbers don't regress
+1. All 836 tests pass (differential + regression + stdlib + audit)
+2. Stdlib compilation count: 104/104 (baseline after Phase 4)
+3. Benchmark numbers don't regress

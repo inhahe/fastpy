@@ -62,9 +62,11 @@
 
 ### Performance optimizations
 - Internal linkage + alwaysinline for whole-program inlining
-- Vtable dispatch for O(1) polymorphic method calls
+- Vtable dispatch for O(1) polymorphic method calls (with CHA devirtualization)
 - Per-class typed attributes (float/str/bool)
 - FV ABI for native-typed method parameters
+- FpyClassDef struct alignment fix (72→88 bytes, correct array stride for vtable lookup)
+- Void return type detection in vtable dispatch (eliminates calling convention UB)
 
 ### Codegen refactor (Phases 1-4 complete)
 - Phase 1: TypedValue foundation (VKind, ValueType, TypedValue classes)
@@ -245,9 +247,9 @@ and scattered inttoptr/ptrtoint/bitcast calls.
 
 | Metric | Value |
 |--------|-------|
-| Differential tests | 405/405 passing |
-| Regression tests | 94/94 passing |
+| Total tests passing | 836 (1 skipped — django not installed) |
 | Stdlib .py files compiling | 104/104 |
+| Stdlib module tests | 134/134 |
 | Platforms | Windows x64, Linux x64 (WSL Ubuntu tested) |
 | Python versions | 3.11, 3.12, 3.13, 3.14 |
 | Codegen refactor phases | 4/6 complete |

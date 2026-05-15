@@ -1,11 +1,10 @@
 # fastpy future optimization plans (deferred)
 
-Context: after the big correctness + optimization session, these remaining
-optimizations were identified but deferred because their absolute gains are
-small (diminishing returns). The compiler currently hits ~147x CPython on
-tight int loops and 8-22x on class-heavy code; attribute access is already
-at ~1.5ns/op (near native struct speed). Revisit these if profiling shows
-attribute access is still a bottleneck.
+Context: after the Phase A-F refactoring, these remaining optimizations
+were identified but deferred because their absolute gains are small
+(diminishing returns). The compiler currently hits ~250x CPython on tight
+int loops and 10-280x on class-heavy code; attribute access is already
+at native struct speed. Revisit these if profiling shows a bottleneck.
 
 ## 1. Direct struct IR access — ✅ DONE (Phase 8)
 
@@ -37,21 +36,16 @@ instead of 12 (tag + data).
 Risk: significant compiler complexity; monomorphism analysis must be
 conservative or handle demotion correctly.
 
-## 3. Vtable dispatch (for the remaining dynamic method calls)
+## 3. Vtable dispatch — ✅ DONE
 
-Still not done. Direct dispatch already handles ~95% of method calls
-(when class is statically known). For the remaining cases (polymorphic
-calls on list-of-mixed-classes, function params without class info),
-dispatch goes through `obj_call_methodN` which does name lookup.
+Implemented as part of the Phase A-F refactoring. Each class gets a vtable
+array in `FpyClassDef`, methods assigned fixed indices at class declaration.
+Inherited methods share indices with parent. Runtime dispatch is
+`obj->class->vtable[method_idx](obj, args)` — O(1).
 
-A vtable would:
-- Assign each method a fixed index at class declaration
-- Inherited methods share indices with parent
-- Runtime dispatch becomes `obj->vtable[method_idx](obj, args)`
-- O(1) instead of O(N) linear scan
-
-Expected gain: ~3ns per polymorphic method call (skip name scan).
-Risk: low — similar structure to the existing slot work.
+Also includes CHA (Class Hierarchy Analysis) for devirtualization: when a
+method has only one implementation across all classes, calls are inlined
+directly without vtable lookup.
 
 ## 4. Native-typed method parameters (eliminate i64 coercion)
 
@@ -104,8 +98,8 @@ Must not apply to recursive or very large methods.
 
 ## Why these aren't urgent
 
-The compiler already hits ~280x CPython on inlinable functions and
-18-37x on class-heavy code. The remaining gap to C++ (~4x on method
-calls) comes from optimizations #4 and #5. They're worth doing if
-the target is truly native-speed OOP, but for most Python programs
-the current speed is more than sufficient.
+The compiler already hits ~250x CPython on tight loops and within 1-2x
+of C++ on most benchmarks. The remaining gap to C++ (~2.6x on multi-obj
+method calls like dist_sq) comes from optimizations #4 and #5. They're
+worth doing if the target is truly native-speed OOP, but for most Python
+programs the current speed is more than sufficient.
