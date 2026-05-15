@@ -58,12 +58,23 @@ void fastpy_format_float(double value, char *buf, int bufsize) {
 
     if (absval == 0.0 || (absval >= 1e-4 && absval < 1e16)) {
         /* Use fixed-point notation. Convert %g precision (significant digits)
-         * to %f precision (decimal places): decimal_places = sig_digits - floor(log10(absval)) - 1 */
-        int int_digits = 1;
+         * to %f precision (decimal places): decimal_places = sig_digits - int_digits.
+         * int_digits counts digits before the decimal point for values >= 1,
+         * and is negative for values < 1 to account for leading zeros. */
+        int int_digits;
         if (absval >= 1.0) {
             double tmp = absval;
             int_digits = 0;
             while (tmp >= 1.0) { tmp /= 10.0; int_digits++; }
+        } else if (absval > 0.0) {
+            /* Values < 1: count leading zeros after the decimal point.
+             * E.g. 0.0001 → int_digits = -3 so decimal_places = prec + 3. */
+            double tmp = absval;
+            int_digits = 0;
+            while (tmp < 1.0) { tmp *= 10.0; int_digits--; }
+            int_digits++;  /* adjust: 0.0001 → -4+1=-3; 0.5 → -1+1=0 */
+        } else {
+            int_digits = 1;
         }
         int decimal_places = prec - int_digits;
         if (decimal_places < 1) decimal_places = 1;
@@ -95,13 +106,37 @@ void fastpy_format_float(double value, char *buf, int bufsize) {
         }
     }
 
-    /* Fall back to %g (scientific notation for very large/small numbers) */
-    snprintf(buf, bufsize, "%.*g", prec, value);
+    /* Fall back: scientific notation for very large/small numbers.
+     * Use %e (not %g) to match CPython's convention of always using
+     * scientific notation for |value| >= 1e16 or 0 < |value| < 1e-4.
+     * %g at high precision (e.g. 17) would still use fixed-point for
+     * values like 1.2e+16 (exponent 16 < precision 17). */
+    snprintf(buf, bufsize, "%.*e", prec - 1, value);
+    /* Strip trailing zeros in the mantissa (after the dot, before 'e').
+     * CPython prints "1.2e+16" not "1.20000000000000000e+16". */
+    char *e_pos = strchr(buf, 'e');
+    if (!e_pos) e_pos = strchr(buf, 'E');
+    if (e_pos) {
+        char *dot = strchr(buf, '.');
+        if (dot && dot < e_pos) {
+            char *end = e_pos - 1;
+            while (end > dot + 1 && *end == '0') end--;
+            /* Shift 'e...' part right after the trimmed mantissa */
+            if (end + 1 != e_pos) {
+                memmove(end + 1, e_pos, strlen(e_pos) + 1);
+            }
+        }
+    }
 
     /* Ensure there's a dot or 'e' so it looks like a float */
     if (!strchr(buf, '.') && !strchr(buf, 'e') && !strchr(buf, 'E')
         && !strchr(buf, 'n') && !strchr(buf, 'i')) {
-        strcat(buf, ".0");
+        size_t len = strlen(buf);
+        if ((int)(len + 2) < bufsize) {
+            buf[len] = '.';
+            buf[len + 1] = '0';
+            buf[len + 2] = '\0';
+        }
     }
 }
 
@@ -134,19 +169,31 @@ const char* fastpy_str_concat(const char *a, const char *b) {
 }
 
 int64_t fastpy_str_len(const char *s) {
-    return (int64_t)strlen(s);
+    /* Count UTF-8 code points, not bytes.  A continuation byte has the
+     * form 10xxxxxx (top bits == 0x80, masked with 0xC0).  We skip those
+     * and count only leading bytes. */
+    int64_t count = 0;
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        if ((*p & 0xC0) != 0x80) count++;
+    }
+    return count;
 }
 
 const char* fastpy_str_index(const char *s, int64_t index) {
-    int64_t len = (int64_t)strlen(s);
+    int64_t len = fastpy_str_len(s);  /* code point count */
     if (index < 0) index += len;
     if (index < 0 || index >= len) {
         fprintf(stderr, "IndexError: string index out of range\n");
         exit(1);
     }
-    FpyString *r = fpy_str_alloc(1);
-    r->data[0] = s[index];
-    r->data[1] = '\0';
+    const unsigned char *p = (const unsigned char *)s;
+    for (int64_t i = 0; i < index; i++) {
+        p += fpy_utf8_cplen(p);
+    }
+    int clen = fpy_utf8_cplen(p);
+    FpyString *r = fpy_str_alloc(clen);
+    memcpy(r->data, p, clen);
+    r->data[clen] = '\0';
     return r->data;
 }
 
@@ -167,7 +214,7 @@ int64_t fastpy_bytes_get(const char *b, int64_t index) {
 }
 
 const char* fastpy_str_slice(const char *s, int64_t start, int64_t stop, int64_t has_start, int64_t has_stop) {
-    int64_t len = (int64_t)strlen(s);
+    int64_t len = fastpy_str_len(s);  /* code point count */
     if (!has_start) start = 0;
     if (!has_stop) stop = len;
     if (start < 0) start += len;
@@ -175,20 +222,30 @@ const char* fastpy_str_slice(const char *s, int64_t start, int64_t stop, int64_t
     if (start < 0) start = 0;
     if (stop > len) stop = len;
     if (start >= stop) {
-        char *result = (char*)malloc(1);
-        result[0] = '\0';
-        return result;
+        FpyString *r = fpy_str_alloc(0);
+        r->data[0] = '\0';
+        return r->data;
     }
-    int64_t rlen = stop - start;
-    char *result = (char*)malloc(rlen + 1);
-    memcpy(result, s + start, rlen);
-    result[rlen] = '\0';
-    return result;
+    /* Walk to start code point */
+    const unsigned char *p = (const unsigned char *)s;
+    for (int64_t i = 0; i < start; i++) {
+        p += fpy_utf8_cplen(p);
+    }
+    /* Walk from start to stop, measuring byte span */
+    const unsigned char *q = p;
+    for (int64_t i = start; i < stop; i++) {
+        q += fpy_utf8_cplen(q);
+    }
+    int64_t byte_len = q - p;
+    FpyString *r = fpy_str_alloc(byte_len);
+    memcpy(r->data, p, byte_len);
+    r->data[byte_len] = '\0';
+    return r->data;
 }
 
 const char* fastpy_str_slice_step(const char *s, int64_t start, int64_t stop,
                                    int64_t step, int64_t has_start, int64_t has_stop) {
-    int64_t len = (int64_t)strlen(s);
+    int64_t len = fastpy_str_len(s);  /* code point count */
     if (step == 0) step = 1;
     if (step > 0) {
         if (!has_start) start = 0;
@@ -204,21 +261,42 @@ const char* fastpy_str_slice_step(const char *s, int64_t start, int64_t stop,
         if (start < 0) start += len;
         if (start >= len) start = len - 1;
     }
+    /* Build byte-offset table: offsets[i] = byte offset of code point i */
+    int64_t *offsets = (int64_t *)malloc((len + 1) * sizeof(int64_t));
+    const unsigned char *p = (const unsigned char *)s;
+    for (int64_t i = 0; i < len; i++) {
+        offsets[i] = (int64_t)(p - (const unsigned char *)s);
+        p += fpy_utf8_cplen(p);
+    }
+    offsets[len] = (int64_t)(p - (const unsigned char *)s);
+    /* First pass: count result bytes */
     int64_t rlen = 0;
     if (step > 0) {
-        for (int64_t i = start; i < stop; i += step) rlen++;
+        for (int64_t i = start; i < stop; i += step)
+            rlen += offsets[i + 1] - offsets[i];
     } else {
-        for (int64_t i = start; i > stop; i += step) rlen++;
+        for (int64_t i = start; i > stop; i += step)
+            rlen += offsets[i + 1] - offsets[i];
     }
-    char *result = (char*)malloc(rlen + 1);
+    /* Second pass: copy code points */
+    FpyString *r = fpy_str_alloc(rlen);
     int64_t out = 0;
     if (step > 0) {
-        for (int64_t i = start; i < stop; i += step) result[out++] = s[i];
+        for (int64_t i = start; i < stop; i += step) {
+            int64_t cb = offsets[i + 1] - offsets[i];
+            memcpy(r->data + out, s + offsets[i], cb);
+            out += cb;
+        }
     } else {
-        for (int64_t i = start; i > stop; i += step) result[out++] = s[i];
+        for (int64_t i = start; i > stop; i += step) {
+            int64_t cb = offsets[i + 1] - offsets[i];
+            memcpy(r->data + out, s + offsets[i], cb);
+            out += cb;
+        }
     }
-    result[out] = '\0';
-    return result;
+    r->data[out] = '\0';
+    free(offsets);
+    return r->data;
 }
 
 const char* fastpy_str_repeat(const char *s, int64_t n) {
@@ -270,6 +348,63 @@ FpyList* fastpy_bytes_to_list(const char *b) {
         fpy_list_append(result, val);
     }
     return result;
+}
+
+/* Convert string to list of single-character strings: list("café") → ['c','a','f','é'] */
+FpyList* fastpy_str_to_list(const char *s) {
+    if (!s) return fpy_list_new(0);
+    int64_t len = fastpy_str_len(s);  /* code point count */
+    FpyList *result = fpy_list_new(len > 0 ? len : 4);
+    const unsigned char *p = (const unsigned char *)s;
+    while (*p) {
+        int clen = fpy_utf8_cplen(p);
+        FpyString *ch = fpy_str_alloc(clen);
+        memcpy(ch->data, p, clen);
+        ch->data[clen] = '\0';
+        fpy_list_append(result, fpy_str(ch->data));
+        p += clen;
+    }
+    return result;
+}
+
+/* Forward declarations for functions in other TUs used by fv_to_list */
+extern FpyList* fastpy_list_copy(FpyList*);
+extern FpyList* fastpy_dict_keys(FpyDict*);
+extern FpyList* fpy_cpython_to_list(void*);
+
+/* Convert any FpyValue (tag + data) to a list.
+ * OBJ-tagged values are iterated via CPython protocol; native types
+ * are converted directly. Used by list()/tuple()/set() builtins when
+ * the argument is a PYOBJ expression whose runtime result may have
+ * been auto-converted to a native type by pyobject_to_fpy. */
+FpyList* fastpy_fv_to_list(int32_t tag, int64_t data) {
+    switch (tag) {
+    case FPY_TAG_LIST: {
+        FpyList *copy = fastpy_list_copy((FpyList*)(intptr_t)data);
+        /* list() always returns a list, even if the source was a tuple */
+        copy->is_tuple = 0;
+        return copy;
+    }
+    case FPY_TAG_STR:
+        return fastpy_str_to_list((const char*)(intptr_t)data);
+    case FPY_TAG_DICT:
+        return fastpy_dict_keys((FpyDict*)(intptr_t)data);
+    case FPY_TAG_SET:
+        return fastpy_dict_keys((FpyDict*)(intptr_t)data);
+    case FPY_TAG_BYTES:
+        return fastpy_bytes_to_list((const char*)(intptr_t)data);
+    case FPY_TAG_OBJ:
+        return fpy_cpython_to_list((void*)(intptr_t)data);
+    default: {
+        /* Scalar or unknown — wrap as single-element list */
+        FpyList *lst = fpy_list_new(1);
+        FpyValue v;
+        v.tag = tag;
+        v.data.i = data;
+        fpy_list_append(lst, v);
+        return lst;
+    }
+    }
 }
 
 /* Convert int to string (for f-string formatting) */
@@ -342,6 +477,11 @@ double fastpy_pow_float(double base, double exp) {
 FPY_THREAD_LOCAL int fpy_exc_type = FPY_EXC_NONE;
 FPY_THREAD_LOCAL const char *fpy_exc_msg = "";
 FPY_THREAD_LOCAL int fpy_exc_group_inner = FPY_EXC_NONE;
+#define FPY_MAX_GROUP_INNERS 16
+FPY_THREAD_LOCAL int fpy_exc_group_inner_types[FPY_MAX_GROUP_INNERS];
+FPY_THREAD_LOCAL int fpy_exc_group_inner_count = 0;
+FPY_THREAD_LOCAL void *fpy_exc_obj = NULL;  /* exception object for user-defined exceptions */
+FPY_THREAD_LOCAL const char *fpy_exc_class_name = "";  /* actual class name for type(e).__name__ */
 
 /* Per-thread return tag for closure calls. The closure body stores
  * the value's runtime tag here before returning the i64 data. The
@@ -351,6 +491,21 @@ FPY_THREAD_LOCAL int32_t fpy_ret_tag = 0;  /* FPY_TAG_INT */
 
 void fastpy_set_ret_tag(int32_t tag) { fpy_ret_tag = tag; }
 int32_t fastpy_get_ret_tag(void) { return fpy_ret_tag; }
+
+/* --- Argument tag side-channel for closure dispatch ---
+ * When calling a function through closure_call_list / call_ptr, the
+ * raw i64 calling convention loses type tags.  The compiler and runtime
+ * store argument tags here before the call; the i64 wrapper reads them
+ * to reconstruct FpyValues with correct runtime tags. */
+FPY_THREAD_LOCAL int32_t fpy_arg_tags[8] = {0};
+
+void fastpy_set_arg_tag(int32_t index, int32_t tag) {
+    if (index >= 0 && index < 8) fpy_arg_tags[index] = tag;
+}
+int32_t fastpy_get_arg_tag(int32_t index) {
+    if (index >= 0 && index < 8) return fpy_arg_tags[index];
+    return 0;  /* FPY_TAG_INT */
+}
 
 /* --- Shadow call stack (for traceback on unhandled exceptions) --- */
 
@@ -518,6 +673,30 @@ static void fpy_shadow_print_traceback(void) {
 void fastpy_raise(int exc_type, const char *msg) {
     fpy_exc_type = exc_type;
     fpy_exc_msg = msg;
+    /* Auto-set the class name for builtin exception types so that
+     * type(e).__name__ works even for runtime-raised exceptions (1/0,
+     * d["missing"], lst[999], etc.) where the compiler doesn't emit
+     * an explicit exc_set_class_name call. */
+    {
+        static const char *builtin_names[] = {
+            "Exception",        /* 0 — shouldn't be raised, but safe */
+            "ZeroDivisionError",/* 1 */
+            "ValueError",       /* 2 */
+            "TypeError",        /* 3 */
+            "IndexError",       /* 4 */
+            "KeyError",         /* 5 */
+            "RuntimeError",     /* 6 */
+            "StopIteration",    /* 7 */
+            "ExceptionGroup",   /* 8 */
+            "NameError",        /* 9 */
+            "OverflowError",    /* 10 */
+            "AttributeError"    /* 11 */
+        };
+        if (exc_type >= 1 && exc_type <= 11)
+            fpy_exc_class_name = builtin_names[exc_type];
+        /* For FPY_EXC_GENERIC (99), the compiler sets the name explicitly
+         * via fastpy_exc_set_class_name — don't overwrite it here. */
+    }
     /* Update the current frame's line number from the compiler-set global
      * before snapshotting — fpy_current_line is updated by the compiler
      * before every statement via a direct store (no function call). */
@@ -528,6 +707,31 @@ void fastpy_raise(int exc_type, const char *msg) {
     if (fpy_shadow_depth > 0)
         memcpy(fpy_traceback, fpy_shadow_stack,
                sizeof(FpyShadowFrame) * fpy_shadow_depth);
+}
+
+/* Raise with an object pointer (for user-defined exception classes) */
+extern void fastpy_obj_set_fv(void*, const char*, int32_t, int64_t);
+void fastpy_raise_with_obj(int exc_type, const char *msg, void *obj) {
+    fpy_exc_type = exc_type;
+    fpy_exc_msg = msg;
+    fpy_exc_obj = obj;
+    /* Store the message on the object so str(e) works after exc_clear().
+     * Uses a dynamic attribute "__exc_msg__" that obj_to_str checks. */
+    if (obj) {
+        fastpy_obj_set_fv(obj, "__exc_msg__", 2 /*FPY_TAG_STR*/,
+                          (int64_t)(intptr_t)msg);
+    }
+    if (fpy_shadow_depth > 0)
+        fpy_shadow_stack[fpy_shadow_depth - 1].lineno = fpy_current_line;
+    fpy_traceback_depth = fpy_shadow_depth;
+    if (fpy_shadow_depth > 0)
+        memcpy(fpy_traceback, fpy_shadow_stack,
+               sizeof(FpyShadowFrame) * fpy_shadow_depth);
+}
+
+/* Get the exception object pointer (NULL if not a user-class exception) */
+void* fastpy_exc_get_obj(void) {
+    return fpy_exc_obj;
 }
 
 /* Check if an exception is pending */
@@ -550,10 +754,23 @@ void fastpy_exc_clear(void) {
     fpy_exc_type = FPY_EXC_NONE;
     fpy_exc_msg = "";
     fpy_exc_group_inner = FPY_EXC_NONE;
+    fpy_exc_group_inner_count = 0;
+    fpy_exc_obj = NULL;
+    fpy_exc_class_name = "";
     fpy_traceback_depth = 0;
 }
 
-/* Set the inner exception type for ExceptionGroup */
+/* Set the actual exception class name (for type(e).__name__) */
+void fastpy_exc_set_class_name(const char *name) {
+    fpy_exc_class_name = name;
+}
+
+/* Get the actual exception class name */
+const char* fastpy_exc_get_class_name(void) {
+    return fpy_exc_class_name;
+}
+
+/* Set the inner exception type for ExceptionGroup (legacy single-type) */
 void fastpy_exc_set_group_inner(int inner_type) {
     fpy_exc_group_inner = inner_type;
 }
@@ -561,6 +778,25 @@ void fastpy_exc_set_group_inner(int inner_type) {
 /* Get the inner exception type for ExceptionGroup */
 int fastpy_exc_get_group_inner(void) {
     return fpy_exc_group_inner;
+}
+
+/* Add an inner exception type to the ExceptionGroup's type set */
+void fastpy_exc_group_add_inner(int32_t type_id) {
+    if (fpy_exc_group_inner_count < FPY_MAX_GROUP_INNERS) {
+        fpy_exc_group_inner_types[fpy_exc_group_inner_count++] = type_id;
+    }
+    /* Also set the legacy single-type field to the first type */
+    if (fpy_exc_group_inner_count == 1) {
+        fpy_exc_group_inner = type_id;
+    }
+}
+
+/* Check if the ExceptionGroup contains a specific inner type */
+int32_t fastpy_exc_group_has_type(int32_t type_id) {
+    for (int i = 0; i < fpy_exc_group_inner_count; i++) {
+        if (fpy_exc_group_inner_types[i] == type_id) return 1;
+    }
+    return 0;
 }
 
 /* Map exception name to type id */
@@ -579,6 +815,48 @@ int fastpy_exc_name_to_id(const char *name) {
     return FPY_EXC_GENERIC;
 }
 
+/* ---- Exception class hierarchy registry ---- */
+#define FPY_MAX_EXC_CLASSES 64
+typedef struct {
+    const char *name;
+    const char *parent;  /* NULL for base Exception */
+} FpyExcClassEntry;
+static FpyExcClassEntry fpy_exc_classes[FPY_MAX_EXC_CLASSES];
+static int fpy_exc_class_count = 0;
+
+/* Register a user-defined exception class with its parent.
+ * Called at module init time for each class that inherits from Exception. */
+void fastpy_exc_register_class(const char *name, const char *parent) {
+    if (fpy_exc_class_count >= FPY_MAX_EXC_CLASSES) return;
+    fpy_exc_classes[fpy_exc_class_count].name = name;
+    fpy_exc_classes[fpy_exc_class_count].parent = parent;
+    fpy_exc_class_count++;
+}
+
+/* Check if raised_name matches handler_name via inheritance.
+ * Returns 1 if raised_name IS handler_name, or if raised_name inherits
+ * from handler_name through the registered class hierarchy. */
+int fastpy_exc_class_matches(const char *raised_name, const char *handler_name) {
+    /* Direct match */
+    if (strcmp(raised_name, handler_name) == 0) return 1;
+    /* Walk up the inheritance chain */
+    const char *current = raised_name;
+    for (int depth = 0; depth < FPY_MAX_EXC_CLASSES; depth++) {
+        /* Find the parent of current */
+        const char *parent = NULL;
+        for (int i = 0; i < fpy_exc_class_count; i++) {
+            if (strcmp(fpy_exc_classes[i].name, current) == 0) {
+                parent = fpy_exc_classes[i].parent;
+                break;
+            }
+        }
+        if (!parent) break;
+        if (strcmp(parent, handler_name) == 0) return 1;
+        current = parent;
+    }
+    return 0;
+}
+
 /* Print unhandled exception with traceback and exit */
 void fastpy_exc_unhandled(void) {
     if (fpy_exc_type == FPY_EXC_NONE) return;
@@ -587,8 +865,13 @@ void fastpy_exc_unhandled(void) {
         "IndexError", "KeyError", "RuntimeError", "StopIteration",
         "ExceptionGroup", "NameError", "OverflowError", "AttributeError"
     };
-    const char *name = (fpy_exc_type >= 1 && fpy_exc_type <= 11)
-        ? names[fpy_exc_type] : "Exception";
+    const char *name;
+    if (fpy_exc_class_name[0] != '\0') {
+        name = fpy_exc_class_name;
+    } else {
+        name = (fpy_exc_type >= 1 && fpy_exc_type <= 11)
+            ? names[fpy_exc_type] : "Exception";
+    }
     fpy_shadow_print_traceback();
     fprintf(stderr, "%s: %s\n", name, fpy_exc_msg);
     exit(1);
@@ -618,9 +901,9 @@ int64_t fastpy_safe_mod(int64_t a, int64_t b) {
 
 double fastpy_safe_fdiv(double a, double b) {
     if (b == 0.0) {
-        /* CPython 3.14+ uses "division by zero" for all cases (int/int,
-         * float/float, and mixed). Older CPython said "float division by
-         * zero" for float operands — we match current behavior. */
+        /* CPython 3.14+ uses plain "division by zero" for all cases,
+         * including float/float.  Older versions used "float division
+         * by zero" but that changed in 3.14. */
         fastpy_raise(FPY_EXC_ZERODIVISION, "division by zero");
         return 0.0;
     }
@@ -660,6 +943,7 @@ extern const char* fastpy_fv_str(int32_t, int64_t);
 extern int32_t fastpy_fv_truthy(int32_t, int64_t);
 extern int32_t fastpy_fv_compare(int32_t, int64_t, int32_t, int64_t, int32_t);
 extern int64_t fastpy_fv_len(int32_t, int64_t);
+extern void fastpy_fv_iter_get(int32_t, int64_t, int64_t, int32_t*, int64_t*);
 extern void fastpy_fv_subscript(int32_t, int64_t, int32_t, int64_t, int32_t*, int64_t*);
 extern void fastpy_fv_binop(int32_t, int64_t, int32_t, int64_t, int32_t, int32_t*, int64_t*);
 extern void fastpy_raise(int, const char*);
@@ -677,6 +961,7 @@ extern FpyList* fastpy_list_sorted(FpyList*);
 extern FpyList* fastpy_list_from_obj_iter(void*);
 extern FpyList* fastpy_list_reversed(FpyList*);
 extern void fastpy_list_reverse_prefix(FpyList*, int64_t);
+extern void fastpy_list_reverse(FpyList*);
 extern FpyList* fastpy_list_copy(FpyList*);
 extern void fastpy_list_clear(FpyList*);
 extern void fastpy_list_extend(FpyList*, FpyList*);
@@ -716,6 +1001,9 @@ extern int64_t fastpy_str_rfind(const char*, const char*);
 extern int64_t fastpy_str_count(const char*, const char*);
 extern int fastpy_str_startswith(const char*, const char*);
 extern int fastpy_str_endswith(const char*, const char*);
+extern int32_t fastpy_fv_contains(int32_t, int64_t, int32_t, int64_t);
+extern void fastpy_list_pop_fv(FpyList*, int32_t*, int64_t*);
+extern void fastpy_list_pop_at_fv(FpyList*, int64_t, int32_t*, int64_t*);
 extern int64_t fastpy_list_index(FpyList*, int64_t);
 extern int64_t fastpy_list_index_str(FpyList*, const char*);
 extern int64_t fastpy_list_count_str(FpyList*, const char*);
@@ -740,6 +1028,7 @@ extern const char* fastpy_str_casefold(const char*);
 extern const char* fastpy_str_expandtabs(const char*, int64_t);
 extern FpyList* fastpy_str_partition(const char*, const char*);
 extern FpyList* fastpy_str_rpartition(const char*, const char*);
+extern void fastpy_dict_pop_nodefault_fv(FpyDict*, const char*, int32_t*, int64_t*);
 extern void fastpy_dict_pop_fv(FpyDict*, const char*, int32_t, int64_t, int32_t*, int64_t*);
 extern FpyList* fastpy_str_rsplit(const char*, const char*, int64_t);
 extern FpyDict* fastpy_set_union(FpyDict*, FpyDict*);
@@ -778,7 +1067,10 @@ extern const char* fastpy_bytes_decode(const char*);
 extern int64_t fastpy_bytes_get(const char*, int64_t);
 extern int64_t fastpy_bytes_len(const char*);
 extern FpyList* fastpy_bytes_to_list(const char*);
+extern FpyList* fastpy_str_to_list(const char*);
+extern FpyList* fastpy_fv_to_list(int32_t, int64_t);
 extern void fastpy_list_mark_tuple(FpyList*);
+extern void fastpy_list_mark_list(FpyList*);
 extern FpyDict* fastpy_dict_fromkeys(FpyList*, int32_t, int64_t);
 extern FpyDict* fastpy_dict_fromkeys_none(FpyList*);
 extern FpyList* fastpy_float_as_integer_ratio(double);
@@ -805,6 +1097,7 @@ extern int64_t fastpy_closure_call0(void*);
 extern int64_t fastpy_closure_call1(void*, int64_t);
 extern int64_t fastpy_closure_call2(void*, int64_t, int64_t);
 extern void* fastpy_cell_new(int64_t);
+extern void fastpy_cell_incref(void*);
 extern void fastpy_cell_set(void*, int64_t);
 extern int64_t fastpy_cell_get(void*);
 extern void* fpy_cpython_import(const char*);
@@ -815,6 +1108,7 @@ extern void fpy_cpython_call2(void*, int32_t, int64_t, int32_t, int64_t, int32_t
 extern void fpy_cpython_call3(void*, int32_t, int64_t, int32_t, int64_t, int32_t, int64_t, int32_t*, int64_t*);
 extern void fpy_cpython_call_kw(void*, int32_t, int32_t*, int64_t*, int32_t, const char**, int32_t*, int64_t*, int32_t*, int64_t*);
 extern void fpy_cpython_to_fv(void*, int32_t*, int64_t*);
+extern void fpy_cpython_peek_fv(void*, int32_t*, int64_t*);
 extern void fpy_fv_call_method0(int32_t, int64_t, const char*, int32_t*, int64_t*);
 extern void fpy_fv_call_method1(int32_t, int64_t, const char*, int32_t, int64_t, int32_t*, int64_t*);
 extern void fpy_fv_call_method2(int32_t, int64_t, const char*, int32_t, int64_t, int32_t, int64_t, int32_t*, int64_t*);
@@ -825,6 +1119,8 @@ extern int64_t fpy_cpython_bool(void*);
 extern void fpy_cpython_flush(void);
 extern void* fpy_cpython_iter(void*);
 extern int32_t fpy_cpython_iter_next(void*, int32_t*, int64_t*);
+extern FpyList* fpy_cpython_to_list(void*);
+extern FpyDict* fpy_cpython_to_dict(void*);
 extern void fpy_jit_exec(const char*);
 extern void* fpy_jit_import(const char*);
 extern void fpy_rc_incref(int32_t, int64_t);
@@ -838,13 +1134,16 @@ static FpySymEntry fpy_jit_symbols[] = {
     SYM(fastpy_print_newline),
     SYM(fastpy_fv_print), SYM(fastpy_fv_write),
     SYM(fastpy_fv_repr), SYM(fastpy_fv_str), SYM(fastpy_fv_truthy), SYM(fastpy_fv_compare),
-    SYM(fastpy_fv_len), SYM(fastpy_fv_subscript), SYM(fastpy_fv_binop),
-    SYM(fastpy_raise), SYM(fastpy_exc_pending), SYM(fastpy_exc_clear),
-    SYM(fastpy_exc_get_type), SYM(fastpy_exc_get_msg), SYM(fastpy_exc_name_to_id),
+    SYM(fastpy_fv_len), SYM(fastpy_fv_iter_get), SYM(fastpy_fv_subscript), SYM(fastpy_fv_contains), SYM(fastpy_fv_binop),
+    SYM(fastpy_raise), SYM(fastpy_raise_with_obj),
+    SYM(fastpy_exc_pending), SYM(fastpy_exc_clear),
+    SYM(fastpy_exc_get_type), SYM(fastpy_exc_get_msg), SYM(fastpy_exc_get_obj),
+    SYM(fastpy_exc_name_to_id), SYM(fastpy_exc_set_class_name), SYM(fastpy_exc_get_class_name),
+    SYM(fastpy_exc_register_class), SYM(fastpy_exc_class_matches),
     SYM(fastpy_list_new), SYM(fastpy_list_append_fv),
     SYM(fastpy_list_get_fv), SYM(fastpy_list_set_fv),
     SYM(fastpy_list_length), SYM(fastpy_list_sorted), SYM(fastpy_list_from_obj_iter), SYM(fastpy_list_reversed),
-    SYM(fastpy_list_reverse_prefix),
+    SYM(fastpy_list_reverse_prefix), SYM(fastpy_list_reverse),
     SYM(fastpy_list_copy), SYM(fastpy_list_clear),
     SYM(fastpy_list_extend), SYM(fastpy_list_sort), SYM(fastpy_list_concat),
     SYM(fastpy_dict_new), SYM(fastpy_dict_set_fv), SYM(fastpy_dict_get_fv), SYM(fastpy_dict_get_fv_safe),
@@ -867,7 +1166,7 @@ static FpySymEntry fpy_jit_symbols[] = {
     SYM(fastpy_str_isdecimal), SYM(fastpy_str_isnumeric),
     SYM(fastpy_str_casefold), SYM(fastpy_str_expandtabs),
     SYM(fastpy_str_partition), SYM(fastpy_str_rpartition),
-    SYM(fastpy_dict_pop_fv), SYM(fastpy_str_rsplit),
+    SYM(fastpy_dict_pop_nodefault_fv), SYM(fastpy_dict_pop_fv), SYM(fastpy_str_rsplit),
     SYM(fastpy_set_union), SYM(fastpy_set_intersection),
     SYM(fastpy_set_difference), SYM(fastpy_set_symmetric_diff),
     SYM(fastpy_set_contains_fv), SYM(fastpy_set_add_fv),
@@ -888,11 +1187,13 @@ static FpySymEntry fpy_jit_symbols[] = {
     SYM(fastpy_bytes_decode),
     SYM(fastpy_bytes_get),
     SYM(fastpy_bytes_len),
-    SYM(fastpy_bytes_to_list),
+    SYM(fastpy_bytes_to_list), SYM(fastpy_str_to_list), SYM(fastpy_fv_to_list),
     SYM(fastpy_list_mark_tuple),
+    SYM(fastpy_list_mark_list),
     SYM(fastpy_dict_fromkeys), SYM(fastpy_dict_fromkeys_none),
     SYM(fastpy_str_rfind), SYM(fastpy_str_count),
     SYM(fastpy_str_startswith), SYM(fastpy_str_endswith),
+    SYM(fastpy_list_pop_fv), SYM(fastpy_list_pop_at_fv),
     SYM(fastpy_list_index),
     SYM(fastpy_float_as_integer_ratio),
     SYM(fastpy_int_to_bytes), SYM(fastpy_int_from_bytes),
@@ -907,16 +1208,17 @@ static FpySymEntry fpy_jit_symbols[] = {
     SYM(fastpy_closure_new), SYM(fastpy_closure_set_capture), SYM(fastpy_closure_set_vararg),
     SYM(fastpy_closure_set_defaults), SYM(fastpy_closure_set_default),
     SYM(fastpy_closure_call0), SYM(fastpy_closure_call1), SYM(fastpy_closure_call2),
-    SYM(fastpy_cell_new), SYM(fastpy_cell_set), SYM(fastpy_cell_get),
+    SYM(fastpy_cell_new), SYM(fastpy_cell_incref), SYM(fastpy_cell_set), SYM(fastpy_cell_get),
     SYM(fpy_cpython_import), SYM(fpy_cpython_getattr),
     SYM(fpy_cpython_call0), SYM(fpy_cpython_call1), SYM(fpy_cpython_call2),
     SYM(fpy_cpython_call3), SYM(fpy_cpython_call_kw),
-    SYM(fpy_cpython_to_fv),
+    SYM(fpy_cpython_to_fv), SYM(fpy_cpython_peek_fv),
     SYM(fpy_fv_call_method0), SYM(fpy_fv_call_method1),
     SYM(fpy_fv_call_method2), SYM(fpy_fv_call_method3),
     SYM(fpy_fv_getattr),
     SYM(fpy_cpython_len), SYM(fpy_cpython_bool),
     SYM(fpy_cpython_flush), SYM(fpy_cpython_iter), SYM(fpy_cpython_iter_next),
+    SYM(fpy_cpython_to_list), SYM(fpy_cpython_to_dict),
     SYM(fpy_jit_exec), SYM(fpy_jit_import),
     SYM(fpy_rc_incref), SYM(fpy_rc_decref),
     SYM(fpy_cpython_binop), SYM(fpy_cpython_rbinop),
@@ -977,6 +1279,17 @@ int main(int argc, char *argv[]) {
     extern void fpy_cpython_flush(void);
     fpy_cpython_flush();
     fflush(stdout);
+    /* Skip Py_FinalizeEx().  The GC finalize above may have freed fastpy
+     * objects that still hold raw PyObject* references (OBJ-tagged FpyValues
+     * storing real CPython pointers).  Calling Py_FinalizeEx() after that
+     * can trigger heap corruption on Windows (STATUS_HEAP_CORRUPTION /
+     * 0xC0000374) because Python's internal bookkeeping finds dangling or
+     * double-freed objects.  Since we're about to exit anyway, let the OS
+     * reclaim all process memory — this is safe and avoids the ordering
+     * problem entirely.  Python's atexit handlers that flush I/O are
+     * covered by fpy_cpython_flush() above. */
+    /* extern void fpy_cpython_fini(void); */
+    /* fpy_cpython_fini(); */
     if (fastpy_exc_pending()) {
         const char *name = "Exception";
         switch (fpy_exc_type) {
@@ -1340,12 +1653,12 @@ const char* fastpy_uuid_uuid4(void) {
     /* Set version (4) and variant (10xx) bits */
     r1 = (r1 & 0xFFFFFFFFFFFF0FFFULL) | 0x0000000000004000ULL;  /* version 4 */
     r2 = (r2 & 0x3FFFFFFFFFFFFFFFULL) | 0x8000000000000000ULL;  /* variant 10 */
-    sprintf(buf, "%08x-%04x-%04x-%04x-%012llx",
-            (uint32_t)(r1 >> 32),
-            (uint16_t)(r1 >> 16),
-            (uint16_t)(r1),
-            (uint16_t)(r2 >> 48),
-            (unsigned long long)(r2 & 0x0000FFFFFFFFFFFFULL));
+    snprintf(buf, 37, "%08x-%04x-%04x-%04x-%012llx",
+             (uint32_t)(r1 >> 32),
+             (uint16_t)(r1 >> 16),
+             (uint16_t)(r1),
+             (uint16_t)(r2 >> 48),
+             (unsigned long long)(r2 & 0x0000FFFFFFFFFFFFULL));
     return buf;
 }
 

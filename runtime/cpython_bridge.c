@@ -148,6 +148,10 @@ static PyObject* fpy_to_pyobject(int32_t tag, int64_t data);
  * in bridge call functions.  Returns the fastpy exc-type id.         */
 extern void  fastpy_raise(int, const char*);
 extern int   fastpy_exc_name_to_id(const char*);
+extern int   fastpy_exc_pending(void);
+extern int   fastpy_exc_get_type(void);
+extern const char* fastpy_exc_get_msg(void);
+extern const char* fastpy_exc_get_class_name(void);
 extern char* fpy_strdup(const char*);
 
 static void bridge_propagate_exception(void) {
@@ -181,9 +185,8 @@ static void bridge_propagate_exception(void) {
 void* fpy_cpython_getattr(void *obj, const char *attr_name) {
     PyObject *result = PyObject_GetAttrString((PyObject*)obj, attr_name);
     if (!result) {
-        PyErr_Print();
-        fprintf(stderr, "AttributeError: '%s'\n", attr_name);
-        exit(1);
+        bridge_propagate_exception();
+        Py_RETURN_NONE;
     }
     return (void*)result;
 }
@@ -193,8 +196,9 @@ void fpy_cpython_setattr(void *obj, const char *attr_name,
                          int32_t val_tag, int64_t val_data) {
     PyObject *value = fpy_to_pyobject(val_tag, val_data);
     if (PyObject_SetAttrString((PyObject*)obj, attr_name, value) < 0) {
-        PyErr_Print();
-        fprintf(stderr, "Error setting attribute '%s'\n", attr_name);
+        Py_DECREF(value);
+        bridge_propagate_exception();
+        return;
     }
     Py_DECREF(value);
 }
@@ -511,6 +515,27 @@ static void pyobject_to_fpy(PyObject *obj, int32_t *out_tag, int64_t *out_data) 
         *out_data = (int64_t)(intptr_t)proxy->obj;
         fpy_rc_incref(FPY_TAG_OBJ, *out_data);
     } else {
+        /* Try to convert unknown *sequences* (dict_keys, dict_values,
+         * dict_items, range, etc.) to a native list.  These types
+         * support len() and indexing but aren't directly handled above.
+         * Converting them avoids falling through to the opaque OBJ tag,
+         * which would crash if the compiled code later tries to iterate
+         * or subscript the result as a list.
+         *
+         * IMPORTANT: only convert objects that support the sequence
+         * protocol AND are NOT iterators.  PySequence_List on an
+         * iterator (e.g. sqlite3 cursor, file object) would consume
+         * it as a destructive side-effect.  We detect iterators by
+         * checking for __next__ (tp_iternext). */
+        if (PySequence_Check(obj) && !obj->ob_type->tp_iternext) {
+            PyObject *as_list = PySequence_List(obj);
+            if (as_list) {
+                pyobject_to_fpy(as_list, out_tag, out_data);
+                Py_DECREF(as_list);
+                return;
+            }
+            PyErr_Clear();
+        }
         /* Opaque PyObject* — store as a tagged pointer.
          * We increment the refcount so it stays alive. */
         Py_INCREF(obj);
@@ -552,9 +577,10 @@ void fpy_cpython_call(void *callable, int32_t argc,
     Py_DECREF(result);
 }
 
-/* Convert a PyObject* to FpyValue (tag + data). Used for attribute
- * access on modules: `math.pi` returns a PyFloat which needs to be
- * converted to FpyValue{FLOAT, bits}. */
+/* Convert a PyObject* to FpyValue (tag + data).  CONSUMING: decrefs
+ * the input.  Use only for one-shot values (e.g. return values from
+ * bridge calls) that the caller wants to release after extraction.
+ * For variables that may be accessed again, use fpy_cpython_peek_fv. */
 void fpy_cpython_to_fv(void *obj, int32_t *out_tag, int64_t *out_data) {
     if (!obj) {
         /* NULL → PyErr was set.  pyobject_to_fpy propagates via
@@ -569,22 +595,201 @@ void fpy_cpython_to_fv(void *obj, int32_t *out_tag, int64_t *out_data) {
     Py_DECREF((PyObject*)obj);
 }
 
+/* Convert a PyObject* to FpyValue (tag + data).  BORROWING: does NOT
+ * decref the input.  Safe to call on stored variable references that
+ * will be accessed again later.  Use this instead of cpython_to_fv
+ * whenever the caller does not own the sole reference (e.g. loading
+ * from a variable, printing a value that remains live). */
+void fpy_cpython_peek_fv(void *obj, int32_t *out_tag, int64_t *out_data) {
+    if (!obj) {
+        pyobject_to_fpy(NULL, out_tag, out_data);
+        return;
+    }
+    pyobject_to_fpy((PyObject*)obj, out_tag, out_data);
+}
+
 /* Convert an FpyValue (tag, data) to a PyObject*.
  * Exported wrapper around the static fpy_to_pyobject. */
 void* fpy_cpython_to_pyobj(int32_t tag, int64_t data) {
+    fpy_cpython_init();
     return (void*)fpy_to_pyobject(tag, data);
+}
+
+/* ── Exception info for __exit__ ──────────────────────────────────
+ * Build Python exception objects (type, value) from fastpy's pending
+ * exception state.  Used by the with-statement's __exit__ call so
+ * CPython context managers (especially contextlib.contextmanager)
+ * receive proper exception info instead of (None, None, None).
+ *
+ * Returns two PyObject* (new references) via output pointers.
+ * If no exception pending, both are Py_None.  Caller must Py_DECREF. */
+void fpy_cpython_exc_info_for_exit(void **out_type, void **out_value) {
+    fpy_cpython_init();
+
+    if (!fastpy_exc_pending()) {
+        Py_INCREF(Py_None);
+        Py_INCREF(Py_None);
+        *out_type = (void*)Py_None;
+        *out_value = (void*)Py_None;
+        return;
+    }
+
+    const char *name = fastpy_exc_get_class_name();
+    if (!name || !name[0]) name = "Exception";
+
+    /* Look up the Python exception class from builtins */
+    PyObject *builtins = PyImport_ImportModule("builtins");
+    PyObject *exc_class = NULL;
+    if (builtins) {
+        exc_class = PyObject_GetAttrString(builtins, name);
+        Py_DECREF(builtins);
+    }
+    if (!exc_class) {
+        /* Unknown exception class — fall back to Exception */
+        PyErr_Clear();
+        builtins = PyImport_ImportModule("builtins");
+        if (builtins) {
+            exc_class = PyObject_GetAttrString(builtins, "Exception");
+            Py_DECREF(builtins);
+        }
+    }
+    if (!exc_class) {
+        PyErr_Clear();
+        Py_INCREF(Py_None);
+        Py_INCREF(Py_None);
+        *out_type = (void*)Py_None;
+        *out_value = (void*)Py_None;
+        return;
+    }
+
+    /* Create exception instance with the message */
+    const char *msg = fastpy_exc_get_msg();
+    PyObject *py_msg = PyUnicode_FromString(msg ? msg : "");
+    PyObject *exc_value = PyObject_CallOneArg(exc_class, py_msg);
+    Py_DECREF(py_msg);
+
+    if (!exc_value) {
+        PyErr_Clear();
+        Py_INCREF(Py_None);
+        exc_value = Py_None;
+    }
+
+    *out_type = (void*)exc_class;   /* new reference */
+    *out_value = (void*)exc_value;  /* new reference */
 }
 
 /* ── FpyValue method dispatch ─────────────────────────────────────
  * These functions call a method on ANY FpyValue (int, str, list, dict,
- * FpyObj, PyObject*, etc.) by converting to PyObject* first and
- * dispatching through CPython.  This is the universal fallback for
+ * FpyObj, PyObject*, etc.).
+ *
+ * Native dispatch: for LIST and DICT receivers, call the native fastpy
+ * runtime functions directly.  This avoids fpy_to_pyobject which COPIES
+ * the list/dict, making in-place mutations (append, extend, clear, etc.)
+ * silently fail on the original data structure.
+ *
+ * CPython fallback: for all other receiver types, convert to PyObject*
+ * and dispatch through CPython.  This is the universal fallback for
  * variables whose compile-time type is unknown.
  */
+
+/* Forward declarations for native list/dict functions used below */
+extern void fastpy_list_append_fv(FpyList*, int32_t, int64_t);
+extern void fastpy_list_clear(FpyList*);
+extern void fastpy_list_sort(FpyList*);
+extern void fastpy_list_reverse(FpyList*);
+extern void fastpy_list_extend(FpyList*, FpyList*);
+extern void fastpy_list_pop_fv(FpyList*, int32_t*, int64_t*);
+extern void fastpy_list_pop_at_fv(FpyList*, int64_t, int32_t*, int64_t*);
+extern FpyList* fastpy_list_copy(FpyList*);
+extern int64_t fastpy_list_index(FpyList*, int64_t);
+extern int64_t fastpy_list_index_str(FpyList*, const char*);
+extern int64_t fastpy_list_count_str(FpyList*, const char*);
+extern void fastpy_list_remove(FpyList*, int64_t);
+extern void fastpy_list_remove_str(FpyList*, const char*);
+extern void fastpy_list_insert_int(FpyList*, int64_t, int64_t);
+extern void fastpy_list_insert_str(FpyList*, int64_t, const char*);
+extern void fastpy_dict_clear(FpyDict*);
+extern FpyDict* fastpy_dict_copy(FpyDict*);
+extern FpyList* fastpy_dict_keys(FpyDict*);
+extern FpyList* fastpy_dict_values(FpyDict*);
+extern FpyList* fastpy_dict_items(FpyDict*);
+extern void fastpy_dict_update(FpyDict*, FpyDict*);
+extern void fastpy_dict_pop_nodefault_fv(FpyDict*, const char*, int32_t*, int64_t*);
+extern void fastpy_dict_pop_fv(FpyDict*, const char*, int32_t, int64_t, int32_t*, int64_t*);
+extern void fastpy_dict_get_fv_safe(FpyDict*, const char*, int32_t*, int64_t*);
+extern void fastpy_dict_setdefault_fv(FpyDict*, const char*, int32_t, int64_t, int32_t*, int64_t*);
+extern void fastpy_dict_set_fv(FpyDict*, const char*, int32_t, int64_t);
+extern void fastpy_dict_popitem(FpyDict*, int32_t*, int64_t*, int32_t*, int64_t*);
 
 void fpy_fv_call_method0(int32_t rcv_tag, int64_t rcv_data,
                          const char *name,
                          int32_t *out_tag, int64_t *out_data) {
+    /* ── Native LIST dispatch (0 args) ──────────────────────────── */
+    if (rcv_tag == FPY_TAG_LIST) {
+        FpyList *lst = (FpyList*)(intptr_t)rcv_data;
+        if (strcmp(name, "clear") == 0) {
+            fastpy_list_clear(lst);
+            *out_tag = FPY_TAG_NONE; *out_data = 0; return;
+        }
+        if (strcmp(name, "sort") == 0) {
+            fastpy_list_sort(lst);
+            *out_tag = FPY_TAG_NONE; *out_data = 0; return;
+        }
+        if (strcmp(name, "reverse") == 0) {
+            fastpy_list_reverse(lst);
+            *out_tag = FPY_TAG_NONE; *out_data = 0; return;
+        }
+        if (strcmp(name, "pop") == 0) {
+            fastpy_list_pop_fv(lst, out_tag, out_data);
+            return;
+        }
+        if (strcmp(name, "copy") == 0) {
+            *out_tag = FPY_TAG_LIST;
+            *out_data = (int64_t)(intptr_t)fastpy_list_copy(lst);
+            return;
+        }
+    }
+    /* ── Native DICT dispatch (0 args) ──────────────────────────── */
+    if (rcv_tag == FPY_TAG_DICT) {
+        FpyDict *dict = (FpyDict*)(intptr_t)rcv_data;
+        if (strcmp(name, "clear") == 0) {
+            fastpy_dict_clear(dict);
+            *out_tag = FPY_TAG_NONE; *out_data = 0; return;
+        }
+        if (strcmp(name, "copy") == 0) {
+            *out_tag = FPY_TAG_DICT;
+            *out_data = (int64_t)(intptr_t)fastpy_dict_copy(dict);
+            return;
+        }
+        if (strcmp(name, "keys") == 0) {
+            *out_tag = FPY_TAG_LIST;
+            *out_data = (int64_t)(intptr_t)fastpy_dict_keys(dict);
+            return;
+        }
+        if (strcmp(name, "values") == 0) {
+            *out_tag = FPY_TAG_LIST;
+            *out_data = (int64_t)(intptr_t)fastpy_dict_values(dict);
+            return;
+        }
+        if (strcmp(name, "items") == 0) {
+            *out_tag = FPY_TAG_LIST;
+            *out_data = (int64_t)(intptr_t)fastpy_dict_items(dict);
+            return;
+        }
+        if (strcmp(name, "popitem") == 0) {
+            /* popitem returns (key, value) as a tuple — return as LIST */
+            int32_t kt, vt; int64_t kd, vd;
+            fastpy_dict_popitem(dict, &kt, &kd, &vt, &vd);
+            FpyList *tup = fastpy_list_new();
+            fastpy_list_append_fv(tup, kt, kd);
+            fastpy_list_append_fv(tup, vt, vd);
+            *out_tag = FPY_TAG_LIST;
+            *out_data = (int64_t)(intptr_t)tup;
+            return;
+        }
+    }
+    /* ── CPython fallback ───────────────────────────────────────── */
+    fpy_cpython_init();
     PyObject *py_rcv = fpy_to_pyobject(rcv_tag, rcv_data);
     PyObject *method = PyObject_GetAttrString(py_rcv, name);
     if (!method) {
@@ -610,6 +815,64 @@ void fpy_fv_call_method1(int32_t rcv_tag, int64_t rcv_data,
                          const char *name,
                          int32_t a1_tag, int64_t a1_data,
                          int32_t *out_tag, int64_t *out_data) {
+    /* ── Native LIST dispatch (1 arg) ──────────────────────────── */
+    if (rcv_tag == FPY_TAG_LIST) {
+        FpyList *lst = (FpyList*)(intptr_t)rcv_data;
+        if (strcmp(name, "append") == 0) {
+            fastpy_list_append_fv(lst, a1_tag, a1_data);
+            *out_tag = FPY_TAG_NONE; *out_data = 0; return;
+        }
+        if (strcmp(name, "extend") == 0 && a1_tag == FPY_TAG_LIST) {
+            fastpy_list_extend(lst, (FpyList*)(intptr_t)a1_data);
+            *out_tag = FPY_TAG_NONE; *out_data = 0; return;
+        }
+        if (strcmp(name, "pop") == 0 && a1_tag == FPY_TAG_INT) {
+            fastpy_list_pop_at_fv(lst, a1_data, out_tag, out_data);
+            return;
+        }
+        if (strcmp(name, "remove") == 0) {
+            if (a1_tag == FPY_TAG_STR) {
+                fastpy_list_remove_str(lst, (const char*)(intptr_t)a1_data);
+            } else {
+                fastpy_list_remove(lst, a1_data);
+            }
+            *out_tag = FPY_TAG_NONE; *out_data = 0; return;
+        }
+        if (strcmp(name, "index") == 0) {
+            int64_t idx;
+            if (a1_tag == FPY_TAG_STR) {
+                idx = fastpy_list_index_str(lst, (const char*)(intptr_t)a1_data);
+            } else {
+                idx = fastpy_list_index(lst, a1_data);
+            }
+            *out_tag = FPY_TAG_INT; *out_data = idx; return;
+        }
+        if (strcmp(name, "count") == 0 && a1_tag == FPY_TAG_STR) {
+            *out_tag = FPY_TAG_INT;
+            *out_data = fastpy_list_count_str(lst, (const char*)(intptr_t)a1_data);
+            return;
+        }
+    }
+    /* ── Native DICT dispatch (1 arg) ──────────────────────────── */
+    if (rcv_tag == FPY_TAG_DICT) {
+        FpyDict *dict = (FpyDict*)(intptr_t)rcv_data;
+        if (strcmp(name, "pop") == 0 && a1_tag == FPY_TAG_STR) {
+            fastpy_dict_pop_nodefault_fv(dict, (const char*)(intptr_t)a1_data,
+                                         out_tag, out_data);
+            return;
+        }
+        if (strcmp(name, "get") == 0 && a1_tag == FPY_TAG_STR) {
+            fastpy_dict_get_fv_safe(dict, (const char*)(intptr_t)a1_data,
+                                    out_tag, out_data);
+            return;
+        }
+        if (strcmp(name, "update") == 0 && a1_tag == FPY_TAG_DICT) {
+            fastpy_dict_update(dict, (FpyDict*)(intptr_t)a1_data);
+            *out_tag = FPY_TAG_NONE; *out_data = 0; return;
+        }
+    }
+    /* ── CPython fallback ───────────────────────────────────────── */
+    fpy_cpython_init();
     PyObject *py_rcv = fpy_to_pyobject(rcv_tag, rcv_data);
     PyObject *method = PyObject_GetAttrString(py_rcv, name);
     if (!method) {
@@ -638,6 +901,47 @@ void fpy_fv_call_method2(int32_t rcv_tag, int64_t rcv_data,
                          int32_t a1_tag, int64_t a1_data,
                          int32_t a2_tag, int64_t a2_data,
                          int32_t *out_tag, int64_t *out_data) {
+    /* ── Native LIST dispatch (2 args) ──────────────────────────── */
+    if (rcv_tag == FPY_TAG_LIST) {
+        FpyList *lst = (FpyList*)(intptr_t)rcv_data;
+        if (strcmp(name, "insert") == 0 && a1_tag == FPY_TAG_INT) {
+            if (a2_tag == FPY_TAG_STR) {
+                fastpy_list_insert_str(lst, a1_data,
+                                       (const char*)(intptr_t)a2_data);
+            } else {
+                fastpy_list_insert_int(lst, a1_data, a2_data);
+            }
+            *out_tag = FPY_TAG_NONE; *out_data = 0; return;
+        }
+    }
+    /* ── Native DICT dispatch (2 args) ──────────────────────────── */
+    if (rcv_tag == FPY_TAG_DICT) {
+        FpyDict *dict = (FpyDict*)(intptr_t)rcv_data;
+        if (strcmp(name, "pop") == 0 && a1_tag == FPY_TAG_STR) {
+            fastpy_dict_pop_fv(dict, (const char*)(intptr_t)a1_data,
+                               a2_tag, a2_data, out_tag, out_data);
+            return;
+        }
+        if (strcmp(name, "get") == 0 && a1_tag == FPY_TAG_STR) {
+            /* dict.get(key, default): check key existence first to
+             * distinguish missing keys from keys mapping to None. */
+            extern int fastpy_dict_has_key(FpyDict*, const char*);
+            const char *key = (const char*)(intptr_t)a1_data;
+            if (fastpy_dict_has_key(dict, key)) {
+                fastpy_dict_get_fv_safe(dict, key, out_tag, out_data);
+            } else {
+                *out_tag = a2_tag; *out_data = a2_data;
+            }
+            return;
+        }
+        if (strcmp(name, "setdefault") == 0 && a1_tag == FPY_TAG_STR) {
+            fastpy_dict_setdefault_fv(dict, (const char*)(intptr_t)a1_data,
+                                      a2_tag, a2_data, out_tag, out_data);
+            return;
+        }
+    }
+    /* ── CPython fallback ───────────────────────────────────────── */
+    fpy_cpython_init();
     PyObject *py_rcv = fpy_to_pyobject(rcv_tag, rcv_data);
     PyObject *method = PyObject_GetAttrString(py_rcv, name);
     if (!method) {
@@ -669,6 +973,7 @@ void fpy_fv_call_method3(int32_t rcv_tag, int64_t rcv_data,
                          int32_t a2_tag, int64_t a2_data,
                          int32_t a3_tag, int64_t a3_data,
                          int32_t *out_tag, int64_t *out_data) {
+    fpy_cpython_init();
     PyObject *py_rcv = fpy_to_pyobject(rcv_tag, rcv_data);
     PyObject *method = PyObject_GetAttrString(py_rcv, name);
     if (!method) {
@@ -701,6 +1006,7 @@ void fpy_fv_call_method3(int32_t rcv_tag, int64_t rcv_data,
 void fpy_fv_getattr(int32_t rcv_tag, int64_t rcv_data,
                     const char *name,
                     int32_t *out_tag, int64_t *out_data) {
+    fpy_cpython_init();
     PyObject *py_rcv = fpy_to_pyobject(rcv_tag, rcv_data);
     PyObject *result = PyObject_GetAttrString(py_rcv, name);
     Py_DECREF(py_rcv);
@@ -1070,15 +1376,14 @@ void* fastpy_path_cwd(void) {
 
 void* fastpy_path_join(void *self, void *other) {
     fpy_cpython_init();
-    /* Try Path / other (truediv). If other is a C string, wrap first. */
-    PyObject *r = PyNumber_TrueDivide((PyObject*)self, (PyObject*)other);
-    if (!r) {
-        PyErr_Clear();
-        PyObject *ostr = PyUnicode_FromString((const char*)other);
-        if (!ostr) { bridge_propagate_exception(); return NULL; }
-        r = PyNumber_TrueDivide((PyObject*)self, ostr);
-        Py_DECREF(ostr);
-    }
+    /* other is a C string from compiled code — wrap to PyUnicode first.
+     * The old code tried PyNumber_TrueDivide(self, (PyObject*)other)
+     * directly, but passing a raw const char* as a PyObject* causes
+     * hangs or segfaults when CPython tries to read ob_type. */
+    PyObject *ostr = PyUnicode_FromString((const char*)other);
+    if (!ostr) { bridge_propagate_exception(); return NULL; }
+    PyObject *r = PyNumber_TrueDivide((PyObject*)self, ostr);
+    Py_DECREF(ostr);
     if (!r) { bridge_propagate_exception(); return NULL; }
     return (void*)r;
 }
@@ -2190,6 +2495,84 @@ void* fpy_cpython_iter_next_raw(void *iter) {
         return NULL;
     }
     return (void*)item;
+}
+
+/* Convert a CPython iterable (PyObject*) to a native FpyList*.
+ * Iterates via PyObject_GetIter + PyIter_Next, converting each element
+ * to an FpyValue via pyobject_to_fpy.  Returns an empty list on error. */
+FpyList* fpy_cpython_to_list(void *obj) {
+    FpyList *result = fpy_list_new(8);
+    if (!obj) return result;
+    /* Fast path for lists and tuples — avoid iterator overhead */
+    PyObject *pyobj = (PyObject*)obj;
+    if (PyList_Check(pyobj)) {
+        Py_ssize_t n = PyList_GET_SIZE(pyobj);
+        for (Py_ssize_t i = 0; i < n; i++) {
+            FpyValue v;
+            pyobject_to_fpy(PyList_GET_ITEM(pyobj, i), &v.tag, &v.data.i);
+            fpy_list_append(result, v);
+        }
+        return result;
+    }
+    if (PyTuple_Check(pyobj)) {
+        Py_ssize_t n = PyTuple_GET_SIZE(pyobj);
+        for (Py_ssize_t i = 0; i < n; i++) {
+            FpyValue v;
+            pyobject_to_fpy(PyTuple_GET_ITEM(pyobj, i), &v.tag, &v.data.i);
+            fpy_list_append(result, v);
+        }
+        return result;
+    }
+    /* General path: use iterator protocol */
+    PyObject *iter = PyObject_GetIter(pyobj);
+    if (!iter) { PyErr_Clear(); return result; }
+    PyObject *item;
+    while ((item = PyIter_Next(iter)) != NULL) {
+        FpyValue v;
+        pyobject_to_fpy(item, &v.tag, &v.data.i);
+        Py_DECREF(item);
+        fpy_list_append(result, v);
+    }
+    if (PyErr_Occurred()) PyErr_Clear();
+    Py_DECREF(iter);
+    return result;
+}
+
+/* Convert a CPython dict (PyObject*) to a native FpyDict*.
+ * Iterates via PyDict_Next, converting keys and values to FpyValue.
+ * Non-dict iterables are treated as iterables of (key, value) pairs.
+ * Returns an empty dict on error. */
+FpyDict* fpy_cpython_to_dict(void *obj) {
+    FpyDict *result = fpy_dict_new(4);
+    if (!obj) return result;
+    PyObject *pyobj = (PyObject*)obj;
+    if (PyDict_Check(pyobj)) {
+        PyObject *key, *value;
+        Py_ssize_t pos = 0;
+        while (PyDict_Next(pyobj, &pos, &key, &value)) {
+            FpyValue fk, fv;
+            pyobject_to_fpy(key, &fk.tag, &fk.data.i);
+            pyobject_to_fpy(value, &fv.tag, &fv.data.i);
+            fpy_dict_set(result, fk, fv);
+        }
+        return result;
+    }
+    /* For non-dicts, try iterating as (key, value) pairs */
+    PyObject *iter = PyObject_GetIter(pyobj);
+    if (!iter) { PyErr_Clear(); return result; }
+    PyObject *item;
+    while ((item = PyIter_Next(iter)) != NULL) {
+        if (PyTuple_Check(item) && PyTuple_GET_SIZE(item) == 2) {
+            FpyValue fk, fv;
+            pyobject_to_fpy(PyTuple_GET_ITEM(item, 0), &fk.tag, &fk.data.i);
+            pyobject_to_fpy(PyTuple_GET_ITEM(item, 1), &fv.tag, &fv.data.i);
+            fpy_dict_set(result, fk, fv);
+        }
+        Py_DECREF(item);
+    }
+    if (PyErr_Occurred()) PyErr_Clear();
+    Py_DECREF(iter);
+    return result;
 }
 
 /* Arithmetic on pyobj: call a binary operator via Python C API.

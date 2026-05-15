@@ -112,6 +112,8 @@ typedef struct {
     int arg_count;       /* number of args (excluding self) */
     int returns_value;   /* 1 if returns a value, 0 if void */
     int return_tag;      /* FPY_TAG_* for the return value, -1 = unknown */
+    int is_vararg;       /* 1 if method accepts *args (last param is list ptr) */
+    int n_positional;    /* number of positional params before *args */
 } FpyMethodDef;
 
 /* Class definition */
@@ -126,6 +128,8 @@ typedef struct {
     void (*destructor)(FpyObj *obj); /* per-class destructor, NULL if none */
     void **vtable;                  /* vtable[i] = method func ptr, NULL-filled */
     int vtable_size;                /* number of vtable entries */
+    int *mro;                       /* C3-linearized MRO (array of class_ids) */
+    int mro_count;                  /* number of entries in mro[] */
 } FpyClassDef;
 
 #define FPY_MAX_VTABLE 64  /* max methods per class hierarchy */
@@ -271,6 +275,35 @@ static inline int64_t fpy_bytes_len(const char *s) {
     return (int64_t)strlen(s);  /* fallback for plain char* */
 }
 
+/* Return the byte-length of the UTF-8 code point starting at *p.
+ * p must point to a leading byte (not a continuation byte). */
+static inline int fpy_utf8_cplen(const unsigned char *p) {
+    if (*p < 0x80) return 1;
+    if ((*p & 0xE0) == 0xC0) return 2;
+    if ((*p & 0xF0) == 0xE0) return 3;
+    if ((*p & 0xF8) == 0xF0) return 4;
+    return 1;  /* invalid leading byte — advance 1 to avoid infinite loops */
+}
+
+/* Convert byte offset → code-point index (count leading bytes before offset). */
+static inline int64_t fpy_byte_to_cp(const char *s, int64_t byte_off) {
+    int64_t cp = 0;
+    for (const unsigned char *p = (const unsigned char *)s;
+         p < (const unsigned char *)s + byte_off; p++) {
+        if ((*p & 0xC0) != 0x80) cp++;
+    }
+    return cp;
+}
+
+/* Convert code-point index → byte offset (walk n code points). */
+static inline int64_t fpy_cp_to_byte(const char *s, int64_t cp_idx) {
+    const unsigned char *p = (const unsigned char *)s;
+    for (int64_t i = 0; i < cp_idx && *p; i++) {
+        p += fpy_utf8_cplen(p);
+    }
+    return (int64_t)(p - (const unsigned char *)s);
+}
+
 /* --- Value constructors --- */
 
 static inline FpyValue fpy_int(int64_t v) {
@@ -356,5 +389,19 @@ FpyWeakRef* fpy_weakref_new(FpyObj *target);
 FpyObj* fpy_weakref_deref(FpyWeakRef *wr);
 int32_t fpy_weakref_alive(FpyWeakRef *wr);
 void fpy_weakref_destroy(FpyWeakRef *wr);
+
+/* Extended-slice assignment: list[start:stop:step] = values */
+void fastpy_list_slice_step_assign(FpyList *list, int64_t start, int64_t stop,
+                                    int64_t step, int64_t has_start,
+                                    int64_t has_stop, FpyList *new_values);
+
+/* --- Built-in list/tuple iterator --- */
+FpyObj* fastpy_list_iter_new(FpyList *list);
+
+/* --- Attribute access helpers (hasattr/getattr with default) --- */
+int32_t fastpy_obj_has_attr(FpyObj *obj, const char *name);
+int32_t fastpy_obj_getattr_default(FpyObj *obj, const char *name,
+                                    int32_t def_tag, int64_t def_data,
+                                    int32_t *out_tag, int64_t *out_data);
 
 #endif /* FASTPY_OBJECTS_H */

@@ -252,6 +252,16 @@ def test_django_template():
     if result.skipped:
         pytest.skip(result.reason)
     if result.failed:
+        # The benchmark prints timing info (e.g. "0.5 ms/iter") which
+        # differs between CPython and compiled.  Normalize timing values
+        # before comparing — the actual pass/fail counts are what matter.
+        import re
+        _timing_re = re.compile(r'\(\d+\.\d+ ms/iter\)')
+        if result.cpython and result.compiled:
+            c_norm = _timing_re.sub('(X ms/iter)', result.cpython.stdout)
+            f_norm = _timing_re.sub('(X ms/iter)', result.compiled.stdout)
+            if c_norm == f_norm:
+                return  # Timing-only diff — pass
         pytest.fail(result.detail())
 
 

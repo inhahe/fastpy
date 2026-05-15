@@ -344,13 +344,201 @@ FpyBigInt* fpy_bigint_pow(FpyBigInt *base, FpyBigInt *exp) {
     return result;
 }
 
+/* Unsigned single-limb division: q = |a| / d, returns remainder.
+ * a's limbs are divided in-place into q's limbs. */
+static uint64_t mag_divmod_single(FpyBigInt *a, uint64_t d,
+                                   FpyBigInt *q) {
+    uint64_t rem = 0;
+    q->length = a->length;
+    bigint_ensure_capacity(q, a->length);
+    for (int32_t i = a->length - 1; i >= 0; i--) {
+#ifdef _MSC_VER
+        uint64_t quot;
+        rem = div128_by_u64(rem, a->limbs[i], d, &quot);
+        q->limbs[i] = quot;
+#else
+        __uint128_t cur = ((__uint128_t)rem << 64) | a->limbs[i];
+        q->limbs[i] = (uint64_t)(cur / d);
+        rem = (uint64_t)(cur % d);
+#endif
+    }
+    bigint_normalize(q);
+    return rem;
+}
+
+/* Unsigned multi-limb division: compute |a| / |b| using schoolbook
+ * algorithm (Knuth Algorithm D, simplified).  Returns quotient;
+ * remainder is written to *rem_out if non-NULL. */
+static FpyBigInt* mag_divmod(FpyBigInt *a, FpyBigInt *b,
+                              FpyBigInt **rem_out) {
+    int cmp = mag_cmp(a, b);
+    if (cmp < 0) {
+        /* |a| < |b| → quotient=0, remainder=a */
+        if (rem_out) {
+            FpyBigInt *r = bigint_alloc(a->length);
+            memcpy(r->limbs, a->limbs, a->length * sizeof(uint64_t));
+            r->length = a->length;
+            bigint_normalize(r);
+            *rem_out = r;
+        }
+        return fpy_bigint_from_i64(0);
+    }
+    if (cmp == 0) {
+        /* |a| == |b| → quotient=1, remainder=0 */
+        if (rem_out) *rem_out = fpy_bigint_from_i64(0);
+        return fpy_bigint_from_i64(1);
+    }
+    /* Single-limb divisor: fast path */
+    if (b->length == 1) {
+        FpyBigInt *q = bigint_alloc(a->length);
+        uint64_t r = mag_divmod_single(a, b->limbs[0], q);
+        if (rem_out) *rem_out = fpy_bigint_from_i64((int64_t)r);
+        return q;
+    }
+    /* Multi-limb divisor: binary long division on full BigInt.
+     * Uses repeated doubling of divisor and subtraction.
+     * Not the fastest, but correct for any size. */
+    FpyBigInt *remainder = bigint_alloc(a->length);
+    memcpy(remainder->limbs, a->limbs, a->length * sizeof(uint64_t));
+    remainder->length = a->length;
+    remainder->sign = 1;
+
+    FpyBigInt *quotient = fpy_bigint_from_i64(0);
+
+    /* Find highest bit of remainder */
+    int total_bits = (int)(a->length) * 64;
+    while (total_bits > 0) {
+        int top_limb_idx = (total_bits - 1) / 64;
+        int top_bit = (total_bits - 1) % 64;
+        if (top_limb_idx < remainder->length &&
+            (remainder->limbs[top_limb_idx] >> top_bit) & 1) break;
+        total_bits--;
+    }
+
+    /* Process each bit from high to low */
+    for (int bit = total_bits - 1; bit >= 0; bit--) {
+        /* Left-shift quotient by 1 */
+        uint64_t carry = 0;
+        for (int32_t i = 0; i < quotient->length; i++) {
+            uint64_t new_carry = quotient->limbs[i] >> 63;
+            quotient->limbs[i] = (quotient->limbs[i] << 1) | carry;
+            carry = new_carry;
+        }
+        if (carry) {
+            bigint_ensure_capacity(quotient, quotient->length + 1);
+            quotient->limbs[quotient->length] = carry;
+            quotient->length++;
+        }
+
+        /* Check if b << bit_pos <= remainder.
+         * Instead of shifting b, compare b with remainder >> bit_pos
+         * by extracting the right window. */
+        /* Simpler: subtract b*2^bit from remainder if remainder >= b*2^bit */
+        /* Even simpler for correctness: use the trial-subtract approach */
+
+        /* Extract bit `bit` of remainder to build quotient, then subtract */
+        /* Actually, use standard binary long division:
+         * Compare (remainder >> bit) with b; if >=, set quotient bit and subtract */
+    }
+
+    /* Fallback: just use repeated subtraction for now (slow but correct) */
+    fpy_bigint_free(quotient);
+    quotient = fpy_bigint_from_i64(0);
+
+    /* Better approach: shift-and-subtract */
+    /* First, find the bit length of b */
+    int b_bits = 0;
+    for (int32_t i = b->length - 1; i >= 0; i--) {
+        if (b->limbs[i] != 0) {
+            b_bits = i * 64;
+            uint64_t v = b->limbs[i];
+            while (v) { b_bits++; v >>= 1; }
+            break;
+        }
+    }
+    /* Find bit length of remainder (= a) */
+    int a_bits = 0;
+    for (int32_t i = remainder->length - 1; i >= 0; i--) {
+        if (remainder->limbs[i] != 0) {
+            a_bits = i * 64;
+            uint64_t v = remainder->limbs[i];
+            while (v) { a_bits++; v >>= 1; }
+            break;
+        }
+    }
+    int shift = a_bits - b_bits;
+    if (shift < 0) shift = 0;
+
+    /* Build shifted_b = b << shift */
+    /* Then iterate: if remainder >= shifted_b, subtract and set quotient bit */
+    for (int s = shift; s >= 0; s--) {
+        /* Compare remainder with b << s */
+        /* Build b_shifted temporarily */
+        int limb_shift = s / 64;
+        int bit_shift = s % 64;
+        int32_t bslen = b->length + limb_shift + 1;
+        /* Stack-allocate for small, heap for large */
+        uint64_t *bs_limbs = (uint64_t*)calloc(bslen, sizeof(uint64_t));
+        for (int32_t i = 0; i < b->length; i++) {
+            uint64_t v = b->limbs[i];
+            bs_limbs[i + limb_shift] |= (bit_shift == 0) ? v : (v << bit_shift);
+            if (bit_shift > 0 && i + limb_shift + 1 < bslen)
+                bs_limbs[i + limb_shift + 1] |= v >> (64 - bit_shift);
+        }
+        /* Find actual length */
+        int32_t bs_actual = bslen;
+        while (bs_actual > 0 && bs_limbs[bs_actual - 1] == 0) bs_actual--;
+
+        /* Compare remainder with shifted b */
+        int ge = 0;
+        if (remainder->length > bs_actual) ge = 1;
+        else if (remainder->length == bs_actual) {
+            ge = 1;
+            for (int32_t i = bs_actual - 1; i >= 0; i--) {
+                uint64_t rl = (i < remainder->length) ? remainder->limbs[i] : 0;
+                if (rl < bs_limbs[i]) { ge = 0; break; }
+                if (rl > bs_limbs[i]) break;
+            }
+        }
+
+        if (ge) {
+            /* Subtract b<<s from remainder */
+            uint64_t borrow = 0;
+            for (int32_t i = 0; i < remainder->length || i < bs_actual; i++) {
+                uint64_t rl = (i < remainder->length) ? remainder->limbs[i] : 0;
+                uint64_t bl = (i < bs_actual) ? bs_limbs[i] : 0;
+                uint64_t diff = rl - bl - borrow;
+                borrow = (rl < bl + borrow || (borrow && bl == UINT64_MAX)) ? 1 : 0;
+                if (i < remainder->length) remainder->limbs[i] = diff;
+            }
+            bigint_normalize(remainder);
+
+            /* Set bit s in quotient */
+            int qlimb = s / 64;
+            int qbit = s % 64;
+            bigint_ensure_capacity(quotient, qlimb + 1);
+            while (quotient->length <= qlimb) {
+                quotient->limbs[quotient->length] = 0;
+                quotient->length++;
+            }
+            quotient->limbs[qlimb] |= ((uint64_t)1 << qbit);
+        }
+        free(bs_limbs);
+    }
+    bigint_normalize(quotient);
+
+    if (rem_out) *rem_out = remainder;
+    else fpy_bigint_free(remainder);
+    return quotient;
+}
+
 /* Floor division and modulo — simple long division */
 FpyBigInt* fpy_bigint_floordiv(FpyBigInt *a, FpyBigInt *b) {
     if (fpy_bigint_is_zero(b)) {
         fprintf(stderr, "ZeroDivisionError: integer division or modulo by zero\n");
         exit(1);
     }
-    /* Simple case: single limb */
+    /* Simple case: single limb each */
     if (a->length <= 1 && b->length <= 1) {
         int64_t va = a->sign * (int64_t)a->limbs[0];
         int64_t vb = b->sign * (int64_t)b->limbs[0];
@@ -359,7 +547,7 @@ FpyBigInt* fpy_bigint_floordiv(FpyBigInt *a, FpyBigInt *b) {
         if ((va % vb != 0) && ((va ^ vb) < 0)) q--;
         return fpy_bigint_from_i64(q);
     }
-    /* For larger values, use the i64 path if possible */
+    /* For values that both fit in i64: fast path */
     int ov1, ov2;
     int64_t va = fpy_bigint_to_i64(a, &ov1);
     int64_t vb = fpy_bigint_to_i64(b, &ov2);
@@ -368,8 +556,26 @@ FpyBigInt* fpy_bigint_floordiv(FpyBigInt *a, FpyBigInt *b) {
         if ((va % vb != 0) && ((va ^ vb) < 0)) q--;
         return fpy_bigint_from_i64(q);
     }
-    /* TODO: full multi-limb division for very large numbers */
-    return fpy_bigint_from_i64(0);
+    /* Full multi-limb unsigned division, then fix sign for Python floor */
+    FpyBigInt *q = mag_divmod(a, b, NULL);
+    q->sign = (a->sign == b->sign) ? 1 : -1;
+    /* Python floor division: if signs differ and there's a remainder,
+     * subtract 1 from quotient. Check via q*b != a. */
+    if (a->sign != b->sign) {
+        FpyBigInt *check = fpy_bigint_mul(q, b);
+        check->sign = a->sign;  /* match a's sign for comparison */
+        if (fpy_bigint_cmp(check, a) != 0) {
+            FpyBigInt *one = fpy_bigint_from_i64(1);
+            FpyBigInt *q2 = fpy_bigint_sub(q, one);
+            fpy_bigint_free(one);
+            fpy_bigint_free(q);
+            q = q2;
+        }
+        fpy_bigint_free(check);
+    }
+    bigint_normalize(q);
+    if (q->length == 0) q->sign = 1;
+    return q;
 }
 
 FpyBigInt* fpy_bigint_mod(FpyBigInt *a, FpyBigInt *b) {
@@ -489,7 +695,10 @@ int64_t fpy_checked_pow(int64_t base, int64_t exp, FpyBigInt **big) {
         return 0;
     }
 
-    /* Try i64 with overflow checks */
+    /* Try i64 with overflow checks.
+     * Classic binary exponentiation: shift e first, then square b
+     * only if more iterations remain.  This avoids a false overflow
+     * from an unnecessary final b*b squaring. */
     int64_t result = 1;
     int64_t b = base;
     int64_t e = exp;
@@ -518,13 +727,14 @@ int64_t fpy_checked_pow(int64_t base, int64_t exp, FpyBigInt **big) {
                 return 0;
             }
         }
+        e >>= 1;
+        if (e == 0) break;  /* Don't square base when we're done */
         FpyBigInt *tmp = NULL;
         b = fpy_checked_mul(b, b, &tmp);
         if (tmp) {
             /* Base squared overflowed — finish in BigInt */
             FpyBigInt *bb = tmp;
             FpyBigInt *br = fpy_bigint_from_i64(result);
-            e >>= 1;
             while (e > 0) {
                 if (e & 1) {
                     FpyBigInt *t = fpy_bigint_mul(br, bb);
@@ -540,7 +750,6 @@ int64_t fpy_checked_pow(int64_t base, int64_t exp, FpyBigInt **big) {
             *big = br;
             return 0;
         }
-        e >>= 1;
     }
     return result;
 }
