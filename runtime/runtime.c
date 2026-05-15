@@ -901,10 +901,7 @@ int64_t fastpy_safe_mod(int64_t a, int64_t b) {
 
 double fastpy_safe_fdiv(double a, double b) {
     if (b == 0.0) {
-        /* CPython 3.14+ uses plain "division by zero" for all cases,
-         * including float/float.  Older versions used "float division
-         * by zero" but that changed in 3.14. */
-        fastpy_raise(FPY_EXC_ZERODIVISION, "division by zero");
+        fastpy_raise(FPY_EXC_ZERODIVISION, "float division by zero");
         return 0.0;
     }
     return a / b;

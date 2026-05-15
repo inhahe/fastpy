@@ -41,13 +41,15 @@ fpy_val_ptr = ir.PointerType(fpy_val)
 # side-table so FpyObj is ~24 bytes (was ~1560). Used for direct-struct
 # IR access to obj->slots[idx] (skips the fastpy_obj_get_slot /
 # fastpy_obj_set_slot function call overhead).
-# FpyObj layout on x64 (MSVC, sizeof=96):
+# FpyObj layout on x64 (MSVC, sizeof=56):
 #   offset  0: i32 refcount  (+4 pad)
 #   offset  8: FpyGCNode (24 bytes: gc_prev, gc_next, gc_refs+flags)
 #   offset 32: i32 magic + i32 class_id
 #   offset 40: ptr dynamic_attrs
 #   offset 48: ptr weakref_list
-#   offset 56: CRITICAL_SECTION lock (40 bytes)
+# Lock field removed — FPY_LOCK/FPY_UNLOCK are never used with FpyObj,
+# so the 40-byte CRITICAL_SECTION was pure waste.  Saves 40 bytes per
+# object (96→56), improving cache utilization for object-heavy workloads.
 # NOTE: the 'slots' pointer field was removed — slots are always inline
 # at (obj + 1), accessed via GEP arithmetic (zero pointer loads).
 # ALL fields must be present so that sizeof(fpy_obj_type) == sizeof(FpyObj)
@@ -60,7 +62,6 @@ fpy_obj_type = ir.LiteralStructType([
     i64,                             # 4: magic (i32) + class_id (i32)
     i8_ptr,                          # 5: dynamic_attrs
     i8_ptr,                          # 6: weakref_list
-    ir.ArrayType(i64, 5),            # 7: lock (CRITICAL_SECTION = 40 bytes on x64)
 ])
 fpy_obj_ptr = ir.PointerType(fpy_obj_type)
 
@@ -74,9 +75,9 @@ fpy_obj_ptr = ir.PointerType(fpy_obj_type)
 #   offset 40: const char **slot_names (i8*)
 #   offset 48: void (*destructor)(FpyObj*) (i8*)
 #   offset 56: void **vtable (i8*)
-#   offset 64: int vtable_size (i32) + 4 padding
-#   offset 72: int *mro (pointer to C3-linearized MRO array)
-#   offset 80: int mro_count (i32) + 4 padding
+#   offset 64: int vtable_size (i32) + uint8_t acyclic + 3 padding
+#   offset 72: int *mro (i8*)
+#   offset 80: int mro_len (i32) + 4 tail padding
 # Modeled as i64 + pointer pairs to match alignment (88 bytes total).
 fpy_classdef_type = ir.LiteralStructType([
     i64,    # 0: class_id(i32) + padding → offset 0
@@ -87,9 +88,9 @@ fpy_classdef_type = ir.LiteralStructType([
     i8_ptr, # 5: slot_names → offset 40
     i8_ptr, # 6: destructor → offset 48
     i8_ptr, # 7: vtable (void**) → offset 56
-    i64,    # 8: vtable_size(i32) + padding → offset 64
+    i64,    # 8: vtable_size(i32) + acyclic(u8) + padding → offset 64
     i8_ptr, # 9: mro (int*) → offset 72
-    i64,    # 10: mro_count(i32) + padding → offset 80
+    i64,    # 10: mro_len(i32) + tail padding → offset 80
 ])
 
 # FpyList layout — must match struct FpyList in objects.h:
@@ -1156,6 +1157,24 @@ class CodeGen:
         # LLVM from optimizing the loop.  The line number at loop entry is
         # still recorded.
         self._in_hot_loop = False
+
+        # Variables that have been assigned at least once (outside any try
+        # block).  Used to skip the UNDEF tag check in _load_variable when
+        # inside a hot loop — the variable is guaranteed to hold a real
+        # value, so the icmp+branch is pure overhead.
+        self._definitely_assigned: set[str] = set()
+
+        # Fresh-object optimisation for __init__: when compiling an __init__
+        # method, all slots start as {NONE, 0} (set by fastpy_obj_new).
+        # The first store to each slot can skip loading + decrefing the old
+        # value because it is guaranteed to be {NONE, 0} (a no-op decref).
+        # _init_stored_slots tracks which slot indices have already been
+        # stored to in the current __init__, so only the very first textual
+        # store skips the decref.  Stores inside loops are excluded (the
+        # same IR runs multiple times, and the second iteration may see
+        # a non-NONE old value).
+        self._compiling_init = False
+        self._init_stored_slots: set[int] = set()
 
         # Per-function bare-ABI flag: True when the current function being
         # compiled uses bare-type ABI (direct i64/double params/locals/return)
@@ -2293,6 +2312,18 @@ class CodeGen:
         ft = ir.FunctionType(void, [i32, i32])
         self.runtime["set_class_slot_count"] = ir.Function(
             self.module, ft, name="fastpy_set_class_slot_count")
+        # Mark a class as acyclic (scalar-only slots, skip GC tracking)
+        ft = ir.FunctionType(void, [i32])
+        self.runtime["set_class_acyclic"] = ir.Function(
+            self.module, ft, name="fastpy_set_class_acyclic")
+        # Set MRO for a class (diamond inheritance super() dispatch)
+        ft = ir.FunctionType(void, [i32, i8_ptr, i32])
+        self.runtime["set_class_mro"] = ir.Function(
+            self.module, ft, name="fastpy_set_class_mro")
+        # Resolve super() method via MRO
+        ft = ir.FunctionType(i8_ptr, [i8_ptr, i32, i8_ptr])
+        self.runtime["super_resolve"] = ir.Function(
+            self.module, ft, name="fastpy_super_resolve")
         # Per-class destructor callback (for generator finally cleanup)
         ft = ir.FunctionType(void, [i32, i8_ptr])
         self.runtime["set_class_destructor"] = ir.Function(
@@ -2302,14 +2333,6 @@ class CodeGen:
         ft = ir.FunctionType(void, [i32, i32, i8_ptr])
         self.runtime["register_slot_name"] = ir.Function(
             self.module, ft, name="fastpy_register_slot_name")
-        # MRO registration — class_set_mro(class_id, mro_ids_ptr, count)
-        ft = ir.FunctionType(void, [i32, ir.PointerType(i32), i32])
-        self.runtime["class_set_mro"] = ir.Function(
-            self.module, ft, name="fastpy_class_set_mro")
-        # super() method lookup — super_find_method(obj_class_id, current_class_id, name) -> FpyMethodDef*
-        ft = ir.FunctionType(i8_ptr, [i32, i32, i8_ptr])
-        self.runtime["super_find_method"] = ir.Function(
-            self.module, ft, name="fastpy_super_find_method")
         ft = ir.FunctionType(i64, [i8_ptr, i8_ptr])  # obj_call_method0(obj, name) -> result
         self.runtime["obj_call_method0"] = ir.Function(self.module, ft, name="fastpy_obj_call_method0")
         ft = ir.FunctionType(i64, [i8_ptr, i8_ptr, i64])
@@ -2342,16 +2365,6 @@ class CodeGen:
         self.runtime["obj_call_method0_double"] = ir.Function(self.module, ft, name="fastpy_obj_call_method0_double")
         ft = ir.FunctionType(double, [i8_ptr, i8_ptr, i64])
         self.runtime["obj_call_method1_double"] = ir.Function(self.module, ft, name="fastpy_obj_call_method1_double")
-
-        # super() method dispatch: super_call_method0/1/2/3(obj, current_class_id, name, args...)
-        ft = ir.FunctionType(i64, [i8_ptr, i32, i8_ptr])
-        self.runtime["super_call_method0"] = ir.Function(self.module, ft, name="fastpy_super_call_method0")
-        ft = ir.FunctionType(i64, [i8_ptr, i32, i8_ptr, i64])
-        self.runtime["super_call_method1"] = ir.Function(self.module, ft, name="fastpy_super_call_method1")
-        ft = ir.FunctionType(i64, [i8_ptr, i32, i8_ptr, i64, i64])
-        self.runtime["super_call_method2"] = ir.Function(self.module, ft, name="fastpy_super_call_method2")
-        ft = ir.FunctionType(i64, [i8_ptr, i32, i8_ptr, i64, i64, i64])
-        self.runtime["super_call_method3"] = ir.Function(self.module, ft, name="fastpy_super_call_method3")
 
         # Safe division (checks for zero, raises ZeroDivisionError)
         ft = ir.FunctionType(i64, [i64, i64])
@@ -2528,9 +2541,20 @@ class CodeGen:
         # Mark a closure as using *args (arguments will be packed into a list)
         ft = ir.FunctionType(void, [i8_ptr])
         self.runtime["closure_set_vararg"] = ir.Function(self.module, ft, name="fastpy_closure_set_vararg")
-        # Mark a closure as using **kwargs (keyword args packed into a dict)
+
+        # Mark a closure as using **kwargs
+        ft = ir.FunctionType(void, [i8_ptr])
         self.runtime["closure_set_kwarg"] = ir.Function(self.module, ft, name="fastpy_closure_set_kwarg")
-        # Call a closure/function with keyword args from a dict
+
+        # Set parameter names on a closure (for **kwargs dispatch)
+        ft = ir.FunctionType(void, [i8_ptr, i8_ptr])
+        self.runtime["closure_set_param_names"] = ir.Function(self.module, ft, name="fastpy_closure_set_param_names")
+
+        # Set a single parameter name by index
+        ft = ir.FunctionType(void, [i8_ptr, i32, i8_ptr])
+        self.runtime["closure_set_param_name"] = ir.Function(self.module, ft, name="fastpy_closure_set_param_name")
+
+        # Call a closure with a kwargs dict (for func(**kwargs) pattern)
         ft = ir.FunctionType(i64, [i8_ptr, i8_ptr])
         self.runtime["closure_call_dict"] = ir.Function(self.module, ft, name="fastpy_closure_call_dict")
 
@@ -2760,59 +2784,63 @@ class CodeGen:
 
     _RC_IMMORTAL = 0x7FFFFFFF
 
-    def _emit_inline_obj_incref(self, data_i64: ir.Value) -> None:
+    def _emit_inline_obj_incref(self, data_i64: ir.Value,
+                                nonnull: bool = False) -> None:
         """Emit inline incref for a known-OBJ pointer.
 
-        Equivalent to: if (ptr && ptr->refcount != IMMORTAL) ptr->refcount++
-        Null check handles the None case (e.g., end of linked list).
-        """
-        is_null = self.builder.icmp_unsigned(
-            "==", data_i64, ir.Constant(i64, 0))
-        do_bb = self._new_block("irc.inc")
-        end_bb = self._new_block("irc.end")
-        self.builder.cbranch(is_null, end_bb, do_bb)
+        FpyObj instances are never immortal (only static constants like
+        interned strings get immortal refcounts), so the immortal check is
+        omitted — saves one compare + one branch per incref.
 
-        self.builder.position_at_end(do_bb)
+        When *nonnull* is True the caller guarantees the pointer is not
+        NULL (e.g. old value of a variable that just passed ``is not
+        None``), so the null-check branch is also skipped — the incref
+        becomes a straight-line load/add/store with zero branches.
+        """
+        end_bb = self._new_block("irc.end")
+        if nonnull:
+            do_bb = None  # fall through
+        else:
+            is_null = self.builder.icmp_unsigned(
+                "==", data_i64, ir.Constant(i64, 0))
+            do_bb = self._new_block("irc.inc")
+            self.builder.cbranch(is_null, end_bb, do_bb)
+            self.builder.position_at_end(do_bb)
+
         ptr = self._ensure_ptr(data_i64)
         rc_ptr = self.builder.bitcast(ptr, ir.PointerType(i32))
         rc = self.builder.load(rc_ptr)
-        is_imm = self.builder.icmp_unsigned(
-            "==", rc, ir.Constant(i32, self._RC_IMMORTAL))
-        inc_bb = self._new_block("irc.do")
-        self.builder.cbranch(is_imm, end_bb, inc_bb)
-
-        self.builder.position_at_end(inc_bb)
         new_rc = self.builder.add(rc, ir.Constant(i32, 1))
         self.builder.store(new_rc, rc_ptr)
         self.builder.branch(end_bb)
 
         self.builder.position_at_end(end_bb)
 
-    def _emit_inline_obj_decref(self, data_i64: ir.Value) -> None:
+    def _emit_inline_obj_decref(self, data_i64: ir.Value,
+                                nonnull: bool = False) -> None:
         """Emit inline decref for a known-OBJ pointer.
 
-        Equivalent to: if (ptr && ptr->refcount != IMMORTAL) {
-            if (--ptr->refcount == 0) fpy_rc_decref(OBJ, ptr);  // full destroy
-        }
-        The hot path (refcount > 1 after decrement) is pure inline
-        loads/stores. Only the cold destroy path calls the C function.
-        """
-        is_null = self.builder.icmp_unsigned(
-            "==", data_i64, ir.Constant(i64, 0))
-        do_bb = self._new_block("drc.dec")
-        end_bb = self._new_block("drc.end")
-        self.builder.cbranch(is_null, end_bb, do_bb)
+        FpyObj instances are never immortal, so the immortal check is
+        omitted.  The hot path (refcount > 1 after decrement) is pure
+        inline loads/stores with a single well-predicted branch.  Only
+        the cold destroy path (refcount hits zero) calls the C function.
 
-        self.builder.position_at_end(do_bb)
+        When *nonnull* is True the caller guarantees the pointer is not
+        NULL, so the null-check branch is also skipped.
+        """
+        end_bb = self._new_block("drc.end")
+        if nonnull:
+            pass  # fall through
+        else:
+            is_null = self.builder.icmp_unsigned(
+                "==", data_i64, ir.Constant(i64, 0))
+            do_bb = self._new_block("drc.dec")
+            self.builder.cbranch(is_null, end_bb, do_bb)
+            self.builder.position_at_end(do_bb)
+
         ptr = self._ensure_ptr(data_i64)
         rc_ptr = self.builder.bitcast(ptr, ir.PointerType(i32))
         rc = self.builder.load(rc_ptr)
-        is_imm = self.builder.icmp_unsigned(
-            "==", rc, ir.Constant(i32, self._RC_IMMORTAL))
-        dec_bb = self._new_block("drc.do")
-        self.builder.cbranch(is_imm, end_bb, dec_bb)
-
-        self.builder.position_at_end(dec_bb)
         new_rc = self.builder.sub(rc, ir.Constant(i32, 1))
         is_zero = self.builder.icmp_unsigned(
             "==", new_rc, ir.Constant(i32, 0))
@@ -3791,8 +3819,14 @@ class CodeGen:
             self.variables[gname] = (gvar, gtag)
         self._loop_stack = []
 
-        # Register classes with the runtime
+        # Register classes with the runtime.
+        # Deduplicate by identity: monomorphized aliases (e.g. "Counter"
+        # → same ClassInfo as "Counter__i") must not be registered twice.
+        _registered_cls_ids: set[int] = set()
         for cls_info in self._user_classes.values():
+            if id(cls_info) in _registered_cls_ids:
+                continue
+            _registered_cls_ids.add(id(cls_info))
             self._emit_class_registration(cls_info)
 
         # Register exception class hierarchy so except handlers can match
@@ -3961,6 +3995,8 @@ class CodeGen:
         outer_params = {arg.arg for arg in outer_func.args.args}
         if outer_func.args.vararg:
             outer_params.add(outer_func.args.vararg.arg)
+        if outer_func.args.kwarg:
+            outer_params.add(outer_func.args.kwarg.arg)
         # Collect variables assigned in the outer function body
         outer_locals = set(outer_params)
         for stmt in outer_func.body:
@@ -4022,6 +4058,8 @@ class CodeGen:
                 inner_params = {arg.arg for arg in node.args.args}
                 if node.args.vararg:
                     inner_params.add(node.args.vararg.arg)
+                if node.args.kwarg:
+                    inner_params.add(node.args.kwarg.arg)
 
                 # Detect nonlocal declarations
                 nonlocal_vars = set()
@@ -4081,7 +4119,7 @@ class CodeGen:
                         if node.args.vararg:
                             param_types.append(i8_ptr)
                         if node.args.kwarg:
-                            param_types.append(i8_ptr)  # dict pointer
+                            param_types.append(i8_ptr)
                         has_return = any(
                             isinstance(n, ast.Return) and n.value is not None
                             for n in ast.walk(node)
@@ -4130,7 +4168,8 @@ class CodeGen:
                     # Mutable captures are i8* (cell pointers), immutable are i64
                     # If the inner function uses *args, include it as a single
                     # i8* parameter (pointer to the args list).
-                    # If **kwargs, include it as an i8* dict pointer.
+                    # If the inner function uses **kwargs, include it as a
+                    # single i8* parameter (pointer to the kwargs dict).
                     explicit_params = [arg.arg for arg in node.args.args]
                     if node.args.vararg:
                         explicit_params.append(node.args.vararg.arg)
@@ -4186,12 +4225,15 @@ class CodeGen:
                                         and v.func.id in ("bool", "isinstance")):
                                     ret_tag = "bool"
                     # Register as a special closure function
+                    _n_positional = len(node.args.args)
+                    _has_kwarg = node.args.kwarg is not None
                     self._user_functions[full_name] = FuncInfo(
                         func=func, ret_tag=ret_tag,
-                        param_count=len(node.args.args),  # explicit params only
+                        param_count=_n_positional + (1 if _has_kwarg else 0),
                         defaults=node.args.defaults,
-                        min_args=len(node.args.args) - len(node.args.defaults),
+                        min_args=_n_positional - len(node.args.defaults),
                         param_names=[a.arg for a in node.args.args],
+                        is_kwarg=_has_kwarg,
                     )
 
                     # Recurse to scan this inner function for its own
@@ -4280,6 +4322,55 @@ class CodeGen:
             b.ret(data)
         return wrapper
 
+    def _wrap_func_in_closure(self, info: "FuncInfo",
+                              func_ptr: ir.Function) -> ir.Value:
+        """Wrap a user function in a FpyClosure with param_names, defaults,
+        and vararg/kwarg flags.  Returns the closure pointer as i64.
+
+        Used when a function name appears as a value expression (e.g.,
+        passed to a decorator, stored in a variable).  The closure carries
+        metadata needed for runtime dispatch — in particular, param_names
+        enables closure_call_dict for **kwargs forwarding.
+        """
+        func_ptr_i8 = self.builder.bitcast(func_ptr, i8_ptr)
+        closure = self.builder.call(self.runtime["closure_new"], [
+            func_ptr_i8,
+            ir.Constant(i32, info.param_count),
+            ir.Constant(i32, 0),
+        ])
+        if info.is_vararg:
+            self.builder.call(self.runtime["closure_set_vararg"], [closure])
+        if info.is_kwarg:
+            self.builder.call(self.runtime["closure_set_kwarg"], [closure])
+        # Set default values
+        if info.defaults:
+            n_defaults = len(info.defaults)
+            self.builder.call(self.runtime["closure_set_defaults"],
+                              [closure, ir.Constant(i32, n_defaults)])
+            for di, def_node in enumerate(info.defaults):
+                def_val = self._emit_expr_value(def_node)
+                if isinstance(def_val.type, ir.PointerType):
+                    def_val = self.builder.ptrtoint(def_val, i64)
+                elif isinstance(def_val.type, ir.IntType) and def_val.type.width != 64:
+                    def_val = self.builder.zext(def_val, i64)
+                elif isinstance(def_val.type, ir.DoubleType):
+                    def_val = self.builder.bitcast(def_val, i64)
+                self.builder.call(self.runtime["closure_set_default"],
+                                  [closure, ir.Constant(i32, di), def_val])
+        # Set parameter names for kwargs dispatch
+        if info.param_names:
+            self._emit_closure_param_names(closure, info.param_names)
+        return self.builder.ptrtoint(closure, i64)
+
+    def _emit_closure_param_names(self, closure: ir.Value,
+                                   param_names: list[str]) -> None:
+        """Set parameter names on a closure by calling
+        closure_set_param_name for each parameter."""
+        for i, pn in enumerate(param_names):
+            name_ptr = self._make_string_constant(pn)
+            self.builder.call(self.runtime["closure_set_param_name"],
+                              [closure, ir.Constant(i32, i), name_ptr])
+
     def _emit_method_i64_wrapper(self, method_func: ir.Function) -> ir.Function:
         """Create a thin i64-ABI wrapper for a FV-ABI method.
 
@@ -4339,10 +4430,6 @@ class CodeGen:
                     self._emit_closure_body(closure_func, node, captures)
                 func_ptr = self.builder.bitcast(closure_func, i8_ptr)
                 n_params = len(node.args.args)
-                if node.args.vararg:
-                    n_params += 1
-                if node.args.kwarg:
-                    n_params += 1
                 n_captures = len(captures)
 
                 nonlocals = self._closure_nonlocals.get(full_name, set())
@@ -4410,6 +4497,10 @@ class CodeGen:
                         val = self._load_variable(var_name, node)
                         if isinstance(val.type, ir.PointerType):
                             val = self.builder.ptrtoint(val, i64)
+                        elif (isinstance(val.type, ir.LiteralStructType)
+                              and val.type == fpy_val):
+                            # FpyValue capture — extract the i64 data field
+                            val = self.builder.extract_value(val, 1)
                         elif isinstance(val.type, ir.IntType) and val.type.width != 64:
                             val = self.builder.zext(val, i64)
                         self.builder.call(self.runtime["closure_set_capture"], [
@@ -4433,10 +4524,21 @@ class CodeGen:
                 if node.args.vararg:
                     self.builder.call(self.runtime["closure_set_vararg"],
                                       [closure])
+
                 # Mark as **kwargs closure if the function uses **kwargs
                 if node.args.kwarg:
                     self.builder.call(self.runtime["closure_set_kwarg"],
                                       [closure])
+
+                # Set parameter names on the closure (for **kwargs dispatch)
+                _clos_info = self._user_functions.get(full_name)
+                if _clos_info and _clos_info.param_names:
+                    self._emit_closure_param_names(closure,
+                                                    _clos_info.param_names)
+                elif not _clos_info:
+                    _param_names = [a.arg for a in node.args.args]
+                    if _param_names:
+                        self._emit_closure_param_names(closure, _param_names)
 
                 # Store closure as a variable with the inner function's name
                 self._store_variable(node.name, closure, ValueType(VKind.CLOSURE))
@@ -4476,8 +4578,7 @@ class CodeGen:
                 if _inner_has_vararg:
                     self.builder.call(self.runtime["closure_set_vararg"],
                                       [closure])
-                _inner_has_kwarg = node.args.kwarg is not None
-                if _inner_has_kwarg:
+                if node.args.kwarg:
                     self.builder.call(self.runtime["closure_set_kwarg"],
                                       [closure])
                 if _inner_defaults:
@@ -4493,6 +4594,11 @@ class CodeGen:
                             def_val = self.builder.bitcast(def_val, i64)
                         self.builder.call(self.runtime["closure_set_default"],
                                           [closure, ir.Constant(i32, di), def_val])
+                # Set param names for **kwargs dispatch
+                _hoisted_info = self._user_functions.get(node.name)
+                if _hoisted_info and _hoisted_info.param_names:
+                    self._emit_closure_param_names(closure,
+                                                    _hoisted_info.param_names)
                 self._store_variable(node.name, closure, ValueType(VKind.CLOSURE))
             elif _inner_has_vararg:
                 # *args function: returns FpyValue but closure expects i64.
@@ -4519,9 +4625,6 @@ class CodeGen:
                 ])
                 self.builder.call(self.runtime["closure_set_vararg"],
                                   [closure])
-                if node.args.kwarg:
-                    self.builder.call(self.runtime["closure_set_kwarg"],
-                                      [closure])
                 if _inner_defaults:
                     self.builder.call(self.runtime["closure_set_defaults"],
                                       [closure, ir.Constant(i32, len(_inner_defaults))])
@@ -4632,12 +4735,6 @@ class CodeGen:
                 self.builder.store(param, alloca)
                 # Mutable capture — param is a cell pointer (i8*)
                 self.variables[pname] = (alloca, ValueType(VKind.CELL))
-            elif node.args.kwarg and pname == node.args.kwarg.arg:
-                # **kwargs parameter — it's a dict pointer (i8*)
-                ptr = self._ensure_ptr(param)
-                alloca = self.builder.alloca(i8_ptr, name=pname)
-                self.builder.store(ptr, alloca)
-                self.variables[pname] = (alloca, ValueType(VKind.DICT))
             elif node.args.vararg and pname == node.args.vararg.arg:
                 alloca = self.builder.alloca(param.type, name=pname)
                 self.builder.store(param, alloca)
@@ -4645,6 +4742,12 @@ class CodeGen:
                 # Element type is FVALUE (unknown at compile time) so
                 # iteration preserves the runtime tag for each element.
                 self.variables[pname] = (alloca, ValueType(VKind.LIST, elem_type=ValueType(VKind.FVALUE)))
+            elif node.args.kwarg and pname == node.args.kwarg.arg:
+                # **kwargs parameter — it's a dict pointer (i8*)
+                ptr = self._ensure_ptr(param)
+                alloca = self.builder.alloca(i8_ptr, name=pname)
+                self.builder.store(ptr, alloca)
+                self.variables[pname] = (alloca, ValueType(VKind.DICT))
             elif pi < n_explicit:
                 # Explicit function parameter — use CSA or FVALUE fallback
                 ct = _cl_call_types[pi] if pi < len(_cl_call_types) else None
@@ -4852,15 +4955,7 @@ class CodeGen:
             result = self._emit_expr_value(node.body)
             expected_ret = func.return_value.type
             if result.type != expected_ret:
-                if (isinstance(result.type, ir.LiteralStructType)
-                        and result.type == fpy_val
-                        and isinstance(expected_ret, ir.IntType)):
-                    # FpyValue result from i64 function: set ret_tag and
-                    # return the data field.
-                    _ret_tag = self.builder.extract_value(result, 0)
-                    self.builder.call(self.runtime["set_ret_tag"], [_ret_tag])
-                    result = self.builder.extract_value(result, 1)
-                elif isinstance(expected_ret, ir.IntType) and isinstance(result.type, ir.DoubleType):
+                if isinstance(expected_ret, ir.IntType) and isinstance(result.type, ir.DoubleType):
                     result = self.builder.fptosi(result, expected_ret)
                 elif isinstance(expected_ret, ir.DoubleType) and isinstance(result.type, ir.IntType):
                     result = self.builder.sitofp(result, expected_ret)
@@ -7820,7 +7915,8 @@ class CodeGen:
                 # caller can reconstruct the runtime type, then return
                 # just the i64 data field.
                 _ret_tag = self.builder.extract_value(result, 0)
-                self.builder.call(self.runtime["set_ret_tag"], [_ret_tag])
+                self.builder.call(self.runtime["set_arg_tag"],
+                                  [ir.Constant(i32, 99), _ret_tag])
                 result = self.builder.extract_value(result, 1)
             elif isinstance(expected_ret, ir.IntType) and isinstance(result.type, ir.DoubleType):
                 result = self.builder.fptosi(result, expected_ret)
@@ -13150,6 +13246,12 @@ class CodeGen:
             abstract_methods=_effective_abstract,
         )
 
+        # Store secondary bases for MRO computation during registration
+        if secondary_bases:
+            if not hasattr(self, '_class_secondary_bases'):
+                self._class_secondary_bases: dict[str, list[str]] = {}
+            self._class_secondary_bases[class_name] = secondary_bases
+
         # Monomorphized variants: propagate class-level dicts from the
         # original (un-mangled) class name.  These dicts are populated
         # during analysis (before monomorphization) and keyed by the
@@ -14041,8 +14143,12 @@ class CodeGen:
         saved = (self.function, self.builder, self.variables, self._loop_stack,
                  self._current_fn_bare_abi)
         saved_func_name = getattr(self, '_current_func_name', '')
+        saved_init = (self._compiling_init, self._init_stored_slots)
 
         self.function = func
+        # Fresh-object optimisation: track first stores in __init__.
+        self._compiling_init = (node.name == "__init__")
+        self._init_stored_slots = set()
         # Set _current_func_name so _emit_nested_funcdef can match
         # closures registered under the method name (e.g. "greet.helper").
         self._current_func_name = node.name
@@ -14479,6 +14585,7 @@ class CodeGen:
         (self.function, self.builder, self.variables, self._loop_stack,
          self._current_fn_bare_abi) = saved
         self._current_func_name = saved_func_name
+        self._compiling_init, self._init_stored_slots = saved_init
 
     def _emit_exc_class_hierarchy(self) -> None:
         """Register user-defined exception classes and their parents so
@@ -14661,16 +14768,90 @@ class CodeGen:
             self.builder.call(self.runtime["set_class_slot_count"], [
                 class_id, ir.Constant(i32, len(slots))
             ])
-            # Register slot names only if something in the program needs
-            # name-based lookup (getattr, dir, vars, unknown receivers, etc.).
-            # When every attribute access is statically resolved, names are
-            # pure overhead.
-            if getattr(self, '_slot_names_needed', True):
-                for attr_name, slot_idx in slots.items():
-                    name_ptr = self._make_string_constant(attr_name)
-                    self.builder.call(self.runtime["register_slot_name"], [
-                        class_id, ir.Constant(i32, slot_idx), name_ptr
-                    ])
+
+        # Mark acyclic classes — those whose slots only hold scalars
+        # (INT, FLOAT, BOOL, NONE, STR).  Instances skip GC tracking
+        # entirely since they can never form reference cycles.  Check
+        # both obj attrs (OBJ pointers) and container attrs (LIST, DICT).
+        _obj_attrs = getattr(self, '_class_obj_attrs', {}).get(
+            cls_info.name, set())
+        _list_attrs, _dict_attrs = self._class_container_attrs.get(
+            cls_info.name, (set(), set()))
+        _has_container_slots = bool(_obj_attrs or _list_attrs or _dict_attrs)
+        if not _has_container_slots:
+            # No outgoing references to other tracked containers.
+            # Also check parent: child inherits parent's attrs, so
+            # the parent must also be acyclic.
+            _parent_acyclic = True
+            if cls_info.parent_name:
+                _p_obj = getattr(self, '_class_obj_attrs', {}).get(
+                    cls_info.parent_name, set())
+                _p_list, _p_dict = self._class_container_attrs.get(
+                    cls_info.parent_name, (set(), set()))
+                if _p_obj or _p_list or _p_dict:
+                    _parent_acyclic = False
+            if _parent_acyclic:
+                self.builder.call(self.runtime["set_class_acyclic"],
+                                  [class_id])
+
+        # Register slot names only if something in the program needs
+        # name-based lookup (getattr, dir, vars, unknown receivers, etc.).
+        # When every attribute access is statically resolved, names are
+        # pure overhead.
+        if slots and getattr(self, '_slot_names_needed', True):
+            for attr_name, slot_idx in slots.items():
+                name_ptr = self._make_string_constant(attr_name)
+                self.builder.call(self.runtime["register_slot_name"], [
+                    class_id, ir.Constant(i32, slot_idx), name_ptr
+                ])
+
+        # Register MRO for classes in diamond inheritance hierarchies.
+        # The MRO is needed for correct super() dispatch: when D(B,C)
+        # and B(A), C(A) form a diamond, B.super() must dispatch to C
+        # (not A) when called on a D instance.  Register MRO for ALL
+        # classes when any class has multiple inheritance, so that
+        # super_resolve can look up self's actual MRO at runtime.
+        _any_mi = any(
+            getattr(self, '_class_secondary_bases', {}).get(cn, [])
+            for cn in self._user_classes)
+        if _any_mi:
+            # Compute MRO using the existing C3 linearization method
+            _all_bases = []
+            if cls_info.parent_name and cls_info.parent_name in self._user_classes:
+                _all_bases.append(cls_info.parent_name)
+            _all_bases.extend(
+                getattr(self, '_class_secondary_bases', {}).get(
+                    cls_info.name, []))
+            mro = self._compute_c3_mro(cls_info.name, _all_bases)
+            if mro:
+                # Build a global array of class IDs for the MRO
+                arr_type = ir.ArrayType(i32, len(mro))
+                mro_global = ir.GlobalVariable(
+                    self.module, arr_type,
+                    name=f"mro.{cls_info.name}")
+                mro_global.linkage = 'internal'
+                mro_global.global_constant = False
+                mro_global.initializer = ir.Constant(
+                    arr_type, [ir.Constant(i32, 0)] * len(mro))
+                # Store class IDs at runtime (they're not known until
+                # register_class runs)
+                for i, cname in enumerate(mro):
+                    cinfo = self._user_classes.get(cname)
+                    if cinfo:
+                        cid = self.builder.load(cinfo.class_id_global)
+                        cid = self.builder.sext(cid, i32) if cid.type.width < 32 \
+                            else cid
+                        ptr = self.builder.gep(
+                            mro_global,
+                            [ir.Constant(i32, 0), ir.Constant(i32, i)],
+                            inbounds=True)
+                        self.builder.store(cid, ptr)
+                mro_ptr = self.builder.bitcast(
+                    mro_global, i8_ptr)
+                self.builder.call(
+                    self.runtime["set_class_mro"],
+                    [class_id, mro_ptr,
+                     ir.Constant(i32, len(mro))])
 
         # Register each method and assign vtable slot.
         # FV-ABI methods (returning fpy_val struct) need an i64-ABI wrapper
@@ -14727,36 +14908,6 @@ class CodeGen:
         # Copy parent vtable entries into child so that inherited methods
         # are available for O(1) vtable dispatch without a parent walk.
         self.builder.call(self.runtime["inherit_parent_vtable"], [class_id])
-
-        # Register C3 MRO for super() dispatch in multiple-inheritance
-        # hierarchies. For single inheritance, the parent_id chain suffices.
-        # Only register if there are multiple known user classes in the MRO
-        # (builtins like Exception aren't tracked, so single-inheritance from
-        # a builtin shouldn't trigger MRO registration).
-        mro_names = getattr(self, '_class_mro', {}).get(cls_info.name)
-        if mro_names:
-            # Filter to only known user classes
-            mro_known = [n for n in mro_names
-                         if n == cls_info.name or n in self._user_classes]
-            if len(mro_known) > 1:
-                n_mro = len(mro_known)
-                mro_arr = self.builder.alloca(
-                    ir.ArrayType(i32, n_mro), name=f"mro.{cls_info.name}")
-                for idx, mro_cls_name in enumerate(mro_known):
-                    if mro_cls_name == cls_info.name:
-                        cid_val = class_id
-                    else:
-                        cid_val = self.builder.load(
-                            self._user_classes[mro_cls_name].class_id_global)
-                    self.builder.store(
-                        cid_val,
-                        self.builder.gep(mro_arr,
-                                        [ir.Constant(i32, 0),
-                                         ir.Constant(i32, idx)]))
-                mro_ptr = self.builder.gep(
-                    mro_arr, [ir.Constant(i32, 0), ir.Constant(i32, 0)])
-                self.builder.call(self.runtime["class_set_mro"],
-                                  [class_id, mro_ptr, ir.Constant(i32, n_mro)])
 
         # Generator destructor: if this class was generated from a generator
         # with try/finally blocks, register the close() method as a destructor.
@@ -15849,8 +16000,14 @@ class CodeGen:
         # If the RHS raised an exception (e.g. 10 / 0 in a try block),
         # bail before storing — the variable should remain UNDEF so that
         # accessing it later correctly raises NameError, matching CPython.
+        # Skip in hot loops when not in a try block: pure arithmetic and
+        # slot accesses cannot raise, and the function-call overhead of
+        # exc_pending() (2 calls per iteration) prevents LLVM from
+        # optimizing the loop.  The next non-hot-loop statement will catch
+        # any pending exception.
         if not self.builder.block.is_terminated:
-            self._emit_try_bail_if_exc()
+            if not (self._in_hot_loop and not self._in_try_block):
+                self._emit_try_bail_if_exc()
         if self.builder.block.is_terminated:
             return
 
@@ -16790,10 +16947,6 @@ class CodeGen:
                     self.builder.call(
                         self.runtime["closure_set_vararg"],
                         [closure])
-                if info.is_kwarg:
-                    self.builder.call(
-                        self.runtime["closure_set_kwarg"],
-                        [closure])
                 return (ir.Constant(i32, FPY_TAG_OBJ),
                         self.builder.ptrtoint(closure, i64))
         # Not a function reference — use normal tag/data conversion
@@ -16821,9 +16974,11 @@ class CodeGen:
             obj_cls, set())
 
     # Constants for direct slot offset computation (must match C layout).
-    # FpyObj: { i32 class_id, 4 pad, i8* slots, i8* dynamic_attrs } = 24 bytes
+    # NOTE: these constants are documentation only — the actual slot offset
+    # is computed by GEP on fpy_obj_type (which models the 56-byte
+    # struct; lock field was removed from FpyObj).
     # FpyValue: { i32 tag, 4 pad, i64 data } = 16 bytes
-    _FPYOBJ_SIZE = 32    # sizeof(FpyObj) on x64 (excl lock): refcount(4) + magic(4) + class_id(4) + pad(4) + slots(8) + dynamic_attrs(8)
+    _FPYOBJ_SIZE = 56    # sizeof(FpyObj) on x64: refcount(4) + pad(4) + gc_node(24) + magic(4) + class_id(4) + dynamic_attrs(8) + weakref_list(8)
     _FPYVAL_SIZE = 16    # sizeof(FpyValue) on x64
     _FPYVAL_DATA_OFF = 8 # offsetof(FpyValue, data) = 4 (tag) + 4 (pad)
 
@@ -17240,9 +17395,20 @@ class CodeGen:
                     fv = self.builder.load(alloca_var, name=f"{value_node.id}.fv")
                     tag_val = self.builder.extract_value(fv, 0)
                     data_val = self.builder.extract_value(fv, 1)
-                    # Decref old slot value before overwriting.
-                    old_tag, old_data = self._emit_slot_get_direct(
-                        obj, slot_idx)
+                    # Fresh-object optimisation: in __init__, the first
+                    # store to each slot can skip loading + decrefing the
+                    # old value because fastpy_obj_new sets all slots to
+                    # {NONE, 0} — decref(NONE, 0) is always a no-op.
+                    # Not used inside loops (same IR runs multiple times).
+                    _fresh = (self._compiling_init
+                              and not self._loop_stack
+                              and isinstance(target.value, ast.Name)
+                              and target.value.id == "self"
+                              and slot_idx not in self._init_stored_slots)
+                    if not _fresh:
+                        # Load old slot value for decref after store.
+                        old_tag, old_data = self._emit_slot_get_direct(
+                            obj, slot_idx)
                     # Incref the value being stored — the variable's
                     # alloca holds a borrowed reference; the slot needs
                     # its own.  rc_incref is a no-op for scalars (INT,
@@ -17251,11 +17417,14 @@ class CodeGen:
                                       [tag_val, data_val])
                     self._emit_slot_set_direct(
                         obj, slot_idx, tag_val, data_val)
-                    # Decref old after store (safe order: incref-new →
-                    # store → decref-old avoids premature free when
-                    # old and new are the same object).
-                    self.builder.call(self.runtime["rc_decref"],
-                                      [old_tag, old_data])
+                    if not _fresh:
+                        # Decref old after store (safe order: incref-new →
+                        # store → decref-old avoids premature free when
+                        # old and new are the same object).
+                        self.builder.call(self.runtime["rc_decref"],
+                                          [old_tag, old_data])
+                    if self._compiling_init and isinstance(target.value, ast.Name) and target.value.id == "self":
+                        self._init_stored_slots.add(slot_idx)
                     return
 
         # Runtime-tag-preserving path for attribute-to-attribute stores:
@@ -17292,19 +17461,25 @@ class CodeGen:
                     rhs_obj = self._ensure_ptr(rhs_obj)
                     tag_val, data_val = self._emit_slot_get_direct(
                         rhs_obj, src_slot)
-                    # Load old target value before overwriting.
-                    old_tag, old_data = self._emit_slot_get_direct(
-                        obj, tgt_slot)
+                    _fresh = (self._compiling_init
+                              and not self._loop_stack
+                              and isinstance(target.value, ast.Name)
+                              and target.value.id == "self"
+                              and tgt_slot not in self._init_stored_slots)
+                    if not _fresh:
+                        # Load old target value before overwriting.
+                        old_tag, old_data = self._emit_slot_get_direct(
+                            obj, tgt_slot)
                     # Incref new value (slot needs its own reference).
                     self.builder.call(self.runtime["rc_incref"],
                                       [tag_val, data_val])
                     self._emit_slot_set_direct(
                         obj, tgt_slot, tag_val, data_val)
-                    # Decref old after store (safe order: incref-new →
-                    # store → decref-old avoids premature free when
-                    # old and new are the same object).
-                    self.builder.call(self.runtime["rc_decref"],
-                                      [old_tag, old_data])
+                    if not _fresh:
+                        self.builder.call(self.runtime["rc_decref"],
+                                          [old_tag, old_data])
+                    if self._compiling_init and isinstance(target.value, ast.Name) and target.value.id == "self":
+                        self._init_stored_slots.add(tgt_slot)
                     return
                 else:
                     # Slot unknown (class not resolved) — use runtime
@@ -17345,14 +17520,23 @@ class CodeGen:
             data_val = self.builder.extract_value(value, 1, name="fv.data")
             slot_idx = self._get_attr_slot(target)
             if slot_idx is not None:
-                old_tag, old_data = self._emit_slot_get_direct(
-                    obj, slot_idx)
+                _fresh = (self._compiling_init
+                          and not self._loop_stack
+                          and isinstance(target.value, ast.Name)
+                          and target.value.id == "self"
+                          and slot_idx not in self._init_stored_slots)
+                if not _fresh:
+                    old_tag, old_data = self._emit_slot_get_direct(
+                        obj, slot_idx)
                 self.builder.call(self.runtime["rc_incref"],
                                   [tag_val, data_val])
                 self._emit_slot_set_direct(
                     obj, slot_idx, tag_val, data_val)
-                self.builder.call(self.runtime["rc_decref"],
-                                  [old_tag, old_data])
+                if not _fresh:
+                    self.builder.call(self.runtime["rc_decref"],
+                                      [old_tag, old_data])
+                if self._compiling_init and isinstance(target.value, ast.Name) and target.value.id == "self":
+                    self._init_stored_slots.add(slot_idx)
             else:
                 self.builder.call(self.runtime["obj_set_fv"],
                                   [obj, attr_name, tag_val, data_val])
@@ -17434,18 +17618,32 @@ class CodeGen:
             ast.Call, ast.List, ast.ListComp,
             ast.Dict, ast.DictComp, ast.Set, ast.SetComp))
         tag_const = ir.Constant(i32, tag)
+        # Tags that have no heap allocation — no refcounting needed for
+        # the NEW value.  Old slot value may still need decref (it could
+        # hold a heap-allocated type from a previous assignment).
+        _SCALAR_TAGS = {FPY_TAG_INT, FPY_TAG_FLOAT, FPY_TAG_BOOL, FPY_TAG_NONE}
         # Try static slot fast path first (direct pointer-arithmetic store).
         slot_idx = self._get_attr_slot(target)
         if slot_idx is not None:
-            # Decref old slot value (may be non-trivial on reassignment).
-            old_tag, old_data = self._emit_slot_get_direct(obj, slot_idx)
-            self.builder.call(self.runtime["rc_decref"],
-                              [old_tag, old_data])
+            _fresh = (self._compiling_init
+                      and not self._loop_stack
+                      and isinstance(target.value, ast.Name)
+                      and target.value.id == "self"
+                      and slot_idx not in self._init_stored_slots)
+            if not _fresh:
+                # Decref old slot value (may be non-trivial on reassignment).
+                old_tag, old_data = self._emit_slot_get_direct(obj, slot_idx)
+                self.builder.call(self.runtime["rc_decref"],
+                                  [old_tag, old_data])
             self._emit_slot_set_direct(obj, slot_idx, tag_const, data)
-            # Incref new value unless it's an owned reference (steal).
-            if not _steal:
+            # Incref new value unless it's an owned reference (steal)
+            # or a scalar type (INT, FLOAT, BOOL, NONE have no heap
+            # allocation so incref is a no-op — skip the function call).
+            if not _steal and tag not in _SCALAR_TAGS:
                 self.builder.call(self.runtime["rc_incref"],
                                   [tag_const, data])
+            if self._compiling_init and isinstance(target.value, ast.Name) and target.value.id == "self":
+                self._init_stored_slots.add(slot_idx)
         else:
             # obj_set_fv handles incref(new) + decref(old) internally.
             self.builder.call(self.runtime["obj_set_fv"],
@@ -19616,8 +19814,15 @@ class CodeGen:
                 old_fv = self.builder.load(alloca, name=f"{name}.old")
                 old_tag_val = self.builder.extract_value(old_fv, 0)
                 old_data = self.builder.extract_value(old_fv, 1)
-                self.builder.call(self.runtime["rc_decref"],
-                                  [old_tag_val, old_data])
+                # Inline OBJ decref when the new kind is OBJ — the alloca
+                # alternates between NONE (initial) and OBJ (subsequent
+                # iterations), both handled by the inline null check.
+                # Avoids the fpy_rc_decref function call overhead in hot loops.
+                if _new_kind in (VKind.OBJ, VKind.CLOSURE):
+                    self._emit_inline_obj_decref(old_data)
+                else:
+                    self.builder.call(self.runtime["rc_decref"],
+                                      [old_tag_val, old_data])
         # Incref the new value being stored (skip if stealing an owned ref)
         if self._USE_REFCOUNT and not steal and not _new_is_scalar:
             new_tag = self.builder.extract_value(fv, 0)
@@ -19632,6 +19837,14 @@ class CodeGen:
                                   [new_tag, new_data])
         self.variables[name] = (alloca, type_tag)
         self.builder.store(fv, alloca)
+        # Track that this variable has been assigned a real value.  Inside
+        # hot loops, _load_variable uses this to skip the UNDEF tag check
+        # (one icmp + one branch per load) which otherwise blocks LLVM loop
+        # optimizations.  Only mark outside try blocks — inside a try, the
+        # assignment could be interrupted by an exception, leaving the
+        # variable UNDEF.
+        if not self._in_try_block:
+            self._definitely_assigned.add(name)
 
     @staticmethod
     def _tag_kind(tag) -> VKind:
@@ -20118,7 +20331,13 @@ class CodeGen:
         # (determined by the variable's current type_tag)
         if isinstance(alloca.type, ir.PointerType) and alloca.type.pointee is fpy_val:
             fv = self.builder.load(alloca, name=f"{name}.fv")
-            self._check_fv_undef(fv, name)
+            # Skip the UNDEF tag check for variables that have been
+            # assigned at least once (outside try blocks).  The check
+            # is an icmp + predicted-not-taken branch per load which
+            # prevents LLVM from optimizing hot loops.
+            if not (name in self._definitely_assigned
+                    and not self._in_try_block):
+                self._check_fv_undef(fv, name)
             return self._unwrap_fv_for_tag(fv, type_tag)
         # Legacy alloca (not yet migrated) — load directly
         return self.builder.load(alloca, name=name)
@@ -26727,6 +26946,46 @@ class CodeGen:
         _, tag = self.variables.get(name, (None, ValueType(VKind.INT)))
         is_closure = (self._tag_kind(tag) == VKind.CLOSURE)
 
+        # Handle f(**kwargs) or f(key=val, ...) in closure/function-pointer call.
+        # Uses closure_call_dict which maps dict keys to positional params.
+        has_kwargs_unpack = (node.keywords
+                            and any(kw.arg is None for kw in node.keywords))
+        has_explicit_kwargs = (node.keywords
+                               and all(kw.arg is not None for kw in node.keywords))
+        if (has_kwargs_unpack or has_explicit_kwargs) and n_args == 0:
+            if has_kwargs_unpack and len(node.keywords) == 1:
+                # Simple f(**kwargs) — forward the existing dict
+                kw = node.keywords[0]
+                dict_val = self._emit_expr_value(kw.value)
+                dict_ptr = self._ensure_ptr(dict_val)
+            else:
+                # Build a dict from keyword arguments
+                dict_ptr = self.builder.call(self.runtime["dict_new"], [])
+                for kw in node.keywords:
+                    if kw.arg is None:
+                        # **kwargs_spread — merge into dict
+                        src = self._emit_expr_value(kw.value)
+                        src_ptr = self._ensure_ptr(src)
+                        self.builder.call(self.runtime["dict_update"],
+                                          [dict_ptr, src_ptr])
+                    else:
+                        key = self._make_string_constant(kw.arg)
+                        val_expr = self._emit_expr_value(kw.value)
+                        tag, data = self._bare_to_tag_data(val_expr, kw.value)
+                        self.builder.call(self.runtime["dict_set_fv"],
+                                          [dict_ptr, key,
+                                           ir.Constant(i32, tag), data])
+            ptr = self._ensure_ptr(val)
+            result = self.builder.call(
+                self.runtime["closure_call_dict"], [ptr, dict_ptr])
+            # The callee sets ret_tag — use it to build an FpyValue with
+            # the correct runtime type (str, int, etc.)
+            if (isinstance(result.type, ir.LiteralStructType)
+                    and result.type == fpy_val):
+                return result  # already an FpyValue
+            ret_tag_val = self.builder.call(self.runtime["get_ret_tag"], [])
+            return self._fv_build_from_slots(ret_tag_val, result)
+
         # Handle f(*args) — Starred arg in closure/function-pointer call.
         # Common in decorator wrappers: def wrapper(*args): return f(*args)
         # Uses closure_call_list which unpacks the args list at runtime
@@ -26736,59 +26995,8 @@ class CodeGen:
             args_list = self._emit_expr_value(node.args[0].value)
             args_list = self._ensure_ptr(args_list)
             ptr = self._ensure_ptr(val)
-            _star_result = self.builder.call(
+            return self.builder.call(
                 self.runtime["closure_call_list"], [ptr, args_list])
-            # Build FpyValue from runtime ret_tag so the type is preserved
-            _rt = self.builder.call(self.runtime["get_ret_tag"], [])
-            return self._fv_build_from_slots(_rt, _star_result)
-
-        # Handle f(**kwargs) — Double-star unpack in closure/function-pointer call.
-        # Common in decorator wrappers: def wrapper(**kw): return f(**kw)
-        # Uses closure_call_dict which dispatches based on callee type:
-        #   - has_kwarg closure: passes dict directly
-        #   - regular function: extracts dict values as positional args
-        _kwargs_result = None
-        has_dstar = any(kw.arg is None for kw in node.keywords)
-        if has_dstar and len(node.keywords) == 1 and n_args == 0:
-            # Simple forwarding: func(**kwargs)
-            dict_val = self._emit_expr_value(node.keywords[0].value)
-            dict_ptr = self._ensure_ptr(dict_val)
-            ptr = self._ensure_ptr(val)
-            _kwargs_result = self.builder.call(
-                self.runtime["closure_call_dict"], [ptr, dict_ptr])
-
-        # Handle f(key=val, ...) — Named keyword args in closure call.
-        # Pack them into a dict and dispatch via closure_call_dict.
-        elif node.keywords and n_args == 0:
-            dict_ptr = self.builder.call(self.runtime["dict_new"], [])
-            for kw in node.keywords:
-                if kw.arg is None:
-                    # **spread — get the dict and merge
-                    spread = self._emit_expr_value(kw.value)
-                    spread = self._ensure_ptr(spread)
-                    self.builder.call(self.runtime["dict_update"],
-                                      [dict_ptr, spread])
-                else:
-                    key = self._make_string_constant(kw.arg)
-                    kw_val = self._emit_expr_value(kw.value)
-                    kw_tag, kw_data = self._bare_to_tag_data(kw_val, kw.value)
-                    self.builder.call(self.runtime["dict_set_fv"],
-                                      [dict_ptr, key,
-                                       ir.Constant(i32, kw_tag), kw_data])
-            ptr = self._ensure_ptr(val)
-            _kwargs_result = self.builder.call(
-                self.runtime["closure_call_dict"], [ptr, dict_ptr])
-
-        if _kwargs_result is not None:
-            _drt = getattr(self, '_decorated_ret_tags', {}).get(name)
-            if _drt == "str":
-                return self.builder.inttoptr(_kwargs_result, i8_ptr)
-            if _drt == "float":
-                return self.builder.bitcast(_kwargs_result, double)
-            # Build FpyValue from runtime ret_tag so the type is preserved
-            # (the i64 wrapper of the callee sets ret_tag before returning)
-            _rt = self.builder.call(self.runtime["get_ret_tag"], [])
-            return self._fv_build_from_slots(_rt, _kwargs_result)
 
         # Always use call_ptr (auto-detects closures via magic number).
         # A "closure"-tagged variable might be either a real FpyClosure*
@@ -26849,12 +27057,7 @@ class CodeGen:
                 return self.builder.inttoptr(result, i8_ptr)
             if _drt == "float":
                 return self.builder.bitcast(result, double)
-            if _drt is not None:
-                return result
-            # Unknown return type: use runtime ret_tag to build FpyValue
-            # (the i64 wrapper of the callee sets ret_tag before returning)
-            _rt = self.builder.call(self.runtime["get_ret_tag"], [])
-            return self._fv_build_from_slots(_rt, result)
+            return result
 
         # 3+ args: pack into list and use closure_call_list
         if n_args >= 3:
@@ -26865,9 +27068,7 @@ class CodeGen:
                 tag, data = self._bare_to_tag_data(v, arg_node)
                 self._rt_call("list_append_fv",
                               [args_list, ir.Constant(i32, tag), data])
-            _r3 = self.builder.call(self.runtime["closure_call_list"], [ptr, args_list])
-            _rt3 = self.builder.call(self.runtime["get_ret_tag"], [])
-            return self._fv_build_from_slots(_rt3, _r3)
+            return self.builder.call(self.runtime["closure_call_list"], [ptr, args_list])
         return self._bridge_fallback_expr(node, f"call with {n_args} args for {name}")
 
     def _emit_constructor(self, node: ast.Call) -> ir.Value:
@@ -28779,8 +28980,8 @@ class CodeGen:
                 and node.func.id in self.variables
                 and self._var_kind(node.func.id) == VKind.CLOSURE):
             data = self._emit_expr_value(node)
-            # _emit_closure_call may already return FpyValue (e.g., when
-            # the closure call dispatches through call_ptr + get_ret_tag).
+            # _emit_expr_value may already return a complete FpyValue
+            # (e.g. kwargs path wraps result in _emit_closure_call).
             if (isinstance(data.type, ir.LiteralStructType)
                     and data.type == fpy_val):
                 return data
@@ -28797,9 +28998,15 @@ class CodeGen:
         # losing the runtime tag for polymorphic returns.
         if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
                 and node.func.id in self._user_functions):
-            info = self._user_functions[node.func.id]
-            if info.uses_fv_abi and info.ret_tag != "void":
-                return self._emit_user_call_fv(node)
+            # Skip decorated functions — they're stored as CLOSURE variables
+            # and should go through closure_call, not the original function.
+            _fn_name = node.func.id
+            _is_decorated = (_fn_name in self.variables
+                             and self._var_kind(_fn_name) == VKind.CLOSURE)
+            if not _is_decorated:
+                info = self._user_functions[_fn_name]
+                if info.uses_fv_abi and info.ret_tag != "void":
+                    return self._emit_user_call_fv(node)
         # CPython module method call (e.g. math.sqrt(x)) — returns FpyValue
         # with the runtime tag set by the bridge's type conversion.
         # Also handles chained attrs: os.path.exists(x) where os is pyobj.
@@ -34662,7 +34869,8 @@ class CodeGen:
                 # int, float, etc.) rather than treating everything as i64.
                 if _vk in (VKind.FVALUE, VKind.MIXED, VKind.OBJ):
                     result = self._emit_closure_call(node)
-                    # If already an FpyValue struct, return directly
+                    # _emit_closure_call may already return an FpyValue
+                    # (e.g. kwargs path uses _fv_build_from_slots).
                     if (isinstance(result.type, ir.LiteralStructType)
                             and result.type == fpy_val):
                         return result
@@ -38454,9 +38662,18 @@ class CodeGen:
                     # hierarchy), so the vtable entry is guaranteed valid.
                     func_ptr = self._emit_inline_vtable_lookup(
                         obj, vtable_slot, unchecked=True)
-                    # The vtable stores the i64-ABI dispatch function,
-                    # same pointer that register_method receives.
-                    if is_double_ret:
+                    # The vtable stores the actual function pointer (same
+                    # pointer that register_method receives).  Match the
+                    # return type to the resolved method's actual signature
+                    # to avoid calling convention mismatches (e.g. calling
+                    # a void function as if it returns i64 is UB).
+                    _is_void_ret = (direct_func is not None
+                                    and isinstance(
+                                        direct_func.return_value.type,
+                                        ir.VoidType))
+                    if _is_void_ret:
+                        ret_t = ir.VoidType()
+                    elif is_double_ret:
                         ret_t = ir.DoubleType()
                     else:
                         ret_t = i64
@@ -38466,6 +38683,8 @@ class CodeGen:
                         func_ptr, ir.PointerType(ftype))
                     result = self.builder.call(
                         func_typed, [obj] + call_args)
+                    if _is_void_ret:
+                        return ir.Constant(i64, 0)
                     # Post-process return type to match caller expectations
                     if not is_double_ret:
                         ret_type = self._find_method_return_type(
@@ -39583,97 +39802,6 @@ class CodeGen:
                     return self.builder.call(self.runtime["obj_new"], [cls_arg])
                 # Phase 4: no parent class → no-op for super() calls
                 return ir.Constant(i64, 0)
-
-            # Check if this class needs MRO-aware super() dispatch FIRST,
-            # before trying static parent lookup.  This handles diamond
-            # inheritance where the next method in MRO depends on self's
-            # actual runtime type.
-            _needs_mro_dispatch = False
-            _class_mro = getattr(self, '_class_mro', {})
-            for _mro_cls_name, _mro_list in _class_mro.items():
-                if self._current_class not in _mro_list:
-                    continue
-                # Check if this MRO differs from the simple parent
-                # chain — if it does, multiple inheritance is involved.
-                # Only count user classes (builtins like Exception aren't
-                # in _user_classes and don't participate in MRO dispatch).
-                _primary = []
-                _pn = _mro_cls_name
-                while _pn and _pn in self._user_classes:
-                    _primary.append(_pn)
-                    _pn = self._user_classes[_pn].parent_name
-                _mro_user = [c for c in _mro_list
-                             if c in self._user_classes]
-                if len(_mro_user) > len(_primary):
-                    _needs_mro_dispatch = True
-                    break
-
-            if _needs_mro_dispatch:
-                # Runtime MRO-aware super dispatch: routes through
-                # super_call_methodN which finds the correct method
-                # based on self's actual class MRO.
-                self_val = self._load_variable("self", node)
-                self_ptr = self._ensure_ptr(self_val)
-                cur_class_id = self.builder.load(
-                    cls_info.class_id_global)
-                method_name_ptr = self._make_string_constant(method)
-                n_args = len(node.args)
-                _super_args = []
-                for _ai in range(min(n_args, 3)):
-                    _av = self._emit_expr_value(node.args[_ai])
-                    if isinstance(_av.type, ir.PointerType):
-                        _av = self.builder.ptrtoint(_av, i64)
-                    elif isinstance(_av.type, ir.IntType) and _av.type.width != 64:
-                        _av = self.builder.zext(_av, i64)
-                    elif isinstance(_av.type, ir.LiteralStructType):
-                        _av = self.builder.extract_value(_av, 1)
-                    _super_args.append(_av)
-                _rt_name = f"super_call_method{min(n_args, 3)}"
-                result = self.builder.call(
-                    self.runtime[_rt_name],
-                    [self_ptr, cur_class_id, method_name_ptr] + _super_args)
-                # Determine return type by finding the method in the
-                # ancestor chain for type conversion.
-                _parent_func = None
-                parent_info = self._user_classes.get(cls_info.parent_name)
-                if parent_info:
-                    _parent_func = parent_info.methods.get(method)
-                    if _parent_func is None:
-                        _pn2 = parent_info.parent_name
-                        while _pn2 and _pn2 in self._user_classes:
-                            _pi2 = self._user_classes[_pn2]
-                            if _pi2.methods and method in _pi2.methods:
-                                _parent_func = _pi2.methods[method]
-                                break
-                            _pn2 = _pi2.parent_name
-                # Also check secondary bases for the method
-                if _parent_func is None:
-                    for _mro_c in _class_mro.get(
-                            self._current_class, [])[1:]:
-                        _mc = self._user_classes.get(_mro_c)
-                        if _mc and _mc.methods and method in _mc.methods:
-                            _parent_func = _mc.methods[method]
-                            break
-                if _parent_func is not None:
-                    ret_type = _parent_func.return_value.type
-                    if isinstance(ret_type, ir.VoidType):
-                        return ir.Constant(i64, 0)
-                    elif isinstance(ret_type, ir.PointerType):
-                        return self.builder.inttoptr(result, ret_type)
-                    elif isinstance(ret_type, ir.DoubleType):
-                        return self.builder.bitcast(
-                            result, ir.DoubleType())
-                    elif isinstance(ret_type, ir.LiteralStructType):
-                        _rt = self.builder.call(
-                            self.runtime["get_ret_tag"], [])
-                        return self._fv_build_from_slots(_rt, result)
-                    elif (isinstance(ret_type, ir.IntType)
-                            and ret_type.width != 64):
-                        return self.builder.trunc(result, ret_type)
-                return result
-
-            # Static parent method lookup (single inheritance or
-            # method found directly in parent)
             parent_info = self._user_classes.get(cls_info.parent_name)
             if parent_info is None or method not in parent_info.methods:
                 # Parent is a builtin class (e.g. Exception).
@@ -39707,8 +39835,41 @@ class CodeGen:
                         self.builder.ptrtoint(args_list, i64)])
                 return ir.Constant(i64, 0)
 
-            # Single-inheritance static dispatch (no MI involved):
-            # call the parent's method directly.
+            # Check if any class in the program uses diamond inheritance
+            # involving this class's hierarchy.  If so, use runtime MRO
+            # dispatch for correct super() resolution.
+            _any_diamond = any(
+                getattr(self, '_class_secondary_bases', {}).get(cn, [])
+                for cn in self._user_classes)
+            if _any_diamond:
+                # Runtime MRO dispatch: resolve the correct method at
+                # runtime based on self's actual class (handles diamond).
+                self_val = self._load_variable("self", node)
+                self_ptr = self._ensure_ptr(self_val)
+                cur_class_id = self.builder.load(cls_info.class_id_global)
+                cur_class_id = self.builder.sext(cur_class_id, i32)
+                method_name_ptr = self._make_string_constant(method)
+                func_ptr = self.builder.call(
+                    self.runtime["super_resolve"],
+                    [self_ptr, cur_class_id, method_name_ptr])
+                # Cast void* to the expected function type and call
+                func = parent_info.methods[method]
+                typed_ptr = self.builder.bitcast(
+                    func_ptr, ir.PointerType(func.type.pointee))
+                args = [self_val] + [
+                    self._emit_expr_value(a) for a in node.args]
+                coerced = []
+                for val, param in zip(args, func.args):
+                    if val.type != param.type:
+                        if (isinstance(param.type, ir.IntType)
+                                and isinstance(val.type, ir.PointerType)):
+                            val = self.builder.ptrtoint(val, param.type)
+                        elif (isinstance(param.type, ir.PointerType)
+                              and isinstance(val.type, ir.IntType)):
+                            val = self.builder.inttoptr(val, param.type)
+                    coerced.append(val)
+                return self.builder.call(typed_ptr, coerced)
+
             func = parent_info.methods[method]
             # Pass current self as first arg, then the user args
             self_val = self._load_variable("self", node)

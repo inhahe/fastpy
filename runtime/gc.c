@@ -17,7 +17,7 @@
 static FpyGCNode gc_sentinel = { &gc_sentinel, &gc_sentinel, 0, 0 };
 static int64_t gc_tracked = 0;
 static int64_t gc_alloc_count = 0;
-static int64_t gc_threshold = 700;
+static int64_t gc_threshold = 5000;
 
 void fpy_gc_track(FpyGCNode *node) {
     node->gc_flags |= FPY_GC_TRACKED;
@@ -302,8 +302,8 @@ void fpy_gc_maybe_collect(void) {
          * toward the base threshold to stay responsive. */
         if (freed == 0 && gc_threshold < 50000) {
             gc_threshold *= 2;
-        } else if (freed > 0 && gc_threshold > 700) {
-            gc_threshold = (gc_threshold > 1400) ? gc_threshold / 2 : 700;
+        } else if (freed > 0 && gc_threshold > 5000) {
+            gc_threshold = (gc_threshold > 10000) ? gc_threshold / 2 : 5000;
         }
     }
 }

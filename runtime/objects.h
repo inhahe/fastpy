@@ -128,8 +128,14 @@ typedef struct {
     void (*destructor)(FpyObj *obj); /* per-class destructor, NULL if none */
     void **vtable;                  /* vtable[i] = method func ptr, NULL-filled */
     int vtable_size;                /* number of vtable entries */
-    int *mro;                       /* C3-linearized MRO (array of class_ids) */
-    int mro_count;                  /* number of entries in mro[] */
+    uint8_t acyclic;        /* 1 = slots only hold scalars, can't form cycles
+                             * → skip GC tracking for instances (no cycle collector
+                             * overhead, freed purely by reference counting). */
+    int *mro;               /* C3-linearized MRO: array of class_ids.
+                             * mro[0] = self, mro[1..mro_len-1] = ancestors.
+                             * NULL until set by fastpy_set_class_mro.
+                             * Used by super() for correct diamond dispatch. */
+    int mro_len;            /* number of entries in mro[] */
 } FpyClassDef;
 
 #define FPY_MAX_VTABLE 64  /* max methods per class hierarchy */
@@ -192,7 +198,9 @@ struct FpyObj {
     int class_id;
     FpyObjAttrs *dynamic_attrs;      /* NULL unless used */
     FpyWeakRef *weakref_list;        /* singly-linked list of weak refs, NULL if none */
-    fpy_mutex_t lock;                /* per-object lock (free-threaded mode) */
+    /* Lock removed: FPY_LOCK/FPY_UNLOCK are never used with FpyObj.
+     * Saves 40 bytes per object (CRITICAL_SECTION on Windows), improving
+     * cache utilization for object-heavy workloads. */
 };
 
 /* Inline slot access: slots are allocated contiguously after the FpyObj
