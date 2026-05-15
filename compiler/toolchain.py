@@ -418,16 +418,33 @@ def _find_msvc_cl() -> str | None:
     """Find cl.exe by setting up MSVC environment via vcvars64.bat.
 
     Returns a bat preamble string that sets up the environment, or None
-    if MSVC cannot be found. Searches VS 2026, 2025, 2024, 2022 in order
-    so the newest available version is preferred.
+    if MSVC cannot be found. Searches VS 2026 down to 2019 so the newest
+    available version is preferred.
     """
-    for year in ["2026", "2025", "2024", "2022"]:
+    for year in ["2026", "2025", "2024", "2022", "2019"]:
         for edition in ["Community", "Enterprise", "Professional", "BuildTools"]:
             vcvars = (
                 f"C:\\Program Files\\Microsoft Visual Studio\\{year}\\{edition}"
                 f"\\VC\\Auxiliary\\Build\\vcvars64.bat"
             )
             if Path(vcvars).exists():
+                return f'call "{vcvars}" 1>NUL 2>NUL'
+    # Last resort: use vswhere.exe (handles any edition/year)
+    vswhere = Path(
+        r"C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe"
+    )
+    if vswhere.exists():
+        import subprocess
+        result = subprocess.run(
+            [str(vswhere), "-latest", "-property", "installationPath"],
+            capture_output=True, text=True,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            vcvars = (
+                Path(result.stdout.strip())
+                / "VC" / "Auxiliary" / "Build" / "vcvars64.bat"
+            )
+            if vcvars.exists():
                 return f'call "{vcvars}" 1>NUL 2>NUL'
     return None
 
