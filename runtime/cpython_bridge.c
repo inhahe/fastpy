@@ -17,6 +17,7 @@
 #ifdef _WIN32
 #include <io.h>
 #include <fcntl.h>
+#include <windows.h>
 #endif
 
 /* GIL release/acquire macros for CPython bridge calls.

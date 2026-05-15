@@ -388,6 +388,41 @@ def _find_python_lib_name(install: PythonInstall | None = None) -> str:
         return f"python{ver}"
 
 
+def _check_python_dll_on_path(install: PythonInstall | None = None) -> None:
+    """Warn if the Python DLL isn't findable at runtime.
+
+    On Windows the compiled exe links against pythonXY.dll.  If the DLL
+    directory isn't on PATH, the exe fails silently (no output, no error
+    message) because the OS loader terminates the process before main().
+    """
+    import ctypes
+    import ctypes.util
+    if install is not None:
+        dll_name = f"python{install.version[0]}{install.version[1]}.dll"
+        py_dir = install.prefix
+    else:
+        dll_name = f"python{sys.version_info.major}{sys.version_info.minor}.dll"
+        py_dir = Path(sys.prefix)
+    # Check if Windows can find the DLL via normal search order
+    try:
+        ctypes.WinDLL(dll_name)
+        return  # DLL found, all good
+    except OSError:
+        pass
+    # DLL not on PATH — emit a prominent warning
+    print(
+        f"\n  WARNING: {dll_name} is not on your PATH.\n"
+        f"  The compiled .exe will fail silently without it.\n"
+        f"\n"
+        f"  Fix: add your Python directory to PATH:\n"
+        f"    set PATH={py_dir};%PATH%\n"
+        f"\n"
+        f"  Or copy {dll_name} next to the .exe:\n"
+        f"    copy \"{py_dir / dll_name}\" .\n",
+        flush=True,
+    )
+
+
 def _version_bridge_obj(install: PythonInstall) -> Path:
     """Path to the version-specific cpython_bridge object file."""
     return RUNTIME_DIR / install.version_tag / ("cpython_bridge" + OBJ_EXT)
@@ -901,8 +936,15 @@ def compile_and_link(ir_string: str, output_path: Path,
     compile_ir_to_obj(ir_string, ir_obj)
 
     try:
-        return link_executable([ir_obj] + runtime_objs, output_path, install)
+        exe = link_executable([ir_obj] + runtime_objs, output_path, install)
     finally:
         # Clean up intermediate obj
         if ir_obj.exists():
             ir_obj.unlink()
+
+    # On Windows, warn if the Python DLL isn't on PATH — the exe will
+    # fail silently (no output, no error) when the OS loader can't find it.
+    if IS_WINDOWS:
+        _check_python_dll_on_path(install)
+
+    return exe
