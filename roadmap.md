@@ -233,15 +233,11 @@ coefficient + exponent. Supports Decimal(str), Decimal(int), arithmetic
 ### 18. ~~REPL mode~~ SKIPPED
 Doesn't apply to an AOT compiler. Use CPython for interactive work.
 
-## Planned -- Remaining
-
-### Phase 5: Module registry (codegen refactor)
-Convert the if/elif module dispatch chain to a dispatch dict. Each module
-handler becomes a small function or lambda.
-
-### Phase 6: Cleanup (codegen refactor)
-Remove old `_emit_expr_value`, `_bare_to_tag_data`, `_infer_type_tag`,
-and scattered inttoptr/ptrtoint/bitcast calls.
+### Phase 5-6: Module registry + Cleanup — ✅ DONE (via REFACTORING_ANALYSIS Phases B-D)
+- 6 dispatch registry dicts replace if/elif chains
+- VKind migration: 1400+ VKind refs, string-tag comparisons eliminated
+- God methods decomposed (1400→300 lines each)
+- elif chain conversion across ~25 dispatch sites
 
 ## Stats
 

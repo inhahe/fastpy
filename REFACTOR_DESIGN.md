@@ -370,15 +370,19 @@ The rewrite doesn't need to happen all at once. The plan:
   store, ret, phi, select)
 - Result: 104/104 stdlib files compile (up from 17/104)
 
-### Phase 5: Module registry — PENDING
-- Convert the if/elif chain to a dispatch dict
-- Each module handler becomes a small function or lambda
+### Phase 5: Module registry — ✅ COMPLETE (via Phase B of REFACTORING_ANALYSIS)
+- `_MODULE_DISPATCH`, `_BUILTIN_DISPATCH`, `_LIST_METHOD_DISPATCH`,
+  `_SET_METHOD_DISPATCH`, `_DICT_METHOD_DISPATCH`, `_STR_METHOD_DISPATCH`
+  dict registries replace the if/elif chains
+- Each handler is a small extracted method
 
-### Phase 6: Cleanup — PENDING
-- Remove old `_emit_expr_value` (replaced by `_emit_expr`)
-- Remove old `_bare_to_tag_data` (replaced by `TypedValue.as_fv`)
-- Remove old `_infer_type_tag` (replaced by `TypedValue.vtype`)
-- Remove all scattered inttoptr/ptrtoint/bitcast (handled by coercion layer)
+### Phase 6: Cleanup — ✅ COMPLETE (via Phases C-D of REFACTORING_ANALYSIS)
+- VKind migration: 1400+ VKind references, down from 339 string-tag comparisons to 3
+  (all `ret_tag == "ptr"` for ABI return convention, not type dispatch)
+- God method decomposition: `_emit_call_expr` 1436→337 lines,
+  `_emit_method_call` 1235→392 lines, `_analyze_call_sites` 1434→202 lines
+- Dead code deletion, elif chain conversion
+- SafeIRBuilder handles remaining type coercions automatically
 
 Each phase is a commit that passes all tests. If any phase breaks something,
 we can revert to the previous phase.
