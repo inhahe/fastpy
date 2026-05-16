@@ -67,6 +67,9 @@
 - FV ABI for native-typed method parameters
 - FpyClassDef struct alignment fix (72→88 bytes, correct array stride for vtable lookup)
 - Void return type detection in vtable dispatch (eliminates calling convention UB)
+- Native double params for float methods (CSA-driven, eliminates i64↔double coercion)
+- set_arg_tag elimination for native-typed params (direct + CHA dispatch)
+- Monomorphic scalar slot optimization (skip tag store + refcount for float/bool attrs)
 
 ### Codegen refactor (Phases 1-4 complete)
 - Phase 1: TypedValue foundation (VKind, ValueType, TypedValue classes)

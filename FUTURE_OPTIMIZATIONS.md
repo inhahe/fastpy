@@ -12,29 +12,25 @@ Replaced `fastpy_obj_get_slot`/`fastpy_obj_set_slot` calls with inline
 GEPs in `_emit_slot_addr_direct()`. FpyObj struct slimmed from 1560 → 24
 bytes in Phase 21 (dynamic attrs moved to lazily-allocated side table).
 
-## 2. Type-specialized slots (monomorphic native storage)
+## 2. Type-specialized slots (monomorphic native storage) — ✅ PARTIALLY DONE
 
-When an attribute is provably always one type (float, int, bool, str),
-store it as the native type without the FpyValue tag:
+Conservative approach implemented: for monomorphic scalar slots (float,
+bool) detected via `_per_class_float_attrs` / `_per_class_bool_attrs`,
+skip the tag store and all refcounting (rc_incref/rc_decref) on writes.
+The read path already used `_emit_slot_get_data_only` (Phase 9) to skip
+the tag load for statically-typed accesses.
 
-- `class Point: def __init__(self, x, y): self.x = x; self.y = y`
-  where call sites always pass floats → `x` and `y` are native doubles.
+What's done:
+- `_emit_slot_set_direct` accepts `skip_tag=True` for scalar slots
+- `_emit_attr_store` detects monomorphic scalar self.attr stores
+- Saves 2 memory loads (old tag+data) + 1 function call (rc_decref) +
+  1 memory store (tag) per scalar attribute write
 
-Design:
-- Detect monomorphic attrs during slot assignment pass
-- Mark slot as "native float" / "native int" / "native ptr" / etc.
-- Allocate slot storage as `double[]` / `int64_t[]` / `void*[]` based on types
-- Codegen emits direct typed load/store instead of FV tag+data pair
-- Falls back to FV representation if an assignment violates monomorphism
-  (option A: reject at compile time; option B: reserve extra bit for
-   "boxed" state that promotes the slot when needed)
-
-Expected gain: ~1ns per monomorphic access (skip tag check + no
-extract/insert of the union). Also saves memory: typed slots are 8 bytes
-instead of 12 (tag + data).
-
-Risk: significant compiler complexity; monomorphism analysis must be
-conservative or handle demotion correctly.
+What's NOT done (full native slots):
+- Slot memory layout unchanged (still FpyValue {tag, data} = 16 bytes)
+- Could split into native-typed section (8 bytes) + boxed section
+- Would require C runtime changes (fastpy_obj_new, GC scanner)
+- Deferred: the conservative approach captures most of the perf gain
 
 ## 3. Vtable dispatch — ✅ DONE
 
@@ -47,59 +43,39 @@ Also includes CHA (Class Hierarchy Analysis) for devirtualization: when a
 method has only one implementation across all classes, calls are inlined
 directly without vtable lookup.
 
-## 4. Native-typed method parameters (eliminate i64 coercion)
+## 4. Native-typed method parameters (eliminate i64 coercion) — ✅ DONE
 
-Method calls currently pass all non-self args as i64, then the method
-body coerces them back to the expected type (inttoptr for pointers,
-bitcast for floats). For methods where parameter types are known from
-call-site analysis (the common case with direct dispatch), this
-round-trip is wasted work.
+When call-site analysis (CSA) confirms ALL call sites pass float for a
+parameter, the method is declared with `double` instead of `i64`. The
+method body receives the native double directly — no i64→double bitcast
+at entry. An `.__n64` wrapper function is auto-generated for vtable
+dispatch (runtime dispatch still uses the i64 ABI).
 
-Design:
-- When declaring a method, if ALL call sites agree on param types,
-  declare with native LLVM types (i64, double, i8*) instead of i64
-- At direct-dispatch call sites, pass bare values directly
-- Keep i64 ABI for runtime dispatch (`obj_call_methodN`) as fallback
-- May need two entry points per method: native (for direct calls)
-  and i64 (for runtime dispatch)
+Also eliminates `set_arg_tag` / `get_arg_tag` calls for native-typed
+params in both direct dispatch and CHA dispatch paths — the type is
+statically encoded in the LLVM function signature.
 
-Expected gain: ~2-4ns per method call (skip coercion per arg).
-On dist_sq benchmark: ~4 args coerced → ~8-16ns savings → 12ns → ~4ns
-(approaching C++ struct method speed).
+Benchmarks:
+- Vec3 dot+update 500K: 3.0ms (vs 562ms CPython = 187x)
+- dist_sq float 1M: 4.2ms (vs 444ms CPython = 105x)
 
-Risk: medium — need to handle the dual-entry-point cleanly and ensure
-the right one is called. Similar to function monomorphization but for
-methods.
+## 5. Whole-program method devirtualization + inlining — ✅ MOSTLY DONE
 
-## 5. Whole-program method devirtualization + inlining
+Investigation revealed direct dispatch and CHA dispatch already produce
+direct calls to named `ir.Function`s with `internal` linkage — LLVM CAN
+and does inline these (methods ≤50 AST nodes get `alwaysinline`, ≤120
+get `inlinehint`). The remaining overhead was the `set_arg_tag` /
+`get_arg_tag` ceremony per call, which is now eliminated for native-typed
+params (Optimization #4).
 
-Currently LLVM can't inline method bodies even with direct dispatch
-because the function is called through a separately-compiled function
-pointer. If the method body were emitted at the call site (or marked
-`alwaysinline` with guaranteed direct calls), LLVM could inline and
-optimize across the method boundary.
+Only vtable dispatch (polymorphic calls) goes through an indirect function
+pointer that LLVM cannot inline. Speculative devirt already handles the
+2-4 implementation case with a class_id switch + direct calls.
 
-Design:
-- For small methods (< ~20 AST nodes) with direct dispatch, emit
-  the method body inline at the call site instead of calling through
-  a function pointer
-- Or: ensure the direct-dispatch function pointer is visible to LLVM
-  as a known constant (not loaded from a global), enabling LLVM's
-  own inliner
-- The `inlinehint` attribute (Phase 26) is already added but doesn't
-  help when LLVM can't resolve the call target
+## What's left
 
-Expected gain: eliminates ALL per-call overhead for small methods.
-On dist_sq: method body inlined → 4 attr accesses become 4 GEPs →
-LLVM can hoist loop-invariant reads → near-zero cost.
-
-Risk: code size increase for frequently-called small methods.
-Must not apply to recursive or very large methods.
-
-## Why these aren't urgent
-
-The compiler already hits ~250x CPython on tight loops and within 1-2x
-of C++ on most benchmarks. The remaining gap to C++ (~2.6x on multi-obj
-method calls like dist_sq) comes from optimizations #4 and #5. They're
-worth doing if the target is truly native-speed OOP, but for most Python
-programs the current speed is more than sufficient.
+All major optimizations are now implemented. The remaining gap to C++ is:
+- Full native slot layout (changing FpyValue slots to raw typed storage)
+  — requires C runtime changes, marginal gain over the conservative approach
+- Vtable inlining for the polymorphic dispatch case — only matters when
+  the receiver class isn't statically known, which is uncommon in practice

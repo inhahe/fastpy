@@ -4411,6 +4411,51 @@ class CodeGen:
             b.ret(data)
         return wrapper
 
+    def _emit_method_native_wrapper(self, method_func: ir.Function) -> ir.Function:
+        """Create an i64-ABI wrapper for a method with native-typed params.
+
+        Runtime dispatch (vtable, obj_call_methodN) passes all non-self args
+        as i64.  When a method uses native LLVM types (e.g. double for float
+        params), this wrapper bridges the ABI gap: receives i64 args, coerces
+        to the native types the real function expects, calls it, and returns
+        the result in the ABI the caller expects.
+        """
+        wrapper_name = f"{method_func.name}.__n64"
+        try:
+            return self.module.get_global(wrapper_name)
+        except KeyError:
+            pass
+        n_params = len(method_func.args)
+        # Wrapper ABI: same self type + i64 per non-self param
+        wrapper_params = [method_func.args[0].type] + [i64] * (n_params - 1)
+        wrapper_type = ir.FunctionType(
+            method_func.return_value.type, wrapper_params)
+        wrapper = ir.Function(self.module, wrapper_type, name=wrapper_name)
+        block = wrapper.append_basic_block("entry")
+        b = _SafeIRBuilder(block)
+        native_args = []
+        for idx in range(n_params):
+            wparam = wrapper.args[idx]
+            expected = method_func.args[idx].type
+            if wparam.type == expected:
+                native_args.append(wparam)
+            elif (isinstance(expected, ir.DoubleType)
+                  and isinstance(wparam.type, ir.IntType)):
+                native_args.append(b.bitcast(wparam, double))
+            elif (isinstance(expected, ir.PointerType)
+                  and isinstance(wparam.type, ir.IntType)):
+                native_args.append(b.inttoptr(wparam, expected))
+            else:
+                native_args.append(wparam)
+        real_ret = method_func.return_value.type
+        if isinstance(real_ret, ir.VoidType):
+            b.call(method_func, native_args)
+            b.ret_void()
+        else:
+            result = b.call(method_func, native_args)
+            b.ret(result)
+        return wrapper
+
     def _emit_nested_funcdef(self, node: ast.FunctionDef) -> None:
         """Handle a nested function definition — either a closure or a simple inner def."""
         # Look up the closure using the fully qualified name
@@ -13154,6 +13199,19 @@ class CodeGen:
                     if isinstance(d, ast.Constant) and isinstance(d.value, float):
                         float_method_params.add(params[pidx])
 
+                # Optimization #4: native LLVM types for provably-typed params.
+                # Use double instead of i64 when CSA confirms ALL call sites
+                # pass float.  Only for instance methods (not static/classmethod)
+                # and non-vararg methods.  Eliminates the i64↔double bitcast
+                # round-trip and enables better LLVM register allocation.
+                if (not is_static and not is_classmethod
+                        and not _method_has_vararg):
+                    for _npi, _npn in enumerate(params[1:]):  # skip self
+                        if (_npi < len(m_call_types)
+                                and m_call_types[_npi] is not None
+                                and self._tag_kind(m_call_types[_npi]) == VKind.FLOAT):
+                            param_types[1 + _npi] = double
+
                 # Determine return type
                 ret_type, _init_argc, _init_defs = self._dcl_detect_method_ret_type(
                     item, method_name, class_name, node, parent_name,
@@ -14460,6 +14518,11 @@ class CodeGen:
             if isinstance(param.type, ir.PointerType):
                 tag = "obj"
                 bare = param
+            elif isinstance(param.type, ir.DoubleType):
+                # Native float param (Optimization #4): already the correct
+                # type — no bitcast needed.  Skip all IntType-specific paths.
+                tag = "float"
+                bare = param
             elif pname in nullable_params and isinstance(param.type, ir.IntType):
                 # Param is compared with `is None` in the body — treat as
                 # potentially None. The runtime null-check will emit
@@ -14869,10 +14932,17 @@ class CodeGen:
             returns = 0 if method_func.return_value.type == void else 1
             # Create i64 wrapper for FV-ABI methods so runtime dispatch
             # uses compatible calling convention.
-            if (isinstance(method_func.return_value.type, ir.LiteralStructType)
-                    or any(isinstance(a.type, ir.LiteralStructType)
-                           for a in method_func.args)):
+            _has_fv_abi = (
+                isinstance(method_func.return_value.type, ir.LiteralStructType)
+                or any(isinstance(a.type, ir.LiteralStructType)
+                       for a in method_func.args))
+            _has_native_params = any(
+                isinstance(a.type, ir.DoubleType)
+                for a in method_func.args[1:])  # skip self
+            if _has_fv_abi:
                 dispatch_func = self._emit_method_i64_wrapper(method_func)
+            elif _has_native_params:
+                dispatch_func = self._emit_method_native_wrapper(method_func)
             else:
                 dispatch_func = method_func
             func_ptr = self.builder.bitcast(dispatch_func, i8_ptr)
@@ -17056,17 +17126,22 @@ class CodeGen:
         return data
 
     def _emit_slot_set_direct(self, obj: ir.Value, slot_idx: int,
-                               tag: ir.Value, data: ir.Value) -> None:
+                               tag: ir.Value, data: ir.Value,
+                               skip_tag: bool = False) -> None:
         """Emit direct IR to store (tag, data) into obj->slots[slot_idx].
 
         Skips the fastpy_obj_set_slot function-call overhead.
+        When *skip_tag* is True, only the data field is stored — the tag
+        field is left unchanged.  Used for monomorphic scalar slots where
+        the tag is always the same constant (Optimization #2).
 
         NOTE: This is a raw store — callers are responsible for
         increfing the new value (if borrowed) and decrefing the old
         value.  The higher-level ``_emit_attr_store`` handles this.
         """
         tag_addr, data_addr = self._emit_slot_addr_direct(obj, slot_idx)
-        self.builder.store(tag, tag_addr)
+        if not skip_tag:
+            self.builder.store(tag, tag_addr)
         self.builder.store(data, data_addr)
 
     # ── Inline list element access (Phase: list-inline) ─────────────
@@ -17625,17 +17700,36 @@ class CodeGen:
         # Try static slot fast path first (direct pointer-arithmetic store).
         slot_idx = self._get_attr_slot(target)
         if slot_idx is not None:
+            # Optimization #2: monomorphic scalar slots (float/bool) skip
+            # both tag store and refcounting.  These slots always hold the
+            # same scalar type, so: the tag never changes after the first
+            # write (skip redundant tag stores), the old value is always
+            # scalar (rc_decref is a no-op → skip the call), and the new
+            # value is scalar (rc_incref is a no-op → already skipped).
+            # Saves 2 memory ops (old tag+data load) + 1 function call
+            # (rc_decref) + 1 memory op (tag store) per attribute write.
+            _is_mono_scalar = False
+            if (isinstance(target.value, ast.Name)
+                    and target.value.id == "self"
+                    and self._current_class):
+                _mc = self._current_class
+                _ma = target.attr
+                if (_ma in self._per_class_float_attrs.get(_mc, set())
+                        or _ma in self._per_class_bool_attrs.get(_mc, set())):
+                    _is_mono_scalar = True
             _fresh = (self._compiling_init
                       and not self._loop_stack
                       and isinstance(target.value, ast.Name)
                       and target.value.id == "self"
                       and slot_idx not in self._init_stored_slots)
-            if not _fresh:
+            if not _fresh and not _is_mono_scalar:
                 # Decref old slot value (may be non-trivial on reassignment).
                 old_tag, old_data = self._emit_slot_get_direct(obj, slot_idx)
                 self.builder.call(self.runtime["rc_decref"],
                                   [old_tag, old_data])
-            self._emit_slot_set_direct(obj, slot_idx, tag_const, data)
+            self._emit_slot_set_direct(
+                obj, slot_idx, tag_const, data,
+                skip_tag=_is_mono_scalar)
             # Incref new value unless it's an owned reference (steal)
             # or a scalar type (INT, FLOAT, BOOL, NONE have no heap
             # allocation so incref is a no-op — skip the function call).
@@ -38772,6 +38866,12 @@ class CodeGen:
                 # recover runtime types for polymorphic parameters (e.g.
                 # def echo(self, val): return val — val could be any type).
                 for _ati, _atv in enumerate(call_args):
+                    # Skip set_arg_tag for native-typed params (Optimization #4):
+                    # the callee's LLVM type already encodes the type statically.
+                    if (1 + _ati < len(direct_func.args)
+                            and isinstance(direct_func.args[1 + _ati].type,
+                                           ir.DoubleType)):
+                        continue
                     _at_node = (resolved_arg_nodes[_ati]
                                 if _ati < len(resolved_arg_nodes) else None)
                     # For FV-local (mixed) variables, extract the runtime
@@ -38832,6 +38932,11 @@ class CodeGen:
             # recover runtime types for polymorphic parameters (e.g.
             # def echo(self, val): return val — val could be any type).
             for _ati, _atv in enumerate(call_args):
+                # Skip set_arg_tag for native-typed params (Optimization #4).
+                if (1 + _ati < len(cha_func.args)
+                        and isinstance(cha_func.args[1 + _ati].type,
+                                       ir.DoubleType)):
+                    continue
                 _at_node = (resolved_arg_nodes[_ati]
                             if _ati < len(resolved_arg_nodes) else None)
                 _rt_tag_val = None
