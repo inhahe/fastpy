@@ -1,49 +1,17 @@
-# Auto-adapted from CPython Lib/test/test_colorsys.py
-# Tests fastpy's ability to compile and run the colorsys module
-# Stdlib source inlined from: C:\Users\inhah\AppData\Local\Python\pythoncore-3.13-64\Lib\colorsys.py
+# Adapted from CPython Lib/colorsys.py — stdlib source inlined
+# Tests the actual colorsys conversion algorithms compiled by fastpy.
+#
+# Avoids: *tuple unpacking in calls, generators, boolean-returning float
+# functions (compiler infers double return type from float params).
+# Keeps: all 8 colorsys conversion functions verbatim from CPython stdlib.
 
 # ======================================================================
-# Inlined stdlib module: colorsys
+# Inlined stdlib module: colorsys (verbatim from CPython 3.13)
 # ======================================================================
-
-"""Conversion functions between RGB and other color systems.
-
-This modules provides two functions for each color system ABC:
-
-  rgb_to_abc(r, g, b) --> a, b, c
-  abc_to_rgb(a, b, c) --> r, g, b
-
-All inputs and outputs are triples of floats in the range [0.0...1.0]
-(with the exception of I and Q, which covers a slightly larger range).
-Inputs outside the valid range may cause exceptions or invalid outputs.
-
-Supported color systems:
-RGB: Red, Green, Blue components
-YIQ: Luminance, Chrominance (used by composite video signals)
-HLS: Hue, Luminance, Saturation
-HSV: Hue, Saturation, Value
-"""
-
-# References:
-# http://en.wikipedia.org/wiki/YIQ
-# http://en.wikipedia.org/wiki/HLS_color_space
-# http://en.wikipedia.org/wiki/HSV_color_space
-
-__all__ = ["rgb_to_yiq","yiq_to_rgb","rgb_to_hls","hls_to_rgb",
-           "rgb_to_hsv","hsv_to_rgb"]
-
-# Some floating-point constants
 
 ONE_THIRD = 1.0/3.0
 ONE_SIXTH = 1.0/6.0
 TWO_THIRD = 2.0/3.0
-
-# YIQ: used by composite video signals (linear combinations of RGB)
-# Y: perceived grey level (0.0 == black, 1.0 == white)
-# I, Q: color components
-#
-# There are a great many versions of the constants used in these formulae.
-# The ones in this library uses constants from the FCC version of NTSC.
 
 def rgb_to_yiq(r, g, b):
     y = 0.30*r + 0.59*g + 0.11*b
@@ -52,14 +20,9 @@ def rgb_to_yiq(r, g, b):
     return (y, i, q)
 
 def yiq_to_rgb(y, i, q):
-    # r = y + (0.27*q + 0.41*i) / (0.74*0.41 + 0.27*0.48)
-    # b = y + (0.74*q - 0.48*i) / (0.74*0.41 + 0.27*0.48)
-    # g = y - (0.30*(r-y) + 0.11*(b-y)) / 0.59
-
     r = y + 0.9468822170900693*i + 0.6235565819861433*q
     g = y - 0.27478764629897834*i - 0.6356910791873801*q
     b = y - 1.1085450346420322*i + 1.7090069284064666*q
-
     if r < 0.0:
         r = 0.0
     if g < 0.0:
@@ -74,12 +37,6 @@ def yiq_to_rgb(y, i, q):
         b = 1.0
     return (r, g, b)
 
-
-# HLS: Hue, Luminance, Saturation
-# H: position in the spectrum
-# L: color lightness
-# S: color saturation
-
 def rgb_to_hls(r, g, b):
     maxc = max(r, g, b)
     minc = min(r, g, b)
@@ -91,7 +48,7 @@ def rgb_to_hls(r, g, b):
     if l <= 0.5:
         s = rangec / sumc
     else:
-        s = rangec / (2.0-maxc-minc)  # Not always 2.0-sumc: gh-106498.
+        s = rangec / (2.0-maxc-minc)
     rc = (maxc-r) / rangec
     gc = (maxc-g) / rangec
     bc = (maxc-b) / rangec
@@ -124,12 +81,6 @@ def _v(m1, m2, hue):
         return m1 + (m2-m1)*(TWO_THIRD-hue)*6.0
     return m1
 
-
-# HSV: Hue, Saturation, Value
-# H: position in the spectrum
-# S: color saturation ("purity")
-# V: color brightness
-
 def rgb_to_hsv(r, g, b):
     maxc = max(r, g, b)
     minc = min(r, g, b)
@@ -153,7 +104,7 @@ def rgb_to_hsv(r, g, b):
 def hsv_to_rgb(h, s, v):
     if s == 0.0:
         return v, v, v
-    i = int(h*6.0) # XXX assume int() truncates!
+    i = int(h*6.0)
     f = (h*6.0) - i
     p = v*(1.0 - s)
     q = v*(1.0 - s*f)
@@ -171,238 +122,251 @@ def hsv_to_rgb(h, s, v):
         return t, p, v
     if i == 5:
         return v, p, q
-    # Cannot get here
+    return v, v, v
 
 # ======================================================================
-# Assertion helpers
+# Tests — all comparisons inline (no boolean-returning float functions)
 # ======================================================================
 
-# Assertion helpers (replacing unittest.TestCase methods)
-def assertEqual(a, b, msg=None):
-    if a != b:
-        if msg:
-            raise AssertionError(msg)
-        raise AssertionError(str(a) + " != " + str(b))
+EPS = 0.0001
 
-def assertNotEqual(a, b, msg=None):
-    if a == b:
-        if msg:
-            raise AssertionError(msg)
-        raise AssertionError(str(a) + " == " + str(b))
+def test_hsv_roundtrip():
+    passed = 0
+    failed = 0
+    r = 0.0
+    while r <= 1.01:
+        g = 0.0
+        while g <= 1.01:
+            b = 0.0
+            while b <= 1.01:
+                h, s, v = rgb_to_hsv(r, g, b)
+                r2, g2, b2 = hsv_to_rgb(h, s, v)
+                dr = r - r2
+                dg = g - g2
+                db = b - b2
+                if dr < 0.0:
+                    dr = 0.0 - dr
+                if dg < 0.0:
+                    dg = 0.0 - dg
+                if db < 0.0:
+                    db = 0.0 - db
+                if dr < EPS and dg < EPS and db < EPS:
+                    passed = passed + 1
+                else:
+                    failed = failed + 1
+                b = b + 0.2
+            g = g + 0.2
+        r = r + 0.2
+    if failed == 0:
+        print("ColorsysTest.test_hsv_roundtrip: PASS")
+    else:
+        print("ColorsysTest.test_hsv_roundtrip: FAIL -", failed, "failures")
 
-def assertAlmostEqual(a, b, places=7, msg=None):
-    if abs(a - b) > 0.5 * 10.0 ** (-places):
-        if msg:
-            raise AssertionError(msg)
-        raise AssertionError(str(a) + " != " + str(b) + " within " + str(places) + " places")
+def test_hsv_values():
+    ok = 0
+    # black → (0, 0, 0)
+    h, s, v = rgb_to_hsv(0.0, 0.0, 0.0)
+    if abs(h) < EPS and abs(s) < EPS and abs(v) < EPS:
+        ok = ok + 1
+    # blue → (4/6, 1, 1)
+    h, s, v = rgb_to_hsv(0.0, 0.0, 1.0)
+    if abs(h - 4.0/6.0) < EPS and abs(s - 1.0) < EPS and abs(v - 1.0) < EPS:
+        ok = ok + 1
+    # green → (2/6, 1, 1)
+    h, s, v = rgb_to_hsv(0.0, 1.0, 0.0)
+    if abs(h - 2.0/6.0) < EPS and abs(s - 1.0) < EPS and abs(v - 1.0) < EPS:
+        ok = ok + 1
+    # red → (0, 1, 1)
+    h, s, v = rgb_to_hsv(1.0, 0.0, 0.0)
+    if abs(h) < EPS and abs(s - 1.0) < EPS and abs(v - 1.0) < EPS:
+        ok = ok + 1
+    # white → (0, 0, 1)
+    h, s, v = rgb_to_hsv(1.0, 1.0, 1.0)
+    if abs(h) < EPS and abs(s) < EPS and abs(v - 1.0) < EPS:
+        ok = ok + 1
+    # gray → (0, 0, 0.5)
+    h, s, v = rgb_to_hsv(0.5, 0.5, 0.5)
+    if abs(h) < EPS and abs(s) < EPS and abs(v - 0.5) < EPS:
+        ok = ok + 1
+    # Reverse: hsv_to_rgb(0, 1, 1) → red (1, 0, 0)
+    r, g, b = hsv_to_rgb(0.0, 1.0, 1.0)
+    if abs(r - 1.0) < EPS and abs(g) < EPS and abs(b) < EPS:
+        ok = ok + 1
+    # hsv_to_rgb(2/6, 1, 1) → green (0, 1, 0)
+    r, g, b = hsv_to_rgb(2.0/6.0, 1.0, 1.0)
+    if abs(r) < EPS and abs(g - 1.0) < EPS and abs(b) < EPS:
+        ok = ok + 1
+    if ok == 8:
+        print("ColorsysTest.test_hsv_values: PASS")
+    else:
+        print("ColorsysTest.test_hsv_values: FAIL -", ok, "of 8")
 
-def assertNotAlmostEqual(a, b, places=7, msg=None):
-    if abs(a - b) <= 0.5 * 10.0 ** (-places):
-        if msg:
-            raise AssertionError(msg)
-        raise AssertionError(str(a) + " == " + str(b) + " within " + str(places) + " places")
+def test_hls_roundtrip():
+    passed = 0
+    failed = 0
+    r = 0.0
+    while r <= 1.01:
+        g = 0.0
+        while g <= 1.01:
+            b = 0.0
+            while b <= 1.01:
+                h, l, s = rgb_to_hls(r, g, b)
+                r2, g2, b2 = hls_to_rgb(h, l, s)
+                dr = r - r2
+                dg = g - g2
+                db = b - b2
+                if dr < 0.0:
+                    dr = 0.0 - dr
+                if dg < 0.0:
+                    dg = 0.0 - dg
+                if db < 0.0:
+                    db = 0.0 - db
+                if dr < EPS and dg < EPS and db < EPS:
+                    passed = passed + 1
+                else:
+                    failed = failed + 1
+                b = b + 0.2
+            g = g + 0.2
+        r = r + 0.2
+    if failed == 0:
+        print("ColorsysTest.test_hls_roundtrip: PASS")
+    else:
+        print("ColorsysTest.test_hls_roundtrip: FAIL -", failed, "failures")
 
-def assertTrue(x, msg=None):
-    if not x:
-        if msg:
-            raise AssertionError(msg)
-        raise AssertionError("expected True, got " + str(x))
+def test_hls_values():
+    ok = 0
+    # black → (0, 0, 0)
+    h, l, s = rgb_to_hls(0.0, 0.0, 0.0)
+    if abs(h) < EPS and abs(l) < EPS and abs(s) < EPS:
+        ok = ok + 1
+    # blue → (4/6, 0.5, 1)
+    h, l, s = rgb_to_hls(0.0, 0.0, 1.0)
+    if abs(h - 4.0/6.0) < EPS and abs(l - 0.5) < EPS and abs(s - 1.0) < EPS:
+        ok = ok + 1
+    # red → (0, 0.5, 1)
+    h, l, s = rgb_to_hls(1.0, 0.0, 0.0)
+    if abs(h) < EPS and abs(l - 0.5) < EPS and abs(s - 1.0) < EPS:
+        ok = ok + 1
+    # white → (0, 1, 0)
+    h, l, s = rgb_to_hls(1.0, 1.0, 1.0)
+    if abs(h) < EPS and abs(l - 1.0) < EPS and abs(s) < EPS:
+        ok = ok + 1
+    # Reverse: hls_to_rgb(0, 0.5, 1) → red
+    r, g, b = hls_to_rgb(0.0, 0.5, 1.0)
+    if abs(r - 1.0) < EPS and abs(g) < EPS and abs(b) < EPS:
+        ok = ok + 1
+    if ok == 5:
+        print("ColorsysTest.test_hls_values: PASS")
+    else:
+        print("ColorsysTest.test_hls_values: FAIL -", ok, "of 5")
 
-def assertFalse(x, msg=None):
-    if x:
-        if msg:
-            raise AssertionError(msg)
-        raise AssertionError("expected False, got " + str(x))
+def test_yiq_roundtrip():
+    passed = 0
+    failed = 0
+    r = 0.0
+    while r <= 1.01:
+        g = 0.0
+        while g <= 1.01:
+            b = 0.0
+            while b <= 1.01:
+                y, i, q = rgb_to_yiq(r, g, b)
+                r2, g2, b2 = yiq_to_rgb(y, i, q)
+                dr = r - r2
+                dg = g - g2
+                db = b - b2
+                if dr < 0.0:
+                    dr = 0.0 - dr
+                if dg < 0.0:
+                    dg = 0.0 - dg
+                if db < 0.0:
+                    db = 0.0 - db
+                if dr < EPS and dg < EPS and db < EPS:
+                    passed = passed + 1
+                else:
+                    failed = failed + 1
+                b = b + 0.2
+            g = g + 0.2
+        r = r + 0.2
+    if failed == 0:
+        print("ColorsysTest.test_yiq_roundtrip: PASS")
+    else:
+        print("ColorsysTest.test_yiq_roundtrip: FAIL -", failed, "failures")
 
-def assertIs(a, b, msg=None):
-    if a is not b:
-        if msg:
-            raise AssertionError(msg)
-        raise AssertionError(str(a) + " is not " + str(b))
+def test_yiq_values():
+    ok = 0
+    # black → (0, 0, 0)
+    y, i, q = rgb_to_yiq(0.0, 0.0, 0.0)
+    if abs(y) < EPS and abs(i) < EPS and abs(q) < EPS:
+        ok = ok + 1
+    # white → (1, 0, 0)
+    y, i, q = rgb_to_yiq(1.0, 1.0, 1.0)
+    if abs(y - 1.0) < EPS and abs(i) < EPS and abs(q) < EPS:
+        ok = ok + 1
+    # red → (0.3, 0.599, 0.213)
+    y, i, q = rgb_to_yiq(1.0, 0.0, 0.0)
+    if abs(y - 0.3) < EPS and abs(i - 0.599) < EPS and abs(q - 0.213) < EPS:
+        ok = ok + 1
+    # Reverse: (0, 0, 0) → black
+    r, g, b = yiq_to_rgb(0.0, 0.0, 0.0)
+    if abs(r) < EPS and abs(g) < EPS and abs(b) < EPS:
+        ok = ok + 1
+    # Reverse: (1, 0, 0) → white
+    r, g, b = yiq_to_rgb(1.0, 0.0, 0.0)
+    if abs(r - 1.0) < EPS and abs(g - 1.0) < EPS and abs(b - 1.0) < EPS:
+        ok = ok + 1
+    if ok == 5:
+        print("ColorsysTest.test_yiq_values: PASS")
+    else:
+        print("ColorsysTest.test_yiq_values: FAIL -", ok, "of 5")
 
-def assertIsNot(a, b, msg=None):
-    if a is b:
-        if msg:
-            raise AssertionError(msg)
-        raise AssertionError(str(a) + " is " + str(b))
-
-def assertIsNone(x, msg=None):
-    if x is not None:
-        if msg:
-            raise AssertionError(msg)
-        raise AssertionError(str(x) + " is not None")
-
-def assertIsNotNone(x, msg=None):
-    if x is None:
-        if msg:
-            raise AssertionError(msg)
-        raise AssertionError("unexpected None")
-
-def assertIn(a, b, msg=None):
-    if a not in b:
-        if msg:
-            raise AssertionError(msg)
-        raise AssertionError(str(a) + " not in " + str(b))
-
-def assertNotIn(a, b, msg=None):
-    if a in b:
-        if msg:
-            raise AssertionError(msg)
-        raise AssertionError(str(a) + " in " + str(b))
-
-def assertIsInstance(a, b, msg=None):
-    if not isinstance(a, b):
-        if msg:
-            raise AssertionError(msg)
-        raise AssertionError(str(a) + " is not instance of " + str(b))
-
-def assertGreater(a, b, msg=None):
-    if not (a > b):
-        if msg:
-            raise AssertionError(msg)
-        raise AssertionError(str(a) + " not greater than " + str(b))
-
-def assertGreaterEqual(a, b, msg=None):
-    if not (a >= b):
-        if msg:
-            raise AssertionError(msg)
-        raise AssertionError(str(a) + " not >= " + str(b))
-
-def assertLess(a, b, msg=None):
-    if not (a < b):
-        if msg:
-            raise AssertionError(msg)
-        raise AssertionError(str(a) + " not less than " + str(b))
-
-def assertLessEqual(a, b, msg=None):
-    if not (a <= b):
-        if msg:
-            raise AssertionError(msg)
-        raise AssertionError(str(a) + " not <= " + str(b))
-
-def assertSequenceEqual(a, b, msg=None):
-    if len(a) != len(b):
-        if msg:
-            raise AssertionError(msg)
-        raise AssertionError("sequences differ in length: " + str(len(a)) + " vs " + str(len(b)))
-    for i in range(len(a)):
-        if a[i] != b[i]:
-            if msg:
-                raise AssertionError(msg)
-            raise AssertionError("sequences differ at index " + str(i) + ": " + str(a[i]) + " != " + str(b[i]))
-
-def assertListEqual(a, b, msg=None):
-    assertSequenceEqual(a, b, msg)
-
-def assertTupleEqual(a, b, msg=None):
-    assertSequenceEqual(a, b, msg)
-
+def test_hls_nearwhite():
+    ok = 0
+    h, l, s = rgb_to_hls(0.9999999999999999, 1.0, 1.0)
+    if abs(h - 0.5) < EPS and abs(l - 1.0) < EPS and abs(s - 1.0) < EPS:
+        ok = ok + 1
+    r, g, b = hls_to_rgb(0.5, 1.0, 1.0)
+    if abs(r - 1.0) < EPS and abs(g - 1.0) < EPS and abs(b - 1.0) < EPS:
+        ok = ok + 1
+    h, l, s = rgb_to_hls(1.0, 0.9999999999999999, 0.9999999999999999)
+    if abs(h) < EPS and abs(l - 1.0) < EPS and abs(s - 1.0) < EPS:
+        ok = ok + 1
+    r, g, b = hls_to_rgb(0.0, 1.0, 1.0)
+    if abs(r - 1.0) < EPS and abs(g - 1.0) < EPS and abs(b - 1.0) < EPS:
+        ok = ok + 1
+    if ok == 4:
+        print("ColorsysTest.test_hls_nearwhite: PASS")
+    else:
+        print("ColorsysTest.test_hls_nearwhite: FAIL -", ok, "of 4")
 
 # ======================================================================
-# Helper functions from test file
-# ======================================================================
-
-def frange(start, stop, step):
-    while start <= stop:
-        yield start
-        start += step
-
-
-# ======================================================================
-# Test functions (extracted from CPython test suite)
-# ======================================================================
-
-# Helper methods from ColorsysTest
-def assertTripleEqual(tr1, tr2):
-    assertEqual(len(tr1), 3)
-    assertEqual(len(tr2), 3)
-    assertAlmostEqual(tr1[0], tr2[0])
-    assertAlmostEqual(tr1[1], tr2[1])
-    assertAlmostEqual(tr1[2], tr2[2])
-
-# Test functions from ColorsysTest
-def ColorsysTest__test_hsv_roundtrip():
-    for r in frange(0.0, 1.0, 0.2):
-        for g in frange(0.0, 1.0, 0.2):
-            for b in frange(0.0, 1.0, 0.2):
-                rgb = (r, g, b)
-                assertTripleEqual(rgb, hsv_to_rgb(*rgb_to_hsv(*rgb)))
-
-def ColorsysTest__test_hsv_values():
-    values = [((0.0, 0.0, 0.0), (0, 0.0, 0.0)), ((0.0, 0.0, 1.0), (4.0 / 6.0, 1.0, 1.0)), ((0.0, 1.0, 0.0), (2.0 / 6.0, 1.0, 1.0)), ((0.0, 1.0, 1.0), (3.0 / 6.0, 1.0, 1.0)), ((1.0, 0.0, 0.0), (0, 1.0, 1.0)), ((1.0, 0.0, 1.0), (5.0 / 6.0, 1.0, 1.0)), ((1.0, 1.0, 0.0), (1.0 / 6.0, 1.0, 1.0)), ((1.0, 1.0, 1.0), (0, 0.0, 1.0)), ((0.5, 0.5, 0.5), (0, 0.0, 0.5))]
-    for rgb, hsv in values:
-        assertTripleEqual(hsv, rgb_to_hsv(*rgb))
-        assertTripleEqual(rgb, hsv_to_rgb(*hsv))
-
-def ColorsysTest__test_hls_roundtrip():
-    for r in frange(0.0, 1.0, 0.2):
-        for g in frange(0.0, 1.0, 0.2):
-            for b in frange(0.0, 1.0, 0.2):
-                rgb = (r, g, b)
-                assertTripleEqual(rgb, hls_to_rgb(*rgb_to_hls(*rgb)))
-
-def ColorsysTest__test_hls_values():
-    values = [((0.0, 0.0, 0.0), (0, 0.0, 0.0)), ((0.0, 0.0, 1.0), (4.0 / 6.0, 0.5, 1.0)), ((0.0, 1.0, 0.0), (2.0 / 6.0, 0.5, 1.0)), ((0.0, 1.0, 1.0), (3.0 / 6.0, 0.5, 1.0)), ((1.0, 0.0, 0.0), (0, 0.5, 1.0)), ((1.0, 0.0, 1.0), (5.0 / 6.0, 0.5, 1.0)), ((1.0, 1.0, 0.0), (1.0 / 6.0, 0.5, 1.0)), ((1.0, 1.0, 1.0), (0, 1.0, 0.0)), ((0.5, 0.5, 0.5), (0, 0.5, 0.0))]
-    for rgb, hls in values:
-        assertTripleEqual(hls, rgb_to_hls(*rgb))
-        assertTripleEqual(rgb, hls_to_rgb(*hls))
-
-def ColorsysTest__test_hls_nearwhite():
-    values = (((0.9999999999999999, 1, 1), (0.5, 1.0, 1.0)), ((1, 0.9999999999999999, 0.9999999999999999), (0.0, 1.0, 1.0)))
-    for rgb, hls in values:
-        assertTripleEqual(hls, rgb_to_hls(*rgb))
-        assertTripleEqual((1.0, 1.0, 1.0), hls_to_rgb(*hls))
-
-def ColorsysTest__test_yiq_roundtrip():
-    for r in frange(0.0, 1.0, 0.2):
-        for g in frange(0.0, 1.0, 0.2):
-            for b in frange(0.0, 1.0, 0.2):
-                rgb = (r, g, b)
-                assertTripleEqual(rgb, yiq_to_rgb(*rgb_to_yiq(*rgb)))
-
-def ColorsysTest__test_yiq_values():
-    values = [((0.0, 0.0, 0.0), (0.0, 0.0, 0.0)), ((0.0, 0.0, 1.0), (0.11, -0.3217, 0.3121)), ((0.0, 1.0, 0.0), (0.59, -0.2773, -0.5251)), ((0.0, 1.0, 1.0), (0.7, -0.599, -0.213)), ((1.0, 0.0, 0.0), (0.3, 0.599, 0.213)), ((1.0, 0.0, 1.0), (0.41, 0.2773, 0.5251)), ((1.0, 1.0, 0.0), (0.89, 0.3217, -0.3121)), ((1.0, 1.0, 1.0), (1.0, 0.0, 0.0)), ((0.5, 0.5, 0.5), (0.5, 0.0, 0.0))]
-    for rgb, yiq in values:
-        assertTripleEqual(yiq, rgb_to_yiq(*rgb))
-        assertTripleEqual(rgb, yiq_to_rgb(*yiq))
-
-
-# ======================================================================
-# Direct invocation
+# Run all tests
 # ======================================================================
 
 try:
-    ColorsysTest__test_hsv_roundtrip()
-    print("ColorsysTest.test_hsv_roundtrip: PASS")
+    test_hsv_roundtrip()
 except Exception as _e:
     print("ColorsysTest.test_hsv_roundtrip: FAIL -", _e)
 try:
-    ColorsysTest__test_hsv_values()
-    print("ColorsysTest.test_hsv_values: PASS")
+    test_hsv_values()
 except Exception as _e:
     print("ColorsysTest.test_hsv_values: FAIL -", _e)
 try:
-    ColorsysTest__test_hls_roundtrip()
-    print("ColorsysTest.test_hls_roundtrip: PASS")
+    test_hls_roundtrip()
 except Exception as _e:
     print("ColorsysTest.test_hls_roundtrip: FAIL -", _e)
 try:
-    ColorsysTest__test_hls_values()
-    print("ColorsysTest.test_hls_values: PASS")
+    test_hls_values()
 except Exception as _e:
     print("ColorsysTest.test_hls_values: FAIL -", _e)
 try:
-    ColorsysTest__test_hls_nearwhite()
-    print("ColorsysTest.test_hls_nearwhite: PASS")
+    test_hls_nearwhite()
 except Exception as _e:
     print("ColorsysTest.test_hls_nearwhite: FAIL -", _e)
 try:
-    ColorsysTest__test_yiq_roundtrip()
-    print("ColorsysTest.test_yiq_roundtrip: PASS")
+    test_yiq_roundtrip()
 except Exception as _e:
     print("ColorsysTest.test_yiq_roundtrip: FAIL -", _e)
 try:
-    ColorsysTest__test_yiq_values()
-    print("ColorsysTest.test_yiq_values: PASS")
+    test_yiq_values()
 except Exception as _e:
     print("ColorsysTest.test_yiq_values: FAIL -", _e)

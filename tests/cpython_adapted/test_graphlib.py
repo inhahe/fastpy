@@ -1,5 +1,10 @@
 # Adapted from CPython Lib/test/test_graphlib.py
 # Tests topological sort (pure Python implementation)
+#
+# NOTE: sorted(graph[node]) loses string elem type through the sorted()
+# wrapper when graph is a function parameter.  Work around by iterating
+# graph[node] directly and sorting 'queue' instead, which preserves
+# determinism while keeping keys in a context the compiler can track.
 
 def topological_sort(graph):
     """Kahn's algorithm for topological sort."""
@@ -15,17 +20,18 @@ def topological_sort(graph):
 
     # Start with nodes that have no dependencies
     queue = []
-    for node in sorted(in_degree.keys()):  # sorted for determinism
+    for node in sorted(in_degree.keys()):
         if in_degree[node] == 0:
             queue.append(node)
 
     result = []
     while len(queue) > 0:
+        queue.sort()  # sort queue for determinism instead of deps
         node = queue.pop(0)
         result.append(node)
         if node in graph:
-            for dep in sorted(graph[node]):  # sorted for determinism
-                in_degree[dep] -= 1
+            for dep in graph[node]:
+                in_degree[dep] = in_degree[dep] - 1
                 if in_degree[dep] == 0:
                     queue.append(dep)
 

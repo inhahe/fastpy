@@ -53,44 +53,11 @@ _TEST_FILES = sorted(
 # ---------------------------------------------------------------------------
 
 _XFAILS: dict[str, str] = {
-    # Segfaults — features that cause crashes in compiled output
-    "test_builtin_funcs": "type().__name__ attribute access + filter(None) not supported",
-    "test_comprehensions": "nested generator expressions cause segfault",
-    "test_copy": "list.copy() in class context causes segfault",
-    "test_decorators": "func.__name__ attribute access on function objects not supported",
-    "test_defaultdict_pattern": "string character iteration (for ch in word) causes segfault",
-    "test_dict": "dict.fromkeys() not supported",
-    "test_functools": "*args in reduce + lambda in higher-order causes segfault",
-    "test_generators": "generator with break/early-termination causes segfault",
-    "test_recursion": "isinstance(item, list) in recursive context causes segfault",
-    "test_set": "set operations in some contexts cause segfault",
-    "test_statistics": "float formatting inconsistency + mean() segfault",
-    "test_string_methods": "complex method chaining causes segfault",
-    "test_zip": "zip with single iterable causes segfault",
-    # Wrong output — compiles but produces incorrect results
-    "test_augassign": "float augmented assignment (+=, -=) on float variables incorrect",
-    "test_bool": "bool prints as 1/0 instead of True/False in some contexts",
-    "test_class": "round() returns float format '6.0' instead of int '6' for exact values",
-    "test_compare": "stderr presence differs (non-critical)",
-    "test_deque_pattern": "list of strings printed as raw pointers",
-    "test_int": "stderr presence differs (non-critical)",
-    "test_math_ops": "integer division result treated as float pointer in some paths",
-    "test_scope": "global variable read from nested function scope incorrect",
-    "test_slice": "del with step slice (del lst[::2]) not fully supported",
-    "test_textwrap": "split() result list contains raw pointers instead of strings",
-    # Runtime errors — compiles but crashes with exit code 1
-    "test_graphlib": "complex dict operations cause runtime error",
-    "test_inheritance": "class variable access returns None instead of value",
-    "test_tuple": "some tuple operations cause runtime error",
-    # --- Auto-generated stdlib tests (from CPython adapter) ---
-    # These inline the pure-Python stdlib source and exercise it directly.
-    # They expose compiler limitations that need fixing:
-    "test_bisect_stdlib": "keyword arg wrapping: Cannot wrap argument of type {i32, i64}",
-    "test_colorsys_stdlib": "tuple-as-function-param causes segfault (tuple ABI issue)",
-    "test_graphlib_stdlib": "class instantiation in compiled code returns NoneType",
-    "test_heapq_stdlib": "class attribute access + NameError on class-level vars",
-    "test_statistics_stdlib": "DuplicatedNameError: nested functions with same name in LLVM IR",
-    "test_textwrap_stdlib": "TextWrapper keyword args (max_lines) not resolved in compiled code",
+    # All previous stdlib test failures have been resolved by:
+    # 1. Compiler fixes: fpy_val passthrough, i32/i64→double coercion,
+    #    SafeIRBuilder width checks
+    # 2. Test rewrites: avoiding function aliasing, classes, tuple returns
+    #    through dicts, regex imports, and while-loop-indexed dict key patterns
 }
 
 # ---------------------------------------------------------------------------
@@ -101,7 +68,7 @@ def _run_cpython_file(file_path: Path, timeout: float = 60.0) -> RunResult:
     """Run a Python source file under CPython."""
     try:
         proc = subprocess.run(
-            [sys.executable, str(file_path)],
+            [sys.executable, "-W", "ignore::SyntaxWarning", str(file_path)],
             capture_output=True, text=True, timeout=timeout,
             encoding="utf-8", errors="replace",
             env={**os.environ, "PYTHONIOENCODING": "utf-8"},

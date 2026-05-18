@@ -148,6 +148,12 @@ typedef struct {
                              * NULL until set by fastpy_set_class_mro.
                              * Used by super() for correct diamond dispatch. */
     int mro_len;            /* number of entries in mro[] */
+    /* Class-level variables (e.g. `kind = "parent"` on the class body).
+     * Stored as parallel arrays of (name, tag, data) triples.
+     * Looked up by obj_get_fv when the instance has no matching attr. */
+    const char **class_var_names;
+    FpyValue    *class_var_values;
+    int          class_var_count;
 } FpyClassDef;
 
 #define FPY_MAX_VTABLE 64  /* max methods per class hierarchy */
@@ -428,6 +434,19 @@ void fpy_weakref_destroy(FpyWeakRef *wr);
 void fastpy_list_slice_step_assign(FpyList *list, int64_t start, int64_t stop,
                                     int64_t step, int64_t has_start,
                                     int64_t has_stop, FpyList *new_values);
+
+/* Extended-slice deletion: del list[start:stop:step] */
+void fastpy_list_slice_step_delete(FpyList *list, int64_t start, int64_t stop,
+                                    int64_t step, int64_t has_start,
+                                    int64_t has_stop);
+
+/* set.intersection_update / difference_update / symmetric_difference_update */
+void fastpy_set_intersection_update(FpyDict *a, FpyDict *b);
+void fastpy_set_difference_update(FpyDict *a, FpyDict *b);
+void fastpy_set_symmetric_difference_update(FpyDict *a, FpyDict *b);
+
+/* zip with 1 iterable */
+FpyList* fastpy_zip1(FpyList *a);
 
 /* --- Built-in list/tuple iterator --- */
 FpyObj* fastpy_list_iter_new(FpyList *list);

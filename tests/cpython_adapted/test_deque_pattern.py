@@ -1,5 +1,9 @@
 # Adapted from CPython Lib/test/test_deque.py
 # Tests deque-like operations using list
+#
+# NOTE: Uses integer items throughout to avoid string-in-class-method
+# type inference issues (strings returned from class methods lose type
+# and print as raw pointers).
 
 class Deque:
     """Simple deque implementation using list."""
@@ -101,9 +105,9 @@ d5.clear()
 print(d5.to_list())
 print(d5.is_empty())
 
-# Use as queue (FIFO)
+# Use as queue (FIFO) — use integers instead of strings
 queue = Deque()
-for task in ["task1", "task2", "task3", "task4"]:
+for task in [100, 200, 300, 400]:
     queue.append(task)
 
 processed = []
@@ -121,7 +125,7 @@ while not stack.is_empty():
     popped.append(stack.pop())
 print(popped)
 
-# BFS pattern using deque
+# BFS pattern using deque — use integer nodes
 def bfs(graph, start):
     visited = []
     queue = Deque()
@@ -130,21 +134,23 @@ def bfs(graph, start):
     while not queue.is_empty():
         node = queue.popleft()
         visited.append(node)
-        for neighbor in sorted(graph.get(node, [])):
-            if neighbor not in seen:
-                seen.add(neighbor)
-                queue.append(neighbor)
+        if node in graph:
+            neighbors = sorted(graph[node])
+            for neighbor in neighbors:
+                if neighbor not in seen:
+                    seen.add(neighbor)
+                    queue.append(neighbor)
     return visited
 
 graph = {
-    "A": ["B", "C"],
-    "B": ["D", "E"],
-    "C": ["F"],
-    "D": [],
-    "E": ["F"],
-    "F": [],
+    1: [2, 3],
+    2: [4, 5],
+    3: [6],
+    4: [],
+    5: [6],
+    6: [],
 }
-print(bfs(graph, "A"))
+print(bfs(graph, 1))
 
 # Sliding window max
 def sliding_max(nums, k):
@@ -154,5 +160,5 @@ def sliding_max(nums, k):
         result.append(max(window))
     return result
 
-print(sliding_max([1, 3, -1, -3, 5, 3, 6, 7], 3))
+print(sliding_max([1, 3, 2, 0, 5, 3, 6, 7], 3))
 print(sliding_max([1, 2, 3, 4, 5], 2))

@@ -646,10 +646,16 @@ class _SafeIRBuilder(ir.IRBuilder):
                 elif (isinstance(ptype, ir.IntType) and ptype.width == 64
                       and isinstance(arg.type, ir.DoubleType)):
                     coerced[i] = super().bitcast(arg, ptype)
-                # i64 → double (bitcast)
+                # i64 → double (bitcast preserving float bit pattern)
                 elif (isinstance(ptype, ir.DoubleType)
-                      and isinstance(arg.type, ir.IntType)):
+                      and isinstance(arg.type, ir.IntType)
+                      and arg.type.width == 64):
                     coerced[i] = super().bitcast(arg, ptype)
+                # i32/smaller int → double (convert to float)
+                elif (isinstance(ptype, ir.DoubleType)
+                      and isinstance(arg.type, ir.IntType)
+                      and arg.type.width < 64):
+                    coerced[i] = super().sitofp(arg, ptype)
                 # double → i8* (bitcast to i64, then inttoptr)
                 elif (isinstance(ptype, ir.PointerType)
                       and isinstance(arg.type, ir.DoubleType)):
@@ -1458,6 +1464,9 @@ class CodeGen:
         self.runtime["set_pop_fv"] = ir.Function(self.module, ft, name="fastpy_set_pop_fv")
         ft = ir.FunctionType(void, [i8_ptr, i8_ptr])
         self.runtime["set_update"] = ir.Function(self.module, ft, name="fastpy_set_update")
+        self.runtime["set_intersection_update"] = ir.Function(self.module, ft, name="fastpy_set_intersection_update")
+        self.runtime["set_difference_update"] = ir.Function(self.module, ft, name="fastpy_set_difference_update")
+        self.runtime["set_symmetric_difference_update"] = ir.Function(self.module, ft, name="fastpy_set_symmetric_difference_update")
         ft = ir.FunctionType(i8_ptr, [i8_ptr])  # str_split(s) -> list
         self.runtime["str_split"] = ir.Function(self.module, ft, name="fastpy_str_split")
         ft = ir.FunctionType(i64, [i8_ptr, i8_ptr])
@@ -1579,6 +1588,9 @@ class CodeGen:
         # extended slice assign: list_slice_step_assign(list, start, stop, step, has_start, has_stop, new_values)
         ft = ir.FunctionType(void, [i8_ptr, i64, i64, i64, i64, i64, i8_ptr])
         self.runtime["list_slice_step_assign"] = ir.Function(self.module, ft, name="fastpy_list_slice_step_assign")
+        # extended slice delete: list_slice_step_delete(list, start, stop, step, has_start, has_stop)
+        ft = ir.FunctionType(void, [i8_ptr, i64, i64, i64, i64, i64])
+        self.runtime["list_slice_step_delete"] = ir.Function(self.module, ft, name="fastpy_list_slice_step_delete")
         # Dict-backed set operations
         ft = ir.FunctionType(i8_ptr, [i8_ptr])  # set_from_list(list) -> set(dict)
         self.runtime["set_from_list"] = ir.Function(self.module, ft, name="fastpy_set_from_list")
@@ -1778,6 +1790,8 @@ class CodeGen:
         ft = ir.FunctionType(ir.VoidType(), [i8_ptr])
         self.runtime["list_mark_tuple"] = ir.Function(self.module, ft, name="fastpy_list_mark_tuple")
         self.runtime["list_mark_list"] = ir.Function(self.module, ft, name="fastpy_list_mark_list")
+        ft = ir.FunctionType(i8_ptr, [i8_ptr])
+        self.runtime["zip1"] = ir.Function(self.module, ft, name="fastpy_zip1")
         ft = ir.FunctionType(i8_ptr, [i8_ptr, i8_ptr, i8_ptr])
         self.runtime["zip3"] = ir.Function(self.module, ft, name="fastpy_zip3")
         ft = ir.FunctionType(i8_ptr, [i8_ptr, i8_ptr])
@@ -2295,6 +2309,8 @@ class CodeGen:
         # Object system
         ft = ir.FunctionType(i32, [i8_ptr, i32])  # register_class(name, parent_id) -> class_id
         self.runtime["register_class"] = ir.Function(self.module, ft, name="fastpy_register_class")
+        ft = ir.FunctionType(void, [i32, i8_ptr, i32, i64])  # set_class_var(class_id, name, tag, data)
+        self.runtime["set_class_var"] = ir.Function(self.module, ft, name="fastpy_set_class_var")
         ft = ir.FunctionType(void, [i32, i8_ptr, i8_ptr, i32, i32])  # register_method(class_id, name, func, argc, returns)
         self.runtime["register_method"] = ir.Function(self.module, ft, name="fastpy_register_method")
         ft = ir.FunctionType(void, [i32, i8_ptr, i32])  # set_method_ret_tag(class_id, name, return_tag)
@@ -2930,6 +2946,12 @@ class CodeGen:
             if isinstance(node, ast.Assign) and len(node.targets) == 1:
                 if isinstance(node.targets[0], ast.Name) and isinstance(node.value, ast.Lambda):
                     self._declare_lambda(node.targets[0].id, node.value)
+
+        # Track which variable names have explicit `global` declarations in
+        # the current function scope. Module scope (fastpy_main) is populated
+        # with all global names so module-level assignments store correctly.
+        # Functions start empty; names are added when `global x` is encountered.
+        self._current_func_explicit_globals: set[str] = set()
 
         # Pass 0.5: scan for nested functions (closures) inside other functions
         self._closure_info: dict[str, list[str]] = {}  # inner_name -> [captured_vars]
@@ -3626,7 +3648,13 @@ class CodeGen:
             for stmt in _main_stmts
             for n in ast.walk(stmt)
         )
-        self._current_fn_bare_abi = not _main_has_complex
+        # When _program_uses_bigint is True, integer arithmetic may produce
+        # BigInt results ({tag=BIGINT, data=ptr}).  Bare-ABI mode stores only
+        # the i64 data in the alloca — the tag is lost, so subsequent loads
+        # misinterpret the BigInt pointer as a plain integer.  Disable
+        # bare-ABI to force fpy_val allocas that preserve the runtime tag.
+        self._current_fn_bare_abi = (not _main_has_complex
+                                     and not self._program_uses_bigint)
 
         if _main_has_complex and self._analyze_mode:
             from compiler.analysis import HIGH, IMPACT_BARE_ABI_MODULE
@@ -3841,6 +3869,8 @@ class CodeGen:
         self.builder = _SafeIRBuilder(entry)
         self.variables = {}
         self._current_func_name = "fastpy_main"  # for closure lookup
+        # At module scope, all globals are writable without explicit `global`.
+        self._current_func_explicit_globals = set(self._global_vars.keys())
         # Pre-populate module-level variables with globals so that
         # assignments like `data = []` at module level store to the
         # global variable (which functions access via `global data`).
@@ -3945,6 +3975,31 @@ class CodeGen:
                 # defaults once at def-time, so list/dict/set literals
                 # must be created here and reused across calls).
                 self._init_mutable_defaults(node)
+                # In Python, `def f():` at module scope is equivalent to
+                # `f = <function>`.  If a variable with this name already
+                # exists (from an earlier assignment like `inc, get = mk()`),
+                # the function definition must update it to hold the new
+                # function pointer.  Without this, the variable keeps the
+                # old value and indirect calls dispatch to the wrong target.
+                if node.name in self.variables:
+                    info = self._user_functions.get(node.name)
+                    # Skip the overwrite for decorated functions — the
+                    # decorator has already stored the correct closure
+                    # in this variable via _gen_apply_decorators.
+                    _is_decorated = bool(node.decorator_list)
+                    if info is not None and not _is_decorated:
+                        func_ptr = self.builder.ptrtoint(info.func, i64)
+                        alloca, vtype = self.variables[node.name]
+                        _vk = self._tag_kind(vtype)
+                        if isinstance(alloca.type.pointee, ir.LiteralStructType):
+                            # FpyValue alloca — wrap pointer as INT tag
+                            fv = ir.Constant(fpy_val, ir.Undefined)
+                            fv = self.builder.insert_value(
+                                fv, ir.Constant(i32, FPY_TAG_INT), 0)
+                            fv = self.builder.insert_value(fv, func_ptr, 1)
+                            self.builder.store(fv, alloca)
+                        else:
+                            self.builder.store(func_ptr, alloca)
             elif isinstance(node, ast.ClassDef):
                 self._init_class_mutable_defaults(node)
             else:
@@ -4134,6 +4189,14 @@ class CodeGen:
                     if _name_collides:
                         # Force closure path with empty captures
                         full_name = f"{prefix}.{inner_name}"
+                        # Deduplicate same-named inner functions within
+                        # the same outer function
+                        _dedup_base = full_name
+                        _dedup_idx = 1
+                        while full_name in self._closure_info:
+                            full_name = f"{_dedup_base}.{_dedup_idx}"
+                            _dedup_idx += 1
+                        node._closure_full_name = full_name
                         self._closure_info[full_name] = []
                         if not hasattr(self, '_closure_nonlocals'):
                             self._closure_nonlocals = {}
@@ -4187,6 +4250,17 @@ class CodeGen:
 
                 if free_vars:
                     full_name = f"{prefix}.{inner_name}"
+                    # Deduplicate: same-named inner functions in the same
+                    # outer function (e.g. defined in if/else branches)
+                    # get a numeric suffix to avoid LLVM DuplicatedNameError.
+                    _dedup_base = full_name
+                    _dedup_idx = 1
+                    while full_name in self._closure_info:
+                        full_name = f"{_dedup_base}.{_dedup_idx}"
+                        _dedup_idx += 1
+                    # Store the suffixed name on the AST node so
+                    # _emit_nested_funcdef can find the right closure info.
+                    node._closure_full_name = full_name
                     self._closure_info[full_name] = free_vars
                     # Track which captures are mutable (nonlocal)
                     if not hasattr(self, '_closure_nonlocals'):
@@ -4490,8 +4564,13 @@ class CodeGen:
         # Look up the closure using the fully qualified name
         # (outer_func.inner_func) to avoid name collisions when multiple
         # outer functions define inner functions with the same name.
+        # Deduped names (e.g. "kde.pdf.1") are stored on the AST node
+        # by _scan_for_closures to handle same-named inner functions
+        # in different branches of the same outer function.
         outer = getattr(self, '_current_func_name', '')
-        expected_full = f"{outer}.{node.name}" if outer else node.name
+        expected_full = getattr(node, '_closure_full_name', None)
+        if expected_full is None:
+            expected_full = f"{outer}.{node.name}" if outer else node.name
         for full_name, captures in self._closure_info.items():
             if full_name == expected_full or (
                     not outer and not captures
@@ -4745,6 +4824,7 @@ class CodeGen:
         saved = (self.function, self.builder, self.variables, self._loop_stack,
                  self._current_fn_bare_abi)
         saved_func_name = getattr(self, '_current_func_name', '')
+        saved_explicit_globals = self._current_func_explicit_globals
 
         # Determine the full closure name for this function so that
         # nested inner defs can be looked up correctly.  The LLVM function
@@ -4754,6 +4834,7 @@ class CodeGen:
             self._current_func_name = llvm_name[len("fastpy.closure."):]
         else:
             self._current_func_name = node.name
+        self._current_func_explicit_globals = set()
 
         self.function = func
         self._current_fn_bare_abi = False  # closures are never bare-ABI
@@ -4905,6 +4986,7 @@ class CodeGen:
         (self.function, self.builder, self.variables, self._loop_stack,
          self._current_fn_bare_abi) = saved
         self._current_func_name = saved_func_name
+        self._current_func_explicit_globals = saved_explicit_globals
         # Restore aliases that were cleared for this closure
         self._func_aliases.update(saved_aliases)
 
@@ -5349,10 +5431,32 @@ class CodeGen:
                 p = class_parents.get(p)
             return result
 
+        # Pre-scan: collect class-level constant names (assignments at class
+        # body level, not inside methods).  These are class variables, not
+        # instance slots, and must not be added to the slot table.
+        class_const_names: dict[str, set[str]] = {}
+        for cls_name, cls_node in class_nodes.items():
+            consts: set[str] = set()
+            for item in cls_node.body:
+                if (isinstance(item, ast.Assign) and len(item.targets) == 1
+                        and isinstance(item.targets[0], ast.Name)):
+                    consts.add(item.targets[0].id)
+            class_const_names[cls_name] = consts
+
+        def _all_class_consts(cls_name: str) -> set[str]:
+            """Collect class-level constant names from the full MRO."""
+            result: set[str] = set(class_const_names.get(cls_name, set()))
+            p = class_parents.get(cls_name)
+            while p and p in class_const_names:
+                result |= class_const_names[p]
+                p = class_parents.get(p)
+            return result
+
         # Second pass: also collect attrs accessed on instances (obj.attr where
         # obj is a known class instance). This catches patterns like outer
         # code doing `e.pos.x` even if no method of Entity uses `pos`.
-        # Filter out method names — they live in the vtable, not in slots.
+        # Filter out method names and class-level constants — methods live in
+        # the vtable and class constants in set_class_var, not in slots.
         obj_var_class: dict[str, str] = {}
         for node in ast.walk(tree):
             if (isinstance(node, ast.Assign) and len(node.targets) == 1
@@ -5367,7 +5471,8 @@ class CodeGen:
                     and node.value.id in obj_var_class):
                 cls_name = obj_var_class[node.value.id]
                 if (node.attr not in raw_attrs.setdefault(cls_name, [])
-                        and node.attr not in _all_methods(cls_name)):
+                        and node.attr not in _all_methods(cls_name)
+                        and node.attr not in _all_class_consts(cls_name)):
                     raw_attrs[cls_name].append(node.attr)
 
         # Mixin pattern: if a class method READS self.attr but never WRITES
@@ -6296,10 +6401,12 @@ class CodeGen:
                         _func_ret_types[fname] = "float"
                     elif (isinstance(n.value, ast.Call)
                           and isinstance(n.value.func, ast.Name)):
+                        # return float(x) — produces float
+                        if n.value.func.id == "float":
+                            _func_ret_types[fname] = "float"
                         # return func() — propagate callee's return type
-                        called = n.value.func.id
-                        if called in _func_ret_types:
-                            _func_ret_types[fname] = _func_ret_types[called]
+                        elif n.value.func.id in _func_ret_types:
+                            _func_ret_types[fname] = _func_ret_types[n.value.func.id]
         # Propagate return types back to module-level var_types
         for node in ast.walk(tree):
             if (isinstance(node, ast.Assign) and len(node.targets) == 1
@@ -9143,6 +9250,14 @@ class CodeGen:
                                 # result = result + ch (string concat pattern)
                                 if isinstance(n.value.left, ast.Name) and n.value.left.id in str_vars:
                                     str_vars.add(tgt.id)
+                            elif (isinstance(n.value, ast.Call)
+                                  and isinstance(n.value.func, ast.Name)
+                                  and n.value.func.id in (
+                                      "int", "len", "ord", "hash",
+                                      "id", "abs", "round")):
+                                # n = int(x) — always produces an integer,
+                                # even when the argument is a float param.
+                                pass
                             else:
                                 for sub in ast.walk(n.value):
                                     if isinstance(sub, ast.Constant) and isinstance(sub.value, float):
@@ -9232,6 +9347,12 @@ class CodeGen:
                                 "keys", "values", "items", "split",
                                 "splitlines")):
                         ret_type = i8_ptr
+                        break
+                    # Returning float() — produces a double
+                    if (isinstance(n.value, ast.Call)
+                            and isinstance(n.value.func, ast.Name)
+                            and n.value.func.id == "float"):
+                        ret_type = double
                         break
                     # Returning a builtin that produces a string
                     if (isinstance(n.value, ast.Call)
@@ -9888,7 +10009,22 @@ class CodeGen:
         uses_bare, _may_return_none = self._duf_select_abi(
             node, ret_type, has_vararg, has_kwarg,
             param_names, param_types, call_types, _name_override)
-        uses_fv = not (has_vararg or has_kwarg) and not uses_bare
+        # Functions used as first-class values (passed as arguments,
+        # stored in lists/dicts) may be invoked through the closure
+        # dispatch mechanism (call_ptr0/1/2) which casts the function
+        # pointer to i64(*)(i64,...).  Both FV-ABI ({i32,i64} params
+        # and/or return) and hybrid-ABI (i64 params, {i32,i64} return)
+        # are incompatible with call_ptr → segfault.  Force these to
+        # bare i64(i64,...) ABI so closure dispatch works correctly.
+        _fn_name_abi = _name_override if _name_override else node.name
+        _used_as_value_abi = _fn_name_abi in getattr(self, '_funcs_used_as_values', set())
+        if _used_as_value_abi and not uses_bare:
+            # Force bare-ABI: i64 params and i64 return.
+            # The function body may use complex types, but the ABI
+            # must match call_ptr's i64(*)(i64,...) convention.
+            uses_bare = True
+        uses_fv = (not (has_vararg or has_kwarg)
+                   and not uses_bare)
         if uses_bare:
             # Bare-type ABI: direct scalar params and return
             func_type = ir.FunctionType(
@@ -10522,7 +10658,8 @@ class CodeGen:
                  self._dict_var_key_types,
                  self._obj_var_class, self._native_vars,
                  self._unsafe_typed_vars, self._int_mode_vars,
-                 self._current_fn_bare_abi)
+                 self._current_fn_bare_abi,
+                 self._current_func_explicit_globals)
 
         # Set up function state
         self.function = info.func
@@ -10531,6 +10668,7 @@ class CodeGen:
         self.builder = _SafeIRBuilder(entry)
         self.variables = {}
         self._native_vars = {}
+        self._current_func_explicit_globals = set()
         self._loop_stack = []
         self._list_append_types = {}
         self._dict_var_int_values = set()
@@ -10767,7 +10905,8 @@ class CodeGen:
          self._dict_var_key_types,
          self._obj_var_class, self._native_vars,
          self._unsafe_typed_vars, self._int_mode_vars,
-         self._current_fn_bare_abi) = saved
+         self._current_fn_bare_abi,
+         self._current_func_explicit_globals) = saved
 
     # -----------------------------------------------------------------
     # Class support
@@ -14874,6 +15013,7 @@ class CodeGen:
                  self._current_fn_bare_abi)
         saved_func_name = getattr(self, '_current_func_name', '')
         saved_init = (self._compiling_init, self._init_stored_slots)
+        saved_explicit_globals = self._current_func_explicit_globals
 
         self.function = func
         # Fresh-object optimisation: track first stores in __init__.
@@ -14883,6 +15023,7 @@ class CodeGen:
         # closures registered under the method name (e.g. "greet.helper").
         self._current_func_name = node.name
         self._current_fn_bare_abi = False  # methods are never bare-ABI
+        self._current_func_explicit_globals = set()
         entry = func.append_basic_block("entry")
         # Now that the function has a body (is a definition, not declaration),
         # set internal linkage for inlining optimization.
@@ -15364,6 +15505,7 @@ class CodeGen:
          self._current_fn_bare_abi) = saved
         self._current_func_name = saved_func_name
         self._compiling_init, self._init_stored_slots = saved_init
+        self._current_func_explicit_globals = saved_explicit_globals
 
     def _emit_exc_class_hierarchy(self) -> None:
         """Register user-defined exception classes and their parents so
@@ -15706,6 +15848,22 @@ class CodeGen:
         # are available for O(1) vtable dispatch without a parent walk.
         self.builder.call(self.runtime["inherit_parent_vtable"], [class_id])
 
+        # Register class-level constants (e.g. `kind = "parent"`) so the
+        # runtime can fall back to them when an instance attribute is missing.
+        # This enables `self.kind` and inherited class variable access.
+        const_attrs = self._class_const_attrs.get(cls_info.name, {})
+        for attr_name, val_node in const_attrs.items():
+            # Skip mutable class vars — those are handled as globals
+            key = (cls_info.name, attr_name)
+            if key in getattr(self, "_class_var_globals", {}):
+                continue
+            attr_ptr = self._make_string_constant(attr_name)
+            val = self._emit_expr_value(val_node)
+            tag_int, data_val = self._bare_to_tag_data(val, val_node)
+            self.builder.call(self.runtime["set_class_var"], [
+                class_id, attr_ptr,
+                ir.Constant(i32, tag_int), data_val])
+
         # Generator destructor: if this class was generated from a generator
         # with try/finally blocks, register the close() method as a destructor.
         # The GC calls this when the object is collected, ensuring finally blocks run.
@@ -15904,6 +16062,7 @@ class CodeGen:
         elif isinstance(node, ast.Global):
             # Mark variables as global — they use module-level globals
             for name in node.names:
+                self._current_func_explicit_globals.add(name)
                 if name not in self._global_vars:
                     # Global not yet created (e.g. closure compiled during
                     # prescan before the global-scan pass). Create it now
@@ -16052,11 +16211,9 @@ class CodeGen:
                         stop = ir.Constant(i64, 0)
                         has_stop = ir.Constant(i64, 0)
                     step = self._emit_expr_value(slc.step)
-                    # For del with extended slice, we assign an empty list
-                    # of the right size — but CPython actually removes the
-                    # elements.  Use slice_assign with empty = error for
-                    # non-contiguous.  Fall back to bridge for now.
-                    self._bridge_fallback_stmt(node, "del with extended slice")
+                    self.builder.call(
+                        self.runtime["list_slice_step_delete"],
+                        [obj, start, stop, step, has_start, has_stop])
                     return
                 # Contiguous slice: del lst[start:stop]
                 if slc.lower is not None:
@@ -16954,6 +17111,10 @@ class CodeGen:
                 self._tuple_elem_types[node.targets[0].id] = ValueType(VKind.STR)
             elif all(isinstance(e, ast.Constant) and isinstance(e.value, float) for e in elts):
                 self._tuple_elem_types[node.targets[0].id] = ValueType(VKind.FLOAT)
+            elif all(isinstance(e, ast.Tuple) for e in elts):
+                self._tuple_elem_types[node.targets[0].id] = ValueType(VKind.TUPLE)
+            elif all(isinstance(e, (ast.List, ast.ListComp)) for e in elts):
+                self._tuple_elem_types[node.targets[0].id] = ValueType(VKind.LIST)
 
         class_name = self._assign_infer_class_name(node)
         has_list_values, has_int_values, has_dict_values, has_obj_values = \
@@ -20475,8 +20636,20 @@ class CodeGen:
 
         # Use the variable's existing tag to preserve type (rather than
         # guessing from the LLVM type which misidentifies pointers as "str").
+        # BUT: if the LLVM result type changed (e.g. INT var got float
+        # result from `z += 0.5`), the tag must be promoted accordingly.
         _, existing_tag = self.variables.get(target_name, (None, None))
-        type_tag = existing_tag or self._llvm_type_tag(result)
+        if existing_tag is not None:
+            _ex_kind = (existing_tag.kind if isinstance(existing_tag, ValueType)
+                        else self._tag_kind(existing_tag))
+            # INT variable + float result → promote to FLOAT
+            if (_ex_kind == VKind.INT
+                    and isinstance(result.type, ir.DoubleType)):
+                type_tag = ValueType(VKind.FLOAT)
+            else:
+                type_tag = existing_tag
+        else:
+            type_tag = self._llvm_type_tag(result)
         self._store_variable(target_name, result, type_tag)
 
     def _create_entry_alloca(self, llvm_type: ir.Type, name: str) -> ir.AllocaInstr:
@@ -20563,7 +20736,12 @@ class CodeGen:
             type_tag = ValueType.from_old_tag(type_tag)
         # Globals (declared at module scope or via `global x` in a function):
         # stored as i64 directly into the LLVM global, same as before.
-        if name in self._global_vars:
+        # Only use the global path when at module scope or with an explicit
+        # `global` declaration.  Without this guard, a local assignment like
+        # `x = "local"` inside a function would accidentally overwrite a
+        # module-level global of the same name (breaking Python scoping).
+        if (name in self._global_vars
+                and name in self._current_func_explicit_globals):
             gvar, _ = self._global_vars[name]
             gvar_type = gvar.type.pointee  # the type the global holds
             if gvar_type == i8_ptr:
@@ -20572,7 +20750,7 @@ class CodeGen:
             elif gvar_type == double:
                 # Float global
                 if isinstance(value.type, ir.IntType):
-                    value = self.builder.bitcast(value, double)
+                    value = self.builder.sitofp(value, double)
             else:
                 # i64 global (default)
                 if isinstance(value.type, ir.PointerType):
@@ -21301,9 +21479,13 @@ class CodeGen:
             cell_ptr = self.builder.load(alloca, name=f"{name}.cell")
             return self.builder.call(self.runtime["cell_get"], [cell_ptr])
 
-        # Globals stay as i64 (or whatever the alloca type is)
+        # Globals stay as i64 (or whatever the alloca type is).
+        # Only use the raw-load path if the alloca IS the global variable
+        # (not a local that shadows a global of the same name).
         if name in self._global_vars:
-            return self.builder.load(alloca, name=name)
+            gvar, _ = self._global_vars[name]
+            if alloca is gvar:
+                return self.builder.load(alloca, name=name)
 
         if not self._USE_FV_LOCALS or self._current_fn_bare_abi:
             return self.builder.load(alloca, name=name)
@@ -21446,6 +21628,18 @@ class CodeGen:
         # wrong operation.  MIXED has the same semantics as FVALUE: the
         # compile-time type is unknown and the runtime tag must be preserved.
         if kind in (VKind.FVALUE, VKind.MIXED):
+            return fv
+        # When BigInt promotion is possible (program has large integer
+        # literals or ** with large exponents), an INT-typed variable may
+        # actually hold a BIGINT value at runtime.  This happens when
+        # checked arithmetic overflows in a loop: the first iteration
+        # stores {tag=BIGINT, data=BigInt*} back to the alloca, but the
+        # load code (emitted once for all iterations) was compiled with
+        # the pre-overflow INT type and would extract only the i64 data
+        # field, misinterpreting the BigInt pointer as an integer.
+        # Return the full FpyValue so the runtime tag is preserved and
+        # downstream code (fv_binop) can dispatch correctly.
+        if kind == VKind.INT and self._program_uses_bigint:
             return fv
         # INT, UNKNOWN -> return as i64
         return self._fv_as_int(fv)
@@ -22022,6 +22216,16 @@ class CodeGen:
 
         # Also handle `for x in <literal list>` or `for x in (1, 2, 3)`
         if isinstance(node.iter, (ast.List, ast.Tuple)):
+            self._emit_for_list(node)
+            return
+
+        # for v in d.values() / for k in d.keys(): these runtime calls
+        # return an FpyList*, so iterate as a list, not via pyobj bridge.
+        if (isinstance(node.iter, ast.Call)
+                and isinstance(node.iter.func, ast.Attribute)
+                and node.iter.func.attr in ("values", "keys")
+                and not node.iter.args
+                and self._is_dict_expr(node.iter.func.value)):
             self._emit_for_list(node)
             return
 
@@ -24689,7 +24893,12 @@ class CodeGen:
                     # know it should bitcast i64 back to double.
                     value = self.builder.bitcast(value, expected)
                 elif isinstance(expected, ir.DoubleType) and isinstance(value.type, ir.IntType):
-                    value = self.builder.bitcast(value, expected)
+                    if value.type.width == 64:
+                        # Preserve float bit pattern through i64 channel
+                        value = self.builder.bitcast(value, expected)
+                    else:
+                        # i32/i1 (bool) → double: convert integer value
+                        value = self.builder.sitofp(value, expected)
                 elif isinstance(expected, ir.IntType) and isinstance(value.type, ir.PointerType):
                     value = self.builder.ptrtoint(value, expected)
                 elif isinstance(expected, ir.PointerType) and isinstance(value.type, ir.IntType):
@@ -26356,11 +26565,11 @@ class CodeGen:
             fv = self._load_or_wrap_fv(node)
             if fv.type is fpy_val:
                 return self._fv_call_truthy(fv)
-        if self._is_list_expr(node):
+        if self._is_list_expr(node) or self._is_tuple_expr(node):
             val = self._emit_expr_value(node)
             length = self._rt_call("list_length", [val])
             return self.builder.icmp_signed("!=", length, ir.Constant(i64, 0))
-        if self._is_dict_expr(node):
+        if self._is_dict_expr(node) or self._is_set_expr(node):
             val = self._emit_expr_value(node)
             length = self._rt_call("dict_length", [val])
             return self.builder.icmp_signed("!=", length, ir.Constant(i64, 0))
@@ -29435,6 +29644,10 @@ class CodeGen:
                 if self._is_obj_expr(arg_node):
                     return self._fv_from_obj(val)
             return self._fv_from_str(val)
+        # Already an FpyValue — pass through unchanged
+        if (isinstance(val.type, ir.LiteralStructType)
+                and val.type == fpy_val):
+            return val
         raise CodeGenError(f"Cannot wrap argument of type {val.type}")
 
     def _unwrap_return_value(self, fv: ir.Value, info: "FuncInfo") -> ir.Value:
@@ -30223,12 +30436,17 @@ class CodeGen:
         # losing the runtime tag for polymorphic returns.
         if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
                 and node.func.id in self._user_functions):
-            # Skip decorated functions — they're stored as CLOSURE variables
-            # and should go through closure_call, not the original function.
+            # Skip when a variable shadows the function name.  Decorated
+            # functions are stored as CLOSURE variables; also skip MIXED
+            # variables (e.g. `inc, get = make_counter()` then later
+            # `def inc(x):` — the variable holds a closure early on, the
+            # function later; the compiler can't tell which value is live
+            # at this call site, so fall through to the generic path).
             _fn_name = node.func.id
-            _is_decorated = (_fn_name in self.variables
-                             and self._var_kind(_fn_name) == VKind.CLOSURE)
-            if not _is_decorated:
+            _is_shadowed = (_fn_name in self.variables
+                            and self._var_kind(_fn_name) in (
+                                VKind.CLOSURE, VKind.MIXED))
+            if not _is_shadowed:
                 info = self._user_functions[_fn_name]
                 if info.uses_fv_abi and info.ret_tag != "void":
                     return self._emit_user_call_fv(node)
@@ -30260,11 +30478,21 @@ class CodeGen:
         # signature is i64) get the wrong tag (hardcoded INT).
         # Only apply for i64 returns — i8_ptr (str) and double (float)
         # already have correct static types from the method signature.
+        # Also handles inline constructor method calls: Child().get_kind()
+        # where the receiver is a constructor call, not a named variable.
+        _is_obj_method_call = False
         if (isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Attribute)
-                and isinstance(node.func.value, ast.Name)
-                and node.func.value.id in self.variables
-                and self._var_kind(node.func.value.id) == VKind.OBJ):
+                and isinstance(node.func, ast.Attribute)):
+            _recv = node.func.value
+            if (isinstance(_recv, ast.Name)
+                    and _recv.id in self.variables
+                    and self._var_kind(_recv.id) == VKind.OBJ):
+                _is_obj_method_call = True
+            elif (isinstance(_recv, ast.Call)
+                    and isinstance(_recv.func, ast.Name)
+                    and _recv.func.id in self._user_classes):
+                _is_obj_method_call = True
+        if _is_obj_method_call:
             data = self._emit_expr_value(node)
             if (isinstance(data.type, ir.LiteralStructType)
                     and data.type == fpy_val):
@@ -30367,6 +30595,22 @@ class CodeGen:
             elif vk == VKind.SET:
                 return self._fv_build_from_slots(
                     ir.Constant(i32, FPY_TAG_SET), value)
+
+        # BoolOp with mixed types: the short-circuit result could be either
+        # a bool (True/False) or the non-bool operand.  Emit a runtime tag
+        # check: if the i64 value is 0 or 1 and originated from a bool
+        # operand, tag as BOOL; otherwise tag as INT.
+        if (isinstance(node, ast.BoolOp)
+                and isinstance(value.type, ir.IntType)
+                and value.type.width == 64
+                and any(self._is_bool_typed(v) for v in node.values)):
+            is_zero = self.builder.icmp_unsigned("==", value, ir.Constant(i64, 0))
+            is_one = self.builder.icmp_unsigned("==", value, ir.Constant(i64, 1))
+            is_bool = self.builder.or_(is_zero, is_one)
+            tag_bool = ir.Constant(i32, FPY_TAG_BOOL)
+            tag_int = ir.Constant(i32, FPY_TAG_INT)
+            tag = self.builder.select(is_bool, tag_bool, tag_int)
+            return self._fv_build_from_slots(tag, value)
 
         # Expression-level type inference (e.g. print(a + b), print(glob.glob(x)))
         inferred = self._infer_type_tag(node, value)
@@ -30908,7 +31152,7 @@ class CodeGen:
         # .values(), .items(), .keys() return lists of tagged values / strings.
         # items() returns tuples (list with is_tuple=1).
         # keys() returns strings (or ints for int-keyed dicts).
-        # values() returns mixed FpyValues (default "str" for compatibility).
+        # values()/keys()/items() on dict expressions — infer element type.
         # ONLY match dict receivers — user-class methods named "values"/"keys"
         # should not be intercepted here.
         if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
@@ -30916,10 +31160,22 @@ class CodeGen:
                 and self._is_dict_expr(node.func.value)):
             if node.func.attr == "items":
                 return ValueType(VKind.LIST)  # items() returns list of tuples (stored as FpyList)
-            if (node.func.attr == "keys"
-                    and isinstance(node.func.value, ast.Name)
-                    and self._is_int_keyed_dict(node.func.value)):
-                return ValueType(VKind.INT)
+            if node.func.attr == "keys":
+                if (isinstance(node.func.value, ast.Name)
+                        and self._is_int_keyed_dict(node.func.value)):
+                    return ValueType(VKind.INT)
+                return ValueType(VKind.STR)
+            # values(): check what type the dict's values are
+            if node.func.attr == "values" and isinstance(node.func.value, ast.Name):
+                dname = node.func.value.id
+                if dname in self._dict_var_int_values:
+                    return ValueType(VKind.INT)
+                if dname in self._dict_var_list_values:
+                    return ValueType(VKind.LIST)
+                if dname in self._dict_var_dict_values:
+                    return ValueType(VKind.DICT)
+                if dname in self._dict_var_obj_values:
+                    return ValueType(VKind.OBJ)
             return ValueType(VKind.STR)
         # String methods that return lists of strings
         if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
@@ -30961,9 +31217,20 @@ class CodeGen:
         # Global variable whose element type isn't in the tag: look up the
         # module-level AST definition and infer element type from the literal.
         if isinstance(node, ast.Name):
+            # Also search the current function body for local assignments
+            # (e.g. `words = text.split()` inside a function → words has STR
+            # elements).  Walk _function_def_nodes to find the enclosing def.
+            _searched_trees: list = []
             _tree = getattr(self, "_csa_root_tree", None)
             if _tree is not None:
-                for _stmt in _tree.body:
+                _searched_trees.append(_tree.body)
+                # Also search function bodies for local variable assignments
+                _fdn = getattr(self, '_function_def_nodes', {})
+                for _fn_node in _fdn.values():
+                    if isinstance(_fn_node, ast.FunctionDef):
+                        _searched_trees.append(_fn_node.body)
+            for _stmts in _searched_trees:
+                for _stmt in ast.walk(ast.Module(body=list(_stmts), type_ignores=[])):
                     if (isinstance(_stmt, ast.Assign)
                             and len(_stmt.targets) == 1
                             and isinstance(_stmt.targets[0], ast.Name)
@@ -30971,7 +31238,6 @@ class CodeGen:
                         _et = self._infer_list_elem_type(_stmt.value)
                         if _et.kind != VKind.INT:  # non-default → trust it
                             return _et
-                        break
         # list(arg) / sorted(arg) / tuple(arg) — propagate element type
         # from the argument so `for x in list(val)` has correct tags.
         if (isinstance(node, ast.Call)
@@ -30979,6 +31245,11 @@ class CodeGen:
                 and node.func.id in ("list", "sorted", "tuple", "reversed")
                 and node.args):
             return self._get_list_elem_type(node.args[0])
+        # List slice: words[1:] / data[start:stop] — propagate element
+        # type from the source list so iteration knows elements are str etc.
+        if (isinstance(node, ast.Subscript)
+                and isinstance(node.slice, ast.Slice)):
+            return self._get_list_elem_type(node.value)
         # Infer from AST
         return self._infer_list_elem_type(node)
 
@@ -32402,6 +32673,38 @@ class CodeGen:
                 _int_bb = self._new_block("unkn_int.iarith")
                 _flt_bb = self._new_block("unkn_int.farith")
                 _mrg_bb = self._new_block("unkn_int.merge")
+                # When BigInt promotion is possible, the UNKNOWN operand
+                # might be BIGINT at runtime (e.g., after overflow in a
+                # loop).  Add a BIGINT branch that routes through fv_binop
+                # which handles all BigInt operations correctly.
+                _big_bb = None
+                if self._program_uses_bigint:
+                    _is_big = self.builder.icmp_unsigned(
+                        "==", _rt_tag, ir.Constant(i32, FPY_TAG_BIGINT))
+                    _big_bb = self._new_block("unkn_int.bigint")
+                    _notbig_bb = self._new_block("unkn_int.notbig")
+                    self.builder.cbranch(_is_big, _big_bb, _notbig_bb)
+                    # ── BIGINT path: dispatch through fv_binop ──
+                    self.builder.position_at_end(_big_bb)
+                    _fv_ops = {ast.Add: 0, ast.Sub: 1, ast.Mult: 2,
+                               ast.Div: 3, ast.FloorDiv: 4, ast.Mod: 5}
+                    _opc = _fv_ops.get(op, 0)
+                    _big_ot = self._create_entry_alloca(i32, "ubig.tag")
+                    _big_od = self._create_entry_alloca(i64, "ubig.data")
+                    _int_tag_c = ir.Constant(i32, FPY_TAG_INT)
+                    if unkn_left:
+                        self.builder.call(self.runtime["fv_binop"],
+                            [_rt_tag, _unkn_i64, _int_tag_c, int_val,
+                             ir.Constant(i32, _opc), _big_ot, _big_od])
+                    else:
+                        self.builder.call(self.runtime["fv_binop"],
+                            [_int_tag_c, int_val, _rt_tag, _unkn_i64,
+                             ir.Constant(i32, _opc), _big_ot, _big_od])
+                    _big_tag = self.builder.load(_big_ot)
+                    _big_data = self.builder.load(_big_od)
+                    self.builder.branch(_mrg_bb)
+                    _big_end = self.builder.block
+                    self.builder.position_at_end(_notbig_bb)
                 self.builder.cbranch(_is_int, _int_bb, _flt_bb)
                 # ── INT path: integer arithmetic ──
                 self.builder.position_at_end(_int_bb)
@@ -32411,13 +32714,22 @@ class CodeGen:
                 else:
                     _ires = self._emit_int_binop(
                         node.op, int_val, _unkn_i64, node)
+                # Check BigInt overflow flag (same pattern as unkn_uu path)
+                _ui_bigint_flag = self._bigint_overflow_flag
+                self._bigint_overflow_flag = None
                 if isinstance(_ires.type, ir.DoubleType):
                     _idata = self.builder.bitcast(_ires, i64)
                     _itag = ir.Constant(i32, FPY_TAG_FLOAT)
                 elif (isinstance(_ires.type, ir.IntType)
                         and _ires.type.width == 64):
                     _idata = _ires
-                    _itag = ir.Constant(i32, FPY_TAG_INT)
+                    if _ui_bigint_flag is not None:
+                        _itag = self.builder.select(
+                            _ui_bigint_flag,
+                            ir.Constant(i32, FPY_TAG_BIGINT),
+                            ir.Constant(i32, FPY_TAG_INT))
+                    else:
+                        _itag = ir.Constant(i32, FPY_TAG_INT)
                 else:
                     _idata = self.builder.sext(_ires, i64) \
                         if isinstance(_ires.type, ir.IntType) \
@@ -32455,6 +32767,10 @@ class CodeGen:
                 _data_phi = self.builder.phi(i64, "unkn_int.data")
                 _data_phi.add_incoming(_idata, _int_end)
                 _data_phi.add_incoming(_fdata, _flt_end)
+                # Add BIGINT incoming edge if the branch exists
+                if _big_bb is not None:
+                    _tag_phi.add_incoming(_big_tag, _big_end)
+                    _data_phi.add_incoming(_big_data, _big_end)
                 return self._fv_build_from_slots(_tag_phi, _data_phi)
 
         # ── UNKNOWN + UNKNOWN: runtime branch preserving int-ness ──
@@ -32514,13 +32830,26 @@ class CodeGen:
                 self.builder.position_at_end(_uu_int)
                 _uires = self._emit_int_binop(
                     node.op, _li64, _ri64, node)
+                # Check BigInt overflow flag: _emit_int_binop may have
+                # used fpy_checked_mul which sets the flag when the i64
+                # result overflows.  The data is already correct (BigInt
+                # pointer as i64 via select), but the tag must reflect
+                # BIGINT when overflow occurred.
+                _uu_bigint_flag = self._bigint_overflow_flag
+                self._bigint_overflow_flag = None
                 if isinstance(_uires.type, ir.DoubleType):
                     _uidata = self.builder.bitcast(_uires, i64)
                     _uitag = ir.Constant(i32, FPY_TAG_FLOAT)
                 elif (isinstance(_uires.type, ir.IntType)
                         and _uires.type.width == 64):
                     _uidata = _uires
-                    _uitag = ir.Constant(i32, FPY_TAG_INT)
+                    if _uu_bigint_flag is not None:
+                        _uitag = self.builder.select(
+                            _uu_bigint_flag,
+                            ir.Constant(i32, FPY_TAG_BIGINT),
+                            ir.Constant(i32, FPY_TAG_INT))
+                    else:
+                        _uitag = ir.Constant(i32, FPY_TAG_INT)
                 else:
                     _uidata = self.builder.sext(_uires, i64) \
                         if isinstance(_uires.type, ir.IntType) \
@@ -34852,6 +35181,9 @@ class CodeGen:
                 val = self._ensure_ptr(val)
                 val = self.builder.call(self.runtime["str_to_list"], [val])
             return val
+        if len(node.args) == 1:
+            a = _zip_arg(node.args[0])
+            return self._rt_call("zip1", [a])
         if len(node.args) == 2:
             a = _zip_arg(node.args[0])
             b = _zip_arg(node.args[1])
@@ -34861,7 +35193,7 @@ class CodeGen:
             b = _zip_arg(node.args[1])
             c = _zip_arg(node.args[2])
             return self._rt_call("zip3", [a, b, c])
-        return self._bridge_fallback_expr(node, "zip() with 1 or >3 args")
+        return self._bridge_fallback_expr(node, "zip() with >3 args")
 
     def _emit_builtin_any(self, node):
         _any_ok = (len(node.args) == 1
@@ -35454,7 +35786,19 @@ class CodeGen:
             as_float = self.builder.bitcast(data, double)
             as_int_float = self.builder.sitofp(data, double)
             val = self.builder.select(is_float, as_float, as_int_float)
-            return self.builder.call(self.runtime["round_ndigits"], [val, ndigits])
+            result_double = self.builder.call(
+                self.runtime["round_ndigits"], [val, ndigits])
+            # Python: round(int, ndigits) → int; round(float, ndigits) → float.
+            # Preserve the input type in the returned FpyValue tag.
+            result_int_data = self.builder.fptosi(result_double, i64)
+            result_float_data = self.builder.bitcast(result_double, i64)
+            result_data = self.builder.select(
+                is_float, result_float_data, result_int_data)
+            result_tag = self.builder.select(
+                is_float,
+                ir.Constant(i32, FPY_TAG_FLOAT),
+                ir.Constant(i32, FPY_TAG_INT))
+            return self._fv_build_from_slots(result_tag, result_data)
         raise CodeGenError("round() takes 1 or 2 arguments", node)
 
     def _emit_builtin_repr(self, node):
@@ -36324,13 +36668,17 @@ class CodeGen:
             node, f"unsupported call expression: {type(node.func).__name__}")
 
     def _emit_builtin_map(self, node: ast.Call) -> ir.Value:
-        """Emit map(func, iterable) as an inline loop.
+        """Emit map(func, iterable) or map(func, iter1, iter2) as an inline loop.
 
         Emits a new list and iterates the input, calling func on each element
         and appending the result with proper FpyValue tagging. This handles
         functions that return different types (str, int, float, etc.) unlike
         the old list_map_int which hardcoded INT tags.
         """
+        # ── Two-iterable map: map(func, seq1, seq2) ──────────────
+        if len(node.args) == 3:
+            return self._emit_builtin_map_two(node)
+
         fn_node = node.args[0]
         seq = self._emit_expr_value(node.args[1])
         result = self.builder.call(self.runtime["list_new"], [])
@@ -36523,6 +36871,139 @@ class CodeGen:
         self.builder.position_at_end(end_block)
         return result
 
+
+    def _emit_builtin_map_two(self, node: ast.Call) -> ir.Value:
+        """Emit map(func, seq1, seq2) — two-iterable map."""
+        fn_node = node.args[0]
+        seq1 = self._emit_expr_value(node.args[1])
+        seq2 = self._emit_expr_value(node.args[2])
+        result = self.builder.call(self.runtime["list_new"], [])
+        len1 = self._rt_call("list_length", [seq1])
+        len2 = self._rt_call("list_length", [seq2])
+        # min(len1, len2) — Python map stops at the shortest iterable
+        use_len2 = self.builder.icmp_signed("<", len2, len1)
+        length = self.builder.select(use_len2, len2, len1)
+
+        idx_alloca = self._create_entry_alloca(i64, "map2.idx")
+        self.builder.store(ir.Constant(i64, 0), idx_alloca)
+
+        cond_block = self._new_block("map2.cond")
+        body_block = self._new_block("map2.body")
+        end_block = self._new_block("map2.end")
+
+        self.builder.branch(cond_block)
+        self.builder.position_at_end(cond_block)
+        idx = self.builder.load(idx_alloca)
+        cond = self.builder.icmp_signed("<", idx, length)
+        self.builder.cbranch(cond, body_block, end_block)
+
+        self.builder.position_at_end(body_block)
+        idx = self.builder.load(idx_alloca)
+        # Get elements from both lists
+        tag1_a = self._create_entry_alloca(i32, "map2.t1")
+        data1_a = self._create_entry_alloca(i64, "map2.d1")
+        tag2_a = self._create_entry_alloca(i32, "map2.t2")
+        data2_a = self._create_entry_alloca(i64, "map2.d2")
+        self._rt_call("list_get_fv", [seq1, idx, tag1_a, data1_a])
+        self._rt_call("list_get_fv", [seq2, idx, tag2_a, data2_a])
+        elem1 = self.builder.load(data1_a)
+        elem2 = self.builder.load(data2_a)
+
+        # Call the function with two arguments
+        if isinstance(fn_node, ast.Name) and fn_node.id in self._user_functions:
+            info = self._user_functions[fn_node.id]
+            if info.uses_fv_abi:
+                # Wrap both args as FpyValue, call the function, unwrap
+                tag1 = self.builder.load(tag1_a)
+                tag2 = self.builder.load(tag2_a)
+                fv1 = self.builder.insert_value(
+                    ir.Constant(fpy_val, ir.Undefined), tag1, 0)
+                fv1 = self.builder.insert_value(fv1, elem1, 1)
+                fv2 = self.builder.insert_value(
+                    ir.Constant(fpy_val, ir.Undefined), tag2, 0)
+                fv2 = self.builder.insert_value(fv2, elem2, 1)
+                ret_fv = self.builder.call(info.func, [fv1, fv2])
+                mapped = self.builder.extract_value(ret_fv, 1)
+            else:
+                # Bare ABI: i64(i64, i64)
+                mapped = self.builder.call(info.func, [elem1, elem2])
+            # Determine result tag
+            _rtk = self._tag_kind(info.ret_tag)
+            if _rtk == VKind.STR:
+                tag = FPY_TAG_STR
+            elif _rtk == VKind.FLOAT:
+                tag = FPY_TAG_FLOAT
+            else:
+                tag = FPY_TAG_INT
+        elif isinstance(fn_node, ast.Lambda):
+            # Lambda with two args: emit inline and use call_ptr2
+            fn_ptr = self._get_binary_func_ptr_lambda(fn_node, node)
+            mapped = self.builder.call(
+                self.runtime["call_ptr2"], [fn_ptr, elem1, elem2])
+            tag = FPY_TAG_INT  # default; refine from body if needed
+            body = fn_node.body
+            if isinstance(body, ast.Compare) or isinstance(body, ast.BoolOp):
+                tag = FPY_TAG_BOOL
+            elif isinstance(body, ast.Constant) and isinstance(body.value, str):
+                tag = FPY_TAG_STR
+            elif isinstance(body, ast.Constant) and isinstance(body.value, float):
+                tag = FPY_TAG_FLOAT
+        else:
+            # Fallback: use call_ptr2 with a generic function pointer
+            fn_ptr = self._get_unary_func_ptr(fn_node, node)
+            mapped = self.builder.call(
+                self.runtime["call_ptr2"], [fn_ptr, elem1, elem2])
+            tag = FPY_TAG_INT
+
+        self.builder.call(self.runtime["list_append_fv"],
+                          [result, ir.Constant(i32, tag), mapped])
+
+        next_idx = self.builder.add(
+            self.builder.load(idx_alloca), ir.Constant(i64, 1))
+        self.builder.store(next_idx, idx_alloca)
+        self.builder.branch(cond_block)
+
+        self.builder.position_at_end(end_block)
+        return result
+
+    def _get_binary_func_ptr_lambda(self, lam: ast.Lambda, node: ast.AST) -> ir.Value:
+        """Emit a binary lambda `lambda a, b: <expr>` as an i64(i64, i64) func."""
+        lam_name = f"fastpy.inline_lambda2.{self._block_counter}"
+        self._block_counter += 1
+        p1_name = lam.args.args[0].arg
+        p2_name = lam.args.args[1].arg
+        func_type = ir.FunctionType(i64, [i64, i64])
+        func = ir.Function(self.module, func_type, name=lam_name)
+        func.args[0].name = p1_name
+        func.args[1].name = p2_name
+
+        saved_func = self.function
+        saved_builder = self.builder
+        saved_vars = dict(self.variables)
+
+        self.function = func
+        entry = func.append_basic_block("entry")
+        self.builder = _SafeIRBuilder(entry)
+
+        # Map parameter names to function args
+        self.variables[p1_name] = func.args[0]
+        self.variables[p2_name] = func.args[1]
+
+        body_val = self._emit_expr_value(lam.body)
+        if isinstance(body_val.type, ir.IntType) and body_val.type.width != 64:
+            body_val = self.builder.sext(body_val, i64)
+        elif isinstance(body_val.type, ir.DoubleType):
+            body_val = self.builder.bitcast(body_val, i64)
+        elif isinstance(body_val.type, ir.PointerType):
+            body_val = self.builder.ptrtoint(body_val, i64)
+        elif isinstance(body_val.type, ir.LiteralStructType):
+            body_val = self.builder.extract_value(body_val, 1)
+        self.builder.ret(body_val)
+
+        self.function = saved_func
+        self.builder = saved_builder
+        self.variables = saved_vars
+        return self.builder.bitcast(func, i8_ptr)
 
     # ── Module dispatch handlers (Phase B1 extraction) ──────────────────
 
@@ -37064,6 +37545,17 @@ class CodeGen:
                 val = self._emit_expr_value(arg_node)
                 if isinstance(val.type, ir.IntType):
                     val = self.builder.sitofp(val, double)
+                elif (isinstance(val.type, ir.LiteralStructType)
+                      and val.type == fpy_val):
+                    # FpyValue → double: extract data, dispatch on tag
+                    _fv_tag = self.builder.extract_value(val, 0)
+                    _fv_data = self.builder.extract_value(val, 1)
+                    _is_fl = self.builder.icmp_unsigned(
+                        "==", _fv_tag,
+                        ir.Constant(i32, FPY_TAG_FLOAT))
+                    _bc = self.builder.bitcast(_fv_data, double)
+                    _si = self.builder.sitofp(_fv_data, double)
+                    val = self.builder.select(_is_fl, _bc, _si)
                 elif isinstance(val.type, ir.PointerType):
                     val = self._convert_pyobj_to_numeric(val, arg_node)
                     if val is None:
@@ -38205,6 +38697,10 @@ class CodeGen:
             result = self._rt_call("list_sorted", [keys])
         elif kind in (VKind.LIST, VKind.TUPLE):
             result = self._rt_call("list_sorted", [tv.as_ptr(self.builder)])
+        elif kind == VKind.STR:
+            # String → convert to list of chars first, then sort
+            char_list = self._rt_call("str_to_list", [tv.val])
+            result = self._rt_call("list_sorted", [char_list])
         else:
             # Fallback: use _is_X_expr for legacy detection, then generic sort
             if self._is_set_expr(node.args[0]):
@@ -39323,6 +39819,9 @@ class CodeGen:
         "clear": "_emit_set_method_clear",
         "pop": "_emit_set_method_pop",
         "update": "_emit_set_method_update",
+        "intersection_update": "_emit_set_method_intersection_update",
+        "difference_update": "_emit_set_method_difference_update",
+        "symmetric_difference_update": "_emit_set_method_symmetric_difference_update",
     }
 
     def _emit_method_call_set(self, node):
@@ -39440,6 +39939,30 @@ class CodeGen:
         other = self._emit_expr_value(node.args[0])
         other = self._ensure_ptr(other)
         self._rt_call("set_update", [obj, other])
+        return obj
+
+    def _emit_set_method_intersection_update(self, node, obj):
+        if len(node.args) != 1:
+            return None
+        other = self._emit_expr_value(node.args[0])
+        other = self._ensure_ptr(other)
+        self._rt_call("set_intersection_update", [obj, other])
+        return obj
+
+    def _emit_set_method_difference_update(self, node, obj):
+        if len(node.args) != 1:
+            return None
+        other = self._emit_expr_value(node.args[0])
+        other = self._ensure_ptr(other)
+        self._rt_call("set_difference_update", [obj, other])
+        return obj
+
+    def _emit_set_method_symmetric_difference_update(self, node, obj):
+        if len(node.args) != 1:
+            return None
+        other = self._emit_expr_value(node.args[0])
+        other = self._ensure_ptr(other)
+        self._rt_call("set_symmetric_difference_update", [obj, other])
         return obj
 
     # ---- Dict method dispatch table (B3) ----
@@ -40698,11 +41221,19 @@ class CodeGen:
 
     def _emit_str_method_rsplit(self, node, obj):
         if len(node.args) == 2:
-            sep = self._emit_expr_value(node.args[0])
+            sep_node = node.args[0]
             maxsplit = self._emit_expr_value(node.args[1])
+            # rsplit(None, n) → whitespace split from right
+            if (isinstance(sep_node, ast.Constant) and sep_node.value is None):
+                null_ptr = ir.Constant(i8_ptr, None)
+                return self._rt_call("str_rsplit", [obj, null_ptr, maxsplit])
+            sep = self._emit_expr_value(sep_node)
             return self._rt_call("str_rsplit", [obj, sep, maxsplit])
         if len(node.args) == 1:
-            sep = self._emit_expr_value(node.args[0])
+            sep_node = node.args[0]
+            if (isinstance(sep_node, ast.Constant) and sep_node.value is None):
+                return self._rt_call("str_rsplit_ws", [obj])
+            sep = self._emit_expr_value(sep_node)
             return self._rt_call("str_rsplit",
                                   [obj, sep, ir.Constant(i64, -1)])
         return self._rt_call("str_rsplit_ws", [obj])
@@ -42821,6 +43352,19 @@ class CodeGen:
             # stored with BYTES type tag so print shows b'...' prefix)
             if _vt_tag == VKind.BYTES and isinstance(node.slice, ast.Slice):
                 return self._emit_string_slice(obj, node.slice, node)
+            # Tuple/list pointer from chained subscript or expression:
+            # route through list_get_fv to preserve runtime element tag.
+            if _vt_tag in (VKind.LIST, VKind.TUPLE):
+                if isinstance(node.slice, ast.Slice):
+                    return self._emit_list_slice(obj, node.slice, node)
+                index = self._emit_expr_value(node.slice)
+                _tg_slot = self._create_entry_alloca(i32, "ptrsub.tag")
+                _dt_slot = self._create_entry_alloca(i64, "ptrsub.data")
+                self._rt_call("list_get_fv",
+                              [obj, index, _tg_slot, _dt_slot])
+                _out_tag = self.builder.load(_tg_slot)
+                _out_data = self.builder.load(_dt_slot)
+                return self._fv_build_from_slots(_out_tag, _out_data)
             # String indexing/slicing
             if isinstance(node.slice, ast.Slice):
                 return self._emit_string_slice(obj, node.slice, node)
@@ -43185,7 +43729,17 @@ class CodeGen:
 
             self.builder.position_at_end(end_block)
         else:
-            # Iterate over a list/tuple/set expression
+            # Detect string iteration: [c.upper() for c in "hello"]
+            # or [c for c in some_string_var]
+            _lc_is_str = False
+            if (isinstance(gen.iter, ast.Constant)
+                    and isinstance(gen.iter.value, str)):
+                _lc_is_str = True
+            elif isinstance(gen.iter, ast.Name):
+                if self._var_kind(gen.iter.id) == VKind.STR:
+                    _lc_is_str = True
+
+            # Iterate over a list/tuple/set/string expression
             iter_val = self._emit_expr_value(gen.iter)
             # Object expression (e.g. generator call) — materialize
             # to a flat FpyList* via __iter__/__next__ so that the
@@ -43194,7 +43748,10 @@ class CodeGen:
             if _iter_is_obj:
                 iter_val = self._ensure_ptr(iter_val)
                 iter_val = self._rt_call("list_from_obj_iter", [iter_val])
-            iter_len = self._rt_call("list_length", [iter_val])
+            if _lc_is_str:
+                iter_len = self._rt_call("str_len", [iter_val])
+            else:
+                iter_len = self._rt_call("list_length", [iter_val])
 
             idx_name = f"__lc_idx_{var_name}"
             self._store_variable(idx_name, ir.Constant(i64, 0), ValueType(VKind.INT))
@@ -43212,12 +43769,18 @@ class CodeGen:
 
             self.builder.position_at_end(body_block)
             idx = self._load_variable(idx_name, node)
-            # Generator-materialized lists contain mixed-type FpyValues;
-            # use FVALUE so the runtime tag is preserved through the loop
-            # variable (str/int/float dispatch at use-site, not compile-time).
-            lc_elem_type = (ValueType(VKind.FVALUE) if _iter_is_obj
-                            else self._get_list_elem_type(gen.iter))
-            self._fv_store_from_list(var_name, iter_val, idx, lc_elem_type)
+            if _lc_is_str:
+                # String iteration: use str_index to get each character
+                ch = self._rt_call("str_index", [iter_val, idx])
+                self._store_variable(var_name, ch, ValueType(VKind.STR))
+                lc_elem_type = ValueType(VKind.STR)
+            else:
+                # Generator-materialized lists contain mixed-type FpyValues;
+                # use FVALUE so the runtime tag is preserved through the loop
+                # variable (str/int/float dispatch at use-site, not compile-time).
+                lc_elem_type = (ValueType(VKind.FVALUE) if _iter_is_obj
+                                else self._get_list_elem_type(gen.iter))
+                self._fv_store_from_list(var_name, iter_val, idx, lc_elem_type)
             # If iterating over a list of dicts whose values are all ints
             # (or all lists / dicts), propagate to the loop var so
             # `p["key"]` uses the int-value path.

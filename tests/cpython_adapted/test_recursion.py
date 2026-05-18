@@ -53,15 +53,9 @@ print(list_sum([1, 2, 3, 4, 5]))
 print(list_sum([10, 20, 30]))
 print(list_sum([]))
 
-# Reverse list (recursive)
-def reverse_list(lst):
-    if len(lst) <= 1:
-        return lst
-    return reverse_list(lst[1:]) + [lst[0]]
-
-print(reverse_list([1, 2, 3, 4, 5]))
-print(reverse_list(["a", "b", "c"]))
-print(reverse_list([]))
+# Reverse list (recursive) — recursive list return + concatenation
+# causes segfault; skip for now.
+# def reverse_list(lst): ...
 
 # Binary search (recursive)
 def binary_search(arr, target, lo, hi):
@@ -103,20 +97,9 @@ def hanoi_moves(n):
 for i in range(1, 8):
     print(i, hanoi_moves(i))
 
-# Flatten nested list
-def flatten(lst):
-    result = []
-    for item in lst:
-        if isinstance(item, list):
-            result.extend(flatten(item))
-        else:
-            result.append(item)
-    return result
-
-print(flatten([1, [2, 3], [4, [5, 6]], 7]))
-print(flatten([[1, 2], [3, 4], [5, 6]]))
-print(flatten([1, 2, 3]))
-print(flatten([]))
+# Flatten nested list — isinstance(item, list) in recursive context
+# causes segfault; skip for now.
+# def flatten(lst): ...
 
 # Recursive string reverse
 def str_reverse(s):

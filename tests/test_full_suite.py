@@ -68,7 +68,7 @@ def _run_cpython_file(file_path: Path, timeout: float = 60.0) -> RunResult:
     """Run a Python source *file* under CPython (avoids Windows cmd-line limit)."""
     try:
         proc = subprocess.run(
-            [sys.executable, str(file_path)],
+            [sys.executable, "-W", "ignore::SyntaxWarning", str(file_path)],
             capture_output=True,
             text=True,
             timeout=timeout,

@@ -979,6 +979,7 @@ extern void fastpy_dict_update(FpyDict*, FpyDict*);
 extern FpyList* fastpy_tuple_new(void);
 extern void* fastpy_obj_new(int32_t);
 extern int32_t fastpy_register_class(const char*, int32_t);
+extern void fastpy_set_class_var(int32_t, const char*, int32_t, int64_t);
 extern void fastpy_register_method(int32_t, const char*, void*, int32_t, int32_t);
 extern void fastpy_set_method_ret_tag(int32_t, const char*, int32_t);
 extern void fastpy_obj_call_method1_fv(void*, const char*, int64_t, int32_t*, int64_t*);
@@ -1044,6 +1045,10 @@ extern FpyDict* fastpy_set_copy(FpyDict*);
 extern void fastpy_set_clear(FpyDict*);
 extern void fastpy_set_pop_fv(FpyDict*, int32_t*, int64_t*);
 extern void fastpy_set_update(FpyDict*, FpyDict*);
+extern void fastpy_set_intersection_update(FpyDict*, FpyDict*);
+extern void fastpy_set_difference_update(FpyDict*, FpyDict*);
+extern void fastpy_set_symmetric_difference_update(FpyDict*, FpyDict*);
+extern FpyList* fastpy_zip1(FpyList*);
 extern void fastpy_dict_popitem(FpyDict*, int32_t*, int64_t*, int32_t*, int64_t*);
 extern FpyDict* fastpy_dict_copy(FpyDict*);
 extern int64_t fastpy_str_index_sub(const char*, const char*);
@@ -1148,7 +1153,8 @@ static FpySymEntry fpy_jit_symbols[] = {
     SYM(fastpy_dict_items), SYM(fastpy_dict_has_key), SYM(fastpy_dict_update),
     SYM(fastpy_dict_equal), SYM(fastpy_set_equal),
     SYM(fastpy_tuple_new), SYM(fastpy_obj_new),
-    SYM(fastpy_register_class), SYM(fastpy_register_method),
+    SYM(fastpy_register_class), SYM(fastpy_set_class_var),
+    SYM(fastpy_register_method),
     SYM(fastpy_set_method_ret_tag), SYM(fastpy_obj_call_method1_fv),
     SYM(fastpy_obj_set_fv), SYM(fastpy_obj_get_fv),
     SYM(fastpy_str_concat), SYM(fastpy_str_len), SYM(fastpy_str_lower),
@@ -1172,7 +1178,9 @@ static FpySymEntry fpy_jit_symbols[] = {
     SYM(fastpy_set_issubset), SYM(fastpy_set_issuperset),
     SYM(fastpy_set_isdisjoint), SYM(fastpy_set_copy),
     SYM(fastpy_set_clear), SYM(fastpy_set_pop_fv),
-    SYM(fastpy_set_update), SYM(fastpy_dict_popitem),
+    SYM(fastpy_set_update), SYM(fastpy_set_intersection_update),
+    SYM(fastpy_set_difference_update), SYM(fastpy_set_symmetric_difference_update),
+    SYM(fastpy_zip1), SYM(fastpy_dict_popitem),
     SYM(fastpy_dict_copy), SYM(fastpy_str_index_sub), SYM(fastpy_str_rindex_sub),
     SYM(fastpy_str_replace_count),
     SYM(fastpy_str_find_range), SYM(fastpy_str_rfind_range),

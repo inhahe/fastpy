@@ -2537,6 +2537,38 @@ void fastpy_set_update(FpyDict *a, FpyDict *b) {
     }
 }
 
+/* set.intersection_update(other) — keep only elements found in other */
+void fastpy_set_intersection_update(FpyDict *a, FpyDict *b) {
+    /* Build list of keys to remove (can't mutate while iterating). */
+    int64_t n = 0;
+    FpyValue *to_remove = (FpyValue*)malloc(a->length * sizeof(FpyValue));
+    for (int64_t i = 0; i < a->length; i++) {
+        if (!fastpy_set_contains(b, a->keys[i]))
+            to_remove[n++] = a->keys[i];
+    }
+    for (int64_t i = 0; i < n; i++)
+        fastpy_set_discard_fv(a, to_remove[i].tag, to_remove[i].data.i);
+    free(to_remove);
+}
+
+/* set.difference_update(other) — remove elements found in other */
+void fastpy_set_difference_update(FpyDict *a, FpyDict *b) {
+    for (int64_t i = 0; i < b->length; i++) {
+        if (fastpy_set_contains(a, b->keys[i]))
+            fastpy_set_discard_fv(a, b->keys[i].tag, b->keys[i].data.i);
+    }
+}
+
+/* set.symmetric_difference_update(other) — keep elements in either but not both */
+void fastpy_set_symmetric_difference_update(FpyDict *a, FpyDict *b) {
+    for (int64_t i = 0; i < b->length; i++) {
+        if (fastpy_set_contains(a, b->keys[i]))
+            fastpy_set_discard_fv(a, b->keys[i].tag, b->keys[i].data.i);
+        else
+            fpy_dict_set(a, b->keys[i], fpy_none());
+    }
+}
+
 /* Print a set in {a, b, c} format. */
 void fastpy_set_print(FpyDict *set) {
     printf("{");
@@ -3024,6 +3056,18 @@ FpyList* fastpy_zip(FpyList *a, FpyList *b) {
         fpy_list_append(pair, a->items[i]);
         fpy_list_append(pair, b->items[i]);
         fpy_list_append(result, fpy_list(pair));
+    }
+    return result;
+}
+
+/* zip(a) — single iterable: wraps each element in a 1-tuple */
+FpyList* fastpy_zip1(FpyList *a) {
+    FpyList *result = fpy_list_new(a->length);
+    for (int64_t i = 0; i < a->length; i++) {
+        FpyList *t = fpy_list_new(1);
+        t->is_tuple = 1;
+        fpy_list_append(t, a->items[i]);
+        fpy_list_append(result, fpy_list(t));
     }
     return result;
 }
@@ -4006,8 +4050,58 @@ FpyList* fastpy_str_rsplit_ws(const char *s) {
     return fastpy_str_split(s);
 }
 
-/* str.rsplit(sep, maxsplit) — split from the right */
+/* str.rsplit(sep, maxsplit) — split from the right.
+ * sep == NULL means split on whitespace (Python: s.rsplit(None, n)). */
 FpyList* fastpy_str_rsplit(const char *s, const char *sep, int64_t max_split) {
+    if (sep == NULL) {
+        if (max_split < 0)
+            return fastpy_str_split(s);
+        /* Whitespace rsplit: split from the right up to max_split times.
+         * Strategy: collect all words left-to-right, then only split the
+         * last max_split ones (join the rest as the first element). */
+        size_t len = strlen(s);
+        /* Collect word boundaries (start, end) */
+        size_t starts[256], ends[256];
+        int n_words = 0;
+        size_t i = 0;
+        while (i < len) {
+            while (i < len && (s[i]==' '||s[i]=='\t'||s[i]=='\n'||
+                               s[i]=='\r'||s[i]=='\f'||s[i]=='\v')) i++;
+            if (i >= len) break;
+            size_t ws = i;
+            while (i < len && s[i]!=' '&&s[i]!='\t'&&s[i]!='\n'&&
+                   s[i]!='\r'&&s[i]!='\f'&&s[i]!='\v') i++;
+            if (n_words < 256) {
+                starts[n_words] = ws;
+                ends[n_words] = i;
+                n_words++;
+            }
+        }
+        FpyList *result = fpy_list_new(0);
+        if (n_words == 0) return result;
+        int split_from = n_words - max_split;
+        if (split_from < 0) split_from = 0;
+        if (split_from > 0) {
+            /* Join words 0..split_from-1 plus intervening whitespace
+             * as the first element (everything from start of first word
+             * to end of word split_from-1). */
+            size_t seg_start = starts[0];
+            size_t seg_end = ends[split_from - 1];
+            size_t seg_len = seg_end - seg_start;
+            char *seg = (char*)malloc(seg_len + 1);
+            memcpy(seg, s + seg_start, seg_len);
+            seg[seg_len] = '\0';
+            fpy_list_append(result, fpy_str(seg));
+        }
+        for (int w = (split_from > 0 ? split_from : 0); w < n_words; w++) {
+            size_t seg_len = ends[w] - starts[w];
+            char *seg = (char*)malloc(seg_len + 1);
+            memcpy(seg, s + starts[w], seg_len);
+            seg[seg_len] = '\0';
+            fpy_list_append(result, fpy_str(seg));
+        }
+        return result;
+    }
     size_t s_len = strlen(s);
     size_t sep_len = strlen(sep);
     if (sep_len == 0) {
@@ -4077,6 +4171,44 @@ FpyList* fastpy_str_rsplit(const char *s, const char *sep, int64_t max_split) {
 }
 
 FpyList* fastpy_str_split_max(const char *s, const char *sep, int64_t max_split) {
+    /* sep == NULL means split on whitespace (Python: s.split(None, n)) */
+    if (sep == NULL) {
+        if (max_split < 0)
+            return fastpy_str_split(s);
+        /* Whitespace split with maxsplit limit */
+        FpyList *result = fpy_list_new(0);
+        size_t len = strlen(s);
+        size_t i = 0;
+        int64_t splits = 0;
+        while (i < len && (s[i] == ' ' || s[i] == '\t' || s[i] == '\n'
+                           || s[i] == '\r' || s[i] == '\f' || s[i] == '\v'))
+            i++;
+        while (i < len) {
+            if (splits >= max_split) {
+                /* Remainder of string (including leading whitespace already skipped) */
+                size_t rest_len = len - i;
+                char *seg = (char*)malloc(rest_len + 1);
+                memcpy(seg, s + i, rest_len);
+                seg[rest_len] = '\0';
+                fpy_list_append(result, fpy_str(seg));
+                break;
+            }
+            size_t start = i;
+            while (i < len && s[i] != ' ' && s[i] != '\t' && s[i] != '\n'
+                   && s[i] != '\r' && s[i] != '\f' && s[i] != '\v')
+                i++;
+            size_t seg_len = i - start;
+            char *seg = (char*)malloc(seg_len + 1);
+            memcpy(seg, s + start, seg_len);
+            seg[seg_len] = '\0';
+            fpy_list_append(result, fpy_str(seg));
+            splits++;
+            while (i < len && (s[i] == ' ' || s[i] == '\t' || s[i] == '\n'
+                               || s[i] == '\r' || s[i] == '\f' || s[i] == '\v'))
+                i++;
+        }
+        return result;
+    }
     FpyList *result = fpy_list_new(0);
     size_t sep_len = strlen(sep);
     size_t s_len = strlen(s);
@@ -4125,7 +4257,21 @@ const char* fastpy_str_replace(const char *s, const char *old, const char *new_s
     size_t s_len = strlen(s);
     size_t old_len = strlen(old);
     size_t new_len = strlen(new_str);
-    if (old_len == 0) return s;
+    if (old_len == 0) {
+        /* Python: "abc".replace("", "x") → "xaxbxcx"
+         * Insert new_str at every position (n+1 positions for n chars). */
+        size_t n_inserts = s_len + 1;
+        size_t result_len = s_len + n_inserts * new_len;
+        char *result = (char*)malloc(result_len + 1);
+        char *dst = result;
+        for (size_t i = 0; i <= s_len; i++) {
+            memcpy(dst, new_str, new_len);
+            dst += new_len;
+            if (i < s_len) *dst++ = s[i];
+        }
+        *dst = '\0';
+        return result;
+    }
 
     /* Count occurrences */
     int count = 0;
@@ -5381,6 +5527,82 @@ void fastpy_list_slice_step_assign(FpyList *list, int64_t start, int64_t stop,
     FPY_UNLOCK(list);
 }
 
+/* Step-slice deletion: del lst[start:stop:step]
+ * Removes elements at positions selected by the extended slice.
+ * For positive step: collects indices, removes from highest to lowest. */
+void fastpy_list_slice_step_delete(FpyList *list, int64_t start, int64_t stop,
+                                    int64_t step, int64_t has_start,
+                                    int64_t has_stop) {
+    FPY_LOCK(list);
+    int64_t len = list->length;
+
+    if (step == 0) {
+        FPY_UNLOCK(list);
+        fastpy_raise(FPY_EXC_VALUEERROR, "slice step cannot be zero");
+        return;
+    }
+
+    /* Normalize start/stop like CPython */
+    if (step > 0) {
+        if (!has_start) start = 0;
+        if (!has_stop) stop = len;
+    } else {
+        if (!has_start) start = len - 1;
+        if (!has_stop) stop = -len - 1;
+    }
+    if (start < 0) start += len;
+    if (stop < 0) stop += len;
+    if (start < 0) start = 0;
+    if (start > len) start = len;
+    if (stop < -1) stop = -1;
+    if (stop > len) stop = len;
+
+    /* Collect indices to delete */
+    int64_t *indices = (int64_t*)malloc(len * sizeof(int64_t));
+    int64_t n = 0;
+    if (step > 0) {
+        for (int64_t i = start; i < stop; i += step)
+            if (i >= 0 && i < len) indices[n++] = i;
+    } else {
+        for (int64_t i = start; i > stop; i += step)
+            if (i >= 0 && i < len) indices[n++] = i;
+    }
+
+    if (n == 0) {
+        free(indices);
+        FPY_UNLOCK(list);
+        return;
+    }
+
+    /* Sort indices ascending (for negative step they're reversed) */
+    for (int64_t i = 0; i < n - 1; i++)
+        for (int64_t j = i + 1; j < n; j++)
+            if (indices[i] > indices[j]) {
+                int64_t tmp = indices[i];
+                indices[i] = indices[j];
+                indices[j] = tmp;
+            }
+
+    /* Decref removed elements */
+    for (int64_t i = 0; i < n; i++)
+        FPY_VAL_DECREF(list->items[indices[i]]);
+
+    /* Compact: shift elements to fill gaps.
+     * Walk two pointers: src reads all items, dst writes kept items. */
+    int64_t dst = indices[0];
+    int64_t di = 0;  /* index into indices[] */
+    for (int64_t src = indices[0]; src < len; src++) {
+        if (di < n && src == indices[di]) {
+            di++;
+            continue;  /* skip deleted element */
+        }
+        list->items[dst++] = list->items[src];
+    }
+    list->length = len - n;
+    free(indices);
+    FPY_UNLOCK(list);
+}
+
 /* Set discard — remove element if present, no error if absent */
 void fastpy_set_discard(FpyList *set, int64_t value) {
     for (int64_t i = 0; i < set->length; i++) {
@@ -6304,6 +6526,9 @@ int fastpy_register_class(const char *name, int parent_id) {
     fpy_classes[id].acyclic = 0;
     fpy_classes[id].mro = NULL;
     fpy_classes[id].mro_len = 0;
+    fpy_classes[id].class_var_names = NULL;
+    fpy_classes[id].class_var_values = NULL;
+    fpy_classes[id].class_var_count = 0;
     return id;
 }
 
@@ -6312,6 +6537,23 @@ int fastpy_register_class(const char *name, int parent_id) {
  * reference cycles.  Instances skip GC tracking entirely. */
 void fastpy_set_class_acyclic(int class_id) {
     fpy_classes[class_id].acyclic = 1;
+}
+
+/* Store a class-level variable (e.g. `kind = "parent"` from the class body).
+ * Called during class registration. obj_get_fv falls back to these when
+ * the instance has no matching attribute. */
+void fastpy_set_class_var(int class_id, const char *name,
+                          int32_t tag, int64_t data) {
+    FpyClassDef *cls = &fpy_classes[class_id];
+    int n = cls->class_var_count;
+    cls->class_var_names = realloc(cls->class_var_names,
+                                    (n + 1) * sizeof(const char *));
+    cls->class_var_values = realloc(cls->class_var_values,
+                                     (n + 1) * sizeof(FpyValue));
+    cls->class_var_names[n] = name;
+    cls->class_var_values[n].tag = tag;
+    cls->class_var_values[n].data.i = data;
+    cls->class_var_count = n + 1;
 }
 
 /* Set the MRO (Method Resolution Order) for a class.
@@ -6877,6 +7119,24 @@ void fastpy_obj_get_fv(FpyObj *obj, const char *name, int32_t *out_tag, int64_t 
             }
         }
     }
+    /* Fall back to class-level variables (walk MRO / parent chain).
+     * This handles `self.kind` where `kind = "parent"` is defined on
+     * the class body, and also inherits class vars from parent classes. */
+    {
+        int cid = obj->class_id;
+        while (cid >= 0) {
+            FpyClassDef *cls = &fpy_classes[cid];
+            for (int i = 0; i < cls->class_var_count; i++) {
+                if (cls->class_var_names[i] == name
+                        || strcmp(cls->class_var_names[i], name) == 0) {
+                    *out_tag = cls->class_var_values[i].tag;
+                    *out_data = cls->class_var_values[i].data.i;
+                    return;
+                }
+            }
+            cid = cls->parent_id;
+        }
+    }
     snprintf(_err_buf, sizeof(_err_buf), "'%s' object has no attribute '%s'",
              fpy_classes[obj->class_id].name, name);
     fastpy_raise(FPY_EXC_ATTRIBUTEERROR, _err_buf);
@@ -6897,6 +7157,20 @@ int32_t fastpy_obj_has_attr(FpyObj *obj, const char *name) {
                     || strcmp(a->names[i], name) == 0) {
                 return 1;
             }
+        }
+    }
+    /* Check class-level variables (walk parent chain) */
+    {
+        int cid = obj->class_id;
+        while (cid >= 0) {
+            FpyClassDef *cls = &fpy_classes[cid];
+            for (int i = 0; i < cls->class_var_count; i++) {
+                if (cls->class_var_names[i] == name
+                        || strcmp(cls->class_var_names[i], name) == 0) {
+                    return 1;
+                }
+            }
+            cid = cls->parent_id;
         }
     }
     return 0;
@@ -6931,6 +7205,22 @@ int32_t fastpy_obj_getattr_default(FpyObj *obj, const char *name,
                 *out_data = a->values[i].data.i;
                 return 1;
             }
+        }
+    }
+    /* Check class-level variables (walk parent chain) */
+    {
+        int cid = obj->class_id;
+        while (cid >= 0) {
+            FpyClassDef *cls = &fpy_classes[cid];
+            for (int i = 0; i < cls->class_var_count; i++) {
+                if (cls->class_var_names[i] == name
+                        || strcmp(cls->class_var_names[i], name) == 0) {
+                    *out_tag = cls->class_var_values[i].tag;
+                    *out_data = cls->class_var_values[i].data.i;
+                    return 1;
+                }
+            }
+            cid = cls->parent_id;
         }
     }
     /* Not found — use default */

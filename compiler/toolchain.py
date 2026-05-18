@@ -475,7 +475,7 @@ def _find_msvc_cl() -> str | None:
             for edition in editions:
                 vcvars = subdir / edition / "VC" / "Auxiliary" / "Build" / "vcvars64.bat"
                 if vcvars.exists():
-                    return f'call "{vcvars}" 1>NUL 2>NUL'
+                    return f'call "{vcvars}" >NUL'
     # Last resort: use vswhere.exe (handles any edition/year/path)
     vswhere = Path(
         r"C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe"
@@ -492,7 +492,7 @@ def _find_msvc_cl() -> str | None:
                 / "VC" / "Auxiliary" / "Build" / "vcvars64.bat"
             )
             if vcvars.exists():
-                return f'call "{vcvars}" 1>NUL 2>NUL'
+                return f'call "{vcvars}" >NUL'
     return None
 
 
@@ -528,7 +528,7 @@ def _compile_shared_runtime_windows(vcvars_cmd: str) -> None:
         try:
             result = subprocess.run(
                 ["cmd.exe", "/c", str(bat_path.resolve())],
-                capture_output=True, text=True, timeout=30,
+                capture_output=True, text=True, timeout=120,
             )
             if result.returncode != 0 or not obj.exists():
                 raise RuntimeError(
@@ -592,7 +592,7 @@ def _compile_bridge_windows(vcvars_cmd: str, install: PythonInstall) -> Path:
     try:
         result = subprocess.run(
             ["cmd.exe", "/c", str(bat_path.resolve())],
-            capture_output=True, text=True, timeout=30,
+            capture_output=True, text=True, timeout=120,
         )
         if result.returncode != 0 or not out_obj.exists():
             raise RuntimeError(
@@ -632,7 +632,7 @@ def _compile_shared_runtime_posix() -> None:
             continue
         result = subprocess.run(
             [cc, "-c", "-O2", "-fPIC", str(src), "-o", str(obj)],
-            capture_output=True, text=True, timeout=30,
+            capture_output=True, text=True, timeout=120,
             cwd=str(RUNTIME_DIR),
         )
         if result.returncode != 0 or not obj.exists():
@@ -668,7 +668,7 @@ def _compile_bridge_posix(install: PythonInstall) -> Path:
          f'-DPYTHON_HOME_STR="{python_home}"',
          "cpython_bridge.c",
          "-o", str(out_obj)],
-        capture_output=True, text=True, timeout=30,
+        capture_output=True, text=True, timeout=120,
         cwd=str(RUNTIME_DIR),
     )
     if result.returncode != 0 or not out_obj.exists():
@@ -830,7 +830,7 @@ def _link_windows(obj_files: list[Path], output_path: Path,
     try:
         result = subprocess.run(
             ["cmd.exe", "/c", str(bat_path.resolve())],
-            capture_output=True, text=True, timeout=30,
+            capture_output=True, text=True, timeout=300,
         )
         if "LINK_FAILED" in result.stdout or result.returncode != 0:
             raise RuntimeError(

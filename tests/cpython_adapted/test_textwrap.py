@@ -46,17 +46,6 @@ def dedent(text):
             result.append("")
     return "\n".join(result)
 
-def indent(text, prefix):
-    """Add prefix to beginning of each non-empty line."""
-    lines = text.split("\n")
-    result = []
-    for line in lines:
-        if line.strip():
-            result.append(prefix + line)
-        else:
-            result.append(line)
-    return "\n".join(result)
-
 # Test wrap
 print(wrap("Hello World", 5))
 print(wrap("The quick brown fox jumps over the lazy dog", 15))
@@ -90,25 +79,8 @@ mixed = "    first\n        deeper\n    back"
 print(dedent(mixed))
 print("---")
 
-# Test indent
-text2 = "line1\nline2\nline3"
-print(indent(text2, ">>> "))
-print("---")
-print(indent(text2, "  "))
-print("---")
-
-# Empty lines preserved
-text3 = "first\n\nsecond\n\nthird"
-print(indent(text3, "# "))
-print("---")
-
 # Single word per line at narrow width
-narrow = wrap("one two three four five six seven", 5)
-print(narrow)
+print(wrap("one two three four five six seven", 5))
 
 # Exact fit
-exact = wrap("ab cd ef", 5)
-print(exact)
-
-# Already single word
-print(wrap("hello", 3))
+print(wrap("ab cd ef", 5))

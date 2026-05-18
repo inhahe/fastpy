@@ -106,7 +106,7 @@ def compile_source(source: str, output: Path | None = None,
     # Stage 3: Generate LLVM IR
     import sys as _sys
     old_limit = _sys.getrecursionlimit()
-    _sys.setrecursionlimit(max(old_limit, 20000))  # large stdlib modules need headroom
+    _sys.setrecursionlimit(max(old_limit, 50000))  # large stdlib modules need headroom
     try:
         codegen = CodeGen(threading_mode=threading_mode, int64_mode=int64_mode,
                           typed_mode=typed_mode,

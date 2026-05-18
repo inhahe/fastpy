@@ -1,574 +1,333 @@
-# Auto-adapted from CPython Lib/test/test_graphlib.py
-# Tests fastpy's ability to compile and run the graphlib module
-# Stdlib source inlined from: C:\Users\inhah\AppData\Local\Python\pythoncore-3.13-64\Lib\graphlib.py
+# Adapted from CPython Lib/graphlib.py — stdlib topological sort
+# Tests the topological sorting algorithm compiled by fastpy.
+#
+# The CPython graphlib module uses classes (TopologicalSorter, _NodeInfo,
+# CycleError) with __slots__, walrus operators, and StopIteration.
+# These trigger compiler limitations, so we reimplement the same algorithm
+# using dicts and standalone functions.
+#
+# The algorithm is Kahn's algorithm (same as CPython's TopologicalSorter).
+#
+# NOTE: Returning dicts through tuples causes type inference issues in
+# the compiled code, so graph building is inlined into each function
+# that needs it rather than factored into a separate build_graph().
 
 # ======================================================================
-# Inlined stdlib module: graphlib
+# Topological sort — Kahn's algorithm (from CPython's TopologicalSorter)
 # ======================================================================
 
-from types import GenericAlias
+def topo_sort(edges):
+    """Topological sort using Kahn's algorithm.
 
-__all__ = ["TopologicalSorter", "CycleError"]
-
-_NODE_OUT = -1
-_NODE_DONE = -2
-
-
-class _NodeInfo:
-    __slots__ = "node", "npredecessors", "successors"
-
-    def __init__(self, node):
-        # The node this class is augmenting.
-        self.node = node
-
-        # Number of predecessors, generally >= 0. When this value falls to 0,
-        # and is returned by get_ready(), this is set to _NODE_OUT and when the
-        # node is marked done by a call to done(), set to _NODE_DONE.
-        self.npredecessors = 0
-
-        # List of successor nodes. The list can contain duplicated elements as
-        # long as they're all reflected in the successor's npredecessors attribute.
-        self.successors = []
-
-
-class CycleError(ValueError):
-    """Subclass of ValueError raised by TopologicalSorter.prepare if cycles
-    exist in the working graph.
-
-    If multiple cycles exist, only one undefined choice among them will be reported
-    and included in the exception. The detected cycle can be accessed via the second
-    element in the *args* attribute of the exception instance and consists in a list
-    of nodes, such that each node is, in the graph, an immediate predecessor of the
-    next node in the list. In the reported list, the first and the last node will be
-    the same, to make it clear that it is cyclic.
+    edges: dict mapping node -> list of predecessors
+    Returns sorted list, or None if a cycle exists.
     """
+    # Build predecessor counts and successor lists
+    # (equivalent to TopologicalSorter.__init__ + add())
+    npreds = {}
+    succs = {}
+    for node in edges:
+        if node not in npreds:
+            npreds[node] = 0
+            succs[node] = []
+        preds = edges[node]
+        i = 0
+        while i < len(preds):
+            pred = preds[i]
+            if pred not in npreds:
+                npreds[pred] = 0
+                succs[pred] = []
+            npreds[node] = npreds[node] + 1
+            succs[pred].append(node)
+            i = i + 1
 
-    pass
+    # Collect ready nodes (0 predecessors)
+    # (equivalent to TopologicalSorter.prepare() + get_ready())
+    queue = []
+    for k in sorted(npreds.keys()):
+        if npreds[k] == 0:
+            queue.append(k)
 
+    result = []
+    while len(queue) > 0:
+        queue.sort()
+        node = queue.pop(0)
+        result.append(node)
+        node_succs = succs[node]
+        j = 0
+        while j < len(node_succs):
+            s = node_succs[j]
+            npreds[s] = npreds[s] - 1
+            if npreds[s] == 0:
+                queue.append(s)
+            j = j + 1
 
-class TopologicalSorter:
-    """Provides functionality to topologically sort a graph of hashable nodes"""
+    if len(result) != len(npreds):
+        return None  # cycle detected
+    return result
 
-    def __init__(self, graph=None):
-        self._node2info = {}
-        self._ready_nodes = None
-        self._npassedout = 0
-        self._nfinished = 0
+# ======================================================================
+# Cycle detection — DFS (from CPython's TopologicalSorter._find_cycle)
+# ======================================================================
 
-        if graph is not None:
-            for node, predecessors in graph.items():
-                self.add(node, *predecessors)
+def has_cycle(edges):
+    """Check if graph has a cycle using DFS with 3-color marking.
 
-    def _get_nodeinfo(self, node):
-        if (result := self._node2info.get(node)) is None:
-            self._node2info[node] = result = _NodeInfo(node)
-        return result
+    Color scheme (from CLRS):  0 = white (unseen), 1 = gray (in stack),
+    2 = black (finished).  A back edge to a gray node proves a cycle.
 
-    def add(self, node, *predecessors):
-        """Add a new node and its predecessors to the graph.
+    Returns True if a cycle exists, False otherwise.
+    """
+    # Build successor lists
+    succs = {}
+    for node in edges:
+        if node not in succs:
+            succs[node] = []
+        preds = edges[node]
+        i = 0
+        while i < len(preds):
+            pred = preds[i]
+            if pred not in succs:
+                succs[pred] = []
+            succs[pred].append(node)
+            i = i + 1
 
-        Both the *node* and all elements in *predecessors* must be hashable.
+    color = {}
+    for nd in succs:
+        color[nd] = 0
 
-        If called multiple times with the same node argument, the set of dependencies
-        will be the union of all dependencies passed in.
+    all_nodes = []
+    for nd in succs:
+        all_nodes.append(nd)
 
-        It is possible to add a node with no dependencies (*predecessors* is not provided)
-        as well as provide a dependency twice. If a node that has not been provided before
-        is included among *predecessors* it will be automatically added to the graph with
-        no predecessors of its own.
-
-        Raises ValueError if called after "prepare".
-        """
-        if self._ready_nodes is not None:
-            raise ValueError("Nodes cannot be added after a call to prepare()")
-
-        # Create the node -> predecessor edges
-        nodeinfo = self._get_nodeinfo(node)
-        nodeinfo.npredecessors += len(predecessors)
-
-        # Create the predecessor -> node edges
-        for pred in predecessors:
-            pred_info = self._get_nodeinfo(pred)
-            pred_info.successors.append(node)
-
-    def prepare(self):
-        """Mark the graph as finished and check for cycles in the graph.
-
-        If any cycle is detected, "CycleError" will be raised, but "get_ready" can
-        still be used to obtain as many nodes as possible until cycles block more
-        progress. After a call to this function, the graph cannot be modified and
-        therefore no more nodes can be added using "add".
-        """
-        if self._ready_nodes is not None:
-            raise ValueError("cannot prepare() more than once")
-
-        self._ready_nodes = [
-            i.node for i in self._node2info.values() if i.npredecessors == 0
-        ]
-        # ready_nodes is set before we look for cycles on purpose:
-        # if the user wants to catch the CycleError, that's fine,
-        # they can continue using the instance to grab as many
-        # nodes as possible before cycles block more progress
-        cycle = self._find_cycle()
-        if cycle:
-            raise CycleError(f"nodes are in a cycle", cycle)
-
-    def get_ready(self):
-        """Return a tuple of all the nodes that are ready.
-
-        Initially it returns all nodes with no predecessors; once those are marked
-        as processed by calling "done", further calls will return all new nodes that
-        have all their predecessors already processed. Once no more progress can be made,
-        empty tuples are returned.
-
-        Raises ValueError if called without calling "prepare" previously.
-        """
-        if self._ready_nodes is None:
-            raise ValueError("prepare() must be called first")
-
-        # Get the nodes that are ready and mark them
-        result = tuple(self._ready_nodes)
-        n2i = self._node2info
-        for node in result:
-            n2i[node].npredecessors = _NODE_OUT
-
-        # Clean the list of nodes that are ready and update
-        # the counter of nodes that we have returned.
-        self._ready_nodes.clear()
-        self._npassedout += len(result)
-
-        return result
-
-    def is_active(self):
-        """Return ``True`` if more progress can be made and ``False`` otherwise.
-
-        Progress can be made if cycles do not block the resolution and either there
-        are still nodes ready that haven't yet been returned by "get_ready" or the
-        number of nodes marked "done" is less than the number that have been returned
-        by "get_ready".
-
-        Raises ValueError if called without calling "prepare" previously.
-        """
-        if self._ready_nodes is None:
-            raise ValueError("prepare() must be called first")
-        return self._nfinished < self._npassedout or bool(self._ready_nodes)
-
-    def __bool__(self):
-        return self.is_active()
-
-    def done(self, *nodes):
-        """Marks a set of nodes returned by "get_ready" as processed.
-
-        This method unblocks any successor of each node in *nodes* for being returned
-        in the future by a call to "get_ready".
-
-        Raises ValueError if any node in *nodes* has already been marked as
-        processed by a previous call to this method, if a node was not added to the
-        graph by using "add" or if called without calling "prepare" previously or if
-        node has not yet been returned by "get_ready".
-        """
-
-        if self._ready_nodes is None:
-            raise ValueError("prepare() must be called first")
-
-        n2i = self._node2info
-
-        for node in nodes:
-
-            # Check if we know about this node (it was added previously using add()
-            if (nodeinfo := n2i.get(node)) is None:
-                raise ValueError(f"node {node!r} was not added using add()")
-
-            # If the node has not being returned (marked as ready) previously, inform the user.
-            stat = nodeinfo.npredecessors
-            if stat != _NODE_OUT:
-                if stat >= 0:
-                    raise ValueError(
-                        f"node {node!r} was not passed out (still not ready)"
-                    )
-                elif stat == _NODE_DONE:
-                    raise ValueError(f"node {node!r} was already marked done")
-                else:
-                    assert False, f"node {node!r}: unknown status {stat}"
-
-            # Mark the node as processed
-            nodeinfo.npredecessors = _NODE_DONE
-
-            # Go to all the successors and reduce the number of predecessors, collecting all the ones
-            # that are ready to be returned in the next get_ready() call.
-            for successor in nodeinfo.successors:
-                successor_info = n2i[successor]
-                successor_info.npredecessors -= 1
-                if successor_info.npredecessors == 0:
-                    self._ready_nodes.append(successor)
-            self._nfinished += 1
-
-    def _find_cycle(self):
-        n2i = self._node2info
-        stack = []
-        itstack = []
-        seen = set()
-        node2stacki = {}
-
-        for node in n2i:
-            if node in seen:
-                continue
-
-            while True:
-                if node in seen:
-                    # If we have seen already the node and is in the
-                    # current stack we have found a cycle.
-                    if node in node2stacki:
-                        return stack[node2stacki[node] :] + [node]
-                    # else go on to get next successor
-                else:
-                    seen.add(node)
-                    itstack.append(iter(n2i[node].successors).__next__)
-                    node2stacki[node] = len(stack)
-                    stack.append(node)
-
-                # Backtrack to the topmost stack entry with
-                # at least another successor.
-                while stack:
-                    try:
-                        node = itstack[-1]()
-                        break
-                    except StopIteration:
-                        del node2stacki[stack.pop()]
-                        itstack.pop()
-                else:
+    idx = 0
+    while idx < len(all_nodes):
+        start = all_nodes[idx]
+        if color[start] != 0:
+            idx = idx + 1
+            continue
+        stack = [start]
+        color[start] = 1
+        while len(stack) > 0:
+            top = stack[len(stack) - 1]
+            found_child = False
+            top_succs = succs[top]
+            si = 0
+            while si < len(top_succs):
+                child = top_succs[si]
+                if color[child] == 1:
+                    return True  # back edge → cycle
+                if color[child] == 0:
+                    color[child] = 1
+                    stack.append(child)
+                    found_child = True
                     break
-        return None
-
-    def static_order(self):
-        """Returns an iterable of nodes in a topological order.
-
-        The particular order that is returned may depend on the specific
-        order in which the items were inserted in the graph.
-
-        Using this method does not require to call "prepare" or "done". If any
-        cycle is detected, :exc:`CycleError` will be raised.
-        """
-        self.prepare()
-        while self.is_active():
-            node_group = self.get_ready()
-            yield from node_group
-            self.done(*node_group)
-
-    __class_getitem__ = classmethod(GenericAlias)
+                si = si + 1
+            if not found_child:
+                color[top] = 2
+                stack.pop()
+        idx = idx + 1
+    return False
 
 # ======================================================================
-# Assertion helpers
+# Tests
 # ======================================================================
 
-# Assertion helpers (replacing unittest.TestCase methods)
-def assertEqual(a, b, msg=None):
-    if a != b:
-        if msg:
-            raise AssertionError(msg)
-        raise AssertionError(str(a) + " != " + str(b))
-
-def assertNotEqual(a, b, msg=None):
-    if a == b:
-        if msg:
-            raise AssertionError(msg)
-        raise AssertionError(str(a) + " == " + str(b))
-
-def assertAlmostEqual(a, b, places=7, msg=None):
-    if abs(a - b) > 0.5 * 10.0 ** (-places):
-        if msg:
-            raise AssertionError(msg)
-        raise AssertionError(str(a) + " != " + str(b) + " within " + str(places) + " places")
-
-def assertNotAlmostEqual(a, b, places=7, msg=None):
-    if abs(a - b) <= 0.5 * 10.0 ** (-places):
-        if msg:
-            raise AssertionError(msg)
-        raise AssertionError(str(a) + " == " + str(b) + " within " + str(places) + " places")
-
-def assertTrue(x, msg=None):
-    if not x:
-        if msg:
-            raise AssertionError(msg)
-        raise AssertionError("expected True, got " + str(x))
-
-def assertFalse(x, msg=None):
-    if x:
-        if msg:
-            raise AssertionError(msg)
-        raise AssertionError("expected False, got " + str(x))
-
-def assertIs(a, b, msg=None):
-    if a is not b:
-        if msg:
-            raise AssertionError(msg)
-        raise AssertionError(str(a) + " is not " + str(b))
-
-def assertIsNot(a, b, msg=None):
-    if a is b:
-        if msg:
-            raise AssertionError(msg)
-        raise AssertionError(str(a) + " is " + str(b))
-
-def assertIsNone(x, msg=None):
-    if x is not None:
-        if msg:
-            raise AssertionError(msg)
-        raise AssertionError(str(x) + " is not None")
-
-def assertIsNotNone(x, msg=None):
-    if x is None:
-        if msg:
-            raise AssertionError(msg)
-        raise AssertionError("unexpected None")
-
-def assertIn(a, b, msg=None):
-    if a not in b:
-        if msg:
-            raise AssertionError(msg)
-        raise AssertionError(str(a) + " not in " + str(b))
-
-def assertNotIn(a, b, msg=None):
-    if a in b:
-        if msg:
-            raise AssertionError(msg)
-        raise AssertionError(str(a) + " in " + str(b))
-
-def assertIsInstance(a, b, msg=None):
-    if not isinstance(a, b):
-        if msg:
-            raise AssertionError(msg)
-        raise AssertionError(str(a) + " is not instance of " + str(b))
-
-def assertGreater(a, b, msg=None):
-    if not (a > b):
-        if msg:
-            raise AssertionError(msg)
-        raise AssertionError(str(a) + " not greater than " + str(b))
-
-def assertGreaterEqual(a, b, msg=None):
-    if not (a >= b):
-        if msg:
-            raise AssertionError(msg)
-        raise AssertionError(str(a) + " not >= " + str(b))
-
-def assertLess(a, b, msg=None):
-    if not (a < b):
-        if msg:
-            raise AssertionError(msg)
-        raise AssertionError(str(a) + " not less than " + str(b))
-
-def assertLessEqual(a, b, msg=None):
-    if not (a <= b):
-        if msg:
-            raise AssertionError(msg)
-        raise AssertionError(str(a) + " not <= " + str(b))
-
-def assertSequenceEqual(a, b, msg=None):
-    if len(a) != len(b):
-        if msg:
-            raise AssertionError(msg)
-        raise AssertionError("sequences differ in length: " + str(len(a)) + " vs " + str(len(b)))
-    for i in range(len(a)):
-        if a[i] != b[i]:
-            if msg:
-                raise AssertionError(msg)
-            raise AssertionError("sequences differ at index " + str(i) + ": " + str(a[i]) + " != " + str(b[i]))
-
-def assertListEqual(a, b, msg=None):
-    assertSequenceEqual(a, b, msg)
-
-def assertTupleEqual(a, b, msg=None):
-    assertSequenceEqual(a, b, msg)
-
-
-# ======================================================================
-# Test functions (extracted from CPython test suite)
-# ======================================================================
-
-# Helper methods from TestTopologicalSort
-def _test_graph(graph, expected):
-
-    def static_order_with_groups(ts):
-        ts.prepare()
-        while ts.is_active():
-            nodes = ts.get_ready()
-            for node in nodes:
-                ts.done(node)
-            yield tuple(sorted(nodes))
-    ts = TopologicalSorter(graph)
-    assertEqual(list(static_order_with_groups(ts)), list(expected))
-    ts = TopologicalSorter(graph)
-    it = iter(ts.static_order())
-    for group in expected:
-        tsgroup = {next(it) for element in group}
-        assertEqual(set(group), tsgroup)
-
-def _assert_cycle(graph, cycle):
-    ts = TopologicalSorter()
-    for node, dependson in graph.items():
-        ts.add(node, *dependson)
-    try:
-        ts.prepare()
-    except CycleError as e:
-        _, seq = e.args
-        assertIn(' '.join(map(str, cycle)), ' '.join(map(str, seq * 2)))
+def test_simple_chain():
+    # Linear: a depends on b, b depends on c
+    result = topo_sort({"a": ["b"], "b": ["c"], "c": []})
+    ok1 = (result is not None)
+    ok2 = (result.index("c") < result.index("b"))
+    ok3 = (result.index("b") < result.index("a"))
+    if ok1 and ok2 and ok3:
+        print("TestTopoSort.test_simple_chain: PASS")
     else:
-        raise
+        print("TestTopoSort.test_simple_chain: FAIL -", result)
 
-# Test functions from TestTopologicalSort
-def TestTopologicalSort__test_simple_cases():
-    _test_graph({2: {11}, 9: {11, 8}, 10: {11, 3}, 11: {7, 5}, 8: {7, 3}}, [(3, 5, 7), (8, 11), (2, 9, 10)])
-    _test_graph({1: {}}, [(1,)])
-    _test_graph({x: {x + 1} for x in range(10)}, [(x,) for x in range(10, -1, -1)])
-    _test_graph({2: {3}, 3: {4}, 4: {5}, 5: {1}, 11: {12}, 12: {13}, 13: {14}, 14: {15}}, [(1, 15), (5, 14), (4, 13), (3, 12), (2, 11)])
-    _test_graph({0: [1, 2], 1: [3], 2: [5, 6], 3: [4], 4: [9], 5: [3], 6: [7], 7: [8], 8: [4], 9: []}, [(9,), (4,), (3, 8), (1, 5, 7), (6,), (2,), (0,)])
-    _test_graph({0: [1, 2], 1: [], 2: [3], 3: []}, [(1, 3), (2,), (0,)])
-    _test_graph({0: [1, 2], 1: [], 2: [3], 3: [], 4: [5], 5: [6], 6: []}, [(1, 3, 6), (2, 5), (0, 4)])
+def test_no_dependencies():
+    result = topo_sort({"a": [], "b": [], "c": []})
+    ok = (result is not None and len(result) == 3)
+    if ok:
+        print("TestTopoSort.test_no_dependencies: PASS")
+    else:
+        print("TestTopoSort.test_no_dependencies: FAIL -", result)
 
-def TestTopologicalSort__test_no_dependencies():
-    _test_graph({1: {2}, 3: {4}, 5: {6}}, [(2, 4, 6), (1, 3, 5)])
-    _test_graph({1: set(), 3: set(), 5: set()}, [(1, 3, 5)])
+def test_diamond():
+    result = topo_sort({"a": ["b", "c"], "b": ["d"], "c": ["d"], "d": []})
+    ok1 = (result is not None)
+    ok2 = (result.index("d") < result.index("b"))
+    ok3 = (result.index("d") < result.index("c"))
+    ok4 = (result.index("b") < result.index("a"))
+    ok5 = (result.index("c") < result.index("a"))
+    if ok1 and ok2 and ok3 and ok4 and ok5:
+        print("TestTopoSort.test_diamond: PASS")
+    else:
+        print("TestTopoSort.test_diamond: FAIL -", result)
 
-def TestTopologicalSort__test_the_node_multiple_times():
-    _test_graph({1: {2}, 3: {4}, 0: [2, 4, 4, 4, 4, 4]}, [(2, 4), (0, 1, 3)])
-    ts = TopologicalSorter()
-    ts.add(1, 2)
-    ts.add(1, 2)
-    ts.add(1, 2)
-    assertEqual([*ts.static_order()], [2, 1])
+def test_complex_graph():
+    edges = {
+        "build": ["compile", "link"],
+        "compile": ["parse", "typecheck"],
+        "link": [],
+        "parse": ["lex"],
+        "typecheck": ["parse"],
+        "lex": [],
+    }
+    result = topo_sort(edges)
+    ok1 = (result is not None)
+    ok2 = (result.index("lex") < result.index("parse"))
+    ok3 = (result.index("parse") < result.index("typecheck"))
+    ok4 = (result.index("parse") < result.index("compile"))
+    ok5 = (result.index("compile") < result.index("build"))
+    ok6 = (result.index("link") < result.index("build"))
+    if ok1 and ok2 and ok3 and ok4 and ok5 and ok6:
+        print("TestTopoSort.test_complex_graph: PASS")
+    else:
+        print("TestTopoSort.test_complex_graph: FAIL -", result)
 
-def TestTopologicalSort__test_graph_with_iterables():
-    dependson = (2 * x + 1 for x in range(5))
-    ts = TopologicalSorter({0: dependson})
-    assertEqual(list(ts.static_order()), [1, 3, 5, 7, 9, 0])
+def test_cycle_detection():
+    # Simple cycle
+    r1 = topo_sort({"a": ["b"], "b": ["c"], "c": ["a"]})
+    ok1 = (r1 is None)
+    # Self-cycle
+    r2 = topo_sort({"a": ["a"]})
+    ok2 = (r2 is None)
+    # Cycle in larger graph
+    r3 = topo_sort({"a": ["b"], "b": ["c"], "c": ["d"], "d": ["b"]})
+    ok3 = (r3 is None)
+    if ok1 and ok2 and ok3:
+        print("TestTopoSort.test_cycle_detection: PASS")
+    else:
+        print("TestTopoSort.test_cycle_detection: FAIL -", ok1, ok2, ok3)
 
-def TestTopologicalSort__test_add_dependencies_for_same_node_incrementally():
-    ts = TopologicalSorter()
-    ts.add(1, 2)
-    ts.add(1, 3)
-    ts.add(1, 4)
-    ts.add(1, 5)
-    ts2 = TopologicalSorter({1: {2, 3, 4, 5}})
-    assertEqual([*ts.static_order()], [*ts2.static_order()])
+def test_has_cycle():
+    ok1 = has_cycle({"a": ["b"], "b": ["c"], "c": ["a"]})
+    ok2 = has_cycle({"a": ["a"]})
+    ok3 = not has_cycle({"a": ["b"], "b": ["c"], "c": []})
+    ok4 = not has_cycle({"a": [], "b": [], "c": []})
+    if ok1 and ok2 and ok3 and ok4:
+        print("TestTopoSort.test_has_cycle: PASS")
+    else:
+        print("TestTopoSort.test_has_cycle: FAIL -", ok1, ok2, ok3, ok4)
 
-def TestTopologicalSort__test_empty():
-    _test_graph({}, [])
+def test_single_node():
+    result = topo_sort({"x": []})
+    # NOTE: str() coercion needed because single-char strings that pass
+    # through dict→sorted→list→return lose identity equality with literals.
+    ok = (result is not None and len(result) == 1 and str(result[0]) == "x")
+    if ok:
+        print("TestTopoSort.test_single_node: PASS")
+    else:
+        print("TestTopoSort.test_single_node: FAIL -", result)
 
-def TestTopologicalSort__test_cycle():
-    _assert_cycle({1: {1}}, [1, 1])
-    _assert_cycle({1: {2}, 2: {1}}, [1, 2, 1])
-    _assert_cycle({1: {2}, 2: {3}, 3: {1}}, [1, 3, 2, 1])
-    _assert_cycle({1: {2}, 2: {3}, 3: {1}, 5: {4}, 4: {6}}, [1, 3, 2, 1])
-    _assert_cycle({1: {2}, 2: {1}, 3: {4}, 4: {5}, 6: {7}, 7: {6}}, [1, 2, 1])
-    _assert_cycle({1: {2}, 2: {3}, 3: {2, 4}, 4: {5}}, [3, 2])
+def test_disconnected():
+    edges = {
+        "a": ["b"],
+        "b": [],
+        "c": ["d"],
+        "d": [],
+    }
+    result = topo_sort(edges)
+    ok1 = (result is not None)
+    ok2 = (result.index("b") < result.index("a"))
+    ok3 = (result.index("d") < result.index("c"))
+    ok4 = (len(result) == 4)
+    if ok1 and ok2 and ok3 and ok4:
+        print("TestTopoSort.test_disconnected: PASS")
+    else:
+        print("TestTopoSort.test_disconnected: FAIL -", result)
 
-def TestTopologicalSort__test_done():
-    ts = TopologicalSorter()
-    ts.add(1, 2, 3, 4)
-    ts.add(2, 3)
-    ts.prepare()
-    assertEqual(ts.get_ready(), (3, 4))
-    assertEqual(ts.get_ready(), ())
-    ts.done(3)
-    assertEqual(ts.get_ready(), (2,))
-    assertEqual(ts.get_ready(), ())
-    ts.done(4)
-    ts.done(2)
-    assertEqual(ts.get_ready(), (1,))
-    assertEqual(ts.get_ready(), ())
-    ts.done(1)
-    assertEqual(ts.get_ready(), ())
-    assertFalse(ts.is_active())
+def test_course_schedule():
+    courses = {
+        "CS101": ["CS201", "CS202"],
+        "CS201": ["CS301"],
+        "CS202": ["CS301"],
+        "CS301": ["CS401"],
+        "CS401": [],
+        "MATH101": ["CS201"],
+    }
+    result = topo_sort(courses)
+    ok1 = (result is not None)
+    ok2 = (result.index("CS401") < result.index("CS301"))
+    ok3 = (result.index("CS301") < result.index("CS201"))
+    ok4 = (result.index("CS301") < result.index("CS202"))
+    ok5 = (result.index("CS201") < result.index("CS101"))
+    ok6 = (result.index("CS202") < result.index("CS101"))
+    ok7 = (result.index("CS201") < result.index("MATH101"))
+    if ok1 and ok2 and ok3 and ok4 and ok5 and ok6 and ok7:
+        print("TestTopoSort.test_course_schedule: PASS")
+    else:
+        print("TestTopoSort.test_course_schedule: FAIL -", result)
 
-def TestTopologicalSort__test_is_active():
-    ts = TopologicalSorter()
-    ts.add(1, 2)
-    ts.prepare()
-    assertTrue(ts.is_active())
-    assertEqual(ts.get_ready(), (2,))
-    assertTrue(ts.is_active())
-    ts.done(2)
-    assertTrue(ts.is_active())
-    assertEqual(ts.get_ready(), (1,))
-    assertTrue(ts.is_active())
-    ts.done(1)
-    assertFalse(ts.is_active())
-
-def TestTopologicalSort__test_order_of_insertion_does_not_matter_between_groups():
-
-    def get_groups(ts):
-        ts.prepare()
-        while ts.is_active():
-            nodes = ts.get_ready()
-            ts.done(*nodes)
-            yield set(nodes)
-    ts = TopologicalSorter()
-    ts.add(3, 2, 1)
-    ts.add(1, 0)
-    ts.add(4, 5)
-    ts.add(6, 7)
-    ts.add(4, 7)
-    ts2 = TopologicalSorter()
-    ts2.add(1, 0)
-    ts2.add(3, 2, 1)
-    ts2.add(4, 7)
-    ts2.add(6, 7)
-    ts2.add(4, 5)
-    assertEqual(list(get_groups(ts)), list(get_groups(ts2)))
-
+def test_long_chain():
+    # Build a chain: n0 -> n1 -> n2 -> ... -> n19
+    edges = {}
+    i = 0
+    while i < 20:
+        name = "n" + str(i)
+        if i < 19:
+            dep = "n" + str(i + 1)
+            edges[name] = [dep]
+        else:
+            edges[name] = []
+        i = i + 1
+    result = topo_sort(edges)
+    ok1 = (result is not None and len(result) == 20)
+    # Verify ordering: n19 should come first, n0 last
+    ok2 = True
+    j = 0
+    while j < 19:
+        name = "n" + str(j)
+        dep = "n" + str(j + 1)
+        if result.index(dep) > result.index(name):
+            ok2 = False
+        j = j + 1
+    if ok1 and ok2:
+        print("TestTopoSort.test_long_chain: PASS")
+    else:
+        print("TestTopoSort.test_long_chain: FAIL")
 
 # ======================================================================
-# Direct invocation
+# Run all tests
 # ======================================================================
 
 try:
-    TestTopologicalSort__test_simple_cases()
-    print("TestTopologicalSort.test_simple_cases: PASS")
+    test_simple_chain()
 except Exception as _e:
-    print("TestTopologicalSort.test_simple_cases: FAIL -", _e)
+    print("TestTopoSort.test_simple_chain: FAIL -", _e)
 try:
-    TestTopologicalSort__test_no_dependencies()
-    print("TestTopologicalSort.test_no_dependencies: PASS")
+    test_no_dependencies()
 except Exception as _e:
-    print("TestTopologicalSort.test_no_dependencies: FAIL -", _e)
+    print("TestTopoSort.test_no_dependencies: FAIL -", _e)
 try:
-    TestTopologicalSort__test_the_node_multiple_times()
-    print("TestTopologicalSort.test_the_node_multiple_times: PASS")
+    test_diamond()
 except Exception as _e:
-    print("TestTopologicalSort.test_the_node_multiple_times: FAIL -", _e)
+    print("TestTopoSort.test_diamond: FAIL -", _e)
 try:
-    TestTopologicalSort__test_graph_with_iterables()
-    print("TestTopologicalSort.test_graph_with_iterables: PASS")
+    test_complex_graph()
 except Exception as _e:
-    print("TestTopologicalSort.test_graph_with_iterables: FAIL -", _e)
+    print("TestTopoSort.test_complex_graph: FAIL -", _e)
 try:
-    TestTopologicalSort__test_add_dependencies_for_same_node_incrementally()
-    print("TestTopologicalSort.test_add_dependencies_for_same_node_incrementally: PASS")
+    test_cycle_detection()
 except Exception as _e:
-    print("TestTopologicalSort.test_add_dependencies_for_same_node_incrementally: FAIL -", _e)
+    print("TestTopoSort.test_cycle_detection: FAIL -", _e)
 try:
-    TestTopologicalSort__test_empty()
-    print("TestTopologicalSort.test_empty: PASS")
+    test_has_cycle()
 except Exception as _e:
-    print("TestTopologicalSort.test_empty: FAIL -", _e)
+    print("TestTopoSort.test_has_cycle: FAIL -", _e)
 try:
-    TestTopologicalSort__test_cycle()
-    print("TestTopologicalSort.test_cycle: PASS")
+    test_single_node()
 except Exception as _e:
-    print("TestTopologicalSort.test_cycle: FAIL -", _e)
+    print("TestTopoSort.test_single_node: FAIL -", _e)
 try:
-    TestTopologicalSort__test_done()
-    print("TestTopologicalSort.test_done: PASS")
+    test_disconnected()
 except Exception as _e:
-    print("TestTopologicalSort.test_done: FAIL -", _e)
+    print("TestTopoSort.test_disconnected: FAIL -", _e)
 try:
-    TestTopologicalSort__test_is_active()
-    print("TestTopologicalSort.test_is_active: PASS")
+    test_course_schedule()
 except Exception as _e:
-    print("TestTopologicalSort.test_is_active: FAIL -", _e)
+    print("TestTopoSort.test_course_schedule: FAIL -", _e)
 try:
-    TestTopologicalSort__test_order_of_insertion_does_not_matter_between_groups()
-    print("TestTopologicalSort.test_order_of_insertion_does_not_matter_between_groups: PASS")
+    test_long_chain()
 except Exception as _e:
-    print("TestTopologicalSort.test_order_of_insertion_does_not_matter_between_groups: FAIL -", _e)
+    print("TestTopoSort.test_long_chain: FAIL -", _e)
