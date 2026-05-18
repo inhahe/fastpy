@@ -16,6 +16,7 @@ dev = [
 testpaths = ["tests"]
 python_files = ["test_*.py"]
 python_functions = ["test_*"]
+norecursedirs = ["cpython_raw", "cpython_adapted"]
 markers = [
     "regression: marks a test as a regression test",
     "generated: marks a test as using generated programs",

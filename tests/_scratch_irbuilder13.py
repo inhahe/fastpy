@@ -1,0 +1,66 @@
+# Test: IRBuilder with blocks list + new_block + dump
+class Instruction:
+    def __init__(self, opcode, operands, result=None):
+        self.opcode = opcode
+        self.operands = operands
+        self.result = result
+
+    def __str__(self):
+        ops = ", ".join(str(o) for o in self.operands)
+        r = self.result
+        if r:
+            return r + " = " + self.opcode + " " + ops
+        return self.opcode + " " + ops
+
+class BasicBlock:
+    def __init__(self, name):
+        self.name = name
+        self.instructions = []
+
+    def add(self, instr):
+        self.instructions.append(instr)
+
+    def __str__(self):
+        lines = [self.name + ":"]
+        for i in self.instructions:
+            s = str(i)
+            lines.append("  " + s)
+        return "\n".join(lines)
+
+class IRBuilder:
+    def __init__(self):
+        self.blocks = []
+        self.current = None
+        self._counter = 0
+
+    def new_block(self, name):
+        bb = BasicBlock(name)
+        self.blocks.append(bb)
+        self.current = bb
+        return bb
+
+    def _tmp(self):
+        self._counter = self._counter + 1
+        return "%" + str(self._counter)
+
+    def do_add(self, a, b):
+        r = self._tmp()
+        self.current.add(Instruction("add", [a, b], r))
+        return r
+
+    def dump(self):
+        print("dump: starting")
+        for bb in self.blocks:
+            print("dump: about to print bb")
+            print(bb)
+            print("dump: printed bb")
+        print("dump: done")
+
+builder = IRBuilder()
+print("A")
+entry = builder.new_block("entry")
+print("B")
+t1 = builder.do_add("a", "b")
+print("C:", t1)
+builder.dump()
+print("D")

@@ -45,15 +45,18 @@ extern void fastpy_set_ret_tag(int32_t tag);
 static FPY_THREAD_LOCAL char _err_buf[256];
 
 /* --- Object free-list allocator ---
- * Maintain per-slot-count free lists so freed objects can be reused
- * without calling malloc.  Each free-list entry repurposes the
- * `dynamic_attrs` pointer as the "next" link.
+ * Maintain per-class free lists so freed objects can be reused without
+ * calling malloc.  Each free-list entry repurposes the `dynamic_attrs`
+ * pointer as the "next" link.
  * This eliminates malloc/free overhead in tight loops that create
- * and destroy many objects of the same class.  */
-#define FPY_OBJ_FREELIST_SLOTS  16   /* cover slot counts 0..15 */
-#define FPY_OBJ_FREELIST_MAX    256  /* max cached objects per slot count */
-static FpyObj* fpy_obj_freelist[FPY_OBJ_FREELIST_SLOTS];
-static int     fpy_obj_freelist_count[FPY_OBJ_FREELIST_SLOTS];
+ * and destroy many objects of the same class.
+ *
+ * Keyed by class_id (not slot_count) because the native-slot optimization
+ * means classes with the same slot_count can have different allocation
+ * sizes — per-class keying is always safe. */
+#define FPY_OBJ_FREELIST_MAX    64   /* max cached objects per class */
+static FpyObj* fpy_obj_freelist[FPY_MAX_CLASSES];
+static int     fpy_obj_freelist_count[FPY_MAX_CLASSES];
 
 /* --- List operations --- */
 
@@ -228,11 +231,17 @@ void fpy_rc_decref(int32_t tag, int64_t data) {
                         }
                         wr = next;
                     }
-                    /* Free slots (decref each), dynamic_attrs, and the obj */
+                    /* Free slots: only decref BOXED slots (native slots
+                     * hold scalars — no heap references to release). */
                     {
-                        int sc = fpy_classes[obj->class_id].slot_count;
-                        for (int i = 0; i < sc; i++)
-                            FPY_VAL_DECREF(FPY_OBJ_SLOTS(obj)[i]);
+                        int _cid = obj->class_id;
+                        int nn = fpy_classes[_cid].n_native_slots;
+                        int nb = fpy_classes[_cid].slot_count - nn;
+                        if (nb > 0) {
+                            FpyValue *boxed = FPY_OBJ_BOXED_SLOTS(obj, nn);
+                            for (int i = 0; i < nb; i++)
+                                FPY_VAL_DECREF(boxed[i]);
+                        }
                         /* slots are contiguous with obj (malloc'd together), don't free separately */
                     }
                     if (obj->dynamic_attrs) {
@@ -243,13 +252,13 @@ void fpy_rc_decref(int32_t tag, int64_t data) {
                         free(obj->dynamic_attrs);
                         obj->dynamic_attrs = NULL;
                     }
-                    /* Push to free-list if possible, else free */
-                    int _sc = fpy_classes[obj->class_id].slot_count;
-                    if (_sc < FPY_OBJ_FREELIST_SLOTS
-                            && fpy_obj_freelist_count[_sc] < FPY_OBJ_FREELIST_MAX) {
-                        obj->dynamic_attrs = (FpyObjAttrs*)fpy_obj_freelist[_sc];
-                        fpy_obj_freelist[_sc] = obj;
-                        fpy_obj_freelist_count[_sc]++;
+                    /* Push to per-class free-list if possible, else free */
+                    int _cid2 = obj->class_id;
+                    if (_cid2 < FPY_MAX_CLASSES
+                            && fpy_obj_freelist_count[_cid2] < FPY_OBJ_FREELIST_MAX) {
+                        obj->dynamic_attrs = (FpyObjAttrs*)fpy_obj_freelist[_cid2];
+                        fpy_obj_freelist[_cid2] = obj;
+                        fpy_obj_freelist_count[_cid2]++;
                     } else {
                         free(obj);
                     }
@@ -6287,6 +6296,7 @@ int fastpy_register_class(const char *name, int parent_id) {
     fpy_classes[id].methods = NULL;
     fpy_classes[id].method_count = 0;
     fpy_classes[id].slot_count = 0;
+    fpy_classes[id].n_native_slots = 0;
     fpy_classes[id].slot_names = NULL;
     fpy_classes[id].destructor = NULL;
     fpy_classes[id].vtable = NULL;
@@ -6358,6 +6368,20 @@ void fastpy_set_class_slot_count(int class_id, int slot_count) {
     fpy_classes[class_id].slot_count = slot_count;
     fpy_classes[class_id].slot_names = (const char**)calloc(
         slot_count, sizeof(const char*));
+}
+
+/* Set the number of native (untagged, 8-byte) slots for a class.
+ * Must be called AFTER set_class_slot_count.  The first n_native slots
+ * are stored as raw i64 (8 bytes each) — no tag field.  Remaining slots
+ * are boxed FpyValue (16 bytes each).  This saves 8 bytes per native slot.
+ * Slots 0..n_native-1 must be statically-typed scalars (int/float/bool). */
+void fastpy_set_class_native_slot_count(int class_id, int n_native) {
+    fpy_classes[class_id].n_native_slots = n_native;
+}
+
+void fastpy_set_class_native_slot_tag(int class_id, int slot_idx, int tag) {
+    if (slot_idx >= 0 && slot_idx < 16)
+        fpy_classes[class_id].native_slot_tags[slot_idx] = (int8_t)tag;
 }
 
 /* Set a destructor callback for a class (e.g., generators with finally blocks).
@@ -6671,20 +6695,26 @@ static void* fpy_arena_alloc(size_t size) {
 }
 
 /* Create a new object instance.
- * Uses a per-slot-count free-list: if a previously freed object of the
- * same size is available, reuse it (pointer pop — no malloc).
- * Otherwise falls back to malloc with contiguous header+slots layout. */
+ * Uses a per-class free-list: if a previously freed object of the same
+ * class is available, reuse it (pointer pop — no malloc).
+ * Otherwise falls back to malloc with contiguous header+slots layout.
+ *
+ * Two-region layout: native slots (i64, 8 bytes each) come first,
+ * then boxed slots (FpyValue, 16 bytes each). */
 FpyObj* fastpy_obj_new(int class_id) {
     int sc = fpy_classes[class_id].slot_count;
-    size_t total = sizeof(FpyObj) + sizeof(FpyValue) * sc;
+    int nn = fpy_classes[class_id].n_native_slots;
+    int nb = sc - nn;  /* number of boxed slots */
+    size_t total = sizeof(FpyObj) + (size_t)nn * sizeof(int64_t)
+                   + (size_t)nb * sizeof(FpyValue);
     FpyObj *obj;
     int from_freelist = 0;
 
-    /* Try free-list first */
-    if (sc < FPY_OBJ_FREELIST_SLOTS && fpy_obj_freelist[sc]) {
-        obj = fpy_obj_freelist[sc];
-        fpy_obj_freelist[sc] = (FpyObj*)obj->dynamic_attrs;
-        fpy_obj_freelist_count[sc]--;
+    /* Try per-class free-list first */
+    if (class_id < FPY_MAX_CLASSES && fpy_obj_freelist[class_id]) {
+        obj = fpy_obj_freelist[class_id];
+        fpy_obj_freelist[class_id] = (FpyObj*)obj->dynamic_attrs;
+        fpy_obj_freelist_count[class_id]--;
         from_freelist = 1;
     } else {
         obj = (FpyObj*)malloc(total);
@@ -6694,11 +6724,18 @@ FpyObj* fastpy_obj_new(int class_id) {
     obj->class_id = class_id;
     obj->dynamic_attrs = NULL;
     obj->weakref_list = NULL;
-    if (sc > 0) {
-        FpyValue *slots = FPY_OBJ_SLOTS(obj);
-        for (int i = 0; i < sc; i++) {
-            slots[i].tag = FPY_TAG_NONE;
-            slots[i].data.i = 0;
+    /* Initialize native slots to 0 (raw i64) */
+    if (nn > 0) {
+        int64_t *native = FPY_OBJ_NATIVE_SLOTS(obj);
+        for (int i = 0; i < nn; i++)
+            native[i] = 0;
+    }
+    /* Initialize boxed slots to {NONE, 0} */
+    if (nb > 0) {
+        FpyValue *boxed = FPY_OBJ_BOXED_SLOTS(obj, nn);
+        for (int i = 0; i < nb; i++) {
+            boxed[i].tag = FPY_TAG_NONE;
+            boxed[i].data.i = 0;
         }
     }
     /* Acyclic classes (scalar-only slots) skip GC tracking entirely —
@@ -6718,21 +6755,39 @@ FpyObj* fastpy_obj_new(int class_id) {
 }
 
 /* Fast-path static slot access. Slot index is known at compile time.
- * Manages refcounts: increfs the new value, decrefs the old. */
+ * Manages refcounts: increfs the new value, decrefs the old.
+ * Handles two-region layout: native slots (< n_native) are raw i64,
+ * boxed slots (>= n_native) are FpyValue. */
 void fastpy_obj_set_slot(FpyObj *obj, int slot, int32_t tag, int64_t data) {
-    FpyValue *slots = FPY_OBJ_SLOTS(obj);
-    FpyValue old = slots[slot];
-    fpy_rc_incref(tag, data);
-    slots[slot].tag = tag;
-    slots[slot].data.i = data;
-    fpy_rc_decref(old.tag, old.data.i);
+    int nn = fpy_classes[obj->class_id].n_native_slots;
+    if (slot < nn) {
+        /* Native slot: raw i64, no tag, no refcounting */
+        FPY_OBJ_NATIVE_SLOTS(obj)[slot] = data;
+    } else {
+        /* Boxed slot: full FpyValue with refcounting */
+        FpyValue *boxed = FPY_OBJ_BOXED_SLOTS(obj, nn);
+        int bi = slot - nn;
+        FpyValue old = boxed[bi];
+        fpy_rc_incref(tag, data);
+        boxed[bi].tag = tag;
+        boxed[bi].data.i = data;
+        fpy_rc_decref(old.tag, old.data.i);
+    }
 }
 
 void fastpy_obj_get_slot(FpyObj *obj, int slot,
                           int32_t *out_tag, int64_t *out_data) {
-    FpyValue *slots = FPY_OBJ_SLOTS(obj);
-    *out_tag = slots[slot].tag;
-    *out_data = slots[slot].data.i;
+    int nn = fpy_classes[obj->class_id].n_native_slots;
+    if (slot < nn) {
+        /* Native slot: look up the compile-time tag from the class def */
+        *out_tag = (int32_t)fpy_classes[obj->class_id].native_slot_tags[slot];
+        *out_data = FPY_OBJ_NATIVE_SLOTS(obj)[slot];
+    } else {
+        FpyValue *boxed = FPY_OBJ_BOXED_SLOTS(obj, nn);
+        int bi = slot - nn;
+        *out_tag = boxed[bi].tag;
+        *out_data = boxed[bi].data.i;
+    }
 }
 
 /* Set an attribute on an object */
@@ -6740,21 +6795,33 @@ void fastpy_obj_get_slot(FpyObj *obj, int slot,
  * provided. Replaced the old typed variants (obj_set_int with its pointer
  * heuristic, obj_set_float, obj_set_str) and their obj_get_* counterparts. */
 void fastpy_obj_set_fv(FpyObj *obj, const char *name, int32_t tag, int64_t data) {
-    FpyValue v;
-    v.tag = tag;
-    v.data.i = data;
     /* Incref the new value up-front (before any slot/dyn store). */
     fpy_rc_incref(tag, data);
     /* Check static slots first (covers all compiler-known attrs) */
     int slot = fpy_find_slot(obj->class_id, name);
     if (slot >= 0) {
-        FpyValue *slots = FPY_OBJ_SLOTS(obj);
-        FpyValue old = slots[slot];
-        slots[slot] = v;
-        fpy_rc_decref(old.tag, old.data.i);
+        int nn = fpy_classes[obj->class_id].n_native_slots;
+        if (slot < nn) {
+            /* Native slot: raw i64, no tag, no old-value decref */
+            FPY_OBJ_NATIVE_SLOTS(obj)[slot] = data;
+            /* Undo the incref — native slots don't hold references */
+            fpy_rc_decref(tag, data);
+        } else {
+            FpyValue *boxed = FPY_OBJ_BOXED_SLOTS(obj, nn);
+            int bi = slot - nn;
+            FpyValue old = boxed[bi];
+            FpyValue v;
+            v.tag = tag;
+            v.data.i = data;
+            boxed[bi] = v;
+            fpy_rc_decref(old.tag, old.data.i);
+        }
         return;
     }
     /* Dynamic attr fallback — lazily allocate the side table on first use. */
+    FpyValue v;
+    v.tag = tag;
+    v.data.i = data;
     FpyObjAttrs *a = obj->dynamic_attrs;
     if (a != NULL) {
         for (int i = 0; i < a->count; i++) {
@@ -6786,9 +6853,16 @@ void fastpy_obj_get_fv(FpyObj *obj, const char *name, int32_t *out_tag, int64_t 
     /* Check static slots first */
     int slot = fpy_find_slot(obj->class_id, name);
     if (slot >= 0) {
-        FpyValue *slots = FPY_OBJ_SLOTS(obj);
-        *out_tag = slots[slot].tag;
-        *out_data = slots[slot].data.i;
+        int nn = fpy_classes[obj->class_id].n_native_slots;
+        if (slot < nn) {
+            *out_tag = (int32_t)fpy_classes[obj->class_id].native_slot_tags[slot];
+            *out_data = FPY_OBJ_NATIVE_SLOTS(obj)[slot];
+        } else {
+            FpyValue *boxed = FPY_OBJ_BOXED_SLOTS(obj, nn);
+            int bi = slot - nn;
+            *out_tag = boxed[bi].tag;
+            *out_data = boxed[bi].data.i;
+        }
         return;
     }
     /* Dynamic attr fallback */
@@ -6836,9 +6910,16 @@ int32_t fastpy_obj_getattr_default(FpyObj *obj, const char *name,
                                     int32_t *out_tag, int64_t *out_data) {
     int slot = fpy_find_slot(obj->class_id, name);
     if (slot >= 0) {
-        FpyValue *slots = FPY_OBJ_SLOTS(obj);
-        *out_tag = slots[slot].tag;
-        *out_data = slots[slot].data.i;
+        int nn = fpy_classes[obj->class_id].n_native_slots;
+        if (slot < nn) {
+            *out_tag = (int32_t)fpy_classes[obj->class_id].native_slot_tags[slot];
+            *out_data = FPY_OBJ_NATIVE_SLOTS(obj)[slot];
+        } else {
+            FpyValue *boxed = FPY_OBJ_BOXED_SLOTS(obj, nn);
+            int bi = slot - nn;
+            *out_tag = boxed[bi].tag;
+            *out_data = boxed[bi].data.i;
+        }
         return 1;
     }
     FpyObjAttrs *a = obj->dynamic_attrs;

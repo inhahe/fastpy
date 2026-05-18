@@ -1694,15 +1694,23 @@ extern int64_t fastpy_obj_call_method2(FpyObj *obj, const char *name, int64_t a,
 static int fpy_obj_try_get_attr(FpyObj *obj, const char *name,
                                  int32_t *out_tag, int64_t *out_data) {
     FpyClassDef *cls = &fpy_classes[obj->class_id];
-    /* Static slots */
+    /* Static slots — two-region layout: native then boxed */
     if (cls->slot_count > 0) {
-        FpyValue *slots = FPY_OBJ_SLOTS(obj);
+        int nn = cls->n_native_slots;
+        int64_t *native = FPY_OBJ_NATIVE_SLOTS(obj);
+        FpyValue *boxed = FPY_OBJ_BOXED_SLOTS(obj, nn);
         for (int i = 0; i < cls->slot_count; i++) {
             if (cls->slot_names[i] &&
                 (cls->slot_names[i] == name ||
                  strcmp(cls->slot_names[i], name) == 0)) {
-                *out_tag = slots[i].tag;
-                *out_data = slots[i].data.i;
+                if (i < nn) {
+                    *out_tag = (int32_t)cls->native_slot_tags[i];
+                    *out_data = native[i];
+                } else {
+                    int bi = i - nn;
+                    *out_tag = boxed[bi].tag;
+                    *out_data = boxed[bi].data.i;
+                }
                 return 1;
             }
         }

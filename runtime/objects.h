@@ -124,6 +124,18 @@ typedef struct {
     FpyMethodDef *methods;
     int method_count;
     int slot_count;         /* number of pre-declared attribute slots */
+    int n_native_slots;     /* first n_native_slots slots are "native" (8 bytes each,
+                             * raw i64 data without a tag — used for monomorphic
+                             * scalar attrs like int/float/bool). Remaining slots
+                             * (slot_count - n_native_slots) are "boxed" (16 bytes
+                             * each, full FpyValue {tag, data}).
+                             * Memory layout after FpyObj header:
+                             *   [native: n_native × i64]  [boxed: n_boxed × FpyValue]
+                             * 0 by default (all slots are boxed). */
+    int8_t native_slot_tags[16]; /* FPY_TAG_* for each native slot (0..n_native-1).
+                                  * Used by runtime get_slot to return the correct tag
+                                  * when reading from the tag-less native region.
+                                  * Max 16 native slots per class (more than enough). */
     const char **slot_names; /* slot_names[i] = attribute name for slot i */
     void (*destructor)(FpyObj *obj); /* per-class destructor, NULL if none */
     void **vtable;                  /* vtable[i] = method func ptr, NULL-filled */
@@ -206,8 +218,22 @@ struct FpyObj {
 /* Inline slot access: slots are allocated contiguously after the FpyObj
  * header (in the same malloc block), so their address is always (obj + 1).
  * This macro replaces the old obj->slots pointer — no pointer field needed,
- * no memory load, just address arithmetic. */
+ * no memory load, just address arithmetic.
+ *
+ * Two-region layout (native slot optimization):
+ *   [FpyObj header (56 bytes)]
+ *   [native region: n_native × i64 (8 bytes each)]
+ *   [boxed region:  n_boxed × FpyValue (16 bytes each)]
+ *
+ * FPY_OBJ_SLOTS(obj) still returns the start of ALL slot memory (native
+ * region), but callers must respect the native/boxed boundary.
+ * FPY_OBJ_NATIVE_SLOTS: pointer to the native i64 array.
+ * FPY_OBJ_BOXED_SLOTS:  pointer to the boxed FpyValue array (after native).
+ */
 #define FPY_OBJ_SLOTS(obj) ((FpyValue*)((obj) + 1))
+#define FPY_OBJ_NATIVE_SLOTS(obj) ((int64_t*)((obj) + 1))
+#define FPY_OBJ_BOXED_SLOTS(obj, n_native) \
+    ((FpyValue*)(((int64_t*)((obj) + 1)) + (n_native)))
 
 /* List: growable array of FpyValue. `is_tuple` distinguishes tuple-
    typed lists for display purposes (they print with parens). */

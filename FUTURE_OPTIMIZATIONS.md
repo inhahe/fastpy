@@ -12,25 +12,33 @@ Replaced `fastpy_obj_get_slot`/`fastpy_obj_set_slot` calls with inline
 GEPs in `_emit_slot_addr_direct()`. FpyObj struct slimmed from 1560 → 24
 bytes in Phase 21 (dynamic attrs moved to lazily-allocated side table).
 
-## 2. Type-specialized slots (monomorphic native storage) — ✅ PARTIALLY DONE
+## 2. Type-specialized slots (full native slot layout) — ✅ DONE
 
-Conservative approach implemented: for monomorphic scalar slots (float,
-bool) detected via `_per_class_float_attrs` / `_per_class_bool_attrs`,
-skip the tag store and all refcounting (rc_incref/rc_decref) on writes.
-The read path already used `_emit_slot_get_data_only` (Phase 9) to skip
-the tag load for statically-typed accesses.
+Full two-region slot layout implemented. Object memory layout after the
+56-byte FpyObj header:
+
+    [native region: n_native × i64 (8 bytes each)]
+    [boxed region:  n_boxed × FpyValue (16 bytes each)]
+
+Monomorphic scalar attributes (int, float, bool) detected via
+`_detect_class_int_attrs` / `_detect_class_float_attrs` /
+`_detect_class_bool_attrs` are placed in the native region as raw i64
+values (no tag overhead). Non-scalar attributes remain in the boxed
+region as full FpyValue {tag, data} pairs.
 
 What's done:
-- `_emit_slot_set_direct` accepts `skip_tag=True` for scalar slots
-- `_emit_attr_store` detects monomorphic scalar self.attr stores
-- Saves 2 memory loads (old tag+data) + 1 function call (rc_decref) +
-  1 memory store (tag) per scalar attribute write
-
-What's NOT done (full native slots):
-- Slot memory layout unchanged (still FpyValue {tag, data} = 16 bytes)
-- Could split into native-typed section (8 bytes) + boxed section
-- Would require C runtime changes (fastpy_obj_new, GC scanner)
-- Deferred: the conservative approach captures most of the perf gain
+- `_assign_attribute_slots` partitions attrs into native vs boxed
+- `_emit_slot_addr_direct` computes addresses for both regions
+- `_emit_slot_get_direct` / `_emit_slot_set_direct` handle native slots
+  (raw i64 load/store, tag reconstructed from `native_slot_tags[]`)
+- `fastpy_obj_new` initializes native slots to 0, boxed to {NONE, 0}
+- `_is_mono_scalar` optimization: skip tag store on non-first writes
+  (tag never changes for scalar slots after initial write in __init__)
+- `_fresh` optimization: first store in __init__ skips old-value decref
+  (slot guaranteed to be zero-initialized)
+- FpyClassDef extended with `n_native_slots`, `native_slot_tags[16]`
+- GC scanner skips native slots (scalars can't form reference cycles)
+- Per-class `acyclic` flag: all-scalar classes skip GC tracking entirely
 
 ## 3. Vtable dispatch — ✅ DONE
 
@@ -75,7 +83,5 @@ pointer that LLVM cannot inline. Speculative devirt already handles the
 ## What's left
 
 All major optimizations are now implemented. The remaining gap to C++ is:
-- Full native slot layout (changing FpyValue slots to raw typed storage)
-  — requires C runtime changes, marginal gain over the conservative approach
 - Vtable inlining for the polymorphic dispatch case — only matters when
   the receiver class isn't statically known, which is uncommon in practice

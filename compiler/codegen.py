@@ -72,25 +72,31 @@ fpy_obj_ptr = ir.PointerType(fpy_obj_type)
 #   offset 16: int parent_id (i32) + 4 padding
 #   offset 24: FpyMethodDef *methods (i8*)
 #   offset 32: int method_count (i32) + int slot_count (i32)
-#   offset 40: const char **slot_names (i8*)
-#   offset 48: void (*destructor)(FpyObj*) (i8*)
-#   offset 56: void **vtable (i8*)
-#   offset 64: int vtable_size (i32) + uint8_t acyclic + 3 padding
-#   offset 72: int *mro (i8*)
-#   offset 80: int mro_len (i32) + 4 tail padding
-# Modeled as i64 + pointer pairs to match alignment (88 bytes total).
+#   offset 40: int n_native_slots (i32) + int8_t native_slot_tags[0..3]
+#   offset 48: int8_t native_slot_tags[4..11]
+#   offset 56: int8_t native_slot_tags[12..15] + 4 padding
+#   offset 64: const char **slot_names (i8*)
+#   offset 72: void (*destructor)(FpyObj*) (i8*)
+#   offset 80: void **vtable (i8*)
+#   offset 88: int vtable_size (i32) + uint8_t acyclic + 3 padding
+#   offset 96: int *mro (i8*)
+#   offset 104: int mro_len (i32) + 4 tail padding
+# Modeled as i64 + pointer pairs to match alignment (112 bytes total).
 fpy_classdef_type = ir.LiteralStructType([
     i64,    # 0: class_id(i32) + padding → offset 0
     i8_ptr, # 1: name → offset 8
     i64,    # 2: parent_id(i32) + padding → offset 16
     i8_ptr, # 3: methods → offset 24
     i64,    # 4: method_count(i32) + slot_count(i32) → offset 32
-    i8_ptr, # 5: slot_names → offset 40
-    i8_ptr, # 6: destructor → offset 48
-    i8_ptr, # 7: vtable (void**) → offset 56
-    i64,    # 8: vtable_size(i32) + acyclic(u8) + padding → offset 64
-    i8_ptr, # 9: mro (int*) → offset 72
-    i64,    # 10: mro_len(i32) + tail padding → offset 80
+    i64,    # 5: n_native_slots(i32) + native_slot_tags[0..3] → offset 40
+    i64,    # 6: native_slot_tags[4..11] → offset 48
+    i64,    # 7: native_slot_tags[12..15] + padding → offset 56
+    i8_ptr, # 8: slot_names → offset 64
+    i8_ptr, # 9: destructor → offset 72
+    i8_ptr, # 10: vtable (void**) → offset 80
+    i64,    # 11: vtable_size(i32) + acyclic(u8) + padding → offset 88
+    i8_ptr, # 12: mro (int*) → offset 96
+    i64,    # 13: mro_len(i32) + tail padding → offset 104
 ])
 
 # FpyList layout — must match struct FpyList in objects.h:
@@ -1251,10 +1257,22 @@ class CodeGen:
         # Maps class name -> (list_attrs, dict_attrs)
         self._class_container_attrs: dict[str, tuple[set[str], set[str]]] = {}
 
-        # Per-class float/string/bool attribute detection (including inherited attrs)
+        # Per-class float/string/bool/int attribute detection (including inherited attrs)
         self._per_class_float_attrs: dict[str, set[str]] = {}
         self._per_class_string_attrs: dict[str, set[str]] = {}
         self._per_class_bool_attrs: dict[str, set[str]] = {}
+        self._per_class_int_attrs: dict[str, set[str]] = {}
+
+        # Native slot layout: per-class count of native (untagged i64) slots.
+        # Native slots are scalar attrs (int/float/bool) placed at the START
+        # of the slot region.  The remaining slots are boxed (FpyValue, 16 bytes).
+        # Only applied to root classes (no parent with slots) — children
+        # inherit the parent's n_native to keep slot offsets stable.
+        self._class_n_native_slots: dict[str, int] = {}
+        # Per-class, per-slot tag for native slots: cls → {slot_idx → FPY_TAG_*}
+        # Used by _emit_slot_get_direct to synthesize the correct compile-time
+        # tag when loading from a native slot (no tag field in memory).
+        self._class_native_slot_tags: dict[str, dict[int, int]] = {}
 
         # Class-level constant attributes: class_name -> {attr: ast.Constant}
         self._class_const_attrs: dict[str, dict[str, ast.expr]] = {}
@@ -1302,6 +1320,10 @@ class CodeGen:
         # Loads from these slots can be marked !invariant.load, enabling
         # LLVM to hoist them out of loops (e.g., `p.x` in a tight loop).
         self._class_init_only_attrs: dict[str, set[str]] = {}
+        # Per-class mixed-type attributes: attrs whose __init__ parameter has
+        # CSA type None (receives both int and float, or other mixed types).
+        # These slots need runtime tag dispatch for attribute loads.
+        self._class_mixed_attrs: dict[str, set[str]] = {}
 
     def _declare_runtime_functions(self) -> None:
         """Declare external runtime functions we can call."""
@@ -2312,6 +2334,13 @@ class CodeGen:
         ft = ir.FunctionType(void, [i32, i32])
         self.runtime["set_class_slot_count"] = ir.Function(
             self.module, ft, name="fastpy_set_class_slot_count")
+        # Set native slot count (two-region layout: n_native × i64 + n_boxed × FpyValue)
+        self.runtime["set_class_native_slot_count"] = ir.Function(
+            self.module, ft, name="fastpy_set_class_native_slot_count")
+        # Set native slot tag: fastpy_set_class_native_slot_tag(class_id, slot_idx, tag)
+        ft_tag = ir.FunctionType(void, [i32, i32, i32])
+        self.runtime["set_class_native_slot_tag"] = ir.Function(
+            self.module, ft_tag, name="fastpy_set_class_native_slot_tag")
         # Mark a class as acyclic (scalar-only slots, skip GC tracking)
         ft = ir.FunctionType(void, [i32])
         self.runtime["set_class_acyclic"] = ir.Function(
@@ -5400,6 +5429,243 @@ class CodeGen:
         for cls_name in class_nodes:
             assign(cls_name)
 
+        # ── Native slot reordering (two-region layout) ──
+        # After all slots are assigned, detect which attrs are scalars
+        # (int/float/bool) and reorder slots so native attrs come first.
+        # Only applied to root classes (no parent with slots) — children
+        # inherit the parent's n_native to keep boxed slot offsets stable
+        # across the inheritance hierarchy.
+        for cls_name in class_nodes:
+            slots = self._class_attr_slots.get(cls_name)
+            if not slots:
+                continue
+            # Check if parent already has slots — if so, inherit n_native
+            parent = class_parents.get(cls_name)
+            parent_has_slots = (parent and parent in self._class_attr_slots
+                                and len(self._class_attr_slots[parent]) > 0)
+            if parent_has_slots:
+                # Inherit parent's n_native unchanged; child-specific attrs
+                # stay in whatever order they were assigned (all boxed).
+                self._class_n_native_slots[cls_name] = \
+                    self._class_n_native_slots.get(parent, 0)
+                self._class_native_slot_tags[cls_name] = \
+                    self._class_native_slot_tags.get(parent, {})
+                continue
+            # Skip generator classes — their locals are initialized to 0
+            # in __init__ (for type inference reasons), which makes int
+            # detection classify all locals as int.  But they hold lists,
+            # iterators, etc. at runtime, so native slots are unsafe.
+            _gen_classes = getattr(self, '_expanded_generator_classes', set())
+            if cls_name in _gen_classes:
+                self._class_n_native_slots[cls_name] = 0
+                continue
+            # Root class (or parent has 0 slots): detect scalar attrs
+            cls_node = class_nodes[cls_name]
+            float_a = self._detect_class_float_attrs(cls_node, cls_name)
+            bool_a = self._detect_class_bool_attrs(cls_node, cls_name)
+            int_a = self._detect_class_int_attrs(cls_node, cls_name)
+            # Cross-check against string/container attr detection:
+            # attrs known to hold strings, lists, dicts, or objects must
+            # NOT be in native int/float/bool slots (int detection defaults
+            # to "int" for unknown params, misclassifying non-scalar attrs).
+            string_a = self._detect_class_string_attrs(cls_node, cls_name)
+            # Also check child classes: if a child assigns a string literal
+            # to the same attr, it proves the attr holds strings.
+            for _ch_name, _ch_node in class_nodes.items():
+                if class_parents.get(_ch_name) == cls_name:
+                    string_a |= self._detect_class_string_attrs(_ch_node, _ch_name)
+            int_a -= string_a
+            float_a -= string_a
+            bool_a -= string_a
+            # Disqualify attrs that receive conflicting-type assigns
+            # anywhere in the class body or external code (obj.attr = X).
+            # An attr detected as "int" must NEVER be assigned a non-int.
+            disqualified: set[str] = set()
+            # Scan all methods (not just __init__) for self.attr = <non-scalar>
+            for method in cls_node.body:
+                if not isinstance(method, ast.FunctionDef):
+                    continue
+                for n in ast.walk(method):
+                    if not isinstance(n, ast.Assign):
+                        continue
+                    for tgt in n.targets:
+                        if not (isinstance(tgt, ast.Attribute)
+                                and isinstance(tgt.value, ast.Name)
+                                and tgt.value.id == "self"):
+                            continue
+                        attr = tgt.attr
+                        if attr not in (float_a | bool_a | int_a):
+                            continue
+                        # Check if the RHS contradicts the detected type
+                        if attr in int_a:
+                            if not self._is_definitely_int_expr(n.value):
+                                disqualified.add(attr)
+                        elif attr in float_a:
+                            if not self._is_definitely_float_expr(n.value):
+                                disqualified.add(attr)
+                        elif attr in bool_a:
+                            if not self._is_definitely_bool_expr(n.value):
+                                disqualified.add(attr)
+            # Disqualify attrs assigned from __init__ params whose
+            # call-site arguments have conflicting types.  E.g.
+            # `TypedValue(INT, 5)` and `TypedValue(FLOAT, 2.5)` means
+            # the `value` param (→ self.value) receives both int and float.
+            _init_method = None
+            for _m in cls_node.body:
+                if isinstance(_m, ast.FunctionDef) and _m.name == "__init__":
+                    _init_method = _m
+                    break
+            if _init_method:
+                # Map param_name → set of attr names assigned from it
+                _param_names = [a.arg for a in _init_method.args.args[1:]]  # skip self
+                _param_to_attrs: dict[str, set[str]] = {}
+                for _stm in ast.walk(_init_method):
+                    if (isinstance(_stm, ast.Assign)
+                            and len(_stm.targets) == 1
+                            and isinstance(_stm.targets[0], ast.Attribute)
+                            and isinstance(_stm.targets[0].value, ast.Name)
+                            and _stm.targets[0].value.id == "self"
+                            and isinstance(_stm.value, ast.Name)
+                            and _stm.value.id in _param_names):
+                        _pa = _stm.targets[0].attr
+                        _param_to_attrs.setdefault(_stm.value.id, set()).add(_pa)
+                # Disqualify attrs whose __init__ params have None defaults.
+                # E.g. `def __init__(self, parent=None):` — self.parent
+                # can be None or an object, so it can't be a native int slot.
+                _defaults = _init_method.args.defaults
+                _n_defaults = len(_defaults)
+                _n_params = len(_param_names)
+                for _di, _dv in enumerate(_defaults):
+                    if (isinstance(_dv, ast.Constant) and _dv.value is None):
+                        _pidx = _n_params - _n_defaults + _di
+                        if 0 <= _pidx < _n_params:
+                            _pn = _param_names[_pidx]
+                            if _pn in _param_to_attrs:
+                                for _attr in _param_to_attrs[_pn]:
+                                    disqualified.add(_attr)
+                # Check call-site argument types for each mapped param
+                _csa_ct = getattr(self, '_call_site_param_types', {})
+                _call_types = _csa_ct.get(cls_name, []) or _csa_ct.get(
+                    f"{cls_name}.__init__", [])
+                for _pi, _pname in enumerate(_param_names):
+                    if _pname not in _param_to_attrs:
+                        continue
+                    if _pi >= len(_call_types) or _call_types[_pi] is None:
+                        continue
+                    _ct_kind = self._tag_kind(_call_types[_pi])
+                    for _attr in _param_to_attrs[_pname]:
+                        if _attr in int_a and _ct_kind != VKind.INT:
+                            disqualified.add(_attr)
+                        elif _attr in float_a and _ct_kind != VKind.FLOAT:
+                            disqualified.add(_attr)
+                        elif _attr in bool_a and _ct_kind != VKind.BOOL:
+                            disqualified.add(_attr)
+                # Also check ALL call sites in the AST (not just CSA summary)
+                # for conflicting argument types at each position.
+                for _call in ast.walk(tree):
+                    if not (isinstance(_call, ast.Call)
+                            and isinstance(_call.func, ast.Name)
+                            and _call.func.id == cls_name):
+                        continue
+                    for _ai, _arg in enumerate(_call.args):
+                        if _ai >= len(_param_names):
+                            break
+                        _pn = _param_names[_ai]
+                        if _pn not in _param_to_attrs:
+                            continue
+                        for _attr in _param_to_attrs[_pn]:
+                            if _attr in int_a:
+                                if not self._is_definitely_int_expr(_arg):
+                                    disqualified.add(_attr)
+                            elif _attr in float_a:
+                                if not self._is_definitely_float_expr(_arg):
+                                    disqualified.add(_attr)
+                            elif _attr in bool_a:
+                                if not self._is_definitely_bool_expr(_arg):
+                                    disqualified.add(_attr)
+            # Scan external code for obj.attr = <non-scalar>
+            for ext_node in ast.walk(tree):
+                if not isinstance(ext_node, ast.Assign):
+                    continue
+                for tgt in ext_node.targets:
+                    if not (isinstance(tgt, ast.Attribute)
+                            and isinstance(tgt.value, ast.Name)
+                            and tgt.value.id in obj_var_class
+                            and obj_var_class[tgt.value.id] == cls_name):
+                        continue
+                    attr = tgt.attr
+                    if attr not in (float_a | bool_a | int_a):
+                        continue
+                    if attr in int_a:
+                        if not self._is_definitely_int_expr(ext_node.value):
+                            disqualified.add(attr)
+                    elif attr in float_a:
+                        if not self._is_definitely_float_expr(ext_node.value):
+                            disqualified.add(attr)
+                    elif attr in bool_a:
+                        if not self._is_definitely_bool_expr(ext_node.value):
+                            disqualified.add(attr)
+            float_a -= disqualified
+            bool_a -= disqualified
+            int_a -= disqualified
+            scalar_attrs = float_a | bool_a | int_a
+            # Track mixed-type attrs: attrs from __init__ params whose CSA
+            # type is None AND multiple different types appear at call sites.
+            # These slots need runtime tag dispatch for attribute loads.
+            if _init_method:
+                _mixed_set: set[str] = set()
+                for _call in ast.walk(tree):
+                    if not (isinstance(_call, ast.Call)
+                            and isinstance(_call.func, ast.Name)
+                            and _call.func.id == cls_name):
+                        continue
+                    for _ai, _arg in enumerate(_call.args):
+                        if _ai >= len(_param_names):
+                            break
+                        _pn = _param_names[_ai]
+                        if _pn not in _param_to_attrs:
+                            continue
+                        for _attr in _param_to_attrs[_pn]:
+                            if _attr in scalar_attrs:
+                                continue  # already typed
+                            if _attr in string_a:
+                                continue
+                            # Check if this call site has a different type
+                            # than other call sites for the same param
+                            _is_int = self._is_definitely_int_expr(_arg)
+                            _is_float = self._is_definitely_float_expr(
+                                _arg)
+                            if not _is_int and not _is_float:
+                                _mixed_set.add(_attr)
+                if _mixed_set:
+                    self._class_mixed_attrs[cls_name] = _mixed_set
+            if not scalar_attrs:
+                self._class_n_native_slots[cls_name] = 0
+                continue
+            # Partition slots into native (scalar) and boxed (non-scalar)
+            native_slots = [(a, i) for a, i in slots.items() if a in scalar_attrs]
+            boxed_slots = [(a, i) for a, i in slots.items() if a not in scalar_attrs]
+            # Reorder: native first (preserve relative order), then boxed
+            native_slots.sort(key=lambda x: x[1])
+            boxed_slots.sort(key=lambda x: x[1])
+            new_slots: dict[str, int] = {}
+            tag_map: dict[int, int] = {}
+            for new_i, (attr, _) in enumerate(native_slots):
+                new_slots[attr] = new_i
+                # Record the correct tag for this native slot
+                if attr in float_a:
+                    tag_map[new_i] = FPY_TAG_FLOAT
+                elif attr in bool_a:
+                    tag_map[new_i] = FPY_TAG_BOOL
+                else:
+                    tag_map[new_i] = FPY_TAG_INT
+            n_native = len(native_slots)
+            for new_i, (attr, _) in enumerate(boxed_slots):
+                new_slots[attr] = n_native + new_i
+            self._class_attr_slots[cls_name] = new_slots
+            self._class_n_native_slots[cls_name] = n_native
+            self._class_native_slot_tags[cls_name] = tag_map
+
     def _mi_has_slot_conflict(self, base_cls: str, child_cls: str) -> bool:
         """Return True if *base_cls*'s methods would use wrong slot indices
         when called on a *child_cls* instance.
@@ -6150,6 +6416,23 @@ class CodeGen:
                                   and stmt.value.func.id in self._func_ret_types):
                                 local_vt[tgt.id] = self._func_ret_types[
                                     stmt.value.func.id]
+                            # Method call on known object: v = obj.method()
+                            # Determine the class from local_vt or obj_classes
+                            # and infer the method's return type.
+                            elif (isinstance(stmt.value.func, ast.Attribute)
+                                  and isinstance(stmt.value.func.value,
+                                                 ast.Name)):
+                                _lv_obj = stmt.value.func.value.id
+                                _lv_meth = stmt.value.func.attr
+                                _lv_cls = (
+                                    self._csa_obj_classes.get(_lv_obj)
+                                    if hasattr(self, '_csa_obj_classes')
+                                    else None)
+                                if _lv_cls is not None:
+                                    _lv_rt = self._infer_method_return_vtype(
+                                        _lv_cls, _lv_meth)
+                                    if _lv_rt is not None:
+                                        local_vt[tgt.id] = _lv_rt
                 elif isinstance(stmt, (ast.For, ast.While, ast.If,
                                         ast.With, ast.Try)):
                     # Walk into control-flow blocks (but not nested functions)
@@ -6383,6 +6666,12 @@ class CodeGen:
                         arg_types.append("path")
                     else:
                         arg_types.append("pyobj")
+                elif (isinstance(arg, ast.Call)
+                      and isinstance(arg.func, ast.Name)
+                      and arg.func.id in ('float', 'int', 'str', 'bool',
+                                          'list', 'dict')):
+                    # Built-in type conversion: float(...) -> "float", etc.
+                    arg_types.append(arg.func.id)
                 elif (isinstance(arg, ast.Name)
                       and arg.id in var_types
                       and self._tag_kind(var_types[arg.id]) in (VKind.PATH, VKind.PYOBJ)):
@@ -6840,6 +7129,130 @@ class CodeGen:
                                     existing[i] = cls_arg_types[i]
                             for i in range(len(existing), len(cls_arg_types)):
                                 existing.append(cls_arg_types[i])
+
+        # Post-scan: resolve explicit Parent.__init__(self, arg1, arg2, ...)
+        # calls inside child __init__ methods.  During the main walk, these
+        # calls are processed BEFORE the child's constructor call (Car(60.0))
+        # registers the child's parameter types, so all args resolve as None.
+        # Now that all constructor calls are registered, re-resolve them.
+        for cls_node in tree.body:
+            if not isinstance(cls_node, ast.ClassDef):
+                continue
+            parent_cls = self._csa_class_parents.get(cls_node.name)
+            if parent_cls is None:
+                continue
+            for method_node in cls_node.body:
+                if not (isinstance(method_node, ast.FunctionDef)
+                        and method_node.name == "__init__"):
+                    continue
+                # Build param-name-to-CSA-type map for this child class
+                child_csa = self._call_site_param_types.get(cls_node.name, [])
+                child_params = [a.arg for a in method_node.args.args]
+                # param 0 is self, CSA[0] is arg 0 → maps to param 1
+                param_type_map: dict[str, str | None] = {}
+                for ci, ct in enumerate(child_csa):
+                    pi = ci + 1  # skip self
+                    if 0 <= pi < len(child_params):
+                        param_type_map[child_params[pi]] = ct
+                if not param_type_map:
+                    continue
+                # Find Parent.__init__(self, ...) calls
+                for call_node in ast.walk(method_node):
+                    if not isinstance(call_node, ast.Call):
+                        continue
+                    if not (isinstance(call_node.func, ast.Attribute)
+                            and call_node.func.attr == "__init__"
+                            and isinstance(call_node.func.value, ast.Name)
+                            and call_node.func.value.id in self._csa_class_parents):
+                        continue
+                    target_parent = call_node.func.value.id
+                    # Resolve arg types (strip self)
+                    resolved = []
+                    for ai, arg in enumerate(call_node.args):
+                        if ai == 0:
+                            continue  # skip self
+                        if isinstance(arg, ast.Name) and arg.id in param_type_map:
+                            resolved.append(param_type_map[arg.id])
+                        elif isinstance(arg, ast.Constant):
+                            if isinstance(arg.value, float):
+                                resolved.append("float")
+                            elif isinstance(arg.value, bool):
+                                resolved.append("bool")
+                            elif isinstance(arg.value, int):
+                                resolved.append("int")
+                            elif isinstance(arg.value, str):
+                                resolved.append("str")
+                            else:
+                                resolved.append(None)
+                        else:
+                            resolved.append(None)
+                    if not any(t is not None for t in resolved):
+                        continue
+                    existing = self._call_site_param_types.get(target_parent)
+                    if existing is None:
+                        self._call_site_param_types[target_parent] = resolved
+                    else:
+                        for i, t in enumerate(resolved):
+                            if t is None:
+                                continue
+                            if i < len(existing):
+                                if existing[i] is None:
+                                    existing[i] = t
+                            else:
+                                existing.append(t)
+
+        # ── Post-CSA: propagate parameter types through forwarding ──
+        # When method A(self, x) with CSA type [str] calls B(x), propagate
+        # the known type of `x` to B's CSA entry.  Without this, the CSA
+        # records B's arg as None because `x` is a method parameter — not a
+        # local variable or module-level name — so it's invisible to the
+        # var_types / _func_local_vt lookups in the main CSA loop.
+        # Runs AFTER all cleanup passes so forwarded types aren't cleared.
+        for _fw_cls_name, _fw_cls_ast in self._csa_class_asts.items():
+            for _fw_method in _fw_cls_ast.body:
+                if not isinstance(_fw_method, ast.FunctionDef):
+                    continue
+                _fw_params = [a.arg for a in _fw_method.args.args]
+                # Get the method's CSA entry (qualified or constructor key)
+                _fw_q = f"{_fw_cls_name}.{_fw_method.name}"
+                _fw_csa = self._call_site_param_types.get(
+                    _fw_q, self._call_site_param_types.get(
+                        _fw_cls_name if _fw_method.name == "__init__"
+                        else _fw_method.name, []))
+                if not _fw_csa:
+                    continue
+                # Build param → type map (skip self, CSA index = pi - 1)
+                _fw_ptm: dict[str, str] = {}
+                for _fw_pi, _fw_pn in enumerate(_fw_params):
+                    if _fw_pn == "self":
+                        continue
+                    _fw_ci = _fw_pi - 1
+                    if 0 <= _fw_ci < len(_fw_csa) and _fw_csa[_fw_ci]:
+                        _fw_ptm[_fw_pn] = _fw_csa[_fw_ci]
+                if not _fw_ptm:
+                    continue
+                # Scan method body for calls that forward known-type params
+                for _fw_call in ast.walk(_fw_method):
+                    if not isinstance(_fw_call, ast.Call):
+                        continue
+                    if isinstance(_fw_call.func, ast.Name):
+                        _fw_callee = _fw_call.func.id
+                    elif isinstance(_fw_call.func, ast.Attribute):
+                        _fw_callee = _fw_call.func.attr
+                    else:
+                        continue
+                    for _fw_ai, _fw_arg in enumerate(_fw_call.args):
+                        if not (isinstance(_fw_arg, ast.Name)
+                                and _fw_arg.id in _fw_ptm):
+                            continue
+                        _fw_at = _fw_ptm[_fw_arg.id]
+                        # Update callee's CSA entry if currently unknown
+                        _fw_callee_csa = self._call_site_param_types.get(
+                            _fw_callee)
+                        if _fw_callee_csa is not None:
+                            if (_fw_ai < len(_fw_callee_csa)
+                                    and _fw_callee_csa[_fw_ai] is None):
+                                _fw_callee_csa[_fw_ai] = _fw_at
 
     def _csa_track_objects(
         self, tree: ast.Module,
@@ -7648,6 +8061,43 @@ class CodeGen:
         obj_classes, self_attr_classes = self._csa_track_objects(
             tree, class_parents, var_types)
 
+        # ── Infer var types from method calls on known class instances ──
+        # For module-level assignments like `t1 = builder.add("a", "b")`
+        # where `builder` is a known instance of a user class, determine
+        # the method's return type and record it in var_types.  This must
+        # run after _csa_track_objects so obj_classes is available.
+        # Walk only module-level statements (skip function/class bodies).
+        def _walk_mod_skip_funcs(root: ast.AST):
+            from collections import deque
+            q: deque[ast.AST] = deque([root])
+            while q:
+                n = q.popleft()
+                yield n
+                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                  ast.ClassDef)):
+                    continue
+                for child in ast.iter_child_nodes(n):
+                    q.append(child)
+        for _mv_node in _walk_mod_skip_funcs(tree):
+            if not (isinstance(_mv_node, ast.Assign)
+                    and len(_mv_node.targets) == 1
+                    and isinstance(_mv_node.targets[0], ast.Name)
+                    and isinstance(_mv_node.value, ast.Call)
+                    and isinstance(_mv_node.value.func, ast.Attribute)
+                    and isinstance(_mv_node.value.func.value, ast.Name)):
+                continue
+            _mv_tgt = _mv_node.targets[0].id
+            _mv_obj = _mv_node.value.func.value.id
+            _mv_method = _mv_node.value.func.attr
+            _mv_cls = obj_classes.get(_mv_obj)
+            if _mv_cls is None:
+                continue
+            if _mv_tgt in var_types:
+                continue  # don't overwrite existing type info
+            _mv_rt = self._infer_method_return_vtype(_mv_cls, _mv_method)
+            if _mv_rt is not None:
+                var_types[_mv_tgt] = _mv_rt
+
         # Track loop variable types from for-in iterables
         for node in ast.walk(tree):
             if isinstance(node, ast.For) and isinstance(node.target, ast.Name):
@@ -8192,8 +8642,19 @@ class CodeGen:
                 obj_types = self._class_obj_attr_types.get(cls_name, {})
                 if node.attr in obj_types:
                     return "obj"
-                # Default: assume int (slot-typed attrs that aren't
-                # float/bool/string/obj are typically ints).
+                # Default: assume int ONLY when per-class int attrs are
+                # populated (i.e., the class was processed by
+                # _emit_class_methods).  For base classes of monomorphized
+                # classes, per-class attrs aren't populated — an attr
+                # might hold float in some variants, so returning "int"
+                # would cause wrong variant selection.
+                if cls_name in self._per_class_int_attrs:
+                    return "int"
+                # If the class is a monomorphized base, we can't determine
+                # the attr type — return None to avoid wrong specialization.
+                if cls_name in self._monomorphized_classes:
+                    return None
+                # For non-monomorphized classes, default to "int" (legacy).
                 return "int"
         # Binary arithmetic: result is float if either side is float;
         # Div always returns float; otherwise inherit int-ness.
@@ -8221,6 +8682,9 @@ class CodeGen:
         # inside f's body should resolve to the same specialization we're in.
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
             fname = node.func.id
+            # Built-in type conversion calls: float(...) -> "float", etc.
+            if fname in ('float', 'int', 'str', 'bool', 'list', 'dict'):
+                return fname
             if fname in self._user_functions:
                 info = self._user_functions[fname]
                 _rtk = self._tag_kind(info.ret_tag)
@@ -10664,10 +11128,13 @@ class CodeGen:
         # Process in reverse order so index-based removal doesn't shift
         new_nodes: list[ast.stmt] = []
         removed_indices: set[int] = set()
+        if not hasattr(self, '_expanded_generator_classes'):
+            self._expanded_generator_classes: set[str] = set()
         for idx, func_node in reversed(to_expand):
             cls_node, _wrapper = self._gen_expand_one(func_node)
             new_nodes.append(cls_node)
             removed_indices.add(idx)
+            self._expanded_generator_classes.add(func_node.name)
             # Remove from _cpython_generators if it was already added
             cpygen = getattr(self, '_cpython_generators', set())
             cpygen.discard(func_node.name)
@@ -12747,6 +13214,7 @@ class CodeGen:
             self._per_class_float_attrs[class_name] |= self._per_class_float_attrs.get(sec_base, set())
             self._per_class_string_attrs[class_name] |= self._per_class_string_attrs.get(sec_base, set())
             self._per_class_bool_attrs[class_name] |= self._per_class_bool_attrs.get(sec_base, set())
+            self._per_class_int_attrs[class_name] |= self._per_class_int_attrs.get(sec_base, set())
         return own_method_names
 
     def _dcl_precompute_typed_attrs(
@@ -12806,21 +13274,24 @@ class CodeGen:
         float_attrs = self._detect_class_float_attrs(node, class_name)
         string_attrs = self._detect_class_string_attrs(node, class_name)
         bool_attrs = self._detect_class_bool_attrs(node, class_name)
+        int_attrs = self._detect_class_int_attrs(node, class_name)
         # Inherit from parent class
         if parent_name:
             float_attrs |= self._per_class_float_attrs.get(parent_name, set())
             string_attrs |= self._per_class_string_attrs.get(parent_name, set())
             bool_attrs |= self._per_class_bool_attrs.get(parent_name, set())
+            int_attrs |= self._per_class_int_attrs.get(parent_name, set())
         # Store for child class inheritance during this pass
         self._per_class_float_attrs[class_name] = float_attrs
         self._per_class_string_attrs[class_name] = string_attrs
         self._per_class_bool_attrs[class_name] = bool_attrs
+        self._per_class_int_attrs[class_name] = int_attrs
 
         # ── Analysis: report boxed (untyped) attributes ──
         if self._analyze_mode and class_name in self._class_attr_slots:
             from compiler.analysis import MEDIUM, IMPACT_BOXED_ATTR
             all_slots = set(self._class_attr_slots[class_name].keys())
-            typed = (float_attrs | string_attrs | bool_attrs
+            typed = (float_attrs | string_attrs | bool_attrs | int_attrs
                      | list_attrs | dict_attrs
                      | set(self._class_obj_attr_types.get(class_name, {}).keys()))
             boxed = all_slots - typed
@@ -13328,6 +13799,12 @@ class CodeGen:
             _obj_attr_types = getattr(self, '_class_obj_attr_types', {})
             if _base in _obj_attr_types and class_name not in _obj_attr_types:
                 _obj_attr_types[class_name] = dict(_obj_attr_types[_base])
+            # Propagate native slot layout so variants use the same
+            # two-region memory layout as the base class.
+            if _base in self._class_n_native_slots and class_name not in self._class_n_native_slots:
+                self._class_n_native_slots[class_name] = self._class_n_native_slots[_base]
+            if _base in self._class_native_slot_tags and class_name not in self._class_native_slot_tags:
+                self._class_native_slot_tags[class_name] = dict(self._class_native_slot_tags[_base])
 
         # --- Multiple inheritance: pre-create specialized copies of
         # secondary base methods that are called via unbound syntax
@@ -13586,6 +14063,17 @@ class CodeGen:
                                     and n.value.func.id in (
                                         "list", "sorted", "reversed")):
                                 list_attrs.add(tgt.attr)
+                            # IfExp (ternary): self.attr = X if C else Y
+                            # If either branch is a list/dict literal,
+                            # the attr holds that container type.
+                            elif isinstance(n.value, ast.IfExp):
+                                _ifexp_branches = (n.value.body, n.value.orelse)
+                                if any(isinstance(_b, (ast.List, ast.ListComp))
+                                       for _b in _ifexp_branches):
+                                    list_attrs.add(tgt.attr)
+                                elif any(isinstance(_b, (ast.Dict, ast.DictComp))
+                                         for _b in _ifexp_branches):
+                                    dict_attrs.add(tgt.attr)
                             elif isinstance(n.value, (ast.Dict, ast.DictComp)):
                                 dict_attrs.add(tgt.attr)
                             # dict(...) → dict attribute
@@ -13661,7 +14149,7 @@ class CodeGen:
                                                     break
                                                 # known obj variable
                                                 if (isinstance(_r5_arg, ast.Name)
-                                                        and _r5_arg.id in obj_classes):
+                                                        and _r5_arg.id in getattr(self, '_csa_obj_classes', {})):
                                                     _r5_ok = True
                                                     break
                                 if _r5_ok:
@@ -14083,6 +14571,185 @@ class CodeGen:
                                 bool_attrs.add(tgt.attr)
         return bool_attrs
 
+    @staticmethod
+    def _is_definitely_int_expr(node: ast.expr) -> bool:
+        """Static check: is this expression definitely an int value?
+
+        Returns False for expressions that CLEARLY produce non-int (bool,
+        str, float, etc.). Returns True for uncertain expressions (we only
+        disqualify on clear evidence of non-int).
+        """
+        if isinstance(node, ast.Constant):
+            return isinstance(node.value, int) and not isinstance(node.value, bool)
+        # Compare/BoolOp/Not → produce bool, not int
+        if isinstance(node, ast.Compare):
+            return False
+        if isinstance(node, ast.BoolOp):
+            return False
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+            return False
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            if node.func.id in ("len", "int", "ord", "hash", "id", "abs"):
+                return True
+            if node.func.id in ("float", "str", "bool", "list", "dict",
+                                "tuple", "set", "bytes"):
+                return False
+            return True  # unknown function — don't disqualify
+        if isinstance(node, ast.BinOp):
+            # int op int → int (unless truediv)
+            if isinstance(node.op, ast.Div):
+                return False
+            return (CodeGen._is_definitely_int_expr(node.left)
+                    and CodeGen._is_definitely_int_expr(node.right))
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd)):
+            return CodeGen._is_definitely_int_expr(node.operand)
+        # Name(x), self.attr, a[i] — uncertain, don't disqualify
+        if isinstance(node, (ast.Name, ast.Attribute, ast.Subscript)):
+            return True
+        # IfExp, other Call, etc — uncertain, don't disqualify
+        if isinstance(node, (ast.IfExp, ast.Call)):
+            return True
+        # JoinedStr (f-string), List, Dict, etc → clearly not int
+        if isinstance(node, (ast.JoinedStr, ast.List, ast.Dict, ast.Set,
+                             ast.Tuple, ast.ListComp, ast.SetComp,
+                             ast.DictComp, ast.GeneratorExp)):
+            return False
+        return True
+
+    @staticmethod
+    def _is_definitely_float_expr(node: ast.expr) -> bool:
+        """Static check: is this expression definitely a float value?
+
+        Returns False for expressions that CLEARLY produce non-float.
+        Returns True for uncertain expressions.
+        """
+        if isinstance(node, ast.Constant):
+            return isinstance(node.value, float)
+        # Compare/BoolOp/Not → produce bool, not float
+        if isinstance(node, ast.Compare):
+            return False
+        if isinstance(node, ast.BoolOp):
+            return False
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+            return False
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            if node.func.id == "float":
+                return True
+            if node.func.id in ("int", "len", "ord", "hash", "id", "bool",
+                                "str", "list", "dict", "tuple", "set"):
+                return False
+            return True  # unknown function — don't disqualify
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            if (isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "math"):
+                return True
+        # BinOp with at least one float operand
+        if isinstance(node, ast.BinOp):
+            return (CodeGen._is_definitely_float_expr(node.left)
+                    or CodeGen._is_definitely_float_expr(node.right))
+        # uncertain — don't disqualify
+        if isinstance(node, (ast.Name, ast.Attribute, ast.Subscript,
+                             ast.IfExp, ast.Call)):
+            return True
+        # Clearly non-float
+        if isinstance(node, (ast.JoinedStr, ast.List, ast.Dict, ast.Set,
+                             ast.Tuple, ast.ListComp, ast.SetComp,
+                             ast.DictComp, ast.GeneratorExp)):
+            return False
+        return True
+
+    @staticmethod
+    def _is_definitely_bool_expr(node: ast.expr) -> bool:
+        """Static check: is this expression definitely a bool value?
+
+        Returns False for expressions that CLEARLY produce non-bool.
+        Returns True for uncertain expressions.
+        """
+        if isinstance(node, ast.Constant):
+            return isinstance(node.value, bool)
+        if isinstance(node, ast.Compare):
+            return True
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+            return True
+        if isinstance(node, ast.BoolOp):
+            return True
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            if node.func.id in ("bool", "isinstance", "hasattr"):
+                return True
+            if node.func.id in ("int", "float", "str", "len", "ord",
+                                "list", "dict", "tuple", "set"):
+                return False
+            return True  # unknown function — don't disqualify
+        # int/float constants → not bool
+        if isinstance(node, ast.Constant):
+            return False
+        # uncertain — don't disqualify
+        if isinstance(node, (ast.Name, ast.Attribute, ast.Subscript,
+                             ast.IfExp, ast.Call)):
+            return True
+        # Clearly non-bool
+        if isinstance(node, (ast.JoinedStr, ast.List, ast.Dict, ast.Set,
+                             ast.Tuple, ast.BinOp)):
+            return False
+        return True
+
+    def _detect_class_int_attrs(self, node: ast.ClassDef,
+                                  cname: str | None = None) -> set[str]:
+        """Detect attributes that hold integers by checking __init__ assignments."""
+        int_attrs: set[str] = set()
+
+        # From call-site analysis: Node(42) registers "int" for arg 0.
+        lookup_name = cname if cname is not None else node.name
+        call_types = self._call_site_param_types.get(lookup_name, [])
+        int_param_indices = set()
+        for i, t in enumerate(call_types):
+            if self._tag_kind(t) == VKind.INT:
+                int_param_indices.add(i)
+
+        for method in node.body:
+            if not isinstance(method, ast.FunctionDef):
+                continue
+            if method.name != "__init__":
+                continue
+            params = [arg.arg for arg in method.args.args]
+            # param 0 is self — call's arg 0 maps to param 1
+            int_params = set()
+            for i in int_param_indices:
+                pi = i + 1
+                if 0 <= pi < len(params):
+                    int_params.add(params[pi])
+            # Also check int defaults: def __init__(self, x=0)
+            defaults = method.args.defaults
+            for di, d in enumerate(defaults):
+                pidx = len(params) - len(defaults) + di
+                if (isinstance(d, ast.Constant)
+                        and isinstance(d.value, int)
+                        and not isinstance(d.value, bool)
+                        and 0 <= pidx < len(params)):
+                    int_params.add(params[pidx])
+
+            for n in ast.walk(method):
+                if isinstance(n, ast.Assign):
+                    for tgt in n.targets:
+                        if (isinstance(tgt, ast.Attribute)
+                                and isinstance(tgt.value, ast.Name)
+                                and tgt.value.id == "self"):
+                            # self.attr = int_constant
+                            if (isinstance(n.value, ast.Constant)
+                                    and isinstance(n.value.value, int)
+                                    and not isinstance(n.value.value, bool)):
+                                int_attrs.add(tgt.attr)
+                            # self.attr = int_param
+                            if isinstance(n.value, ast.Name) and n.value.id in int_params:
+                                int_attrs.add(tgt.attr)
+                            # self.attr = len(...)
+                            if (isinstance(n.value, ast.Call)
+                                    and isinstance(n.value.func, ast.Name)
+                                    and n.value.func.id in ("len", "int", "ord",
+                                                            "hash", "id")):
+                                int_attrs.add(tgt.attr)
+        return int_attrs
+
     def _emit_class_methods(self, node: ast.ClassDef,
                              _variant_name: str | None = None) -> None:
         """Generate code for all methods in a class.
@@ -14102,7 +14769,7 @@ class CodeGen:
         effective_name = _variant_name if _variant_name else node.name
         cls_info = self._user_classes[effective_name]
         self._current_class = effective_name
-        # Detect string, float, and bool attributes at class level using the
+        # Detect string, float, bool, and int attributes at class level using the
         # variant's call-types so attr typing matches the variant's sig.
         self._class_string_attrs = self._detect_class_string_attrs(
             node, effective_name)
@@ -14110,7 +14777,9 @@ class CodeGen:
             node, effective_name)
         self._class_bool_attrs = self._detect_class_bool_attrs(
             node, effective_name)
-        # Inherit parent class's string/float/bool attrs for subclass methods
+        self._class_int_attrs = self._detect_class_int_attrs(
+            node, effective_name)
+        # Inherit parent class's string/float/bool/int attrs for subclass methods
         if cls_info.parent_name:
             self._class_string_attrs |= self._per_class_string_attrs.get(
                 cls_info.parent_name, set())
@@ -14118,10 +14787,13 @@ class CodeGen:
                 cls_info.parent_name, set())
             self._class_bool_attrs |= self._per_class_bool_attrs.get(
                 cls_info.parent_name, set())
+            self._class_int_attrs |= self._per_class_int_attrs.get(
+                cls_info.parent_name, set())
         # Store for subclass inheritance
         self._per_class_float_attrs[effective_name] = set(self._class_float_attrs)
         self._per_class_string_attrs[effective_name] = set(self._class_string_attrs)
         self._per_class_bool_attrs[effective_name] = set(self._class_bool_attrs)
+        self._per_class_int_attrs[effective_name] = set(self._class_int_attrs)
 
         # Deduplicate: only emit the last definition of each method name.
         # @x.setter / @x.deleter are NOT redefinitions of the getter.
@@ -14523,23 +15195,30 @@ class CodeGen:
                 # type — no bitcast needed.  Skip all IntType-specific paths.
                 tag = "float"
                 bare = param
-            elif pname in nullable_params and isinstance(param.type, ir.IntType):
+            elif (pname in nullable_params and isinstance(param.type, ir.IntType)
+                  and pname not in _none_default_param_names):
                 # Param is compared with `is None` in the body — treat as
                 # potentially None. The runtime null-check will emit
                 # {NONE, 0} when the value is 0.
+                # Skip params with default=None — those fall through to the
+                # mixed-type handler which uses get_arg_tag for the runtime
+                # tag, correctly distinguishing LIST/STR/DICT/OBJ/NONE.
                 ptr_val = self._ensure_ptr(param)
                 tag = "obj"
                 bare = ptr_val
             elif (pname in obj_params and isinstance(param.type, ir.IntType)
-                  and (call_tag is None or self._tag_kind(call_tag).is_ptr)):
+                  and (call_tag is None or self._tag_kind(call_tag).is_ptr)
+                  and pname not in _none_default_param_names):
                 # Only force "obj" tag when call-site analysis doesn't
                 # indicate a concrete scalar type. When call_tag is "int"
                 # (or float/bool), the param truly carries scalars and must
                 # NOT be reinterpreted as a pointer (inttoptr would crash).
+                # Skip params with default=None — those use get_arg_tag.
                 ptr_val = self._ensure_ptr(param)
                 tag = "obj"
                 bare = ptr_val
-            elif call_tag is not None and isinstance(param.type, ir.IntType):
+            elif (call_tag is not None and isinstance(param.type, ir.IntType)
+                  and self._tag_kind(call_tag) != VKind.MIXED):
                 _ctk = self._tag_kind(call_tag)
                 if _ctk.is_ptr:
                     ptr_val = self._ensure_ptr(param)
@@ -14556,16 +15235,6 @@ class CodeGen:
                 else:
                     tag = "int"
                     bare = param
-            elif pname in float_default_params and isinstance(param.type, ir.IntType):
-                bare = self.builder.bitcast(param, double)
-                tag = "float"
-            elif pname in bool_default_params and isinstance(param.type, ir.IntType):
-                tag = "bool"
-                bare = param
-            elif pname in string_params and isinstance(param.type, ir.IntType):
-                ptr_val = self._ensure_ptr(param)
-                tag = "str"
-                bare = ptr_val
             else:
                 # Check for conflicting call-site types: the parameter
                 # receives different types at different call sites (e.g.
@@ -14578,9 +15247,36 @@ class CodeGen:
                 for _ms in _method_sigs:
                     if call_idx >= 0 and call_idx < len(_ms) and _ms[call_idx] is not None:
                         _sig_types_for_param.add(_ms[call_idx])
-                if ((len(_sig_types_for_param) > 1
-                         or pname in _returned_params)
-                        and isinstance(param.type, ir.IntType)):
+                # Also use runtime tag when call_tag is None (CSA
+                # couldn't determine the type).  The parameter may
+                # receive any type (int, float, str, obj) depending on
+                # the call site, so hardcoding INT is incorrect.
+                # Note: we intentionally don't gate on
+                # _sig_types_for_param being empty — the fallback
+                # lookup on bare node.name (e.g. "__init__") pulls in
+                # signatures from ALL classes, making the set
+                # unreliable for specialized variants.
+                _csa_unknown = call_tag is None
+                # Determine if this param has a heuristic type from
+                # usage patterns (string ops, float defaults, etc.)
+                _has_heuristic = (
+                    pname in float_default_params
+                    or pname in bool_default_params
+                    or pname in string_params)
+                # Use mixed-type (get_arg_tag) when there's strong
+                # evidence the param receives different types.
+                # _csa_unknown alone is NOT sufficient — the method
+                # may simply be called indirectly (e.g. via f-string
+                # __format__) with a single type.  Only force mixed
+                # when combined with other polymorphism indicators OR
+                # when _csa_unknown and no heuristic type is available.
+                _needs_mixed = (
+                    (len(_sig_types_for_param) > 1
+                     or pname in _returned_params
+                     or pname in _none_default_param_names
+                     or (_csa_unknown and not _has_heuristic))
+                    and isinstance(param.type, ir.IntType))
+                if _needs_mixed:
                     # Mixed-type param: use runtime tag from arg side-channel
                     _rt_tag = self.builder.call(
                         self.runtime["get_arg_tag"],
@@ -14593,8 +15289,22 @@ class CodeGen:
                     self.variables[pname] = (alloca, "mixed")
                     llvm_arg_idx += 1
                     continue
-                tag = "int"
-                bare = param
+                # Heuristic type detection from usage patterns.
+                # Only applied when the param is NOT polymorphic (mixed
+                # handler above already covers polymorphic params).
+                if pname in float_default_params:
+                    bare = self.builder.bitcast(param, double)
+                    tag = "float"
+                elif pname in bool_default_params:
+                    tag = "bool"
+                    bare = param
+                elif pname in string_params:
+                    ptr_val = self._ensure_ptr(param)
+                    tag = "str"
+                    bare = ptr_val
+                else:
+                    tag = "int"
+                    bare = param
 
             if self._USE_FV_LOCALS:
                 alloca = self.builder.alloca(fpy_val, name=pname)
@@ -14603,12 +15313,17 @@ class CodeGen:
                 # branch so the FV gets NONE tag instead of OBJ tag with a
                 # null pointer. Without this, `self.attr = param` stores
                 # {OBJ, 0} and `obj.attr is None` returns False.
-                if self._tag_kind(tag) == VKind.OBJ and isinstance(param.type, ir.IntType):
+                # Note: params with default=None are now handled by the
+                # mixed-type handler (get_arg_tag) and don't reach here.
+                _needs_null_check = (
+                    self._tag_kind(tag) == VKind.OBJ
+                    and isinstance(param.type, ir.IntType))
+                if _needs_null_check:
                     is_null = self.builder.icmp_unsigned(
                         "==", param, ir.Constant(param.type, 0))
                     fv_none = self._fv_none()
-                    fv_obj = self._wrap_bare_to_fv(bare, "obj")
-                    fv = self.builder.select(is_null, fv_none, fv_obj)
+                    fv_typed = self._wrap_bare_to_fv(bare, tag)
+                    fv = self.builder.select(is_null, fv_none, fv_typed)
                     self.builder.store(fv, alloca)
                     self.variables[pname] = (alloca, tag)
                     llvm_arg_idx += 1
@@ -14831,6 +15546,18 @@ class CodeGen:
             self.builder.call(self.runtime["set_class_slot_count"], [
                 class_id, ir.Constant(i32, len(slots))
             ])
+            # Set native slot count and per-slot tags for two-region layout
+            n_native = self._class_n_native_slots.get(cls_info.name, 0)
+            if n_native > 0:
+                self.builder.call(
+                    self.runtime["set_class_native_slot_count"],
+                    [class_id, ir.Constant(i32, n_native)])
+                tag_map = self._class_native_slot_tags.get(cls_info.name, {})
+                for slot_idx, slot_tag in tag_map.items():
+                    self.builder.call(
+                        self.runtime["set_class_native_slot_tag"],
+                        [class_id, ir.Constant(i32, slot_idx),
+                         ir.Constant(i32, slot_tag)])
 
         # Mark acyclic classes — those whose slots only hold scalars
         # (INT, FLOAT, BOOL, NONE, STR).  Instances skip GC tracking
@@ -16490,10 +17217,10 @@ class CodeGen:
             init_only = self._is_init_only_attr(node)
             if _is_gen_fv_attr:
                 _slot_tag_val, data_i64 = self._emit_slot_get_direct(
-                    obj, slot_idx, init_only=init_only)
+                    obj, slot_idx, init_only=init_only, cls_name=obj_cls)
             else:
                 data_i64 = self._emit_slot_get_data_only(
-                    obj, slot_idx, init_only=init_only)
+                    obj, slot_idx, init_only=init_only, cls_name=obj_cls)
         else:
             # Fall back to FV-ABI getter with name lookup
             tag_slot = self._create_entry_alloca(i32, "attr.tag")
@@ -16560,8 +17287,48 @@ class CodeGen:
         if is_float:
             # Return as double — bitcast i64 data back to double
             return self.builder.bitcast(data_i64, double)
-        # Default: return as i64 (int)
-        return data_i64
+        # Check if this is a native scalar slot — those are definitely ints,
+        # no need for runtime tag dispatch.
+        _is_native_scalar = False
+        if obj_cls and slot_idx is not None:
+            _n_native = self._class_n_native_slots.get(obj_cls, 0)
+            if slot_idx < _n_native:
+                _is_native_scalar = True
+        if _is_native_scalar:
+            return data_i64
+        # Boxed slot with a known static type (int or bool): return bare
+        # i64.  The attr was detected as int/bool by _detect_class_int_attrs
+        # but isn't a native scalar slot (e.g. it shares a boxed layout with
+        # other attrs).  Returning i64 matches what downstream consumers
+        # (float(), BinOp, etc.) expect.
+        if slot_idx is not None and obj_cls:
+            _int_attrs = self._per_class_int_attrs.get(obj_cls, set())
+            _bool_attrs = self._per_class_bool_attrs.get(obj_cls, set())
+            if node.attr in _int_attrs or node.attr in _bool_attrs:
+                return data_i64
+        # Boxed unclassified slot: may hold int, float, str, or other types
+        # at runtime (e.g. TypedValue.value receives both int and float
+        # across different class variants / call sites).
+        # Load the runtime tag and return as FpyValue so downstream consumers
+        # (binop, compare, etc.) use correct type dispatch.
+        if slot_idx is not None:
+            init_only = self._is_init_only_attr(node)
+            _fv_tag_val, _fv_data_val = self._emit_slot_get_direct(
+                obj, slot_idx, init_only=init_only, cls_name=obj_cls)
+            fv = ir.Constant(fpy_val, ir.Undefined)
+            fv = self.builder.insert_value(fv, _fv_tag_val, 0)
+            fv = self.builder.insert_value(fv, _fv_data_val, 1)
+            return fv
+        # Default (no slot, fallback getter): the object's class and attr
+        # type are both unknown.  Load the runtime tag from the already-
+        # allocated tag_slot and return FpyValue so downstream consumers
+        # (binop, compare, print, etc.) use correct type dispatch instead
+        # of blindly assuming int.
+        _fv_tag = self.builder.load(tag_slot)
+        fv = ir.Constant(fpy_val, ir.Undefined)
+        fv = self.builder.insert_value(fv, _fv_tag, 0)
+        fv = self.builder.insert_value(fv, data_i64, 1)
+        return fv
 
     def _emit_subscript_store(self, target: ast.Subscript, value: ir.Value,
                               node: ast.AST,
@@ -16863,6 +17630,12 @@ class CodeGen:
                     elif (isinstance(value_node, ast.Constant)
                             and isinstance(value_node.value, float)):
                         return FPY_TAG_FLOAT, value
+                    # float(expr) call — the result is a double bitcast
+                    # to i64 by coerce_to_i64; tag it correctly as FLOAT.
+                    elif (isinstance(value_node, ast.Call)
+                            and isinstance(value_node.func, ast.Name)
+                            and value_node.func.id == "float"):
+                        return FPY_TAG_FLOAT, value
                     elif (isinstance(value_node, ast.Name)
                             and value_node.id in self.variables
                             and self._var_kind(value_node.id) == VKind.STR):
@@ -17034,6 +17807,21 @@ class CodeGen:
             return None
         return slots.get(attr_node.attr)
 
+    def _get_attr_slot_and_class(self, attr_node: ast.Attribute
+                                  ) -> tuple[int | None, str | None]:
+        """Return (slot_idx, class_name) for an obj.attr reference.
+        Both are None if the class can't be determined or attr isn't known.
+        Used by two-region native slot layout to pass cls_name to GEP.
+        """
+        obj_cls = self._infer_object_class(attr_node.value)
+        if not obj_cls:
+            return None, None
+        slots = self._class_attr_slots.get(obj_cls)
+        if not slots:
+            return None, None
+        idx = slots.get(attr_node.attr)
+        return idx, obj_cls if idx is not None else None
+
     def _is_init_only_attr(self, attr_node: ast.Attribute) -> bool:
         """Return True if the attribute load targets an init-only slot,
         meaning the value is set in ``__init__`` and never modified after."""
@@ -17052,16 +17840,20 @@ class CodeGen:
     _FPYVAL_SIZE = 16    # sizeof(FpyValue) on x64
     _FPYVAL_DATA_OFF = 8 # offsetof(FpyValue, data) = 4 (tag) + 4 (pad)
 
-    def _emit_slot_addr_direct(self, obj: ir.Value, slot_idx: int
-                                ) -> tuple[ir.Value, ir.Value]:
-        """Compute (&slot.tag, &slot.data) via inline address arithmetic.
+    def _emit_slot_addr_direct(self, obj: ir.Value, slot_idx: int,
+                                n_native: int = 0
+                                ) -> tuple[ir.Value | None, ir.Value]:
+        """Compute slot addresses via inline address arithmetic.
 
-        Since fastpy_obj_new allocates slots contiguously after the FpyObj
-        header (obj->slots = (FpyValue*)(obj + 1)), we can compute the slot
-        address as (FpyValue*)(obj + 1) + slot_idx — zero memory loads.
-        This eliminates one pointer-chase from the hot path (critical for
-        linked-list traversal where obj changes every iteration and the
-        slots-pointer load cannot be CSE'd across iterations).
+        Two-region layout after FpyObj header:
+          [native: n_native × i64 (8 bytes)]  [boxed: n_boxed × FpyValue (16 bytes)]
+
+        For native slots (slot_idx < n_native):
+          Returns (None, data_addr) where data_addr points to an i64.
+        For boxed slots (slot_idx >= n_native):
+          Returns (tag_addr, data_addr) as before.
+
+        When n_native == 0 (default), all slots are boxed — same as before.
 
         Requires fpy_obj_type to model ALL fields of the C struct so that
         sizeof(fpy_obj_type) == sizeof(FpyObj) in the LLVM data layout."""
@@ -17069,11 +17861,30 @@ class CodeGen:
         # GEP by 1 element → advances by sizeof(FpyObj) bytes → first slot
         past_obj = self.builder.gep(
             obj_typed, [ir.Constant(i32, 1)], inbounds=True)
-        # Cast to FpyValue* (pointer to array of FpyValue)
-        slots_base = self.builder.bitcast(past_obj, fpy_val_ptr)
-        # Index into slot[slot_idx]
+
+        if n_native > 0 and slot_idx < n_native:
+            # ── Native slot: raw i64, 8-byte stride ──
+            # (i64*)(obj + 1) + slot_idx
+            native_base = self.builder.bitcast(past_obj, i64.as_pointer())
+            data_addr = self.builder.gep(
+                native_base, [ir.Constant(i64, slot_idx)], inbounds=True)
+            return None, data_addr
+
+        # ── Boxed slot: FpyValue, 16-byte stride ──
+        if n_native > 0:
+            # Skip past native region: (i64*)(obj+1) + n_native → FpyValue*
+            native_base = self.builder.bitcast(past_obj, i64.as_pointer())
+            past_native = self.builder.gep(
+                native_base, [ir.Constant(i64, n_native)], inbounds=True)
+            slots_base = self.builder.bitcast(past_native, fpy_val_ptr)
+            boxed_idx = slot_idx - n_native
+        else:
+            # All slots are boxed — no native region
+            slots_base = self.builder.bitcast(past_obj, fpy_val_ptr)
+            boxed_idx = slot_idx
+
         slot_addr = self.builder.gep(
-            slots_base, [ir.Constant(i64, slot_idx)], inbounds=True)
+            slots_base, [ir.Constant(i64, boxed_idx)], inbounds=True)
         tag_addr = self.builder.gep(
             slot_addr,
             [ir.Constant(i32, 0), ir.Constant(i32, 0)],
@@ -17084,8 +17895,15 @@ class CodeGen:
             inbounds=True)
         return tag_addr, data_addr
 
+    def _get_n_native_for_class(self, cls_name: str | None) -> int:
+        """Look up the native slot count for a class. Returns 0 if unknown."""
+        if cls_name:
+            return self._class_n_native_slots.get(cls_name, 0)
+        return 0
+
     def _emit_slot_get_direct(self, obj: ir.Value, slot_idx: int,
-                               init_only: bool = False
+                               init_only: bool = False,
+                               cls_name: str | None = None
                                ) -> tuple[ir.Value, ir.Value]:
         """Emit direct IR to load obj->slots[slot_idx], returning (tag, data).
 
@@ -17096,8 +17914,24 @@ class CodeGen:
         When *init_only* is True the slot value was set in ``__init__`` and
         never modified, so both loads are annotated ``!invariant.load`` —
         LLVM can hoist them out of loops and CSE redundant accesses.
+
+        *cls_name* enables two-region layout: if the slot is native
+        (slot_idx < n_native), the tag is synthesized at compile time.
         """
-        tag_addr, data_addr = self._emit_slot_addr_direct(obj, slot_idx)
+        nn = self._get_n_native_for_class(cls_name)
+        tag_addr, data_addr = self._emit_slot_addr_direct(obj, slot_idx, nn)
+        if tag_addr is None:
+            # Native slot — no tag in memory, synthesize the correct tag
+            # from the compile-time tag map (float→FLOAT, bool→BOOL, int→INT).
+            slot_tag = self._class_native_slot_tags.get(cls_name, {}).get(
+                slot_idx, FPY_TAG_INT)
+            tag = ir.Constant(i32, slot_tag)
+            data = self.builder.load(data_addr)
+            if init_only:
+                if not hasattr(self, "_invariant_md"):
+                    self._invariant_md = self.module.add_metadata([])
+                data.set_metadata("invariant.load", self._invariant_md)
+            return tag, data
         tag = self.builder.load(tag_addr)
         data = self.builder.load(data_addr)
         if init_only:
@@ -17108,7 +17942,8 @@ class CodeGen:
         return tag, data
 
     def _emit_slot_get_data_only(self, obj: ir.Value, slot_idx: int,
-                                  init_only: bool = False) -> ir.Value:
+                                  init_only: bool = False,
+                                  cls_name: str | None = None) -> ir.Value:
         """Load only obj->slots[slot_idx].data (i64) — skips the tag load
         for statically-typed slot accesses (where the caller doesn't need
         the runtime tag). Shaves one memory load and its dead-load hazards
@@ -17116,8 +17951,11 @@ class CodeGen:
 
         When *init_only* is True the data load is annotated
         ``!invariant.load`` — LLVM can hoist it out of loops.
+
+        *cls_name* enables two-region layout for correct offset computation.
         """
-        _, data_addr = self._emit_slot_addr_direct(obj, slot_idx)
+        nn = self._get_n_native_for_class(cls_name)
+        _, data_addr = self._emit_slot_addr_direct(obj, slot_idx, nn)
         data = self.builder.load(data_addr)
         if init_only:
             if not hasattr(self, "_invariant_md"):
@@ -17127,7 +17965,8 @@ class CodeGen:
 
     def _emit_slot_set_direct(self, obj: ir.Value, slot_idx: int,
                                tag: ir.Value, data: ir.Value,
-                               skip_tag: bool = False) -> None:
+                               skip_tag: bool = False,
+                               cls_name: str | None = None) -> None:
         """Emit direct IR to store (tag, data) into obj->slots[slot_idx].
 
         Skips the fastpy_obj_set_slot function-call overhead.
@@ -17135,12 +17974,15 @@ class CodeGen:
         field is left unchanged.  Used for monomorphic scalar slots where
         the tag is always the same constant (Optimization #2).
 
+        *cls_name* enables two-region layout for correct offset computation.
+
         NOTE: This is a raw store — callers are responsible for
         increfing the new value (if borrowed) and decrefing the old
         value.  The higher-level ``_emit_attr_store`` handles this.
         """
-        tag_addr, data_addr = self._emit_slot_addr_direct(obj, slot_idx)
-        if not skip_tag:
+        nn = self._get_n_native_for_class(cls_name)
+        tag_addr, data_addr = self._emit_slot_addr_direct(obj, slot_idx, nn)
+        if tag_addr is not None and not skip_tag:
             self.builder.store(tag, tag_addr)
         self.builder.store(data, data_addr)
 
@@ -17465,7 +18307,7 @@ class CodeGen:
                 # where `self.data = data` with a list param stored
                 # tag=INT instead of tag=LIST, causing len(obj.data) to
                 # return 0.
-                slot_idx = self._get_attr_slot(target)
+                slot_idx, _store_cls = self._get_attr_slot_and_class(target)
                 if slot_idx is not None:
                     fv = self.builder.load(alloca_var, name=f"{value_node.id}.fv")
                     tag_val = self.builder.extract_value(fv, 0)
@@ -17483,7 +18325,7 @@ class CodeGen:
                     if not _fresh:
                         # Load old slot value for decref after store.
                         old_tag, old_data = self._emit_slot_get_direct(
-                            obj, slot_idx)
+                            obj, slot_idx, cls_name=_store_cls)
                     # Incref the value being stored — the variable's
                     # alloca holds a borrowed reference; the slot needs
                     # its own.  rc_incref is a no-op for scalars (INT,
@@ -17491,7 +18333,8 @@ class CodeGen:
                     self.builder.call(self.runtime["rc_incref"],
                                       [tag_val, data_val])
                     self._emit_slot_set_direct(
-                        obj, slot_idx, tag_val, data_val)
+                        obj, slot_idx, tag_val, data_val,
+                        cls_name=_store_cls)
                     if not _fresh:
                         # Decref old after store (safe order: incref-new →
                         # store → decref-old avoids premature free when
@@ -17528,14 +18371,14 @@ class CodeGen:
                         _is_nullable_obj_attr = True
                         break
             if _is_nullable_obj_attr:
-                src_slot = self._get_attr_slot(value_node)
-                tgt_slot = self._get_attr_slot(target)
+                src_slot, _src_cls = self._get_attr_slot_and_class(value_node)
+                tgt_slot, _tgt_cls = self._get_attr_slot_and_class(target)
                 if src_slot is not None and tgt_slot is not None:
                     # Both slots known — direct copy with refcounting.
                     rhs_obj = self._emit_expr_value(value_node.value)
                     rhs_obj = self._ensure_ptr(rhs_obj)
                     tag_val, data_val = self._emit_slot_get_direct(
-                        rhs_obj, src_slot)
+                        rhs_obj, src_slot, cls_name=_src_cls)
                     _fresh = (self._compiling_init
                               and not self._loop_stack
                               and isinstance(target.value, ast.Name)
@@ -17544,12 +18387,13 @@ class CodeGen:
                     if not _fresh:
                         # Load old target value before overwriting.
                         old_tag, old_data = self._emit_slot_get_direct(
-                            obj, tgt_slot)
+                            obj, tgt_slot, cls_name=_tgt_cls)
                     # Incref new value (slot needs its own reference).
                     self.builder.call(self.runtime["rc_incref"],
                                       [tag_val, data_val])
                     self._emit_slot_set_direct(
-                        obj, tgt_slot, tag_val, data_val)
+                        obj, tgt_slot, tag_val, data_val,
+                        cls_name=_tgt_cls)
                     if not _fresh:
                         self.builder.call(self.runtime["rc_decref"],
                                           [old_tag, old_data])
@@ -17570,14 +18414,15 @@ class CodeGen:
                                        _tag_s, _data_s])
                     tag_val = self.builder.load(_tag_s)
                     data_val = self.builder.load(_data_s)
-                    tgt_slot2 = self._get_attr_slot(target)
+                    tgt_slot2, _tgt_cls2 = self._get_attr_slot_and_class(target)
                     if tgt_slot2 is not None:
                         old_tag2, old_data2 = self._emit_slot_get_direct(
-                            obj, tgt_slot2)
+                            obj, tgt_slot2, cls_name=_tgt_cls2)
                         self.builder.call(self.runtime["rc_incref"],
                                           [tag_val, data_val])
                         self._emit_slot_set_direct(
-                            obj, tgt_slot2, tag_val, data_val)
+                            obj, tgt_slot2, tag_val, data_val,
+                            cls_name=_tgt_cls2)
                         self.builder.call(self.runtime["rc_decref"],
                                           [old_tag2, old_data2])
                     else:
@@ -17593,7 +18438,7 @@ class CodeGen:
         if value.type is fpy_val:
             tag_val = self.builder.extract_value(value, 0, name="fv.tag")
             data_val = self.builder.extract_value(value, 1, name="fv.data")
-            slot_idx = self._get_attr_slot(target)
+            slot_idx, _store_cls = self._get_attr_slot_and_class(target)
             if slot_idx is not None:
                 _fresh = (self._compiling_init
                           and not self._loop_stack
@@ -17602,11 +18447,12 @@ class CodeGen:
                           and slot_idx not in self._init_stored_slots)
                 if not _fresh:
                     old_tag, old_data = self._emit_slot_get_direct(
-                        obj, slot_idx)
+                        obj, slot_idx, cls_name=_store_cls)
                 self.builder.call(self.runtime["rc_incref"],
                                   [tag_val, data_val])
                 self._emit_slot_set_direct(
-                    obj, slot_idx, tag_val, data_val)
+                    obj, slot_idx, tag_val, data_val,
+                    cls_name=_store_cls)
                 if not _fresh:
                     self.builder.call(self.runtime["rc_decref"],
                                       [old_tag, old_data])
@@ -17709,13 +18555,16 @@ class CodeGen:
             # Saves 2 memory ops (old tag+data load) + 1 function call
             # (rc_decref) + 1 memory op (tag store) per attribute write.
             _is_mono_scalar = False
+            _store_cls = self._infer_object_class(target.value)
             if (isinstance(target.value, ast.Name)
                     and target.value.id == "self"
                     and self._current_class):
                 _mc = self._current_class
+                _store_cls = _store_cls or _mc
                 _ma = target.attr
                 if (_ma in self._per_class_float_attrs.get(_mc, set())
-                        or _ma in self._per_class_bool_attrs.get(_mc, set())):
+                        or _ma in self._per_class_bool_attrs.get(_mc, set())
+                        or _ma in self._per_class_int_attrs.get(_mc, set())):
                     _is_mono_scalar = True
             _fresh = (self._compiling_init
                       and not self._loop_stack
@@ -17724,12 +18573,19 @@ class CodeGen:
                       and slot_idx not in self._init_stored_slots)
             if not _fresh and not _is_mono_scalar:
                 # Decref old slot value (may be non-trivial on reassignment).
-                old_tag, old_data = self._emit_slot_get_direct(obj, slot_idx)
+                old_tag, old_data = self._emit_slot_get_direct(
+                    obj, slot_idx, cls_name=_store_cls)
                 self.builder.call(self.runtime["rc_decref"],
                                   [old_tag, old_data])
+            # skip_tag: monomorphic scalar slots skip the tag store on
+            # NON-FIRST writes (the tag never changes after the initial
+            # write).  The FIRST write in __init__ must always store the
+            # tag because fastpy_obj_new initialises all boxed slots to
+            # {NONE, 0} — without the tag store the slot keeps NONE.
             self._emit_slot_set_direct(
                 obj, slot_idx, tag_const, data,
-                skip_tag=_is_mono_scalar)
+                skip_tag=(_is_mono_scalar and not _fresh),
+                cls_name=_store_cls)
             # Incref new value unless it's an owned reference (steal)
             # or a scalar type (INT, FLOAT, BOOL, NONE have no heap
             # allocation so incref is a no-op — skip the function call).
@@ -18126,6 +18982,23 @@ class CodeGen:
             if (isinstance(node.value, int)
                     and (node.value > 2**63 - 1 or node.value < -(2**63))):
                 return ValueType(VKind.BIGINT)
+        # Ternary: `x if cond else y` → infer from whichever branch
+        # has a concrete (non-scalar) type.  Covers patterns like
+        # `errors if errors is not None else []` where the result is
+        # a list, not a string (the i8* pointer default).
+        if isinstance(node, ast.IfExp):
+            body_tag = self._infer_type_tag(node.body, value)
+            else_tag = self._infer_type_tag(node.orelse, value)
+            # Prefer the non-default-int branch (lists, dicts, etc.)
+            # but NEVER prefer NONE — that would make `10 if C else None`
+            # typed as NONE, breaking equality comparisons (`val == 10`
+            # would constant-fold to False via the NONE fast-path).
+            _skip = (VKind.INT, VKind.UNKNOWN, VKind.NONE)
+            if body_tag.kind not in _skip:
+                return body_tag
+            if else_tag.kind not in _skip:
+                return else_tag
+            return body_tag
         # Constant-folded BigInt/Complex: BinOp/UnaryOp that evaluated at compile time
         if isinstance(node, (ast.BinOp, ast.UnaryOp)):
             folded = self._try_constant_fold(node)
@@ -19144,6 +20017,17 @@ class CodeGen:
                                and _et_kind in (VKind.INT, VKind.NONE,
                                                 VKind.MIXED, VKind.UNKNOWN,
                                                 VKind.FVALUE))
+                    # Safety net: when per-position analysis says INT but
+                    # the overall elem_type is FLOAT (from _func_ret_types
+                    # or CSA), the position analysis probably failed
+                    # (_infer_elt_kind defaults to INT).  Use FV path to
+                    # preserve the actual runtime tag.
+                    if (not _use_fv
+                            and _et_kind == VKind.INT
+                            and i in _ret_pos_types
+                            and isinstance(elem_type, ValueType)
+                            and elem_type.kind == VKind.FLOAT):
+                        _use_fv = True
                     if isinstance(tgt, ast.Name):
                         if _use_fv:
                             elem_tag, elem_data = self._fv_list_get(
@@ -19233,7 +20117,8 @@ class CodeGen:
                     slot_idx = self._get_attr_slot(tgt)
                     if slot_idx is not None:
                         self._emit_slot_set_direct(
-                            obj, slot_idx, elem_tag, elem_data)
+                            obj, slot_idx, elem_tag, elem_data,
+                            cls_name=self._infer_object_class(tgt.value))
                     else:
                         self._rt_call("obj_set_fv",
                                       [obj, attr_name, elem_tag, elem_data])
@@ -20637,6 +21522,67 @@ class CodeGen:
         self.variables[name] = (alloca, type_tag)
         self.builder.store(fv, alloca)
 
+    def _extract_fv_tag_data_or_static(self, tv, vkind, ast_node):
+        """Extract (tag, data) for a BinOp operand.
+
+        If the operand is stored as an FpyValue alloca with a runtime tag,
+        extract both tag and data from the FpyValue.  Otherwise, use the
+        static compile-time tag.  This handles mixed-type variables whose
+        static type (e.g. INT) doesn't match the runtime type (e.g. STR).
+        """
+        # Check if the value is already an FpyValue struct (inline)
+        if (isinstance(tv.val.type, ir.LiteralStructType)
+                and tv.val.type == fpy_val):
+            tag = self.builder.extract_value(tv.val, 0)
+            data = self.builder.extract_value(tv.val, 1)
+            return tag, data
+        # Check if the variable is stored as an FpyValue alloca
+        if isinstance(ast_node, ast.Name) and ast_node.id in self.variables:
+            _a, _ = self.variables[ast_node.id]
+            if (isinstance(_a.type, ir.PointerType)
+                    and _a.type.pointee is fpy_val):
+                _fv = self.builder.load(_a)
+                tag = self.builder.extract_value(_fv, 0)
+                data = self.builder.extract_value(_fv, 1)
+                return tag, data
+        # Check if this is self.attr where attr is an FpyValue slot.
+        # The attribute access only loads the data field; the tag field
+        # is skipped.  Reload both tag and data from the object slot so
+        # fv_binop uses the correct runtime type.
+        if (isinstance(ast_node, ast.Attribute)
+                and isinstance(ast_node.value, ast.Name)
+                and ast_node.value.id == "self"
+                and self._current_class):
+            _slots = self._class_attr_slots.get(self._current_class, {})
+            _si = _slots.get(ast_node.attr)
+            if _si is not None and "self" in self.variables:
+                _self_a, _ = self.variables["self"]
+                _self_ptr = self.builder.load(_self_a)
+                if isinstance(_self_ptr.type, ir.LiteralStructType):
+                    _self_ptr = self.builder.extract_value(_self_ptr, 1)
+                    _self_ptr = self.builder.inttoptr(_self_ptr, i8_ptr)
+                elif isinstance(_self_ptr.type, ir.IntType):
+                    _self_ptr = self.builder.inttoptr(_self_ptr, i8_ptr)
+                _obj_ty = ir.LiteralStructType(
+                    [i64, i64, i64, i64, i64, i8_ptr, i8_ptr])
+                _obj_p = self.builder.bitcast(_self_ptr, ir.PointerType(_obj_ty))
+                # Slots start after the object header (at offset +1)
+                _slots_base = self.builder.gep(
+                    _obj_p, [ir.Constant(i32, 1)], inbounds=True)
+                _fv_base = self.builder.bitcast(
+                    _slots_base, ir.PointerType(fpy_val))
+                _slot_p = self.builder.gep(
+                    _fv_base, [ir.Constant(i64, _si)], inbounds=True)
+                _tag_p = self.builder.gep(
+                    _slot_p, [ir.Constant(i32, 0),
+                              ir.Constant(i32, 0)], inbounds=True)
+                _data_p = self.builder.gep(
+                    _slot_p, [ir.Constant(i32, 0),
+                              ir.Constant(i32, 1)], inbounds=True)
+                return self.builder.load(_tag_p), self.builder.load(_data_p)
+        # Default: use static tag
+        return ir.Constant(i32, tv.vtype.kind.fpy_tag), tv.as_i64(self.builder)
+
     def _fv_build_from_slots(self, tag: ir.Value, data: ir.Value) -> ir.Value:
         """Build an FpyValue from (i32 tag, i64 data).
 
@@ -20934,7 +21880,16 @@ class CodeGen:
         self.builder.position_at_end(then_block)
         if narrowing:
             for _nv, _na, _ot, _tk in narrowing:
-                self.variables[_nv] = (_na, ValueType(_tk))
+                _narrow_vt = ValueType(_tk)
+                # When narrowing a MIXED variable to a container type
+                # (list, tuple), preserve MIXED as the element type so
+                # subscript access returns a full FpyValue with the
+                # runtime tag.  Without this, _get_list_elem_type
+                # defaults to INT and the element's type tag is lost.
+                if (_tk in (VKind.LIST, VKind.TUPLE)
+                        and self._tag_kind(_ot) == VKind.MIXED):
+                    _narrow_vt = ValueType(_tk, elem_type=ValueType(VKind.MIXED))
+                self.variables[_nv] = (_na, _narrow_vt)
         self._emit_stmts(node.body)
         if narrowing:
             for _nv, _na, _ot, _tk in narrowing:
@@ -21900,7 +22855,7 @@ class CodeGen:
                     slot_idx = slots.get(attr_name)
                     if slot_idx is not None:
                         tag_a, data_a = self._emit_slot_get_direct(
-                            obj_ptr, slot_idx)
+                            obj_ptr, slot_idx, cls_name=cls_name)
                         fv_a = self._fv_build_from_slots(tag_a, data_a)
                         cond = self._emit_match_pattern(
                             fv_a, tag_a, data_a, kwd_pat, node)
@@ -21919,7 +22874,7 @@ class CodeGen:
                     si = slots.get(attr_name) if attr_name else None
                     if si is not None:
                         tag_p, data_p = self._emit_slot_get_direct(
-                            obj_ptr, si)
+                            obj_ptr, si, cls_name=cls_name)
                         fv_p = self._fv_build_from_slots(tag_p, data_p)
                         cond = self._emit_match_pattern(
                             fv_p, tag_p, data_p, pos_pat, node)
@@ -23486,6 +24441,29 @@ class CodeGen:
 
         self._bridge_fallback_stmt(node, "unsupported raise expression")
 
+    def _is_float_expr(self, node: ast.expr) -> bool:
+        """Check if an expression definitely produces a float value.
+
+        Returns True for division, float literals, float(), and expressions
+        containing division/float constants.  Returns False for ambiguous
+        cases (variables, function calls, subscripts) — conservative.
+        """
+        if isinstance(node, ast.Constant):
+            return isinstance(node.value, float)
+        if isinstance(node, ast.BinOp):
+            if isinstance(node.op, ast.Div):
+                return True
+            if any(isinstance(n, ast.Constant) and isinstance(n.value, float)
+                   for n in ast.walk(node)):
+                return True
+            if any(isinstance(n, ast.BinOp) and isinstance(n.op, ast.Div)
+                   for n in ast.walk(node)):
+                return True
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            if node.func.id == "float":
+                return True
+        return False
+
     def _emit_return(self, node: ast.Return) -> None:
         """Emit a return statement.
 
@@ -23504,46 +24482,50 @@ class CodeGen:
                 # For FV-returning functions, check if the function's static
                 # return type is float — if so, promote int returns to float
                 # before wrapping, so the runtime tag matches what callers
-                # expect.
+                # expect.  Exception: if the return expression is an FV-backed
+                # variable, return the raw FpyValue directly to preserve the
+                # runtime tag.  This handles mixed-type functions like
+                # `median` which return int in one branch and float in another.
                 ret_info = next(
                     (i for i in self._user_functions.values()
                      if i.func is self.function), None)
                 if (ret_info is not None
                         and ret_info.static_ret_type is double):
-                    # Force float tag: evaluate, promote int→double, wrap.
-                    # In FV-ABI, parameters may carry float values with
-                    # "int" static tag (because call-site analysis couldn't
-                    # determine types).  For Name returns that might be
-                    # FV-backed, load the raw FpyValue and use the runtime
-                    # tag to pick bitcast (float data) vs sitofp (int data).
+                    # For FV-backed variables, return raw FV to preserve
+                    # runtime tag (handles mixed int/float return functions).
                     if (self._USE_FV_LOCALS
                             and isinstance(node.value, ast.Name)
                             and node.value.id in self.variables):
                         alloca, _vtag = self.variables[node.value.id]
                         if (isinstance(alloca.type, ir.PointerType)
                                 and alloca.type.pointee is fpy_val):
-                            fv = self.builder.load(alloca, name=f"{node.value.id}.retfv")
-                            tag = self.builder.extract_value(fv, 0)
-                            data = self.builder.extract_value(fv, 1)
-                            is_float = self.builder.icmp_unsigned(
-                                "==", tag, ir.Constant(i32, FPY_TAG_FLOAT))
-                            float_val = self.builder.bitcast(data, double)
-                            int_val = self.builder.sitofp(data, double)
-                            bare = self.builder.select(is_float, float_val, int_val)
-                            value = self._fv_from_float(bare)
+                            value = self.builder.load(alloca, name=f"{node.value.id}.retfv")
                         else:
                             bare = self._emit_expr_value(node.value)
                             if isinstance(bare.type, ir.IntType):
                                 bare = self.builder.sitofp(bare, double)
                             value = self._fv_from_float(bare)
                     else:
+                        # Non-Name expression (e.g. `return x / y`): evaluate
+                        # and wrap with the natural type from the LLVM value.
                         bare = self._emit_expr_value(node.value)
-                        if isinstance(bare.type, ir.IntType):
+                        if isinstance(bare.type, ir.DoubleType):
+                            value = self._fv_from_float(bare)
+                        elif isinstance(bare.type, ir.IntType):
                             if bare.type.width == 1 or bare.type.width == 32:
                                 bare = self.builder.zext(bare, i64)
-                            if isinstance(bare.type, ir.IntType):
+                            # Check if this expression is KNOWN to be float
+                            # (e.g. division, float literal, float binop).
+                            if self._is_float_expr(node.value):
                                 bare = self.builder.sitofp(bare, double)
-                        value = self._fv_from_float(bare)
+                                value = self._fv_from_float(bare)
+                            else:
+                                value = self._fv_from_int(bare)
+                        elif (isinstance(bare.type, ir.LiteralStructType)
+                              and bare.type == fpy_val):
+                            value = bare
+                        else:
+                            value = self._wrap_bare_to_fv(bare, "int")
                 else:
                     value = self._load_or_wrap_fv(node.value)
             else:
@@ -23564,7 +24546,8 @@ class CodeGen:
                         _yield_obj = self._emit_expr_value(node.value.value)
                         _yield_obj = self._ensure_ptr(_yield_obj)
                         _yield_tag, _yield_data = self._emit_slot_get_direct(
-                            _yield_obj, _yield_slot)
+                            _yield_obj, _yield_slot,
+                            cls_name=self._current_class)
                         self.builder.call(
                             self.runtime["set_ret_tag"], [_yield_tag])
                         value = _yield_data
@@ -23622,9 +24605,23 @@ class CodeGen:
                 self.builder.call(self.runtime["rc_incref"],
                                   [_ret_tag, _ret_data])
             elif isinstance(value.type, ir.PointerType):
-                # Pointer return (e.g. raw obj pointer)
+                # Pointer return: use the runtime tag from the FpyValue
+                # alloca when available instead of hardcoding OBJ.
+                # Strings live in read-only memory; calling rc_incref
+                # with OBJ tag on a string pointer dereferences it as
+                # a FpyObj header and writes to read-only memory → crash.
                 _ret_data = self.builder.ptrtoint(value, i64)
-                _ret_tag = ir.Constant(i32, FPY_TAG_OBJ)
+                _rv_alloca2, _rv_vtag2 = self.variables.get(
+                    ret_var_name, (None, None))
+                if (_rv_alloca2 is not None
+                        and isinstance(_rv_alloca2.type, ir.PointerType)
+                        and _rv_alloca2.type.pointee is fpy_val):
+                    _rv_fv2 = self.builder.load(
+                        _rv_alloca2, name=f"{ret_var_name}.rc_fv")
+                    _ret_tag = self.builder.extract_value(
+                        _rv_fv2, 0, name=f"{ret_var_name}.rc_tag")
+                else:
+                    _ret_tag = ir.Constant(i32, FPY_TAG_OBJ)
                 self.builder.call(self.runtime["rc_incref"],
                                   [_ret_tag, _ret_data])
         # If returning a Subscript or Attribute expression, the value is
@@ -23660,6 +24657,20 @@ class CodeGen:
                     data = self.builder.extract_value(value, 1)
                     self.builder.call(self.runtime["set_ret_tag"], [tag])
                     self.builder.ret(data)
+                    return
+                # FpyValue → i8* conversion: same as above but for methods
+                # returning pointers (str/obj/list/dict).  Extract the
+                # runtime tag from the FpyValue and store it via set_ret_tag
+                # so the caller can recover the type.  Without this,
+                # _SafeIRBuilder.ret silently strips the tag and
+                # _infer_ret_tag_for_value falls through to INT (wrong).
+                if (isinstance(expected, ir.PointerType)
+                        and isinstance(value.type, ir.LiteralStructType)):
+                    tag = self.builder.extract_value(value, 0)
+                    data = self.builder.extract_value(value, 1)
+                    self.builder.call(self.runtime["set_ret_tag"], [tag])
+                    ptr = self.builder.inttoptr(data, expected)
+                    self.builder.ret(ptr)
                     return
                 # Save original value before type conversion so tag
                 # inference can see the pre-conversion type (e.g. pointer
@@ -23729,9 +24740,11 @@ class CodeGen:
                             self.builder.call(
                                 self.runtime["set_ret_tag"], [_fwd_tag])
                             _used_fv_tag = True
-                    # Closure call return: forward inner callee's ret_tag
+                    # Closure call return: forward inner callee's ret_tag.
+                    # Applies to both closures and methods that return the
+                    # result of calling a local closure variable — the inner
+                    # callee already set fpy_ret_tag with the correct type.
                     if (not _used_fv_tag
-                            and _is_closure
                             and isinstance(node.value, ast.Call)
                             and isinstance(node.value.func, ast.Name)
                             and node.value.func.id in self.variables
@@ -23742,9 +24755,41 @@ class CodeGen:
                         self.builder.call(
                             self.runtime["set_ret_tag"], [_fwd_tag])
                         _used_fv_tag = True
+                    # Self-attribute return: read the runtime tag from
+                    # the object slot.  The static _infer_ret_tag_for_value
+                    # defaults pointer-typed values to STR, which is wrong
+                    # when the attr is actually None or an obj at runtime.
+                    if (not _used_fv_tag
+                            and _is_method
+                            and isinstance(node.value, ast.Attribute)
+                            and isinstance(node.value.value, ast.Name)
+                            and node.value.value.id == "self"):
+                        _slot_idx = self._get_attr_slot(node.value)
+                        if _slot_idx is not None:
+                            _self_ptr = self._emit_expr_value(
+                                node.value.value)
+                            _self_ptr = self._ensure_ptr(_self_ptr)
+                            _slot_tag, _ = self._emit_slot_get_direct(
+                                _self_ptr, _slot_idx,
+                                cls_name=self._current_class)
+                            self.builder.call(
+                                self.runtime["set_ret_tag"],
+                                [_slot_tag])
+                            _used_fv_tag = True
                     if not _used_fv_tag:
+                        # When conversion was i64→i8* (inttoptr), the raw
+                        # data came from a list/dict subscript whose method
+                        # was declared i8* because elements are strings.
+                        # Use the post-conversion pointer for tag inference
+                        # so it enters the PointerType branch (defaults to
+                        # STR) instead of the IntType branch (defaults to INT).
+                        _tag_value = (value
+                                      if (isinstance(expected, ir.PointerType)
+                                          and isinstance(
+                                              pre_conv_value.type, ir.IntType))
+                                      else pre_conv_value)
                         tag = self._infer_ret_tag_for_value(
-                            pre_conv_value, node.value)
+                            _tag_value, node.value)
                         self.builder.call(self.runtime["set_ret_tag"],
                                           [ir.Constant(i32, tag)])
                 self.builder.ret(value)
@@ -23772,7 +24817,8 @@ class CodeGen:
                                 node.value.value)
                             _self_ptr = self._ensure_ptr(_self_ptr)
                             _slot_tag, _ = self._emit_slot_get_direct(
-                                _self_ptr, _slot_idx)
+                                _self_ptr, _slot_idx,
+                                cls_name=self._current_class)
                             self.builder.call(
                                 self.runtime["set_ret_tag"],
                                 [_slot_tag])
@@ -23884,6 +24930,12 @@ class CodeGen:
         """Infer the FpyValue tag for a bare LLVM value being returned.
         Used by closures and methods to store the runtime tag in
         fpy_ret_tag so callers using get_ret_tag() recover the type."""
+        # Explicit None constant → always NONE tag, regardless of LLVM type.
+        # This handles `return None` in methods declared as returning i8*
+        # (where the None is compiled as inttoptr(i64 0) → null pointer,
+        # which would otherwise default to STR in the PointerType branch).
+        if isinstance(node, ast.Constant) and node.value is None:
+            return FPY_TAG_NONE
         if isinstance(value.type, ir.IntType):
             if value.type.width == 1 or value.type.width == 32:
                 return FPY_TAG_BOOL  # comparisons, bool ops
@@ -24864,6 +25916,7 @@ class CodeGen:
         if elem_kind == VKind.INT and not elem_type.elem_type:
             _from_dict = False
             # Case 1: `for x in var:` where var was assigned from dict[key]
+            # or from list(dict[key]) / sorted(dict[key]) etc.
             if (isinstance(node.iter, ast.Name)
                     and node.iter.id in self.variables):
                 _iter_vt = self.variables[node.iter.id][1]
@@ -24874,14 +25927,25 @@ class CodeGen:
                     tree = getattr(self, '_csa_root_tree', None)
                     if tree:
                         for n in ast.walk(tree):
-                            if (isinstance(n, ast.Assign)
+                            if not (isinstance(n, ast.Assign)
                                     and len(n.targets) == 1
                                     and isinstance(n.targets[0], ast.Name)
-                                    and n.targets[0].id == _iter_name
-                                    and isinstance(n.value, ast.Subscript)
-                                    and isinstance(n.value.value, ast.Name)
-                                    and n.value.value.id in self.variables
-                                    and self._var_kind(n.value.value.id)
+                                    and n.targets[0].id == _iter_name):
+                                continue
+                            # Direct subscript: var = d[key]
+                            _rhs = n.value
+                            # Unwrap list()/sorted()/reversed()/tuple():
+                            # var = list(d[key]) → look at d[key]
+                            if (isinstance(_rhs, ast.Call)
+                                    and isinstance(_rhs.func, ast.Name)
+                                    and _rhs.func.id in (
+                                        "list", "sorted", "reversed", "tuple")
+                                    and _rhs.args):
+                                _rhs = _rhs.args[0]
+                            if (isinstance(_rhs, ast.Subscript)
+                                    and isinstance(_rhs.value, ast.Name)
+                                    and _rhs.value.id in self.variables
+                                    and self._var_kind(_rhs.value.id)
                                         in (VKind.DICT, VKind.DEFAULTDICT)):
                                 _from_dict = True
                                 break
@@ -24982,10 +26046,17 @@ class CodeGen:
         # Decref temporary iterables (e.g. `for x in make_list():`).
         # Named variables are borrowed references — the variable owns
         # them, so only decref when the iterable is a temporary.
+        # Dict/list subscript on a named variable (d[key], lst[i])
+        # also returns a borrowed reference — the container still owns
+        # the list, so decref'ing it would corrupt the container.
         _is_named_var = (isinstance(node.iter, ast.Name)
                          and (node.iter.id in self.variables
                               or node.iter.id in self._global_vars))
-        if not _is_named_var and self._USE_REFCOUNT:
+        _is_borrowed = _is_named_var
+        if not _is_borrowed and isinstance(node.iter, ast.Subscript):
+            if isinstance(node.iter.value, ast.Name):
+                _is_borrowed = True
+        if not _is_borrowed and self._USE_REFCOUNT:
             _tag = ir.Constant(i32, FPY_TAG_LIST)
             _data = self.builder.ptrtoint(list_val, i64)
             self.builder.call(self.runtime["rc_decref"], [_tag, _data])
@@ -27232,13 +28303,26 @@ class CodeGen:
                 return self.builder.bitcast(v, i64)
             elif isinstance(v.type, ir.IntType) and v.type.width != 64:
                 return self.builder.zext(v, i64)
+            elif (isinstance(v.type, ir.LiteralStructType)
+                  and v.type == fpy_val):
+                return self.builder.extract_value(v, 1)  # data field
             return v
 
         # Call __init__ via runtime dispatch — coerce all args to i64
         init_args = []
-        for arg_node in node.args:
+        # Track runtime tags for FpyValue args (tag ir.Value or None)
+        _init_arg_fv_tags: dict[int, ir.Value] = {}
+        # Track AST node for each init arg position (for set_arg_tag)
+        _init_arg_nodes: dict[int, ast.expr] = {}
+        for i, arg_node in enumerate(node.args):
             v = self._emit_expr_value(arg_node)
+            # If the raw value is an FpyValue struct, save its tag before
+            # coercion strips it — needed for set_arg_tag on non-Name exprs.
+            if (isinstance(v.type, ir.LiteralStructType)
+                    and v.type == fpy_val):
+                _init_arg_fv_tags[i] = self.builder.extract_value(v, 0)
             init_args.append(coerce_to_i64(v))
+            _init_arg_nodes[i] = arg_node
 
         defaults = cls_info.init_defaults or []
 
@@ -27249,6 +28333,7 @@ class CodeGen:
             if init_ast is not None:
                 init_params = [a.arg for a in init_ast.args.args[1:]]  # skip self
                 kw_values: dict[int, ir.Value] = {}
+                kw_nodes: dict[int, ast.expr] = {}
                 for kw in node.keywords:
                     if kw.arg is None:
                         continue
@@ -27258,10 +28343,12 @@ class CodeGen:
                     if idx < len(init_args):
                         return self._bridge_fallback_expr(node, f"{class_name}() got multiple values for '{kw.arg}'")
                     kw_values[idx] = coerce_to_i64(self._emit_expr_value(kw.value))
+                    kw_nodes[idx] = kw.value
                 while len(init_args) < cls_info.init_arg_count:
                     idx = len(init_args)
                     if idx in kw_values:
                         init_args.append(kw_values[idx])
+                        _init_arg_nodes[idx] = kw_nodes[idx]
                     else:
                         default_idx = idx - (cls_info.init_arg_count - len(defaults))
                         if default_idx >= 0 and default_idx < len(defaults):
@@ -27328,6 +28415,43 @@ class CodeGen:
                         elif isinstance(param.type, ir.IntType) and isinstance(val.type, ir.DoubleType):
                             val = self.builder.bitcast(val, param.type)
                     direct_args.append(val)
+                # Set arg tags for each init arg so the callee can recover
+                # runtime types for None-default params via get_arg_tag.
+                for _ati in range(n_args):
+                    _at_node = _init_arg_nodes.get(_ati)
+                    # For FV-local variables, extract the runtime tag
+                    _rt_tag_val = None
+                    if (_at_node is not None
+                            and isinstance(_at_node, ast.Name)
+                            and _at_node.id in self.variables):
+                        _v_alloca, _ = self.variables[_at_node.id]
+                        if (isinstance(_v_alloca.type, ir.PointerType)
+                                and _v_alloca.type.pointee is fpy_val):
+                            _fv_ld = self.builder.load(_v_alloca)
+                            _rt_tag_val = self.builder.extract_value(_fv_ld, 0)
+                    # Also check pre-saved FpyValue tags for non-Name
+                    # expressions (e.g. BinOp results passed directly).
+                    if _rt_tag_val is None and _ati in _init_arg_fv_tags:
+                        _rt_tag_val = _init_arg_fv_tags[_ati]
+                    if _rt_tag_val is not None:
+                        self.builder.call(self.runtime["set_arg_tag"],
+                                          [ir.Constant(i32, _ati), _rt_tag_val])
+                    else:
+                        # For default None values, set tag to NONE
+                        _d_idx = _ati - (cls_info.init_arg_count - len(defaults))
+                        if (_at_node is None
+                                and 0 <= _d_idx < len(defaults)
+                                and isinstance(defaults[_d_idx], ast.Constant)
+                                and defaults[_d_idx].value is None):
+                            self.builder.call(self.runtime["set_arg_tag"],
+                                              [ir.Constant(i32, _ati),
+                                               ir.Constant(i32, FPY_TAG_NONE)])
+                        else:
+                            _at_tag, _ = self._bare_to_tag_data(
+                                init_args[_ati], value_node=_at_node)
+                            self.builder.call(self.runtime["set_arg_tag"],
+                                              [ir.Constant(i32, _ati),
+                                               ir.Constant(i32, _at_tag)])
             self.builder.call(init_fn, direct_args)
         elif n_args == 0:
             self.builder.call(self.runtime["obj_call_init0"], [obj])
@@ -27434,7 +28558,8 @@ class CodeGen:
             elif isinstance(data_val.type, ir.IntType) and data_val.type.width != 64:
                 data_val = self.builder.zext(data_val, i64)
 
-            self._emit_slot_set_direct(obj, slot_idx, tag_val, data_val)
+            self._emit_slot_set_direct(obj, slot_idx, tag_val, data_val,
+                                       cls_name=class_name)
 
     def _infer_arg_runtime_tag(self, node: ast.expr) -> 'ir.Value | None':
         """Return an i32 IR value with the correct FPY_TAG for *node*.
@@ -29059,8 +30184,10 @@ class CodeGen:
                 slot_idx = self._get_attr_slot(node)
                 if slot_idx is not None:
                     init_only = self._is_init_only_attr(node)
+                    _fv_cls = self._infer_object_class(node.value)
                     tag_val, data_val = self._emit_slot_get_direct(
-                        obj, slot_idx, init_only=init_only)
+                        obj, slot_idx, init_only=init_only,
+                        cls_name=_fv_cls)
                     return self._fv_build_from_slots(tag_val, data_val)
                 tag_slot = self._create_entry_alloca(i32, "aget.tag")
                 data_slot = self._create_entry_alloca(i64, "aget.data")
@@ -29426,6 +30553,15 @@ class CodeGen:
             }
             if elt.func.id in _builtin_ret:
                 return _builtin_ret[elt.func.id]
+            # max()/min() return the type of their arguments:
+            # max(float_a, float_b) → float.  Infer by checking if any
+            # argument is a known float (param with float call-site arg,
+            # or local assigned from division/float literal).
+            if elt.func.id in ("max", "min") and elt.args:
+                for _ma in elt.args:
+                    _ak = CodeGen._infer_elt_kind(_ma, func_ast, param_to_arg)
+                    if _ak == VKind.FLOAT:
+                        return VKind.FLOAT
         if isinstance(elt, ast.BinOp):
             # String concat: "a" + "b" → STR
             if isinstance(elt.op, ast.Add):
@@ -29435,10 +30571,24 @@ class CodeGen:
                 if (isinstance(elt.right, ast.Constant)
                         and isinstance(elt.right.value, str)):
                     return VKind.STR
+            # True division (/) always returns float in Python 3,
+            # regardless of operand types: 4 / 2 → 2.0.
+            if isinstance(elt.op, ast.Div):
+                return VKind.FLOAT
+            # Mod (%) with a float operand returns float: x % 1.0
+            if isinstance(elt.op, ast.Mod):
+                if any(isinstance(n, ast.Constant) and isinstance(n.value, float)
+                       for n in ast.walk(elt)):
+                    return VKind.FLOAT
             # Float arithmetic: check if ANY sub-expression in the
             # BinOp tree contains a float constant.  This catches
             # `a / (2.0 - b - c)` where 2.0 is in a nested BinOp.
             if any(isinstance(n, ast.Constant) and isinstance(n.value, float)
+                   for n in ast.walk(elt)):
+                return VKind.FLOAT
+            # Division anywhere in the BinOp tree implies float result:
+            # catches `(maxc - r) / rangec` stored via intermediate var.
+            if any(isinstance(n, ast.BinOp) and isinstance(n.op, ast.Div)
                    for n in ast.walk(elt)):
                 return VKind.FLOAT
         if isinstance(elt, ast.Name):
@@ -29822,6 +30972,13 @@ class CodeGen:
                         if _et.kind != VKind.INT:  # non-default → trust it
                             return _et
                         break
+        # list(arg) / sorted(arg) / tuple(arg) — propagate element type
+        # from the argument so `for x in list(val)` has correct tags.
+        if (isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id in ("list", "sorted", "tuple", "reversed")
+                and node.args):
+            return self._get_list_elem_type(node.args[0])
         # Infer from AST
         return self._infer_list_elem_type(node)
 
@@ -30172,6 +31329,10 @@ class CodeGen:
         """Check if an AST expression evaluates to a list."""
         if isinstance(node, (ast.List, ast.ListComp, ast.GeneratorExp)):
             return True
+        # Ternary: `x if cond else []` → list if either branch is a list
+        if isinstance(node, ast.IfExp):
+            return self._is_list_expr(node.body) or self._is_list_expr(node.orelse)
+
         if isinstance(node, ast.Name) and node.id in self.variables:
             kind = self._var_kind(node.id)
             return kind == VKind.LIST
@@ -30730,6 +31891,9 @@ class CodeGen:
     def _is_dict_expr(self, node: ast.expr) -> bool:
         if isinstance(node, (ast.Dict, ast.DictComp)):
             return True
+        if isinstance(node, ast.IfExp):
+            return self._is_dict_expr(node.body) or self._is_dict_expr(node.orelse)
+
         if isinstance(node, ast.Name):
             _kind = VKind.UNKNOWN
             if node.id in self.variables:
@@ -31023,7 +32187,13 @@ class CodeGen:
         return val
 
     def _emit_binop_unknown(self, node, ltv, rtv, lk, rk, op):
-        """Handle binop when either operand has VKind.UNKNOWN (runtime-tag dispatch)."""
+        """Handle binop when either operand has VKind.UNKNOWN or FVALUE (runtime-tag dispatch)."""
+        # Normalize FVALUE → UNKNOWN — both are runtime-tagged FpyValue
+        # structs with identical dispatch semantics.
+        if lk == VKind.FVALUE:
+            lk = VKind.UNKNOWN
+        if rk == VKind.FVALUE:
+            rk = VKind.UNKNOWN
         # For Add with FpyValue operands, check runtime tags for STR.
         # String pointers bitcast to double produce garbage, so we must
         # dispatch to str_concat when both operands are strings.
@@ -31507,11 +32677,12 @@ class CodeGen:
         rk = rtv.vtype.kind
         op = type(node.op)
 
-        # ── UNKNOWN FV operands: runtime-tag arithmetic dispatch ──────
-        # Variables from deep/nested for-loop unpacking have type "unknown"
-        # — the i64 data may be a float bit-pattern, not an integer.
-        # Convert to double via a select(tag==FLOAT, bitcast, sitofp).
-        if lk == VKind.UNKNOWN or rk == VKind.UNKNOWN:
+        # ── UNKNOWN / FVALUE operands: runtime-tag arithmetic dispatch ──
+        # Variables from deep/nested for-loop unpacking have type "unknown",
+        # and boxed unclassified attr slots return FVALUE — the i64 data may
+        # be a float bit-pattern, not an integer.  Convert to double via a
+        # select(tag==FLOAT, bitcast, sitofp).
+        if lk in (VKind.UNKNOWN, VKind.FVALUE) or rk in (VKind.UNKNOWN, VKind.FVALUE):
             return self._emit_binop_unknown(node, ltv, rtv, lk, rk, op)
 
         # ── Fast path: BigInt arithmetic ───────────────────────────────
@@ -31864,10 +33035,14 @@ class CodeGen:
             _fv_ops = {ast.Add: 0, ast.Sub: 1, ast.Mult: 2, ast.Div: 3,
                        ast.FloorDiv: 4, ast.Mod: 5}
             if op in _fv_ops:
-                lt_tag = ir.Constant(i32, ltv.vtype.kind.fpy_tag)
-                lt_data = ltv.as_i64(self.builder)
-                rt_tag = ir.Constant(i32, rtv.vtype.kind.fpy_tag)
-                rt_data = rtv.as_i64(self.builder)
+                # For each operand, try to extract the runtime tag from its
+                # FpyValue alloca if available.  This handles mixed-type
+                # variables (e.g. obj attrs with default=None that can hold
+                # str/None/int at runtime) whose static type might be wrong.
+                lt_tag, lt_data = self._extract_fv_tag_data_or_static(
+                    ltv, lk, node.left)
+                rt_tag, rt_data = self._extract_fv_tag_data_or_static(
+                    rtv, rk, node.right)
                 out_tag = self._create_entry_alloca(i32, "ctbop.tag")
                 out_data = self._create_entry_alloca(i64, "ctbop.data")
                 self.builder.call(self.runtime["fv_binop"],
@@ -34092,7 +35267,8 @@ class CodeGen:
                 _iter_obj = self._emit_expr_value(arg_node.value)
                 _iter_obj = self._ensure_ptr(_iter_obj)
                 _slot_tag, _slot_data = self._emit_slot_get_direct(
-                    _iter_obj, slot_idx)
+                    _iter_obj, slot_idx,
+                    cls_name=self._infer_object_class(arg_node.value))
                 _data_ptr = self.builder.inttoptr(_slot_data, i8_ptr)
 
                 _is_str = self.builder.icmp_unsigned(
@@ -36808,7 +37984,9 @@ class CodeGen:
             if slot_idx is not None:
                 recv = self._emit_expr_value(arg_node.value)
                 recv = self._ensure_ptr(recv)
-                s_tag, s_data = self._emit_slot_get_direct(recv, slot_idx)
+                s_tag, s_data = self._emit_slot_get_direct(
+                    recv, slot_idx,
+                    cls_name=self._infer_object_class(arg_node.value))
                 return self.builder.call(
                     self.runtime["fv_len"], [s_tag, s_data])
 
@@ -38551,7 +39729,7 @@ class CodeGen:
                 _ca_obj = self._emit_expr_value(attr.value)
                 _ca_obj = self._ensure_ptr(_ca_obj)
                 _s_tag, _s_data = self._emit_slot_get_direct(
-                    _ca_obj, _ca_slot_idx)
+                    _ca_obj, _ca_slot_idx, cls_name=_ca_cls)
                 # The slot data holds a function pointer or closure pointer
                 fn_ptr = self.builder.inttoptr(_s_data, i8_ptr)
                 n_args = len(node.args)
@@ -38669,7 +39847,12 @@ class CodeGen:
 
         # Evaluate and coerce args to i64 (runtime dispatch expects i64).
         # For "mixed" params, pass (tag_i64, data_i64) as two separate args.
+        # _arg_fv_tags: save FpyValue runtime tags BEFORE coercion to i64.
+        # Non-Name expressions (subscripts, method calls, binops) lose their
+        # runtime tag when extracted/coerced to i64.  The arg-tag setting
+        # loop below needs these to call set_arg_tag with the correct tag.
         call_args = []
+        _arg_fv_tags: dict[int, ir.Value] = {}
         for arg_idx, arg_node in enumerate(resolved_arg_nodes):
             param_idx = arg_idx + 1  # +1 for self
             v = self._emit_expr_value(arg_node)
@@ -38681,6 +39864,9 @@ class CodeGen:
             else:
                 if (isinstance(v.type, ir.LiteralStructType)
                         and v.type == fpy_val):
+                    # Save the runtime tag before extracting data
+                    _arg_fv_tags[arg_idx] = self.builder.extract_value(
+                        v, 0, name=f"arg{arg_idx}.fv_tag")
                     # FpyValue struct: extract the data part (i64)
                     v = self.builder.extract_value(v, 1)
                 elif isinstance(v.type, ir.PointerType):
@@ -38799,6 +39985,17 @@ class CodeGen:
                         fv = self.builder.insert_value(fv, _rt, 0)
                         fv = self.builder.insert_value(fv, result, 1)
                         return fv
+                    # Vtable pointer return: same as CHA.
+                    if (not is_double_ret
+                            and isinstance(ret_t, ir.PointerType)
+                            and self._direct_method_may_return_ptr(
+                                obj_cls, method)):
+                        _rt = self.builder.call(self.runtime["get_ret_tag"], [])
+                        _data = self.builder.ptrtoint(result, i64)
+                        fv = ir.Constant(fpy_val, ir.Undefined)
+                        fv = self.builder.insert_value(fv, _rt, 0)
+                        fv = self.builder.insert_value(fv, _data, 1)
+                        return fv
                     return result
                 direct_func = None  # no vtable slot → string-based fallback
             if direct_func is not None:
@@ -38888,6 +40085,11 @@ class CodeGen:
                                                          name=f"fv.{_at_node.id}")
                             _rt_tag_val = self.builder.extract_value(
                                 _fv_load, 0, name=f"fv.{_at_node.id}.tag")
+                    # Non-Name expression (subscript, binop, method call)
+                    # whose value was an FpyValue before coercion — use the
+                    # saved runtime tag instead of compile-time inference.
+                    if _rt_tag_val is None and _ati in _arg_fv_tags:
+                        _rt_tag_val = _arg_fv_tags[_ati]
                     if _rt_tag_val is not None:
                         self.builder.call(self.runtime["set_arg_tag"],
                                           [ir.Constant(i32, _ati), _rt_tag_val])
@@ -38915,6 +40117,19 @@ class CodeGen:
                     fv = ir.Constant(fpy_val, ir.Undefined)
                     fv = self.builder.insert_value(fv, _rt, 0)
                     fv = self.builder.insert_value(fv, result, 1)
+                    return fv
+                # Pointer return (i8*): method returns a pointer (e.g. obj_attr
+                # that can be str/None/obj).  The callee set_ret_tag with the
+                # runtime tag — read it and wrap as FpyValue so the caller
+                # preserves the dynamic type (prevents None→STR mistagging).
+                if (isinstance(ret_type, ir.PointerType)
+                        and self._direct_method_may_return_ptr(
+                            obj_cls, method)):
+                    _rt = self.builder.call(self.runtime["get_ret_tag"], [])
+                    _data = self.builder.ptrtoint(result, i64)
+                    fv = ir.Constant(fpy_val, ir.Undefined)
+                    fv = self.builder.insert_value(fv, _rt, 0)
+                    fv = self.builder.insert_value(fv, _data, 1)
                     return fv
                 return result
 
@@ -38950,6 +40165,9 @@ class CodeGen:
                                                      name=f"fv.{_at_node.id}")
                         _rt_tag_val = self.builder.extract_value(
                             _fv_load, 0, name=f"fv.{_at_node.id}.tag")
+                # Non-Name expression with saved FpyValue tag
+                if _rt_tag_val is None and _ati in _arg_fv_tags:
+                    _rt_tag_val = _arg_fv_tags[_ati]
                 if _rt_tag_val is not None:
                     self.builder.call(self.runtime["set_arg_tag"],
                                       [ir.Constant(i32, _ati), _rt_tag_val])
@@ -39004,6 +40222,17 @@ class CodeGen:
                 fv = ir.Constant(fpy_val, ir.Undefined)
                 fv = self.builder.insert_value(fv, _rt, 0)
                 fv = self.builder.insert_value(fv, result, 1)
+                return fv
+            # CHA pointer return: method returns i8* (obj_attr that can be
+            # str/None/obj). Callee set_ret_tag — read and wrap as FpyValue.
+            if (isinstance(ret_type, ir.PointerType)
+                    and not is_double_ret
+                    and self._direct_method_may_return_ptr(None, method)):
+                _rt = self.builder.call(self.runtime["get_ret_tag"], [])
+                _data = self.builder.ptrtoint(result, i64)
+                fv = ir.Constant(fpy_val, ir.Undefined)
+                fv = self.builder.insert_value(fv, _rt, 0)
+                fv = self.builder.insert_value(fv, _data, 1)
                 return fv
             return result
 
@@ -40346,10 +41575,10 @@ class CodeGen:
             inbounds=True,
             name="vti.cls")
 
-        # 3. Load vtable pointer (field 7 = void**).
+        # 3. Load vtable pointer (field 10 = void**).
         vtable_ptr_ptr = self.builder.gep(
             cls_ptr,
-            [ir.Constant(i32, 0), ir.Constant(i32, 7)],
+            [ir.Constant(i32, 0), ir.Constant(i32, 10)],
             inbounds=True)
         vtable_raw = self.builder.load(vtable_ptr_ptr, name="vti.vtbl")
 
@@ -40367,7 +41596,7 @@ class CodeGen:
         # 4. Checked path: validate vtable != NULL && slot < vtable_size.
         vtable_size_ptr = self.builder.gep(
             cls_ptr,
-            [ir.Constant(i32, 0), ir.Constant(i32, 8)],
+            [ir.Constant(i32, 0), ir.Constant(i32, 11)],
             inbounds=True)
         vtable_size_raw = self.builder.load(vtable_size_ptr)
         vtable_size = self.builder.trunc(
@@ -40675,6 +41904,8 @@ class CodeGen:
 
     def _is_obj_expr(self, node: ast.expr) -> bool:
         """Check if an expression evaluates to a user-class object."""
+        if isinstance(node, ast.IfExp):
+            return self._is_obj_expr(node.body) or self._is_obj_expr(node.orelse)
         if isinstance(node, ast.Name) and node.id in self.variables:
             return self._var_kind(node.id) == VKind.OBJ
         # Module-level globals holding user class instances
@@ -40839,7 +42070,217 @@ class CodeGen:
                         if self._direct_method_may_return_ptr(
                                 None, _called):
                             return True
+                # return "..." + expr  or  return expr + "..."
+                # String concatenation or any BinOp involving a string
+                # constant produces a string (pointer).  Also handles
+                # chained concatenation: "a" + "b" + str(x).
+                if isinstance(rv, ast.BinOp) and isinstance(rv.op, ast.Add):
+                    if self._ast_subtree_has_str(rv):
+                        return True
+                # return str(expr), repr(expr) — built-in string producers
+                if (isinstance(rv, ast.Call)
+                        and isinstance(rv.func, ast.Name)
+                        and rv.func.id in ("str", "repr", "chr", "hex",
+                                           "oct", "bin", "format", "type")):
+                    return True
+                # return f"..." — f-string
+                if isinstance(rv, ast.JoinedStr):
+                    return True
+                # return "x".join(y) or var.join(y) — str method calls
+                if (isinstance(rv, ast.Call)
+                        and isinstance(rv.func, ast.Attribute)
+                        and rv.func.attr in ("join", "format", "replace",
+                                             "strip", "lstrip", "rstrip",
+                                             "upper", "lower", "title")):
+                    return True
+                # return local_var — non-param local variable that was
+                # assigned from a string operation.  Check if the method
+                # body assigns it from something that may be a pointer.
+                if (isinstance(rv, ast.Name)
+                        and rv.id != "self"
+                        and rv.id not in {a.arg for a in m_ast.args.args}):
+                    # Local variable — check assignments
+                    for _lv_n in ast.walk(m_ast):
+                        if (isinstance(_lv_n, ast.Assign)
+                                and any(isinstance(t, ast.Name)
+                                        and t.id == rv.id
+                                        for t in _lv_n.targets)):
+                            _lv_rhs = _lv_n.value
+                            # var = method_call() — the method call may return ptr
+                            if isinstance(_lv_rhs, ast.Call):
+                                if (isinstance(_lv_rhs.func, ast.Attribute)
+                                        and isinstance(_lv_rhs.func.value, ast.Name)
+                                        and _lv_rhs.func.value.id == "self"
+                                        and _lv_rhs.func.attr != method_name):
+                                    if self._direct_method_may_return_ptr(
+                                            cn, _lv_rhs.func.attr):
+                                        return True
+                                # var = str(...), etc.
+                                if (isinstance(_lv_rhs.func, ast.Name)
+                                        and _lv_rhs.func.id in (
+                                            "str", "repr", "chr")):
+                                    return True
+                                # var = ClassName(...) — constructor returns obj
+                                if (isinstance(_lv_rhs.func, ast.Name)
+                                        and _lv_rhs.func.id
+                                        in self._user_classes):
+                                    return True
+                            # var = "..." + expr
+                            if (isinstance(_lv_rhs, ast.BinOp)
+                                    and isinstance(_lv_rhs.op, ast.Add)
+                                    and self._ast_subtree_has_str(_lv_rhs)):
+                                return True
         return False
+
+    def _ast_subtree_has_str(self, node: ast.expr) -> bool:
+        """Check if an AST expression subtree contains a string constant
+        or a call to str(), indicating the result is a string."""
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return True
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id in ("str", "repr", "chr")):
+            return True
+        if isinstance(node, ast.JoinedStr):
+            return True
+        if isinstance(node, ast.BinOp):
+            return (self._ast_subtree_has_str(node.left)
+                    or self._ast_subtree_has_str(node.right))
+        return False
+
+    def _infer_method_return_vtype(self, cls_name: str,
+                                    method_name: str) -> str | None:
+        """Infer the var_types tag for the return value of a user-class method.
+
+        Returns ``"str"``, ``"list"``, ``"dict"``, ``"obj"``, ``"float"``,
+        or ``None`` if the type cannot be statically determined.  Used by
+        CSA to tag module-level and local variables assigned from
+        ``obj.method(...)`` calls.
+
+        Works at CSA time using ``_csa_class_asts`` (populated early) rather
+        than ``_user_classes`` (populated later during compilation).
+        """
+        _class_asts = getattr(self, '_csa_class_asts', {})
+        _class_parents = getattr(self, '_csa_class_parents', {})
+        cls_ast = _class_asts.get(cls_name)
+        if cls_ast is None:
+            return None
+        # Find the method FunctionDef in the class body
+        m_ast: ast.FunctionDef | None = None
+        for node in cls_ast.body:
+            if isinstance(node, ast.FunctionDef) and node.name == method_name:
+                m_ast = node
+                break
+        if m_ast is None:
+            # Try parent classes via MRO
+            parent = _class_parents.get(cls_name)
+            while parent:
+                p_ast = _class_asts.get(parent)
+                if p_ast:
+                    for node in p_ast.body:
+                        if (isinstance(node, ast.FunctionDef)
+                                and node.name == method_name):
+                            m_ast = node
+                            cls_name = parent
+                            break
+                if m_ast is not None:
+                    break
+                parent = _class_parents.get(parent)
+            if m_ast is None:
+                return None
+        for n in ast.walk(m_ast):
+            if not (isinstance(n, ast.Return) and n.value is not None):
+                continue
+            rv = n.value
+            # return self
+            if isinstance(rv, ast.Name) and rv.id == "self":
+                return "obj"
+            # return ClassName(...)
+            if (isinstance(rv, ast.Call)
+                    and isinstance(rv.func, ast.Name)
+                    and rv.func.id in _class_asts):
+                return "obj"
+            # return [...]
+            if isinstance(rv, (ast.List, ast.ListComp)):
+                return "list"
+            # return {...}
+            if isinstance(rv, (ast.Dict, ast.DictComp)):
+                return "dict"
+            # return "..." + expr or any BinOp with string
+            if (isinstance(rv, ast.BinOp) and isinstance(rv.op, ast.Add)
+                    and self._ast_subtree_has_str(rv)):
+                return "str"
+            # return "literal"
+            if isinstance(rv, ast.Constant) and isinstance(rv.value, str):
+                return "str"
+            if isinstance(rv, ast.Constant) and isinstance(rv.value, float):
+                return "float"
+            # return str(...), repr(...), etc.
+            if (isinstance(rv, ast.Call)
+                    and isinstance(rv.func, ast.Name)
+                    and rv.func.id in ("str", "repr", "chr", "hex",
+                                       "oct", "bin", "format")):
+                return "str"
+            # return f"..."
+            if isinstance(rv, ast.JoinedStr):
+                return "str"
+            # return "x".join(y), etc.
+            if (isinstance(rv, ast.Call)
+                    and isinstance(rv.func, ast.Attribute)
+                    and rv.func.attr in ("join", "format", "replace",
+                                         "strip", "lstrip", "rstrip",
+                                         "upper", "lower", "title")):
+                return "str"
+            # return local_var — check what it was assigned from
+            if isinstance(rv, ast.Name) and rv.id != "self":
+                _m_params = {a.arg for a in m_ast.args.args}
+                for _a in ast.walk(m_ast):
+                    if not (isinstance(_a, ast.Assign)
+                            and len(_a.targets) == 1
+                            and isinstance(_a.targets[0], ast.Name)
+                            and _a.targets[0].id == rv.id):
+                        continue
+                    rhs = _a.value
+                    # r = self.method() — recurse
+                    if (isinstance(rhs, ast.Call)
+                            and isinstance(rhs.func, ast.Attribute)
+                            and isinstance(rhs.func.value, ast.Name)
+                            and rhs.func.value.id == "self"
+                            and rhs.func.attr != method_name):
+                        sub = self._infer_method_return_vtype(
+                            cls_name, rhs.func.attr)
+                        if sub:
+                            return sub
+                    # r = "..." + expr
+                    if (isinstance(rhs, ast.BinOp)
+                            and isinstance(rhs.op, ast.Add)
+                            and self._ast_subtree_has_str(rhs)):
+                        return "str"
+                    # r = str(...)
+                    if (isinstance(rhs, ast.Call)
+                            and isinstance(rhs.func, ast.Name)
+                            and rhs.func.id in ("str", "repr", "chr")):
+                        return "str"
+                    # r = ClassName(...)
+                    if (isinstance(rhs, ast.Call)
+                            and isinstance(rhs.func, ast.Name)
+                            and rhs.func.id in _class_asts):
+                        return "obj"
+                    # r = [...]
+                    if isinstance(rhs, (ast.List, ast.ListComp)):
+                        return "list"
+                    # r = {...}
+                    if isinstance(rhs, (ast.Dict, ast.DictComp)):
+                        return "dict"
+                    # r = "..." constant
+                    if (isinstance(rhs, ast.Constant)
+                            and isinstance(rhs.value, str)):
+                        return "str"
+                    # r = param — parameter forwarded
+                    if (isinstance(rhs, ast.Name)
+                            and rhs.id in _m_params):
+                        # Can't determine static type from parameter
+                        return None
+        return None
 
     def _infer_constant_value_type(self, node: ast.expr) -> str | None:
         """Infer the Python type tag of a simple expression at AST level.
@@ -41491,7 +42932,8 @@ class CodeGen:
             if _slot is not None:
                 obj = self._emit_expr_value(node.value)
                 obj = self._ensure_ptr(obj)
-                _tag, _data = self._emit_slot_get_direct(obj, _slot)
+                _tag, _data = self._emit_slot_get_direct(
+                    obj, _slot, cls_name=self._current_class)
                 self.builder.call(self.runtime["list_append_fv"],
                                   [list_ptr, _tag, _data])
                 return
@@ -42860,7 +44302,8 @@ class CodeGen:
                         if slot_idx is not None:
                             init_only = self._is_init_only_attr(value.value)
                             tag, data = self._emit_slot_get_direct(
-                                obj, slot_idx, init_only=init_only)
+                                obj, slot_idx, init_only=init_only,
+                                cls_name=self._infer_object_class(value.value.value))
                         else:
                             tag_slot = self._create_entry_alloca(i32, "fattr.tag")
                             data_slot = self._create_entry_alloca(i64, "fattr.data")
