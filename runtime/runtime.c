@@ -901,15 +901,14 @@ int64_t fastpy_safe_mod(int64_t a, int64_t b) {
 
 double fastpy_safe_fdiv(double a, double b) {
     if (b == 0.0) {
-        fastpy_raise(FPY_EXC_ZERODIVISION, "float division by zero");
+        fastpy_raise(FPY_EXC_ZERODIVISION, "division by zero");
         return 0.0;
     }
     return a / b;
 }
 
-/* int/int "true division" that returns float but preserves CPython's
- * "division by zero" error message (CPython only says "float division
- * by zero" when one of the operands is actually a float). */
+/* int/int "true division" that returns float.  CPython 3.14+ uses
+ * "division by zero" for all numeric types (int and float). */
 double fastpy_safe_int_fdiv(int64_t a, int64_t b) {
     if (b == 0) {
         fastpy_raise(FPY_EXC_ZERODIVISION, "division by zero");

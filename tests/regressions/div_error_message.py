@@ -1,6 +1,6 @@
-# Regression: ZeroDivisionError message for int / 0 should say
-# "division by zero" (CPython's exact message), not "float division by
-# zero" — CPython only uses the latter when a float operand is involved.
+# Regression: ZeroDivisionError message should always say "division by
+# zero" to match CPython 3.14+ (which uses this message for all numeric
+# types, including float).
 
 try:
     x = 1 / 0

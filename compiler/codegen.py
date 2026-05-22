@@ -96,7 +96,10 @@ fpy_classdef_type = ir.LiteralStructType([
     i8_ptr, # 10: vtable (void**) → offset 80
     i64,    # 11: vtable_size(i32) + acyclic(u8) + padding → offset 88
     i8_ptr, # 12: mro (int*) → offset 96
-    i64,    # 13: mro_len(i32) + tail padding → offset 104
+    i64,    # 13: mro_len(i32) + padding → offset 104
+    i8_ptr, # 14: class_var_names (const char**) → offset 112
+    i8_ptr, # 15: class_var_values (FpyValue*) → offset 120
+    i64,    # 16: class_var_count(i32) + tail padding → offset 128
 ])
 
 # FpyList layout — must match struct FpyList in objects.h:
@@ -769,6 +772,11 @@ class _SafeIRBuilder(ir.IRBuilder):
     def fcmp_ordered(self, op, lhs, rhs, name='', flags=()):
         """Auto-coerce float comparison operands."""
         if lhs.type != rhs.type:
+            # FpyValue struct → extract data field (i64)
+            if isinstance(lhs.type, ir.LiteralStructType) and lhs.type == fpy_val:
+                lhs = super().extract_value(lhs, 1)
+            if isinstance(rhs.type, ir.LiteralStructType) and rhs.type == fpy_val:
+                rhs = super().extract_value(rhs, 1)
             # int → double
             if isinstance(lhs.type, ir.IntType):
                 lhs = super().sitofp(lhs, ir.DoubleType())
@@ -786,6 +794,11 @@ class _SafeIRBuilder(ir.IRBuilder):
     def fcmp_unordered(self, op, lhs, rhs, name='', flags=()):
         """Auto-coerce float comparison operands."""
         if lhs.type != rhs.type:
+            # FpyValue struct → extract data field (i64)
+            if isinstance(lhs.type, ir.LiteralStructType) and lhs.type == fpy_val:
+                lhs = super().extract_value(lhs, 1)
+            if isinstance(rhs.type, ir.LiteralStructType) and rhs.type == fpy_val:
+                rhs = super().extract_value(rhs, 1)
             if isinstance(lhs.type, ir.IntType):
                 lhs = super().sitofp(lhs, ir.DoubleType())
             if isinstance(rhs.type, ir.IntType):
@@ -794,6 +807,13 @@ class _SafeIRBuilder(ir.IRBuilder):
 
     def _coerce_float_pair(self, lhs, rhs):
         """Coerce operands for float operations (fadd/fsub/fmul/fdiv)."""
+        if lhs.type == rhs.type:
+            return lhs, rhs
+        # FpyValue struct → extract data field (i64)
+        if isinstance(lhs.type, ir.LiteralStructType) and lhs.type == fpy_val:
+            lhs = super().extract_value(lhs, 1)
+        if isinstance(rhs.type, ir.LiteralStructType) and rhs.type == fpy_val:
+            rhs = super().extract_value(rhs, 1)
         if lhs.type == rhs.type:
             return lhs, rhs
         if isinstance(lhs.type, ir.IntType):
@@ -852,6 +872,17 @@ class _SafeIRBuilder(ir.IRBuilder):
         if value.type == typ:
             return value
         return super().trunc(value, typ, name=name)
+
+    def sitofp(self, value, typ, name=''):
+        """Handle sitofp on non-integer types (extract from FpyValue first)."""
+        if isinstance(value.type, ir.LiteralStructType) and value.type == fpy_val:
+            value = super().extract_value(value, 1)
+        if isinstance(value.type, ir.PointerType):
+            value = super().ptrtoint(value, i64)
+        if isinstance(value.type, ir.DoubleType):
+            # Already a double — no conversion needed
+            return value
+        return super().sitofp(value, typ, name=name)
 
     def bitcast(self, value, typ, name=''):
         """Safe bitcast that routes int↔ptr through inttoptr/ptrtoint.
@@ -3988,18 +4019,68 @@ class CodeGen:
                     # in this variable via _gen_apply_decorators.
                     _is_decorated = bool(node.decorator_list)
                     if info is not None and not _is_decorated:
-                        func_ptr = self.builder.ptrtoint(info.func, i64)
-                        alloca, vtype = self.variables[node.name]
-                        _vk = self._tag_kind(vtype)
-                        if isinstance(alloca.type.pointee, ir.LiteralStructType):
-                            # FpyValue alloca — wrap pointer as INT tag
-                            fv = ir.Constant(fpy_val, ir.Undefined)
-                            fv = self.builder.insert_value(
-                                fv, ir.Constant(i32, FPY_TAG_INT), 0)
-                            fv = self.builder.insert_value(fv, func_ptr, 1)
-                            self.builder.store(fv, alloca)
+                        if info.uses_fv_abi:
+                            # FV-ABI function: create i64 wrapper + closure
+                            # so indirect calls dispatch correctly (same as
+                            # _emit_nested_funcdef's FV-ABI path).
+                            wrapper = self._get_or_emit_i64_wrapper(info)
+                            wrapper_ptr = self.builder.bitcast(wrapper, i8_ptr)
+                            closure = self.builder.call(
+                                self.runtime["closure_new"], [
+                                    wrapper_ptr,
+                                    ir.Constant(i32, info.param_count),
+                                    ir.Constant(i32, 0),
+                                ])
+                            if node.args.vararg is not None:
+                                self.builder.call(
+                                    self.runtime["closure_set_vararg"],
+                                    [closure])
+                            if node.args.kwarg:
+                                self.builder.call(
+                                    self.runtime["closure_set_kwarg"],
+                                    [closure])
+                            if node.args.defaults:
+                                self.builder.call(
+                                    self.runtime["closure_set_defaults"],
+                                    [closure, ir.Constant(
+                                        i32, len(node.args.defaults))])
+                                for di, def_node in enumerate(
+                                        node.args.defaults):
+                                    def_val = self._emit_expr_value(def_node)
+                                    if isinstance(def_val.type, ir.PointerType):
+                                        def_val = self.builder.ptrtoint(
+                                            def_val, i64)
+                                    elif (isinstance(def_val.type, ir.IntType)
+                                          and def_val.type.width != 64):
+                                        def_val = self.builder.zext(
+                                            def_val, i64)
+                                    elif isinstance(
+                                            def_val.type, ir.DoubleType):
+                                        def_val = self.builder.bitcast(
+                                            def_val, i64)
+                                    self.builder.call(
+                                        self.runtime["closure_set_default"],
+                                        [closure, ir.Constant(i32, di),
+                                         def_val])
+                            if info.param_names:
+                                self._emit_closure_param_names(
+                                    closure, info.param_names)
+                            self._store_variable(
+                                node.name, closure,
+                                ValueType(VKind.CLOSURE))
                         else:
-                            self.builder.store(func_ptr, alloca)
+                            func_ptr = self.builder.ptrtoint(info.func, i64)
+                            alloca, vtype = self.variables[node.name]
+                            if isinstance(alloca.type.pointee,
+                                          ir.LiteralStructType):
+                                fv = ir.Constant(fpy_val, ir.Undefined)
+                                fv = self.builder.insert_value(
+                                    fv, ir.Constant(i32, FPY_TAG_INT), 0)
+                                fv = self.builder.insert_value(
+                                    fv, func_ptr, 1)
+                                self.builder.store(fv, alloca)
+                            else:
+                                self.builder.store(func_ptr, alloca)
             elif isinstance(node, ast.ClassDef):
                 self._init_class_mutable_defaults(node)
             else:
@@ -4952,13 +5033,13 @@ class CodeGen:
                         self.builder.store(ptr, alloca)
                         self.variables[pname] = (alloca, ValueType(_cap_vk))
                         continue
-                    if _cap_vk == VKind.FLOAT:
+                    elif _cap_vk == VKind.FLOAT:
                         dbl = self.builder.bitcast(param, double)
                         alloca = self.builder.alloca(double, name=pname)
                         self.builder.store(dbl, alloca)
                         self.variables[pname] = (alloca, ValueType(VKind.FLOAT))
                         continue
-                    if _cap_vk == VKind.CLOSURE:
+                    elif _cap_vk == VKind.CLOSURE:
                         ptr = self._ensure_ptr(param)
                         alloca = self.builder.alloca(i8_ptr, name=pname)
                         self.builder.store(ptr, alloca)
@@ -8797,11 +8878,11 @@ class CodeGen:
                 _rtk = self._tag_kind(info.ret_tag)
                 if _rtk == VKind.FLOAT:
                     return "float"
-                if _rtk == VKind.INT:
+                elif _rtk == VKind.INT:
                     return "int"
-                if _rtk == VKind.BOOL:
+                elif _rtk == VKind.BOOL:
                     return "bool"
-                if _rtk == VKind.STR:
+                elif _rtk == VKind.STR:
                     return "str"
         # Float-containing expression
         has_float = any(
@@ -10012,17 +10093,14 @@ class CodeGen:
         # Functions used as first-class values (passed as arguments,
         # stored in lists/dicts) may be invoked through the closure
         # dispatch mechanism (call_ptr0/1/2) which casts the function
-        # pointer to i64(*)(i64,...).  Both FV-ABI ({i32,i64} params
-        # and/or return) and hybrid-ABI (i64 params, {i32,i64} return)
-        # are incompatible with call_ptr → segfault.  Force these to
-        # bare i64(i64,...) ABI so closure dispatch works correctly.
-        _fn_name_abi = _name_override if _name_override else node.name
-        _used_as_value_abi = _fn_name_abi in getattr(self, '_funcs_used_as_values', set())
-        if _used_as_value_abi and not uses_bare:
-            # Force bare-ABI: i64 params and i64 return.
-            # The function body may use complex types, but the ABI
-            # must match call_ptr's i64(*)(i64,...) convention.
-            uses_bare = True
+        # pointer to i64(*)(i64,...).  When the function uses FV-ABI,
+        # _emit_expr_value and _get_or_emit_i64_wrapper transparently
+        # create an i64 shim that reads arg tags, wraps them as
+        # FpyValue, and calls the real function — so call_ptr always
+        # sees an i64(*)(i64,...) entry point.  Do NOT force bare ABI
+        # here: bare ABI strips the runtime tag side-channel, causing
+        # string/list/dict arguments to be misinterpreted as int when
+        # the function is called indirectly with types CSA never saw.
         uses_fv = (not (has_vararg or has_kwarg)
                    and not uses_bare)
         if uses_bare:
@@ -18235,6 +18313,9 @@ class CodeGen:
             [ir.Constant(i32, 0), ir.Constant(i32, _FPY_LIST_ITEMS)],
             inbounds=True)
         items_ptr = self.builder.load(items_pp)
+        # GEP index must be a plain integer, not an FpyValue struct
+        if isinstance(index.type, ir.LiteralStructType) and index.type == fpy_val:
+            index = self.builder.extract_value(index, 1)
         # GEP into items[index] — FpyValue is {i32 tag, i64 data}
         elem_addr = self.builder.gep(
             items_ptr, [index], inbounds=True)
@@ -18912,50 +18993,50 @@ class CodeGen:
             fn = node.func.attr
             if mod == "json" and fn == "loads":
                 return None  # json.loads returns any type; runtime tag decides
-            if mod == "dict" and fn == "fromkeys":
+            elif mod == "dict" and fn == "fromkeys":
                 return ValueType(VKind.DICT)
-            if mod == "json" and fn == "dumps":
+            elif mod == "json" and fn == "dumps":
                 return ValueType(VKind.STR)
-            if mod == "base64" and fn in ("b64encode", "b64decode",
+            elif mod == "base64" and fn in ("b64encode", "b64decode",
                                            "b32encode", "b32decode",
                                            "b16encode", "b16decode"):
                 return ValueType(VKind.BYTES)
-            if mod == "os" and fn in ("getcwd",):
+            elif mod == "os" and fn in ("getcwd",):
                 return ValueType(VKind.STR)
-            if mod == "os" and fn == "listdir":
+            elif mod == "os" and fn == "listdir":
                 return ValueType(VKind.LIST, elem_type=ValueType(VKind.STR))
-            if mod == "asyncio" and fn == "gather":
+            elif mod == "asyncio" and fn == "gather":
                 return ValueType(VKind.LIST, elem_type=ValueType(VKind.INT))
-            if mod == "logging" and fn == "getLogger":
+            elif mod == "logging" and fn == "getLogger":
                 return ValueType(VKind.LOGGER)
             # random.sample returns a list
-            if mod == "random" and fn == "sample":
+            elif mod == "random" and fn == "sample":
                 return ValueType(VKind.LIST, elem_type=ValueType(VKind.INT))
             # itertools functions return lists
-            if mod == "itertools":
+            elif mod == "itertools":
                 return ValueType(VKind.LIST, elem_type=ValueType(VKind.INT))
             # glob.glob returns a list of strings
-            if mod == "glob" and fn == "glob":
+            elif mod == "glob" and fn == "glob":
                 return ValueType(VKind.LIST, elem_type=ValueType(VKind.STR))
             # heapq.nsmallest returns a list
-            if mod == "heapq" and fn == "nsmallest":
+            elif mod == "heapq" and fn == "nsmallest":
                 return ValueType(VKind.LIST, elem_type=ValueType(VKind.INT))
             # copy.copy / copy.deepcopy returns same type as input
-            if mod == "copy" and fn in ("copy", "deepcopy"):
+            elif mod == "copy" and fn in ("copy", "deepcopy"):
                 if node.args:
                     inner = self._infer_type_tag(node.args[0], None)
                     if inner.kind != VKind.UNKNOWN:
                         return inner
             # struct.pack returns bytes (raw buffer pointer)
-            if mod == "struct" and fn == "pack":
+            elif mod == "struct" and fn == "pack":
                 return ValueType(VKind.BYTES)
             # struct.unpack returns a tuple (list)
-            if mod == "struct" and fn == "unpack":
+            elif mod == "struct" and fn == "unpack":
                 return ValueType(VKind.TUPLE)
-            if mod == "decimal" and fn == "Decimal":
+            elif mod == "decimal" and fn == "Decimal":
                 return ValueType(VKind.DECIMAL)
             # collections.deque(), _collections.Counter(), etc.
-            if mod in ("collections", "_collections"):
+            elif mod in ("collections", "_collections"):
                 if fn == "Counter":
                     return ValueType(VKind.COUNTER)
                 elif fn == "defaultdict":
@@ -18986,20 +19067,20 @@ class CodeGen:
                         return ValueType(VKind.INT)
                     elif fn == "ChainMap":
                         return ValueType(VKind.CHAINMAP)
-                if mod == "logging" and fn == "getLogger":
+                elif mod == "logging" and fn == "getLogger":
                     return ValueType(VKind.LOGGER)
-                if mod == "functools" and fn == "partial":
+                elif mod == "functools" and fn == "partial":
                     return ValueType(VKind.INT)  # function pointer (callable via call_ptr)
-                if mod == "itertools":
+                elif mod == "itertools":
                     # All itertools functions return lists
                     return ValueType(VKind.LIST, elem_type=ValueType(VKind.INT))
-                if mod == "random" and fn == "sample":
+                elif mod == "random" and fn == "sample":
                     return ValueType(VKind.LIST, elem_type=ValueType(VKind.INT))
-                if mod == "pathlib" and fn == "Path":
+                elif mod == "pathlib" and fn == "Path":
                     return ValueType(VKind.PATH)
-                if mod == "decimal" and fn == "Decimal":
+                elif mod == "decimal" and fn == "Decimal":
                     return ValueType(VKind.DECIMAL)
-                if mod == "copy" and fn in ("copy", "deepcopy"):
+                elif mod == "copy" and fn in ("copy", "deepcopy"):
                     # Return same type as input argument
                     if node.args:
                         return self._infer_type_tag(node.args[0], None)
@@ -19023,11 +19104,11 @@ class CodeGen:
                 _rtk = self._tag_kind(info.ret_tag)
                 if _rtk == VKind.DICT:
                     return ValueType(VKind.DICT)
-                if info.ret_tag == "ptr:list":
+                elif info.ret_tag == "ptr:list":
                     return ValueType(VKind.LIST, elem_type=ValueType(VKind.LIST))  # function returns list of lists
-                if _rtk == VKind.LIST:
+                elif _rtk == VKind.LIST:
                     return ValueType(VKind.LIST, elem_type=ValueType(VKind.INT))  # default to list for pointer returns
-                if _rtk == VKind.OBJ:
+                elif _rtk == VKind.OBJ:
                     return ValueType(VKind.OBJ)
         # Method calls on pyobj receivers return pyobj — EXCEPT for native
         # modules (time, os, json, etc.) whose functions return native types.
@@ -19380,11 +19461,11 @@ class CodeGen:
             _fk = self._tag_kind(factory) if factory else VKind.UNKNOWN
             if _fk == VKind.LIST:
                 return ValueType(VKind.LIST, elem_type=ValueType(VKind.INT))
-            if _fk == VKind.DICT:
+            elif _fk == VKind.DICT:
                 return ValueType(VKind.DICT)
-            if _fk == VKind.STR:
+            elif _fk == VKind.STR:
                 return ValueType(VKind.STR)
-            if _fk == VKind.FLOAT:
+            elif _fk == VKind.FLOAT:
                 return ValueType(VKind.FLOAT)
             return ValueType(VKind.INT)
         # Dict subscript: infer value type from known dict-value-type sets
@@ -21501,6 +21582,15 @@ class CodeGen:
             if not (name in self._definitely_assigned
                     and not self._in_try_block):
                 self._check_fv_undef(fv, name)
+            # Unchecked/checked int-mode variables (from unchecked_int() /
+            # checked_int() constructors): always unwrap to bare i64.
+            # These variables NEVER produce BigInt — unchecked wraps
+            # silently, checked raises OverflowError.  Returning the full
+            # FpyValue struct would route augmented assignments through
+            # fv_binop (generic runtime path) instead of the mode-aware
+            # _emit_int_binop → _emit_unchecked_int_op path.
+            if name in self._int_mode_vars:
+                return self._fv_as_int(fv)
             return self._unwrap_fv_for_tag(fv, type_tag)
         # Legacy alloca (not yet migrated) — load directly
         return self.builder.load(alloca, name=name)
@@ -33131,25 +33221,25 @@ class CodeGen:
         if lk == VKind.LIST and rk == VKind.LIST and op == ast.Add:
             return self._rt_call("list_concat", [ltv, rtv])
         # list + pyobj or pyobj + list: convert pyobj to native list first
-        if lk == VKind.LIST and rk == VKind.PYOBJ and op == ast.Add:
+        elif lk == VKind.LIST and rk == VKind.PYOBJ and op == ast.Add:
             r_native = self._rt_call("cpython_to_list", [rtv])
             return self._rt_call("list_concat", [ltv, r_native])
-        if lk == VKind.PYOBJ and rk == VKind.LIST and op == ast.Add:
+        elif lk == VKind.PYOBJ and rk == VKind.LIST and op == ast.Add:
             l_native = self._rt_call("cpython_to_list", [ltv])
             return self._rt_call("list_concat", [l_native, rtv])
-        if lk == VKind.LIST and rk in (VKind.INT, VKind.BOOL) and op == ast.Mult:
+        elif lk == VKind.LIST and rk in (VKind.INT, VKind.BOOL) and op == ast.Mult:
             return self._rt_call("list_repeat", [ltv, rtv])
-        if lk in (VKind.INT, VKind.BOOL) and rk == VKind.LIST and op == ast.Mult:
+        elif lk in (VKind.INT, VKind.BOOL) and rk == VKind.LIST and op == ast.Mult:
             return self._rt_call("list_repeat", [rtv, ltv])
 
         # ── Fast path: dict | dict → merge ─────────────────────────────
         if lk == VKind.DICT and rk == VKind.DICT and op == ast.BitOr:
             return self._rt_call("dict_merge", [ltv, rtv])
         # dict | pyobj or pyobj | dict: convert pyobj to native dict first
-        if lk == VKind.DICT and rk == VKind.PYOBJ and op == ast.BitOr:
+        elif lk == VKind.DICT and rk == VKind.PYOBJ and op == ast.BitOr:
             r_native = self._rt_call("cpython_to_dict", [rtv])
             return self._rt_call("dict_merge", [ltv, r_native])
-        if lk == VKind.PYOBJ and rk == VKind.DICT and op == ast.BitOr:
+        elif lk == VKind.PYOBJ and rk == VKind.DICT and op == ast.BitOr:
             l_native = self._rt_call("cpython_to_dict", [ltv])
             return self._rt_call("dict_merge", [l_native, rtv])
 
@@ -33609,8 +33699,7 @@ class CodeGen:
         elif isinstance(op, ast.Div):
             # Python's / always returns float, even for ints. Use the
             # int-flavored safe division so the ZeroDivisionError message
-            # matches CPython ("division by zero" for int/int, "float
-            # division by zero" only when a float operand is involved).
+            # matches CPython 3.14+ ("division by zero" for all types).
             result = self.builder.call(self.runtime["safe_int_fdiv"], [left, right])
             self._emit_try_bail_if_exc()
             return result
@@ -36032,7 +36121,7 @@ class CodeGen:
                 """Apply the key function to an element, returning i64."""
                 if key_func_name is None:
                     return e
-                if key_func_name == "__lambda__":
+                elif key_func_name == "__lambda__":
                     # Call through function pointer
                     fn_typed = self.builder.bitcast(
                         key_func_ptr,
@@ -36041,7 +36130,7 @@ class CodeGen:
                     if isinstance(e.type, ir.PointerType):
                         arg = self.builder.ptrtoint(e, i64)
                     return self.builder.call(fn_typed, [arg])
-                if key_func_name == "len":
+                elif key_func_name == "len":
                     # len on strings returns int64
                     if isinstance(e.type, ir.PointerType):
                         return self.builder.call(
@@ -36051,13 +36140,13 @@ class CodeGen:
                             self.runtime["list_length"], [
                                 self._ensure_ptr(e)])
                     return ir.Constant(i64, 0)
-                if key_func_name == "abs":
+                elif key_func_name == "abs":
                     neg = self.builder.neg(e)
                     is_neg = self.builder.icmp_signed(
                         "<", e, ir.Constant(i64, 0))
                     return self.builder.select(is_neg, neg, e)
                 # User function call
-                if key_func_name in self._user_functions:
+                elif key_func_name in self._user_functions:
                     info = self._user_functions[key_func_name]
                     fv = self._wrap_arg_value(e, None)
                     ret = self.builder.call(info.func, [fv])
@@ -36182,12 +36271,12 @@ class CodeGen:
             from_chars = self._emit_expr_value(node.args[0])
             to_chars = self._emit_expr_value(node.args[1])
             return self._rt_call("str_maketrans", [from_chars, to_chars])
-        if cls_name == "int" and method == "from_bytes" and len(node.args) >= 2:
+        elif cls_name == "int" and method == "from_bytes" and len(node.args) >= 2:
             b = self._emit_expr_value(node.args[0])
             byteorder = self._emit_expr_value(node.args[1])
             blen = self._rt_call("str_len", [b])
             return self._rt_call("int_from_bytes", [b, blen, byteorder])
-        if cls_name == "dict" and method == "fromkeys":
+        elif cls_name == "dict" and method == "fromkeys":
             if len(node.args) == 1:
                 keys = self._emit_expr_value(node.args[0])
                 return self._rt_call("dict_fromkeys_none", [keys])
@@ -38374,17 +38463,17 @@ class CodeGen:
                 return None
             if attr_name == "platform":
                 return self.builder.call(self.runtime["sys_platform"], [])
-            if attr_name == "maxsize":
+            elif attr_name == "maxsize":
                 return self.builder.call(self.runtime["sys_maxsize"], [])
-            if attr_name == "argv":
+            elif attr_name == "argv":
                 return self.builder.call(self.runtime["sys_argv"], [])
-            if attr_name == "version_info":
+            elif attr_name == "version_info":
                 return self.builder.call(self.runtime["sys_version_info"], [])
-            if attr_name == "stdout":
+            elif attr_name == "stdout":
                 return ir.Constant(i64, 1)  # sentinel for stdout
-            if attr_name == "stderr":
+            elif attr_name == "stderr":
                 return ir.Constant(i64, 2)  # sentinel for stderr
-            if attr_name == "path":
+            elif attr_name == "path":
                 return self.builder.call(self.runtime["list_new"], [])
         return None
 
@@ -41871,17 +41960,17 @@ class CodeGen:
             if result is not None:
                 return result
 
-        if obj_kind == VKind.BYTES:
+        elif obj_kind == VKind.BYTES:
             result = self._emit_method_call_bytes(node, obj)
             if result is not None:
                 return result
 
-        if obj_kind == VKind.INT:
+        elif obj_kind == VKind.INT:
             result = self._emit_method_call_int(node, obj)
             if result is not None:
                 return result
 
-        if obj_kind == VKind.FLOAT:
+        elif obj_kind == VKind.FLOAT:
             result = self._emit_method_call_float(node, obj)
             if result is not None:
                 return result
