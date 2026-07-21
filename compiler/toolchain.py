@@ -49,6 +49,29 @@ _LEGACY_RUNTIME_NAMES = ["runtime", "objects", "cpython_bridge", "threading", "g
 _LEGACY_RUNTIME_OBJS = [RUNTIME_DIR / (name + OBJ_EXT) for name in _LEGACY_RUNTIME_NAMES]
 
 
+# --- Cross-compilation targets ---
+# Passing target=None to the codegen entry points keeps the existing behavior:
+# emit for the host triple (COFF on Windows, ELF/Mach-O on Linux/macOS), linked
+# against the host CPython. A named cross-target instead emits an object for a
+# foreign platform. The first supported one is SlateOS userspace.
+SLATEOS_TARGET = "x86_64-slateos"
+
+# LLVM parameters for the SlateOS x86_64 userspace target. These MUST stay in
+# lockstep with the OS repo's Rust target spec (toolchain/x86_64-slateos.json)
+# so fastpy-emitted objects are ABI-compatible with that sysroot's libc.a (the
+# `posix` crate compiled as a staticlib) and can be linked by the same
+# gnu-lld/rust-lld linker. Both host and target are x86_64, so the already
+# initialized native X86 backend can emit for this triple with no extra target
+# initialization — we only need the foreign triple, data layout, and codegen
+# knobs (static relocation + large code model + SSE2, matching the JSON).
+_SLATEOS_TRIPLE = "x86_64-unknown-linux-musl"
+_SLATEOS_DATA_LAYOUT = (
+    "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128"
+)
+_SLATEOS_CPU = "x86-64"
+_SLATEOS_FEATURES = "+sse,+sse2"
+
+
 # --- Python installation descriptor ---
 @dataclass
 class PythonInstall:
@@ -388,6 +411,41 @@ def _find_python_lib_name(install: PythonInstall | None = None) -> str:
         return f"python{ver}"
 
 
+def _check_python_dll_on_path(install: PythonInstall | None = None) -> None:
+    """Warn if the Python DLL isn't findable at runtime.
+
+    On Windows the compiled exe links against pythonXY.dll.  If the DLL
+    directory isn't on PATH, the exe fails silently (no output, no error
+    message) because the OS loader terminates the process before main().
+    """
+    import ctypes
+    import ctypes.util
+    if install is not None:
+        dll_name = f"python{install.version[0]}{install.version[1]}.dll"
+        py_dir = install.prefix
+    else:
+        dll_name = f"python{sys.version_info.major}{sys.version_info.minor}.dll"
+        py_dir = Path(sys.prefix)
+    # Check if Windows can find the DLL via normal search order
+    try:
+        ctypes.WinDLL(dll_name)
+        return  # DLL found, all good
+    except OSError:
+        pass
+    # DLL not on PATH — emit a prominent warning
+    print(
+        f"\n  WARNING: {dll_name} is not on your PATH.\n"
+        f"  The compiled .exe will fail silently without it.\n"
+        f"\n"
+        f"  Fix: add your Python directory to PATH:\n"
+        f"    set PATH={py_dir};%PATH%\n"
+        f"\n"
+        f"  Or copy {dll_name} next to the .exe:\n"
+        f"    copy \"{py_dir / dll_name}\" .\n",
+        flush=True,
+    )
+
+
 def _version_bridge_obj(install: PythonInstall) -> Path:
     """Path to the version-specific cpython_bridge object file."""
     return RUNTIME_DIR / install.version_tag / ("cpython_bridge" + OBJ_EXT)
@@ -418,17 +476,46 @@ def _find_msvc_cl() -> str | None:
     """Find cl.exe by setting up MSVC environment via vcvars64.bat.
 
     Returns a bat preamble string that sets up the environment, or None
-    if MSVC cannot be found. Searches VS 2026, 2025, 2024, 2022 in order
-    so the newest available version is preferred.
+    if MSVC cannot be found. Enumerates all VS installations under both
+    Program Files directories (handles year-named and version-named
+    folders like '2022', '18', etc.) and falls back to vswhere.exe.
     """
-    for year in ["2026", "2025", "2024", "2022"]:
-        for edition in ["Community", "Enterprise", "Professional", "BuildTools"]:
+    editions = ["Community", "Enterprise", "Professional", "BuildTools"]
+    bases = [
+        Path(r"C:\Program Files\Microsoft Visual Studio"),
+        Path(r"C:\Program Files (x86)\Microsoft Visual Studio"),
+    ]
+    for base in bases:
+        if not base.is_dir():
+            continue
+        # Enumerate version/year subdirectories, newest first
+        subdirs = sorted(
+            [d for d in base.iterdir() if d.is_dir() and d.name != "Installer"],
+            key=lambda d: d.name,
+            reverse=True,
+        )
+        for subdir in subdirs:
+            for edition in editions:
+                vcvars = subdir / edition / "VC" / "Auxiliary" / "Build" / "vcvars64.bat"
+                if vcvars.exists():
+                    return f'call "{vcvars}" >NUL'
+    # Last resort: use vswhere.exe (handles any edition/year/path)
+    vswhere = Path(
+        r"C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe"
+    )
+    if vswhere.exists():
+        import subprocess
+        result = subprocess.run(
+            [str(vswhere), "-latest", "-property", "installationPath"],
+            capture_output=True, text=True,
+        )
+        if result.returncode == 0 and result.stdout.strip():
             vcvars = (
-                f"C:\\Program Files\\Microsoft Visual Studio\\{year}\\{edition}"
-                f"\\VC\\Auxiliary\\Build\\vcvars64.bat"
+                Path(result.stdout.strip())
+                / "VC" / "Auxiliary" / "Build" / "vcvars64.bat"
             )
-            if Path(vcvars).exists():
-                return f'call "{vcvars}" 1>NUL 2>NUL'
+            if vcvars.exists():
+                return f'call "{vcvars}" >NUL'
     return None
 
 
@@ -464,7 +551,7 @@ def _compile_shared_runtime_windows(vcvars_cmd: str) -> None:
         try:
             result = subprocess.run(
                 ["cmd.exe", "/c", str(bat_path.resolve())],
-                capture_output=True, text=True, timeout=30,
+                capture_output=True, text=True, timeout=120,
             )
             if result.returncode != 0 or not obj.exists():
                 raise RuntimeError(
@@ -528,7 +615,7 @@ def _compile_bridge_windows(vcvars_cmd: str, install: PythonInstall) -> Path:
     try:
         result = subprocess.run(
             ["cmd.exe", "/c", str(bat_path.resolve())],
-            capture_output=True, text=True, timeout=30,
+            capture_output=True, text=True, timeout=120,
         )
         if result.returncode != 0 or not out_obj.exists():
             raise RuntimeError(
@@ -568,7 +655,7 @@ def _compile_shared_runtime_posix() -> None:
             continue
         result = subprocess.run(
             [cc, "-c", "-O2", "-fPIC", str(src), "-o", str(obj)],
-            capture_output=True, text=True, timeout=30,
+            capture_output=True, text=True, timeout=120,
             cwd=str(RUNTIME_DIR),
         )
         if result.returncode != 0 or not obj.exists():
@@ -604,7 +691,7 @@ def _compile_bridge_posix(install: PythonInstall) -> Path:
          f'-DPYTHON_HOME_STR="{python_home}"',
          "cpython_bridge.c",
          "-o", str(out_obj)],
-        capture_output=True, text=True, timeout=30,
+        capture_output=True, text=True, timeout=120,
         cwd=str(RUNTIME_DIR),
     )
     if result.returncode != 0 or not out_obj.exists():
@@ -685,7 +772,44 @@ def ensure_runtime_built(python_exe: str | Path | None = None,
         f"Missing: {', '.join(missing)}")
 
 
-def compile_ir_to_obj(ir_string: str, output_path: Path) -> Path:
+def _make_target_machine(target: str | None):
+    """
+    Build the LLVM `TargetMachine` for a codegen target.
+
+    `target=None` -> host machine (the historical behavior: PIC on POSIX,
+    default relocation on Windows). `target=SLATEOS_TARGET` -> a foreign
+    x86_64 SlateOS-userspace machine using the triple/data-layout/codegen
+    knobs from `toolchain/x86_64-slateos.json` (static relocation, large code
+    model, SSE2), so the emitted object matches the OS's Rust sysroot ABI.
+    """
+    if target is None:
+        # Host codegen. Use PIC relocation on POSIX (required for ASLR and
+        # shared objects); leave Windows at its default.
+        tm = llvm.Target.from_default_triple()
+        return tm.create_target_machine(
+            opt=2,  # -O2 backend codegen
+            reloc="pic" if not IS_WINDOWS else "default",
+            codemodel="default",
+        )
+    if target == SLATEOS_TARGET:
+        tm = llvm.Target.from_triple(_SLATEOS_TRIPLE)
+        return tm.create_target_machine(
+            cpu=_SLATEOS_CPU,
+            features=_SLATEOS_FEATURES,
+            opt=2,
+            # Match x86_64-slateos.json: relocation-model=static,
+            # code-model=large, non-PIE. The SlateOS loader maps userspace
+            # binaries at a fixed base, so static relocation is correct and
+            # avoids needing a PLT/GOT the minimal sysroot doesn't set up.
+            reloc="static",
+            codemodel="large",
+        )
+    raise ValueError(f"Unknown codegen target {target!r}")
+
+
+def compile_ir_to_obj(
+    ir_string: str, output_path: Path, target: str | None = None
+) -> Path:
     """
     Compile LLVM IR text to a native object file.
 
@@ -695,6 +819,9 @@ def compile_ir_to_obj(ir_string: str, output_path: Path) -> Path:
     Args:
         ir_string: LLVM IR as a string.
         output_path: Path for the output object file.
+        target: Codegen target. `None` (default) emits for the host; pass
+            `SLATEOS_TARGET` to cross-compile an x86_64 SlateOS-userspace
+            object (ELF, ABI-matched to the Rust `x86_64-slateos` sysroot).
 
     Returns:
         Path to the generated object file.
@@ -703,14 +830,16 @@ def compile_ir_to_obj(ir_string: str, output_path: Path) -> Path:
     mod = llvm.parse_assembly(ir_string)
     mod.verify()
 
-    # Create target machine (backend-level opts)
-    # Use PIC relocation on POSIX (required for ASLR and shared objects)
-    target = llvm.Target.from_default_triple()
-    target_machine = target.create_target_machine(
-        opt=2,  # -O2 backend codegen
-        reloc="pic" if not IS_WINDOWS else "default",
-        codemodel="default",
-    )
+    # For a cross-target, override the module's triple and data layout so the
+    # emitted object is tagged for the foreign platform (the IR text carries
+    # the host's triple/layout from codegen). Both host and target are x86_64
+    # with the standard layout, so this is a re-tag, not an ABI change.
+    if target == SLATEOS_TARGET:
+        mod.triple = _SLATEOS_TRIPLE
+        mod.data_layout = _SLATEOS_DATA_LAYOUT
+
+    # Create target machine (backend-level opts).
+    target_machine = _make_target_machine(target)
 
     # Run IR-level optimization passes (-O2 pipeline).
     # Uses the new LLVM pass manager API (PassBuilder + PipelineTuningOptions).
@@ -766,7 +895,7 @@ def _link_windows(obj_files: list[Path], output_path: Path,
     try:
         result = subprocess.run(
             ["cmd.exe", "/c", str(bat_path.resolve())],
-            capture_output=True, text=True, timeout=30,
+            capture_output=True, text=True, timeout=300,
         )
         if "LINK_FAILED" in result.stdout or result.returncode != 0:
             raise RuntimeError(
@@ -872,8 +1001,15 @@ def compile_and_link(ir_string: str, output_path: Path,
     compile_ir_to_obj(ir_string, ir_obj)
 
     try:
-        return link_executable([ir_obj] + runtime_objs, output_path, install)
+        exe = link_executable([ir_obj] + runtime_objs, output_path, install)
     finally:
         # Clean up intermediate obj
         if ir_obj.exists():
             ir_obj.unlink()
+
+    # On Windows, warn if the Python DLL isn't on PATH — the exe will
+    # fail silently (no output, no error) when the OS loader can't find it.
+    if IS_WINDOWS:
+        _check_python_dll_on_path(install)
+
+    return exe
