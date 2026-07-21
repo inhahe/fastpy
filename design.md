@@ -73,12 +73,25 @@ resolving open-question Q29). Strategy: **pure-mode native compile first**, add
 the CPython bridge for SlateOS later as a superset once CPython is ported.
 
 - [x] **SlateOS codegen target** — `compile_ir_to_obj(target=SLATEOS_TARGET)`
-  emits ABI-matched x86-64 ELF objects (this increment).
-- [ ] **Cross-compile the C runtime** (`runtime/*.c`) to `x86_64-slateos` against
-  SlateOS libc headers (pure-mode: no `cpython_bridge.c`, no `libpython`).
-- [ ] **SlateOS link step** — a gnu-lld/rust-lld path that links fastpy program
-  objects + the ported runtime objects + the sysroot `libc.a` into a SlateOS
-  executable (the current `link_executable` is host MSVC/`cc` only).
+  emits ABI-matched x86-64 ELF objects.
+- [x] **SlateOS link step (plumbing)** — `link_executable(target=SLATEOS_TARGET)`
+  drives **`rust-lld`** (GNU/ELF flavor, static, non-PIE, `--no-dynamic-linker`)
+  via `_link_slateos`, the same LLVM linker the OS repo uses for its userspace.
+  `_find_rust_lld()` locates it in the active Rust sysroot (or `$FASTPY_RUST_LLD`
+  / PATH). Verified end-to-end on a self-contained object → SlateOS **ET_EXEC**
+  ELF (`tests/test_cross_target.py`). Full program linking (fastpy objects +
+  runtime objects + sysroot `libc.a`) awaits the runtime port below; the
+  function already accepts a `sysroot_lib_dir`/`libs` for that.
+- [ ] **Cross-compile the C runtime** (`runtime/*.c`) to `x86_64-slateos`
+  (pure-mode: no `cpython_bridge.c`, no `libpython`). The runtime already has a
+  working POSIX code path (it builds via `cc`/`gcc`/`clang` on Linux/macOS today
+  with `#ifdef _WIN32` separation), so this is a small port, **not** a rewrite.
+  **Gated on tooling** (operator decision): needs a C compiler that emits
+  `x86_64-unknown-linux-musl` ELF (e.g. `clang --target=…`) plus musl/SlateOS C
+  headers. The dev host has neither — no `clang` on PATH, and the OS sysroot
+  (`toolchain/sysroot/lib`) ships only Rust-built `.a` archives, no C headers.
+  Installing a clang cross-toolchain is heavyweight/system-wide → see
+  `open-questions.md` in the OS repo.
 - [ ] **First real component** — compile an actual OS component (candidate: the
   package manager) as the first fastpy-built SlateOS binary.
 - [ ] **CPython bridge on SlateOS (B)** — later, once CPython is ported, so

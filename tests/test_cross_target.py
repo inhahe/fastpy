@@ -75,3 +75,54 @@ def test_unknown_target_rejected():
     """An unrecognized target name is a clear error, not a silent host build."""
     with pytest.raises(ValueError):
         _compile("some-bogus-target", "bogus.o")
+
+
+# --- Link step (rust-lld) --------------------------------------------------
+#
+# The SlateOS link step drives rust-lld (GNU/ELF flavor) — the same LLVM
+# linker the OS repo uses for its userspace — instead of the host MSVC/cc
+# driver. These tests verify fastpy can find that linker and turn a SlateOS
+# object into a SlateOS ELF *executable* (ET_EXEC), the counterpart of the
+# codegen tests above.
+
+_ET_EXEC = 2
+
+
+def _rust_lld_available() -> bool:
+    return toolchain._find_rust_lld() is not None
+
+
+def test_slateos_link_produces_x86_64_elf_executable():
+    """rust-lld links a SlateOS object into an x86-64 ET_EXEC ELF."""
+    if not _rust_lld_available():
+        pytest.skip("rust-lld not found (no Rust toolchain); link step untestable")
+
+    d = Path(tempfile.mkdtemp(prefix="fastpy_xlink_"))
+    obj = toolchain.compile_ir_to_obj(
+        _TRIVIAL_IR, d / "prog.o", target=toolchain.SLATEOS_TARGET)
+    # The trivial module's `main` references no external symbols, so a static,
+    # entry=main link needs nothing from the sysroot — this isolates the link
+    # plumbing from the not-yet-ported C runtime.
+    exe = toolchain.link_executable(
+        [obj], d / "prog.elf", target=toolchain.SLATEOS_TARGET)
+
+    data = exe.read_bytes()
+    assert data[:4] == _ELFMAG, "SlateOS executable is not an ELF file"
+    ei_class = data[4]
+    e_type, e_machine = struct.unpack_from("<HH", data, 16)
+    assert ei_class == _ELFCLASS64, f"expected ELFCLASS64, got {ei_class}"
+    assert e_type == _ET_EXEC, f"expected ET_EXEC executable, got {e_type}"
+    assert e_machine == _EM_X86_64, f"expected EM_X86_64 (62), got {e_machine}"
+
+
+def test_slateos_link_unknown_target_rejected():
+    """link_executable rejects an unrecognized link target, no silent host link."""
+    d = Path(tempfile.mkdtemp(prefix="fastpy_xlink_"))
+    with pytest.raises(ValueError):
+        toolchain.link_executable([d / "nope.o"], d / "out", target="bogus")
+
+
+def test_find_rust_lld_returns_path_or_none():
+    """The linker locator returns a real file path or None, never a bad path."""
+    lld = toolchain._find_rust_lld()
+    assert lld is None or lld.exists()

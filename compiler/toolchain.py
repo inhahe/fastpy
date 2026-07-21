@@ -71,6 +71,66 @@ _SLATEOS_DATA_LAYOUT = (
 _SLATEOS_CPU = "x86-64"
 _SLATEOS_FEATURES = "+sse,+sse2"
 
+# Link step for the SlateOS target. Unlike the host link paths (MSVC link.exe /
+# cc), a SlateOS executable is an ELF for a foreign platform, so we drive the
+# LLVM linker (`rust-lld` in GNU/ELF flavor) directly. rust-lld ships inside the
+# installed Rust toolchain that the OS repo already uses to build its userspace
+# (the same lld/rust-lld referenced by toolchain/x86_64-slateos.json), so no new
+# tool is required. The SlateOS loader maps userspace binaries at a fixed base,
+# and the sysroot is static-only, hence: static link, no dynamic linker, non-PIE.
+_SLATEOS_LLD_FLAVOR = "gnu"
+
+
+def _find_rust_lld() -> Path | None:
+    """
+    Locate `rust-lld` (the LLVM linker bundled with the Rust toolchain).
+
+    The SlateOS link step reuses the very linker the OS repo builds its
+    userspace with, so a fastpy SlateOS binary is produced by the same
+    gnu-lld/rust-lld path as the rest of the OS. Resolution order:
+
+    1. `$FASTPY_RUST_LLD` — explicit override.
+    2. The active Rust sysroot (`rustc --print sysroot`), under
+       `lib/rustlib/<host>/bin/rust-lld[.exe]`.
+    3. A bare `rust-lld` / `ld.lld` on PATH.
+
+    Returns the path, or None if no linker was found.
+    """
+    import shutil
+
+    override = os.environ.get("FASTPY_RUST_LLD")
+    if override:
+        p = Path(override)
+        if p.exists():
+            return p
+
+    # Query the Rust sysroot and scan its rustlib bin dirs for rust-lld.
+    rustc = shutil.which("rustc")
+    if rustc:
+        try:
+            sysroot = subprocess.run(
+                [rustc, "--print", "sysroot"],
+                capture_output=True, text=True, timeout=15,
+            )
+            if sysroot.returncode == 0:
+                root = Path(sysroot.stdout.strip())
+                rustlib = root / "lib" / "rustlib"
+                if rustlib.is_dir():
+                    exe = "rust-lld.exe" if IS_WINDOWS else "rust-lld"
+                    for host_dir in rustlib.iterdir():
+                        cand = host_dir / "bin" / exe
+                        if cand.exists():
+                            return cand
+        except (subprocess.SubprocessError, OSError):
+            pass
+
+    # Fall back to a linker on PATH.
+    for name in ("rust-lld", "ld.lld"):
+        found = shutil.which(name)
+        if found:
+            return Path(found)
+    return None
+
 
 # --- Python installation descriptor ---
 @dataclass
@@ -947,25 +1007,101 @@ def _link_posix(obj_files: list[Path], output_path: Path,
     return output_path
 
 
+def _link_slateos(
+    obj_files: list[Path],
+    output_path: Path,
+    entry: str = "main",
+    sysroot_lib_dir: Path | None = None,
+    libs: list[str] | None = None,
+) -> Path:
+    """
+    Link object files into a SlateOS-userspace ELF executable via rust-lld.
+
+    This is the foreign-target counterpart of `_link_windows`/`_link_posix`.
+    Instead of the host's MSVC/cc driver it invokes `rust-lld` in GNU/ELF
+    flavor — the same LLVM linker the OS repo uses for its `x86_64-slateos`
+    userspace — so the resulting binary matches that sysroot's ABI.
+
+    The link is static and non-PIE with no dynamic linker, matching
+    `toolchain/x86_64-slateos.json` (relocation-model=static, crt-static,
+    the loader maps userspace at a fixed base). Pure-mode fastpy programs
+    (no CPython bridge) link only their own objects plus, once ported, the
+    fastpy C runtime objects and the sysroot `libc.a`.
+
+    Args:
+        obj_files: Object files to link (fastpy program + runtime objects).
+        output_path: Path for the output ELF executable.
+        entry: Entry symbol. Defaults to ``main``; a real SlateOS program with
+            a crt/`_start` would override this.
+        sysroot_lib_dir: Optional directory added to the linker search path
+            (e.g. the OS repo's ``toolchain/sysroot/lib`` holding ``libc.a``).
+        libs: Optional archive names to link (e.g. ``["c"]`` for ``libc.a``).
+
+    Returns:
+        Path to the generated executable.
+    """
+    lld = _find_rust_lld()
+    if lld is None:
+        raise RuntimeError(
+            "Cannot find rust-lld for the SlateOS link step. Install a Rust "
+            "toolchain (it bundles rust-lld) or set FASTPY_RUST_LLD to the "
+            "linker path.")
+
+    cmd: list[str] = [
+        str(lld),
+        "-flavor", _SLATEOS_LLD_FLAVOR,
+        "-static",            # crt-static: no dynamic loader on SlateOS
+        "--no-dynamic-linker",
+        "-e", entry,          # SlateOS loader jumps to this entry symbol
+        "-o", str(output_path),
+    ]
+    cmd += [str(p) for p in obj_files]
+    if sysroot_lib_dir is not None:
+        cmd.append(f"-L{sysroot_lib_dir}")
+    for lib in libs or []:
+        cmd.append(f"-l{lib}")
+
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"SlateOS link failed:\n{result.stdout}\n{result.stderr}")
+    if not output_path.exists():
+        raise RuntimeError(
+            f"SlateOS link appeared to succeed but {output_path} not found.\n"
+            f"stdout: {result.stdout}\nstderr: {result.stderr}")
+    return output_path
+
+
 def link_executable(
     obj_files: list[Path],
     output_path: Path,
     install: PythonInstall | None = None,
+    target: str | None = None,
 ) -> Path:
     """
     Link object files into a native executable.
 
     On Windows, uses MSVC link.exe. On Linux/macOS, uses cc (gcc/clang).
+    With ``target=SLATEOS_TARGET``, cross-links a SlateOS-userspace ELF via
+    rust-lld instead (see `_link_slateos`); the host CPython is not linked.
 
     Args:
         obj_files: List of object files to link.
         output_path: Path for the output executable.
         install: PythonInstall to link against. If None, uses current Python.
+            Ignored for the SlateOS target (pure-mode, no CPython bridge).
+        target: Link target. ``None`` (default) links a host executable; pass
+            ``SLATEOS_TARGET`` to cross-link a SlateOS ELF.
 
     Returns:
         Path to the generated executable.
     """
     output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if target == SLATEOS_TARGET:
+        return _link_slateos(obj_files, output_path)
+    if target is not None:
+        raise ValueError(f"Unknown link target {target!r}")
 
     if IS_WINDOWS:
         return _link_windows(obj_files, output_path, install)
