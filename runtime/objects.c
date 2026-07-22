@@ -8471,6 +8471,19 @@ int64_t fastpy_os_symlink(const char *target, const char *linkpath) {
 #endif
 }
 
+/* os.link(src, dst) -> 0 ok / -1 error.  Creates a hard link `dst` referring
+ * to the same inode as `src` (POSIX order: link(oldpath, newpath)).  On
+ * SlateOS the posix libc link() maps to SYS_FS_LINK (Rights::CREATE).  Windows
+ * has no POSIX link(), so those builds return -1. */
+int64_t fastpy_os_link(const char *src, const char *dst) {
+#ifdef _WIN32
+    (void)src; (void)dst;
+    return -1;
+#else
+    return (int64_t)(link(src, dst) == 0 ? 0 : -1);
+#endif
+}
+
 /* os.readlink(path) -> str (the link's target).  Returns a valid FpyString
  * `.data` pointer (FPY_TAG_STR); an empty string signals an error, mirroring
  * how callers already branch on os.getcwd/os.path.* string results.  POSIX

@@ -2624,6 +2624,9 @@ class CodeGen:
         # os.symlink(target, linkpath) -> int status (0 ok, -1 error)
         ft = ir.FunctionType(i64, [i8_ptr, i8_ptr])
         self.runtime["os_symlink"] = ir.Function(self.module, ft, name="fastpy_os_symlink")
+        # os.link(src, dst) -> int status (0 ok, -1 error) [hard link]
+        ft = ir.FunctionType(i64, [i8_ptr, i8_ptr])
+        self.runtime["os_link"] = ir.Function(self.module, ft, name="fastpy_os_link")
         # os.readlink(path) -> str (the link target); empty string on error
         ft = ir.FunctionType(i8_ptr, [i8_ptr])
         self.runtime["os_readlink"] = ir.Function(self.module, ft, name="fastpy_os_readlink")
@@ -19015,7 +19018,7 @@ class CodeGen:
                 elif fn in ("listdir",):
                     return ValueType(VKind.LIST, elem_type=ValueType(VKind.STR))
                 elif fn in ("remove", "unlink", "mkdir", "rmdir", "rename",
-                           "getsize", "path_getsize", "symlink"):
+                           "getsize", "path_getsize", "symlink", "link"):
                     return ValueType(VKind.INT)
                 elif fn in ("readlink",):
                     return ValueType(VKind.STR)
@@ -19083,7 +19086,7 @@ class CodeGen:
                 return ValueType(VKind.STR)
             elif mod == "os" and fn == "listdir":
                 return ValueType(VKind.LIST, elem_type=ValueType(VKind.STR))
-            elif mod == "os" and fn in ("remove", "unlink", "mkdir", "rmdir", "rename", "symlink"):
+            elif mod == "os" and fn in ("remove", "unlink", "mkdir", "rmdir", "rename", "symlink", "link"):
                 return ValueType(VKind.INT)
             elif mod in ("os", "os.path") and fn in ("getsize", "path_getsize"):
                 return ValueType(VKind.INT)
@@ -37306,6 +37309,11 @@ class CodeGen:
             target = self._ensure_ptr(self._emit_expr_value(node.args[0]))
             linkpath = self._ensure_ptr(self._emit_expr_value(node.args[1]))
             return self.builder.call(self.runtime["os_symlink"], [target, linkpath])
+        elif func_name == "link" and len(node.args) == 2:
+            # os.link(src, dst) -> bare i64 status (0 ok, -1 error) [hard link].
+            src = self._ensure_ptr(self._emit_expr_value(node.args[0]))
+            dst = self._ensure_ptr(self._emit_expr_value(node.args[1]))
+            return self.builder.call(self.runtime["os_link"], [src, dst])
         elif func_name == "readlink" and len(node.args) == 1:
             # os.readlink(path) -> str (the link's target); returns a valid
             # FpyString pointer (empty string on error).
