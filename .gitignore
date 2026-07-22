@@ -13,3 +13,9 @@ web/venv*/
 *.egg-info/
 # Cross-compiled SlateOS runtime objects (build artifacts, regenerated on demand)
 runtime/slateos/
+
+# Cached MSVC environment (machine-specific absolute paths; regenerated on demand)
+runtime/_msvc_env_cache.json
+
+# Benchmark snapshots written by benchmarks/bench_fastpy_only.py
+benchmarks/_bench_*.json

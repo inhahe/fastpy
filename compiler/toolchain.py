@@ -32,6 +32,17 @@ IS_WINDOWS = sys.platform == "win32"
 IS_MACOS = sys.platform == "darwin"
 IS_LINUX = sys.platform.startswith("linux")
 
+# LLVM optimization level for host codegen (both the IR pass pipeline and
+# backend instruction selection). Defaults to -O2, which measures fastest for
+# fastpy's generated code — -O3 regressed tight loops and cross-FV-boundary
+# inlining in A/B testing. Override with FASTPY_OPT=0..3 for experimentation.
+try:
+    _BACKEND_OPT_LEVEL = int(os.environ.get("FASTPY_OPT", "2"))
+    if _BACKEND_OPT_LEVEL not in (0, 1, 2, 3):
+        _BACKEND_OPT_LEVEL = 2
+except ValueError:
+    _BACKEND_OPT_LEVEL = 2
+
 # --- Object file extension ---
 OBJ_EXT = ".obj" if IS_WINDOWS else ".o"
 EXE_EXT = ".exe" if IS_WINDOWS else ""
@@ -619,13 +630,12 @@ RUNTIME_BUILD_BAT = RUNTIME_DIR / "build_runtime.bat"
 RUNTIME_BUILD_SH = RUNTIME_DIR / "build_runtime.sh"
 
 
-def _find_msvc_cl() -> str | None:
-    """Find cl.exe by setting up MSVC environment via vcvars64.bat.
+def _find_vcvars_bat() -> Path | None:
+    """Locate vcvars64.bat by enumerating VS installations.
 
-    Returns a bat preamble string that sets up the environment, or None
-    if MSVC cannot be found. Enumerates all VS installations under both
-    Program Files directories (handles year-named and version-named
-    folders like '2022', '18', etc.) and falls back to vswhere.exe.
+    Enumerates all VS installations under both Program Files directories
+    (handles year-named and version-named folders like '2022', '18', etc.)
+    and falls back to vswhere.exe. Returns the Path, or None if not found.
     """
     editions = ["Community", "Enterprise", "Professional", "BuildTools"]
     bases = [
@@ -645,7 +655,7 @@ def _find_msvc_cl() -> str | None:
             for edition in editions:
                 vcvars = subdir / edition / "VC" / "Auxiliary" / "Build" / "vcvars64.bat"
                 if vcvars.exists():
-                    return f'call "{vcvars}" >NUL'
+                    return vcvars
     # Last resort: use vswhere.exe (handles any edition/year/path)
     vswhere = Path(
         r"C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe"
@@ -662,8 +672,115 @@ def _find_msvc_cl() -> str | None:
                 / "VC" / "Auxiliary" / "Build" / "vcvars64.bat"
             )
             if vcvars.exists():
-                return f'call "{vcvars}" >NUL'
+                return vcvars
     return None
+
+
+def _find_msvc_cl() -> str | None:
+    """Find cl.exe by setting up MSVC environment via vcvars64.bat.
+
+    Returns a bat preamble string that sets up the environment, or None
+    if MSVC cannot be found.
+    """
+    vcvars = _find_vcvars_bat()
+    if vcvars is not None:
+        return f'call "{vcvars}" >NUL'
+    return None
+
+
+# Cached MSVC environment (in-process). Running vcvars64.bat is slow (~1-2s of
+# environment setup); we do it once, capture the resulting environment, and
+# reuse it to invoke link.exe/cl.exe directly on subsequent calls. This is the
+# single biggest compile-time win — a bare link previously re-ran vcvars every
+# time. A disk cache (keyed on the vcvars path + mtime) extends the win across
+# separate one-shot CLI compiles.
+_MSVC_ENV_CACHE: dict[str, str] | None = None
+_MSVC_ENV_TRIED = False
+
+
+def _msvc_env_cache_file() -> Path:
+    return RUNTIME_DIR / "_msvc_env_cache.json"
+
+
+def _get_msvc_env() -> dict[str, str] | None:
+    """Return a cached environment dict (for subprocess `env=`) that has the
+    MSVC toolchain (link.exe/cl.exe, INCLUDE, LIB, PATH) set up, or None if
+    MSVC can't be found. Runs vcvars64.bat at most once per process.
+    """
+    global _MSVC_ENV_CACHE, _MSVC_ENV_TRIED
+    if _MSVC_ENV_CACHE is not None:
+        return _MSVC_ENV_CACHE
+    if _MSVC_ENV_TRIED:
+        return None
+    _MSVC_ENV_TRIED = True
+
+    vcvars = _find_vcvars_bat()
+    if vcvars is None:
+        return None
+    vcvars_key = str(vcvars.resolve())
+    try:
+        vcvars_mtime = vcvars.stat().st_mtime
+    except OSError:
+        vcvars_mtime = 0.0
+
+    # Try the disk cache first.
+    cache_file = _msvc_env_cache_file()
+    if cache_file.exists():
+        try:
+            import json
+            data = json.loads(cache_file.read_text(encoding="utf-8"))
+            if (data.get("vcvars") == vcvars_key
+                    and data.get("mtime") == vcvars_mtime
+                    and isinstance(data.get("env"), dict)
+                    and data["env"]):
+                _MSVC_ENV_CACHE = {str(k): str(v) for k, v in data["env"].items()}
+                return _MSVC_ENV_CACHE
+        except (ValueError, OSError):
+            pass
+
+    # Run vcvars once and capture the resulting environment via `set`.
+    # Pass a single command *string* (not an argv list) with `cmd /s /c` so
+    # cmd strips exactly the outer quote pair — this is the robust way to run
+    # a quoted batch path followed by `&& set` without cmd mangling quotes.
+    cmd_str = f'cmd.exe /s /c ""{vcvars}" >NUL && set"'
+    try:
+        result = subprocess.run(
+            cmd_str, capture_output=True, text=True, timeout=120,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+
+    env: dict[str, str] = {}
+    for line in result.stdout.splitlines():
+        if "=" in line:
+            key, _, val = line.partition("=")
+            if key:
+                env[key] = val
+    # Sanity check: a valid MSVC env must expose PATH and LIB.
+    keys_upper = {k.upper() for k in env}
+    if "PATH" not in keys_upper or "LIB" not in keys_upper:
+        return None
+
+    _MSVC_ENV_CACHE = env
+    try:
+        import json
+        cache_file.write_text(
+            json.dumps({"vcvars": vcvars_key, "mtime": vcvars_mtime, "env": env}),
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
+    return env
+
+
+def _env_path_value(env: dict[str, str]) -> str:
+    """Extract the PATH value from an env dict, case-insensitively."""
+    for k, v in env.items():
+        if k.upper() == "PATH":
+            return v
+    return ""
 
 
 def _obj_is_current(src: Path, obj: Path) -> bool:
@@ -993,7 +1110,7 @@ def _make_target_machine(target: str | None):
         # shared objects); leave Windows at its default.
         tm = llvm.Target.from_default_triple()
         return tm.create_target_machine(
-            opt=2,  # -O2 backend codegen
+            opt=_BACKEND_OPT_LEVEL,  # -O3 backend codegen (override w/ FASTPY_OPT)
             reloc="pic" if not IS_WINDOWS else "default",
             codemodel="default",
         )
@@ -1049,8 +1166,9 @@ def compile_ir_to_obj(
 
     # Run IR-level optimization passes (-O2 pipeline).
     # Uses the new LLVM pass manager API (PassBuilder + PipelineTuningOptions).
-    pto = llvm.PipelineTuningOptions(speed_level=2, size_level=0)
-    pto.inlining_threshold = 225  # standard -O2 inlining
+    pto = llvm.PipelineTuningOptions(speed_level=_BACKEND_OPT_LEVEL, size_level=0)
+    # -O3 uses a larger inline threshold (275) than -O2 (225).
+    pto.inlining_threshold = 275 if _BACKEND_OPT_LEVEL >= 3 else 225
     pb = llvm.create_pass_builder(target_machine, pto)
     mpm = pb.getModulePassManager()
     mpm.run(mod, pb)
@@ -1064,13 +1182,53 @@ def compile_ir_to_obj(
 
 
 def _link_windows(obj_files: list[Path], output_path: Path,
-                   install: PythonInstall | None = None) -> Path:
-    """Link object files using MSVC's link.exe (Windows)."""
-    obj_list = " ".join(f'"{p}"' for p in obj_files)
-    out_str = str(output_path)
+                  install: PythonInstall | None = None) -> Path:
+    """Link object files using MSVC's link.exe (Windows).
 
+    Fast path: use the cached MSVC environment (captured once via vcvars) and
+    invoke link.exe directly — this avoids re-running vcvars64.bat (~1-2s) on
+    every link, which dominates compile time. Falls back to the vcvars-batch
+    method if the cached-env path is unavailable or fails.
+    """
     py_lib_dir = _find_python_lib_dir(install)
     py_lib = _find_python_lib_name(install)
+
+    env = _get_msvc_env()
+    if env is not None:
+        import shutil
+        link_exe = shutil.which("link.exe", path=_env_path_value(env))
+        if link_exe:
+            args = [
+                link_exe, "/NOLOGO", f"/OUT:{output_path}",
+                *[str(p) for p in obj_files],
+                f"/LIBPATH:{py_lib_dir}", py_lib,
+                "/DEFAULTLIB:ucrt", "/DEFAULTLIB:msvcrt",
+                "/DEFAULTLIB:legacy_stdio_definitions",
+                "/SUBSYSTEM:CONSOLE", "/STACK:8388608",
+                "/EXPORT:fastpy_get_jit_symbols",
+                "/EXPORT:fastpy_get_jit_symbol_count",
+            ]
+            try:
+                result = subprocess.run(
+                    args, capture_output=True, text=True,
+                    timeout=300, env=env,
+                )
+            except (OSError, subprocess.SubprocessError):
+                result = None
+            if result is not None and result.returncode == 0 \
+                    and output_path.exists():
+                return output_path
+            # Otherwise fall through to the batch fallback below, which
+            # produces a full diagnostic if linking genuinely fails.
+
+    return _link_windows_batch(obj_files, output_path, py_lib_dir, py_lib)
+
+
+def _link_windows_batch(obj_files: list[Path], output_path: Path,
+                        py_lib_dir: Path, py_lib: str) -> Path:
+    """Fallback linker path: set up MSVC via a vcvars batch, then link."""
+    obj_list = " ".join(f'"{p}"' for p in obj_files)
+    out_str = str(output_path)
 
     vcvars_cmd = _find_msvc_cl()
     if vcvars_cmd is None:
