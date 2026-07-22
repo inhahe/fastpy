@@ -8690,6 +8690,41 @@ int64_t fastpy_os_path_islink(const char *path) {
 #endif
 }
 
+/* os.stat(path) -> a 10-int list mirroring CPython's os.stat_result *sequence*
+ * form: (st_mode, st_ino, st_dev, st_nlink, st_uid, st_gid, st_size,
+ *        st_atime, st_mtime, st_ctime).  The timestamps are integer seconds —
+ * the index/tuple form (CPython exposes sub-second floats only via the named
+ * .st_*time attributes, not the sequence).  A single stat() call (SYS_FS_STAT,
+ * follows symlinks) fills the whole struct, so this is the capstone that
+ * exercises many stat fields at once — st_mode/st_ino/st_dev/st_nlink/st_size
+ * plus the three timestamps — rather than one field per lowering.  CPython
+ * raises OSError on failure; the AOT-simplified form returns an empty list on
+ * any stat error (an indexing self-test uses a known-good path). */
+FpyList* fastpy_os_stat(const char *path) {
+    FpyList *lst = fpy_list_new(10);
+    if (path == NULL) return lst;
+#ifdef _WIN32
+    struct _stat64 st;
+    if (_stat64(path, &st) != 0) return lst;
+#else
+    struct stat st;
+    if (stat(path, &st) != 0) return lst;
+#endif
+    /* musl/glibc/Win32 all provide st_atime/st_mtime/st_ctime (as macros for
+     * the .tv_sec of the timespec on POSIX), so this order is portable. */
+    fpy_list_append(lst, fpy_int((int64_t)st.st_mode));
+    fpy_list_append(lst, fpy_int((int64_t)st.st_ino));
+    fpy_list_append(lst, fpy_int((int64_t)st.st_dev));
+    fpy_list_append(lst, fpy_int((int64_t)st.st_nlink));
+    fpy_list_append(lst, fpy_int((int64_t)st.st_uid));
+    fpy_list_append(lst, fpy_int((int64_t)st.st_gid));
+    fpy_list_append(lst, fpy_int((int64_t)st.st_size));
+    fpy_list_append(lst, fpy_int((int64_t)st.st_atime));
+    fpy_list_append(lst, fpy_int((int64_t)st.st_mtime));
+    fpy_list_append(lst, fpy_int((int64_t)st.st_ctime));
+    return lst;
+}
+
 const char* fastpy_os_path_join(const char *a, const char *b) {
     int alen = (int)strlen(a), blen = (int)strlen(b);
     char *buf = (char*)malloc(alen + blen + 2);

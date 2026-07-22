@@ -2654,6 +2654,13 @@ class CodeGen:
         self.runtime["os_getenv"] = ir.Function(self.module, ft, name="fastpy_os_getenv")
         ft = ir.FunctionType(i8_ptr, [i8_ptr])
         self.runtime["os_listdir"] = ir.Function(self.module, ft, name="fastpy_os_listdir")
+        # os.stat(path) -> FpyList* (opaque i8_ptr) of 10 ints, mirroring
+        # CPython's os.stat_result sequence form: (st_mode, st_ino, st_dev,
+        # st_nlink, st_uid, st_gid, st_size, st_atime, st_mtime, st_ctime).
+        # One SYS_FS_STAT fills the whole struct — the capstone exercising many
+        # stat fields at once. Returned like listdir (raw list pointer).
+        ft = ir.FunctionType(i8_ptr, [i8_ptr])
+        self.runtime["os_stat"] = ir.Function(self.module, ft, name="fastpy_os_stat")
         # os.remove(path)/os.unlink(path) -> int status (0 ok, -1 error)
         ft = ir.FunctionType(i64, [i8_ptr])
         self.runtime["os_remove"] = ir.Function(self.module, ft, name="fastpy_os_remove")
@@ -19114,6 +19121,8 @@ class CodeGen:
                     return ValueType(VKind.STR)
                 elif fn in ("listdir",):
                     return ValueType(VKind.LIST, elem_type=ValueType(VKind.STR))
+                elif fn in ("stat",):
+                    return ValueType(VKind.LIST, elem_type=ValueType(VKind.INT))
                 elif fn in ("remove", "unlink", "mkdir", "rmdir", "rename",
                            "getsize", "path_getsize", "symlink", "link",
                            "chmod", "truncate", "utime", "chown"):
@@ -19198,6 +19207,8 @@ class CodeGen:
                 return ValueType(VKind.LIST, elem_type=ValueType(VKind.INT))
             elif mod == "os" and fn == "listdir":
                 return ValueType(VKind.LIST, elem_type=ValueType(VKind.STR))
+            elif mod == "os" and fn == "stat":
+                return ValueType(VKind.LIST, elem_type=ValueType(VKind.INT))
             elif mod == "os" and fn in ("remove", "unlink", "mkdir", "rmdir", "rename", "symlink", "link", "chmod", "truncate", "utime", "chown"):
                 return ValueType(VKind.INT)
             elif mod == "os" and fn == "access":
@@ -37636,6 +37647,13 @@ class CodeGen:
             v = self._emit_expr_value(node.args[0])
             v = self._ensure_ptr(v)
             return self.builder.call(self.runtime["os_listdir"], [v])
+        elif func_name == "stat" and len(node.args) == 1:
+            # os.stat(path) -> raw FpyList* (10 ints); inference (VKind.LIST,
+            # elem INT) makes downstream indexing st[i] treat it as a list,
+            # exactly like os.listdir. No FpyValue boxing needed.
+            v = self._emit_expr_value(node.args[0])
+            v = self._ensure_ptr(v)
+            return self.builder.call(self.runtime["os_stat"], [v])
         elif func_name in ("remove", "unlink") and len(node.args) == 1:
             # os.remove/os.unlink(path) -> bare i64 status (0 ok, -1 error).
             # Inference (VKind.INT) makes downstream treat the result as a
@@ -38178,6 +38196,7 @@ class CodeGen:
         "os.path.samefile": "bool",
         "os.path.islink": "bool",
         "os.listdir": "list:str",
+        "os.stat": "list:int",
         "os.access": "bool",
         # json
         "json.dumps": "str", "json.loads": "pyobj",
