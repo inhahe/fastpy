@@ -62,9 +62,14 @@
 
 ### Performance optimizations
 - Internal linkage + alwaysinline for whole-program inlining
-- Vtable dispatch for O(1) polymorphic method calls
+- Vtable dispatch for O(1) polymorphic method calls (with CHA devirtualization)
 - Per-class typed attributes (float/str/bool)
 - FV ABI for native-typed method parameters
+- FpyClassDef struct alignment fix (72→88 bytes, correct array stride for vtable lookup)
+- Void return type detection in vtable dispatch (eliminates calling convention UB)
+- Native double params for float methods (CSA-driven, eliminates i64↔double coercion)
+- set_arg_tag elimination for native-typed params (direct + CHA dispatch)
+- Monomorphic scalar slot optimization (skip tag store + refcount for float/bool attrs)
 
 ### Codegen refactor (Phases 1-4 complete)
 - Phase 1: TypedValue foundation (VKind, ValueType, TypedValue classes)
@@ -231,23 +236,19 @@ coefficient + exponent. Supports Decimal(str), Decimal(int), arithmetic
 ### 18. ~~REPL mode~~ SKIPPED
 Doesn't apply to an AOT compiler. Use CPython for interactive work.
 
-## Planned -- Remaining
-
-### Phase 5: Module registry (codegen refactor)
-Convert the if/elif module dispatch chain to a dispatch dict. Each module
-handler becomes a small function or lambda.
-
-### Phase 6: Cleanup (codegen refactor)
-Remove old `_emit_expr_value`, `_bare_to_tag_data`, `_infer_type_tag`,
-and scattered inttoptr/ptrtoint/bitcast calls.
+### Phase 5-6: Module registry + Cleanup — ✅ DONE (via REFACTORING_ANALYSIS Phases B-D)
+- 6 dispatch registry dicts replace if/elif chains
+- VKind migration: 1400+ VKind refs, string-tag comparisons eliminated
+- God methods decomposed (1400→300 lines each)
+- elif chain conversion across ~25 dispatch sites
 
 ## Stats
 
 | Metric | Value |
 |--------|-------|
-| Differential tests | 405/405 passing |
-| Regression tests | 94/94 passing |
+| Total tests passing | 836 (1 skipped — django not installed) |
 | Stdlib .py files compiling | 104/104 |
+| Stdlib module tests | 134/134 |
 | Platforms | Windows x64, Linux x64 (WSL Ubuntu tested) |
 | Python versions | 3.11, 3.12, 3.13, 3.14 |
 | Codegen refactor phases | 4/6 complete |

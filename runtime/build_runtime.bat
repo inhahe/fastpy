@@ -13,9 +13,39 @@ REM NOTE: For multi-version builds, prefer using the Python toolchain:
 REM   python -c "from compiler.toolchain import ensure_runtime_built; ensure_runtime_built()"
 REM which handles MSVC quoting, response files, and version discovery automatically.
 
-call "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat" 1>NUL 2>NUL
-if errorlevel 1 (
-    call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat" 1>NUL 2>NUL
+REM --- Locate vcvars64.bat across all VS editions, years, and paths ---
+set "_VCVARS_FOUND=0"
+for %%D in ("C:\Program Files" "C:\Program Files (x86)") do (
+    if exist "%%~D\Microsoft Visual Studio\" (
+        for /d %%Y in ("%%~D\Microsoft Visual Studio\*") do (
+            for %%E in (Community Professional Enterprise BuildTools) do (
+                if "!_VCVARS_FOUND!"=="0" (
+                    if exist "%%Y\%%E\VC\Auxiliary\Build\vcvars64.bat" (
+                        call "%%Y\%%E\VC\Auxiliary\Build\vcvars64.bat" 1>NUL 2>NUL
+                        if not errorlevel 1 set "_VCVARS_FOUND=1"
+                    )
+                )
+            )
+        )
+    )
+)
+if "!_VCVARS_FOUND!"=="0" (
+    REM Try vswhere as last resort
+    set "_VSWHERE=C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe"
+    if exist "!_VSWHERE!" (
+        for /f "delims=" %%P in ('"!_VSWHERE!" -latest -property installationPath 2^>NUL') do (
+            if exist "%%P\VC\Auxiliary\Build\vcvars64.bat" (
+                call "%%P\VC\Auxiliary\Build\vcvars64.bat" 1>NUL 2>NUL
+                if not errorlevel 1 set "_VCVARS_FOUND=1"
+            )
+        )
+    )
+)
+if "!_VCVARS_FOUND!"=="0" (
+    echo ERROR: Could not find vcvars64.bat.  Install the
+    echo "Desktop development with C++" workload in Visual Studio.
+    echo   Visual Studio Installer ^> Modify ^> check "Desktop development with C++"
+    exit /b 1
 )
 
 cd /d "%~dp0"

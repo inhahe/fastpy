@@ -172,6 +172,7 @@ int  fpy_gil_held(void);
 /* Print mutex — serializes print() calls across threads */
 extern fpy_mutex_t fpy_print_mutex;
 extern int fpy_print_mutex_initialized;
+void fpy_print_mutex_init(void);
 
 static inline void fpy_print_lock(void) {
     if (fpy_threading_mode >= FPY_THREADING_GIL && fpy_print_mutex_initialized)

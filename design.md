@@ -116,12 +116,37 @@ the CPython bridge for SlateOS later as a superset once CPython is ported.
 - [x] **First real component — on-target execution confirmed** (2026-07-21). A
   fastpy-built SlateOS binary (`services/fastpy-hello` in the OS repo, a real
   fastpy program with lists/iteration) now **boots under the SlateOS kernel and
-  runs to `exit(0)` at ring 3** — the kernel self-test
-  `self_test_fastpy_slateos_tls` spawns it via the native ABI and asserts the
-  process reaches `Zombie` with exit 0 (serial: *"fastpy-on-SlateOS TLS … set up
-  main-thread ELF TLS via SYS_SET_FS_BASE and ran to exit(0): OK"*). The crt
+  runs at ring 3** — the kernel self-test `self_test_fastpy_slateos_tls` spawns
+  it via the native ABI and asserts the process reaches `Zombie`. The crt
   startup + native syscalls behave on-target; the pipeline is now validated
   end-to-end, not just at link time.
+  - **argv delivery validated on-target** (2026-07-21). The self-test spawns
+    the program with a known 3-element argv (`["fastpy-hello","alpha","bravo"]`)
+    and the program runs `sys.exit(len(sys.argv))`; the kernel asserts
+    `exit_code == 3`. This exercises the full argument path end-to-end: kernel
+    `SYS_PROCESS_GET_ARGS` → crt `retrieve_initial_args` → runtime `fpy_argv` →
+    Python `sys.argv` → non-zero exit code back to the parent (serial:
+    *"fastpy-on-SlateOS TLS … read its 3-element argv via sys.argv, and ran to
+    exit(argc): OK"*). Two fixes made this work: (a) runtime `fastpy_sys_argv`
+    now allocates each element as a heap `FpyString` (a raw C `char*` is not a
+    valid `FPY_TAG_STR` value — reading the length header faults); and (b)
+    codegen learned that `sys.argv`/`sys.path` are `list[str]` and
+    `sys.version_info` is a `tuple[int]`, so `len()`/iteration/subscript dispatch
+    natively instead of routing through the CPython-bridge object path (which,
+    in pure mode, raises).
+  - **Pure-mode native imports no longer require the CPython bridge.**
+    `import sys` (and other native modules) previously emitted
+    `fpy_cpython_import("sys")`, which in a pure-mode (no-CPython) build raises
+    `RuntimeError` from `bridge_stub.c` — so the very first line of any program
+    that imported a native module crashed on-target. Because the *same* IR is
+    compiled for both host and pure targets, codegen cannot special-case the
+    mode; the fix is at the runtime-C level. Codegen now emits
+    `fpy_cpython_import_native` / `fpy_cpython_getattr_native` for native-module
+    imports and attribute fallbacks. In the host bridge these forward to the
+    real `fpy_cpython_import`/`getattr`; in `bridge_stub.c` they return a
+    non-null opaque sentinel with **no raise** (native dispatch never
+    dereferences it), so `import sys` links and runs in pure mode and only a
+    genuine use of an unsupported non-native attribute fails cleanly.
   - **Q31 resolved — Option A** (operator's call; open-questions.md → OS
     design-decisions.md §82): the `PT_TLS` problem (the C runtime's
     `FPY_THREAD_LOCAL __thread` locals lower to `%fs:offset`, and a native static
@@ -139,7 +164,43 @@ the CPython bridge for SlateOS later as a superset once CPython is ported.
     change — the toolchain remains complete and green.
   - Next: pick a genuinely useful component (candidate: the package manager) as
     the first *shipping* fastpy SlateOS binary now that the runtime path is
-    proven.
+    proven. **Prerequisite in progress — pure-mode file I/O** (see below).
+- [x] **Pure-mode file I/O — native file objects** (host-verified 2026-07-21;
+  SlateOS build+link verified). A
+  genuinely useful on-target utility (`cat`, `sysinfo`, the package manager)
+  needs `open()`/read/write, but the built-in `open()` used to route through the
+  CPython bridge (`builtins.open`), which raises in pure mode. Fix: a **native
+  file object** in the runtime, backed by C stdio (`fopen`/`fread`/`fwrite`/
+  `fgets`/`fclose` — the SlateOS posix libc implements these over the `SYS_FS_*`
+  VFS syscalls, so it works on-target with no bridge). The file object is a
+  built-in `FpyObj` class (`file`, registered lazily in `objects.c`) holding the
+  `FILE*` in a slot; `open()` returns it tagged `FPY_TAG_OBJ`, so the existing
+  object-method dispatch (`fastpy_obj_call_methodN`) and context-manager path
+  (`with open(...) as f:` → `__enter__`/`__exit__`) drive `read`/`write`/
+  `readline`/`readlines`/`close`/iteration with no per-method codegen. Because
+  the `file` class is registered only at runtime (invisible to codegen), method
+  calls on `open()` results are routed by codegen through a dedicated path
+  (`_emit_method_call_file`): it emits `fastpy_obj_call_methodN` and recovers the
+  dynamic return type from the runtime ret-tag side channel (`get_ret_tag`),
+  packing the result as an `FpyValue` so `read`/`readline` → str, `readlines` →
+  list, `write` → int are correctly typed at the call site (an earlier bug
+  mistyped these as int, returning len 0 and segfaulting). Codegen tracks file
+  variables (`_file_vars`) from `f = open(...)` assignments and `with open(...)
+  as f:` bindings; the `with`/`for line in f` paths bind `f` as `VKind.OBJ` so
+  the context-manager and iterator-protocol dispatch drive the runtime methods.
+  **Design
+  decision (Claude, autonomous):** native file objects are used in **both** host
+  and pure mode (uniform behaviour, and it removes the bridge dependency
+  entirely for core file I/O) rather than native-only-in-pure. Tradeoff: a native
+  file object can't be handed to a *bridge* stdlib function (`json.load(f)`,
+  `csv.reader(f)`) in host mode — but the test suite has no such fixture (only
+  `shelve.open`, a module method, and the `_run_scratch`/`_dump_ir` harness
+  scripts which run under host CPython, not compiled), and the idiomatic
+  `json.loads(open(p).read())` still works because `read()` returns a native str.
+  Known slice-1 limitations (documented, to extend): text mode only (`read()`
+  returns `str`, binary `'rb'`/`bytes` not yet wired); `read(n)` size arg not yet
+  supported (`read()` reads all); `FileNotFoundError` is raised by name but not
+  yet registered in the OSError hierarchy.
 - [ ] **CPython bridge on SlateOS (B)** — later, once CPython is ported, so
   unsupported-stdlib programs also run on-target.
 

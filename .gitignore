@@ -11,3 +11,5 @@ __pycache__/
 .build/
 web/venv*/
 *.egg-info/
+# Cross-compiled SlateOS runtime objects (build artifacts, regenerated on demand)
+runtime/slateos/

@@ -17,7 +17,7 @@
 static FpyGCNode gc_sentinel = { &gc_sentinel, &gc_sentinel, 0, 0 };
 static int64_t gc_tracked = 0;
 static int64_t gc_alloc_count = 0;
-static int64_t gc_threshold = 700;
+static int64_t gc_threshold = 5000;
 
 void fpy_gc_track(FpyGCNode *node) {
     node->gc_flags |= FPY_GC_TRACKED;
@@ -132,10 +132,14 @@ static void gc_visit_refs(FpyGCNode *node, gc_visitor_fn visitor) {
             FpyObj *obj = (FpyObj*)container;
             extern FpyClassDef fpy_classes[];
             int sc = fpy_classes[obj->class_id].slot_count;
-            if (sc > 0) {
-                FpyValue *slots = FPY_OBJ_SLOTS(obj);
-                for (int i = 0; i < sc; i++) {
-                    FpyGCNode *ref = gc_node_from_value(slots[i]);
+            int nn = fpy_classes[obj->class_id].n_native_slots;
+            int nb = sc - nn;
+            /* Only scan BOXED slots — native slots hold scalars (int/float/bool)
+             * which can never reference other GC'd objects. */
+            if (nb > 0) {
+                FpyValue *boxed = FPY_OBJ_BOXED_SLOTS(obj, nn);
+                for (int i = 0; i < nb; i++) {
+                    FpyGCNode *ref = gc_node_from_value(boxed[i]);
                     if (ref && (ref->gc_flags & FPY_GC_TRACKED))
                         visitor(ref);
                 }
@@ -302,8 +306,8 @@ void fpy_gc_maybe_collect(void) {
          * toward the base threshold to stay responsive. */
         if (freed == 0 && gc_threshold < 50000) {
             gc_threshold *= 2;
-        } else if (freed > 0 && gc_threshold > 700) {
-            gc_threshold = (gc_threshold > 1400) ? gc_threshold / 2 : 700;
+        } else if (freed > 0 && gc_threshold > 5000) {
+            gc_threshold = (gc_threshold > 10000) ? gc_threshold / 2 : 5000;
         }
     }
 }

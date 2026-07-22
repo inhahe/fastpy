@@ -80,6 +80,93 @@ _SLATEOS_FEATURES = "+sse,+sse2"
 # and the sysroot is static-only, hence: static link, no dynamic linker, non-PIE.
 _SLATEOS_LLD_FLAVOR = "gnu"
 
+# Directory where the cross-compiled pure-mode SlateOS runtime objects are
+# cached (out-of-tree from the host .obj/.o so the two never collide).
+SLATEOS_RUNTIME_DIR = RUNTIME_DIR / "slateos"
+
+# Pure-mode runtime translation units for the SlateOS target. Unlike the host
+# build (which links cpython_bridge.c against libpython), a SlateOS pure-mode
+# build omits the CPython bridge entirely and substitutes bridge_stub.c — its
+# operational entry points raise a catchable RuntimeError and the refcount
+# hooks are no-ops (no bridge objects can exist). The JIT symbol table in
+# runtime.c is compiled out via -DFPY_PURE_MODE (it would otherwise
+# force-reference bridge functions pure mode omits).
+_SLATEOS_RUNTIME_NAMES = [
+    "runtime", "objects", "threading", "gc", "bigint", "bridge_stub",
+]
+
+# The C cross-compiler target passed to `zig cc`. `zig cc --target=<t>` is a
+# self-contained clang plus bundled musl headers and libc, so no system-wide
+# toolchain or separately vendored musl sysroot is required. The flags below
+# mirror the codegen ABI in `_make_target_machine`: static relocation
+# (-fno-pic/-fno-pie), large code model, and -O2 to match the IR opt level.
+_SLATEOS_ZIG_TARGET = "x86_64-linux-musl"
+
+
+def _find_zig_cc() -> Path | None:
+    """
+    Locate the `zig` executable used as the SlateOS C cross-compiler.
+
+    `zig cc --target=x86_64-linux-musl` bundles clang + musl headers + musl
+    libc in one portable download, so it needs neither a system-wide install
+    nor a separately vendored musl sysroot. Resolution order:
+
+    1. ``$FASTPY_ZIG`` — explicit override (path to ``zig[.exe]``).
+    2. A bare ``zig`` on PATH.
+    3. A portable unpack under ``D:\\utils\\zig-*`` / ``C:\\utils\\zig-*``
+       (dev-machine fallback).
+
+    Returns the path to zig, or None if not found.
+    """
+    import shutil
+    import glob
+
+    override = os.environ.get("FASTPY_ZIG")
+    if override:
+        p = Path(override)
+        if p.exists():
+            return p
+
+    found = shutil.which("zig")
+    if found:
+        return Path(found)
+
+    # Dev-machine portable-install fallback.
+    for base in (r"D:\utils", r"C:\utils"):
+        for m in sorted(glob.glob(os.path.join(base, "zig-*", "zig.exe")),
+                        reverse=True):
+            return Path(m)
+    return None
+
+
+def _find_slateos_sysroot_lib() -> Path | None:
+    """
+    Locate the SlateOS sysroot ``lib`` directory that holds ``libc.a``.
+
+    A pure-mode SlateOS executable links the fastpy program + runtime objects
+    against the OS repo's static ``libc.a`` (the ``posix`` crate built as a
+    libc-shaped staticlib). Resolution order:
+
+    1. ``$FASTPY_SLATEOS_SYSROOT`` — either the sysroot root (its ``lib``
+       subdir is tried) or the ``lib`` dir itself.
+    2. A sibling ``os`` checkout at ``<fastpy>/../os/toolchain/sysroot/lib``.
+
+    Returns the directory containing ``libc.a``, or None if not found.
+    """
+    candidates: list[Path] = []
+    env = os.environ.get("FASTPY_SLATEOS_SYSROOT")
+    if env:
+        p = Path(env)
+        candidates.append(p / "lib")
+        candidates.append(p)
+    candidates.append(
+        _PROJECT_ROOT.parent / "os" / "toolchain" / "sysroot" / "lib"
+    )
+    for c in candidates:
+        if (c / "libc.a").exists():
+            return c
+    return None
+
 
 def _find_rust_lld() -> Path | None:
     """
@@ -768,6 +855,65 @@ def _compile_bridge_posix(install: PythonInstall) -> Path:
     return out_obj
 
 
+def _compile_shared_runtime_slateos(force: bool = False) -> list[Path]:
+    """Cross-compile the pure-mode C runtime to SlateOS (musl) ELF objects.
+
+    Drives ``zig cc --target=x86_64-linux-musl`` over the pure-mode runtime
+    translation units (``_SLATEOS_RUNTIME_NAMES``), emitting one ``.o`` per
+    source into ``SLATEOS_RUNTIME_DIR``. The compile flags mirror the codegen
+    ABI (static relocation, large code model) and define ``FPY_PURE_MODE`` so
+    the CPython-bridge fallbacks resolve to ``bridge_stub.c`` and the JIT
+    symbol table is compiled out. Objects that are already newer than their
+    source are skipped unless ``force`` is set.
+
+    Returns the list of object paths (in ``_SLATEOS_RUNTIME_NAMES`` order).
+    """
+    zig = _find_zig_cc()
+    if zig is None:
+        raise RuntimeError(
+            "Cannot find `zig` for the SlateOS runtime cross-compile. Install "
+            "zig (it bundles clang + musl), put it on PATH, or set FASTPY_ZIG "
+            "to the zig executable path.")
+
+    SLATEOS_RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+    objs: list[Path] = []
+    for name in _SLATEOS_RUNTIME_NAMES:
+        src = RUNTIME_DIR / f"{name}.c"
+        obj = SLATEOS_RUNTIME_DIR / f"{name}.o"
+        objs.append(obj)
+        if not force and _obj_is_current(src, obj):
+            continue
+        cmd = [
+            str(zig), "cc",
+            f"--target={_SLATEOS_ZIG_TARGET}",
+            "-c", "-O2",
+            "-mcmodel=large",     # match codegen code-model=large
+            "-fno-pic", "-fno-pie",  # match relocation-model=static
+            "-DFPY_PURE_MODE",    # no CPython bridge / no JIT symbol table
+            str(src),
+            "-o", str(obj),
+        ]
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=300,
+            cwd=str(RUNTIME_DIR),
+        )
+        if result.returncode != 0 or not obj.exists():
+            raise RuntimeError(
+                f"Failed to cross-compile {src.name} for SlateOS:\n"
+                f"{result.stdout}\n{result.stderr}")
+    return objs
+
+
+def ensure_slateos_runtime_built(force: bool = False) -> list[Path]:
+    """Ensure the pure-mode SlateOS C runtime objects are built; return paths.
+
+    Public entry point mirroring :func:`ensure_runtime_built` for the SlateOS
+    cross-target. Pure mode has no per-Python-version bridge, so there is a
+    single shared set of objects independent of any ``PythonInstall``.
+    """
+    return _compile_shared_runtime_slateos(force=force)
+
+
 def ensure_runtime_built(python_exe: str | Path | None = None,
                          python_version: str | None = None) -> list[Path]:
     """Ensure the C runtime is compiled for the target Python. Returns list of
@@ -1010,7 +1156,7 @@ def _link_posix(obj_files: list[Path], output_path: Path,
 def _link_slateos(
     obj_files: list[Path],
     output_path: Path,
-    entry: str = "main",
+    entry: str = "_start",
     sysroot_lib_dir: Path | None = None,
     libs: list[str] | None = None,
 ) -> Path:
@@ -1025,14 +1171,19 @@ def _link_slateos(
     The link is static and non-PIE with no dynamic linker, matching
     `toolchain/x86_64-slateos.json` (relocation-model=static, crt-static,
     the loader maps userspace at a fixed base). Pure-mode fastpy programs
-    (no CPython bridge) link only their own objects plus, once ported, the
-    fastpy C runtime objects and the sysroot `libc.a`.
+    (no CPython bridge) link their own objects plus the fastpy C runtime
+    objects and the sysroot `libc.a`.
 
     Args:
         obj_files: Object files to link (fastpy program + runtime objects).
         output_path: Path for the output ELF executable.
-        entry: Entry symbol. Defaults to ``main``; a real SlateOS program with
-            a crt/`_start` would override this.
+        entry: Entry symbol. Defaults to ``_start`` — the real ELF entry, which
+            the sysroot ``libc.a`` provides (crt0: ``_start`` →
+            ``__libc_start_main`` retrieves argv/envp from the kernel, inits
+            environ/signals, runs ELF constructors, calls ``main``, then
+            ``exit``s with its return value). Setting the entry to ``_start``
+            pulls that crt member out of the archive. Pass ``"main"`` only to
+            link a bare object with no crt (e.g. the low-level plumbing test).
         sysroot_lib_dir: Optional directory added to the linker search path
             (e.g. the OS repo's ``toolchain/sysroot/lib`` holding ``libc.a``).
         libs: Optional archive names to link (e.g. ``["c"]`` for ``libc.a``).
@@ -1099,7 +1250,23 @@ def link_executable(
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     if target == SLATEOS_TARGET:
-        return _link_slateos(obj_files, output_path)
+        # Pure-mode SlateOS link: program objects + cross-compiled fastpy
+        # runtime objects, resolved against the OS repo's static libc.a. The
+        # runtime is built on demand (cached under SLATEOS_RUNTIME_DIR).
+        runtime_objs = ensure_slateos_runtime_built()
+        sysroot_lib = _find_slateos_sysroot_lib()
+        if sysroot_lib is None:
+            raise RuntimeError(
+                "Cannot find the SlateOS sysroot libc.a. Set "
+                "FASTPY_SLATEOS_SYSROOT to the sysroot directory (holding "
+                "lib/libc.a), or check out the OS repo as a sibling of fastpy "
+                "(../os/toolchain/sysroot/lib).")
+        return _link_slateos(
+            list(obj_files) + runtime_objs,
+            output_path,
+            sysroot_lib_dir=sysroot_lib,
+            libs=["c"],
+        )
     if target is not None:
         raise ValueError(f"Unknown link target {target!r}")
 

@@ -124,10 +124,36 @@ typedef struct {
     FpyMethodDef *methods;
     int method_count;
     int slot_count;         /* number of pre-declared attribute slots */
+    int n_native_slots;     /* first n_native_slots slots are "native" (8 bytes each,
+                             * raw i64 data without a tag — used for monomorphic
+                             * scalar attrs like int/float/bool). Remaining slots
+                             * (slot_count - n_native_slots) are "boxed" (16 bytes
+                             * each, full FpyValue {tag, data}).
+                             * Memory layout after FpyObj header:
+                             *   [native: n_native × i64]  [boxed: n_boxed × FpyValue]
+                             * 0 by default (all slots are boxed). */
+    int8_t native_slot_tags[16]; /* FPY_TAG_* for each native slot (0..n_native-1).
+                                  * Used by runtime get_slot to return the correct tag
+                                  * when reading from the tag-less native region.
+                                  * Max 16 native slots per class (more than enough). */
     const char **slot_names; /* slot_names[i] = attribute name for slot i */
     void (*destructor)(FpyObj *obj); /* per-class destructor, NULL if none */
     void **vtable;                  /* vtable[i] = method func ptr, NULL-filled */
     int vtable_size;                /* number of vtable entries */
+    uint8_t acyclic;        /* 1 = slots only hold scalars, can't form cycles
+                             * → skip GC tracking for instances (no cycle collector
+                             * overhead, freed purely by reference counting). */
+    int *mro;               /* C3-linearized MRO: array of class_ids.
+                             * mro[0] = self, mro[1..mro_len-1] = ancestors.
+                             * NULL until set by fastpy_set_class_mro.
+                             * Used by super() for correct diamond dispatch. */
+    int mro_len;            /* number of entries in mro[] */
+    /* Class-level variables (e.g. `kind = "parent"` on the class body).
+     * Stored as parallel arrays of (name, tag, data) triples.
+     * Looked up by obj_get_fv when the instance has no matching attr. */
+    const char **class_var_names;
+    FpyValue    *class_var_values;
+    int          class_var_count;
 } FpyClassDef;
 
 #define FPY_MAX_VTABLE 64  /* max methods per class hierarchy */
@@ -167,6 +193,11 @@ static inline int fpy_decref(int32_t *rc) {
 void fpy_incref_atomic(int32_t *rc);
 int fpy_decref_atomic(int32_t *rc);
 
+/* Tagged-value refcount release — decrefs and destroys when count hits 0.
+ * Defined in objects.c; declared here so callers (gc.c, runtime.c,
+ * cpython_bridge.c) don't rely on an implicit declaration. */
+void fpy_rc_decref(int32_t tag, int64_t data);
+
 #define FPY_OBJ_MAGIC 0x4F424A53  /* "OBJS" — distinguishes FpyObj from PyObject* */
 
 /* Weak reference: points to an object without preventing its collection.
@@ -190,14 +221,30 @@ struct FpyObj {
     int class_id;
     FpyObjAttrs *dynamic_attrs;      /* NULL unless used */
     FpyWeakRef *weakref_list;        /* singly-linked list of weak refs, NULL if none */
-    fpy_mutex_t lock;                /* per-object lock (free-threaded mode) */
+    /* Lock removed: FPY_LOCK/FPY_UNLOCK are never used with FpyObj.
+     * Saves 40 bytes per object (CRITICAL_SECTION on Windows), improving
+     * cache utilization for object-heavy workloads. */
 };
 
 /* Inline slot access: slots are allocated contiguously after the FpyObj
  * header (in the same malloc block), so their address is always (obj + 1).
  * This macro replaces the old obj->slots pointer — no pointer field needed,
- * no memory load, just address arithmetic. */
+ * no memory load, just address arithmetic.
+ *
+ * Two-region layout (native slot optimization):
+ *   [FpyObj header (56 bytes)]
+ *   [native region: n_native × i64 (8 bytes each)]
+ *   [boxed region:  n_boxed × FpyValue (16 bytes each)]
+ *
+ * FPY_OBJ_SLOTS(obj) still returns the start of ALL slot memory (native
+ * region), but callers must respect the native/boxed boundary.
+ * FPY_OBJ_NATIVE_SLOTS: pointer to the native i64 array.
+ * FPY_OBJ_BOXED_SLOTS:  pointer to the boxed FpyValue array (after native).
+ */
 #define FPY_OBJ_SLOTS(obj) ((FpyValue*)((obj) + 1))
+#define FPY_OBJ_NATIVE_SLOTS(obj) ((int64_t*)((obj) + 1))
+#define FPY_OBJ_BOXED_SLOTS(obj, n_native) \
+    ((FpyValue*)(((int64_t*)((obj) + 1)) + (n_native)))
 
 /* List: growable array of FpyValue. `is_tuple` distinguishes tuple-
    typed lists for display purposes (they print with parens). */
@@ -393,8 +440,27 @@ void fastpy_list_slice_step_assign(FpyList *list, int64_t start, int64_t stop,
                                     int64_t step, int64_t has_start,
                                     int64_t has_stop, FpyList *new_values);
 
+/* Extended-slice deletion: del list[start:stop:step] */
+void fastpy_list_slice_step_delete(FpyList *list, int64_t start, int64_t stop,
+                                    int64_t step, int64_t has_start,
+                                    int64_t has_stop);
+
+/* set.intersection_update / difference_update / symmetric_difference_update */
+void fastpy_set_intersection_update(FpyDict *a, FpyDict *b);
+void fastpy_set_difference_update(FpyDict *a, FpyDict *b);
+void fastpy_set_symmetric_difference_update(FpyDict *a, FpyDict *b);
+
+/* zip with 1 iterable */
+FpyList* fastpy_zip1(FpyList *a);
+
 /* --- Built-in list/tuple iterator --- */
 FpyObj* fastpy_list_iter_new(FpyList *list);
+
+/* --- Built-in file object (open()) — C-stdio-backed, works in pure mode.
+ * Returns an FpyObj of the built-in "file" class; method dispatch
+ * (read/write/readline/readlines/close/__enter__/__exit__/__iter__/__next__)
+ * goes through the normal object machinery.  `mode` may be NULL ("r"). --- */
+FpyObj* fastpy_io_open(const char *path, const char *mode);
 
 /* --- Attribute access helpers (hasattr/getattr with default) --- */
 int32_t fastpy_obj_has_attr(FpyObj *obj, const char *name);

@@ -17,6 +17,7 @@
 #ifdef _WIN32
 #include <io.h>
 #include <fcntl.h>
+#include <windows.h>
 #endif
 
 /* GIL release/acquire macros for CPython bridge calls.
@@ -189,6 +190,19 @@ void* fpy_cpython_getattr(void *obj, const char *attr_name) {
         Py_RETURN_NONE;
     }
     return (void*)result;
+}
+
+/* Native-module import/getattr.  On a host (CPython-embedded) build these are
+ * exactly the real import/getattr — the native module's real object is
+ * available for non-native attribute fallback.  The pure-mode build supplies
+ * non-raising sentinel stubs (see bridge_stub.c) so `import sys` never
+ * requires the bridge; keeping the entry points symmetric lets codegen emit
+ * one call sequence for both link targets. */
+void* fpy_cpython_import_native(const char *module_name) {
+    return fpy_cpython_import(module_name);
+}
+void* fpy_cpython_getattr_native(void *obj, const char *attr_name) {
+    return fpy_cpython_getattr(obj, attr_name);
 }
 
 /* Set an attribute on a PyObject*. Takes a tag+data FpyValue. */
@@ -1693,15 +1707,23 @@ extern int64_t fastpy_obj_call_method2(FpyObj *obj, const char *name, int64_t a,
 static int fpy_obj_try_get_attr(FpyObj *obj, const char *name,
                                  int32_t *out_tag, int64_t *out_data) {
     FpyClassDef *cls = &fpy_classes[obj->class_id];
-    /* Static slots */
+    /* Static slots — two-region layout: native then boxed */
     if (cls->slot_count > 0) {
-        FpyValue *slots = FPY_OBJ_SLOTS(obj);
+        int nn = cls->n_native_slots;
+        int64_t *native = FPY_OBJ_NATIVE_SLOTS(obj);
+        FpyValue *boxed = FPY_OBJ_BOXED_SLOTS(obj, nn);
         for (int i = 0; i < cls->slot_count; i++) {
             if (cls->slot_names[i] &&
                 (cls->slot_names[i] == name ||
                  strcmp(cls->slot_names[i], name) == 0)) {
-                *out_tag = slots[i].tag;
-                *out_data = slots[i].data.i;
+                if (i < nn) {
+                    *out_tag = (int32_t)cls->native_slot_tags[i];
+                    *out_data = native[i];
+                } else {
+                    int bi = i - nn;
+                    *out_tag = boxed[bi].tag;
+                    *out_data = boxed[bi].data.i;
+                }
                 return 1;
             }
         }
