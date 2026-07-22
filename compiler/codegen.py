@@ -2607,6 +2607,20 @@ class CodeGen:
         # real SYS_TASK_ID syscall via posix gettid() — a distinct kernel path
         # from the process table, hitting the scheduler's task table).
         self.runtime["os_gettid"] = ir.Function(self.module, ft, name="fastpy_os_gettid")
+        # os.pipe() -> 2-element list [read_fd, write_fd] (FpyList* as i8_ptr).
+        # On SlateOS posix pipe() is a real SYS_PIPE_CREATE syscall — a distinct
+        # kernel path (the pipe subsystem) from file/process syscalls.
+        ft = ir.FunctionType(i8_ptr, [])
+        self.runtime["os_pipe"] = ir.Function(self.module, ft, name="fastpy_os_pipe")
+        # os.write(fd, data) -> bytes written (i64); fd is a raw int fd, data a str.
+        ft = ir.FunctionType(i64, [i64, i8_ptr])
+        self.runtime["os_write"] = ir.Function(self.module, ft, name="fastpy_os_write")
+        # os.read(fd, n) -> str (i8_ptr) of up to n bytes read.
+        ft = ir.FunctionType(i8_ptr, [i64, i64])
+        self.runtime["os_read"] = ir.Function(self.module, ft, name="fastpy_os_read")
+        # os.close(fd) -> int status (0 ok, -1 error).
+        ft = ir.FunctionType(i64, [i64])
+        self.runtime["os_close"] = ir.Function(self.module, ft, name="fastpy_os_close")
         ft = ir.FunctionType(i64, [i8_ptr])
         self.runtime["os_path_exists"] = ir.Function(self.module, ft, name="fastpy_os_path_exists")
         self.runtime["os_path_isfile"] = ir.Function(self.module, ft, name="fastpy_os_path_isfile")
@@ -19112,6 +19126,12 @@ class CodeGen:
                 return ValueType(VKind.STR)
             elif mod == "os" and fn in ("getpid", "getppid", "gettid"):
                 return ValueType(VKind.INT)
+            elif mod == "os" and fn in ("write", "close"):
+                return ValueType(VKind.INT)
+            elif mod == "os" and fn == "read":
+                return ValueType(VKind.STR)
+            elif mod == "os" and fn == "pipe":
+                return ValueType(VKind.LIST, elem_type=ValueType(VKind.INT))
             elif mod == "os" and fn == "listdir":
                 return ValueType(VKind.LIST, elem_type=ValueType(VKind.STR))
             elif mod == "os" and fn in ("remove", "unlink", "mkdir", "rmdir", "rename", "symlink", "link", "chmod", "truncate", "utime", "chown"):
@@ -37318,6 +37338,65 @@ class CodeGen:
             # os.gettid() -> bare i64 kernel task ID (on SlateOS a real
             # SYS_TASK_ID syscall via posix gettid()).
             return self.builder.call(self.runtime["os_gettid"], [])
+        elif func_name == "pipe" and len(node.args) == 0:
+            # os.pipe() -> FpyList* [read_fd, write_fd] (as i8_ptr). On SlateOS a
+            # real SYS_PIPE_CREATE syscall via posix pipe(). Inference tags this
+            # LIST(INT), so `r, w = os.pipe()` unpacks the 2-element list.
+            return self.builder.call(self.runtime["os_pipe"], [])
+        elif func_name == "write" and len(node.args) == 2:
+            # os.write(fd, data) -> bare i64 bytes written. fd is a raw int fd,
+            # data a str; on SlateOS posix write() dispatches by fd kind — a
+            # pipe end routes to the pipe's kernel buffer via SYS_PIPE_WRITE
+            # (a regular file fd would use SYS_FS_WRITE).
+            def _fd_i64(v):
+                if (isinstance(v.type, ir.LiteralStructType)
+                        and v.type == fpy_val):
+                    return self.builder.extract_value(v, 1)
+                if isinstance(v.type, ir.PointerType):
+                    return self.builder.ptrtoint(v, i64)
+                if isinstance(v.type, ir.DoubleType):
+                    return self.builder.fptosi(v, i64)
+                if isinstance(v.type, ir.IntType) and v.type.width != 64:
+                    return self.builder.zext(v, i64)
+                return v
+            fd = _fd_i64(self._emit_expr_value(node.args[0]))
+            data = self._ensure_ptr(self._emit_expr_value(node.args[1]))
+            return self.builder.call(self.runtime["os_write"], [fd, data])
+        elif func_name == "read" and len(node.args) == 2:
+            # os.read(fd, n) -> str of up to n bytes (i8_ptr). On SlateOS posix
+            # read() dispatches by fd kind — a pipe end pulls from the pipe's
+            # kernel buffer via SYS_PIPE_READ (a file fd would use SYS_FS_READ).
+            def _fd_i64(v):
+                if (isinstance(v.type, ir.LiteralStructType)
+                        and v.type == fpy_val):
+                    return self.builder.extract_value(v, 1)
+                if isinstance(v.type, ir.PointerType):
+                    return self.builder.ptrtoint(v, i64)
+                if isinstance(v.type, ir.DoubleType):
+                    return self.builder.fptosi(v, i64)
+                if isinstance(v.type, ir.IntType) and v.type.width != 64:
+                    return self.builder.zext(v, i64)
+                return v
+            fd = _fd_i64(self._emit_expr_value(node.args[0]))
+            n = _fd_i64(self._emit_expr_value(node.args[1]))
+            return self.builder.call(self.runtime["os_read"], [fd, n])
+        elif func_name == "close" and len(node.args) == 1:
+            # os.close(fd) -> bare i64 status (0 ok, -1 error). Closes a raw int
+            # fd (e.g. a pipe end); on SlateOS posix close() dispatches by fd
+            # kind — a pipe end maps to SYS_PIPE_CLOSE.
+            def _fd_i64(v):
+                if (isinstance(v.type, ir.LiteralStructType)
+                        and v.type == fpy_val):
+                    return self.builder.extract_value(v, 1)
+                if isinstance(v.type, ir.PointerType):
+                    return self.builder.ptrtoint(v, i64)
+                if isinstance(v.type, ir.DoubleType):
+                    return self.builder.fptosi(v, i64)
+                if isinstance(v.type, ir.IntType) and v.type.width != 64:
+                    return self.builder.zext(v, i64)
+                return v
+            fd = _fd_i64(self._emit_expr_value(node.args[0]))
+            return self.builder.call(self.runtime["os_close"], [fd])
         elif func_name == "listdir" and len(node.args) == 1:
             v = self._emit_expr_value(node.args[0])
             v = self._ensure_ptr(v)
@@ -37822,6 +37901,8 @@ class CodeGen:
         # os / os.path
         "os.getcwd": "str", "os.getenv": "pyobj", "os.getpid": "int",
         "os.getppid": "int", "os.gettid": "int",
+        "os.pipe": "list:int", "os.read": "str",
+        "os.write": "int", "os.close": "int",
         "os.path.join": "str", "os.path.dirname": "str",
         "os.path.basename": "str", "os.path.abspath": "str",
         "os.path.realpath": "str", "os.path.expanduser": "str",

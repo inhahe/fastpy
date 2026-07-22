@@ -8342,6 +8342,72 @@ int64_t fastpy_os_gettid(void) {
 #endif
 }
 
+/* os.pipe() -> (read_fd, write_fd). On SlateOS posix pipe() issues the real
+ * SYS_PIPE_CREATE syscall — a genuinely distinct kernel path (the pipe
+ * subsystem) not touched by any file/process syscall. Python's os.pipe()
+ * returns a 2-tuple; fastpy pure mode unpacks a 2-element list identically, so
+ * we return a fastpy list [read_fd, write_fd]. On error both entries are -1.
+ * Windows host builds don't run on SlateOS but _pipe() fills the fds too. */
+FpyList* fastpy_os_pipe(void) {
+    FpyList *lst = fpy_list_new(2);
+    int r = -1, w = -1;
+    int fds[2];
+#ifdef _WIN32
+    if (_pipe(fds, 65536, 0) == 0) { r = fds[0]; w = fds[1]; }
+#else
+    if (pipe(fds) == 0) { r = fds[0]; w = fds[1]; }
+#endif
+    FpyValue vr; vr.tag = FPY_TAG_INT; vr.data.i = (int64_t)r; fpy_list_append(lst, vr);
+    FpyValue vw; vw.tag = FPY_TAG_INT; vw.data.i = (int64_t)w; fpy_list_append(lst, vw);
+    return lst;
+}
+
+/* os.write(fd, data) -> bytes written (or -1). `fd` is a raw integer fd (e.g. a
+ * pipe end from os.pipe()); `data` is a fastpy str (NUL-terminated char*). On
+ * SlateOS posix write() dispatches by fd kind — for a pipe fd it routes to the
+ * pipe's kernel buffer via SYS_PIPE_WRITE (a regular file fd would use
+ * SYS_FS_WRITE). We use strlen() — the pipe self-test uses NUL-free ASCII; a
+ * NUL-safe bytes overload can be added later if a caller needs embedded NULs. */
+int64_t fastpy_os_write(int64_t fd, const char *data) {
+    if (!data) return -1;
+    size_t n = strlen(data);
+#ifdef _WIN32
+    return (int64_t)_write((int)fd, data, (unsigned)n);
+#else
+    return (int64_t)write((int)fd, data, n);
+#endif
+}
+
+/* os.read(fd, n) -> str of up to `n` bytes read (empty on EOF/error). `fd` is a
+ * raw integer fd. On SlateOS posix read() dispatches by fd kind — for a pipe fd
+ * it pulls from the pipe's kernel buffer via SYS_PIPE_READ (a regular file fd
+ * would use SYS_FS_READ). Returns a fastpy owned string; NUL-terminated, so it
+ * is safe for the NUL-free ASCII the pipe self-test round-trips. */
+const char* fastpy_os_read(int64_t fd, int64_t n) {
+    if (n < 0) n = 0;
+    FpyString *s = fpy_str_alloc(n);
+    long got;
+#ifdef _WIN32
+    got = (long)_read((int)fd, s->data, (unsigned)n);
+#else
+    got = (long)read((int)fd, s->data, (size_t)n);
+#endif
+    if (got < 0) got = 0;
+    s->data[got] = '\0';
+    return s->data;
+}
+
+/* os.close(fd) -> 0 on success, -1 on error. Closes a raw integer fd (e.g. a
+ * pipe end); posix close() releases the fd-table entry and its kernel handle
+ * (SYS_PIPE_CLOSE for a pipe end). */
+int64_t fastpy_os_close(int64_t fd) {
+#ifdef _WIN32
+    return (int64_t)(_close((int)fd) == 0 ? 0 : -1);
+#else
+    return (int64_t)(close((int)fd) == 0 ? 0 : -1);
+#endif
+}
+
 int64_t fastpy_os_path_exists(const char *path) {
 #ifdef _WIN32
     DWORD attrs = GetFileAttributesA(path);
