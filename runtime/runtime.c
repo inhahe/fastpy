@@ -901,18 +901,14 @@ int64_t fastpy_safe_mod(int64_t a, int64_t b) {
 
 double fastpy_safe_fdiv(double a, double b) {
     if (b == 0.0) {
-        /* CPython 3.14+ uses plain "division by zero" for all cases,
-         * including float/float.  Older versions used "float division
-         * by zero" but that changed in 3.14. */
         fastpy_raise(FPY_EXC_ZERODIVISION, "division by zero");
         return 0.0;
     }
     return a / b;
 }
 
-/* int/int "true division" that returns float but preserves CPython's
- * "division by zero" error message (CPython only says "float division
- * by zero" when one of the operands is actually a float). */
+/* int/int "true division" that returns float.  CPython 3.14+ uses
+ * "division by zero" for all numeric types (int and float). */
 double fastpy_safe_int_fdiv(int64_t a, int64_t b) {
     if (b == 0) {
         fastpy_raise(FPY_EXC_ZERODIVISION, "division by zero");
@@ -982,6 +978,7 @@ extern void fastpy_dict_update(FpyDict*, FpyDict*);
 extern FpyList* fastpy_tuple_new(void);
 extern void* fastpy_obj_new(int32_t);
 extern int32_t fastpy_register_class(const char*, int32_t);
+extern void fastpy_set_class_var(int32_t, const char*, int32_t, int64_t);
 extern void fastpy_register_method(int32_t, const char*, void*, int32_t, int32_t);
 extern void fastpy_set_method_ret_tag(int32_t, const char*, int32_t);
 extern void fastpy_obj_call_method1_fv(void*, const char*, int64_t, int32_t*, int64_t*);
@@ -1047,6 +1044,10 @@ extern FpyDict* fastpy_set_copy(FpyDict*);
 extern void fastpy_set_clear(FpyDict*);
 extern void fastpy_set_pop_fv(FpyDict*, int32_t*, int64_t*);
 extern void fastpy_set_update(FpyDict*, FpyDict*);
+extern void fastpy_set_intersection_update(FpyDict*, FpyDict*);
+extern void fastpy_set_difference_update(FpyDict*, FpyDict*);
+extern void fastpy_set_symmetric_difference_update(FpyDict*, FpyDict*);
+extern FpyList* fastpy_zip1(FpyList*);
 extern void fastpy_dict_popitem(FpyDict*, int32_t*, int64_t*, int32_t*, int64_t*);
 extern FpyDict* fastpy_dict_copy(FpyDict*);
 extern int64_t fastpy_str_index_sub(const char*, const char*);
@@ -1130,6 +1131,11 @@ extern void fpy_cpython_rbinop(int32_t, int64_t, void*, int32_t, int32_t*, int64
 extern int32_t fpy_cpython_compare(void*, void*, int32_t);
 extern void fpy_cpython_concat(void*, void*, int32_t*, int64_t*);
 
+/* The JIT symbol table is used only by the Python-side JIT to resolve runtime
+ * symbols via ctypes. Pure-mode AOT builds (SlateOS / no-CPython) neither run
+ * the JIT nor link the CPython bridge, so the table is excluded there — it
+ * would otherwise force-reference bridge functions that pure mode omits. */
+#ifndef FPY_PURE_MODE
 static FpySymEntry fpy_jit_symbols[] = {
     SYM(fastpy_print_newline),
     SYM(fastpy_fv_print), SYM(fastpy_fv_write),
@@ -1150,8 +1156,9 @@ static FpySymEntry fpy_jit_symbols[] = {
     SYM(fastpy_dict_length), SYM(fastpy_dict_keys), SYM(fastpy_dict_values),
     SYM(fastpy_dict_items), SYM(fastpy_dict_has_key), SYM(fastpy_dict_update),
     SYM(fastpy_dict_equal), SYM(fastpy_set_equal),
-    SYM(fastpy_tuple_new), SYM(fastpy_obj_new),
-    SYM(fastpy_register_class), SYM(fastpy_register_method),
+    SYM(fastpy_tuple_new), SYM(fastpy_obj_new), SYM(fastpy_io_open),
+    SYM(fastpy_register_class), SYM(fastpy_set_class_var),
+    SYM(fastpy_register_method),
     SYM(fastpy_set_method_ret_tag), SYM(fastpy_obj_call_method1_fv),
     SYM(fastpy_obj_set_fv), SYM(fastpy_obj_get_fv),
     SYM(fastpy_str_concat), SYM(fastpy_str_len), SYM(fastpy_str_lower),
@@ -1175,7 +1182,9 @@ static FpySymEntry fpy_jit_symbols[] = {
     SYM(fastpy_set_issubset), SYM(fastpy_set_issuperset),
     SYM(fastpy_set_isdisjoint), SYM(fastpy_set_copy),
     SYM(fastpy_set_clear), SYM(fastpy_set_pop_fv),
-    SYM(fastpy_set_update), SYM(fastpy_dict_popitem),
+    SYM(fastpy_set_update), SYM(fastpy_set_intersection_update),
+    SYM(fastpy_set_difference_update), SYM(fastpy_set_symmetric_difference_update),
+    SYM(fastpy_zip1), SYM(fastpy_dict_popitem),
     SYM(fastpy_dict_copy), SYM(fastpy_str_index_sub), SYM(fastpy_str_rindex_sub),
     SYM(fastpy_str_replace_count),
     SYM(fastpy_str_find_range), SYM(fastpy_str_rfind_range),
@@ -1245,6 +1254,10 @@ int fastpy_get_jit_symbol_count(void) {
     while (fpy_jit_symbols[n].name) n++;
     return n;
 }
+#else  /* FPY_PURE_MODE: no JIT symbol table in pure AOT builds */
+FpySymEntry *fastpy_get_jit_symbols(void) { return (FpySymEntry *)0; }
+int fastpy_get_jit_symbol_count(void) { return 0; }
+#endif /* FPY_PURE_MODE */
 
 /* Command-line argument storage (populated by main).
  * Non-static so cpython_bridge.c can extern-reference them. */
@@ -1321,13 +1334,23 @@ void fastpy_sys_exit(int64_t code) {
     exit((int)code);
 }
 
-/* sys.argv — returns the real command-line arguments. */
+/* sys.argv — returns the real command-line arguments.
+ *
+ * Each element must be a heap FpyString (a length header precedes the char
+ * data), not a raw C string: FPY_TAG_STR values are dereferenced as
+ * FpyString.data by list iteration / print / string ops, so a bare
+ * `fpy_argv[i]` would fault when the runtime reads the missing length
+ * header. Copy each argv entry into a fresh fpy_str_alloc buffer. */
 FpyList* fastpy_sys_argv(void) {
     FpyList *lst = fpy_list_new(fpy_argc > 4 ? fpy_argc : 4);
     for (int i = 0; i < fpy_argc; i++) {
+        const char *src = fpy_argv[i] ? fpy_argv[i] : "";
+        size_t len = strlen(src);
+        FpyString *s = fpy_str_alloc(len);
+        memcpy(s->data, src, len + 1);
         FpyValue v;
         v.tag = FPY_TAG_STR;
-        v.data.s = fpy_argv[i];
+        v.data.s = s->data;
         fpy_list_append(lst, v);
     }
     return lst;
@@ -1845,6 +1868,7 @@ extern const char* fastpy_os_path_basename(const char *path);
 extern const char* fastpy_os_path_dirname(const char *path);
 extern const char* fastpy_os_getcwd(void);
 extern FpyList* fastpy_os_listdir(const char *path);
+extern int64_t fastpy_os_remove(const char *path);
 
 /* Path(str) → just returns the string (Path IS a string internally) */
 /* Path() — implemented in cpython_bridge.c */

@@ -7,12 +7,13 @@
 #include "gc.h"
 #include "bigint.h"
 #include <math.h>
+#include <assert.h>  /* static_assert macro (C11); MSVC provides it implicitly */
 
 /* The codegen computes inline slot addresses as (FpyValue*)(obj + 1) + idx,
- * relying on sizeof(FpyObj) == 96 on x64 (after slots pointer removal).
+ * relying on sizeof(FpyObj) == 56 on x64 (lock field removed).
  * If the struct layout changes, this will fire at compile time rather than
  * silently corrupting memory. */
-static_assert(sizeof(FpyObj) == 96,
+static_assert(sizeof(FpyObj) == 56,
     "FpyObj size changed -- update fpy_obj_type in codegen.py to match");
 static_assert(sizeof(FpyValue) == 16,
     "FpyValue size changed -- update fpy_val_type in codegen.py to match");
@@ -22,6 +23,11 @@ void fastpy_tuple_write(FpyList *tuple);
 void fastpy_dict_write(FpyDict *dict);
 void fastpy_obj_write(FpyObj *obj);
 FpyMethodDef* fastpy_find_method(int class_id, const char *name);
+/* Defined later in this file; declared here so callers earlier in the TU
+ * don't rely on an implicit declaration (rejected by strict C99+/clang). */
+int fastpy_dict_has_key(FpyDict *dict, const char *key);
+int32_t fastpy_dict_has_int_key(FpyDict *dict, int64_t key);
+static int _fpy_ws_fwd(const unsigned char *p);
 
 /* External APIs (defined in runtime.c) */
 extern void fastpy_raise(int exc_type, const char *msg);
@@ -45,15 +51,18 @@ extern void fastpy_set_ret_tag(int32_t tag);
 static FPY_THREAD_LOCAL char _err_buf[256];
 
 /* --- Object free-list allocator ---
- * Maintain per-slot-count free lists so freed objects can be reused
- * without calling malloc.  Each free-list entry repurposes the
- * `dynamic_attrs` pointer as the "next" link.
+ * Maintain per-class free lists so freed objects can be reused without
+ * calling malloc.  Each free-list entry repurposes the `dynamic_attrs`
+ * pointer as the "next" link.
  * This eliminates malloc/free overhead in tight loops that create
- * and destroy many objects of the same class.  */
-#define FPY_OBJ_FREELIST_SLOTS  16   /* cover slot counts 0..15 */
-#define FPY_OBJ_FREELIST_MAX    256  /* max cached objects per slot count */
-static FpyObj* fpy_obj_freelist[FPY_OBJ_FREELIST_SLOTS];
-static int     fpy_obj_freelist_count[FPY_OBJ_FREELIST_SLOTS];
+ * and destroy many objects of the same class.
+ *
+ * Keyed by class_id (not slot_count) because the native-slot optimization
+ * means classes with the same slot_count can have different allocation
+ * sizes — per-class keying is always safe. */
+#define FPY_OBJ_FREELIST_MAX    64   /* max cached objects per class */
+static FpyObj* fpy_obj_freelist[FPY_MAX_CLASSES];
+static int     fpy_obj_freelist_count[FPY_MAX_CLASSES];
 
 /* --- List operations --- */
 
@@ -81,10 +90,15 @@ typedef struct {
     void *func;
     uint8_t capture_is_cell;  /* bitmask: bit i set = captures[i] is a cell pointer */
     uint8_t has_vararg;        /* 1 if function uses *args — args must be packed into list */
+    uint8_t has_kwarg;         /* 1 if function uses **kwargs — first param is dict */
     int n_defaults;            /* number of default parameter values */
     int64_t defaults[8];       /* default values for last n_defaults params */
     int64_t captures[8];
+    const char **param_names;  /* parameter names (n_params entries), for **kwargs dispatch */
 } FpyClosure;
+/* Declared here (right after the type) so early callers in this TU use the
+ * real signature instead of an implicit/void* declaration. */
+int64_t fastpy_closure_call1(FpyClosure *c, int64_t a);
 
 typedef struct {
     int32_t refcount;
@@ -142,32 +156,18 @@ void fpy_rc_incref(int32_t tag, int64_t data) {
             fpy_incref(&((FpyDict*)(intptr_t)data)->refcount); break;
         case FPY_TAG_OBJ: {
             /* Could be FpyObj, FpyClosure, or CPython PyObject*.
-             * FpyClosure starts with magic 0x434C4F53 at offset 0.
-             * FpyObj has refcount at offset 0 (small positive int) and
-             * magic 0x4F424A53 at offset 32.
-             * CPython PyObject* has ob_refcnt at offset 0.
-             *
-             * Strategy: check closure magic at offset 0 (safe — always
-             * readable for any valid heap pointer). Then check FpyObj by
-             * reading the refcount first (offset 0) — if it's a sane
-             * value (1..10000), it's likely an FpyObj or FpyClosure;
-             * read magic at offset 32 to confirm. Otherwise delegate to
-             * Py_INCREF via the bridge helper. */
-            void *ptr = (void*)(intptr_t)data;
-            int32_t first_word = *(int32_t*)ptr;
-            if (first_word == FPY_CLOSURE_MAGIC) {
-                fpy_incref(&((FpyClosure*)ptr)->refcount);
-            } else if (first_word > 0 && first_word < 100000) {
-                /* Plausible refcount — check FpyObj magic at offset 32 */
-                FpyObj *obj = (FpyObj*)ptr;
-                if (obj->magic == FPY_OBJ_MAGIC)
-                    fpy_incref(&obj->refcount);
-                else
-                    fpy_bridge_pyobj_incref(ptr);
+             * FpyObj is the overwhelmingly common case, so check its
+             * magic first (at offset 32) to avoid the multi-step
+             * closure/plausibility dispatch.  Reading at offset 32 is
+             * safe — the current code already does this for FpyObj, and
+             * closures + PyObject* are always ≥ 32 bytes. */
+            FpyObj *obj = (FpyObj*)(intptr_t)data;
+            if (obj->magic == FPY_OBJ_MAGIC) {
+                fpy_incref(&obj->refcount);
+            } else if (*(int32_t*)(intptr_t)data == FPY_CLOSURE_MAGIC) {
+                fpy_incref(&((FpyClosure*)(intptr_t)data)->refcount);
             } else {
-                /* Not a closure, not a plausible FpyObj refcount —
-                 * treat as CPython PyObject* */
-                fpy_bridge_pyobj_incref(ptr);
+                fpy_bridge_pyobj_incref((void*)(intptr_t)data);
             }
             break;
         }
@@ -199,11 +199,82 @@ void fpy_rc_decref(int32_t tag, int64_t data) {
                 fpy_dict_destroy((FpyDict*)(intptr_t)data);
             break;
         case FPY_TAG_OBJ: {
-            void *ptr = (void*)(intptr_t)data;
-            int32_t first_word = *(int32_t*)ptr;
-            /* Check if this is a closure (not an FpyObj) */
-            if (first_word == FPY_CLOSURE_MAGIC) {
-                FpyClosure *c = (FpyClosure*)ptr;
+            /* Could be FpyObj, FpyClosure, or CPython PyObject*.
+             * FpyObj is the overwhelmingly common case, so check its
+             * magic first (at offset 32) — this is a single comparison
+             * on the hot path instead of the multi-step dispatch.
+             * Reading at offset 32 is safe: closures and PyObject*
+             * are always ≥ 32 bytes, and the previous code already
+             * read obj->magic for the same pointer types. */
+            FpyObj *obj = (FpyObj*)(intptr_t)data;
+            if (obj->magic == FPY_OBJ_MAGIC) {
+                if (fpy_decref(&obj->refcount)) {
+                    /* Untrack from GC before freeing — the gc_node would
+                     * otherwise dangle in the tracked list, causing a
+                     * segfault on the next GC traversal. */
+                    fpy_gc_untrack(&obj->gc_node);
+                    /* Call per-class destructor if set (e.g., generator cleanup).
+                     * Runs before slots are freed so the destructor can access attrs. */
+                    void (*dtor)(FpyObj*) = fpy_classes[obj->class_id].destructor;
+                    if (dtor) dtor(obj);
+                    /* Invalidate all weak references to this object.
+                     * Walk the singly-linked list and null out target pointers
+                     * so deref returns None instead of a dangling pointer. */
+                    FpyWeakRef *wr = obj->weakref_list;
+                    while (wr) {
+                        FpyWeakRef *next = wr->next;
+                        wr->target = NULL;
+                        /* Invoke callback if set.  The callback is stored
+                         * as an FpyValue (tag + data).  Tag 0 (NONE) means
+                         * no callback.  Otherwise it should be a closure
+                         * pointer we can call with the weakref as argument. */
+                        if (wr->callback_tag != 0 && wr->callback != 0) {
+                            /* callback(weakref) — call with the weakref
+                             * itself as the single argument, per CPython
+                             * weakref semantics. (Declared at file scope.) */
+                            fastpy_closure_call1(
+                                (FpyClosure*)(intptr_t)wr->callback,
+                                (int64_t)(intptr_t)wr);
+                        }
+                        wr = next;
+                    }
+                    /* Free slots: only decref BOXED slots (native slots
+                     * hold scalars — no heap references to release). */
+                    {
+                        int _cid = obj->class_id;
+                        int nn = fpy_classes[_cid].n_native_slots;
+                        int nb = fpy_classes[_cid].slot_count - nn;
+                        if (nb > 0) {
+                            FpyValue *boxed = FPY_OBJ_BOXED_SLOTS(obj, nn);
+                            for (int i = 0; i < nb; i++)
+                                FPY_VAL_DECREF(boxed[i]);
+                        }
+                        /* slots are contiguous with obj (malloc'd together), don't free separately */
+                    }
+                    if (obj->dynamic_attrs) {
+                        for (int i = 0; i < obj->dynamic_attrs->count; i++)
+                            FPY_VAL_DECREF(obj->dynamic_attrs->values[i]);
+                        free(obj->dynamic_attrs->names);
+                        free(obj->dynamic_attrs->values);
+                        free(obj->dynamic_attrs);
+                        obj->dynamic_attrs = NULL;
+                    }
+                    /* Push to per-class free-list if possible, else free */
+                    int _cid2 = obj->class_id;
+                    if (_cid2 < FPY_MAX_CLASSES
+                            && fpy_obj_freelist_count[_cid2] < FPY_OBJ_FREELIST_MAX) {
+                        obj->dynamic_attrs = (FpyObjAttrs*)fpy_obj_freelist[_cid2];
+                        fpy_obj_freelist[_cid2] = obj;
+                        fpy_obj_freelist_count[_cid2]++;
+                    } else {
+                        free(obj);
+                    }
+                }
+                break;
+            }
+            /* Not FpyObj — check closure magic at offset 0 */
+            if (*(int32_t*)(intptr_t)data == FPY_CLOSURE_MAGIC) {
+                FpyClosure *c = (FpyClosure*)(intptr_t)data;
                 if (fpy_decref(&c->refcount)) {
                     /* Free captured values: cells get freed, others decrefd */
                     for (int i = 0; i < c->n_captures; i++) {
@@ -219,73 +290,8 @@ void fpy_rc_decref(int32_t tag, int64_t data) {
                 }
                 break;
             }
-            /* Check if plausible FpyObj (first word is refcount, small positive) */
-            if (first_word > 0 && first_word < 100000) {
-                FpyObj *obj = (FpyObj*)ptr;
-                if (obj->magic == FPY_OBJ_MAGIC) {
-                    if (fpy_decref(&obj->refcount)) {
-                        /* Untrack from GC before freeing — the gc_node would
-                         * otherwise dangle in the tracked list, causing a
-                         * segfault on the next GC traversal. */
-                        fpy_gc_untrack(&obj->gc_node);
-                        /* Call per-class destructor if set (e.g., generator cleanup).
-                         * Runs before slots are freed so the destructor can access attrs. */
-                        void (*dtor)(FpyObj*) = fpy_classes[obj->class_id].destructor;
-                        if (dtor) dtor(obj);
-                        /* Invalidate all weak references to this object.
-                         * Walk the singly-linked list and null out target pointers
-                         * so deref returns None instead of a dangling pointer. */
-                        FpyWeakRef *wr = obj->weakref_list;
-                        while (wr) {
-                            FpyWeakRef *next = wr->next;
-                            wr->target = NULL;
-                            /* Invoke callback if set.  The callback is stored
-                             * as an FpyValue (tag + data).  Tag 0 (NONE) means
-                             * no callback.  Otherwise it should be a closure
-                             * pointer we can call with the weakref as argument. */
-                            if (wr->callback_tag != 0 && wr->callback != 0) {
-                                /* callback(weakref) — call with the weakref
-                                 * itself as the single argument, per CPython
-                                 * weakref semantics. */
-                                extern int64_t fastpy_closure_call1(
-                                    void*, int64_t);
-                                fastpy_closure_call1(
-                                    (void*)(intptr_t)wr->callback,
-                                    (int64_t)(intptr_t)wr);
-                            }
-                            wr = next;
-                        }
-                        /* Free slots (decref each), dynamic_attrs, and the obj */
-                        {
-                            int sc = fpy_classes[obj->class_id].slot_count;
-                            for (int i = 0; i < sc; i++)
-                                FPY_VAL_DECREF(FPY_OBJ_SLOTS(obj)[i]);
-                            /* slots are contiguous with obj (malloc'd together), don't free separately */
-                        }
-                        if (obj->dynamic_attrs) {
-                            for (int i = 0; i < obj->dynamic_attrs->count; i++)
-                                FPY_VAL_DECREF(obj->dynamic_attrs->values[i]);
-                            free(obj->dynamic_attrs->names);
-                            free(obj->dynamic_attrs->values);
-                            free(obj->dynamic_attrs);
-                            obj->dynamic_attrs = NULL;
-                        }
-                        /* Push to free-list if possible, else free */
-                        int _sc = fpy_classes[obj->class_id].slot_count;
-                        if (_sc < FPY_OBJ_FREELIST_SLOTS
-                                && fpy_obj_freelist_count[_sc] < FPY_OBJ_FREELIST_MAX) {
-                            obj->dynamic_attrs = (FpyObjAttrs*)fpy_obj_freelist[_sc];
-                            fpy_obj_freelist[_sc] = obj;
-                            fpy_obj_freelist_count[_sc]++;
-                        } else {
-                            free(obj);
-                        }
-                    }
-                    break;
-                }
-            }
             /* Not a closure, not an FpyObj — treat as CPython PyObject* */
-            fpy_bridge_pyobj_decref(ptr);
+            fpy_bridge_pyobj_decref((void*)(intptr_t)data);
             break;
         }
         case FPY_TAG_BIGINT: {
@@ -2538,6 +2544,38 @@ void fastpy_set_update(FpyDict *a, FpyDict *b) {
     }
 }
 
+/* set.intersection_update(other) — keep only elements found in other */
+void fastpy_set_intersection_update(FpyDict *a, FpyDict *b) {
+    /* Build list of keys to remove (can't mutate while iterating). */
+    int64_t n = 0;
+    FpyValue *to_remove = (FpyValue*)malloc(a->length * sizeof(FpyValue));
+    for (int64_t i = 0; i < a->length; i++) {
+        if (!fastpy_set_contains(b, a->keys[i]))
+            to_remove[n++] = a->keys[i];
+    }
+    for (int64_t i = 0; i < n; i++)
+        fastpy_set_discard_fv(a, to_remove[i].tag, to_remove[i].data.i);
+    free(to_remove);
+}
+
+/* set.difference_update(other) — remove elements found in other */
+void fastpy_set_difference_update(FpyDict *a, FpyDict *b) {
+    for (int64_t i = 0; i < b->length; i++) {
+        if (fastpy_set_contains(a, b->keys[i]))
+            fastpy_set_discard_fv(a, b->keys[i].tag, b->keys[i].data.i);
+    }
+}
+
+/* set.symmetric_difference_update(other) — keep elements in either but not both */
+void fastpy_set_symmetric_difference_update(FpyDict *a, FpyDict *b) {
+    for (int64_t i = 0; i < b->length; i++) {
+        if (fastpy_set_contains(a, b->keys[i]))
+            fastpy_set_discard_fv(a, b->keys[i].tag, b->keys[i].data.i);
+        else
+            fpy_dict_set(a, b->keys[i], fpy_none());
+    }
+}
+
 /* Print a set in {a, b, c} format. */
 void fastpy_set_print(FpyDict *set) {
     printf("{");
@@ -2574,7 +2612,9 @@ FpyClosure* fastpy_closure_new(void *func, int n_params, int n_captures) {
     c->n_captures = n_captures;
     c->capture_is_cell = 0;  /* caller sets bits for cell captures */
     c->has_vararg = 0;       /* caller sets to 1 if function uses *args */
+    c->has_kwarg = 0;        /* caller sets to 1 if function uses **kwargs */
     c->n_defaults = 0;
+    c->param_names = NULL;
     return c;
 }
 
@@ -2596,6 +2636,24 @@ void fastpy_closure_mark_cell(FpyClosure *c, int index) {
 /* Mark a closure as using *args (args must be packed into a list) */
 void fastpy_closure_set_vararg(FpyClosure *c) {
     c->has_vararg = 1;
+}
+
+void fastpy_closure_set_kwarg(FpyClosure *c) {
+    c->has_kwarg = 1;
+}
+
+void fastpy_closure_set_param_names(FpyClosure *c, const char **names) {
+    c->param_names = names;
+}
+
+void fastpy_closure_set_param_name(FpyClosure *c, int index, const char *name) {
+    if (!c->param_names) {
+        c->param_names = (const char**)malloc(sizeof(const char*) * c->n_params);
+        for (int i = 0; i < c->n_params; i++) c->param_names[i] = NULL;
+    }
+    if (index >= 0 && index < c->n_params) {
+        c->param_names[index] = name;
+    }
 }
 
 void fastpy_closure_set_capture(FpyClosure *c, int index, int64_t value) {
@@ -2832,6 +2890,132 @@ int64_t fastpy_closure_call_list(void *closure, void *args_list) {
     }
 }
 
+/* Try to find a string key in dict without raising KeyError.
+ * Returns 1 and sets out_tag/out_data if found, 0 if not found. */
+static int fpy_dict_try_get(FpyDict *dict, const char *key,
+                            int32_t *out_tag, int64_t *out_data) {
+    if (!dict || !key) return 0;
+    uint64_t h = fpy_hash_string(key);
+    int64_t mask = dict->table_size - 1;
+    int64_t slot = (int64_t)(h & (uint64_t)mask);
+    while (1) {
+        int64_t idx = dict->indices[slot];
+        if (idx == FPY_DICT_EMPTY) return 0;
+        if (idx != FPY_DICT_DELETED
+                && dict->keys[idx].tag == FPY_TAG_STR
+                && (dict->keys[idx].data.s == key
+                    || strcmp(dict->keys[idx].data.s, key) == 0)) {
+            *out_tag = dict->values[idx].tag;
+            *out_data = dict->values[idx].data.i;
+            return 1;
+        }
+        slot = (slot + 1) & mask;
+    }
+}
+
+/* Call closure with keyword args passed as a dict.
+ * Maps dict keys to positional params using the closure's param_names,
+ * fills defaults for missing params, then dispatches. */
+int64_t fastpy_closure_call_dict(void *closure, void *dict_ptr) {
+    /* Raw function pointer: extract dict values in insertion order and
+     * dispatch positionally.  This relies on Python 3.7+ dict ordering:
+     * kwargs passed in the same order as the function's params work. */
+    if (!fpy_is_closure(closure)) {
+        FpyDict *d = (FpyDict *)dict_ptr;
+        int64_t n = d ? d->length : 0;
+        int64_t a[8] = {0};
+        extern void fastpy_set_arg_tag(int32_t, int32_t);
+        for (int64_t i = 0; i < n && i < 8; i++) {
+            a[i] = d->values[i].data.i;
+            fastpy_set_arg_tag((int32_t)i, d->values[i].tag);
+        }
+        typedef int64_t (*fn0_t)(void);
+        typedef int64_t (*fn1_t)(int64_t);
+        typedef int64_t (*fn2_t)(int64_t, int64_t);
+        typedef int64_t (*fn3_t)(int64_t, int64_t, int64_t);
+        typedef int64_t (*fn4_t)(int64_t, int64_t, int64_t, int64_t);
+        switch (n) {
+            case 0: return ((fn0_t)closure)();
+            case 1: return ((fn1_t)closure)(a[0]);
+            case 2: return ((fn2_t)closure)(a[0], a[1]);
+            case 3: return ((fn3_t)closure)(a[0], a[1], a[2]);
+            case 4: return ((fn4_t)closure)(a[0], a[1], a[2], a[3]);
+            default: return 0;
+        }
+    }
+
+    FpyClosure *c = (FpyClosure *)closure;
+    FpyDict *d = (FpyDict *)dict_ptr;
+
+    /* If target is itself a **kwargs function, forward the dict directly */
+    if (c->has_kwarg) {
+        int64_t dict_val = (int64_t)(intptr_t)dict_ptr;
+        typedef int64_t (*fn1_t)(int64_t);
+        typedef int64_t (*fn2c_t)(int64_t, int64_t);
+        typedef int64_t (*fn3c_t)(int64_t, int64_t, int64_t);
+        typedef int64_t (*fn4c_t)(int64_t, int64_t, int64_t, int64_t);
+        switch (c->n_captures) {
+            case 0: return ((fn1_t)c->func)(dict_val);
+            case 1: return ((fn2c_t)c->func)(dict_val, c->captures[0]);
+            case 2: return ((fn3c_t)c->func)(dict_val, c->captures[0], c->captures[1]);
+            case 3: return ((fn4c_t)c->func)(dict_val, c->captures[0], c->captures[1], c->captures[2]);
+            default: return 0;
+        }
+    }
+
+    /* Map dict keys to positional args using param_names */
+    extern void fastpy_set_arg_tag(int32_t, int32_t);
+    int n = c->n_params;
+    int64_t args[8] = {0};
+
+    for (int i = 0; i < n && i < 8; i++) {
+        int32_t tag = FPY_TAG_NONE;
+        int64_t data = 0;
+        int found = 0;
+
+        if (c->param_names && c->param_names[i]) {
+            found = fpy_dict_try_get(d, c->param_names[i], &tag, &data);
+        }
+
+        if (found) {
+            args[i] = data;
+            fastpy_set_arg_tag(i, tag);
+        } else if (c->n_defaults > 0 && i >= n - c->n_defaults) {
+            /* Use default value */
+            int def_idx = c->n_defaults - (n - i);
+            if (def_idx >= 0 && def_idx < c->n_defaults) {
+                args[i] = c->defaults[def_idx];
+            }
+        }
+    }
+
+    /* Dispatch with positional args + captures */
+    int64_t n_caps = c->n_captures;
+    int64_t total = n + n_caps;
+
+    int64_t all[8];
+    for (int i = 0; i < n && i < 8; i++) all[i] = args[i];
+    for (int64_t i = 0; i < n_caps && (n + i) < 8; i++)
+        all[n + i] = c->captures[i];
+
+    typedef int64_t (*fn0_t)(void);
+    typedef int64_t (*fn1_t)(int64_t);
+    typedef int64_t (*fn2_t)(int64_t, int64_t);
+    typedef int64_t (*fn3_t)(int64_t, int64_t, int64_t);
+    typedef int64_t (*fn4_t)(int64_t, int64_t, int64_t, int64_t);
+    typedef int64_t (*fn5_t)(int64_t, int64_t, int64_t, int64_t, int64_t);
+
+    switch (total) {
+        case 0: return ((fn0_t)c->func)();
+        case 1: return ((fn1_t)c->func)(all[0]);
+        case 2: return ((fn2_t)c->func)(all[0], all[1]);
+        case 3: return ((fn3_t)c->func)(all[0], all[1], all[2]);
+        case 4: return ((fn4_t)c->func)(all[0], all[1], all[2], all[3]);
+        case 5: return ((fn5_t)c->func)(all[0], all[1], all[2], all[3], all[4]);
+        default: return 0;
+    }
+}
+
 /* --- enumerate and zip --- */
 
 /* enumerate(list) -> list of [index, element] pairs */
@@ -2879,6 +3063,18 @@ FpyList* fastpy_zip(FpyList *a, FpyList *b) {
         fpy_list_append(pair, a->items[i]);
         fpy_list_append(pair, b->items[i]);
         fpy_list_append(result, fpy_list(pair));
+    }
+    return result;
+}
+
+/* zip(a) — single iterable: wraps each element in a 1-tuple */
+FpyList* fastpy_zip1(FpyList *a) {
+    FpyList *result = fpy_list_new(a->length);
+    for (int64_t i = 0; i < a->length; i++) {
+        FpyList *t = fpy_list_new(1);
+        t->is_tuple = 1;
+        fpy_list_append(t, a->items[i]);
+        fpy_list_append(result, fpy_list(t));
     }
     return result;
 }
@@ -3861,8 +4057,58 @@ FpyList* fastpy_str_rsplit_ws(const char *s) {
     return fastpy_str_split(s);
 }
 
-/* str.rsplit(sep, maxsplit) — split from the right */
+/* str.rsplit(sep, maxsplit) — split from the right.
+ * sep == NULL means split on whitespace (Python: s.rsplit(None, n)). */
 FpyList* fastpy_str_rsplit(const char *s, const char *sep, int64_t max_split) {
+    if (sep == NULL) {
+        if (max_split < 0)
+            return fastpy_str_split(s);
+        /* Whitespace rsplit: split from the right up to max_split times.
+         * Strategy: collect all words left-to-right, then only split the
+         * last max_split ones (join the rest as the first element). */
+        size_t len = strlen(s);
+        /* Collect word boundaries (start, end) */
+        size_t starts[256], ends[256];
+        int n_words = 0;
+        size_t i = 0;
+        while (i < len) {
+            while (i < len && (s[i]==' '||s[i]=='\t'||s[i]=='\n'||
+                               s[i]=='\r'||s[i]=='\f'||s[i]=='\v')) i++;
+            if (i >= len) break;
+            size_t ws = i;
+            while (i < len && s[i]!=' '&&s[i]!='\t'&&s[i]!='\n'&&
+                   s[i]!='\r'&&s[i]!='\f'&&s[i]!='\v') i++;
+            if (n_words < 256) {
+                starts[n_words] = ws;
+                ends[n_words] = i;
+                n_words++;
+            }
+        }
+        FpyList *result = fpy_list_new(0);
+        if (n_words == 0) return result;
+        int split_from = n_words - max_split;
+        if (split_from < 0) split_from = 0;
+        if (split_from > 0) {
+            /* Join words 0..split_from-1 plus intervening whitespace
+             * as the first element (everything from start of first word
+             * to end of word split_from-1). */
+            size_t seg_start = starts[0];
+            size_t seg_end = ends[split_from - 1];
+            size_t seg_len = seg_end - seg_start;
+            char *seg = (char*)malloc(seg_len + 1);
+            memcpy(seg, s + seg_start, seg_len);
+            seg[seg_len] = '\0';
+            fpy_list_append(result, fpy_str(seg));
+        }
+        for (int w = (split_from > 0 ? split_from : 0); w < n_words; w++) {
+            size_t seg_len = ends[w] - starts[w];
+            char *seg = (char*)malloc(seg_len + 1);
+            memcpy(seg, s + starts[w], seg_len);
+            seg[seg_len] = '\0';
+            fpy_list_append(result, fpy_str(seg));
+        }
+        return result;
+    }
     size_t s_len = strlen(s);
     size_t sep_len = strlen(sep);
     if (sep_len == 0) {
@@ -3932,6 +4178,44 @@ FpyList* fastpy_str_rsplit(const char *s, const char *sep, int64_t max_split) {
 }
 
 FpyList* fastpy_str_split_max(const char *s, const char *sep, int64_t max_split) {
+    /* sep == NULL means split on whitespace (Python: s.split(None, n)) */
+    if (sep == NULL) {
+        if (max_split < 0)
+            return fastpy_str_split(s);
+        /* Whitespace split with maxsplit limit */
+        FpyList *result = fpy_list_new(0);
+        size_t len = strlen(s);
+        size_t i = 0;
+        int64_t splits = 0;
+        while (i < len && (s[i] == ' ' || s[i] == '\t' || s[i] == '\n'
+                           || s[i] == '\r' || s[i] == '\f' || s[i] == '\v'))
+            i++;
+        while (i < len) {
+            if (splits >= max_split) {
+                /* Remainder of string (including leading whitespace already skipped) */
+                size_t rest_len = len - i;
+                char *seg = (char*)malloc(rest_len + 1);
+                memcpy(seg, s + i, rest_len);
+                seg[rest_len] = '\0';
+                fpy_list_append(result, fpy_str(seg));
+                break;
+            }
+            size_t start = i;
+            while (i < len && s[i] != ' ' && s[i] != '\t' && s[i] != '\n'
+                   && s[i] != '\r' && s[i] != '\f' && s[i] != '\v')
+                i++;
+            size_t seg_len = i - start;
+            char *seg = (char*)malloc(seg_len + 1);
+            memcpy(seg, s + start, seg_len);
+            seg[seg_len] = '\0';
+            fpy_list_append(result, fpy_str(seg));
+            splits++;
+            while (i < len && (s[i] == ' ' || s[i] == '\t' || s[i] == '\n'
+                               || s[i] == '\r' || s[i] == '\f' || s[i] == '\v'))
+                i++;
+        }
+        return result;
+    }
     FpyList *result = fpy_list_new(0);
     size_t sep_len = strlen(sep);
     size_t s_len = strlen(s);
@@ -3980,7 +4264,21 @@ const char* fastpy_str_replace(const char *s, const char *old, const char *new_s
     size_t s_len = strlen(s);
     size_t old_len = strlen(old);
     size_t new_len = strlen(new_str);
-    if (old_len == 0) return s;
+    if (old_len == 0) {
+        /* Python: "abc".replace("", "x") → "xaxbxcx"
+         * Insert new_str at every position (n+1 positions for n chars). */
+        size_t n_inserts = s_len + 1;
+        size_t result_len = s_len + n_inserts * new_len;
+        char *result = (char*)malloc(result_len + 1);
+        char *dst = result;
+        for (size_t i = 0; i <= s_len; i++) {
+            memcpy(dst, new_str, new_len);
+            dst += new_len;
+            if (i < s_len) *dst++ = s[i];
+        }
+        *dst = '\0';
+        return result;
+    }
 
     /* Count occurrences */
     int count = 0;
@@ -5236,6 +5534,82 @@ void fastpy_list_slice_step_assign(FpyList *list, int64_t start, int64_t stop,
     FPY_UNLOCK(list);
 }
 
+/* Step-slice deletion: del lst[start:stop:step]
+ * Removes elements at positions selected by the extended slice.
+ * For positive step: collects indices, removes from highest to lowest. */
+void fastpy_list_slice_step_delete(FpyList *list, int64_t start, int64_t stop,
+                                    int64_t step, int64_t has_start,
+                                    int64_t has_stop) {
+    FPY_LOCK(list);
+    int64_t len = list->length;
+
+    if (step == 0) {
+        FPY_UNLOCK(list);
+        fastpy_raise(FPY_EXC_VALUEERROR, "slice step cannot be zero");
+        return;
+    }
+
+    /* Normalize start/stop like CPython */
+    if (step > 0) {
+        if (!has_start) start = 0;
+        if (!has_stop) stop = len;
+    } else {
+        if (!has_start) start = len - 1;
+        if (!has_stop) stop = -len - 1;
+    }
+    if (start < 0) start += len;
+    if (stop < 0) stop += len;
+    if (start < 0) start = 0;
+    if (start > len) start = len;
+    if (stop < -1) stop = -1;
+    if (stop > len) stop = len;
+
+    /* Collect indices to delete */
+    int64_t *indices = (int64_t*)malloc(len * sizeof(int64_t));
+    int64_t n = 0;
+    if (step > 0) {
+        for (int64_t i = start; i < stop; i += step)
+            if (i >= 0 && i < len) indices[n++] = i;
+    } else {
+        for (int64_t i = start; i > stop; i += step)
+            if (i >= 0 && i < len) indices[n++] = i;
+    }
+
+    if (n == 0) {
+        free(indices);
+        FPY_UNLOCK(list);
+        return;
+    }
+
+    /* Sort indices ascending (for negative step they're reversed) */
+    for (int64_t i = 0; i < n - 1; i++)
+        for (int64_t j = i + 1; j < n; j++)
+            if (indices[i] > indices[j]) {
+                int64_t tmp = indices[i];
+                indices[i] = indices[j];
+                indices[j] = tmp;
+            }
+
+    /* Decref removed elements */
+    for (int64_t i = 0; i < n; i++)
+        FPY_VAL_DECREF(list->items[indices[i]]);
+
+    /* Compact: shift elements to fill gaps.
+     * Walk two pointers: src reads all items, dst writes kept items. */
+    int64_t dst = indices[0];
+    int64_t di = 0;  /* index into indices[] */
+    for (int64_t src = indices[0]; src < len; src++) {
+        if (di < n && src == indices[di]) {
+            di++;
+            continue;  /* skip deleted element */
+        }
+        list->items[dst++] = list->items[src];
+    }
+    list->length = len - n;
+    free(indices);
+    FPY_UNLOCK(list);
+}
+
 /* Set discard — remove element if present, no error if absent */
 void fastpy_set_discard(FpyList *set, int64_t value) {
     for (int64_t i = 0; i < set->length; i++) {
@@ -6151,11 +6525,90 @@ int fastpy_register_class(const char *name, int parent_id) {
     fpy_classes[id].methods = NULL;
     fpy_classes[id].method_count = 0;
     fpy_classes[id].slot_count = 0;
+    fpy_classes[id].n_native_slots = 0;
     fpy_classes[id].slot_names = NULL;
     fpy_classes[id].destructor = NULL;
     fpy_classes[id].vtable = NULL;
     fpy_classes[id].vtable_size = 0;
+    fpy_classes[id].acyclic = 0;
+    fpy_classes[id].mro = NULL;
+    fpy_classes[id].mro_len = 0;
+    fpy_classes[id].class_var_names = NULL;
+    fpy_classes[id].class_var_values = NULL;
+    fpy_classes[id].class_var_count = 0;
     return id;
+}
+
+/* Mark a class as acyclic — its slots can only hold scalar values
+ * (INT, FLOAT, BOOL, NONE), so instances can never participate in
+ * reference cycles.  Instances skip GC tracking entirely. */
+void fastpy_set_class_acyclic(int class_id) {
+    fpy_classes[class_id].acyclic = 1;
+}
+
+/* Store a class-level variable (e.g. `kind = "parent"` from the class body).
+ * Called during class registration. obj_get_fv falls back to these when
+ * the instance has no matching attribute. */
+void fastpy_set_class_var(int class_id, const char *name,
+                          int32_t tag, int64_t data) {
+    FpyClassDef *cls = &fpy_classes[class_id];
+    int n = cls->class_var_count;
+    cls->class_var_names = realloc(cls->class_var_names,
+                                    (n + 1) * sizeof(const char *));
+    cls->class_var_values = realloc(cls->class_var_values,
+                                     (n + 1) * sizeof(FpyValue));
+    cls->class_var_names[n] = name;
+    cls->class_var_values[n].tag = tag;
+    cls->class_var_values[n].data.i = data;
+    cls->class_var_count = n + 1;
+}
+
+/* Set the MRO (Method Resolution Order) for a class.
+ * mro_ids is a heap-allocated array of class IDs in C3-linearized order:
+ *   mro[0] = self, mro[1..n-1] = ancestors in MRO order.
+ * The class takes ownership of the array (no copy). */
+void fastpy_set_class_mro(int class_id, int *mro_ids, int mro_len) {
+    fpy_classes[class_id].mro = mro_ids;
+    fpy_classes[class_id].mro_len = mro_len;
+}
+
+/* Resolve a super() method call using MRO.
+ * Finds the next class in self's MRO after calling_class_id that
+ * implements method_name, and returns its function pointer.
+ * Returns NULL if no such method exists. */
+void* fastpy_super_resolve(FpyObj *self, int calling_class_id,
+                            const char *method_name) {
+    int actual_class = self->class_id;
+    int *mro = fpy_classes[actual_class].mro;
+    int mro_len = fpy_classes[actual_class].mro_len;
+
+    /* If no MRO registered, fall back to single-parent lookup */
+    if (!mro || mro_len == 0) {
+        int pid = fpy_classes[calling_class_id].parent_id;
+        if (pid < 0) return NULL;
+        FpyClassDef *pcls = &fpy_classes[pid];
+        for (int i = 0; i < pcls->method_count; i++) {
+            if (strcmp(pcls->methods[i].name, method_name) == 0)
+                return pcls->methods[i].func;
+        }
+        return NULL;
+    }
+
+    /* Find calling_class_id in the MRO, then search subsequent entries */
+    int found = 0;
+    for (int i = 0; i < mro_len; i++) {
+        if (!found) {
+            if (mro[i] == calling_class_id) found = 1;
+            continue;
+        }
+        /* Search this class's methods */
+        FpyClassDef *cls = &fpy_classes[mro[i]];
+        for (int j = 0; j < cls->method_count; j++) {
+            if (strcmp(cls->methods[j].name, method_name) == 0)
+                return cls->methods[j].func;
+        }
+    }
+    return NULL;
 }
 
 /* Set the number of pre-declared attribute slots for a class.
@@ -6164,6 +6617,20 @@ void fastpy_set_class_slot_count(int class_id, int slot_count) {
     fpy_classes[class_id].slot_count = slot_count;
     fpy_classes[class_id].slot_names = (const char**)calloc(
         slot_count, sizeof(const char*));
+}
+
+/* Set the number of native (untagged, 8-byte) slots for a class.
+ * Must be called AFTER set_class_slot_count.  The first n_native slots
+ * are stored as raw i64 (8 bytes each) — no tag field.  Remaining slots
+ * are boxed FpyValue (16 bytes each).  This saves 8 bytes per native slot.
+ * Slots 0..n_native-1 must be statically-typed scalars (int/float/bool). */
+void fastpy_set_class_native_slot_count(int class_id, int n_native) {
+    fpy_classes[class_id].n_native_slots = n_native;
+}
+
+void fastpy_set_class_native_slot_tag(int class_id, int slot_idx, int tag) {
+    if (slot_idx >= 0 && slot_idx < 16)
+        fpy_classes[class_id].native_slot_tags[slot_idx] = (int8_t)tag;
 }
 
 /* Set a destructor callback for a class (e.g., generators with finally blocks).
@@ -6477,20 +6944,26 @@ static void* fpy_arena_alloc(size_t size) {
 }
 
 /* Create a new object instance.
- * Uses a per-slot-count free-list: if a previously freed object of the
- * same size is available, reuse it (pointer pop — no malloc).
- * Otherwise falls back to malloc with contiguous header+slots layout. */
+ * Uses a per-class free-list: if a previously freed object of the same
+ * class is available, reuse it (pointer pop — no malloc).
+ * Otherwise falls back to malloc with contiguous header+slots layout.
+ *
+ * Two-region layout: native slots (i64, 8 bytes each) come first,
+ * then boxed slots (FpyValue, 16 bytes each). */
 FpyObj* fastpy_obj_new(int class_id) {
     int sc = fpy_classes[class_id].slot_count;
-    size_t total = sizeof(FpyObj) + sizeof(FpyValue) * sc;
+    int nn = fpy_classes[class_id].n_native_slots;
+    int nb = sc - nn;  /* number of boxed slots */
+    size_t total = sizeof(FpyObj) + (size_t)nn * sizeof(int64_t)
+                   + (size_t)nb * sizeof(FpyValue);
     FpyObj *obj;
     int from_freelist = 0;
 
-    /* Try free-list first */
-    if (sc < FPY_OBJ_FREELIST_SLOTS && fpy_obj_freelist[sc]) {
-        obj = fpy_obj_freelist[sc];
-        fpy_obj_freelist[sc] = (FpyObj*)obj->dynamic_attrs;
-        fpy_obj_freelist_count[sc]--;
+    /* Try per-class free-list first */
+    if (class_id < FPY_MAX_CLASSES && fpy_obj_freelist[class_id]) {
+        obj = fpy_obj_freelist[class_id];
+        fpy_obj_freelist[class_id] = (FpyObj*)obj->dynamic_attrs;
+        fpy_obj_freelist_count[class_id]--;
         from_freelist = 1;
     } else {
         obj = (FpyObj*)malloc(total);
@@ -6498,44 +6971,72 @@ FpyObj* fastpy_obj_new(int class_id) {
     obj->refcount = 1;
     obj->magic = FPY_OBJ_MAGIC;
     obj->class_id = class_id;
-    if (fpy_threading_mode == FPY_THREADING_FREE) fpy_mutex_init(&obj->lock);
     obj->dynamic_attrs = NULL;
     obj->weakref_list = NULL;
-    if (sc > 0) {
-        FpyValue *slots = FPY_OBJ_SLOTS(obj);
-        for (int i = 0; i < sc; i++) {
-            slots[i].tag = FPY_TAG_NONE;
-            slots[i].data.i = 0;
+    /* Initialize native slots to 0 (raw i64) */
+    if (nn > 0) {
+        int64_t *native = FPY_OBJ_NATIVE_SLOTS(obj);
+        for (int i = 0; i < nn; i++)
+            native[i] = 0;
+    }
+    /* Initialize boxed slots to {NONE, 0} */
+    if (nb > 0) {
+        FpyValue *boxed = FPY_OBJ_BOXED_SLOTS(obj, nn);
+        for (int i = 0; i < nb; i++) {
+            boxed[i].tag = FPY_TAG_NONE;
+            boxed[i].data.i = 0;
         }
     }
-    /* Track AFTER the object is fully initialized — gc_maybe_collect may
-     * traverse this object's slots, so magic/class_id must be valid. */
+    /* Acyclic classes (scalar-only slots) skip GC tracking entirely —
+     * they can never form reference cycles, so the cycle collector
+     * never needs to see them.  This eliminates the GC doubly-linked
+     * list insert/remove and all GC scan overhead for these objects. */
     memset(&obj->gc_node, 0, sizeof(FpyGCNode));
     obj->gc_node.gc_type = FPY_GC_TYPE_OBJ;
-    fpy_gc_track(&obj->gc_node);
-    /* Skip gc_maybe_collect for free-list reuse — no new memory was
-     * allocated, so there's nothing for the GC to reclaim. */
-    if (!from_freelist)
-        fpy_gc_maybe_collect();
+    if (!fpy_classes[class_id].acyclic) {
+        fpy_gc_track(&obj->gc_node);
+        /* Skip gc_maybe_collect for free-list reuse — no new memory was
+         * allocated, so there's nothing for the GC to reclaim. */
+        if (!from_freelist)
+            fpy_gc_maybe_collect();
+    }
     return obj;
 }
 
 /* Fast-path static slot access. Slot index is known at compile time.
- * Manages refcounts: increfs the new value, decrefs the old. */
+ * Manages refcounts: increfs the new value, decrefs the old.
+ * Handles two-region layout: native slots (< n_native) are raw i64,
+ * boxed slots (>= n_native) are FpyValue. */
 void fastpy_obj_set_slot(FpyObj *obj, int slot, int32_t tag, int64_t data) {
-    FpyValue *slots = FPY_OBJ_SLOTS(obj);
-    FpyValue old = slots[slot];
-    fpy_rc_incref(tag, data);
-    slots[slot].tag = tag;
-    slots[slot].data.i = data;
-    fpy_rc_decref(old.tag, old.data.i);
+    int nn = fpy_classes[obj->class_id].n_native_slots;
+    if (slot < nn) {
+        /* Native slot: raw i64, no tag, no refcounting */
+        FPY_OBJ_NATIVE_SLOTS(obj)[slot] = data;
+    } else {
+        /* Boxed slot: full FpyValue with refcounting */
+        FpyValue *boxed = FPY_OBJ_BOXED_SLOTS(obj, nn);
+        int bi = slot - nn;
+        FpyValue old = boxed[bi];
+        fpy_rc_incref(tag, data);
+        boxed[bi].tag = tag;
+        boxed[bi].data.i = data;
+        fpy_rc_decref(old.tag, old.data.i);
+    }
 }
 
 void fastpy_obj_get_slot(FpyObj *obj, int slot,
                           int32_t *out_tag, int64_t *out_data) {
-    FpyValue *slots = FPY_OBJ_SLOTS(obj);
-    *out_tag = slots[slot].tag;
-    *out_data = slots[slot].data.i;
+    int nn = fpy_classes[obj->class_id].n_native_slots;
+    if (slot < nn) {
+        /* Native slot: look up the compile-time tag from the class def */
+        *out_tag = (int32_t)fpy_classes[obj->class_id].native_slot_tags[slot];
+        *out_data = FPY_OBJ_NATIVE_SLOTS(obj)[slot];
+    } else {
+        FpyValue *boxed = FPY_OBJ_BOXED_SLOTS(obj, nn);
+        int bi = slot - nn;
+        *out_tag = boxed[bi].tag;
+        *out_data = boxed[bi].data.i;
+    }
 }
 
 /* Set an attribute on an object */
@@ -6543,21 +7044,33 @@ void fastpy_obj_get_slot(FpyObj *obj, int slot,
  * provided. Replaced the old typed variants (obj_set_int with its pointer
  * heuristic, obj_set_float, obj_set_str) and their obj_get_* counterparts. */
 void fastpy_obj_set_fv(FpyObj *obj, const char *name, int32_t tag, int64_t data) {
-    FpyValue v;
-    v.tag = tag;
-    v.data.i = data;
     /* Incref the new value up-front (before any slot/dyn store). */
     fpy_rc_incref(tag, data);
     /* Check static slots first (covers all compiler-known attrs) */
     int slot = fpy_find_slot(obj->class_id, name);
     if (slot >= 0) {
-        FpyValue *slots = FPY_OBJ_SLOTS(obj);
-        FpyValue old = slots[slot];
-        slots[slot] = v;
-        fpy_rc_decref(old.tag, old.data.i);
+        int nn = fpy_classes[obj->class_id].n_native_slots;
+        if (slot < nn) {
+            /* Native slot: raw i64, no tag, no old-value decref */
+            FPY_OBJ_NATIVE_SLOTS(obj)[slot] = data;
+            /* Undo the incref — native slots don't hold references */
+            fpy_rc_decref(tag, data);
+        } else {
+            FpyValue *boxed = FPY_OBJ_BOXED_SLOTS(obj, nn);
+            int bi = slot - nn;
+            FpyValue old = boxed[bi];
+            FpyValue v;
+            v.tag = tag;
+            v.data.i = data;
+            boxed[bi] = v;
+            fpy_rc_decref(old.tag, old.data.i);
+        }
         return;
     }
     /* Dynamic attr fallback — lazily allocate the side table on first use. */
+    FpyValue v;
+    v.tag = tag;
+    v.data.i = data;
     FpyObjAttrs *a = obj->dynamic_attrs;
     if (a != NULL) {
         for (int i = 0; i < a->count; i++) {
@@ -6589,9 +7102,16 @@ void fastpy_obj_get_fv(FpyObj *obj, const char *name, int32_t *out_tag, int64_t 
     /* Check static slots first */
     int slot = fpy_find_slot(obj->class_id, name);
     if (slot >= 0) {
-        FpyValue *slots = FPY_OBJ_SLOTS(obj);
-        *out_tag = slots[slot].tag;
-        *out_data = slots[slot].data.i;
+        int nn = fpy_classes[obj->class_id].n_native_slots;
+        if (slot < nn) {
+            *out_tag = (int32_t)fpy_classes[obj->class_id].native_slot_tags[slot];
+            *out_data = FPY_OBJ_NATIVE_SLOTS(obj)[slot];
+        } else {
+            FpyValue *boxed = FPY_OBJ_BOXED_SLOTS(obj, nn);
+            int bi = slot - nn;
+            *out_tag = boxed[bi].tag;
+            *out_data = boxed[bi].data.i;
+        }
         return;
     }
     /* Dynamic attr fallback */
@@ -6604,6 +7124,24 @@ void fastpy_obj_get_fv(FpyObj *obj, const char *name, int32_t *out_tag, int64_t 
                 *out_data = a->values[i].data.i;
                 return;
             }
+        }
+    }
+    /* Fall back to class-level variables (walk MRO / parent chain).
+     * This handles `self.kind` where `kind = "parent"` is defined on
+     * the class body, and also inherits class vars from parent classes. */
+    {
+        int cid = obj->class_id;
+        while (cid >= 0) {
+            FpyClassDef *cls = &fpy_classes[cid];
+            for (int i = 0; i < cls->class_var_count; i++) {
+                if (cls->class_var_names[i] == name
+                        || strcmp(cls->class_var_names[i], name) == 0) {
+                    *out_tag = cls->class_var_values[i].tag;
+                    *out_data = cls->class_var_values[i].data.i;
+                    return;
+                }
+            }
+            cid = cls->parent_id;
         }
     }
     snprintf(_err_buf, sizeof(_err_buf), "'%s' object has no attribute '%s'",
@@ -6628,6 +7166,20 @@ int32_t fastpy_obj_has_attr(FpyObj *obj, const char *name) {
             }
         }
     }
+    /* Check class-level variables (walk parent chain) */
+    {
+        int cid = obj->class_id;
+        while (cid >= 0) {
+            FpyClassDef *cls = &fpy_classes[cid];
+            for (int i = 0; i < cls->class_var_count; i++) {
+                if (cls->class_var_names[i] == name
+                        || strcmp(cls->class_var_names[i], name) == 0) {
+                    return 1;
+                }
+            }
+            cid = cls->parent_id;
+        }
+    }
     return 0;
 }
 
@@ -6639,9 +7191,16 @@ int32_t fastpy_obj_getattr_default(FpyObj *obj, const char *name,
                                     int32_t *out_tag, int64_t *out_data) {
     int slot = fpy_find_slot(obj->class_id, name);
     if (slot >= 0) {
-        FpyValue *slots = FPY_OBJ_SLOTS(obj);
-        *out_tag = slots[slot].tag;
-        *out_data = slots[slot].data.i;
+        int nn = fpy_classes[obj->class_id].n_native_slots;
+        if (slot < nn) {
+            *out_tag = (int32_t)fpy_classes[obj->class_id].native_slot_tags[slot];
+            *out_data = FPY_OBJ_NATIVE_SLOTS(obj)[slot];
+        } else {
+            FpyValue *boxed = FPY_OBJ_BOXED_SLOTS(obj, nn);
+            int bi = slot - nn;
+            *out_tag = boxed[bi].tag;
+            *out_data = boxed[bi].data.i;
+        }
         return 1;
     }
     FpyObjAttrs *a = obj->dynamic_attrs;
@@ -6653,6 +7212,22 @@ int32_t fastpy_obj_getattr_default(FpyObj *obj, const char *name,
                 *out_data = a->values[i].data.i;
                 return 1;
             }
+        }
+    }
+    /* Check class-level variables (walk parent chain) */
+    {
+        int cid = obj->class_id;
+        while (cid >= 0) {
+            FpyClassDef *cls = &fpy_classes[cid];
+            for (int i = 0; i < cls->class_var_count; i++) {
+                if (cls->class_var_names[i] == name
+                        || strcmp(cls->class_var_names[i], name) == 0) {
+                    *out_tag = cls->class_var_values[i].tag;
+                    *out_data = cls->class_var_values[i].data.i;
+                    return 1;
+                }
+            }
+            cid = cls->parent_id;
         }
     }
     /* Not found — use default */
@@ -6901,6 +7476,211 @@ FpyObj* fastpy_list_iter_new(FpyList *list) {
     fpy_rc_incref(FPY_TAG_LIST, (int64_t)(intptr_t)list);
     slots[1].tag = FPY_TAG_INT;
     slots[1].data.i = 0;
+    return obj;
+}
+
+/* ================================================================
+ * Built-in file object — open()/read/write/readline/readlines/close,
+ * context-manager (__enter__/__exit__) and line iteration.
+ *
+ * Backed entirely by C stdio (fopen/fread/fwrite/fgetc/fclose), so it
+ * works in *pure mode* with no CPython bridge: the SlateOS posix libc
+ * implements the stdio surface over the SYS_FS_* VFS syscalls.  The
+ * file object is a normal FpyObj of a lazily-registered built-in class,
+ * so it plugs into the existing object refcounting/GC, dynamic method
+ * dispatch (fastpy_obj_call_methodN), and `with` handling for free.
+ *
+ * Slot layout:
+ *   slot 0 = FILE*  (stored raw in an FPY_TAG_INT slot — non-owning for GC)
+ *   slot 1 = flags  (FPY_TAG_INT): bit0 = closed
+ *
+ * Slice-1 limitations (see design.md): text mode only (read() returns a
+ * str; binary 'rb'/bytes not yet wired); read() reads the whole remaining
+ * file (no size argument yet); FileNotFoundError is raised by name but is
+ * not yet part of a registered OSError hierarchy.
+ * ================================================================ */
+#define FPY_EXC_GENERIC 99
+extern void fastpy_exc_set_class_name(const char *name);
+
+static int fpy_file_class_id = -1;
+
+/* Return the FILE* for an open file, or NULL (raising ValueError) if closed. */
+static FILE *fpy_file_fp(FpyObj *self) {
+    FpyValue *slots = FPY_OBJ_SLOTS(self);
+    if (slots[1].data.i & 1) {
+        fastpy_raise(FPY_EXC_VALUEERROR, "I/O operation on closed file");
+        return NULL;
+    }
+    return (FILE*)(intptr_t)slots[0].data.i;
+}
+
+/* Read a single line (through and including '\n', or to EOF) into a fresh
+ * FpyString.  A zero-length result means EOF (matches Python readline). */
+static FpyString *fpy_file_readline_raw(FILE *fp) {
+    size_t cap = 128, len = 0;
+    char *buf = (char*)malloc(cap);
+    int c;
+    while ((c = fgetc(fp)) != EOF) {
+        if (len + 1 > cap) { cap *= 2; buf = (char*)realloc(buf, cap); }
+        buf[len++] = (char)c;
+        if (c == '\n') break;
+    }
+    FpyString *s = fpy_str_alloc((int64_t)len);
+    if (len) memcpy(s->data, buf, len);
+    free(buf);
+    return s;
+}
+
+static int64_t fpy_file_read(FpyObj *self) {
+    FILE *fp = fpy_file_fp(self);
+    if (!fp) { fastpy_set_ret_tag(FPY_TAG_NONE); return 0; }
+    size_t cap = 4096, len = 0;
+    char *buf = (char*)malloc(cap);
+    for (;;) {
+        if (len + 4096 > cap) { cap *= 2; buf = (char*)realloc(buf, cap); }
+        size_t n = fread(buf + len, 1, 4096, fp);
+        len += n;
+        if (n < 4096) break;  /* short read = EOF or error */
+    }
+    FpyString *s = fpy_str_alloc((int64_t)len);
+    if (len) memcpy(s->data, buf, len);
+    free(buf);
+    fastpy_set_ret_tag(FPY_TAG_STR);
+    return (int64_t)(intptr_t)s->data;
+}
+
+static int64_t fpy_file_readline(FpyObj *self) {
+    FILE *fp = fpy_file_fp(self);
+    if (!fp) { fastpy_set_ret_tag(FPY_TAG_NONE); return 0; }
+    FpyString *s = fpy_file_readline_raw(fp);
+    fastpy_set_ret_tag(FPY_TAG_STR);
+    return (int64_t)(intptr_t)s->data;
+}
+
+static int64_t fpy_file_readlines(FpyObj *self) {
+    FILE *fp = fpy_file_fp(self);
+    if (!fp) { fastpy_set_ret_tag(FPY_TAG_NONE); return 0; }
+    FpyList *lst = fpy_list_new(8);
+    for (;;) {
+        FpyString *s = fpy_file_readline_raw(fp);
+        if (fastpy_str_len(s->data) == 0) { free(s); break; }  /* EOF */
+        FpyValue v; v.tag = FPY_TAG_STR; v.data.s = s->data;
+        fpy_list_append(lst, v);  /* increfs → drop our builder ref below */
+        fpy_rc_decref(FPY_TAG_STR, (int64_t)(intptr_t)s->data);
+    }
+    fastpy_set_ret_tag(FPY_TAG_LIST);
+    return (int64_t)(intptr_t)lst;
+}
+
+/* write(self, s) → number of characters written. `a` is the str data ptr. */
+static int64_t fpy_file_write(FpyObj *self, int64_t a) {
+    FILE *fp = fpy_file_fp(self);
+    if (!fp) { fastpy_set_ret_tag(FPY_TAG_NONE); return 0; }
+    const char *str = (const char*)(intptr_t)a;
+    int64_t n = str ? fastpy_str_len(str) : 0;
+    if (n > 0) fwrite(str, 1, (size_t)n, fp);
+    fastpy_set_ret_tag(FPY_TAG_INT);
+    return n;
+}
+
+static int64_t fpy_file_close(FpyObj *self) {
+    FpyValue *slots = FPY_OBJ_SLOTS(self);
+    if (!(slots[1].data.i & 1)) {
+        FILE *fp = (FILE*)(intptr_t)slots[0].data.i;
+        if (fp) fclose(fp);
+        slots[1].data.i |= 1;
+        slots[0].data.i = 0;
+    }
+    fastpy_set_ret_tag(FPY_TAG_NONE);
+    return 0;
+}
+
+static int64_t fpy_file_enter(FpyObj *self) {
+    fpy_incref(&self->refcount);
+    fastpy_set_ret_tag(FPY_TAG_OBJ);
+    return (int64_t)(intptr_t)self;
+}
+
+/* __exit__(self, exc_type, exc_val, tb) → None (closes the file). */
+static int64_t fpy_file_exit(FpyObj *self, int64_t a, int64_t b, int64_t c) {
+    (void)a; (void)b; (void)c;
+    return fpy_file_close(self);
+}
+
+static int64_t fpy_file_iter(FpyObj *self) {
+    fpy_incref(&self->refcount);
+    fastpy_set_ret_tag(FPY_TAG_OBJ);
+    return (int64_t)(intptr_t)self;
+}
+
+static int64_t fpy_file_next(FpyObj *self) {
+    FILE *fp = fpy_file_fp(self);
+    if (!fp) { fastpy_set_ret_tag(FPY_TAG_NONE); return 0; }
+    FpyString *s = fpy_file_readline_raw(fp);
+    if (fastpy_str_len(s->data) == 0) {
+        free(s);
+        fastpy_raise(FPY_EXC_STOPITERATION, "");
+        fastpy_set_ret_tag(FPY_TAG_NONE);
+        return 0;
+    }
+    fastpy_set_ret_tag(FPY_TAG_STR);
+    return (int64_t)(intptr_t)s->data;
+}
+
+/* Destructor: close the underlying FILE* if the program dropped the file
+ * object without calling close() (matches CPython's finalizer flush/close). */
+static void fpy_file_dtor(FpyObj *self) {
+    FpyValue *slots = FPY_OBJ_SLOTS(self);
+    if (!(slots[1].data.i & 1)) {
+        FILE *fp = (FILE*)(intptr_t)slots[0].data.i;
+        if (fp) fclose(fp);
+        slots[1].data.i |= 1;
+    }
+}
+
+static void fpy_file_ensure_class(void) {
+    if (fpy_file_class_id >= 0) return;
+    fpy_file_class_id = fastpy_register_class("file", -1);
+    fastpy_set_class_slot_count(fpy_file_class_id, 2);
+    fastpy_register_slot_name(fpy_file_class_id, 0, "_fp");
+    fastpy_register_slot_name(fpy_file_class_id, 1, "_flags");
+    fastpy_set_class_destructor(fpy_file_class_id, fpy_file_dtor);
+    fastpy_register_method(fpy_file_class_id, "read", (void*)fpy_file_read, 0, 1);
+    fastpy_set_method_ret_tag(fpy_file_class_id, "read", FPY_TAG_STR);
+    fastpy_register_method(fpy_file_class_id, "readline", (void*)fpy_file_readline, 0, 1);
+    fastpy_set_method_ret_tag(fpy_file_class_id, "readline", FPY_TAG_STR);
+    fastpy_register_method(fpy_file_class_id, "readlines", (void*)fpy_file_readlines, 0, 1);
+    fastpy_set_method_ret_tag(fpy_file_class_id, "readlines", FPY_TAG_LIST);
+    fastpy_register_method(fpy_file_class_id, "write", (void*)fpy_file_write, 1, 1);
+    fastpy_set_method_ret_tag(fpy_file_class_id, "write", FPY_TAG_INT);
+    fastpy_register_method(fpy_file_class_id, "close", (void*)fpy_file_close, 0, 1);
+    fastpy_set_method_ret_tag(fpy_file_class_id, "close", FPY_TAG_NONE);
+    fastpy_register_method(fpy_file_class_id, "__enter__", (void*)fpy_file_enter, 0, 1);
+    fastpy_set_method_ret_tag(fpy_file_class_id, "__enter__", FPY_TAG_OBJ);
+    fastpy_register_method(fpy_file_class_id, "__exit__", (void*)fpy_file_exit, 3, 1);
+    fastpy_set_method_ret_tag(fpy_file_class_id, "__exit__", FPY_TAG_NONE);
+    fastpy_register_method(fpy_file_class_id, "__iter__", (void*)fpy_file_iter, 0, 1);
+    fastpy_set_method_ret_tag(fpy_file_class_id, "__iter__", FPY_TAG_OBJ);
+    fastpy_register_method(fpy_file_class_id, "__next__", (void*)fpy_file_next, 0, 1);
+    fastpy_set_method_ret_tag(fpy_file_class_id, "__next__", -1);
+}
+
+/* Public: open(path, mode) → file object.  `mode` may be NULL ("r" default). */
+FpyObj* fastpy_io_open(const char *path, const char *mode) {
+    fpy_file_ensure_class();
+    if (!mode || !mode[0]) mode = "r";
+    FILE *fp = fopen(path ? path : "", mode);
+    if (!fp) {
+        snprintf(_err_buf, sizeof(_err_buf),
+                 "[Errno 2] No such file or directory: '%s'", path ? path : "");
+        fastpy_exc_set_class_name("FileNotFoundError");
+        fastpy_raise(FPY_EXC_GENERIC, _err_buf);
+        return NULL;
+    }
+    FpyObj *obj = fastpy_obj_new(fpy_file_class_id);
+    FpyValue *slots = FPY_OBJ_SLOTS(obj);
+    slots[0].tag = FPY_TAG_INT; slots[0].data.i = (int64_t)(intptr_t)fp;
+    slots[1].tag = FPY_TAG_INT; slots[1].data.i = 0;
     return obj;
 }
 
@@ -7626,6 +8406,17 @@ const char* fastpy_os_getenv(const char *name) {
     return val ? fpy_strdup(val) : NULL;
 }
 
+/* os.remove(path) / os.unlink(path): delete a directory entry.
+ * Returns 0 on success, -1 on failure.  Python's os.remove returns None and
+ * raises OSError on failure; in pure/AOT mode (no exception unwinding wired
+ * for this path) we surface success/failure as an int status instead, so a
+ * caller can branch on it (mirrors os.path.exists returning a bool).  Backed
+ * by C stdio remove(), which the SlateOS posix libc implements over
+ * SYS_FS_DELETE. */
+int64_t fastpy_os_remove(const char *path) {
+    return (int64_t)(remove(path) == 0 ? 0 : -1);
+}
+
 /* ============================================================
  * Native collections module
  * ============================================================ */
@@ -7661,7 +8452,7 @@ FpyDict* fastpy_counter_from_string(const char *str) {
             if (idx != FPY_DICT_DELETED && fpy_key_equal(counter->keys[idx], key)) {
                 counter->values[idx].data.i++;
                 found = 1;
-                free(key.data.s);
+                free((void *)key.data.s);
                 break;
             }
             slot = (slot + 1) & mask;
