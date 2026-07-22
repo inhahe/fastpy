@@ -8589,6 +8589,21 @@ double fastpy_os_path_getmtime(const char *path) {
 #endif
 }
 
+/* os.path.getatime: last-access time (st_atim) as epoch seconds (double).
+ * Distinct stat field from getmtime's st_mtim — reads the *atime* the
+ * kernel/utime stamped.  CPython returns a float; -1.0 on stat error. */
+double fastpy_os_path_getatime(const char *path) {
+#ifdef _WIN32
+    struct _stat64 st;
+    if (_stat64(path, &st) != 0) return -1.0;
+    return (double)st.st_atime;
+#else
+    struct stat st;
+    if (stat(path, &st) != 0) return -1.0;
+    return (double)st.st_atim.tv_sec + (double)st.st_atim.tv_nsec / 1e9;
+#endif
+}
+
 const char* fastpy_os_path_join(const char *a, const char *b) {
     int alen = (int)strlen(a), blen = (int)strlen(b);
     char *buf = (char*)malloc(alen + blen + 2);
