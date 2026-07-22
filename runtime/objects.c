@@ -8408,6 +8408,19 @@ int64_t fastpy_os_close(int64_t fd) {
 #endif
 }
 
+/* os.dup(fd) -> a new raw integer fd referring to the same open file /
+ * pipe end / socket as `fd` (or -1 on error). On SlateOS posix dup()
+ * shares the underlying kernel handle at the fd-table level — for a pipe
+ * end the duplicate aliases the same kernel pipe buffer, so bytes written
+ * through the dup are readable from the original pipe's read end. */
+int64_t fastpy_os_dup(int64_t fd) {
+#ifdef _WIN32
+    return (int64_t)_dup((int)fd);
+#else
+    return (int64_t)dup((int)fd);
+#endif
+}
+
 int64_t fastpy_os_path_exists(const char *path) {
 #ifdef _WIN32
     DWORD attrs = GetFileAttributesA(path);
