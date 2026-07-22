@@ -8497,6 +8497,18 @@ int64_t fastpy_os_chmod(const char *path, int64_t mode) {
 #endif
 }
 
+/* os.truncate(path, length) -> int status (0 ok, -1 error).  Resizes the file
+ * to exactly `length` bytes (shrinking discards the tail; growing zero-fills).
+ * Pure/AOT mode surfaces the result as a bare int, mirroring os.chmod. */
+int64_t fastpy_os_truncate(const char *path, int64_t length) {
+#ifdef _WIN32
+    (void)path; (void)length;
+    return -1;
+#else
+    return (int64_t)(truncate(path, (off_t)length) == 0 ? 0 : -1);
+#endif
+}
+
 /* os.readlink(path) -> str (the link's target).  Returns a valid FpyString
  * `.data` pointer (FPY_TAG_STR); an empty string signals an error, mirroring
  * how callers already branch on os.getcwd/os.path.* string results.  POSIX

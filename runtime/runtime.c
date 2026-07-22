@@ -1877,6 +1877,7 @@ extern int64_t fastpy_os_symlink(const char *target, const char *linkpath);
 extern const char* fastpy_os_readlink(const char *path);
 extern int64_t fastpy_os_link(const char *src, const char *dst);
 extern int64_t fastpy_os_chmod(const char *path, int64_t mode);
+extern int64_t fastpy_os_truncate(const char *path, int64_t length);
 
 /* Path(str) → just returns the string (Path IS a string internally) */
 /* Path() — implemented in cpython_bridge.c */
