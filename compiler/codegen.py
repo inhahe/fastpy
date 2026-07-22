@@ -2611,6 +2611,13 @@ class CodeGen:
         # os.remove(path)/os.unlink(path) -> int status (0 ok, -1 error)
         ft = ir.FunctionType(i64, [i8_ptr])
         self.runtime["os_remove"] = ir.Function(self.module, ft, name="fastpy_os_remove")
+        # os.mkdir(path)/os.rmdir(path) -> int status (0 ok, -1 error)
+        ft = ir.FunctionType(i64, [i8_ptr])
+        self.runtime["os_mkdir"] = ir.Function(self.module, ft, name="fastpy_os_mkdir")
+        self.runtime["os_rmdir"] = ir.Function(self.module, ft, name="fastpy_os_rmdir")
+        # os.rename(src, dst) -> int status (0 ok, -1 error)
+        ft = ir.FunctionType(i64, [i8_ptr, i8_ptr])
+        self.runtime["os_rename"] = ir.Function(self.module, ft, name="fastpy_os_rename")
         # Vtable dispatch
         ft = ir.FunctionType(void, [i32, i32, i8_ptr])
         self.runtime["set_vtable_entry"] = ir.Function(self.module, ft, name="fastpy_set_vtable_entry")
@@ -18988,7 +18995,7 @@ class CodeGen:
                     return ValueType(VKind.STR)
                 elif fn in ("listdir",):
                     return ValueType(VKind.LIST, elem_type=ValueType(VKind.STR))
-                elif fn in ("remove", "unlink"):
+                elif fn in ("remove", "unlink", "mkdir", "rmdir", "rename"):
                     return ValueType(VKind.INT)
                 elif fn in ("exists", "isfile", "isdir",
                            "path_exists", "path_isfile", "path_isdir"):
@@ -19054,7 +19061,7 @@ class CodeGen:
                 return ValueType(VKind.STR)
             elif mod == "os" and fn == "listdir":
                 return ValueType(VKind.LIST, elem_type=ValueType(VKind.STR))
-            elif mod == "os" and fn in ("remove", "unlink"):
+            elif mod == "os" and fn in ("remove", "unlink", "mkdir", "rmdir", "rename"):
                 return ValueType(VKind.INT)
             elif mod == "asyncio" and fn == "gather":
                 return ValueType(VKind.LIST, elem_type=ValueType(VKind.INT))
@@ -37255,6 +37262,21 @@ class CodeGen:
             v = self._emit_expr_value(node.args[0])
             v = self._ensure_ptr(v)
             return self.builder.call(self.runtime["os_remove"], [v])
+        elif func_name == "mkdir" and len(node.args) == 1:
+            # os.mkdir(path) -> bare i64 status (0 ok, -1 error).
+            v = self._emit_expr_value(node.args[0])
+            v = self._ensure_ptr(v)
+            return self.builder.call(self.runtime["os_mkdir"], [v])
+        elif func_name == "rmdir" and len(node.args) == 1:
+            # os.rmdir(path) -> bare i64 status (0 ok, -1 error).
+            v = self._emit_expr_value(node.args[0])
+            v = self._ensure_ptr(v)
+            return self.builder.call(self.runtime["os_rmdir"], [v])
+        elif func_name == "rename" and len(node.args) == 2:
+            # os.rename(src, dst) -> bare i64 status (0 ok, -1 error).
+            src = self._ensure_ptr(self._emit_expr_value(node.args[0]))
+            dst = self._ensure_ptr(self._emit_expr_value(node.args[1]))
+            return self.builder.call(self.runtime["os_rename"], [src, dst])
         elif func_name == "getenv" and len(node.args) == 1:
             v = self._emit_expr_value(node.args[0])
             v = self._ensure_ptr(v)

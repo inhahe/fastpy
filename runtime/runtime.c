@@ -1869,6 +1869,9 @@ extern const char* fastpy_os_path_dirname(const char *path);
 extern const char* fastpy_os_getcwd(void);
 extern FpyList* fastpy_os_listdir(const char *path);
 extern int64_t fastpy_os_remove(const char *path);
+extern int64_t fastpy_os_mkdir(const char *path);
+extern int64_t fastpy_os_rmdir(const char *path);
+extern int64_t fastpy_os_rename(const char *src, const char *dst);
 
 /* Path(str) → just returns the string (Path IS a string internally) */
 /* Path() — implemented in cpython_bridge.c */

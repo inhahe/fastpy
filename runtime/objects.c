@@ -8417,6 +8417,32 @@ int64_t fastpy_os_remove(const char *path) {
     return (int64_t)(remove(path) == 0 ? 0 : -1);
 }
 
+/* os.mkdir(path) -> 0 ok / -1 error.  Python's os.mkdir defaults mode 0o777
+ * (further masked by umask); we pass 0777 on POSIX/SlateOS.  On Windows the
+ * CRT _mkdir takes no mode. */
+int64_t fastpy_os_mkdir(const char *path) {
+#ifdef _WIN32
+    return (int64_t)(_mkdir(path) == 0 ? 0 : -1);
+#else
+    return (int64_t)(mkdir(path, 0777) == 0 ? 0 : -1);
+#endif
+}
+
+/* os.rmdir(path) -> 0 ok / -1 error. */
+int64_t fastpy_os_rmdir(const char *path) {
+#ifdef _WIN32
+    return (int64_t)(_rmdir(path) == 0 ? 0 : -1);
+#else
+    return (int64_t)(rmdir(path) == 0 ? 0 : -1);
+#endif
+}
+
+/* os.rename(src, dst) -> 0 ok / -1 error.  C rename() handles both files and
+ * directories; on SlateOS it maps to SYS_FS_RENAME. */
+int64_t fastpy_os_rename(const char *src, const char *dst) {
+    return (int64_t)(rename(src, dst) == 0 ? 0 : -1);
+}
+
 /* ============================================================
  * Native collections module
  * ============================================================ */
