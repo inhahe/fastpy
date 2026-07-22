@@ -8484,6 +8484,19 @@ int64_t fastpy_os_link(const char *src, const char *dst) {
 #endif
 }
 
+/* os.chmod(path, mode) -> int status (0 ok, -1 error).  Python's os.chmod
+ * returns None and raises on error, but pure/AOT mode surfaces the result as
+ * a bare int (mirroring os.remove/os.mkdir).  Only the low permission bits of
+ * `mode` apply; the kernel ignores the file-type bits. */
+int64_t fastpy_os_chmod(const char *path, int64_t mode) {
+#ifdef _WIN32
+    (void)path; (void)mode;
+    return -1;
+#else
+    return (int64_t)(chmod(path, (mode_t)mode) == 0 ? 0 : -1);
+#endif
+}
+
 /* os.readlink(path) -> str (the link's target).  Returns a valid FpyString
  * `.data` pointer (FPY_TAG_STR); an empty string signals an error, mirroring
  * how callers already branch on os.getcwd/os.path.* string results.  POSIX

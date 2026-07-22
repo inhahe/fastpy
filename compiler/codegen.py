@@ -2630,6 +2630,9 @@ class CodeGen:
         # os.readlink(path) -> str (the link target); empty string on error
         ft = ir.FunctionType(i8_ptr, [i8_ptr])
         self.runtime["os_readlink"] = ir.Function(self.module, ft, name="fastpy_os_readlink")
+        # os.chmod(path, mode) -> int status (0 ok, -1 error); mode is an i64
+        ft = ir.FunctionType(i64, [i8_ptr, i64])
+        self.runtime["os_chmod"] = ir.Function(self.module, ft, name="fastpy_os_chmod")
         # Vtable dispatch
         ft = ir.FunctionType(void, [i32, i32, i8_ptr])
         self.runtime["set_vtable_entry"] = ir.Function(self.module, ft, name="fastpy_set_vtable_entry")
@@ -19018,7 +19021,8 @@ class CodeGen:
                 elif fn in ("listdir",):
                     return ValueType(VKind.LIST, elem_type=ValueType(VKind.STR))
                 elif fn in ("remove", "unlink", "mkdir", "rmdir", "rename",
-                           "getsize", "path_getsize", "symlink", "link"):
+                           "getsize", "path_getsize", "symlink", "link",
+                           "chmod"):
                     return ValueType(VKind.INT)
                 elif fn in ("readlink",):
                     return ValueType(VKind.STR)
@@ -19086,7 +19090,7 @@ class CodeGen:
                 return ValueType(VKind.STR)
             elif mod == "os" and fn == "listdir":
                 return ValueType(VKind.LIST, elem_type=ValueType(VKind.STR))
-            elif mod == "os" and fn in ("remove", "unlink", "mkdir", "rmdir", "rename", "symlink", "link"):
+            elif mod == "os" and fn in ("remove", "unlink", "mkdir", "rmdir", "rename", "symlink", "link", "chmod"):
                 return ValueType(VKind.INT)
             elif mod in ("os", "os.path") and fn in ("getsize", "path_getsize"):
                 return ValueType(VKind.INT)
@@ -37319,6 +37323,21 @@ class CodeGen:
             # FpyString pointer (empty string on error).
             v = self._ensure_ptr(self._emit_expr_value(node.args[0]))
             return self.builder.call(self.runtime["os_readlink"], [v])
+        elif func_name == "chmod" and len(node.args) == 2:
+            # os.chmod(path, mode) -> bare i64 status (0 ok, -1 error).  mode
+            # is a plain integer (e.g. 0o644), so coerce it to bare i64.
+            path = self._ensure_ptr(self._emit_expr_value(node.args[0]))
+            mode = self._emit_expr_value(node.args[1])
+            if (isinstance(mode.type, ir.LiteralStructType)
+                    and mode.type == fpy_val):
+                mode = self.builder.extract_value(mode, 1)
+            elif isinstance(mode.type, ir.PointerType):
+                mode = self.builder.ptrtoint(mode, i64)
+            elif isinstance(mode.type, ir.DoubleType):
+                mode = self.builder.fptosi(mode, i64)
+            elif isinstance(mode.type, ir.IntType) and mode.type.width != 64:
+                mode = self.builder.zext(mode, i64)
+            return self.builder.call(self.runtime["os_chmod"], [path, mode])
         elif func_name == "getenv" and len(node.args) == 1:
             v = self._emit_expr_value(node.args[0])
             v = self._ensure_ptr(v)
