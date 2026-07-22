@@ -1898,6 +1898,7 @@ extern int64_t fastpy_os_truncate(const char *path, int64_t length);
 extern int64_t fastpy_os_utime(const char *path, int64_t atime_ns, int64_t mtime_ns);
 extern int64_t fastpy_os_chown(const char *path, int64_t uid, int64_t gid);
 extern int64_t fastpy_os_access(const char *path, int64_t mode);
+extern int64_t fastpy_os_path_samefile(const char *a, const char *b);
 
 /* Path(str) → just returns the string (Path IS a string internally) */
 /* Path() — implemented in cpython_bridge.c */

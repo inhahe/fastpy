@@ -2692,6 +2692,12 @@ class CodeGen:
         # bits outside R|W|X with EINVAL). Runtime returns i64 1/0.
         ft = ir.FunctionType(i64, [i8_ptr, i64])
         self.runtime["os_access"] = ir.Function(self.module, ft, name="fastpy_os_access")
+        # os.path.samefile(a, b) -> bool (True if both paths are the same file).
+        # Compares the (st_dev, st_ino) identity of two SYS_FS_STAT results — the
+        # first lowering to exercise the st_ino field. Both stats follow symlinks,
+        # so a file and a symlink to it compare equal. Runtime returns i64 1/0.
+        ft = ir.FunctionType(i64, [i8_ptr, i8_ptr])
+        self.runtime["os_path_samefile"] = ir.Function(self.module, ft, name="fastpy_os_path_samefile")
         # os.symlink(target, linkpath) -> int status (0 ok, -1 error)
         ft = ir.FunctionType(i64, [i8_ptr, i8_ptr])
         self.runtime["os_symlink"] = ir.Function(self.module, ft, name="fastpy_os_symlink")
@@ -19114,7 +19120,7 @@ class CodeGen:
                     return ValueType(VKind.FLOAT)
                 elif fn in ("exists", "isfile", "isdir",
                            "path_exists", "path_isfile", "path_isdir",
-                           "access"):
+                           "access", "samefile", "path_samefile"):
                     return ValueType(VKind.BOOL)
                 # collections types via from-import
                 elif mod in ("collections", "_collections"):
@@ -19266,7 +19272,7 @@ class CodeGen:
                         return ValueType(VKind.INT)
                     if _fn in ("getmtime", "getatime", "getctime"):
                         return ValueType(VKind.FLOAT)
-                    if _fn in ("exists", "isfile", "isdir"):
+                    if _fn in ("exists", "isfile", "isdir", "samefile"):
                         return ValueType(VKind.BOOL)
         # Collections module — from-import calls: Counter(), defaultdict(), deque()
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
@@ -37775,6 +37781,7 @@ class CodeGen:
             "getmtime": ("os_path_getmtime", 1),
             "getatime": ("os_path_getatime", 1),
             "getctime": ("os_path_getctime", 1),
+            "samefile": ("os_path_samefile", 2),
         }
         if func_name in _os_path_fns:
             rt_key, n_args = _os_path_fns[func_name]
@@ -37791,7 +37798,7 @@ class CodeGen:
                         for i in range(n_args)]
                 result = self.builder.call(self.runtime[rt_key], args)
                 # Boolean-returning functions: wrap as BOOL FpyValue
-                if func_name in ("exists", "isfile", "isdir"):
+                if func_name in ("exists", "isfile", "isdir", "samefile"):
                     return self._fv_from_bool(result)
                 return result
         return None
@@ -38160,6 +38167,7 @@ class CodeGen:
         "os.path.getmtime": "float",
         "os.path.getatime": "float",
         "os.path.getctime": "float",
+        "os.path.samefile": "bool",
         "os.listdir": "list:str",
         "os.access": "bool",
         # json

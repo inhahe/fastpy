@@ -8646,6 +8646,28 @@ int64_t fastpy_os_access(const char *path, int64_t mode) {
 #endif
 }
 
+/* os.path.samefile(a, b) -> 1 if both paths refer to the same file (True),
+ * 0 otherwise (False).  Mirrors CPython os.path.samefile, which compares the
+ * (st_dev, st_ino) identity of two stat() results.  This is the first fastpy
+ * lowering to exercise the *st_ino* field: both stat() calls follow symlinks
+ * (POSIX stat semantics), so a file and a symlink pointing at it compare equal
+ * (same inode), while two distinct files have distinct synthetic inodes and
+ * compare unequal.  CPython raises if a path is missing; the AOT-simplified
+ * form returns False on any stat error. */
+int64_t fastpy_os_path_samefile(const char *a, const char *b) {
+    if (a == NULL || b == NULL) return 0;
+#ifdef _WIN32
+    struct _stat64 sa, sb;
+    if (_stat64(a, &sa) != 0) return 0;
+    if (_stat64(b, &sb) != 0) return 0;
+#else
+    struct stat sa, sb;
+    if (stat(a, &sa) != 0) return 0;
+    if (stat(b, &sb) != 0) return 0;
+#endif
+    return (sa.st_dev == sb.st_dev && sa.st_ino == sb.st_ino) ? 1 : 0;
+}
+
 const char* fastpy_os_path_join(const char *a, const char *b) {
     int alen = (int)strlen(a), blen = (int)strlen(b);
     char *buf = (char*)malloc(alen + blen + 2);
