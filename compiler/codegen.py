@@ -2623,6 +2623,27 @@ class CodeGen:
         ft = ir.FunctionType(i64, [i64])
         self.runtime["os_setuid"] = ir.Function(self.module, ft, name="fastpy_os_setuid")
         self.runtime["os_setgid"] = ir.Function(self.module, ft, name="fastpy_os_setgid")
+        # os.nice(inc) -> int new nice value.  On SlateOS posix nice() reads the
+        # process's current kernel nice (SYS_PROCESS_GET_NICE), adds the
+        # increment, and — after the userspace CAP_SYS_NICE check for a
+        # priority-raise — installs it via SYS_PROCESS_SET_NICE, which *also*
+        # maps nice to a scheduler priority level and re-prioritises the
+        # process's tasks.  Nice is a real scheduling attribute, not a stored
+        # no-op.  A distinct kernel path (the scheduler) from every filesystem/
+        # credential syscall.
+        ft = ir.FunctionType(i64, [i64])
+        self.runtime["os_nice"] = ir.Function(self.module, ft, name="fastpy_os_nice")
+        # os.getpriority(which, who) -> int nice value.  On SlateOS posix
+        # getpriority() reads the caller's real kernel nice via
+        # SYS_PROCESS_GET_NICE.
+        ft = ir.FunctionType(i64, [i64, i64])
+        self.runtime["os_getpriority"] = ir.Function(self.module, ft, name="fastpy_os_getpriority")
+        # os.setpriority(which, who, prio) -> int status (0 ok, -1 error).  On
+        # SlateOS posix setpriority() installs the nice value via
+        # SYS_PROCESS_SET_NICE (re-prioritising the process's tasks) after the
+        # userspace CAP_SYS_NICE check.
+        ft = ir.FunctionType(i64, [i64, i64, i64])
+        self.runtime["os_setpriority"] = ir.Function(self.module, ft, name="fastpy_os_setpriority")
         # os.pipe() -> 2-element list [read_fd, write_fd] (FpyList* as i8_ptr).
         # On SlateOS posix pipe() is a real SYS_PIPE_CREATE syscall — a distinct
         # kernel path (the pipe subsystem) from file/process syscalls.
@@ -19224,6 +19245,15 @@ class CodeGen:
             elif mod == "os" and fn in ("getpid", "getppid", "gettid", "getuid", "getgid"):
                 return ValueType(VKind.INT)
             elif mod == "os" and fn in ("setuid", "setgid"):
+                return ValueType(VKind.INT)
+            elif mod == "os" and fn in ("nice", "getpriority", "setpriority"):
+                # os.nice(inc)/os.getpriority(which, who)/os.setpriority(which,
+                # who, prio) -> int. On SlateOS these issue the real
+                # SYS_PROCESS_GET_NICE/SYS_PROCESS_SET_NICE syscalls, which
+                # record the nice value AND map it to a scheduler priority
+                # level (nice becomes a real scheduling attribute) — a distinct
+                # kernel path (the scheduler's per-task priority) from every
+                # filesystem/credential syscall.
                 return ValueType(VKind.INT)
             elif mod == "os" and fn in ("write", "close", "dup", "dup2", "lseek", "open", "ftruncate", "pwrite"):
                 return ValueType(VKind.INT)
@@ -37503,6 +37533,38 @@ class CodeGen:
             idv = _id_i64(self._emit_expr_value(node.args[0]))
             rt_name = "os_setuid" if func_name == "setuid" else "os_setgid"
             return self.builder.call(self.runtime[rt_name], [idv])
+        elif func_name in ("nice", "getpriority", "setpriority"):
+            # os.nice(inc)/os.getpriority(which, who)/os.setpriority(which, who,
+            # prio) -> bare i64.  On SlateOS these issue SYS_PROCESS_GET_NICE /
+            # SYS_PROCESS_SET_NICE via posix nice()/getpriority()/setpriority():
+            # the kernel records the nice value AND maps it to a scheduler
+            # priority level (nice is a real scheduling attribute) — a distinct
+            # kernel path (the scheduler's per-task priority) from every
+            # filesystem/credential syscall.
+            def _arg_i64(v):
+                if (isinstance(v.type, ir.LiteralStructType)
+                        and v.type == fpy_val):
+                    return self.builder.extract_value(v, 1)
+                if isinstance(v.type, ir.PointerType):
+                    return self.builder.ptrtoint(v, i64)
+                if isinstance(v.type, ir.DoubleType):
+                    return self.builder.fptosi(v, i64)
+                if isinstance(v.type, ir.IntType) and v.type.width != 64:
+                    return self.builder.zext(v, i64)
+                return v
+            if func_name == "nice" and len(node.args) == 1:
+                inc = _arg_i64(self._emit_expr_value(node.args[0]))
+                return self.builder.call(self.runtime["os_nice"], [inc])
+            if func_name == "getpriority" and len(node.args) == 2:
+                which = _arg_i64(self._emit_expr_value(node.args[0]))
+                who = _arg_i64(self._emit_expr_value(node.args[1]))
+                return self.builder.call(self.runtime["os_getpriority"], [which, who])
+            if func_name == "setpriority" and len(node.args) == 3:
+                which = _arg_i64(self._emit_expr_value(node.args[0]))
+                who = _arg_i64(self._emit_expr_value(node.args[1]))
+                prio = _arg_i64(self._emit_expr_value(node.args[2]))
+                return self.builder.call(self.runtime["os_setpriority"], [which, who, prio])
+            # Fall through for unsupported arities.
         elif func_name == "pipe" and len(node.args) == 0:
             # os.pipe() -> FpyList* [read_fd, write_fd] (as i8_ptr). On SlateOS a
             # real SYS_PIPE_CREATE syscall via posix pipe(). Inference tags this
@@ -38241,6 +38303,7 @@ class CodeGen:
         "os.getppid": "int", "os.gettid": "int",
         "os.getuid": "int", "os.getgid": "int",
         "os.setuid": "int", "os.setgid": "int",
+        "os.nice": "int", "os.getpriority": "int", "os.setpriority": "int",
         "os.pipe": "list:int", "os.read": "str",
         "os.write": "int", "os.close": "int", "os.dup": "int",
         "os.dup2": "int",

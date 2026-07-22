@@ -8289,6 +8289,7 @@ void fastpy_json_loads(const char *json_str, int32_t *out_tag, int64_t *out_data
 #include <dirent.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
+#include <sys/resource.h>
 #include <fcntl.h>
 #endif
 
@@ -8392,6 +8393,53 @@ int64_t fastpy_os_setgid(int64_t gid) {
     return (int64_t)0;
 #else
     return (int64_t)setgid((gid_t)gid);
+#endif
+}
+
+/* os.nice(inc) -> the new nice value. On SlateOS posix nice() reads the
+ * process's current kernel nice (SYS_PROCESS_GET_NICE), adds the increment,
+ * and — after the userspace CAP_SYS_NICE check for a priority-raise — installs
+ * it via SYS_PROCESS_SET_NICE, which ALSO maps nice to a scheduler priority
+ * level and re-prioritises the process's tasks. Nice is thus a real scheduling
+ * attribute (previously the value was stored in a userspace static that did
+ * not affect scheduling). A distinct kernel path (the scheduler's per-task
+ * priority) from every filesystem/credential syscall. nice() is declared by
+ * musl's <unistd.h> and resolves at link time to the SlateOS posix crate's
+ * extern "C" symbol. Windows has no nice(); host builds don't run on SlateOS,
+ * so 0 is a fine placeholder. */
+int64_t fastpy_os_nice(int64_t inc) {
+#ifdef _WIN32
+    (void)inc;
+    return (int64_t)0;
+#else
+    return (int64_t)nice((int)inc);
+#endif
+}
+
+/* os.getpriority(which, who) -> the target's nice value. On SlateOS posix
+ * getpriority() reads the caller's real kernel nice via SYS_PROCESS_GET_NICE.
+ * getpriority() is declared by musl's <sys/resource.h>. Windows host builds
+ * don't run on SlateOS, so 0 (the default nice) is a fine placeholder. */
+int64_t fastpy_os_getpriority(int64_t which, int64_t who) {
+#ifdef _WIN32
+    (void)which; (void)who;
+    return (int64_t)0;
+#else
+    return (int64_t)getpriority((int)which, (id_t)who);
+#endif
+}
+
+/* os.setpriority(which, who, prio) -> status (0 ok, -1 error). On SlateOS
+ * posix setpriority() installs the nice value via SYS_PROCESS_SET_NICE (which
+ * re-prioritises the process's tasks) after the userspace CAP_SYS_NICE check.
+ * setpriority() is declared by musl's <sys/resource.h>. Windows host builds
+ * don't run on SlateOS, so report success (0). */
+int64_t fastpy_os_setpriority(int64_t which, int64_t who, int64_t prio) {
+#ifdef _WIN32
+    (void)which; (void)who; (void)prio;
+    return (int64_t)0;
+#else
+    return (int64_t)setpriority((int)which, (id_t)who, (int)prio);
 #endif
 }
 
