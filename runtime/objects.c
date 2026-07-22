@@ -8367,6 +8367,34 @@ int64_t fastpy_os_getgid(void) {
 #endif
 }
 
+/* os.setuid(uid)/os.setgid(gid) -> status (0 ok, -1 on EPERM). On SlateOS
+ * posix setuid()/setgid() perform the userspace CAP_SETUID/CAP_SETGID +
+ * identity check and, if allowed, issue the real SYS_PROCESS_SET_CREDENTIALS
+ * syscall that *mutates* the process's kernel credentials (previously these
+ * silently succeeded without changing anything). A distinct kernel path (the
+ * process-credentials table) from the read-only getuid/getgid. setuid()/
+ * setgid() are declared by musl's <unistd.h> and resolve at link time to the
+ * SlateOS posix crate's extern "C" symbols. CPython os.setuid returns None;
+ * like os.remove/chmod, fastpy models the outcome as an int status. Windows
+ * host builds don't run on SlateOS, so report success (0) there. */
+int64_t fastpy_os_setuid(int64_t uid) {
+#ifdef _WIN32
+    (void)uid;
+    return (int64_t)0;
+#else
+    return (int64_t)setuid((uid_t)uid);
+#endif
+}
+
+int64_t fastpy_os_setgid(int64_t gid) {
+#ifdef _WIN32
+    (void)gid;
+    return (int64_t)0;
+#else
+    return (int64_t)setgid((gid_t)gid);
+#endif
+}
+
 /* os.pipe() -> (read_fd, write_fd). On SlateOS posix pipe() issues the real
  * SYS_PIPE_CREATE syscall — a genuinely distinct kernel path (the pipe
  * subsystem) not touched by any file/process syscall. Python's os.pipe()

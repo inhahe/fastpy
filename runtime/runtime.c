@@ -1872,6 +1872,8 @@ extern int64_t fastpy_os_getppid(void);
 extern int64_t fastpy_os_gettid(void);
 extern int64_t fastpy_os_getuid(void);
 extern int64_t fastpy_os_getgid(void);
+extern int64_t fastpy_os_setuid(int64_t uid);
+extern int64_t fastpy_os_setgid(int64_t gid);
 extern FpyList* fastpy_os_pipe(void);
 extern int64_t fastpy_os_write(int64_t fd, const char *data);
 extern const char* fastpy_os_read(int64_t fd, int64_t n);

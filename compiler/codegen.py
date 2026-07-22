@@ -2613,6 +2613,16 @@ class CodeGen:
         # distinct kernel path from the pid/tid identity syscalls).
         self.runtime["os_getuid"] = ir.Function(self.module, ft, name="fastpy_os_getuid")
         self.runtime["os_getgid"] = ir.Function(self.module, ft, name="fastpy_os_getgid")
+        # os.setuid(uid)/os.setgid(gid) -> int status (0 ok, -1 EPERM).  On
+        # SlateOS these call posix setuid()/setgid(), which — after the
+        # userspace CAP_SETUID/CAP_SETGID + identity check — issue the real
+        # SYS_PROCESS_SET_CREDENTIALS syscall that *mutates* the process's
+        # kernel credentials (previously a silent no-op).  A distinct kernel
+        # path (the process-credentials table) from the read-only getuid/getgid.
+        # CPython returns None; like os.remove/chmod we model the status as int.
+        ft = ir.FunctionType(i64, [i64])
+        self.runtime["os_setuid"] = ir.Function(self.module, ft, name="fastpy_os_setuid")
+        self.runtime["os_setgid"] = ir.Function(self.module, ft, name="fastpy_os_setgid")
         # os.pipe() -> 2-element list [read_fd, write_fd] (FpyList* as i8_ptr).
         # On SlateOS posix pipe() is a real SYS_PIPE_CREATE syscall — a distinct
         # kernel path (the pipe subsystem) from file/process syscalls.
@@ -19139,7 +19149,7 @@ class CodeGen:
                 elif fn in ("remove", "unlink", "mkdir", "rmdir", "rename",
                            "getsize", "path_getsize", "symlink", "link",
                            "chmod", "truncate", "utime", "chown",
-                           "getuid", "getgid"):
+                           "getuid", "getgid", "setuid", "setgid"):
                     return ValueType(VKind.INT)
                 elif fn in ("readlink",):
                     return ValueType(VKind.STR)
@@ -19212,6 +19222,8 @@ class CodeGen:
             elif mod == "os" and fn in ("getcwd", "readlink"):
                 return ValueType(VKind.STR)
             elif mod == "os" and fn in ("getpid", "getppid", "gettid", "getuid", "getgid"):
+                return ValueType(VKind.INT)
+            elif mod == "os" and fn in ("setuid", "setgid"):
                 return ValueType(VKind.INT)
             elif mod == "os" and fn in ("write", "close", "dup", "dup2", "lseek", "open", "ftruncate", "pwrite"):
                 return ValueType(VKind.INT)
@@ -37470,6 +37482,27 @@ class CodeGen:
             # os.getgid() -> bare i64 real gid (on SlateOS a real
             # SYS_PROCESS_GET_CREDENTIALS syscall via posix getgid()).
             return self.builder.call(self.runtime["os_getgid"], [])
+        elif func_name in ("setuid", "setgid") and len(node.args) == 1:
+            # os.setuid(uid)/os.setgid(gid) -> bare i64 status (0 ok, -1 EPERM).
+            # On SlateOS posix setuid()/setgid() run the userspace
+            # CAP_SETUID/CAP_SETGID + identity check and, if allowed, issue the
+            # real SYS_PROCESS_SET_CREDENTIALS syscall that mutates the kernel
+            # process credentials — a distinct kernel path (the
+            # process-credentials table) from the read-only getuid/getgid.
+            def _id_i64(v):
+                if (isinstance(v.type, ir.LiteralStructType)
+                        and v.type == fpy_val):
+                    return self.builder.extract_value(v, 1)
+                if isinstance(v.type, ir.PointerType):
+                    return self.builder.ptrtoint(v, i64)
+                if isinstance(v.type, ir.DoubleType):
+                    return self.builder.fptosi(v, i64)
+                if isinstance(v.type, ir.IntType) and v.type.width != 64:
+                    return self.builder.zext(v, i64)
+                return v
+            idv = _id_i64(self._emit_expr_value(node.args[0]))
+            rt_name = "os_setuid" if func_name == "setuid" else "os_setgid"
+            return self.builder.call(self.runtime[rt_name], [idv])
         elif func_name == "pipe" and len(node.args) == 0:
             # os.pipe() -> FpyList* [read_fd, write_fd] (as i8_ptr). On SlateOS a
             # real SYS_PIPE_CREATE syscall via posix pipe(). Inference tags this
@@ -38207,6 +38240,7 @@ class CodeGen:
         "os.getcwd": "str", "os.getenv": "pyobj", "os.getpid": "int",
         "os.getppid": "int", "os.gettid": "int",
         "os.getuid": "int", "os.getgid": "int",
+        "os.setuid": "int", "os.setgid": "int",
         "os.pipe": "list:int", "os.read": "str",
         "os.write": "int", "os.close": "int", "os.dup": "int",
         "os.dup2": "int",
