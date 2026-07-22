@@ -8312,6 +8312,18 @@ int64_t fastpy_os_getpid(void) {
 #endif
 }
 
+/* os.getppid() -> the parent process's PID. On SlateOS posix getppid() is a
+ * real SYS_PROCESS_PARENT_ID syscall (a kernel-spawned orphan is reparented to
+ * init, so it returns 1). Windows has no getppid(); host builds of fastpy
+ * tools don't run on SlateOS, so a fixed 1 placeholder is fine there. */
+int64_t fastpy_os_getppid(void) {
+#ifdef _WIN32
+    return (int64_t)1;
+#else
+    return (int64_t)getppid();
+#endif
+}
+
 int64_t fastpy_os_path_exists(const char *path) {
 #ifdef _WIN32
     DWORD attrs = GetFileAttributesA(path);
