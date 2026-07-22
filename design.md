@@ -78,22 +78,68 @@ the CPython bridge for SlateOS later as a superset once CPython is ported.
   drives **`rust-lld`** (GNU/ELF flavor, static, non-PIE, `--no-dynamic-linker`)
   via `_link_slateos`, the same LLVM linker the OS repo uses for its userspace.
   `_find_rust_lld()` locates it in the active Rust sysroot (or `$FASTPY_RUST_LLD`
-  / PATH). Verified end-to-end on a self-contained object → SlateOS **ET_EXEC**
-  ELF (`tests/test_cross_target.py`). Full program linking (fastpy objects +
-  runtime objects + sysroot `libc.a`) awaits the runtime port below; the
-  function already accepts a `sysroot_lib_dir`/`libs` for that.
-- [ ] **Cross-compile the C runtime** (`runtime/*.c`) to `x86_64-slateos`
-  (pure-mode: no `cpython_bridge.c`, no `libpython`). The runtime already has a
-  working POSIX code path (it builds via `cc`/`gcc`/`clang` on Linux/macOS today
-  with `#ifdef _WIN32` separation), so this is a small port, **not** a rewrite.
-  **Gated on tooling** (operator decision): needs a C compiler that emits
-  `x86_64-unknown-linux-musl` ELF (e.g. `clang --target=…`) plus musl/SlateOS C
-  headers. The dev host has neither — no `clang` on PATH, and the OS sysroot
-  (`toolchain/sysroot/lib`) ships only Rust-built `.a` archives, no C headers.
-  Installing a clang cross-toolchain is heavyweight/system-wide → see
-  `open-questions.md` in the OS repo.
-- [ ] **First real component** — compile an actual OS component (candidate: the
-  package manager) as the first fastpy-built SlateOS binary.
+  / PATH).
+- [x] **Cross-compile the C runtime** (`runtime/*.c`) to `x86_64-slateos`
+  (pure-mode: no `cpython_bridge.c`, no `libpython`). Done via **`zig cc
+  --target=x86_64-linux-musl`** — a self-contained clang + bundled musl headers
+  + musl libc in one portable download, so no system-wide toolchain and no
+  separately vendored musl sysroot is needed (operator approved option A, Q30).
+  `_find_zig_cc()` locates it (`$FASTPY_ZIG` / PATH / `D:\utils\zig-*`).
+  `ensure_slateos_runtime_built()` compiles the six pure-mode TUs — `runtime`,
+  `objects`, `threading`, `gc`, `bigint`, **`bridge_stub`** — into
+  `runtime/slateos/*.o` with flags mirroring the codegen ABI (`-mcmodel=large`,
+  `-fno-pic -fno-pie`, `-DFPY_PURE_MODE`). Pure-mode specifics:
+  - **`bridge_stub.c`** substitutes for `cpython_bridge.c`: refcount hooks are
+    no-ops (no bridge objects can exist) and operational entry points raise a
+    catchable `RuntimeError`.
+  - **`-DFPY_PURE_MODE`** compiles out the JIT symbol table in `runtime.c`
+    (which would otherwise force-reference bridge functions pure mode omits).
+  The port also fixed latent MSVC-isms in `objects.c`/`objects.h`/`threading.h`
+  that MSVC accepted implicitly but Clang rejects (forward decls, `<assert.h>`,
+  a `const`-discard cast) — all verified still safe for the host MSVC build.
+- [x] **Full program link + crt startup** — `link_executable(target=SLATEOS_TARGET)`
+  builds the runtime on demand, resolves the OS repo's static `libc.a`
+  (`_find_slateos_sysroot_lib()`: `$FASTPY_SLATEOS_SYSROOT` or the sibling
+  `../os/toolchain/sysroot/lib`), and links program object + runtime objects +
+  `-lc` via `_link_slateos`. The link entry is **`_start`** (the real ELF
+  entry), so rust-lld pulls the crt0 out of `libc.a` — the OS `posix` crate
+  (built for `x86_64-unknown-none`, so its `#[cfg(target_os = "none")]` crt is
+  present) provides `_start` → `__libc_start_main` (retrieves argv/envp from the
+  kernel via syscall, inits environ/signals, runs ELF constructors) → calls
+  `main` (runtime.c's `main`, which runs `fastpy_main`) → `exit(ret)`. A real
+  fastpy program (lists/iteration/print) links to a ~2.9 MB SlateOS **ET_EXEC**
+  ELF with a nonzero `_start` entry and zero undefined symbols (a static non-PIE
+  link fails otherwise). Covered by `tests/test_cross_target.py` (skips cleanly
+  without zig / rust-lld / sysroot). Note the fastpy program is emitted for the
+  `x86_64-unknown-linux-musl` triple while the crt/libc is `x86_64-unknown-none`
+  — ABI-identical at the object level (plain x86-64 SysV, static, large model).
+- [x] **First real component — on-target execution confirmed** (2026-07-21). A
+  fastpy-built SlateOS binary (`services/fastpy-hello` in the OS repo, a real
+  fastpy program with lists/iteration) now **boots under the SlateOS kernel and
+  runs to `exit(0)` at ring 3** — the kernel self-test
+  `self_test_fastpy_slateos_tls` spawns it via the native ABI and asserts the
+  process reaches `Zombie` with exit 0 (serial: *"fastpy-on-SlateOS TLS … set up
+  main-thread ELF TLS via SYS_SET_FS_BASE and ran to exit(0): OK"*). The crt
+  startup + native syscalls behave on-target; the pipeline is now validated
+  end-to-end, not just at link time.
+  - **Q31 resolved — Option A** (operator's call; open-questions.md → OS
+    design-decisions.md §82): the `PT_TLS` problem (the C runtime's
+    `FPY_THREAD_LOCAL __thread` locals lower to `%fs:offset`, and a native static
+    binary starts with `fs_base = 0`) is fixed **in the posix crt**. On startup
+    `setup_main_thread_tls()` (`posix/src/crt.rs`, `#[cfg(target_os="none")]`)
+    finds `PT_TLS` via the linker-defined `__ehdr_start` (no aux vector needed
+    for a static non-PIE), mmaps a variant-II TLS block + TCB, copies the
+    `.tdata` init image, writes the `%fs:0` self-pointer, and installs the thread
+    pointer via the native `SYS_SET_FS_BASE` syscall — all before the first
+    `__thread` access or stack-protector check runs.
+  - Latent OS bug found + fixed en route: posix's native `SYS_MMAP`/`SYS_MUNMAP`/
+    `SYS_MPROTECT` numbers (30/31/32) collided with the kernel's IRQ syscalls, so
+    the crt's TLS mmap came back `PermissionDenied`; corrected to the kernel's
+    native numbers (20/21/22). This is an OS-side fix, not a fastpy toolchain
+    change — the toolchain remains complete and green.
+  - Next: pick a genuinely useful component (candidate: the package manager) as
+    the first *shipping* fastpy SlateOS binary now that the runtime path is
+    proven.
 - [ ] **CPython bridge on SlateOS (B)** — later, once CPython is ported, so
   unsupported-stdlib programs also run on-target.
 
