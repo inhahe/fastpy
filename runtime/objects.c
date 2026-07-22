@@ -8668,6 +8668,28 @@ int64_t fastpy_os_path_samefile(const char *a, const char *b) {
     return (sa.st_dev == sb.st_dev && sa.st_ino == sb.st_ino) ? 1 : 0;
 }
 
+/* os.path.islink(path) -> 1 if path is a symbolic link (True), 0 otherwise.
+ * Mirrors CPython os.path.islink, which lstat()s the path (crucially NOT
+ * following the final symlink) and tests S_ISLNK on st_mode.  This is the
+ * first fastpy lowering to use *lstat* (no-follow) semantics — distinct from
+ * exists/isfile/isdir, which all follow symlinks via stat().  Because it does
+ * not follow the link, a symlink returns True even when its target is missing
+ * (the link entry itself exists), while a regular file — or the target a
+ * symlink resolves to — returns False.  CPython returns False on any OSError;
+ * the AOT-simplified form returns 0 on any lstat error. */
+int64_t fastpy_os_path_islink(const char *path) {
+    if (path == NULL) return 0;
+#ifdef _WIN32
+    /* Windows _stat cannot distinguish reparse points; the host self-test does
+     * not exercise this branch, so report non-link. */
+    return 0;
+#else
+    struct stat st;
+    if (lstat(path, &st) != 0) return 0;
+    return S_ISLNK(st.st_mode) ? 1 : 0;
+#endif
+}
+
 const char* fastpy_os_path_join(const char *a, const char *b) {
     int alen = (int)strlen(a), blen = (int)strlen(b);
     char *buf = (char*)malloc(alen + blen + 2);
