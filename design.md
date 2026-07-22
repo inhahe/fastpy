@@ -201,6 +201,38 @@ the CPython bridge for SlateOS later as a superset once CPython is ported.
   returns `str`, binary `'rb'`/`bytes` not yet wired); `read(n)` size arg not yet
   supported (`read()` reads all); `FileNotFoundError` is raised by name but not
   yet registered in the OSError hierarchy.
+- [x] **Native `os.*` syscall surface (pure-mode, bridge-free)** — a growing set
+  of `os` functions lower directly to native runtime C calls (`fastpy_os_*` in
+  `runtime/objects.c`, declared `extern` in `runtime.c`) that call the SlateOS
+  posix libc, which dispatches to the kernel `SYS_*` syscalls — no CPython
+  bridge (only the `fpy_cpython_import_native` sentinel from `import os`). Each
+  lowering has **five sites** in `compiler/codegen.py`: (1) runtime `ir.Function`
+  registration (`self.runtime["os_X"]`), (2) return-type inference in the
+  `mod == "os"` chain, (3) an emit handler in `_emit_os_call` (raw-fd args are
+  coerced to i64 via the inline `_fd_i64` helper; string args via
+  `_ensure_ptr`), (4) an entry in the `_CSA_MODULE_FUNC_RETURNS` map, plus (5)
+  the C impl + extern. Surface so far:
+  - **process/identity:** `getpid`, `getppid`, `gettid`, `getcwd`, `getenv`.
+  - **raw-fd I/O:** `open(path, flags[, mode])` → raw file fd (SYS_FS_OPEN; the
+    raw-fd counterpart to the high-level builtin `open()`), `read(fd, n)` → str,
+    `write(fd, data)` → int, `close(fd)` (posix dispatches by fd kind:
+    SYS_PIPE_* for pipe ends, SYS_FS_* for files), `dup(fd)` (shares the kernel
+    handle — a pipe dup aliases the same buffer), `lseek(fd, off, whence)`
+    (SYS_FS_SEEK), `ftruncate(fd, len)` (SYS_FS_FTRUNCATE — distinct from the
+    path-based `truncate()`/SYS_FS_TRUNCATE), `pwrite`/`pread(fd, …, offset)`
+    (positioned I/O that leaves the fd offset untouched).
+  - **pipes:** `pipe()` → `[r, w]` (SYS_PIPE_CREATE). NOTE: this exercise
+    uncovered and fixed a systemic kernel ABI bug — the native SYSCALL exit
+    path dropped `SyscallResult::value2` (the RDX second return), so *every*
+    two-value syscall (SYS_PIPE_CREATE, SYS_CHANNEL_CREATE, dma_alloc, …) lost
+    its second value in userspace until fixed.
+  - **path helpers:** `path.exists`/`isfile`/`isdir`/`join`/`dirname`/…,
+    `listdir`, `remove`/`unlink`/`mkdir`/`rmdir`/`rename`/`truncate`/…
+  Each new raw-fd syscall ships with a **false-pass-proof ring-3 kernel
+  self-test** in the OS repo (`services/fastpy-<name>/` tool +
+  `self_test_fastpy_slateos_<name>` in `kernel/src/proc/spawn.rs`): the tool
+  round-trips data through the kernel path and writes the result to a file the
+  harness asserts byte-for-byte, so a stub/mis-lowering cannot fake a pass.
 - [ ] **CPython bridge on SlateOS (B)** — later, once CPython is ported, so
   unsupported-stdlib programs also run on-target.
 
