@@ -8287,6 +8287,7 @@ void fastpy_json_loads(const char *json_str, int32_t *out_tag, int64_t *out_data
 #include <unistd.h>
 #include <dirent.h>
 #include <sys/stat.h>
+#include <fcntl.h>
 #endif
 
 const char* fastpy_os_getcwd(void) {
@@ -8506,6 +8507,24 @@ int64_t fastpy_os_truncate(const char *path, int64_t length) {
     return -1;
 #else
     return (int64_t)(truncate(path, (off_t)length) == 0 ? 0 : -1);
+#endif
+}
+
+/* os.utime(path, atime_ns, mtime_ns) -> int status (0 ok, -1 error).  AOT-
+ * simplified 3-positional form of os.utime: both times are nanoseconds since
+ * the Unix epoch (bare i64), applied via utimensat().  A time of 0 still sets
+ * the field to epoch (not "unchanged") — callers pass concrete stamps. */
+int64_t fastpy_os_utime(const char *path, int64_t atime_ns, int64_t mtime_ns) {
+#ifdef _WIN32
+    (void)path; (void)atime_ns; (void)mtime_ns;
+    return -1;
+#else
+    struct timespec times[2];
+    times[0].tv_sec = (time_t)(atime_ns / 1000000000);
+    times[0].tv_nsec = (long)(atime_ns % 1000000000);
+    times[1].tv_sec = (time_t)(mtime_ns / 1000000000);
+    times[1].tv_nsec = (long)(mtime_ns % 1000000000);
+    return (int64_t)(utimensat(AT_FDCWD, path, times, 0) == 0 ? 0 : -1);
 #endif
 }
 
