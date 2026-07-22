@@ -1869,6 +1869,7 @@ extern const char* fastpy_os_path_dirname(const char *path);
 extern const char* fastpy_os_getcwd(void);
 extern int64_t fastpy_os_getpid(void);
 extern int64_t fastpy_os_getppid(void);
+extern int64_t fastpy_os_gettid(void);
 extern FpyList* fastpy_os_listdir(const char *path);
 extern int64_t fastpy_os_remove(const char *path);
 extern int64_t fastpy_os_mkdir(const char *path);

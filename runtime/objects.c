@@ -8324,6 +8324,24 @@ int64_t fastpy_os_getppid(void) {
 #endif
 }
 
+/* os.gettid() -> the calling thread's kernel task ID. On SlateOS posix
+ * gettid() is a real SYS_TASK_ID syscall — the scheduler's task table, a
+ * distinct kernel path from the process table hit by getpid()/getppid(). musl's
+ * headers only declare gettid() under _GNU_SOURCE, and at link time the symbol
+ * resolves to the SlateOS posix crate's extern "C" gettid (PidT == i32), so we
+ * forward-declare it ourselves rather than depend on a feature-test macro.
+ * Windows host builds don't run on SlateOS, so a fixed 1 placeholder is fine. */
+#ifndef _WIN32
+extern int gettid(void);
+#endif
+int64_t fastpy_os_gettid(void) {
+#ifdef _WIN32
+    return (int64_t)1;
+#else
+    return (int64_t)gettid();
+#endif
+}
+
 int64_t fastpy_os_path_exists(const char *path) {
 #ifdef _WIN32
     DWORD attrs = GetFileAttributesA(path);
