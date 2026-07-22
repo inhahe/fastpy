@@ -2621,6 +2621,12 @@ class CodeGen:
         # os.path.getsize(path) -> file size in bytes (i64; -1 on error)
         ft = ir.FunctionType(i64, [i8_ptr])
         self.runtime["os_path_getsize"] = ir.Function(self.module, ft, name="fastpy_os_path_getsize")
+        # os.symlink(target, linkpath) -> int status (0 ok, -1 error)
+        ft = ir.FunctionType(i64, [i8_ptr, i8_ptr])
+        self.runtime["os_symlink"] = ir.Function(self.module, ft, name="fastpy_os_symlink")
+        # os.readlink(path) -> str (the link target); empty string on error
+        ft = ir.FunctionType(i8_ptr, [i8_ptr])
+        self.runtime["os_readlink"] = ir.Function(self.module, ft, name="fastpy_os_readlink")
         # Vtable dispatch
         ft = ir.FunctionType(void, [i32, i32, i8_ptr])
         self.runtime["set_vtable_entry"] = ir.Function(self.module, ft, name="fastpy_set_vtable_entry")
@@ -19009,8 +19015,10 @@ class CodeGen:
                 elif fn in ("listdir",):
                     return ValueType(VKind.LIST, elem_type=ValueType(VKind.STR))
                 elif fn in ("remove", "unlink", "mkdir", "rmdir", "rename",
-                           "getsize", "path_getsize"):
+                           "getsize", "path_getsize", "symlink"):
                     return ValueType(VKind.INT)
+                elif fn in ("readlink",):
+                    return ValueType(VKind.STR)
                 elif fn in ("exists", "isfile", "isdir",
                            "path_exists", "path_isfile", "path_isdir"):
                     return ValueType(VKind.BOOL)
@@ -19071,11 +19079,11 @@ class CodeGen:
                                            "b32encode", "b32decode",
                                            "b16encode", "b16decode"):
                 return ValueType(VKind.BYTES)
-            elif mod == "os" and fn in ("getcwd",):
+            elif mod == "os" and fn in ("getcwd", "readlink"):
                 return ValueType(VKind.STR)
             elif mod == "os" and fn == "listdir":
                 return ValueType(VKind.LIST, elem_type=ValueType(VKind.STR))
-            elif mod == "os" and fn in ("remove", "unlink", "mkdir", "rmdir", "rename"):
+            elif mod == "os" and fn in ("remove", "unlink", "mkdir", "rmdir", "rename", "symlink"):
                 return ValueType(VKind.INT)
             elif mod in ("os", "os.path") and fn in ("getsize", "path_getsize"):
                 return ValueType(VKind.INT)
@@ -37293,6 +37301,16 @@ class CodeGen:
             src = self._ensure_ptr(self._emit_expr_value(node.args[0]))
             dst = self._ensure_ptr(self._emit_expr_value(node.args[1]))
             return self.builder.call(self.runtime["os_rename"], [src, dst])
+        elif func_name == "symlink" and len(node.args) == 2:
+            # os.symlink(target, linkpath) -> bare i64 status (0 ok, -1 error).
+            target = self._ensure_ptr(self._emit_expr_value(node.args[0]))
+            linkpath = self._ensure_ptr(self._emit_expr_value(node.args[1]))
+            return self.builder.call(self.runtime["os_symlink"], [target, linkpath])
+        elif func_name == "readlink" and len(node.args) == 1:
+            # os.readlink(path) -> str (the link's target); returns a valid
+            # FpyString pointer (empty string on error).
+            v = self._ensure_ptr(self._emit_expr_value(node.args[0]))
+            return self.builder.call(self.runtime["os_readlink"], [v])
         elif func_name == "getenv" and len(node.args) == 1:
             v = self._emit_expr_value(node.args[0])
             v = self._ensure_ptr(v)

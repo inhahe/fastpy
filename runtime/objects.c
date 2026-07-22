@@ -8458,6 +8458,39 @@ int64_t fastpy_os_rename(const char *src, const char *dst) {
     return (int64_t)(rename(src, dst) == 0 ? 0 : -1);
 }
 
+/* os.symlink(target, linkpath) -> 0 ok / -1 error.  Note the CPython argument
+ * order: symlink(src, dst) creates dst as a link *pointing at* src.  On
+ * SlateOS the posix libc symlink() maps to SYS_FS_SYMLINK (Rights::CREATE).
+ * Windows has no POSIX symlink()/readlink(), so those builds return -1. */
+int64_t fastpy_os_symlink(const char *target, const char *linkpath) {
+#ifdef _WIN32
+    (void)target; (void)linkpath;
+    return -1;
+#else
+    return (int64_t)(symlink(target, linkpath) == 0 ? 0 : -1);
+#endif
+}
+
+/* os.readlink(path) -> str (the link's target).  Returns a valid FpyString
+ * `.data` pointer (FPY_TAG_STR); an empty string signals an error, mirroring
+ * how callers already branch on os.getcwd/os.path.* string results.  POSIX
+ * readlink() does NOT null-terminate and returns the byte count, so we bound
+ * the copy by its return value and let fpy_str_alloc add the terminator. */
+const char* fastpy_os_readlink(const char *path) {
+#ifdef _WIN32
+    (void)path;
+    FpyString *empty = fpy_str_alloc(0);
+    return empty->data;
+#else
+    char buf[4096];
+    ssize_t n = readlink(path, buf, sizeof(buf));
+    if (n < 0) n = 0;
+    FpyString *s = fpy_str_alloc((int64_t)n);
+    if (n > 0) memcpy(s->data, buf, (size_t)n);
+    return s->data;
+#endif
+}
+
 /* ============================================================
  * Native collections module
  * ============================================================ */
