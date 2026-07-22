@@ -2624,6 +2624,12 @@ class CodeGen:
         # os.dup(fd) -> new int fd aliasing the same kernel object (-1 error).
         ft = ir.FunctionType(i64, [i64])
         self.runtime["os_dup"] = ir.Function(self.module, ft, name="fastpy_os_dup")
+        # os.lseek(fd, offset, whence) -> new int file offset (-1 error).
+        ft = ir.FunctionType(i64, [i64, i64, i64])
+        self.runtime["os_lseek"] = ir.Function(self.module, ft, name="fastpy_os_lseek")
+        # os.open(path, flags, mode) -> new raw int file fd (-1 error).
+        ft = ir.FunctionType(i64, [i8_ptr, i64, i64])
+        self.runtime["os_open"] = ir.Function(self.module, ft, name="fastpy_os_open")
         ft = ir.FunctionType(i64, [i8_ptr])
         self.runtime["os_path_exists"] = ir.Function(self.module, ft, name="fastpy_os_path_exists")
         self.runtime["os_path_isfile"] = ir.Function(self.module, ft, name="fastpy_os_path_isfile")
@@ -19129,7 +19135,7 @@ class CodeGen:
                 return ValueType(VKind.STR)
             elif mod == "os" and fn in ("getpid", "getppid", "gettid"):
                 return ValueType(VKind.INT)
-            elif mod == "os" and fn in ("write", "close", "dup"):
+            elif mod == "os" and fn in ("write", "close", "dup", "lseek", "open"):
                 return ValueType(VKind.INT)
             elif mod == "os" and fn == "read":
                 return ValueType(VKind.STR)
@@ -37417,6 +37423,50 @@ class CodeGen:
                 return v
             fd = _fd_i64(self._emit_expr_value(node.args[0]))
             return self.builder.call(self.runtime["os_dup"], [fd])
+        elif func_name == "lseek" and len(node.args) == 3:
+            # os.lseek(fd, offset, whence) -> bare i64 new file offset. On
+            # SlateOS posix lseek() repositions a regular file fd's kernel
+            # offset via SYS_FS_SEEK — a distinct kernel path from read/write.
+            def _fd_i64(v):
+                if (isinstance(v.type, ir.LiteralStructType)
+                        and v.type == fpy_val):
+                    return self.builder.extract_value(v, 1)
+                if isinstance(v.type, ir.PointerType):
+                    return self.builder.ptrtoint(v, i64)
+                if isinstance(v.type, ir.DoubleType):
+                    return self.builder.fptosi(v, i64)
+                if isinstance(v.type, ir.IntType) and v.type.width != 64:
+                    return self.builder.zext(v, i64)
+                return v
+            fd = _fd_i64(self._emit_expr_value(node.args[0]))
+            offset = _fd_i64(self._emit_expr_value(node.args[1]))
+            whence = _fd_i64(self._emit_expr_value(node.args[2]))
+            return self.builder.call(self.runtime["os_lseek"], [fd, offset, whence])
+        elif func_name == "open" and len(node.args) in (2, 3):
+            # os.open(path, flags[, mode]) -> bare i64 raw file fd. On SlateOS
+            # posix open() -> SYS_FS_OPEN yields a raw fd that native
+            # os.read/os.write/os.lseek/os.close drive — the raw-fd counterpart
+            # to the high-level builtin open(). `flags`/`mode` are POSIX bits.
+            def _fd_i64(v):
+                if (isinstance(v.type, ir.LiteralStructType)
+                        and v.type == fpy_val):
+                    return self.builder.extract_value(v, 1)
+                if isinstance(v.type, ir.PointerType):
+                    return self.builder.ptrtoint(v, i64)
+                if isinstance(v.type, ir.DoubleType):
+                    return self.builder.fptosi(v, i64)
+                if isinstance(v.type, ir.IntType) and v.type.width != 64:
+                    return self.builder.zext(v, i64)
+                return v
+            path = self._ensure_ptr(self._emit_expr_value(node.args[0]))
+            flags = _fd_i64(self._emit_expr_value(node.args[1]))
+            if len(node.args) == 3:
+                mode = _fd_i64(self._emit_expr_value(node.args[2]))
+            else:
+                # POSIX default creation mode 0o777 (masked by umask); only
+                # consulted when O_CREAT is set.
+                mode = ir.Constant(i64, 0o777)
+            return self.builder.call(self.runtime["os_open"], [path, flags, mode])
         elif func_name == "listdir" and len(node.args) == 1:
             v = self._emit_expr_value(node.args[0])
             v = self._ensure_ptr(v)
@@ -37923,6 +37973,7 @@ class CodeGen:
         "os.getppid": "int", "os.gettid": "int",
         "os.pipe": "list:int", "os.read": "str",
         "os.write": "int", "os.close": "int", "os.dup": "int",
+        "os.lseek": "int", "os.open": "int",
         "os.path.join": "str", "os.path.dirname": "str",
         "os.path.basename": "str", "os.path.abspath": "str",
         "os.path.realpath": "str", "os.path.expanduser": "str",

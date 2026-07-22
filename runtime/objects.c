@@ -8421,6 +8421,36 @@ int64_t fastpy_os_dup(int64_t fd) {
 #endif
 }
 
+/* os.lseek(fd, offset, whence) -> the new absolute file offset (or -1 on
+ * error). `whence` is SEEK_SET (0), SEEK_CUR (1) or SEEK_END (2). On SlateOS
+ * posix lseek() repositions a regular file fd's kernel offset via SYS_FS_SEEK
+ * — a genuinely distinct kernel path from read/write. Not meaningful for a
+ * pipe (which is not seekable); intended for regular file fds. */
+int64_t fastpy_os_lseek(int64_t fd, int64_t offset, int64_t whence) {
+#ifdef _WIN32
+    return (int64_t)_lseeki64((int)fd, (long long)offset, (int)whence);
+#else
+    return (int64_t)lseek((int)fd, (off_t)offset, (int)whence);
+#endif
+}
+
+/* os.open(path, flags, mode) -> a new raw integer fd for a regular file (or -1
+ * on error). `flags` are the standard POSIX open() bits (O_RDONLY=0,
+ * O_WRONLY=1, O_RDWR=2, O_CREAT=0100, O_TRUNC=01000, ...) and `mode` the
+ * creation permission bits (e.g. 0644). On SlateOS this is posix open() ->
+ * SYS_FS_OPEN, yielding a raw file fd that native os.read/os.write/os.lseek/
+ * os.close then drive — the raw-fd counterpart to the high-level open() every
+ * other fastpy tool uses. (On the Windows host build the flag/mode bit values
+ * differ; this helper targets the SlateOS/posix ABI.) */
+int64_t fastpy_os_open(const char *path, int64_t flags, int64_t mode) {
+    if (!path) return -1;
+#ifdef _WIN32
+    return (int64_t)_open(path, (int)flags, (int)mode);
+#else
+    return (int64_t)open(path, (int)flags, (mode_t)mode);
+#endif
+}
+
 int64_t fastpy_os_path_exists(const char *path) {
 #ifdef _WIN32
     DWORD attrs = GetFileAttributesA(path);
