@@ -8281,6 +8281,7 @@ void fastpy_json_loads(const char *json_str, int32_t *out_tag, int64_t *out_data
 #ifdef _WIN32
 #include <direct.h>
 #include <io.h>
+#include <process.h>
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #else
@@ -8298,6 +8299,17 @@ const char* fastpy_os_getcwd(void) {
     getcwd(buf, 4096);
 #endif
     return buf;
+}
+
+/* os.getpid() -> the calling process's PID. On SlateOS posix getpid() is a
+ * real SYS_PROCESS_ID syscall; on the host it is the OS pid. Returned as a
+ * bare i64 (PIDs comfortably fit). */
+int64_t fastpy_os_getpid(void) {
+#ifdef _WIN32
+    return (int64_t)_getpid();
+#else
+    return (int64_t)getpid();
+#endif
 }
 
 int64_t fastpy_os_path_exists(const char *path) {

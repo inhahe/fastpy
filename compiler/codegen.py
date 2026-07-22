@@ -2596,6 +2596,10 @@ class CodeGen:
         # Native OS functions
         ft = ir.FunctionType(i8_ptr, [])
         self.runtime["os_getcwd"] = ir.Function(self.module, ft, name="fastpy_os_getcwd")
+        # os.getpid() -> int (the calling process's PID; on SlateOS a real
+        # SYS_PROCESS_ID syscall via posix getpid()).
+        ft = ir.FunctionType(i64, [])
+        self.runtime["os_getpid"] = ir.Function(self.module, ft, name="fastpy_os_getpid")
         ft = ir.FunctionType(i64, [i8_ptr])
         self.runtime["os_path_exists"] = ir.Function(self.module, ft, name="fastpy_os_path_exists")
         self.runtime["os_path_isfile"] = ir.Function(self.module, ft, name="fastpy_os_path_isfile")
@@ -19099,6 +19103,8 @@ class CodeGen:
                 return ValueType(VKind.BYTES)
             elif mod == "os" and fn in ("getcwd", "readlink"):
                 return ValueType(VKind.STR)
+            elif mod == "os" and fn == "getpid":
+                return ValueType(VKind.INT)
             elif mod == "os" and fn == "listdir":
                 return ValueType(VKind.LIST, elem_type=ValueType(VKind.STR))
             elif mod == "os" and fn in ("remove", "unlink", "mkdir", "rmdir", "rename", "symlink", "link", "chmod", "truncate", "utime", "chown"):
@@ -37293,6 +37299,10 @@ class CodeGen:
         """os.getcwd / os.listdir / os.getenv + os.path functions"""
         if func_name == "getcwd" and len(node.args) == 0:
             return self.builder.call(self.runtime["os_getcwd"], [])
+        elif func_name == "getpid" and len(node.args) == 0:
+            # os.getpid() -> bare i64 PID (on SlateOS a real SYS_PROCESS_ID
+            # syscall via posix getpid()).
+            return self.builder.call(self.runtime["os_getpid"], [])
         elif func_name == "listdir" and len(node.args) == 1:
             v = self._emit_expr_value(node.args[0])
             v = self._ensure_ptr(v)
@@ -37795,7 +37805,7 @@ class CodeGen:
         "math.factorial": "int", "math.comb": "int", "math.perm": "int",
         "math.isnan": "bool", "math.isinf": "bool", "math.isfinite": "bool",
         # os / os.path
-        "os.getcwd": "str", "os.getenv": "pyobj",
+        "os.getcwd": "str", "os.getenv": "pyobj", "os.getpid": "int",
         "os.path.join": "str", "os.path.dirname": "str",
         "os.path.basename": "str", "os.path.abspath": "str",
         "os.path.realpath": "str", "os.path.expanduser": "str",
