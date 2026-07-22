@@ -1875,6 +1875,7 @@ extern int64_t fastpy_os_write(int64_t fd, const char *data);
 extern const char* fastpy_os_read(int64_t fd, int64_t n);
 extern int64_t fastpy_os_close(int64_t fd);
 extern int64_t fastpy_os_dup(int64_t fd);
+extern int64_t fastpy_os_dup2(int64_t oldfd, int64_t newfd);
 extern int64_t fastpy_os_lseek(int64_t fd, int64_t offset, int64_t whence);
 extern int64_t fastpy_os_open(const char *path, int64_t flags, int64_t mode);
 extern int64_t fastpy_os_ftruncate(int64_t fd, int64_t length);

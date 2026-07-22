@@ -2624,6 +2624,9 @@ class CodeGen:
         # os.dup(fd) -> new int fd aliasing the same kernel object (-1 error).
         ft = ir.FunctionType(i64, [i64])
         self.runtime["os_dup"] = ir.Function(self.module, ft, name="fastpy_os_dup")
+        # os.dup2(oldfd, newfd) -> newfd, aliasing oldfd's handle (-1 error).
+        ft = ir.FunctionType(i64, [i64, i64])
+        self.runtime["os_dup2"] = ir.Function(self.module, ft, name="fastpy_os_dup2")
         # os.lseek(fd, offset, whence) -> new int file offset (-1 error).
         ft = ir.FunctionType(i64, [i64, i64, i64])
         self.runtime["os_lseek"] = ir.Function(self.module, ft, name="fastpy_os_lseek")
@@ -19144,7 +19147,7 @@ class CodeGen:
                 return ValueType(VKind.STR)
             elif mod == "os" and fn in ("getpid", "getppid", "gettid"):
                 return ValueType(VKind.INT)
-            elif mod == "os" and fn in ("write", "close", "dup", "lseek", "open", "ftruncate", "pwrite"):
+            elif mod == "os" and fn in ("write", "close", "dup", "dup2", "lseek", "open", "ftruncate", "pwrite"):
                 return ValueType(VKind.INT)
             elif mod == "os" and fn in ("read", "pread"):
                 return ValueType(VKind.STR)
@@ -37432,6 +37435,24 @@ class CodeGen:
                 return v
             fd = _fd_i64(self._emit_expr_value(node.args[0]))
             return self.builder.call(self.runtime["os_dup"], [fd])
+        elif func_name == "dup2" and len(node.args) == 2:
+            # os.dup2(oldfd, newfd) -> bare i64 newfd. Installs a copy of oldfd
+            # at the caller-chosen newfd (closing whatever was there), sharing
+            # the same kernel handle — a distinct path from dup()'s lowest-free.
+            def _fd_i64(v):
+                if (isinstance(v.type, ir.LiteralStructType)
+                        and v.type == fpy_val):
+                    return self.builder.extract_value(v, 1)
+                if isinstance(v.type, ir.PointerType):
+                    return self.builder.ptrtoint(v, i64)
+                if isinstance(v.type, ir.DoubleType):
+                    return self.builder.fptosi(v, i64)
+                if isinstance(v.type, ir.IntType) and v.type.width != 64:
+                    return self.builder.zext(v, i64)
+                return v
+            oldfd = _fd_i64(self._emit_expr_value(node.args[0]))
+            newfd = _fd_i64(self._emit_expr_value(node.args[1]))
+            return self.builder.call(self.runtime["os_dup2"], [oldfd, newfd])
         elif func_name == "lseek" and len(node.args) == 3:
             # os.lseek(fd, offset, whence) -> bare i64 new file offset. On
             # SlateOS posix lseek() repositions a regular file fd's kernel
@@ -38039,6 +38060,7 @@ class CodeGen:
         "os.getppid": "int", "os.gettid": "int",
         "os.pipe": "list:int", "os.read": "str",
         "os.write": "int", "os.close": "int", "os.dup": "int",
+        "os.dup2": "int",
         "os.lseek": "int", "os.open": "int", "os.ftruncate": "int",
         "os.pwrite": "int", "os.pread": "str",
         "os.path.join": "str", "os.path.dirname": "str",

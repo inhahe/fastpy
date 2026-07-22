@@ -8421,6 +8421,20 @@ int64_t fastpy_os_dup(int64_t fd) {
 #endif
 }
 
+/* os.dup2(oldfd, newfd) -> newfd on success (or -1). Unlike dup(), which picks
+ * the lowest free fd, dup2() installs a copy of `oldfd` at the *caller-chosen*
+ * `newfd` (silently closing whatever was open there first), sharing the same
+ * underlying kernel handle — for a pipe end the target aliases the same kernel
+ * pipe buffer. On SlateOS this is posix dup2() at the fd-table level; the
+ * close-then-alias-at-a-specific-fd semantics are a distinct path from dup(). */
+int64_t fastpy_os_dup2(int64_t oldfd, int64_t newfd) {
+#ifdef _WIN32
+    return (_dup2((int)oldfd, (int)newfd) == 0) ? newfd : (int64_t)-1;
+#else
+    return (int64_t)dup2((int)oldfd, (int)newfd);
+#endif
+}
+
 /* os.lseek(fd, offset, whence) -> the new absolute file offset (or -1 on
  * error). `whence` is SEEK_SET (0), SEEK_CUR (1) or SEEK_END (2). On SlateOS
  * posix lseek() repositions a regular file fd's kernel offset via SYS_FS_SEEK
