@@ -2640,6 +2640,10 @@ class CodeGen:
         # AOT-simplified 3-positional form: nanoseconds-since-epoch as bare i64s.
         ft = ir.FunctionType(i64, [i8_ptr, i64, i64])
         self.runtime["os_utime"] = ir.Function(self.module, ft, name="fastpy_os_utime")
+        # os.chown(path, uid, gid) -> int status (0 ok, -1 error).
+        # AOT-simplified 3-positional form: uid/gid as bare i64s.
+        ft = ir.FunctionType(i64, [i8_ptr, i64, i64])
+        self.runtime["os_chown"] = ir.Function(self.module, ft, name="fastpy_os_chown")
         # Vtable dispatch
         ft = ir.FunctionType(void, [i32, i32, i8_ptr])
         self.runtime["set_vtable_entry"] = ir.Function(self.module, ft, name="fastpy_set_vtable_entry")
@@ -19029,7 +19033,7 @@ class CodeGen:
                     return ValueType(VKind.LIST, elem_type=ValueType(VKind.STR))
                 elif fn in ("remove", "unlink", "mkdir", "rmdir", "rename",
                            "getsize", "path_getsize", "symlink", "link",
-                           "chmod", "truncate", "utime"):
+                           "chmod", "truncate", "utime", "chown"):
                     return ValueType(VKind.INT)
                 elif fn in ("readlink",):
                     return ValueType(VKind.STR)
@@ -19097,7 +19101,7 @@ class CodeGen:
                 return ValueType(VKind.STR)
             elif mod == "os" and fn == "listdir":
                 return ValueType(VKind.LIST, elem_type=ValueType(VKind.STR))
-            elif mod == "os" and fn in ("remove", "unlink", "mkdir", "rmdir", "rename", "symlink", "link", "chmod", "truncate", "utime"):
+            elif mod == "os" and fn in ("remove", "unlink", "mkdir", "rmdir", "rename", "symlink", "link", "chmod", "truncate", "utime", "chown"):
                 return ValueType(VKind.INT)
             elif mod in ("os", "os.path") and fn in ("getsize", "path_getsize"):
                 return ValueType(VKind.INT)
@@ -37378,6 +37382,24 @@ class CodeGen:
             atime = _to_i64(self._emit_expr_value(node.args[1]))
             mtime = _to_i64(self._emit_expr_value(node.args[2]))
             return self.builder.call(self.runtime["os_utime"], [path, atime, mtime])
+        elif func_name == "chown" and len(node.args) == 3:
+            # os.chown(path, uid, gid) -> bare i64 status (0 ok, -1).
+            # AOT-simplified 3-positional form; uid/gid are bare i64.
+            def _to_i64(v):
+                if (isinstance(v.type, ir.LiteralStructType)
+                        and v.type == fpy_val):
+                    return self.builder.extract_value(v, 1)
+                if isinstance(v.type, ir.PointerType):
+                    return self.builder.ptrtoint(v, i64)
+                if isinstance(v.type, ir.DoubleType):
+                    return self.builder.fptosi(v, i64)
+                if isinstance(v.type, ir.IntType) and v.type.width != 64:
+                    return self.builder.zext(v, i64)
+                return v
+            path = self._ensure_ptr(self._emit_expr_value(node.args[0]))
+            uid = _to_i64(self._emit_expr_value(node.args[1]))
+            gid = _to_i64(self._emit_expr_value(node.args[2]))
+            return self.builder.call(self.runtime["os_chown"], [path, uid, gid])
         elif func_name == "getenv" and len(node.args) == 1:
             v = self._emit_expr_value(node.args[0])
             v = self._ensure_ptr(v)

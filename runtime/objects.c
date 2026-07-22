@@ -8528,6 +8528,18 @@ int64_t fastpy_os_utime(const char *path, int64_t atime_ns, int64_t mtime_ns) {
 #endif
 }
 
+/* os.chown(path, uid, gid) -> int status (0 ok, -1 error).  AOT-simplified
+ * 3-positional form: uid/gid as bare ints (Python's os.chown returns None +
+ * raises; pure/AOT mode surfaces the result as an int, like os.utime). */
+int64_t fastpy_os_chown(const char *path, int64_t uid, int64_t gid) {
+#ifdef _WIN32
+    (void)path; (void)uid; (void)gid;
+    return -1;
+#else
+    return (int64_t)(chown(path, (uid_t)uid, (gid_t)gid) == 0 ? 0 : -1);
+#endif
+}
+
 /* os.readlink(path) -> str (the link's target).  Returns a valid FpyString
  * `.data` pointer (FPY_TAG_STR); an empty string signals an error, mirroring
  * how callers already branch on os.getcwd/os.path.* string results.  POSIX
