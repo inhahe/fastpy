@@ -8604,6 +8604,23 @@ double fastpy_os_path_getatime(const char *path) {
 #endif
 }
 
+/* os.path.getctime: metadata-change time (st_ctim) as epoch seconds (double).
+ * On POSIX this is the inode change time (ctime) — a *distinct* stat field
+ * from atime/mtime, and (unlike them) not settable via os.utime; it reflects
+ * when the file's metadata last changed (e.g. creation).  CPython returns a
+ * float (on Windows it's the creation time); -1.0 on stat error. */
+double fastpy_os_path_getctime(const char *path) {
+#ifdef _WIN32
+    struct _stat64 st;
+    if (_stat64(path, &st) != 0) return -1.0;
+    return (double)st.st_ctime;
+#else
+    struct stat st;
+    if (stat(path, &st) != 0) return -1.0;
+    return (double)st.st_ctim.tv_sec + (double)st.st_ctim.tv_nsec / 1e9;
+#endif
+}
+
 const char* fastpy_os_path_join(const char *a, const char *b) {
     int alen = (int)strlen(a), blen = (int)strlen(b);
     char *buf = (char*)malloc(alen + blen + 2);

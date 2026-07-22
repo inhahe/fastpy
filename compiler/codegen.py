@@ -2679,6 +2679,12 @@ class CodeGen:
         # st_mtim.
         ft = ir.FunctionType(ir.DoubleType(), [i8_ptr])
         self.runtime["os_path_getatime"] = ir.Function(self.module, ft, name="fastpy_os_path_getatime")
+        # os.path.getctime(path) -> metadata-change (ctime) time in seconds since
+        # epoch (double float; -1.0 on error).  Reads the *ctime* field of the
+        # stat struct (SYS_FS_STAT) — a distinct timestamp field from atime/mtime
+        # that (unlike them) is not settable via os.utime.
+        ft = ir.FunctionType(ir.DoubleType(), [i8_ptr])
+        self.runtime["os_path_getctime"] = ir.Function(self.module, ft, name="fastpy_os_path_getctime")
         # os.symlink(target, linkpath) -> int status (0 ok, -1 error)
         ft = ir.FunctionType(i64, [i8_ptr, i8_ptr])
         self.runtime["os_symlink"] = ir.Function(self.module, ft, name="fastpy_os_symlink")
@@ -19096,7 +19102,8 @@ class CodeGen:
                 elif fn in ("readlink",):
                     return ValueType(VKind.STR)
                 elif fn in ("getmtime", "path_getmtime",
-                           "getatime", "path_getatime"):
+                           "getatime", "path_getatime",
+                           "getctime", "path_getctime"):
                     return ValueType(VKind.FLOAT)
                 elif fn in ("exists", "isfile", "isdir",
                            "path_exists", "path_isfile", "path_isdir"):
@@ -19175,7 +19182,8 @@ class CodeGen:
             elif mod in ("os", "os.path") and fn in ("getsize", "path_getsize"):
                 return ValueType(VKind.INT)
             elif mod in ("os", "os.path") and fn in ("getmtime", "path_getmtime",
-                                                     "getatime", "path_getatime"):
+                                                     "getatime", "path_getatime",
+                                                     "getctime", "path_getctime"):
                 return ValueType(VKind.FLOAT)
             elif mod == "asyncio" and fn == "gather":
                 return ValueType(VKind.LIST, elem_type=ValueType(VKind.INT))
@@ -19246,7 +19254,7 @@ class CodeGen:
                         return ValueType(VKind.STR)
                     if _fn == "getsize":
                         return ValueType(VKind.INT)
-                    if _fn in ("getmtime", "getatime"):
+                    if _fn in ("getmtime", "getatime", "getctime"):
                         return ValueType(VKind.FLOAT)
                     if _fn in ("exists", "isfile", "isdir"):
                         return ValueType(VKind.BOOL)
@@ -37737,6 +37745,7 @@ class CodeGen:
             "getsize": ("os_path_getsize", 1),
             "getmtime": ("os_path_getmtime", 1),
             "getatime": ("os_path_getatime", 1),
+            "getctime": ("os_path_getctime", 1),
         }
         if func_name in _os_path_fns:
             rt_key, n_args = _os_path_fns[func_name]
@@ -38121,6 +38130,7 @@ class CodeGen:
         "os.path.getsize": "int",
         "os.path.getmtime": "float",
         "os.path.getatime": "float",
+        "os.path.getctime": "float",
         "os.listdir": "list:str",
         # json
         "json.dumps": "str", "json.loads": "pyobj",
