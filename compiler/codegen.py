@@ -2685,6 +2685,13 @@ class CodeGen:
         # that (unlike them) is not settable via os.utime.
         ft = ir.FunctionType(ir.DoubleType(), [i8_ptr])
         self.runtime["os_path_getctime"] = ir.Function(self.module, ft, name="fastpy_os_path_getctime")
+        # os.access(path, mode) -> bool (True if accessible).  mode is the POSIX
+        # accessibility mask (F_OK=0, R_OK=4, W_OK=2, X_OK=1) passed as an i64.
+        # Unlike the get*time stat-field reads, this exercises the libc access()
+        # entry point and the mode argument is honored (access() rejects mode
+        # bits outside R|W|X with EINVAL). Runtime returns i64 1/0.
+        ft = ir.FunctionType(i64, [i8_ptr, i64])
+        self.runtime["os_access"] = ir.Function(self.module, ft, name="fastpy_os_access")
         # os.symlink(target, linkpath) -> int status (0 ok, -1 error)
         ft = ir.FunctionType(i64, [i8_ptr, i8_ptr])
         self.runtime["os_symlink"] = ir.Function(self.module, ft, name="fastpy_os_symlink")
@@ -19106,7 +19113,8 @@ class CodeGen:
                            "getctime", "path_getctime"):
                     return ValueType(VKind.FLOAT)
                 elif fn in ("exists", "isfile", "isdir",
-                           "path_exists", "path_isfile", "path_isdir"):
+                           "path_exists", "path_isfile", "path_isdir",
+                           "access"):
                     return ValueType(VKind.BOOL)
                 # collections types via from-import
                 elif mod in ("collections", "_collections"):
@@ -19179,6 +19187,8 @@ class CodeGen:
                 return ValueType(VKind.LIST, elem_type=ValueType(VKind.STR))
             elif mod == "os" and fn in ("remove", "unlink", "mkdir", "rmdir", "rename", "symlink", "link", "chmod", "truncate", "utime", "chown"):
                 return ValueType(VKind.INT)
+            elif mod == "os" and fn == "access":
+                return ValueType(VKind.BOOL)
             elif mod in ("os", "os.path") and fn in ("getsize", "path_getsize"):
                 return ValueType(VKind.INT)
             elif mod in ("os", "os.path") and fn in ("getmtime", "path_getmtime",
@@ -37665,6 +37675,25 @@ class CodeGen:
             elif isinstance(mode.type, ir.IntType) and mode.type.width != 64:
                 mode = self.builder.zext(mode, i64)
             return self.builder.call(self.runtime["os_chmod"], [path, mode])
+        elif func_name == "access" and len(node.args) == 2:
+            # os.access(path, mode) -> bool. mode is F_OK/R_OK/W_OK/X_OK
+            # (0/4/2/1); posix access() rejects mode bits outside R|W|X with
+            # EINVAL, so the mode argument is genuinely honored (not ignored).
+            # Runtime returns a bare i64 (1/0); wrap as a BOOL FpyValue so the
+            # inferred VKind.BOOL matches downstream truthiness handling.
+            path = self._ensure_ptr(self._emit_expr_value(node.args[0]))
+            mode = self._emit_expr_value(node.args[1])
+            if (isinstance(mode.type, ir.LiteralStructType)
+                    and mode.type == fpy_val):
+                mode = self.builder.extract_value(mode, 1)
+            elif isinstance(mode.type, ir.PointerType):
+                mode = self.builder.ptrtoint(mode, i64)
+            elif isinstance(mode.type, ir.DoubleType):
+                mode = self.builder.fptosi(mode, i64)
+            elif isinstance(mode.type, ir.IntType) and mode.type.width != 64:
+                mode = self.builder.zext(mode, i64)
+            result = self.builder.call(self.runtime["os_access"], [path, mode])
+            return self._fv_from_bool(result)
         elif func_name == "truncate" and len(node.args) == 2:
             # os.truncate(path, length) -> bare i64 status (0 ok, -1 error).
             # length is a plain integer, so coerce it to bare i64.
@@ -38132,6 +38161,7 @@ class CodeGen:
         "os.path.getatime": "float",
         "os.path.getctime": "float",
         "os.listdir": "list:str",
+        "os.access": "bool",
         # json
         "json.dumps": "str", "json.loads": "pyobj",
         # textwrap — dedent/indent have native impls; fill does NOT

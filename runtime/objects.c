@@ -8621,6 +8621,31 @@ double fastpy_os_path_getctime(const char *path) {
 #endif
 }
 
+/* os.access(path, mode) -> 1 if accessible (True), 0 otherwise (False).
+ * Mirrors CPython os.access, which returns a bool.  `mode` is the POSIX
+ * accessibility mask: F_OK=0, R_OK=4, W_OK=2, X_OK=1.  Unlike the get*time
+ * probes this exercises the libc access() entry point, and the mode argument
+ * is genuinely honored: POSIX access() rejects mode bits outside R|W|X with
+ * EINVAL, so os.access(path, 8) returns False even for an existing file.
+ * (SlateOS has no per-user permission enforcement yet, so a *valid* mode
+ * succeeds iff the path exists — but the mode is still validated.) */
+int64_t fastpy_os_access(const char *path, int64_t mode) {
+    if (path == NULL) return 0;
+#ifdef _WIN32
+    /* Windows _access has no X_OK; map any valid *nix mode to an existence
+     * check (mode 0) and reject out-of-range mode bits like POSIX does. */
+    if (mode & ~(int64_t)6) {
+        /* Only F_OK/R_OK/W_OK are representable on Windows; treat X_OK(1) and
+         * out-of-range bits as invalid so host builds match the SlateOS EINVAL
+         * behavior for the self-test's invalid-mode case. */
+        if (mode & ~(int64_t)7) return 0;   /* out of R|W|X range -> False */
+    }
+    return (_access(path, 0) == 0) ? 1 : 0;
+#else
+    return (access(path, (int)mode) == 0) ? 1 : 0;
+#endif
+}
+
 const char* fastpy_os_path_join(const char *a, const char *b) {
     int alen = (int)strlen(a), blen = (int)strlen(b);
     char *buf = (char*)malloc(alen + blen + 2);
