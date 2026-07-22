@@ -8451,6 +8451,19 @@ int64_t fastpy_os_open(const char *path, int64_t flags, int64_t mode) {
 #endif
 }
 
+/* os.ftruncate(fd, length) -> 0 on success, -1 on error. Sets the size of the
+ * regular file open on `fd` to exactly `length` bytes (extending with zeros or
+ * discarding the tail). On SlateOS this is posix ftruncate() -> SYS_FS_FTRUNCATE
+ * — a genuinely distinct kernel path from lseek/write, and from the path-based
+ * os.truncate() (SYS_FS_TRUNCATE). Not meaningful for a pipe. */
+int64_t fastpy_os_ftruncate(int64_t fd, int64_t length) {
+#ifdef _WIN32
+    return (int64_t)(_chsize_s((int)fd, (long long)length) == 0 ? 0 : -1);
+#else
+    return (int64_t)(ftruncate((int)fd, (off_t)length) == 0 ? 0 : -1);
+#endif
+}
+
 int64_t fastpy_os_path_exists(const char *path) {
 #ifdef _WIN32
     DWORD attrs = GetFileAttributesA(path);

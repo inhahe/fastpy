@@ -2630,6 +2630,9 @@ class CodeGen:
         # os.open(path, flags, mode) -> new raw int file fd (-1 error).
         ft = ir.FunctionType(i64, [i8_ptr, i64, i64])
         self.runtime["os_open"] = ir.Function(self.module, ft, name="fastpy_os_open")
+        # os.ftruncate(fd, length) -> int status (0 ok, -1 error).
+        ft = ir.FunctionType(i64, [i64, i64])
+        self.runtime["os_ftruncate"] = ir.Function(self.module, ft, name="fastpy_os_ftruncate")
         ft = ir.FunctionType(i64, [i8_ptr])
         self.runtime["os_path_exists"] = ir.Function(self.module, ft, name="fastpy_os_path_exists")
         self.runtime["os_path_isfile"] = ir.Function(self.module, ft, name="fastpy_os_path_isfile")
@@ -19135,7 +19138,7 @@ class CodeGen:
                 return ValueType(VKind.STR)
             elif mod == "os" and fn in ("getpid", "getppid", "gettid"):
                 return ValueType(VKind.INT)
-            elif mod == "os" and fn in ("write", "close", "dup", "lseek", "open"):
+            elif mod == "os" and fn in ("write", "close", "dup", "lseek", "open", "ftruncate"):
                 return ValueType(VKind.INT)
             elif mod == "os" and fn == "read":
                 return ValueType(VKind.STR)
@@ -37467,6 +37470,25 @@ class CodeGen:
                 # consulted when O_CREAT is set.
                 mode = ir.Constant(i64, 0o777)
             return self.builder.call(self.runtime["os_open"], [path, flags, mode])
+        elif func_name == "ftruncate" and len(node.args) == 2:
+            # os.ftruncate(fd, length) -> bare i64 status (0 ok, -1 error). On
+            # SlateOS posix ftruncate() -> SYS_FS_FTRUNCATE resizes the file
+            # open on `fd` — a distinct kernel path from lseek/write and from
+            # the path-based os.truncate() (SYS_FS_TRUNCATE).
+            def _fd_i64(v):
+                if (isinstance(v.type, ir.LiteralStructType)
+                        and v.type == fpy_val):
+                    return self.builder.extract_value(v, 1)
+                if isinstance(v.type, ir.PointerType):
+                    return self.builder.ptrtoint(v, i64)
+                if isinstance(v.type, ir.DoubleType):
+                    return self.builder.fptosi(v, i64)
+                if isinstance(v.type, ir.IntType) and v.type.width != 64:
+                    return self.builder.zext(v, i64)
+                return v
+            fd = _fd_i64(self._emit_expr_value(node.args[0]))
+            length = _fd_i64(self._emit_expr_value(node.args[1]))
+            return self.builder.call(self.runtime["os_ftruncate"], [fd, length])
         elif func_name == "listdir" and len(node.args) == 1:
             v = self._emit_expr_value(node.args[0])
             v = self._ensure_ptr(v)
@@ -37973,7 +37995,7 @@ class CodeGen:
         "os.getppid": "int", "os.gettid": "int",
         "os.pipe": "list:int", "os.read": "str",
         "os.write": "int", "os.close": "int", "os.dup": "int",
-        "os.lseek": "int", "os.open": "int",
+        "os.lseek": "int", "os.open": "int", "os.ftruncate": "int",
         "os.path.join": "str", "os.path.dirname": "str",
         "os.path.basename": "str", "os.path.abspath": "str",
         "os.path.realpath": "str", "os.path.expanduser": "str",
