@@ -217,7 +217,9 @@ the CPython bridge for SlateOS later as a superset once CPython is ported.
     raw-fd counterpart to the high-level builtin `open()`), `read(fd, n)` → str,
     `write(fd, data)` → int, `close(fd)` (posix dispatches by fd kind:
     SYS_PIPE_* for pipe ends, SYS_FS_* for files), `dup(fd)` (shares the kernel
-    handle — a pipe dup aliases the same buffer), `lseek(fd, off, whence)`
+    handle — a pipe dup aliases the same buffer), `dup2(oldfd, newfd)` (installs
+    the handle at a *caller-chosen* fd, closing whatever was there — fd
+    redirection), `lseek(fd, off, whence)`
     (SYS_FS_SEEK), `ftruncate(fd, len)` (SYS_FS_FTRUNCATE — distinct from the
     path-based `truncate()`/SYS_FS_TRUNCATE), `pwrite`/`pread(fd, …, offset)`
     (positioned I/O that leaves the fd offset untouched).
