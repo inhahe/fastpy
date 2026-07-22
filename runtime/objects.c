@@ -8288,6 +8288,7 @@ void fastpy_json_loads(const char *json_str, int32_t *out_tag, int64_t *out_data
 #include <unistd.h>
 #include <dirent.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <fcntl.h>
 #endif
 
@@ -8723,6 +8724,38 @@ FpyList* fastpy_os_stat(const char *path) {
     fpy_list_append(lst, fpy_int((int64_t)st.st_mtime));
     fpy_list_append(lst, fpy_int((int64_t)st.st_ctime));
     return lst;
+}
+
+/* os.statvfs(path): filesystem capacity/limits via a single statvfs() call.
+ * Returns CPython's os.statvfs_result sequence form as a 10-int list in the
+ * documented field order:
+ *   (f_bsize, f_frsize, f_blocks, f_bfree, f_bavail,
+ *    f_files, f_ffree, f_favail, f_flag, f_namemax)
+ * Distinct from os.stat (per-file metadata): this reports the *whole
+ * filesystem* the path lives on (block sizes, block/inode totals & free
+ * counts, mount flags, and the max filename length). */
+FpyList* fastpy_os_statvfs(const char *path) {
+    FpyList *lst = fpy_list_new(10);
+    if (path == NULL) return lst;
+#ifdef _WIN32
+    /* Win32 has no statvfs; the SlateOS target never takes this branch. */
+    (void)path;
+    return lst;
+#else
+    struct statvfs vfs;
+    if (statvfs(path, &vfs) != 0) return lst;
+    fpy_list_append(lst, fpy_int((int64_t)vfs.f_bsize));
+    fpy_list_append(lst, fpy_int((int64_t)vfs.f_frsize));
+    fpy_list_append(lst, fpy_int((int64_t)vfs.f_blocks));
+    fpy_list_append(lst, fpy_int((int64_t)vfs.f_bfree));
+    fpy_list_append(lst, fpy_int((int64_t)vfs.f_bavail));
+    fpy_list_append(lst, fpy_int((int64_t)vfs.f_files));
+    fpy_list_append(lst, fpy_int((int64_t)vfs.f_ffree));
+    fpy_list_append(lst, fpy_int((int64_t)vfs.f_favail));
+    fpy_list_append(lst, fpy_int((int64_t)vfs.f_flag));
+    fpy_list_append(lst, fpy_int((int64_t)vfs.f_namemax));
+    return lst;
+#endif
 }
 
 const char* fastpy_os_path_join(const char *a, const char *b) {

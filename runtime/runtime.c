@@ -1901,6 +1901,7 @@ extern int64_t fastpy_os_access(const char *path, int64_t mode);
 extern int64_t fastpy_os_path_samefile(const char *a, const char *b);
 extern int64_t fastpy_os_path_islink(const char *path);
 extern FpyList* fastpy_os_stat(const char *path);
+extern FpyList* fastpy_os_statvfs(const char *path);
 
 /* Path(str) → just returns the string (Path IS a string internally) */
 /* Path() — implemented in cpython_bridge.c */
