@@ -14443,6 +14443,46 @@ class CodeGen:
             # Also add any function-local vars — we scan each function
             # separately below, but for module-level we need the module
             # vars here.
+            #
+            # Precompute two variable→class maps ONCE per call (loop-invariant
+            # w.r.t. the assignment scan below). Previously these were rebuilt
+            # by re-walking the whole tree inside the per-assignment loop —
+            # O(assignments × tree) — which dominated compile time.
+            #
+            # Map A (_ctor_first): first `name = ClassName(...)` in walk order
+            # where ClassName is a known user class. Mirrors the original
+            # first-match-then-break inner walk.
+            _ctor_first: dict[str, str] = {}
+            # Map B (_ctor_fixpoint): iterative fixpoint over
+            # `name = ClassName(...)` and Name→Name chains, using the classes
+            # known during CSA. Mirrors the original 5-pass fixpoint inner walk.
+            _ctor_fixpoint: dict[str, str] = {}
+            _known_ctor_classes = set(self._csa_class_asts.keys())
+            _all_assigns: list[ast.Assign] = [
+                _an for _an in ast.walk(tree)
+                if isinstance(_an, ast.Assign) and len(_an.targets) == 1
+                and isinstance(_an.targets[0], ast.Name)
+            ]
+            for _an in _all_assigns:
+                _nm = _an.targets[0].id
+                if (isinstance(_an.value, ast.Call)
+                        and isinstance(_an.value.func, ast.Name)
+                        and _an.value.func.id in self._user_classes
+                        and _nm not in _ctor_first):
+                    _ctor_first[_nm] = _an.value.func.id
+            for _ in range(5):
+                _prev = len(_ctor_fixpoint)
+                for _an in _all_assigns:
+                    _nm = _an.targets[0].id
+                    if (isinstance(_an.value, ast.Call)
+                            and isinstance(_an.value.func, ast.Name)
+                            and _an.value.func.id in _known_ctor_classes):
+                        _ctor_fixpoint[_nm] = _an.value.func.id
+                    elif (isinstance(_an.value, ast.Name)
+                          and _an.value.id in _ctor_fixpoint):
+                        _ctor_fixpoint[_nm] = _ctor_fixpoint[_an.value.id]
+                if len(_ctor_fixpoint) == _prev:
+                    break
             for n in ast.walk(tree):
                 if not (isinstance(n, ast.Assign) and len(n.targets) == 1
                         and isinstance(n.targets[0], ast.Attribute)
@@ -14458,17 +14498,9 @@ class CodeGen:
                 # Try scoped lookup: find the enclosing function and check
                 # local assignments there.
                 if receiver_cls is None:
-                    # Walk tree for an assignment to receiver_name from a
-                    # ClassName(...) call in the same or module scope.
-                    for n2 in ast.walk(tree):
-                        if (isinstance(n2, ast.Assign) and len(n2.targets) == 1
-                                and isinstance(n2.targets[0], ast.Name)
-                                and n2.targets[0].id == receiver_name
-                                and isinstance(n2.value, ast.Call)
-                                and isinstance(n2.value.func, ast.Name)
-                                and n2.value.func.id in self._user_classes):
-                            receiver_cls = n2.value.func.id
-                            break
+                    # Precomputed: first `receiver_name = ClassName(...)` in
+                    # walk order (see _ctor_first above).
+                    receiver_cls = _ctor_first.get(receiver_name)
                 if receiver_cls != node.name:
                     continue
                 # Determine assigned value's class
@@ -14481,31 +14513,10 @@ class CodeGen:
                 elif isinstance(rhs, ast.Name):
                     rhs_cls = var_classes_module.get(rhs.id)
                     if rhs_cls is None:
-                        # Search for a constructor assignment of this name,
-                        # or a Name-to-Name chain ending in one (iterative
-                        # fixpoint, handles `head = None; head = n` where
-                        # n is Node(v)). Uses _csa_class_asts (populated
-                        # early) rather than _user_classes (not yet set
-                        # for classes currently being declared).
-                        known_classes = set(self._csa_class_asts.keys())
-                        local_obj: dict[str, str] = {}
-                        for _ in range(5):
-                            prev = len(local_obj)
-                            for n2 in ast.walk(tree):
-                                if not (isinstance(n2, ast.Assign) and len(n2.targets) == 1
-                                        and isinstance(n2.targets[0], ast.Name)):
-                                    continue
-                                tgt_name = n2.targets[0].id
-                                if (isinstance(n2.value, ast.Call)
-                                        and isinstance(n2.value.func, ast.Name)
-                                        and n2.value.func.id in known_classes):
-                                    local_obj[tgt_name] = n2.value.func.id
-                                elif (isinstance(n2.value, ast.Name)
-                                      and n2.value.id in local_obj):
-                                    local_obj[tgt_name] = local_obj[n2.value.id]
-                            if len(local_obj) == prev:
-                                break
-                        rhs_cls = local_obj.get(rhs.id)
+                        # Precomputed constructor-assignment fixpoint (handles
+                        # `head = None; head = n` where n is Node(v)); see
+                        # _ctor_fixpoint above.
+                        rhs_cls = _ctor_fixpoint.get(rhs.id)
                 if rhs_cls is not None:
                     obj_attrs.add(attr_name)
                     obj_attr_types[attr_name] = rhs_cls
