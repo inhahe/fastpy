@@ -8572,6 +8572,23 @@ int64_t fastpy_os_path_getsize(const char *path) {
 #endif
 }
 
+/* os.path.getmtime(path) -> modification time in seconds since the epoch as a
+ * CPython-faithful float.  Reads the mtime field of the stat struct (a distinct
+ * metadata field from getsize's st_size); returns -1.0 on error.  On posix we
+ * combine whole seconds with the nanosecond sub-second field (st_mtim.tv_nsec)
+ * so sub-second precision survives the round-trip. */
+double fastpy_os_path_getmtime(const char *path) {
+#ifdef _WIN32
+    struct _stat64 st;
+    if (_stat64(path, &st) != 0) return -1.0;
+    return (double)st.st_mtime;
+#else
+    struct stat st;
+    if (stat(path, &st) != 0) return -1.0;
+    return (double)st.st_mtim.tv_sec + (double)st.st_mtim.tv_nsec / 1e9;
+#endif
+}
+
 const char* fastpy_os_path_join(const char *a, const char *b) {
     int alen = (int)strlen(a), blen = (int)strlen(b);
     char *buf = (char*)malloc(alen + blen + 2);

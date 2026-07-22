@@ -8,6 +8,44 @@ how to reproduce it, and what the proper fix looks like.
 
 ## Active Bugs
 
+### BUG-SCALARKIND-LOST-ON-NATIVE-MODULE-CALL-ASSIGN. A variable bound to a native `os.*`/`os.path.*` scalar result loses its VKind, so a later `int()`/`float()`/arith over it bridges to CPython — 2026-07-22
+
+**What:** when a native module call that returns a scalar (e.g.
+`os.path.getmtime(p)` → float, `os.path.getsize(p)` → int) is assigned to a
+variable, the variable's `VKind` is not recorded as the inferred scalar kind
+(FLOAT/INT). A subsequent builtin-cast call over that variable — most
+importantly `int(<var>)` — then treats the operand as a `PYOBJ` and lowers to
+`fpy_cpython_call1`/`fpy_cpython_getattr`/`fpy_cpython_import` (the CPython
+bridge), which is stubbed/undefined in pure mode. The **inline** form
+(`int(os.path.getmtime(p))`, no intermediate var) lowers natively (`fptosi`).
+
+**Reproduce (pure mode, verified 2026-07-22 via `llvm-nm` on `prog.o`):**
+```python
+b = os.path.getmtime(p)   # b's kind is not recorded as FLOAT
+c = int(b)                # int(b) sees b as PYOBJ → bridges to CPython
+```
+vs. the clean forms:
+```python
+c = int(os.path.getmtime(p))   # inline: native fptosi, bridge-free
+x = 3.5; y = int(x)            # float *literal* var: native, bridge-free
+```
+So it is specifically the *native-module-call result var* that loses its kind,
+not float vars in general.
+
+**Where:** `compiler/codegen.py` — `_assign_fv_fast_path` (~line 16580) routes
+the chained-native call (`_is_chained_native`, ~16627) to native lowering, but
+the assignment does not stamp the target variable's `VKind` from the call's
+inferred return type (the `_CSA_MODULE_FUNC_RETURNS` entry / the `mod`,`fn`
+inference at ~19168). The later `int(var)` at the builtin-cast site then can't
+see a scalar kind and falls back to the pyobj path.
+
+**Proper fix:** when the assignment fast-path handles a native module call whose
+inferred return type is a scalar (INT/FLOAT/BOOL/STR), record the target
+variable's `VKind` accordingly (mirror what the direct-argument form already
+knows via `_infer_call_type`). Then `int(var)`/`float(var)`/arith over the
+result would lower natively. **Workaround in use:** `services/fastpy-getmtime`
+inlines `int(os.path.getmtime(path))` to avoid the intermediate var.
+
 ### BUG-BIGINT-MUL-INT-NULL. A bigint × small-int multiply passes a NULL operand into `fpy_bigint_mul` and segfaults — 2026-07-21
 
 **What:** when the running value of an expression has been promoted to a

@@ -1887,6 +1887,7 @@ extern int64_t fastpy_os_mkdir(const char *path);
 extern int64_t fastpy_os_rmdir(const char *path);
 extern int64_t fastpy_os_rename(const char *src, const char *dst);
 extern int64_t fastpy_os_path_getsize(const char *path);
+extern double fastpy_os_path_getmtime(const char *path);
 extern int64_t fastpy_os_symlink(const char *target, const char *linkpath);
 extern const char* fastpy_os_readlink(const char *path);
 extern int64_t fastpy_os_link(const char *src, const char *dst);

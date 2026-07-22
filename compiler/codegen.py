@@ -2667,6 +2667,12 @@ class CodeGen:
         # os.path.getsize(path) -> file size in bytes (i64; -1 on error)
         ft = ir.FunctionType(i64, [i8_ptr])
         self.runtime["os_path_getsize"] = ir.Function(self.module, ft, name="fastpy_os_path_getsize")
+        # os.path.getmtime(path) -> modification time in seconds since epoch
+        # (double, CPython-faithful float; -1.0 on error).  Reads the mtime
+        # field of the stat struct (SYS_FS_STAT) — a distinct metadata field
+        # from getsize's st_size.
+        ft = ir.FunctionType(ir.DoubleType(), [i8_ptr])
+        self.runtime["os_path_getmtime"] = ir.Function(self.module, ft, name="fastpy_os_path_getmtime")
         # os.symlink(target, linkpath) -> int status (0 ok, -1 error)
         ft = ir.FunctionType(i64, [i8_ptr, i8_ptr])
         self.runtime["os_symlink"] = ir.Function(self.module, ft, name="fastpy_os_symlink")
@@ -19083,6 +19089,8 @@ class CodeGen:
                     return ValueType(VKind.INT)
                 elif fn in ("readlink",):
                     return ValueType(VKind.STR)
+                elif fn in ("getmtime", "path_getmtime"):
+                    return ValueType(VKind.FLOAT)
                 elif fn in ("exists", "isfile", "isdir",
                            "path_exists", "path_isfile", "path_isdir"):
                     return ValueType(VKind.BOOL)
@@ -19159,6 +19167,8 @@ class CodeGen:
                 return ValueType(VKind.INT)
             elif mod in ("os", "os.path") and fn in ("getsize", "path_getsize"):
                 return ValueType(VKind.INT)
+            elif mod in ("os", "os.path") and fn in ("getmtime", "path_getmtime"):
+                return ValueType(VKind.FLOAT)
             elif mod == "asyncio" and fn == "gather":
                 return ValueType(VKind.LIST, elem_type=ValueType(VKind.INT))
             elif mod == "logging" and fn == "getLogger":
@@ -37688,6 +37698,7 @@ class CodeGen:
             "basename": ("os_path_basename", 1),
             "dirname": ("os_path_dirname", 1),
             "getsize": ("os_path_getsize", 1),
+            "getmtime": ("os_path_getmtime", 1),
         }
         if func_name in _os_path_fns:
             rt_key, n_args = _os_path_fns[func_name]
@@ -38070,6 +38081,7 @@ class CodeGen:
         "os.path.exists": "bool", "os.path.isfile": "bool",
         "os.path.isdir": "bool", "os.path.isabs": "bool",
         "os.path.getsize": "int",
+        "os.path.getmtime": "float",
         "os.listdir": "list:str",
         # json
         "json.dumps": "str", "json.loads": "pyobj",
