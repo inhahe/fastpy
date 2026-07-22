@@ -8343,6 +8343,30 @@ int64_t fastpy_os_gettid(void) {
 #endif
 }
 
+/* os.getuid()/os.getgid() -> the calling process's real uid/gid. On SlateOS
+ * posix getuid()/getgid() issue the real SYS_PROCESS_GET_CREDENTIALS syscall,
+ * reading the process credentials the kernel set at spawn (from
+ * SpawnOptions.uid_gid) — a distinct kernel path (the process-credentials
+ * table) from the pid/tid identity syscalls. getuid()/getgid() are declared by
+ * musl's <unistd.h> and resolve at link time to the SlateOS posix crate's
+ * extern "C" symbols. Windows host builds don't run on SlateOS, so root (0) is
+ * a fine placeholder there. */
+int64_t fastpy_os_getuid(void) {
+#ifdef _WIN32
+    return (int64_t)0;
+#else
+    return (int64_t)getuid();
+#endif
+}
+
+int64_t fastpy_os_getgid(void) {
+#ifdef _WIN32
+    return (int64_t)0;
+#else
+    return (int64_t)getgid();
+#endif
+}
+
 /* os.pipe() -> (read_fd, write_fd). On SlateOS posix pipe() issues the real
  * SYS_PIPE_CREATE syscall — a genuinely distinct kernel path (the pipe
  * subsystem) not touched by any file/process syscall. Python's os.pipe()

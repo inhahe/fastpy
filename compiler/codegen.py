@@ -2607,6 +2607,12 @@ class CodeGen:
         # real SYS_TASK_ID syscall via posix gettid() — a distinct kernel path
         # from the process table, hitting the scheduler's task table).
         self.runtime["os_gettid"] = ir.Function(self.module, ft, name="fastpy_os_gettid")
+        # os.getuid()/os.getgid() -> int (the calling process's real uid/gid; on
+        # SlateOS a real SYS_PROCESS_GET_CREDENTIALS syscall via posix
+        # getuid()/getgid() — reads the process credentials set at spawn, a
+        # distinct kernel path from the pid/tid identity syscalls).
+        self.runtime["os_getuid"] = ir.Function(self.module, ft, name="fastpy_os_getuid")
+        self.runtime["os_getgid"] = ir.Function(self.module, ft, name="fastpy_os_getgid")
         # os.pipe() -> 2-element list [read_fd, write_fd] (FpyList* as i8_ptr).
         # On SlateOS posix pipe() is a real SYS_PIPE_CREATE syscall — a distinct
         # kernel path (the pipe subsystem) from file/process syscalls.
@@ -19132,7 +19138,8 @@ class CodeGen:
                     return ValueType(VKind.LIST, elem_type=ValueType(VKind.INT))
                 elif fn in ("remove", "unlink", "mkdir", "rmdir", "rename",
                            "getsize", "path_getsize", "symlink", "link",
-                           "chmod", "truncate", "utime", "chown"):
+                           "chmod", "truncate", "utime", "chown",
+                           "getuid", "getgid"):
                     return ValueType(VKind.INT)
                 elif fn in ("readlink",):
                     return ValueType(VKind.STR)
@@ -19204,7 +19211,7 @@ class CodeGen:
                 return ValueType(VKind.BYTES)
             elif mod == "os" and fn in ("getcwd", "readlink"):
                 return ValueType(VKind.STR)
-            elif mod == "os" and fn in ("getpid", "getppid", "gettid"):
+            elif mod == "os" and fn in ("getpid", "getppid", "gettid", "getuid", "getgid"):
                 return ValueType(VKind.INT)
             elif mod == "os" and fn in ("write", "close", "dup", "dup2", "lseek", "open", "ftruncate", "pwrite"):
                 return ValueType(VKind.INT)
@@ -37455,6 +37462,14 @@ class CodeGen:
             # os.gettid() -> bare i64 kernel task ID (on SlateOS a real
             # SYS_TASK_ID syscall via posix gettid()).
             return self.builder.call(self.runtime["os_gettid"], [])
+        elif func_name == "getuid" and len(node.args) == 0:
+            # os.getuid() -> bare i64 real uid (on SlateOS a real
+            # SYS_PROCESS_GET_CREDENTIALS syscall via posix getuid()).
+            return self.builder.call(self.runtime["os_getuid"], [])
+        elif func_name == "getgid" and len(node.args) == 0:
+            # os.getgid() -> bare i64 real gid (on SlateOS a real
+            # SYS_PROCESS_GET_CREDENTIALS syscall via posix getgid()).
+            return self.builder.call(self.runtime["os_getgid"], [])
         elif func_name == "pipe" and len(node.args) == 0:
             # os.pipe() -> FpyList* [read_fd, write_fd] (as i8_ptr). On SlateOS a
             # real SYS_PIPE_CREATE syscall via posix pipe(). Inference tags this
@@ -38191,6 +38206,7 @@ class CodeGen:
         # os / os.path
         "os.getcwd": "str", "os.getenv": "pyobj", "os.getpid": "int",
         "os.getppid": "int", "os.gettid": "int",
+        "os.getuid": "int", "os.getgid": "int",
         "os.pipe": "list:int", "os.read": "str",
         "os.write": "int", "os.close": "int", "os.dup": "int",
         "os.dup2": "int",
