@@ -2618,6 +2618,9 @@ class CodeGen:
         # os.rename(src, dst) -> int status (0 ok, -1 error)
         ft = ir.FunctionType(i64, [i8_ptr, i8_ptr])
         self.runtime["os_rename"] = ir.Function(self.module, ft, name="fastpy_os_rename")
+        # os.path.getsize(path) -> file size in bytes (i64; -1 on error)
+        ft = ir.FunctionType(i64, [i8_ptr])
+        self.runtime["os_path_getsize"] = ir.Function(self.module, ft, name="fastpy_os_path_getsize")
         # Vtable dispatch
         ft = ir.FunctionType(void, [i32, i32, i8_ptr])
         self.runtime["set_vtable_entry"] = ir.Function(self.module, ft, name="fastpy_set_vtable_entry")
@@ -16537,14 +16540,24 @@ class CodeGen:
         # Exclude chained native module calls: os.path.join(a,b,c)
         # These should go through _emit_call_expr which has native handlers.
         # For `os.path.join(...)`, the AST is Name("os").Attribute("path").Attribute("join")
-        # so the dotted module is "os.path", which is what's stored in _native_modules.
+        # so the dotted module is "os.path".  We recognize the call as chained-
+        # native when *either* the full dotted module ("os.path", registered by
+        # `import os.path`) *or* just the top-level name ("os", registered by the
+        # far more common `import os`) is native — matching the top-level-name
+        # check `_emit_call_expr` uses for the direct-argument form (see line ~36601).
+        # Without the top-level fallback, `p = os.path.getsize(f)` under a plain
+        # `import os` fell through to the pyobj-call-chain branch and bridged to
+        # CPython (stubbed in pure mode -> undefined `fpy_cpython_*` at link time),
+        # while the direct form `sys.exit(os.path.getsize(f))` lowered natively.
         _is_chained_native = False
         if (isinstance(rhs, ast.Call)
                 and isinstance(rhs.func, ast.Attribute)
                 and isinstance(rhs.func.value, ast.Attribute)
                 and isinstance(rhs.func.value.value, ast.Name)):
+            _nm_set = getattr(self, '_native_modules', set())
             _dotted = rhs.func.value.value.id + "." + rhs.func.value.attr
-            _is_chained_native = _dotted in getattr(self, '_native_modules', set())
+            _is_chained_native = (_dotted in _nm_set
+                                  or rhs.func.value.value.id in _nm_set)
         is_pyobj_call_chain = (not is_pyobj_call
                                and not _is_chained_native
                                and isinstance(rhs, ast.Call)
@@ -18995,7 +19008,8 @@ class CodeGen:
                     return ValueType(VKind.STR)
                 elif fn in ("listdir",):
                     return ValueType(VKind.LIST, elem_type=ValueType(VKind.STR))
-                elif fn in ("remove", "unlink", "mkdir", "rmdir", "rename"):
+                elif fn in ("remove", "unlink", "mkdir", "rmdir", "rename",
+                           "getsize", "path_getsize"):
                     return ValueType(VKind.INT)
                 elif fn in ("exists", "isfile", "isdir",
                            "path_exists", "path_isfile", "path_isdir"):
@@ -19062,6 +19076,8 @@ class CodeGen:
             elif mod == "os" and fn == "listdir":
                 return ValueType(VKind.LIST, elem_type=ValueType(VKind.STR))
             elif mod == "os" and fn in ("remove", "unlink", "mkdir", "rmdir", "rename"):
+                return ValueType(VKind.INT)
+            elif mod in ("os", "os.path") and fn in ("getsize", "path_getsize"):
                 return ValueType(VKind.INT)
             elif mod == "asyncio" and fn == "gather":
                 return ValueType(VKind.LIST, elem_type=ValueType(VKind.INT))
@@ -37303,6 +37319,7 @@ class CodeGen:
             "join": ("os_path_join", 2),
             "basename": ("os_path_basename", 1),
             "dirname": ("os_path_dirname", 1),
+            "getsize": ("os_path_getsize", 1),
         }
         if func_name in _os_path_fns:
             rt_key, n_args = _os_path_fns[func_name]

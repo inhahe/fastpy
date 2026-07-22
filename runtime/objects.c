@@ -8333,6 +8333,21 @@ int64_t fastpy_os_path_isdir(const char *path) {
 #endif
 }
 
+/* os.path.getsize(path) -> file size in bytes.  Python raises OSError when the
+ * path doesn't exist; pure/AOT mode surfaces that as -1 (mirroring the int
+ * error convention of os.remove/mkdir), so callers can branch on rc < 0. */
+int64_t fastpy_os_path_getsize(const char *path) {
+#ifdef _WIN32
+    struct _stat64 st;
+    if (_stat64(path, &st) != 0) return -1;
+    return (int64_t)st.st_size;
+#else
+    struct stat st;
+    if (stat(path, &st) != 0) return -1;
+    return (int64_t)st.st_size;
+#endif
+}
+
 const char* fastpy_os_path_join(const char *a, const char *b) {
     int alen = (int)strlen(a), blen = (int)strlen(b);
     char *buf = (char*)malloc(alen + blen + 2);
