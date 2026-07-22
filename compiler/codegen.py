@@ -19213,6 +19213,35 @@ class CodeGen:
                     return ValueType(VKind.INT)
                 elif fn == "ChainMap":
                     return ValueType(VKind.CHAINMAP)
+        # Native module method calls in *chained* (submodule) form, e.g.
+        # os.path.getmtime(f) / os.path.getsize(f) / os.path.join(a, b).  Here
+        # `node.func.value` is an Attribute (`os.path`), not a Name, so the
+        # Name-receiver native-module block above never runs — and the generic
+        # pyobj-receiver fallback further down tags the result PYOBJ.  When such
+        # a call is *assigned* to a variable, that PYOBJ tag then makes a later
+        # int()/float()/arith over the var bridge to CPython (stubbed in pure
+        # mode).  Recognize `<pkg>.<sub>.<fn>` where <pkg> (or `<pkg>.<sub>`) is
+        # a native module and map exactly the natively-lowered os.path
+        # functions to their return kinds — mirroring the direct-form block
+        # above and the `_os_path_fns` emit map.  Fixes
+        # BUG-SCALARKIND-LOST-ON-NATIVE-MODULE-CALL-ASSIGN.
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Attribute)
+                and isinstance(node.func.value.value, ast.Name)):
+            _pkg = node.func.value.value.id
+            _sub = node.func.value.attr
+            _fn = node.func.attr
+            _nm = getattr(self, '_native_modules', set())
+            if ((_pkg + "." + _sub) in _nm or _pkg in _nm):
+                if (_pkg == "os" and _sub == "path") or (_pkg + "." + _sub) == "os.path":
+                    if _fn in ("join", "basename", "dirname"):
+                        return ValueType(VKind.STR)
+                    if _fn == "getsize":
+                        return ValueType(VKind.INT)
+                    if _fn == "getmtime":
+                        return ValueType(VKind.FLOAT)
+                    if _fn in ("exists", "isfile", "isdir"):
+                        return ValueType(VKind.BOOL)
         # Collections module — from-import calls: Counter(), defaultdict(), deque()
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
             native_imports = getattr(self, '_native_imports', {})

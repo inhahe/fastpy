@@ -8,44 +8,6 @@ how to reproduce it, and what the proper fix looks like.
 
 ## Active Bugs
 
-### BUG-SCALARKIND-LOST-ON-NATIVE-MODULE-CALL-ASSIGN. A variable bound to a native `os.*`/`os.path.*` scalar result loses its VKind, so a later `int()`/`float()`/arith over it bridges to CPython — 2026-07-22
-
-**What:** when a native module call that returns a scalar (e.g.
-`os.path.getmtime(p)` → float, `os.path.getsize(p)` → int) is assigned to a
-variable, the variable's `VKind` is not recorded as the inferred scalar kind
-(FLOAT/INT). A subsequent builtin-cast call over that variable — most
-importantly `int(<var>)` — then treats the operand as a `PYOBJ` and lowers to
-`fpy_cpython_call1`/`fpy_cpython_getattr`/`fpy_cpython_import` (the CPython
-bridge), which is stubbed/undefined in pure mode. The **inline** form
-(`int(os.path.getmtime(p))`, no intermediate var) lowers natively (`fptosi`).
-
-**Reproduce (pure mode, verified 2026-07-22 via `llvm-nm` on `prog.o`):**
-```python
-b = os.path.getmtime(p)   # b's kind is not recorded as FLOAT
-c = int(b)                # int(b) sees b as PYOBJ → bridges to CPython
-```
-vs. the clean forms:
-```python
-c = int(os.path.getmtime(p))   # inline: native fptosi, bridge-free
-x = 3.5; y = int(x)            # float *literal* var: native, bridge-free
-```
-So it is specifically the *native-module-call result var* that loses its kind,
-not float vars in general.
-
-**Where:** `compiler/codegen.py` — `_assign_fv_fast_path` (~line 16580) routes
-the chained-native call (`_is_chained_native`, ~16627) to native lowering, but
-the assignment does not stamp the target variable's `VKind` from the call's
-inferred return type (the `_CSA_MODULE_FUNC_RETURNS` entry / the `mod`,`fn`
-inference at ~19168). The later `int(var)` at the builtin-cast site then can't
-see a scalar kind and falls back to the pyobj path.
-
-**Proper fix:** when the assignment fast-path handles a native module call whose
-inferred return type is a scalar (INT/FLOAT/BOOL/STR), record the target
-variable's `VKind` accordingly (mirror what the direct-argument form already
-knows via `_infer_call_type`). Then `int(var)`/`float(var)`/arith over the
-result would lower natively. **Workaround in use:** `services/fastpy-getmtime`
-inlines `int(os.path.getmtime(path))` to avoid the intermediate var.
-
 ### BUG-BIGINT-MUL-INT-NULL. A bigint × small-int multiply passes a NULL operand into `fpy_bigint_mul` and segfaults — 2026-07-21
 
 **What:** when the running value of an expression has been promoted to a
@@ -200,3 +162,33 @@ and the call site keeps the STR tag.
 result through a user function). The `services/fastpy-cat` and
 `services/fastpy-sysinfo` SlateOS utilities use the inline pattern for this
 reason.
+
+---
+
+## Recently Fixed
+
+### BUG-SCALARKIND-LOST-ON-NATIVE-MODULE-CALL-ASSIGN (fixed 2026-07-22)
+
+A variable bound to a *chained* native `os.path.*` scalar result
+(`b = os.path.getmtime(p)` → float, `b = os.path.getsize(p)` → int) was
+tagged `PYOBJ` instead of its true scalar kind, so a later `int(b)` /
+`float(b)` / arithmetic over it bridged to CPython
+(`fpy_cpython_call1`/`getattr`/`import`, stubbed/undefined in pure mode).
+The inline form (`int(os.path.getmtime(p))`) was unaffected because it never
+created an intermediate var.
+
+**Root cause:** `_infer_call_type_tag` only recognized native-module method
+calls when `node.func.value` was a bare `Name` (the two-level `os.getsize(f)`
+form). For the chained three-level form `os.path.getsize(f)`,
+`node.func.value` is an `Attribute` (`os.path`), so that block was skipped and
+the generic pyobj-receiver fallback tagged the result `PYOBJ`.
+
+**Fix:** added a chained-form handler in `_infer_call_type_tag`
+(compiler/codegen.py, just before the from-import collections block) that
+recognizes `<pkg>.<sub>.<fn>` where `<pkg>`/`<pkg>.<sub>` is a native module
+and maps the natively-lowered `os.path` functions to their kinds
+(join/basename/dirname→STR, getsize→INT, getmtime→FLOAT,
+exists/isfile/isdir→BOOL), mirroring the `_os_path_fns` emit map. Verified
+bridge-free via `llvm-nm` on the intermediate-var form, and exercised on
+SlateOS: `services/fastpy-getmtime` now uses `back = os.path.getmtime(path);
+got = int(back)` as an on-target regression test.
