@@ -8464,6 +8464,51 @@ int64_t fastpy_os_ftruncate(int64_t fd, int64_t length) {
 #endif
 }
 
+/* os.pwrite(fd, data, offset) -> bytes written (or -1). Positioned write: the
+ * bytes go to absolute file `offset` WITHOUT changing the fd's current file
+ * offset. On SlateOS this is posix pwrite() (atomic seek+write on SYS_FS_SEEK/
+ * SYS_FS_WRITE, restoring the offset) — distinct from write+lseek because the
+ * fd position is untouched. `data` is a fastpy str (NUL-terminated); we use
+ * strlen (NUL-free ASCII, matching the raw-fd I/O convention here). */
+int64_t fastpy_os_pwrite(int64_t fd, const char *data, int64_t offset) {
+    if (!data) return -1;
+    size_t n = strlen(data);
+#ifdef _WIN32
+    long long saved = _lseeki64((int)fd, 0, SEEK_CUR);
+    if (saved < 0) return -1;
+    if (_lseeki64((int)fd, (long long)offset, SEEK_SET) < 0) return -1;
+    int w = _write((int)fd, data, (unsigned)n);
+    (void)_lseeki64((int)fd, saved, SEEK_SET);
+    return (int64_t)w;
+#else
+    return (int64_t)pwrite((int)fd, data, n, (off_t)offset);
+#endif
+}
+
+/* os.pread(fd, n, offset) -> str of up to `n` bytes read from absolute file
+ * `offset` WITHOUT changing the fd's current file offset. On SlateOS this is
+ * posix pread() — distinct from lseek+read because the fd position is
+ * untouched. Returns a fastpy owned NUL-terminated string. */
+const char* fastpy_os_pread(int64_t fd, int64_t n, int64_t offset) {
+    if (n < 0) n = 0;
+    FpyString *s = fpy_str_alloc(n);
+    long got;
+#ifdef _WIN32
+    long long saved = _lseeki64((int)fd, 0, SEEK_CUR);
+    if (saved >= 0 && _lseeki64((int)fd, (long long)offset, SEEK_SET) >= 0) {
+        got = (long)_read((int)fd, s->data, (unsigned)n);
+        (void)_lseeki64((int)fd, saved, SEEK_SET);
+    } else {
+        got = -1;
+    }
+#else
+    got = (long)pread((int)fd, s->data, (size_t)n, (off_t)offset);
+#endif
+    if (got < 0) got = 0;
+    s->data[got] = '\0';
+    return s->data;
+}
+
 int64_t fastpy_os_path_exists(const char *path) {
 #ifdef _WIN32
     DWORD attrs = GetFileAttributesA(path);

@@ -2633,6 +2633,12 @@ class CodeGen:
         # os.ftruncate(fd, length) -> int status (0 ok, -1 error).
         ft = ir.FunctionType(i64, [i64, i64])
         self.runtime["os_ftruncate"] = ir.Function(self.module, ft, name="fastpy_os_ftruncate")
+        # os.pwrite(fd, data, offset) -> bytes written (i64); positioned write.
+        ft = ir.FunctionType(i64, [i64, i8_ptr, i64])
+        self.runtime["os_pwrite"] = ir.Function(self.module, ft, name="fastpy_os_pwrite")
+        # os.pread(fd, n, offset) -> str (i8_ptr); positioned read.
+        ft = ir.FunctionType(i8_ptr, [i64, i64, i64])
+        self.runtime["os_pread"] = ir.Function(self.module, ft, name="fastpy_os_pread")
         ft = ir.FunctionType(i64, [i8_ptr])
         self.runtime["os_path_exists"] = ir.Function(self.module, ft, name="fastpy_os_path_exists")
         self.runtime["os_path_isfile"] = ir.Function(self.module, ft, name="fastpy_os_path_isfile")
@@ -19138,9 +19144,9 @@ class CodeGen:
                 return ValueType(VKind.STR)
             elif mod == "os" and fn in ("getpid", "getppid", "gettid"):
                 return ValueType(VKind.INT)
-            elif mod == "os" and fn in ("write", "close", "dup", "lseek", "open", "ftruncate"):
+            elif mod == "os" and fn in ("write", "close", "dup", "lseek", "open", "ftruncate", "pwrite"):
                 return ValueType(VKind.INT)
-            elif mod == "os" and fn == "read":
+            elif mod == "os" and fn in ("read", "pread"):
                 return ValueType(VKind.STR)
             elif mod == "os" and fn == "pipe":
                 return ValueType(VKind.LIST, elem_type=ValueType(VKind.INT))
@@ -37489,6 +37495,44 @@ class CodeGen:
             fd = _fd_i64(self._emit_expr_value(node.args[0]))
             length = _fd_i64(self._emit_expr_value(node.args[1]))
             return self.builder.call(self.runtime["os_ftruncate"], [fd, length])
+        elif func_name == "pwrite" and len(node.args) == 3:
+            # os.pwrite(fd, data, offset) -> bare i64 bytes written. Positioned
+            # write: posix pwrite() places bytes at `offset` without moving the
+            # fd's file offset — distinct from write+lseek.
+            def _fd_i64(v):
+                if (isinstance(v.type, ir.LiteralStructType)
+                        and v.type == fpy_val):
+                    return self.builder.extract_value(v, 1)
+                if isinstance(v.type, ir.PointerType):
+                    return self.builder.ptrtoint(v, i64)
+                if isinstance(v.type, ir.DoubleType):
+                    return self.builder.fptosi(v, i64)
+                if isinstance(v.type, ir.IntType) and v.type.width != 64:
+                    return self.builder.zext(v, i64)
+                return v
+            fd = _fd_i64(self._emit_expr_value(node.args[0]))
+            data = self._ensure_ptr(self._emit_expr_value(node.args[1]))
+            offset = _fd_i64(self._emit_expr_value(node.args[2]))
+            return self.builder.call(self.runtime["os_pwrite"], [fd, data, offset])
+        elif func_name == "pread" and len(node.args) == 3:
+            # os.pread(fd, n, offset) -> str of up to n bytes read at absolute
+            # `offset` without moving the fd's file offset (posix pread()) —
+            # distinct from lseek+read.
+            def _fd_i64(v):
+                if (isinstance(v.type, ir.LiteralStructType)
+                        and v.type == fpy_val):
+                    return self.builder.extract_value(v, 1)
+                if isinstance(v.type, ir.PointerType):
+                    return self.builder.ptrtoint(v, i64)
+                if isinstance(v.type, ir.DoubleType):
+                    return self.builder.fptosi(v, i64)
+                if isinstance(v.type, ir.IntType) and v.type.width != 64:
+                    return self.builder.zext(v, i64)
+                return v
+            fd = _fd_i64(self._emit_expr_value(node.args[0]))
+            n = _fd_i64(self._emit_expr_value(node.args[1]))
+            offset = _fd_i64(self._emit_expr_value(node.args[2]))
+            return self.builder.call(self.runtime["os_pread"], [fd, n, offset])
         elif func_name == "listdir" and len(node.args) == 1:
             v = self._emit_expr_value(node.args[0])
             v = self._ensure_ptr(v)
@@ -37996,6 +38040,7 @@ class CodeGen:
         "os.pipe": "list:int", "os.read": "str",
         "os.write": "int", "os.close": "int", "os.dup": "int",
         "os.lseek": "int", "os.open": "int", "os.ftruncate": "int",
+        "os.pwrite": "int", "os.pread": "str",
         "os.path.join": "str", "os.path.dirname": "str",
         "os.path.basename": "str", "os.path.abspath": "str",
         "os.path.realpath": "str", "os.path.expanduser": "str",

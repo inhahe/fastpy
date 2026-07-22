@@ -1878,6 +1878,8 @@ extern int64_t fastpy_os_dup(int64_t fd);
 extern int64_t fastpy_os_lseek(int64_t fd, int64_t offset, int64_t whence);
 extern int64_t fastpy_os_open(const char *path, int64_t flags, int64_t mode);
 extern int64_t fastpy_os_ftruncate(int64_t fd, int64_t length);
+extern int64_t fastpy_os_pwrite(int64_t fd, const char *data, int64_t offset);
+extern const char* fastpy_os_pread(int64_t fd, int64_t n, int64_t offset);
 extern FpyList* fastpy_os_listdir(const char *path);
 extern int64_t fastpy_os_remove(const char *path);
 extern int64_t fastpy_os_mkdir(const char *path);
