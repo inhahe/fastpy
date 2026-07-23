@@ -2725,6 +2725,23 @@ class CodeGen:
         # SYS_EXECVE on SlateOS.
         ft = ir.FunctionType(i64, [i8_ptr, i8_ptr])
         self.runtime["os_execv"] = ir.Function(self.module, ft, name="fastpy_os_execv")
+        # os.fork() -> i64: child PID in the parent, 0 in the child, -1 on error.
+        # Backed by posix fork() -> SYS_PROCESS_FORK on SlateOS. The classic
+        # companion to os.execv: fork, then execv in the child.
+        ft = ir.FunctionType(i64, [])
+        self.runtime["os_fork"] = ir.Function(self.module, ft, name="fastpy_os_fork")
+        # os.waitpid(pid, options) -> FpyList* [pid, status] (as i8_ptr). CPython
+        # returns a (pid, status) tuple; pure mode unpacks a 2-element list the
+        # same way. Backed by posix waitpid() on SlateOS. Reaps a child; the
+        # status is decodable via os.WIFEXITED/os.WEXITSTATUS.
+        ft = ir.FunctionType(i8_ptr, [i64, i64])
+        self.runtime["os_waitpid"] = ir.Function(self.module, ft, name="fastpy_os_waitpid")
+        # os.WIFEXITED(status)/os.WEXITSTATUS(status) -> i64. Decode the raw wait
+        # status returned by os.waitpid: WIFEXITED is 1 for a normal exit, and
+        # WEXITSTATUS extracts the child's exit code.
+        ft = ir.FunctionType(i64, [i64])
+        self.runtime["os_wifexited"] = ir.Function(self.module, ft, name="fastpy_os_wifexited")
+        self.runtime["os_wexitstatus"] = ir.Function(self.module, ft, name="fastpy_os_wexitstatus")
         # os.path.getsize(path) -> file size in bytes (i64; -1 on error)
         ft = ir.FunctionType(i64, [i8_ptr])
         self.runtime["os_path_getsize"] = ir.Function(self.module, ft, name="fastpy_os_path_getsize")
@@ -19175,12 +19192,13 @@ class CodeGen:
                     return ValueType(VKind.STR)
                 elif fn in ("listdir",):
                     return ValueType(VKind.LIST, elem_type=ValueType(VKind.STR))
-                elif fn in ("stat", "statvfs"):
+                elif fn in ("stat", "statvfs", "waitpid"):
                     return ValueType(VKind.LIST, elem_type=ValueType(VKind.INT))
                 elif fn in ("remove", "unlink", "mkdir", "rmdir", "rename",
                            "getsize", "path_getsize", "symlink", "link",
                            "chmod", "truncate", "utime", "chown",
-                           "getuid", "getgid", "setuid", "setgid", "execv"):
+                           "getuid", "getgid", "setuid", "setgid", "execv",
+                           "fork", "WIFEXITED", "WEXITSTATUS"):
                     return ValueType(VKind.INT)
                 elif fn in ("readlink",):
                     return ValueType(VKind.STR)
@@ -19256,6 +19274,10 @@ class CodeGen:
                 return ValueType(VKind.INT)
             elif mod == "os" and fn in ("setuid", "setgid"):
                 return ValueType(VKind.INT)
+            elif mod == "os" and fn in ("fork", "WIFEXITED", "WEXITSTATUS"):
+                # os.fork() -> child pid / 0 / -1; os.WIFEXITED/os.WEXITSTATUS
+                # decode a waitpid status. All int-valued.
+                return ValueType(VKind.INT)
             elif mod == "os" and fn in ("nice", "getpriority", "setpriority"):
                 # os.nice(inc)/os.getpriority(which, who)/os.setpriority(which,
                 # who, prio) -> int. On SlateOS these issue the real
@@ -19269,7 +19291,8 @@ class CodeGen:
                 return ValueType(VKind.INT)
             elif mod == "os" and fn in ("read", "pread"):
                 return ValueType(VKind.STR)
-            elif mod == "os" and fn == "pipe":
+            elif mod == "os" and fn in ("pipe", "waitpid"):
+                # os.pipe() -> [r, w]; os.waitpid(pid, opts) -> [pid, status].
                 return ValueType(VKind.LIST, elem_type=ValueType(VKind.INT))
             elif mod == "os" and fn == "listdir":
                 return ValueType(VKind.LIST, elem_type=ValueType(VKind.STR))
@@ -37837,6 +37860,42 @@ class CodeGen:
             path = self._ensure_ptr(self._emit_expr_value(node.args[0]))
             argv = self._ensure_ptr(self._emit_expr_value(node.args[1]))
             return self.builder.call(self.runtime["os_execv"], [path, argv])
+        elif func_name == "fork" and len(node.args) == 0:
+            # os.fork() -> bare i64: child pid in the parent, 0 in the child, -1
+            # on error. Backed by posix fork() -> SYS_PROCESS_FORK on SlateOS.
+            return self.builder.call(self.runtime["os_fork"], [])
+        elif func_name == "waitpid" and len(node.args) == 2:
+            # os.waitpid(pid, options) -> FpyList* [pid, status] (as i8_ptr).
+            # Inference tags this LIST(INT), so `p, st = os.waitpid(c, 0)` works.
+            def _to_i64(v):
+                if isinstance(v.type, ir.LiteralStructType) and v.type == fpy_val:
+                    return self.builder.extract_value(v, 1)
+                if isinstance(v.type, ir.PointerType):
+                    return self.builder.ptrtoint(v, i64)
+                if isinstance(v.type, ir.DoubleType):
+                    return self.builder.fptosi(v, i64)
+                if isinstance(v.type, ir.IntType) and v.type.width != 64:
+                    return self.builder.zext(v, i64)
+                return v
+            pid = _to_i64(self._emit_expr_value(node.args[0]))
+            opts = _to_i64(self._emit_expr_value(node.args[1]))
+            return self.builder.call(self.runtime["os_waitpid"], [pid, opts])
+        elif func_name in ("WIFEXITED", "WEXITSTATUS") and len(node.args) == 1:
+            # os.WIFEXITED(status)/os.WEXITSTATUS(status) -> bare i64. Decode the
+            # raw wait status returned by os.waitpid.
+            def _to_i64(v):
+                if isinstance(v.type, ir.LiteralStructType) and v.type == fpy_val:
+                    return self.builder.extract_value(v, 1)
+                if isinstance(v.type, ir.PointerType):
+                    return self.builder.ptrtoint(v, i64)
+                if isinstance(v.type, ir.DoubleType):
+                    return self.builder.fptosi(v, i64)
+                if isinstance(v.type, ir.IntType) and v.type.width != 64:
+                    return self.builder.zext(v, i64)
+                return v
+            status = _to_i64(self._emit_expr_value(node.args[0]))
+            rt = "os_wifexited" if func_name == "WIFEXITED" else "os_wexitstatus"
+            return self.builder.call(self.runtime[rt], [status])
         elif func_name == "symlink" and len(node.args) == 2:
             # os.symlink(target, linkpath) -> bare i64 status (0 ok, -1 error).
             target = self._ensure_ptr(self._emit_expr_value(node.args[0]))
@@ -38343,6 +38402,8 @@ class CodeGen:
         "os.setuid": "int", "os.setgid": "int",
         "os.nice": "int", "os.getpriority": "int", "os.setpriority": "int",
         "os.pipe": "list:int", "os.read": "str",
+        "os.fork": "int", "os.waitpid": "list:int",
+        "os.WIFEXITED": "int", "os.WEXITSTATUS": "int",
         "os.write": "int", "os.close": "int", "os.dup": "int",
         "os.dup2": "int",
         "os.lseek": "int", "os.open": "int", "os.ftruncate": "int",

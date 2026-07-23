@@ -8290,6 +8290,7 @@ void fastpy_json_loads(const char *json_str, int32_t *out_tag, int64_t *out_data
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <sys/resource.h>
+#include <sys/wait.h>
 #include <fcntl.h>
 #endif
 
@@ -9020,6 +9021,68 @@ int64_t fastpy_os_execv(const char *path, FpyList *argv) {
      * failure; the list-owned strings are not ours to free. */
     free(cargv);
     return -1;
+#endif
+}
+
+/* os.fork() -> child PID in the parent, 0 in the child, -1 on failure.  On
+ * SlateOS posix fork() lowers to SYS_PROCESS_FORK: the kernel clones the
+ * caller's address space copy-on-write, duplicates its handle table
+ * (refcount-shared), and resumes the child at the same point with RAX forced to
+ * 0.  A single call site therefore yields both views — the classic fork/exec
+ * pattern (fork, then os.execv in the child, os.waitpid in the parent) that a
+ * shell/`init` uses to spawn a child without replacing itself.  Windows host
+ * builds have no fork(); they return -1. */
+int64_t fastpy_os_fork(void) {
+#ifdef _WIN32
+    return -1;
+#else
+    return (int64_t)fork();
+#endif
+}
+
+/* os.waitpid(pid, options) -> 2-element list [pid, status].  CPython returns a
+ * (pid, status) tuple; fastpy pure mode unpacks a 2-element list identically, so
+ * `p, st` = os.waitpid(child, 0) works.  On SlateOS posix waitpid() reaps a
+ * child and returns its raw wait status; we hand back both the reaped pid and
+ * the encoded status so a caller can decode it with os.WIFEXITED/os.WEXITSTATUS
+ * (or the raw value).  On error the returned pid is -1.  Windows: -1/0. */
+FpyList* fastpy_os_waitpid(int64_t pid, int64_t options) {
+    FpyList *lst = fpy_list_new(2);
+    int64_t rpid = -1, rstatus = 0;
+#ifndef _WIN32
+    int status = 0;
+    pid_t r = waitpid((pid_t)pid, &status, (int)options);
+    rpid = (int64_t)r;
+    rstatus = (int64_t)status;
+#else
+    (void)pid; (void)options;
+#endif
+    FpyValue vp; vp.tag = FPY_TAG_INT; vp.data.i = rpid; fpy_list_append(lst, vp);
+    FpyValue vs; vs.tag = FPY_TAG_INT; vs.data.i = rstatus; fpy_list_append(lst, vs);
+    return lst;
+}
+
+/* os.WIFEXITED(status) -> 1 if the child exited normally, else 0.  Decodes the
+ * raw wait status from os.waitpid.  Windows builds: the status is already a
+ * plain exit code (no encoding), so treat any status as "exited". */
+int64_t fastpy_os_wifexited(int64_t status) {
+#ifdef _WIN32
+    (void)status; return 1;
+#else
+    int s = (int)status;
+    return (int64_t)(WIFEXITED(s) ? 1 : 0);
+#endif
+}
+
+/* os.WEXITSTATUS(status) -> the child's exit code (low 8 bits) from a status
+ * that WIFEXITED reports as a normal exit.  On Windows the status is already the
+ * exit code. */
+int64_t fastpy_os_wexitstatus(int64_t status) {
+#ifdef _WIN32
+    return status & 0xff;
+#else
+    int s = (int)status;
+    return (int64_t)WEXITSTATUS(s);
 #endif
 }
 
