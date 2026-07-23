@@ -2718,6 +2718,13 @@ class CodeGen:
         # os.rename(src, dst) -> int status (0 ok, -1 error)
         ft = ir.FunctionType(i64, [i8_ptr, i8_ptr])
         self.runtime["os_rename"] = ir.Function(self.module, ft, name="fastpy_os_rename")
+        # os.execv(path, argv) -> i64; only returns on failure (-1). On success
+        # the calling process image is replaced by the new program (execv never
+        # returns). path is a str; argv is an FpyList* of str (opaque i8_ptr)
+        # that becomes the NULL-terminated C argv[]. Backed by posix execv() ->
+        # SYS_EXECVE on SlateOS.
+        ft = ir.FunctionType(i64, [i8_ptr, i8_ptr])
+        self.runtime["os_execv"] = ir.Function(self.module, ft, name="fastpy_os_execv")
         # os.path.getsize(path) -> file size in bytes (i64; -1 on error)
         ft = ir.FunctionType(i64, [i8_ptr])
         self.runtime["os_path_getsize"] = ir.Function(self.module, ft, name="fastpy_os_path_getsize")
@@ -19173,7 +19180,7 @@ class CodeGen:
                 elif fn in ("remove", "unlink", "mkdir", "rmdir", "rename",
                            "getsize", "path_getsize", "symlink", "link",
                            "chmod", "truncate", "utime", "chown",
-                           "getuid", "getgid", "setuid", "setgid"):
+                           "getuid", "getgid", "setuid", "setgid", "execv"):
                     return ValueType(VKind.INT)
                 elif fn in ("readlink",):
                     return ValueType(VKind.STR)
@@ -19268,7 +19275,7 @@ class CodeGen:
                 return ValueType(VKind.LIST, elem_type=ValueType(VKind.STR))
             elif mod == "os" and fn in ("stat", "statvfs"):
                 return ValueType(VKind.LIST, elem_type=ValueType(VKind.INT))
-            elif mod == "os" and fn in ("remove", "unlink", "mkdir", "rmdir", "rename", "symlink", "link", "chmod", "truncate", "utime", "chown"):
+            elif mod == "os" and fn in ("remove", "unlink", "mkdir", "rmdir", "rename", "symlink", "link", "chmod", "truncate", "utime", "chown", "execv"):
                 return ValueType(VKind.INT)
             elif mod == "os" and fn == "access":
                 return ValueType(VKind.BOOL)
@@ -37822,6 +37829,14 @@ class CodeGen:
             src = self._ensure_ptr(self._emit_expr_value(node.args[0]))
             dst = self._ensure_ptr(self._emit_expr_value(node.args[1]))
             return self.builder.call(self.runtime["os_rename"], [src, dst])
+        elif func_name == "execv" and len(node.args) == 2:
+            # os.execv(path, argv) -> only returns on failure (-1); on success
+            # the process image is replaced by the new program. path is a str;
+            # argv is a list[str] whose elements become the C argv[]
+            # (NULL-terminated). Backed by posix execv() -> SYS_EXECVE.
+            path = self._ensure_ptr(self._emit_expr_value(node.args[0]))
+            argv = self._ensure_ptr(self._emit_expr_value(node.args[1]))
+            return self.builder.call(self.runtime["os_execv"], [path, argv])
         elif func_name == "symlink" and len(node.args) == 2:
             # os.symlink(target, linkpath) -> bare i64 status (0 ok, -1 error).
             target = self._ensure_ptr(self._emit_expr_value(node.args[0]))

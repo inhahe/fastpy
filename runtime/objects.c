@@ -8986,6 +8986,43 @@ int64_t fastpy_os_rename(const char *src, const char *dst) {
     return (int64_t)(rename(src, dst) == 0 ? 0 : -1);
 }
 
+/* os.execv(path, argv) -> only returns on FAILURE (-1); on success the calling
+ * process image is REPLACED by the program at `path` (execv never returns).
+ * `argv` is an FpyList* of str whose elements become the NULL-terminated C
+ * argv[].  On SlateOS posix execv() lowers to SYS_EXECVE, so a fastpy program
+ * can resolve an installed /bin command by name and hand off to it — the core
+ * primitive a shell/`init` uses.  Python raises OSError on failure; in pure/AOT
+ * mode (no exception unwinding on this path) we surface the failure as -1 so a
+ * caller can branch on it, mirroring os.remove/os.rename. */
+int64_t fastpy_os_execv(const char *path, FpyList *argv) {
+#ifdef _WIN32
+    (void)path; (void)argv;
+    return -1;
+#else
+    if (path == NULL) return -1;
+    int64_t n = argv ? fpy_list_len(argv) : 0;
+    if (n < 0) n = 0;
+    /* +1 for the NULL terminator execv() requires. */
+    char **cargv = (char **)malloc((size_t)(n + 1) * sizeof(char *));
+    if (cargv == NULL) return -1;
+    for (int64_t i = 0; i < n; i++) {
+        FpyValue v = fpy_list_get(argv, i);
+        /* execv takes char *const argv[]; it does not modify the strings, so
+         * casting away const on the list-owned str is safe.  Non-str elements
+         * (shouldn't happen for a list[str]) degrade to an empty argument. */
+        cargv[i] = (v.tag == FPY_TAG_STR && v.data.s)
+                       ? (char *)v.data.s
+                       : (char *)"";
+    }
+    cargv[n] = NULL;
+    execv(path, cargv);
+    /* Only reached if execv failed (e.g. ENOENT). Free our scratch and report
+     * failure; the list-owned strings are not ours to free. */
+    free(cargv);
+    return -1;
+#endif
+}
+
 /* os.symlink(target, linkpath) -> 0 ok / -1 error.  Note the CPython argument
  * order: symlink(src, dst) creates dst as a link *pointing at* src.  On
  * SlateOS the posix libc symlink() maps to SYS_FS_SYMLINK (Rights::CREATE).
