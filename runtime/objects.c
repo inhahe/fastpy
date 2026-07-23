@@ -8566,6 +8566,24 @@ int64_t fastpy_os_open(const char *path, int64_t flags, int64_t mode) {
 #endif
 }
 
+/* os.umask(mask) -> the *previous* process file-mode creation mask. Sets the
+ * new mask (low 9 rwxrwxrwx bits) and returns the old one, matching POSIX
+ * umask(). On SlateOS this is posix umask(), which stores the mask in the
+ * userspace POSIX layer; subsequent file/dir creation (os.open O_CREAT,
+ * os.mkdir) masks its mode with it before handing the final permission bits
+ * to the kernel create primitive (SYS_FS_OPEN / SYS_FS_MKDIR). A genuine
+ * observable mutation: after os.umask(022), creating a 0777 file yields 0755
+ * on disk. */
+int64_t fastpy_os_umask(int64_t mask) {
+#ifdef _WIN32
+    /* Windows _umask only models the read-only bit; still returns the prior
+     * mask so chained get/set semantics work on the host build. */
+    return (int64_t)_umask((int)(mask & 0777));
+#else
+    return (int64_t)umask((mode_t)(mask & 0777));
+#endif
+}
+
 /* os.ftruncate(fd, length) -> 0 on success, -1 on error. Sets the size of the
  * regular file open on `fd` to exactly `length` bytes (extending with zeros or
  * discarding the tail). On SlateOS this is posix ftruncate() -> SYS_FS_FTRUNCATE

@@ -2670,6 +2670,9 @@ class CodeGen:
         # os.open(path, flags, mode) -> new raw int file fd (-1 error).
         ft = ir.FunctionType(i64, [i8_ptr, i64, i64])
         self.runtime["os_open"] = ir.Function(self.module, ft, name="fastpy_os_open")
+        # os.umask(mask) -> previous mask (i64). Sets the process create mask.
+        ft = ir.FunctionType(i64, [i64])
+        self.runtime["os_umask"] = ir.Function(self.module, ft, name="fastpy_os_umask")
         # os.ftruncate(fd, length) -> int status (0 ok, -1 error).
         ft = ir.FunctionType(i64, [i64, i64])
         self.runtime["os_ftruncate"] = ir.Function(self.module, ft, name="fastpy_os_ftruncate")
@@ -19255,7 +19258,7 @@ class CodeGen:
                 # kernel path (the scheduler's per-task priority) from every
                 # filesystem/credential syscall.
                 return ValueType(VKind.INT)
-            elif mod == "os" and fn in ("write", "close", "dup", "dup2", "lseek", "open", "ftruncate", "pwrite"):
+            elif mod == "os" and fn in ("write", "close", "dup", "dup2", "lseek", "open", "umask", "ftruncate", "pwrite"):
                 return ValueType(VKind.INT)
             elif mod == "os" and fn in ("read", "pread"):
                 return ValueType(VKind.STR)
@@ -37703,6 +37706,26 @@ class CodeGen:
                 # consulted when O_CREAT is set.
                 mode = ir.Constant(i64, 0o777)
             return self.builder.call(self.runtime["os_open"], [path, flags, mode])
+        elif func_name == "umask" and len(node.args) == 1:
+            # os.umask(mask) -> bare i64 previous mask. On SlateOS posix umask()
+            # stores the process file-mode creation mask in the userspace POSIX
+            # layer; subsequent os.open(O_CREAT)/os.mkdir mask their mode with
+            # it before the kernel create syscall stamps the final permission
+            # bits. A genuine observable mutation (umask(022) then create 0777
+            # -> 0755 on disk), distinct from every other os.* path.
+            def _u_i64(v):
+                if (isinstance(v.type, ir.LiteralStructType)
+                        and v.type == fpy_val):
+                    return self.builder.extract_value(v, 1)
+                if isinstance(v.type, ir.PointerType):
+                    return self.builder.ptrtoint(v, i64)
+                if isinstance(v.type, ir.DoubleType):
+                    return self.builder.fptosi(v, i64)
+                if isinstance(v.type, ir.IntType) and v.type.width != 64:
+                    return self.builder.zext(v, i64)
+                return v
+            mask = _u_i64(self._emit_expr_value(node.args[0]))
+            return self.builder.call(self.runtime["os_umask"], [mask])
         elif func_name == "ftruncate" and len(node.args) == 2:
             # os.ftruncate(fd, length) -> bare i64 status (0 ok, -1 error). On
             # SlateOS posix ftruncate() -> SYS_FS_FTRUNCATE resizes the file
@@ -38308,6 +38331,7 @@ class CodeGen:
         "os.write": "int", "os.close": "int", "os.dup": "int",
         "os.dup2": "int",
         "os.lseek": "int", "os.open": "int", "os.ftruncate": "int",
+        "os.umask": "int",
         "os.pwrite": "int", "os.pread": "str",
         "os.path.join": "str", "os.path.dirname": "str",
         "os.path.basename": "str", "os.path.abspath": "str",
