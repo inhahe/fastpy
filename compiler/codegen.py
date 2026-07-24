@@ -25619,6 +25619,21 @@ class CodeGen:
             return
         self._rc_temps.append((tag_val, data_val))
 
+    def _register_owned_str_ptr(self, result) -> ir.Value:
+        """Register a runtime-call result that is a freshly-allocated, owned
+        (+1) FpyString as a Model-2 owned temp, so it is released at the next
+        statement/expression boundary. No-op unless refcounting is on, the
+        result is a pointer, and the current block isn't terminated. Returns
+        `result` unchanged for call-site convenience."""
+        if (result is not None and self._USE_REFCOUNT
+                and isinstance(result, ir.Value)
+                and isinstance(result.type, ir.PointerType)
+                and self.builder is not None and self.builder.block is not None
+                and not self.builder.block.is_terminated):
+            data = self.builder.ptrtoint(result, i64)
+            self._register_owned_temp(ir.Constant(i32, FPY_TAG_STR), data)
+        return result
+
     def _owned_str_concat(self, args) -> ir.Value:
         """Emit a str_concat call and register its (freshly-allocated, +1)
         result as an owned temp so it is released at the statement boundary.
@@ -42258,7 +42273,32 @@ class CodeGen:
         "format": "_emit_str_format",
     }
 
+    # String methods that ALWAYS return a freshly-allocated, owned (+1)
+    # FpyString in every branch (verified against the runtime: each returns
+    # via fpy_str_buf / fpy_str_from_cstr even in the no-op/no-match case).
+    # (Excludes bool/int returns — is*/startswith/endswith/find/rfind/index/
+    # rindex/count — and non-STR heap returns — split/rsplit/splitlines→list,
+    # partition/rpartition→tuple, encode→bytes.  Also excludes `format`, which
+    # can return a *borrowed* single interpolated argument or an immortal
+    # constant — see _emit_str_format, which registers its own concat result.)
+    # Model-2: their result is registered as an owned temp so it's released at
+    # the statement boundary.
+    _STR_METHODS_RETURN_STR = frozenset({
+        "lower", "upper", "capitalize", "title", "swapcase", "casefold",
+        "zfill", "removeprefix", "removesuffix", "translate",
+        "strip", "lstrip", "rstrip", "center", "ljust", "rjust",
+        "expandtabs", "replace", "join",
+    })
+
     def _emit_method_call_str(self, node, obj):
+        """Emit string method calls via dispatch table. Returns None if not
+        recognized. Registers owned-string results (Model 2)."""
+        result = self._emit_method_call_str_inner(node, obj)
+        if result is not None and node.func.attr in self._STR_METHODS_RETURN_STR:
+            self._register_owned_str_ptr(result)
+        return result
+
+    def _emit_method_call_str_inner(self, node, obj):
         """Emit string method calls via dispatch table. Returns None if not recognized."""
         method = node.func.attr
         # str.join(obj_iter): materialize generator/iterator to list first
@@ -46137,20 +46177,29 @@ class CodeGen:
         if not parts:
             return self._make_string_constant("")
 
-        # Concatenate all parts
+        # Concatenate all parts.  A single part is returned as-is (may be a
+        # borrowed interpolated value or an immortal literal) — do NOT register
+        # it.  Multi-part results come from str_concat (fresh +1) — register
+        # each so they're released at the statement boundary (Model 2).
         result = parts[0]
         for part in parts[1:]:
-            result = self._rt_call("str_concat", [result, part])
+            result = self._owned_str_concat([result, part])
         return result
 
     def _value_to_str(self, value: ir.Value, node: ast.AST) -> ir.Value:
         """Convert an LLVM value to a string pointer (for f-string formatting)."""
         if isinstance(value.type, ir.IntType) and value.type.width == 64:
-            return self.builder.call(self.runtime["int_to_str"], [value])
+            # int_to_str always allocates a fresh owned (+1) FpyString — register
+            # it so the interpolated piece is released at the statement boundary
+            # (Model 2).  The concat that consumes it only copies bytes.
+            return self._register_owned_str_ptr(
+                self.builder.call(self.runtime["int_to_str"], [value]))
         elif isinstance(value.type, ir.DoubleType):
-            return self.builder.call(self.runtime["float_to_str"], [value])
+            # float_to_str likewise always allocates fresh owned.
+            return self._register_owned_str_ptr(
+                self.builder.call(self.runtime["float_to_str"], [value]))
         elif isinstance(value.type, ir.PointerType):
-            return value  # already a string
+            return value  # already a string (borrowed) — do NOT register
         elif isinstance(value.type, ir.IntType) and value.type.width == 32:
             # Bool — format as "True" or "False"
             true_str = self._make_string_constant("True")
@@ -46253,9 +46302,13 @@ class CodeGen:
         if not parts:
             return self._make_string_constant("")
 
+        # Single part is returned as-is (may be a borrowed interpolated arg or
+        # an immortal literal constant) — do NOT register it as owned.
+        # Multi-part results come from str_concat (fresh +1) — register each so
+        # they're released at the statement boundary (Model 2).
         result = parts[0]
         for part in parts[1:]:
-            result = self._rt_call("str_concat", [result, part])
+            result = self._owned_str_concat([result, part])
         return result
 
     def _apply_format_spec(self, value: ir.Value, spec: str, arg_node: ast.expr, node: ast.AST) -> ir.Value:

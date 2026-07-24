@@ -1960,6 +1960,12 @@ void fastpy_dict_set_fv(FpyDict *dict, const char *key,
                          int32_t tag, int64_t data) {
     FpyValue k = fpy_str(key);
     FpyValue v; v.tag = tag; v.data.i = data;
+    /* Retain the stored value+key (Model-2 borrowed-at-boundary model):
+     * every retaining container store increfs so a producer's owned temp
+     * survives the statement-boundary flush. Matches the internal
+     * fpy_dict_set and fpy_dict_destroy (which decrefs both). */
+    FPY_VAL_INCREF(k);
+    FPY_VAL_INCREF(v);
     uint64_t h = fpy_hash_string(key);
     int64_t mask = dict->table_size - 1;
     int64_t slot = (int64_t)(h & (uint64_t)mask);
@@ -1972,7 +1978,11 @@ void fastpy_dict_set_fv(FpyDict *dict, const char *key,
         } else if (dict->keys[idx].tag == FPY_TAG_STR
                    && (dict->keys[idx].data.s == key
                        || strcmp(dict->keys[idx].data.s, key) == 0)) {
+            /* Overwrite: release old value's dict-ref; the key is unchanged
+             * so undo the key incref we took above. */
+            FPY_VAL_DECREF(dict->values[idx]);
             dict->values[idx] = v;
+            FPY_VAL_DECREF(k);
             return;
         }
         slot = (slot + 1) & mask;
@@ -2104,6 +2114,9 @@ void fastpy_dict_set_int_fv(FpyDict *dict, int64_t key,
                              int32_t tag, int64_t data) {
     FpyValue k = fpy_int(key);
     FpyValue v; v.tag = tag; v.data.i = data;
+    /* Retain the stored value (int key is not refcounted). See
+     * fastpy_dict_set_fv for the rationale. */
+    FPY_VAL_INCREF(v);
     uint64_t h = fpy_hash_int(key);
     int64_t mask = dict->table_size - 1;
     int64_t slot = (int64_t)(h & (uint64_t)mask);
@@ -2115,6 +2128,7 @@ void fastpy_dict_set_int_fv(FpyDict *dict, int64_t key,
             if (first_deleted < 0) first_deleted = slot;
         } else if (dict->keys[idx].tag == FPY_TAG_INT
                    && dict->keys[idx].data.i == key) {
+            FPY_VAL_DECREF(dict->values[idx]);
             dict->values[idx] = v;
             return;
         }
@@ -2187,6 +2201,9 @@ void fastpy_dict_set_kv_fv(FpyDict *dict,
                             int32_t val_tag, int64_t val_data) {
     FpyValue k; k.tag = key_tag; k.data.i = key_data;
     FpyValue v; v.tag = val_tag; v.data.i = val_data;
+    /* Retain the stored value+key. See fastpy_dict_set_fv for rationale. */
+    FPY_VAL_INCREF(k);
+    FPY_VAL_INCREF(v);
     uint64_t h = fpy_hash_value(k);
     int64_t mask = dict->table_size - 1;
     int64_t slot = (int64_t)(h & (uint64_t)mask);
@@ -2197,7 +2214,9 @@ void fastpy_dict_set_kv_fv(FpyDict *dict,
         if (idx == FPY_DICT_DELETED) {
             if (first_deleted < 0) first_deleted = slot;
         } else if (fpy_key_equal(dict->keys[idx], k)) {
+            FPY_VAL_DECREF(dict->values[idx]);
             dict->values[idx] = v;
+            FPY_VAL_DECREF(k);
             return;
         }
         slot = (slot + 1) & mask;
@@ -2305,6 +2324,13 @@ FpyDict* fastpy_dict_from_pairs(FpyList *pairs) {
 
 void fastpy_dict_clear(FpyDict *dict) {
     FPY_LOCK(dict);
+    /* Release the dict's owned refs on every entry before dropping them
+     * (retain model — see fastpy_dict_set_fv). Without this, clearing a
+     * dict/set that holds heap keys/values leaks them. */
+    for (int64_t i = 0; i < dict->length; i++) {
+        FPY_VAL_DECREF(dict->keys[i]);
+        FPY_VAL_DECREF(dict->values[i]);
+    }
     dict->length = 0;
     memset(dict->indices, 0xFF, dict->table_size * sizeof(int64_t));
     FPY_UNLOCK(dict);

@@ -8,6 +8,61 @@ how to reproduce it, and what the proper fix looks like.
 
 ## Active Bugs
 
+### BUG-LIST-ELEM-STR-TAG-LOST. A list whose string element type isn't statically visible as a `str` Constant is typed `list[int]`, so reading the element back mis-tags it (e.g. `len()` → 0) — 2026-07-24
+
+**What:** list element-type inference only recognises **constant** string
+elements. When a string element is a non-constant expression (str concat
+`a+b`, a `str` Name variable, `str()`/`.upper()`/f-string, etc.), or when the
+list is built with `[]` + `.append(...)`, the list is typed `list[int]`.
+Subsequent reads (`lst[0]`, `for x in lst`) then reinterpret the stored string
+pointer as an `int`, so `len(lst[0])` returns 0 and the value is silently wrong.
+
+**Reproduce (real compile path, differs from CPython):**
+```python
+a='ab'; b='cd'
+l1=[]; l1.append(a+b);  print(len(l1[0]))   # fastpy 0, CPython 4
+c=a+b; l2=[]; l2.append(c); print(len(l2[0]))  # fastpy 0, CPython 4
+l3=[a+b];               print(len(l3[0]))   # fastpy 0, CPython 4
+lit=['abcd','efgh'];    print(len(lit[0]))  # fastpy 4, CPython 4 (constants OK)
+```
+CPython: `4 4 4 4`; fastpy: `0 0 0 4`. Not covered by the differential suite
+(the failing patterns aren't exercised there). Verified pre-existing (reproduces
+on parent commit `ac1fb3b`, before the Model-2 work) — this is a type-inference
+bug, **not** a refcount/UAF bug (the string isn't freed, just mis-tagged; no ASan
+report).
+
+**Where:** `_infer_list_elem_type` (codegen.py ~20296) — the `ast.List`/`ast.Tuple`
+first-element fast paths only return `STR` for `ast.Constant` str (20370) and a
+few attribute patterns; a `BinOp`/`Name`/`Call` string element falls through to
+`return ValueType(VKind.INT)` (20428). Two facets:
+  - **(a) literal `[a+b]` / `[c]`** — fixable in `_infer_list_elem_type` by adding
+    static string-expression detection (BinOp(Add) typed STR, Name of a str var,
+    str()/str-method/JoinedStr calls) to the first-element fast paths (mirror the
+    numeric-BinOp handling already present at ~20334).
+  - **(b) `l=[]; l.append(<str>)`** — harder/flow-sensitive: an empty-list literal
+    is typed `list[int]` and `.append()` does not upgrade the list's element type.
+    Proper fix tracks/updates the variable's element ValueType when a homogeneous
+    non-int value is appended (or infers list element type from all append sites in
+    the function, like the global-scope pass at ~3364 does for module lists).
+
+**Impact:** silent wrong output (worse than a leak) for the common
+build-a-list-of-strings-by-append pattern and list literals with computed string
+elements. Same root family as the (fixed) BUG-VERSIONINFO-TUPLE-STR-INCREF
+(bare-pointer element tag inference).
+
+**Refcount entanglement (do with the container Model-2 stage):** fixing facet
+(a) so `[a+b]` is typed `list[str]` is NOT purely additive — it interacts with
+BUG-CODEGEN-OWNED-TEMP-OVER-INCREF. Today `[a+b]` is "safe" only because the
+mis-typing means the concat is stored/read as an int and never dereferenced as a
+string; the Model-2 boundary flush frees the concat (registered by
+`_owned_str_concat`) but nothing derefs the freed memory. Once correctly typed
+`list[str]`, the freed pointer WOULD be read as a string → UAF **iff** list-literal
+element insertion *steals* the concat's +1 instead of increfing. So before
+applying facet (a), verify list-literal/append element insertion increfs the
+element (Model 2: all consumers incref); do facet (a) in lockstep with converting
+containers to Model 2, with a native-ASan check on `[a+b]`, `[str(i) for ...]`,
+and `lst.append(a+b)` read-back.
+
 ### BUG-CODEGEN-OWNED-TEMP-OVER-INCREF. Owned expression temps leak a refcount; being migrated to Model 2 (borrowed-at-boundary). Stage 1 done: str-concat temps released at statement boundary — 2026-07-24 (partially fixed)
 
 **What:** `_store_variable` (codegen.py:~21434) increfs the stored value unless
@@ -56,12 +111,16 @@ str-concat producers converted.
   site**, not the callee return (even a perfect callee would leak there). Also
   covers the dynamic MIXED `a+b` binop path (33078), which is runtime-conditional
   so can't be registered unconditionally.
-- **Containers/objects** (Stage 3): still use store-site `_steal` (Model 1). They
-  don't leak *observably* because lists/dicts/objects are `fpy_gc_track`'d
+- **Containers/objects** (Stage 3): codegen still uses store-site `_steal` (Model 1)
+  for container/class *literals*, but the runtime container setters have been made
+  **retain-consistent** (see BUG-CONTAINER-STORE-STR-TEMP-UAF below) so a registered
+  str temp stored via `dict[k]=<str-expr>` is no longer a UAF. Containers don't leak
+  *observably* because lists/dicts/objects are `fpy_gc_track`'d
   (objects.c:320/1870/6957) so a leaked refcount is GC-swept; strings are pure-
-  refcounted (no `gc_node`) so their leaks are genuine/LSan-visible. When converting
-  containers to Model 2, the container `_steal` cases must be removed in lockstep
-  (register + steal = double-release → UAF).
+  refcounted (no `gc_node`) so their leaks are genuine/LSan-visible. When fully
+  converting containers to Model 2, the codegen container `_steal` cases must be
+  removed in lockstep (register + steal into a now-retaining setter = double-release
+  → UAF).
 
 **Why the staging is safe:** registration is purely additive (more boundary
 decrefs). A value is only ever registered by ONE producer, and no registered value
@@ -231,6 +290,56 @@ reason.
 ---
 
 ## Recently Fixed
+
+### BUG-CONTAINER-STORE-STR-TEMP-UAF (fixed 2026-07-24)
+
+Storing a Model-2-registered owned **string temp** into a dict/set via the
+`_fv` (flat-value) setters caused a **heap-use-after-free**: the setter *stole*
+the pointer (no incref), but the statement-boundary watermark flush released the
+temp's +1 (Stage 1/2 of BUG-CODEGEN-OWNED-TEMP-OVER-INCREF) **and**
+`fpy_dict_destroy` also decrefs stored values at teardown — so the concat's one
+refcount was conceptually freed twice while the container held a now-dangling
+borrowed pointer. Reproduced under native ASan with `d["k"] = a + b` inside a
+loop (heap-use-after-free on the freed `FpyString`).
+
+**Root cause:** the `_fv` dict setters were the sole **steal-model outliers** in
+an otherwise retain-consistent runtime. `fastpy_dict_set_fv` /
+`fastpy_dict_set_int_fv` / `fastpy_dict_set_kv_fv` (objects.c ~1959/2103/2185)
+stored the caller's value *without* increfing, whereas the internal
+`fpy_dict_set_unlocked` (1880), list append, `set_add_fv`, and both obj setters
+(`fastpy_obj_set_slot`/`fastpy_obj_set_fv`, 6970/7006) already **retained**
+(increfed on store, decrefed the old value on overwrite). Because
+`fpy_dict_destroy` decrefs, the steal path left the container's held ref
+unbalanced against both the destroy-time decref and the Model-2 boundary flush.
+
+**Fix (objects.c):** make the three `_fv` dict setters retain, matching the
+internal setter / list / obj / set paths — the *safe* direction (a missed
+release only ever leaks a GC-backstopped container ref; it can never UAF):
+- `fastpy_dict_set_fv`: `FPY_VAL_INCREF(k); FPY_VAL_INCREF(v);` after building the
+  value; the string-key overwrite branch now `FPY_VAL_DECREF`s the old value and
+  `FPY_VAL_DECREF`s the (already-held) new key before returning.
+- `fastpy_dict_set_int_fv`: `FPY_VAL_INCREF(v);` (int key isn't refcounted);
+  overwrite branch decrefs the old value.
+- `fastpy_dict_set_kv_fv`: `FPY_VAL_INCREF(k); FPY_VAL_INCREF(v);`; `fpy_key_equal`
+  overwrite branch decrefs the old value and the new key.
+- `fastpy_dict_clear`: now decrefs every key+value before zeroing `length` (was
+  leaking all entries). `fastpy_dict_set_int_int` left unchanged (pure int
+  key+value, no heap refs).
+
+**Why this is correct / why no codegen leak-recovery was needed:** container
+*values* are GC-tracked (FpyList/FpyDict/FpyObj mark-swept in gc.c), so any
+residual creation-ref on a stored list/dict/obj value is swept at exit — no
+permanent leak, so codegen doesn't need to release unregistered container-value
+producers. **Strings** are the only refcount-only heap type (no `gc_node`), and
+the retain fix makes their store balance exactly against the Model-2 boundary
+flush. Misclassifying owned→borrowed only leaks (safe); the dangerous
+borrowed→owned direction is avoided because the setter now always takes its own
+ref.
+
+**Validated:** native-ASan probes — dict value, dict key, overwrite, str-method
+value, set literal, `dict.clear`, obj attr, nested dict, and a 200-iteration
+reassign-each-loop stress (`P` attr + nested dict) — all leak-free, no UAF,
+correct output (EXIT=0); full differential suite **314 passed**.
 
 ### BUG-VERSIONINFO-TUPLE-STR-INCREF (fixed 2026-07-24)
 
