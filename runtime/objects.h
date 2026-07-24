@@ -284,6 +284,25 @@ typedef struct {
 
 /* Allocate a refcounted string of `len` chars (+ null terminator). */
 FpyString* fpy_str_alloc(int64_t len);
+
+/* Copy `len` bytes of `src` into a fresh refcounted (headered) string and
+ * return a pointer to its char data (i.e. what a STR-tagged FpyValue.data.s
+ * should point at). Unlike a bare `malloc`+`fpy_str`, the returned pointer has
+ * a valid FpyString header 8 bytes before it, so `fpy_str_header`/incref/decref
+ * work and the string is freed exactly once via the header (no leak, no
+ * out-of-bounds header read). Use this — not `fpy_strdup`/`malloc` — for any
+ * char* that becomes a STR value. See BUG-RUNTIME-STR-PRODUCERS-BARE-MALLOC. */
+static inline char* fpy_str_copy(const char *src, int64_t len) {
+    FpyString *h = fpy_str_alloc(len);
+    if (len > 0) memcpy(h->data, src, (size_t)len);
+    h->data[len] = '\0';
+    return h->data;
+}
+/* Convenience: headered copy of a NUL-terminated C string. */
+static inline char* fpy_str_from_cstr(const char *src) {
+    return fpy_str_copy(src, (int64_t)strlen(src));
+}
+
 /* Get the FpyString header from a char* data pointer. Returns NULL if not owned. */
 static inline FpyString* fpy_str_header(const char *s) {
     FpyString *h = (FpyString*)((char*)s - offsetof(FpyString, data));

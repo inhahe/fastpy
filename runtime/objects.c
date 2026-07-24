@@ -1606,12 +1606,12 @@ FpyList* fastpy_str_split(const char *s) {
         /* Find end of word */
         const unsigned char *start = p;
         while (*p && _fpy_ws_fwd(p) == 0) p++;
-        /* Copy word */
+        /* Copy word into a headered (refcounted) string — see fpy_str_copy /
+         * BUG-RUNTIME-STR-PRODUCERS-BARE-MALLOC. A bare malloc here would leave
+         * the STR value without an FpyString header, leaking it and making
+         * fpy_str_header read out of bounds. */
         int64_t len = p - start;
-        char *word = (char*)malloc(len + 1);
-        memcpy(word, start, len);
-        word[len] = '\0';
-        fpy_list_append(result, fpy_str(word));
+        fpy_list_append(result, fpy_str(fpy_str_copy((const char*)start, len)));
     }
     return result;
 }
@@ -4230,10 +4230,11 @@ FpyList* fastpy_str_split_max(const char *s, const char *sep, int64_t max_split)
     while (p <= end) {
         if (max_split >= 0 && splits >= max_split) {
             size_t rest_len = end - p;
-            char *seg = (char*)malloc(rest_len + 1);
-            memcpy(seg, p, rest_len);
-            seg[rest_len] = '\0';
-            fpy_list_append(result, fpy_str(seg));
+            /* Use fpy_str_copy so the result carries a proper FpyString header
+               (magic + refcount); a bare malloc would be headerless and cause
+               an OOB read in fpy_str_header on incref/decref.
+               See BUG-RUNTIME-STR-PRODUCERS-BARE-MALLOC. */
+            fpy_list_append(result, fpy_str(fpy_str_copy(p, (int64_t)rest_len)));
             break;
         }
         const char *q = (p <= end) ? strstr(p, sep) : NULL;
@@ -4242,17 +4243,11 @@ FpyList* fastpy_str_split_max(const char *s, const char *sep, int64_t max_split)
                if the string ended with the separator, which is correct:
                "a ".split(" ") → ["a", ""]). */
             size_t rest_len = end - p;
-            char *seg = (char*)malloc(rest_len + 1);
-            memcpy(seg, p, rest_len);
-            seg[rest_len] = '\0';
-            fpy_list_append(result, fpy_str(seg));
+            fpy_list_append(result, fpy_str(fpy_str_copy(p, (int64_t)rest_len)));
             break;
         }
         size_t seg_len = q - p;
-        char *seg = (char*)malloc(seg_len + 1);
-        memcpy(seg, p, seg_len);
-        seg[seg_len] = '\0';
-        fpy_list_append(result, fpy_str(seg));
+        fpy_list_append(result, fpy_str(fpy_str_copy(p, (int64_t)seg_len)));
         p = q + sep_len;
         splits++;
     }
