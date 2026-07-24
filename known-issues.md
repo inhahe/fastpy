@@ -8,73 +8,83 @@ how to reproduce it, and what the proper fix looks like.
 
 ## Active Bugs
 
-### BUG-RUNTIME-STR-PRODUCERS-BARE-MALLOC. Most runtime string methods return bare `malloc`'d `char*` with no `FpyString` header → OOB read in `fpy_str_header` + memory leak — 2026-07-24
+### BUG-VERSIONINFO-TUPLE-STR-INCREF. Assigning `sys.version_info` to a variable increfs the tuple pointer via the STR path → OOB read + refcount imbalance — 2026-07-24
 
-**What:** the pure-mode/native string-ownership model (objects.h:261-300) says a
-STR-tagged `FpyValue.data.s` points at `FpyString.data`, with an
-`{i32 magic, i32 refcount}` header in the **8 bytes before** that pointer.
-`fpy_str_header(s)` reads `s-8` and checks the magic to decide ownership;
-`fpy_str_incref`/`_decref` and the `fpy_rc_decref` free path all depend on that
-header being present. **But most runtime string-*producing* functions don't
-allocate a header** — they do `char *r = malloc(len+1); …; return fpy_str(r)`.
-For those strings `fpy_str_header(r)` dereferences `r-8`, which is 8 bytes
-*before* the malloc block → an out-of-bounds read.
+**What:** `sys.version_info` is statically typed `TUPLE(elem=INT)` by
+`_native_module_attr_vtype` (codegen.py:39411-39412), but the *store-incref*
+emitted for `a = sys.version_info` uses the **STR** refcount path, not the list
+path. So codegen emits `fpy_rc_incref(FPY_TAG_STR, <FpyList*>)` on the tuple
+pointer, and `fpy_str_header((char*)list - 8)` reads 8 bytes before the
+`fpy_list_new` struct allocation.
 
-Two consequences:
-1. **Heap-buffer-overflow (read) under ASan.** Any code that increfs/decrefs
-   such a string (container insertion, reassignment, scope exit) calls
-   `fpy_str_header(r-8)` and reads off the front of the allocation. Benign on
-   real hardware/SlateOS (the OS boots green — the stray bytes almost never
-   match the `"STRC"` magic, so it's treated as non-owned), but it's a genuine
-   UB read that ASan flags. First observed at `"…".split()` in a string-stress
-   test under the native-ASan harness (heap-buffer-overflow in
-   `fpy_str_header`, objects.h:290).
-2. **Memory leak.** Because `fpy_str_header` returns NULL for these bare
-   strings, `fpy_str_decref` no-ops and the malloc block is never freed. Low
-   impact for the short-lived AOT binaries (each SlateOS service process exits
-   quickly), but it's a real leak.
+**Reproduce (native-ASan harness):**
+```python
+import sys
+a = sys.version_info
+print(a[0])
+```
+→ `heap-buffer-overflow READ of size 4 in fpy_str_header`, 8 bytes before the
+104-byte (`sizeof(FpyList)`) region allocated by `fastpy_sys_version_info`
+(runtime.c:1377). The bad incref is emitted directly in `fastpy_main`.
 
-**Where (non-exhaustive — ~40 sites in `runtime/objects.c`):** `fastpy_str_split`
-(1598), `fastpy_bytes_split` (1620), `fastpy_str_join` (1638), string concat
-(1047/1061/1074), the `upper`/`lower`/`strip`/`replace`/`center`/`ljust`/`rjust`
-family and `splitlines`/`rsplit`/`partition` (~3653-4210), plus more. The
-*correct* pattern already exists and is used in a few places (e.g. reversed at
-1586, and `fpy_str_alloc` at 71): `FpyString *h = fpy_str_alloc(len);
-memcpy(h->data, …); … return fpy_str(h->data);`.
+**Impact:** benign in production (non-ASan) — the stray 4 bytes almost never
+equal the `"STRC"` magic, so `fpy_str_header` returns NULL and the incref is
+silently skipped. That's why the differential suite (314) passes. But it's (a) a
+genuine UB read, and (b) a **refcount-model violation**: the tuple's refcount is
+never incremented on assignment (and would be decref'd via the same wrong STR
+path), so the ownership bookkeeping for a variable holding `version_info` is
+wrong. Narrow trigger: only assigning the *whole* tuple to a variable; the
+common `sys.version_info.major` / inline `sys.version_info[0]` don't hit the
+store-incref.
 
-**Why this is NOT a quick fix / why it's logged instead of done inline:** the
-runtime has an *inconsistent* ownership model — some STR data pointers are bare
-(freed, if at all, via direct `free((void*)s)`) and some are headered (freed via
-`fpy_str_header`). There are direct `free()` calls on STR data pointers
-(objects.c:9225 `free((void*)key.data.s)`, 10421 `free((void*)formatted)`, and
-others). Converting a producer to headered allocation **without** also fixing
-every direct-free site to free `fpy_str_header(s)` instead of `s` would free the
-wrong address (data ptr = header+8) → heap corruption. So the proper fix is a
-coordinated pass, not a per-site edit.
+**Root cause:** the RHS-type inference at the assignment/incref site doesn't
+consult `_native_module_attr_vtype` for `sys.version_info`; an `i8*`-returning
+native call defaults to STR for the incref decision. Same *class* of "scalar/
+container kind lost on native-module-call assign" as the already-fixed
+BUG-SCALARKIND-LOST-ON-NATIVE-MODULE-CALL-ASSIGN, but for the container (TUPLE)
+kind and specifically the store-incref.
 
-**Proper fix (dedicated task):** unify the string-ownership model so *every*
-STR-tagged data pointer is headered.
-1. Add a central helper in objects.h, e.g. `fpy_str_copy(const char *src,
-   int64_t len)` (headered alloc + memcpy → returns `->data`) and
-   `fpy_str_buf(int64_t len)` (headered writable buffer → returns `->data`) for
-   incremental-build sites.
-2. Replace every `malloc(len+1)+…+fpy_str(r)` producer with the helper.
-3. Audit **all** direct `free()`/`realloc()` of STR data pointers and route them
-   through `fpy_str_header` (free the header, not the data ptr). Grep
-   `free((void*)` and `free((void *)` in objects.c and check each against string
-   flow.
-4. Validate with the full differential suite **and** a broad native-ASan string
-   stress (split/join/concat/slice/format/upper/lower/replace/strip). NOTE: the
-   host differential suite is currently unrunnable on this Windows machine
-   (`objects.c(8685): C2079 '_stat64' undefined` under MSVC/cl.exe), so this
-   fix is blocked on either fixing that build breakage or standing up an
-   equivalent ASan-based oracle harness.
+**Proper fix:** make the assignment path resolve the RHS `ValueType` via
+`_native_module_attr_vtype` (or the general native-call return-type table) so
+the store-incref for `a = sys.version_info` uses the list/tuple refcount path
+(`fpy_list_incref`). Then re-run the native-ASan harness on the reproducer above
+plus `sys.argv`/`sys.path` assignment (same code path) and the full differential
+suite. Note: also a *heterogeneous* tuple — `elem=INT` is a lie (index 3 is STR
+"final"), so `b = a[3]` is typed INT while holding a STR value; a complete fix
+should model version_info's element types per-index or fall back to a dynamic
+element kind. (The STR element itself is now header-backed — see
+STR-CONSTANT/PRODUCERS fixes under Recently Fixed.)
 
-**Already fixed (separate, narrower class):** string *constants* from `.rodata`
-used to be bare too; codegen now emits them as an immortal
-`{magic, IMMORTAL_refcount, data[]}` struct so `fpy_str_header(ptr-8)` lands on
-a real header. See "STR-CONSTANT-BARE-HEADER (fixed 2026-07-24)" under Recently
-Fixed. That fix does **not** touch the runtime heap producers above.
+### BUG-CODEGEN-STR-TEMP-NOT-DECREFFED. Owned STR expression results are incref'd on store but never temp-decref'd → +1 leak per assignment — 2026-07-24
+
+**What:** on `x = <str-returning-expr>`, codegen decref's the old value of `x`,
+increfs the new value, and stores it — but for STR-*producing* expressions (str
+concat, `str()`/`fv_str`, `json.dumps`, `hex`/`oct`/`bin`, format-spec, etc.) it
+**omits** the trailing temp-decref that it *does* emit for LIST-returning calls
+(e.g. `str.split`). A runtime STR producer returns a fresh string at refcount 1;
+the store-incref bumps it to 2; with no temp-decref the refcount never returns
+to 1 for the single owner → the string leaks (refcount stuck at 2).
+
+**Reproduce (native-ASan harness, `ASAN_OPTIONS=detect_leaks=1`):**
+```python
+for i in range(1000):
+    s = "x" + str(i)     # str concat: fresh STR at rc 1, store increfs to 2, no temp-decref
+```
+→ LeakSanitizer reports direct leaks in `fastpy_str_concat` (runtime.c). Proven
+this session with a minimal `_cmp.py` harness. (Container-element producers like
+`split` are *not* affected — the LIST path already emits the balancing
+temp-decref, and LSan confirms split/partition/glob are balanced.)
+
+**Impact:** a per-assignment memory leak for every owned STR expression result.
+Low impact for short-lived AOT binaries but a real leak; independent of the
+now-fixed runtime header work (it only became *observable* once producers were
+headered, because before that `fpy_str_decref` no-oped on unheadered strings).
+
+**Proper fix:** in codegen's assignment lowering, emit the trailing
+temp-decref for owned STR temporaries after the store, matching the existing
+LIST-result path. Care: only for *owned* (freshly produced, refcount-1) STR
+temporaries — borrowed STR fast-paths (e.g. dict f-string value hits) must not
+be decref'd. Validate with the ASan leak harness above + full differential.
 
 ### BUG-BIGINT-MUL-INT-NULL. A bigint × small-int multiply passes a NULL operand into `fpy_bigint_mul` and segfaults — 2026-07-21
 
@@ -235,6 +245,48 @@ reason.
 
 ## Recently Fixed
 
+### BUG-RUNTIME-STR-PRODUCERS-BARE-MALLOC (fixed 2026-07-24)
+
+Most runtime string-*producing* functions returned bare `malloc`'d/`fpy_strdup`'d
+`char*` with no `FpyString` `{magic, refcount}` header, so `fpy_str_header(s)`
+(which reads `s-8`) did an out-of-bounds read on every incref/decref of such a
+string, and `fpy_str_decref` no-oped → the block leaked. Benign on real
+hardware/SlateOS (the stray bytes rarely match the `"STRC"` magic, so it's
+treated as non-owned), but a genuine UB read that ASan flags and a real leak.
+
+**Fix (this session, coordinated pass):**
+1. Added central header-backed helpers in `objects.h`: `fpy_str_copy(src, len)`
+   (headered alloc + memcpy → `->data`, refcount 1), `fpy_str_from_cstr(src)`,
+   and `fpy_str_buf(len)` (uninitialised headered writable buffer → `->data`).
+2. Converted **all** runtime STR-value producers to header-backed allocation:
+   the `str.split`/`rsplit`/`splitlines`/`partition`/`replace`/`strip`/`join`/
+   `translate`/`repr`/`format` family + `os.path`/`os`/`getenv`/Counter key path
+   (objects.c); the scalar producers `fv_repr`/`fv_str`, `list/tuple/dict_to_str`,
+   `chr`/`hex`/`oct`/`bin`, `format_spec_{float,int,str}`, `obj_type_repr`,
+   `obj_to_str`/`obj_to_repr`, `complex_to_str`, `os_getcwd` (objects.c); the
+   `json.loads` parser (`json_parse_string`) and `json.dumps` (`fastpy_json_dumps_fv`),
+   which build in a realloc-grown scratch buffer then copy into a headered string;
+   `str_repeat`/`lower`/`path_with_suffix`/`textwrap`/`tempfile`/`uuid`, `glob.glob`
+   results, and the `sys.version_info` `"final"` literal (runtime.c).
+3. Audited direct `free()`/`realloc()` of STR data pointers — the remaining bare
+   producers are correctly bare (internal helpers freed via `free(buf)` after a
+   `snprintf`/copy, e.g. `fpy_decimal_to_str`; borrowed dict f-string fast-paths;
+   error-message temps handed to `fastpy_raise`; the cpython-bridge `fpy_strdup`
+   sites, whose results are tagged PYOBJ not STR). BYTES producers
+   (`bytes_split`, base64, `int_to_bytes`) are a *separate* value kind and left
+   as-is.
+
+**Validated:** full differential suite (314 passed) after each increment; native
+ASan (`clang -DFPY_PURE_MODE -fsanitize=address`, WSL) confirmed a real
+heap-buffer-overflow in `fpy_str_header` for JSON parse and a global-buffer-overflow
+for the `sys.version_info` "final" literal *before* the fix, and EXIT=0 /
+LeakSanitizer-clean *after* for json/glob/version_info paths. Commits: `902912e`,
+`bf01314`, `190114e`, `99f6f8d`, `56831be`, `004bcbd`.
+
+Two orthogonal bugs surfaced during this work and were logged separately under
+Active Bugs: BUG-CODEGEN-STR-TEMP-NOT-DECREFFED (codegen leak) and
+BUG-VERSIONINFO-TUPLE-STR-INCREF (assignment type-inference).
+
 ### STR-CONSTANT-BARE-HEADER (fixed 2026-07-24)
 
 String constants emitted from `.rodata` were bare NUL-terminated `i8` arrays
@@ -252,10 +304,10 @@ on a real, immortal header: incref/decref are no-ops (never writes to the
 read-only global, never freed). Validated under the native-ASan harness with a
 constant-heavy + file-I/O program (all checks pass, no ASan report).
 
-**Scope note:** this fixes *only* the constant class. Runtime heap string
-producers (`split`, concat, `upper`, etc.) still return bare `malloc`'d strings
-without a header — tracked separately as
-`BUG-RUNTIME-STR-PRODUCERS-BARE-MALLOC` under Active Bugs.
+**Scope note:** this fixed *only* the constant class. Runtime heap string
+producers (`split`, concat, `upper`, etc.) were tracked separately as
+`BUG-RUNTIME-STR-PRODUCERS-BARE-MALLOC` and have since been fixed too — see that
+entry under Recently Fixed.
 
 ### BUG-STR-OF-PATH-RAISES-IN-PURE-MODE (fixed 2026-07-24)
 
