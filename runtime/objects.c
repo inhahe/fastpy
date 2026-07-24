@@ -8282,6 +8282,7 @@ void fastpy_json_loads(const char *json_str, int32_t *out_tag, int64_t *out_data
 #include <direct.h>
 #include <io.h>
 #include <process.h>
+#include <sys/stat.h>   /* MSVC: struct _stat64 / _stat64() for os.path.getsize/getmtime */
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #else
