@@ -104,6 +104,12 @@ SLATEOS_RUNTIME_DIR = RUNTIME_DIR / "slateos"
 # force-reference bridge functions pure mode omits).
 _SLATEOS_RUNTIME_NAMES = [
     "runtime", "objects", "threading", "gc", "bigint", "bridge_stub",
+    # pathlib_pure.c: native (CPython-free) pathlib.Path surface for pure mode.
+    # The bridge's PyObject*-backed path functions live in cpython_bridge.c,
+    # which pure mode omits; this TU supplies them treating a Path as a heap C
+    # string. Pure-only — never compiled into the host build (see
+    # _SHARED_RUNTIME_NAMES), so no symbol collision with the bridge.
+    "pathlib_pure",
 ]
 
 # The C cross-compiler target passed to `zig cc`. `zig cc --target=<t>` is a

@@ -167,6 +167,45 @@ reason.
 
 ## Recently Fixed
 
+### BUG-STR-OF-PATH-RAISES-IN-PURE-MODE (fixed 2026-07-24)
+
+`str(path)` (and any generic `fastpy_fv_str` conversion of a `pathlib.Path`)
+raised `RuntimeError: operation requires the CPython bridge` in pure mode, so
+a pure-mode program aborted the moment it stringified a Path.
+
+**Root cause:** codegen tags a `Path` as `FPY_TAG_OBJ` (tag 6) but its data is
+a **raw `char*`** (the path text), NOT an `FpyObj`. `_emit_builtin_str` fell
+through to the generic `fastpy_fv_str(tag, data)` runtime dispatch, which for
+an OBJ reads a would-be `FpyObj` magic and, finding none, routes to
+`fpy_bridge_pyobj_str` — a no-op/`RuntimeError` stub in pure-mode builds
+(`bridge_stub.c`). Compounding it, a variable bound to a *Path-returning
+method call* (`j = d.joinpath(...)`) lost its PATH tag entirely because
+`_infer_type_tag` had no case for `<path>.<method>()` calls, so even the
+str() PATH-specialization wouldn't fire for it.
+
+**Fix (compiler/codegen.py):** (1) `_emit_builtin_str` now specializes
+`str(x)` for a PATH-typed `x` to call `fastpy_path_str(ptr)` — the native
+handler that exists in *both* runtimes (pure: `_str_dup(_p(self))`; bridge:
+`_path_as_cstr(self)`), mirroring how `.as_posix()`/`__str__` already
+dispatch. (2) `_infer_type_tag` now returns `VKind.PATH` for
+`<path-expr>.<method>()` calls via `_is_path_expr(node)` (which already
+encodes the `resolve/parent/with_suffix/joinpath/absolute` set), so
+Path-returning method results keep their PATH tag. Verified with a native
+Linux AddressSanitizer build of the real codegen IR + pure runtime (all 10
+checks → `ok == 1023`, no RuntimeError) and on-target: the SlateOS
+`self_test_fastpy_slateos_pathlib` reports bitmask 1023 (all checks pass).
+
+**Residual tech-debt (not yet fixed):**
+- *Path-header collision (low risk):* pure-mode Path buffers are zero-padded to
+  ≥40 bytes so the OBJ incref/decref dispatcher's offset-32 magic read is
+  in-bounds and reads 0 (`runtime/pathlib_pure.c` `_path_alloc_n`). A path
+  whose bytes 32–35 happen to equal `FPY_OBJ_MAGIC` ("SJBO") could still
+  misfire. Proper fix: give pure-mode Path a real header struct (magic at a
+  controlled offset) instead of a bare `char*`, so the path text never sits at
+  offset 0/32.
+- *`Path.iterdir()` deferred in pure mode:* needs a runtime list-builder API to
+  materialize the directory entries as an FpyValue list.
+
 ### BUG-SCALARKIND-LOST-ON-NATIVE-MODULE-CALL-ASSIGN (fixed 2026-07-22)
 
 A variable bound to a *chained* native `os.path.*` scalar result

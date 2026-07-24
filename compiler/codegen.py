@@ -19416,6 +19416,17 @@ class CodeGen:
                     # Return same type as input argument
                     if node.args:
                         return self._infer_type_tag(node.args[0], None)
+        # Path-returning method calls: d.joinpath(...), p.resolve(),
+        # p.with_suffix(...), p.absolute() on a Path receiver all return a
+        # Path.  Without this, the assigned variable loses its PATH tag and
+        # str()/print() fall back to the generic fastpy_fv_str dispatch, which
+        # in pure mode routes a Path (OBJ-tagged raw char*) through the CPython
+        # bridge stub and raises.  _is_path_expr already encodes the
+        # PATH-returning-method set, so reuse it.
+        if (isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and self._is_path_expr(node)):
+            return ValueType(VKind.PATH)
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
             if node.func.id in self._user_classes:
                 return ValueType(VKind.OBJ, class_name=node.func.id)
@@ -35849,6 +35860,15 @@ class CodeGen:
     def _emit_builtin_str(self, node):
         if len(node.args) == 1:
             arg_node = node.args[0]
+            # PATH fast path: a pure-mode Path is tagged OBJ but its data is a
+            # raw char* (the path text), NOT an FpyObj.  The generic
+            # fastpy_fv_str() would misread it as an FpyObj/PyObject* and, in
+            # pure mode, route through the CPython bridge stub which RAISES.
+            # Specialize to fastpy_path_str(ptr), the native handler.
+            if self._is_path_expr(arg_node):
+                obj = self._emit_expr_value(arg_node)
+                obj = self._ensure_ptr(obj)
+                return self.builder.call(self.runtime["path_str"], [obj])
             # OBJ fast path: use obj_to_str which handles
             # __str__ → __repr__ → default fallback safely
             if self._is_obj_expr(arg_node):
