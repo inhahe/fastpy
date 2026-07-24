@@ -8,6 +8,74 @@ how to reproduce it, and what the proper fix looks like.
 
 ## Active Bugs
 
+### BUG-RUNTIME-STR-PRODUCERS-BARE-MALLOC. Most runtime string methods return bare `malloc`'d `char*` with no `FpyString` header → OOB read in `fpy_str_header` + memory leak — 2026-07-24
+
+**What:** the pure-mode/native string-ownership model (objects.h:261-300) says a
+STR-tagged `FpyValue.data.s` points at `FpyString.data`, with an
+`{i32 magic, i32 refcount}` header in the **8 bytes before** that pointer.
+`fpy_str_header(s)` reads `s-8` and checks the magic to decide ownership;
+`fpy_str_incref`/`_decref` and the `fpy_rc_decref` free path all depend on that
+header being present. **But most runtime string-*producing* functions don't
+allocate a header** — they do `char *r = malloc(len+1); …; return fpy_str(r)`.
+For those strings `fpy_str_header(r)` dereferences `r-8`, which is 8 bytes
+*before* the malloc block → an out-of-bounds read.
+
+Two consequences:
+1. **Heap-buffer-overflow (read) under ASan.** Any code that increfs/decrefs
+   such a string (container insertion, reassignment, scope exit) calls
+   `fpy_str_header(r-8)` and reads off the front of the allocation. Benign on
+   real hardware/SlateOS (the OS boots green — the stray bytes almost never
+   match the `"STRC"` magic, so it's treated as non-owned), but it's a genuine
+   UB read that ASan flags. First observed at `"…".split()` in a string-stress
+   test under the native-ASan harness (heap-buffer-overflow in
+   `fpy_str_header`, objects.h:290).
+2. **Memory leak.** Because `fpy_str_header` returns NULL for these bare
+   strings, `fpy_str_decref` no-ops and the malloc block is never freed. Low
+   impact for the short-lived AOT binaries (each SlateOS service process exits
+   quickly), but it's a real leak.
+
+**Where (non-exhaustive — ~40 sites in `runtime/objects.c`):** `fastpy_str_split`
+(1598), `fastpy_bytes_split` (1620), `fastpy_str_join` (1638), string concat
+(1047/1061/1074), the `upper`/`lower`/`strip`/`replace`/`center`/`ljust`/`rjust`
+family and `splitlines`/`rsplit`/`partition` (~3653-4210), plus more. The
+*correct* pattern already exists and is used in a few places (e.g. reversed at
+1586, and `fpy_str_alloc` at 71): `FpyString *h = fpy_str_alloc(len);
+memcpy(h->data, …); … return fpy_str(h->data);`.
+
+**Why this is NOT a quick fix / why it's logged instead of done inline:** the
+runtime has an *inconsistent* ownership model — some STR data pointers are bare
+(freed, if at all, via direct `free((void*)s)`) and some are headered (freed via
+`fpy_str_header`). There are direct `free()` calls on STR data pointers
+(objects.c:9225 `free((void*)key.data.s)`, 10421 `free((void*)formatted)`, and
+others). Converting a producer to headered allocation **without** also fixing
+every direct-free site to free `fpy_str_header(s)` instead of `s` would free the
+wrong address (data ptr = header+8) → heap corruption. So the proper fix is a
+coordinated pass, not a per-site edit.
+
+**Proper fix (dedicated task):** unify the string-ownership model so *every*
+STR-tagged data pointer is headered.
+1. Add a central helper in objects.h, e.g. `fpy_str_copy(const char *src,
+   int64_t len)` (headered alloc + memcpy → returns `->data`) and
+   `fpy_str_buf(int64_t len)` (headered writable buffer → returns `->data`) for
+   incremental-build sites.
+2. Replace every `malloc(len+1)+…+fpy_str(r)` producer with the helper.
+3. Audit **all** direct `free()`/`realloc()` of STR data pointers and route them
+   through `fpy_str_header` (free the header, not the data ptr). Grep
+   `free((void*)` and `free((void *)` in objects.c and check each against string
+   flow.
+4. Validate with the full differential suite **and** a broad native-ASan string
+   stress (split/join/concat/slice/format/upper/lower/replace/strip). NOTE: the
+   host differential suite is currently unrunnable on this Windows machine
+   (`objects.c(8685): C2079 '_stat64' undefined` under MSVC/cl.exe), so this
+   fix is blocked on either fixing that build breakage or standing up an
+   equivalent ASan-based oracle harness.
+
+**Already fixed (separate, narrower class):** string *constants* from `.rodata`
+used to be bare too; codegen now emits them as an immortal
+`{magic, IMMORTAL_refcount, data[]}` struct so `fpy_str_header(ptr-8)` lands on
+a real header. See "STR-CONSTANT-BARE-HEADER (fixed 2026-07-24)" under Recently
+Fixed. That fix does **not** touch the runtime heap producers above.
+
 ### BUG-BIGINT-MUL-INT-NULL. A bigint × small-int multiply passes a NULL operand into `fpy_bigint_mul` and segfaults — 2026-07-21
 
 **What:** when the running value of an expression has been promoted to a
@@ -166,6 +234,28 @@ reason.
 ---
 
 ## Recently Fixed
+
+### STR-CONSTANT-BARE-HEADER (fixed 2026-07-24)
+
+String constants emitted from `.rodata` were bare NUL-terminated `i8` arrays
+with no `FpyString` header. The runtime's ownership check `fpy_str_header(s)`
+reads the magic in the 8 bytes *before* `s`, so for a constant it read off the
+front of the `.rodata` array — a benign-on-hardware but genuine out-of-bounds
+read that ASan flags (global-buffer-overflow), and which could spuriously match
+`"STRC"` in adjacent bytes and mis-treat a constant as owned.
+
+**Fix:** `CodeGen._make_string_constant` (compiler/codegen.py ~2870) now emits
+each constant as an `FpyString`-compatible struct global —
+`{i32 magic=0x53545243, i32 refcount=0x7FFFFFFF (FPY_RC_IMMORTAL), [N x i8] data}`
+— and returns a GEP to `data` (struct field 2). So `fpy_str_header(ptr-8)` lands
+on a real, immortal header: incref/decref are no-ops (never writes to the
+read-only global, never freed). Validated under the native-ASan harness with a
+constant-heavy + file-I/O program (all checks pass, no ASan report).
+
+**Scope note:** this fixes *only* the constant class. Runtime heap string
+producers (`split`, concat, `upper`, etc.) still return bare `malloc`'d strings
+without a header — tracked separately as
+`BUG-RUNTIME-STR-PRODUCERS-BARE-MALLOC` under Active Bugs.
 
 ### BUG-STR-OF-PATH-RAISES-IN-PURE-MODE (fixed 2026-07-24)
 

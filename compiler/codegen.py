@@ -2867,8 +2867,25 @@ class CodeGen:
         ft = ir.FunctionType(void, [])
         self.runtime["write_space"] = ir.Function(self.module, ft, name="fastpy_write_space")
 
+    # An immortal FpyString header prefixes every string constant so the
+    # runtime's ownership check (`fpy_str_header`, objects.h) — which reads the
+    # magic 8 bytes BEFORE the char data — always lands in-bounds and reads a
+    # valid header, instead of reading off the front of a bare `.rodata` array
+    # (a benign-on-hardware but genuine out-of-bounds read that ASan flags and
+    # that could spuriously match the magic in adjacent bytes). The header is
+    # `{i32 magic, i32 refcount}` (== FpyString minus its flexible `data[]`),
+    # with refcount = FPY_RC_IMMORTAL so incref/decref are no-ops and the
+    # constant is never written to (safe for a read-only global) or freed.
+    _FPY_STR_MAGIC = 0x53545243   # "STRC" — must match FPY_STR_MAGIC (objects.h)
+    _FPY_RC_IMMORTAL = 0x7FFFFFFF  # INT32_MAX — must match FPY_RC_IMMORTAL
+
     def _make_string_constant(self, value: str) -> ir.Constant:
-        """Create a global string constant and return a pointer to it.
+        """Create a global string constant and return an i8* to its char data.
+
+        The global is an FpyString-compatible struct: an immortal
+        `{magic, refcount}` header followed by the NUL-terminated UTF-8 bytes.
+        Returns a GEP to the first data byte, so callers see a normal
+        `const char*` while `fpy_str_header(ptr)` (ptr-8) reads a real header.
 
         Deduplicates — returns the same GEP for identical string values.
         """
@@ -2877,20 +2894,29 @@ class CodeGen:
         global_str = self._str_constants.get(value)
         if global_str is None:
             encoded = value.encode("utf-8") + b"\x00"
-            str_type = ir.ArrayType(i8, len(encoded))
+            data_type = ir.ArrayType(i8, len(encoded))
+            # FpyString layout: { i32 magic, i32 refcount, i8 data[] }.
+            struct_type = ir.LiteralStructType([i32, i32, data_type])
             name = f".str.{self._str_counter}"
             self._str_counter += 1
-            global_str = ir.GlobalVariable(self.module, str_type, name=name)
+            global_str = ir.GlobalVariable(self.module, struct_type, name=name)
             global_str.global_constant = True
             global_str.linkage = "private"
-            global_str.initializer = ir.Constant(str_type, bytearray(encoded))
+            global_str.initializer = ir.Constant(struct_type, [
+                ir.Constant(i32, self._FPY_STR_MAGIC),
+                ir.Constant(i32, self._FPY_RC_IMMORTAL),
+                ir.Constant(data_type, bytearray(encoded)),
+            ])
             # unnamed_addr allows LLVM/linker to merge equivalent constants
             global_str.unnamed_addr = True
             self._str_constants[value] = global_str
 
-        # Get pointer to first element
-        zero = ir.Constant(i64, 0)
-        return self.builder.gep(global_str, [zero, zero], inbounds=True)
+        # GEP to the first char of the data[] field (struct field index 2).
+        return self.builder.gep(
+            global_str,
+            [ir.Constant(i32, 0), ir.Constant(i32, 2), ir.Constant(i32, 0)],
+            inbounds=True,
+        )
 
     # -------------------------------------------------------------
     # FpyValue helpers (Phase 1 of tagged-value refactor)
