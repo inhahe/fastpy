@@ -302,6 +302,17 @@ static inline char* fpy_str_copy(const char *src, int64_t len) {
 static inline char* fpy_str_from_cstr(const char *src) {
     return fpy_str_copy(src, (int64_t)strlen(src));
 }
+/* Allocate an uninitialised, NUL-terminated writable buffer of `len` bytes
+ * (plus the terminator) that carries a valid FpyString header, and return a
+ * pointer to its char data. Use this instead of `malloc(len+1)` when a runtime
+ * string producer builds its result in place (loops/memcpy) and returns the
+ * char* as a STR value. The buffer is header-backed so incref/decref work and
+ * it is freed exactly once via the header. See
+ * BUG-RUNTIME-STR-PRODUCERS-BARE-MALLOC. */
+static inline char* fpy_str_buf(int64_t len) {
+    FpyString *h = fpy_str_alloc(len);
+    return h->data;
+}
 
 /* Get the FpyString header from a char* data pointer. Returns NULL if not owned. */
 static inline FpyString* fpy_str_header(const char *s) {

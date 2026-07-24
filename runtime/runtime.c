@@ -300,14 +300,14 @@ const char* fastpy_str_slice_step(const char *s, int64_t start, int64_t stop,
 }
 
 const char* fastpy_str_repeat(const char *s, int64_t n) {
+    /* Header-backed buffers so the returned STR value has a valid FpyString
+       header (no OOB header read / leak). See BUG-RUNTIME-STR-PRODUCERS-BARE-MALLOC. */
     if (n <= 0) {
-        char *result = (char*)malloc(1);
-        result[0] = '\0';
-        return result;
+        return fpy_str_buf(0);
     }
     size_t slen = strlen(s);
     size_t rlen = slen * n;
-    char *result = (char*)malloc(rlen + 1);
+    char *result = fpy_str_buf((int64_t)rlen);
     for (int64_t i = 0; i < n; i++) {
         memcpy(result + i * slen, s, slen);
     }
@@ -317,7 +317,7 @@ const char* fastpy_str_repeat(const char *s, int64_t n) {
 
 const char* fastpy_str_lower(const char *s) {
     size_t len = strlen(s);
-    char *result = (char*)malloc(len + 1);
+    char *result = fpy_str_buf((int64_t)len);
     for (size_t i = 0; i <= len; i++) {
         result[i] = (s[i] >= 'A' && s[i] <= 'Z') ? s[i] + 32 : s[i];
     }
@@ -1670,7 +1670,7 @@ const char* fastpy_base64_b64decode(const char *data) {
 /* uuid.uuid4() → random UUID string "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx" */
 const char* fastpy_uuid_uuid4(void) {
     fpy_rng_ensure_init();
-    char *buf = (char*)malloc(37);
+    char *buf = fpy_str_buf(36);
     uint64_t r1 = fpy_rng_next();
     uint64_t r2 = fpy_rng_next();
     /* Set version (4) and variant (10xx) bits */
@@ -1937,7 +1937,7 @@ const char* fastpy_path_with_suffix(const char *self, const char *suffix) {
     }
     int prefix_len = dot ? (int)(dot - self) : (int)strlen(self);
     int suffix_len = (int)strlen(suffix);
-    char *buf = (char*)malloc(prefix_len + suffix_len + 1);
+    char *buf = fpy_str_buf(prefix_len + suffix_len);
     memcpy(buf, self, prefix_len);
     memcpy(buf + prefix_len, suffix, suffix_len + 1);
     return buf;
@@ -1961,11 +1961,11 @@ const char* fastpy_textwrap_dedent(const char *text) {
         while (*p && *p != '\n') p++;
         if (*p == '\n') p++;
     }
-    if (min_indent == 9999 || min_indent == 0) return fpy_strdup(text);
+    if (min_indent == 9999 || min_indent == 0) return fpy_str_from_cstr(text);
 
     /* Build dedented result */
     int64_t len = (int64_t)strlen(text);
-    char *out = (char*)malloc(len + 1);
+    char *out = fpy_str_buf(len);
     char *o = out;
     p = text;
     while (*p) {
@@ -1987,7 +1987,7 @@ const char* fastpy_textwrap_indent(const char *text, const char *prefix) {
     /* Count lines */
     int64_t lines = 1;
     for (const char *p = text; *p; p++) if (*p == '\n') lines++;
-    char *out = (char*)malloc(tlen + lines * plen + 1);
+    char *out = fpy_str_buf(tlen + lines * plen);
     char *o = out;
     const char *p = text;
     int at_line_start = 1;
@@ -2117,13 +2117,13 @@ const char* fastpy_tempfile_gettempdir(void) {
     if (n > 0) {
         /* Remove trailing backslash */
         if (n > 0 && buf[n-1] == '\\') buf[n-1] = '\0';
-        return fpy_strdup(buf);
+        return fpy_str_from_cstr(buf);
     }
-    return fpy_strdup("C:\\Temp");
+    return fpy_str_from_cstr("C:\\Temp");
 #else
     const char *tmp = getenv("TMPDIR");
-    if (tmp) return fpy_strdup(tmp);
-    return fpy_strdup("/tmp");
+    if (tmp) return fpy_str_from_cstr(tmp);
+    return fpy_str_from_cstr("/tmp");
 #endif
 }
 
@@ -2134,11 +2134,11 @@ const char* fastpy_tempfile_mkdtemp(void) {
     GetTempPathA(sizeof(tmp), tmp);
     snprintf(path, sizeof(path), "%sfpy_%08x", tmp, (uint32_t)fpy_rng_next());
     CreateDirectoryA(path, NULL);
-    return fpy_strdup(path);
+    return fpy_str_from_cstr(path);
 #else
     char tmpl[] = "/tmp/fpy_XXXXXX";
     char *result = mkdtemp(tmpl);
-    return result ? fpy_strdup(result) : fpy_strdup("/tmp/fpy_fallback");
+    return result ? fpy_str_from_cstr(result) : fpy_str_from_cstr("/tmp/fpy_fallback");
 #endif
 }
 
