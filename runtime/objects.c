@@ -8125,7 +8125,12 @@ const char* fastpy_json_dumps_fv(int32_t tag, int64_t data) {
     FpyValue val; val.tag = tag; val.data.i = data;
     json_serialize(val, &buf, &len, &cap);
     buf[len] = '\0';
-    return buf;
+    /* json_serialize realloc-grows buf, so it can't carry the FpyString
+     * header; copy into a header-backed string (refcount 1) and free the
+     * scratch buffer. See BUG-RUNTIME-STR-PRODUCERS-BARE-MALLOC. */
+    const char *result = fpy_str_copy(buf, len);
+    free(buf);
+    return result;
 }
 
 /* json.loads */
@@ -8158,7 +8163,13 @@ static const char *json_parse_string(const char *p, const char **out) {
     }
     buf[len] = '\0';
     if (*p == '"') p++;
-    *out = buf;
+    /* Return a header-backed FpyString (refcount 1) so the parsed STR value
+     * has a valid FpyString header for fpy_str_header/decref — the growth
+     * buffer above is realloc'd, so it can't itself carry the header; copy
+     * into a fresh headered string and free the scratch buffer.
+     * See BUG-RUNTIME-STR-PRODUCERS-BARE-MALLOC. */
+    *out = fpy_str_copy(buf, len);
+    free(buf);
     return p;
 }
 
