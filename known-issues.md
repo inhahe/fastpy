@@ -8,79 +8,70 @@ how to reproduce it, and what the proper fix looks like.
 
 ## Active Bugs
 
-### BUG-CODEGEN-OWNED-TEMP-OVER-INCREF. Owned RHS values that aren't covered by the store-site `_steal` whitelist leak a refcount; intermediate/nested/discarded owned temps leak unconditionally — 2026-07-24 (partially fixed)
+### BUG-CODEGEN-OWNED-TEMP-OVER-INCREF. Owned expression temps leak a refcount; being migrated to Model 2 (borrowed-at-boundary). Stage 1 done: str-concat temps released at statement boundary — 2026-07-24 (partially fixed)
 
 **What:** `_store_variable` (codegen.py:~21434) increfs the stored value unless
-its caller passes `steal=True`, treating the RHS as **borrowed**. But many RHS
-expressions produce an **owned** value (rc 1). For an owned value the store bumps
-rc 1→2, and the only later decref (scope-exit `_emit_scope_decref`, or the next
-loop iteration's decref-old) brings it to 1, not 0 → **never freed**.
+its caller passes `steal=True`, treating the RHS as **borrowed**. But many
+expressions produce an **owned** value (rc 1). Under the old mixed model an owned
+value stored bumped rc 1→2 and never returned to 0 → leak; owned temps that never
+landed in a variable (nested/discarded) leaked unconditionally.
 
-**Store-site `_steal` whitelist (codegen.py `_emit_assign`, ~17497):** the
-mechanism to adopt an owned producer's +1 instead of increfing already exists and
-is applied for: container literals/comprehensions (`ast.List/ListComp/Dict/
-DictComp/Set/SetComp`), user-class construction (`ClassName(...)`), and — **added
-2026-07-24** — string concat (`ast.BinOp(Add)` typed STR → `fastpy_str_concat`,
-which always returns a fresh `fpy_str_alloc`, rc 1). So `x = a + b`, list/dict/set
-literals, and `o = MyClass()` no longer leak. (This corrects two earlier claims in
-this entry: (1) container literals do **not** rely on GC-masking — they `steal`
-and are properly freed; (2) `c = "x"+"y"` is now leak-free — verified under LSan:
-was "57 bytes in 3 allocations", now EXIT=0.)
+**Chosen fix: Model 2 (borrowed-at-boundary, CPython-like).** Owned producers
+register their (+1) result on `_rc_temps`; *all* consumers uniformly incref to
+retain; a **watermark flush** at each statement/condition boundary releases every
+temp registered since the mark. Being rolled out in stages.
 
-**Still leaking (owned producers NOT covered by store-site steal):**
-- **Owned producer calls stored to a var but not in the steal set:** `str()`,
-  `str.upper()/.lower()/.strip()/.replace()/.split()/.join()/.format()`,
-  `json.dumps`, `hex/oct/bin`, format-spec, f-strings (`ast.JoinedStr`), and
-  **user-function calls that return an owned value** (`s = build(...)`). These
-  hit `_store_variable(steal=False)` → rc 1→2 → leak.
-- **Intermediate / nested / discarded owned temps** that never land in a
-  variable: `out + prefix + str(k)` (the inner concat results and the `str(k)`
-  result), `foo(bar())` where `bar()` returns owned, bare expression statements.
-  The store-site steal can't help these — there's no store. **This is the larger
-  leak source** (a stress test with chained concat + `str()` in a loop leaked
-  ~49 KB while the simple stored-concat case leaked 57 bytes).
+**Stage 1 — string concatenation — DONE (2026-07-24):** infrastructure +
+str-concat producers converted.
+- Infra (codegen.py): `_register_owned_temp` appends `(tag,data)` to `_rc_temps`;
+  `_flush_rc_temps_to(mark)` pops back to `mark`, emitting `rc_decref` **only when
+  the block is not terminated** (terminated ⇒ truncate silently, so return/break/
+  continue are auto-safe — the returned temp's +1 transfers to the caller or leaks
+  exactly as before, never a UAF); `_flush_rc_temps` = flush-to-0.
+- Watermark call sites: `_emit_stmts` (mark before each stmt, flush after),
+  `_emit_if` (flush condition temps before cbranch), `_emit_while` (flush condition
+  temps each iteration inside cond_block). `_emit_for` deliberately does **not**
+  flush — the iterable temp is registered during the `for` statement and released
+  by the enclosing `_emit_stmts` after the whole loop, so it survives all
+  iterations.
+- Producers: `_owned_str_concat(args)` calls `fastpy_str_concat` (always a fresh
+  `fpy_str_alloc`, rc 1) and registers the result. Wired into the statically-typed
+  `str + str` binop path and the closure-result str-concat paths in `_emit_binop`,
+  and the local-var `str +=` augmented-assign path. The old concat `_steal` case in
+  `_emit_assign` was **removed** (register + steal would double-release → UAF).
+- Verified (native ASan, pure mode): stored `c=a+b`, nested `out=a+b+"cc"` (inner
+  temp freed), discarded `len(a+b)`, augmented `s+=b`, in-loop `acc=acc+"x"`, and
+  concat in if/while conditions + break + nested loops are all **leak-free with no
+  UAF/double-free** (values correct); differential suite **314 passed**.
 
-**Why STR leaks but list/dict/obj *appear* not to:** `fpy_list_new`/`fpy_dict_new`
-/object alloc register with the mark/sweep GC (`fpy_gc_track`, objects.c:
-320/1870/6957), so a leaked container refcount is still swept at collection/
-shutdown. **Strings are pure-refcounted (`fpy_str_alloc` has no `gc_node`)** → a
-leaked string refcount is a genuine, permanent leak. (So container leaks here are
-GC-masked, not truly absent — the refcount bookkeeping is still wrong, fragile if
-GC is ever disabled.)
+**Still leaking (later Model-2 stages):**
+- **str()-family owned producers** (Stage 2): `str()`, `repr`, `hex/oct/bin`,
+  `.upper()/.lower()/.strip()/.replace()/.split()/.join()/.format()`, `json.dumps`,
+  format-spec, f-strings (`ast.JoinedStr`), bytes concat. Not yet registered.
+  (`str(k)` still leaks ~4 KB per call — `fastpy_fv_str` over-allocs a large buf.)
+- **Function-call results dropped at the call site** (Stage 3): `foo()` /
+  `print(ret(a+b))` — a user-function that returns an owned value has its result
+  neither registered nor released at the *caller*. Note this means returning a
+  concat and dropping it in the caller still leaks — the leak is at the **call
+  site**, not the callee return (even a perfect callee would leak there). Also
+  covers the dynamic MIXED `a+b` binop path (33078), which is runtime-conditional
+  so can't be registered unconditionally.
+- **Containers/objects** (Stage 3): still use store-site `_steal` (Model 1). They
+  don't leak *observably* because lists/dicts/objects are `fpy_gc_track`'d
+  (objects.c:320/1870/6957) so a leaked refcount is GC-swept; strings are pure-
+  refcounted (no `gc_node`) so their leaks are genuine/LSan-visible. When converting
+  containers to Model 2, the container `_steal` cases must be removed in lockstep
+  (register + steal = double-release → UAF).
 
-**Impact:** per-assignment / per-temp refcount leak for the uncovered owned
-producers. Only *observable* as an ASan/LSan leak for STR; low impact for
-short-lived AOT binaries, real for long-running loops.
-
-**Proper fix (design-level — an architectural fork; do deliberately):** the two
-models below are **mutually exclusive** and one must be chosen consistently. The
-current code is a *mix*: consumers usually incref (Model 2) but the `_steal` set
-(now incl. concat) is Model 1. Extending Model 1 piecemeal is safe *only* because
-it never registers a temp; combining it with Model 2's temp-release on the same
-value would double-release → UAF.
-1. **Model 1 — move/steal:** owned producers return +1; each *consumer* (store,
-   container-insert, arg-pass, return) classifies its operand owned-vs-borrowed
-   and either steals (owned) or increfs (borrowed). Handles nested temps only if
-   every consumer participates; discarded temps need an explicit decref.
-2. **Model 2 — borrowed-at-boundary (CPython-like):** owned producers return +1
-   **and** register the result on the dormant `_rc_temps` list (codegen.py:
-   ~1231/25579 — `_flush_rc_temps` was built for exactly this but is dead code:
-   never appended to, never called); *all* consumers uniformly incref to retain;
-   `_flush_rc_temps()` at each statement boundary releases every temp's +1. This
-   cleanly handles nested/discarded temps. **Requires removing the existing
-   `_steal` cases** (they'd double-release) and making every owned-producer
-   emitter register — broad but uniform.
-
-Classification must be **conservative**: mis-tagging borrowed as owned → UAF/
-double-free (far worse than the leak). Model 2 is the more complete/correct
-target for nested temps but has the larger blast radius. Because this is an
-architectural decision affecting the core refcount model, treat it as a deliberate
-task (and a candidate to confirm direction before the big conversion), not an
-inline patch. Validate any change with a broad native-ASan leak sweep (concat/
-str()/upper/lower/replace/strip/format/split/join/dict-build/comprehension/
-f-string/user-fn-return, nested & discarded temps, in & out of loops, borrowed
-re-assignment `a = b`, subscript `a = lst[0]`, attr `a = o.x`) **plus** the full
-differential suite.
+**Why the staging is safe:** registration is purely additive (more boundary
+decrefs). A value is only ever registered by ONE producer, and no registered value
+is also stolen (the remaining `_steal` set is container/class literals only, never
+str-concat). Mis-tagging owned→borrowed only leaks; only borrowed→owned = UAF, so
+each stage stays conservative. Validate every stage with the broad native-ASan
+sweep (concat/str()/upper/lower/replace/strip/format/split/join/dict-build/
+comprehension/f-string/user-fn-return, nested & discarded temps, in & out of loops,
+if/while conditions, break/continue/return, borrowed re-assignment `a=b`, subscript
+`a=lst[0]`, attr `a=o.x`) **plus** the full differential suite.
 
 ### BUG-BIGINT-MUL-INT-NULL. A bigint × small-int multiply passes a NULL operand into `fpy_bigint_mul` and segfaults — 2026-07-21
 
@@ -314,7 +305,7 @@ LeakSanitizer-clean *after* for json/glob/version_info paths. Commits: `902912e`
 `bf01314`, `190114e`, `99f6f8d`, `56831be`, `004bcbd`.
 
 Two orthogonal bugs surfaced during this work and were logged separately:
-BUG-CODEGEN-OWNED-TEMP-OVER-INCREF (codegen leak, still Active) and
+BUG-CODEGEN-OWNED-TEMP-OVER-INCREF (codegen leak, Model-2 Stage 1 done) and
 BUG-VERSIONINFO-TUPLE-STR-INCREF (assignment type-inference — now fixed, see its
 Recently Fixed entry above).
 

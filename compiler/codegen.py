@@ -17501,20 +17501,13 @@ class CodeGen:
                         and isinstance(node.value.func, ast.Name)
                         and node.value.func.id in self._user_classes):
                     _steal = True
-                # String concat (str + str) returns a fresh owned string:
-                # fastpy_str_concat always does a new fpy_str_alloc (rc 1,
-                # verified in runtime.c — no borrowed-operand shortcut).  A
-                # BinOp(Add) whose inferred type is STR can *only* be str
-                # concat (bytes+bytes → BYTES, list+list → LIST, path+str →
-                # PATH are typed elsewhere), so stealing here is safe: the
-                # variable adopts the producer's +1 instead of over-increfing
-                # (rc 1→2) and leaking on scope exit.  Constant-folded
-                # concats yield an immortal constant, for which steal is a
-                # no-op (no incref; scope-exit decref no-ops on immortal).
-                if (not _steal and isinstance(node.value, ast.BinOp)
-                        and isinstance(node.value.op, ast.Add)
-                        and type_tag.kind == VKind.STR):
-                    _steal = True
+                # NOTE: str-concat is NOT stolen here under the Model-2
+                # refcount model. The concat producer (_owned_str_concat in
+                # _emit_binop) registers its result as an owned temp, released
+                # at the statement boundary; the store increfs to retain
+                # (rc 1→2), and the boundary flush drops it back to 1. Stealing
+                # here would skip the store incref, so the boundary flush would
+                # free a string the variable still references (UAF).
                 if class_name:
                     self._store_variable(target.id, value,
                                          ValueType(VKind.OBJ, class_name=class_name),
@@ -20989,9 +20982,9 @@ class CodeGen:
 
         # STR += (string concatenation)
         if left_kind == VKind.STR and isinstance(node.op, ast.Add):
-            result = self._rt_call("str_concat",
-                                   [tv_current.as_ptr(self.builder),
-                                    self._ensure_ptr(rhs)])
+            result = self._owned_str_concat(
+                [tv_current.as_ptr(self.builder),
+                 self._ensure_ptr(rhs)])
             self._store_variable(target_name, result, ValueType(VKind.STR))
             return
 
@@ -22481,7 +22474,13 @@ class CodeGen:
             # Don't emit code after a terminator (break/continue/return)
             if self.builder.block.is_terminated:
                     break
+            # Model-2 watermark: release owned temporaries produced while
+            # evaluating this statement at the statement boundary. Only temps
+            # created by this statement are flushed (loop iterables registered
+            # by an enclosing construct survive).
+            _rc_mark = len(self._rc_temps)
             self._emit_stmt(stmt)
+            self._flush_rc_temps_to(_rc_mark)
 
     # -----------------------------------------------------------------
     # Control flow
@@ -22545,7 +22544,11 @@ class CodeGen:
 
     def _emit_if(self, node: ast.If) -> None:
         """Emit if/elif/else."""
+        _cond_mark = len(self._rc_temps)
         cond = self._emit_condition(node.test)
+        # Release owned temporaries created while evaluating the condition
+        # before we branch (they must not leak into either arm).
+        self._flush_rc_temps_to(_cond_mark)
         then_block = self._new_block("if.then")
         merge_block = self._new_block("if.end")
 
@@ -22603,7 +22606,11 @@ class CodeGen:
 
         # Condition check
         self.builder.position_at_end(cond_block)
+        _cond_mark = len(self._rc_temps)
         cond = self._emit_condition(node.test)
+        # Flush condition temps each iteration (cond_block is re-entered every
+        # loop pass), so they don't accumulate across iterations.
+        self._flush_rc_temps_to(_cond_mark)
         after_loop = else_block if else_block else end_block
         self.builder.cbranch(cond, body_block, after_loop)
 
@@ -25601,15 +25608,61 @@ class CodeGen:
                                           [ir.Constant(i32, tag)])
                 self.builder.ret(value)
 
-    def _flush_rc_temps(self) -> None:
-        """Decref any temporary values created during expression evaluation.
-        Called at statement boundaries to free temporaries that weren't
-        stored in variables (e.g., intermediate strings from concat)."""
-        if not self._USE_REFCOUNT or not self._rc_temps:
+    def _register_owned_temp(self, tag_val, data_val) -> None:
+        """Register an owned (+1) temporary produced during expression
+        evaluation so it can be released at the next statement/expression
+        boundary. Part of the Model-2 (borrowed-at-boundary) refcount model:
+        owned producers register their result, all consumers uniformly incref
+        to retain, and the +1 registered here is released by a watermark flush.
+        """
+        if not self._USE_REFCOUNT:
             return
-        for tag_val, data_val in self._rc_temps:
-            self.builder.call(self.runtime["rc_decref"], [tag_val, data_val])
-        self._rc_temps.clear()
+        self._rc_temps.append((tag_val, data_val))
+
+    def _owned_str_concat(self, args) -> ir.Value:
+        """Emit a str_concat call and register its (freshly-allocated, +1)
+        result as an owned temp so it is released at the statement boundary.
+        Used by the statically-typed str+str concat producers in _emit_binop.
+        Every fastpy_str_concat call allocates a new FpyString (verified in
+        runtime.c — no borrowed-operand shortcut), so the result is always
+        owned. Registering here (at the producer) is robust: it does not
+        depend on re-inferring the result type at the consumer."""
+        r = self._rt_call("str_concat", args)
+        if (self._USE_REFCOUNT and self.builder is not None
+                and self.builder.block is not None
+                and not self.builder.block.is_terminated):
+            rp = self._ensure_ptr(r)
+            data = self.builder.ptrtoint(rp, i64)
+            self._register_owned_temp(ir.Constant(i32, FPY_TAG_STR), data)
+        return r
+
+    def _flush_rc_temps_to(self, mark: int) -> None:
+        """Release every owned temp registered since `mark`, popping the list
+        back down to `mark`. Emits `rc_decref` for each temp ONLY when the
+        current block is not terminated — if the block already ended (return/
+        break/continue), we merely truncate the list without emitting decrefs.
+        This makes early-exit statements auto-safe: a returned temp's +1
+        transfers to the caller (or leaks exactly as before), never a UAF.
+
+        The watermark form is essential inside loops: the for-iterable temp
+        is registered before the loop body and must survive every iteration,
+        so body/condition flushes only pop temps created *after* the mark."""
+        if not self._USE_REFCOUNT:
+            return
+        n = len(self._rc_temps)
+        if n <= mark:
+            return
+        terminated = (self.builder is None or self.builder.block is None
+                      or self.builder.block.is_terminated)
+        if not terminated:
+            for tag_val, data_val in self._rc_temps[mark:]:
+                self.builder.call(self.runtime["rc_decref"], [tag_val, data_val])
+        del self._rc_temps[mark:]
+
+    def _flush_rc_temps(self) -> None:
+        """Decref every registered temporary (flush to 0). Statement-boundary
+        helper retained for callers that want a full flush."""
+        self._flush_rc_temps_to(0)
 
     def _emit_scope_decref(self, exclude_var: str | None = None) -> None:
         """Emit decref for all FV-local variables in the current scope.
@@ -33610,7 +33663,7 @@ class CodeGen:
 
         # ── Fast path: str + str → concat ──────────────────────────────
         if lk == VKind.STR and rk == VKind.STR and op == ast.Add:
-            return self._rt_call("str_concat", [ltv, rtv])
+            return self._owned_str_concat([ltv, rtv])
         if lk == VKind.STR and rk in (VKind.INT, VKind.BOOL) and op == ast.Mult:
             return self._rt_call("str_repeat", [ltv, rtv])
         if lk in (VKind.INT, VKind.BOOL) and rk == VKind.STR and op == ast.Mult:
@@ -33639,8 +33692,8 @@ class CodeGen:
             if _is_closure_result:
                 r_ptr = self.builder.inttoptr(
                     rtv.as_i64(self.builder), i8_ptr)
-                return self._rt_call("str_concat",
-                                     [ltv.as_ptr(self.builder), r_ptr])
+                return self._owned_str_concat(
+                    [ltv.as_ptr(self.builder), r_ptr])
         if op == ast.Add and lk == VKind.INT and rk == VKind.STR:
             _is_closure_result = (
                 (isinstance(node.left, ast.Call)
@@ -33651,8 +33704,8 @@ class CodeGen:
             if _is_closure_result:
                 l_ptr = self.builder.inttoptr(
                     ltv.as_i64(self.builder), i8_ptr)
-                return self._rt_call("str_concat",
-                                     [l_ptr, rtv.as_ptr(self.builder)])
+                return self._owned_str_concat(
+                    [l_ptr, rtv.as_ptr(self.builder)])
         # NOTE: true str + int and int + str are NOT valid in Python (TypeError).
         # These fall through to the container guard → fv_binop → TypeError.
 
