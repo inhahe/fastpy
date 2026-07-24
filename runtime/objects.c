@@ -567,7 +567,7 @@ void fastpy_fv_write(int32_t tag, int64_t data) {
 
 /* Return the repr string (allocated) for an FpyValue. */
 const char* fastpy_fv_repr(int32_t tag, int64_t data) {
-    char *buf = (char*)malloc(4096);
+    char *buf = fpy_str_buf(4096);
     fpy_value_repr(_pack_fv(tag, data), buf, 4096);
     return buf;
 }
@@ -593,7 +593,7 @@ const char* fastpy_fv_str(int32_t tag, int64_t data) {
         extern const char* fpy_bridge_pyobj_str(void*);
         return fpy_bridge_pyobj_str(ptr);
     }
-    char *buf = (char*)malloc(4096);
+    char *buf = fpy_str_buf(4096);
     fpy_value_repr(_pack_fv(tag, data), buf, 4096);
     return buf;
 }
@@ -1684,7 +1684,7 @@ FpyList* fastpy_list_set(FpyList *list) {
 
 /* Convert list to string for f-string formatting */
 const char* fastpy_list_to_str(FpyList *list) {
-    char *buf = (char*)malloc(4096);
+    char *buf = fpy_str_buf(4096);
     int pos = 0;
     const char *open = list->is_tuple ? "(" : "[";
     const char *close = list->is_tuple ? ")" : "]";
@@ -1706,7 +1706,7 @@ const char* fastpy_list_to_str(FpyList *list) {
 
 /* Convert tuple to string for f-strings */
 const char* fastpy_tuple_to_str(FpyList *tuple) {
-    char *buf = (char*)malloc(4096);
+    char *buf = fpy_str_buf(4096);
     int pos = 0;
     pos += snprintf(buf + pos, 4096 - pos, "(");
     for (int64_t i = 0; i < tuple->length; i++) {
@@ -4567,7 +4567,7 @@ int32_t fastpy_str_isspace(const char *s) {
 
 const char* fastpy_chr(int64_t code) {
     /* Only ASCII — no Unicode support yet */
-    char *result = (char*)malloc(2);
+    char *result = fpy_str_buf(2);
     result[0] = (char)(code & 0xff);
     result[1] = '\0';
     return result;
@@ -4661,7 +4661,7 @@ double fastpy_str_to_float(const char *s) {
 }
 
 const char* fastpy_hex(int64_t value) {
-    char *buf = (char*)malloc(32);
+    char *buf = fpy_str_buf(32);
     if (value < 0) {
         snprintf(buf, 32, "-0x%llx", (long long)(-value));
     } else {
@@ -4671,7 +4671,7 @@ const char* fastpy_hex(int64_t value) {
 }
 
 const char* fastpy_oct(int64_t value) {
-    char *buf = (char*)malloc(32);
+    char *buf = fpy_str_buf(32);
     if (value < 0) {
         snprintf(buf, 32, "-0o%llo", (long long)(-value));
     } else {
@@ -4681,7 +4681,7 @@ const char* fastpy_oct(int64_t value) {
 }
 
 const char* fastpy_bin(int64_t value) {
-    char *buf = (char*)malloc(80);
+    char *buf = fpy_str_buf(80);
     int neg = value < 0;
     uint64_t v = neg ? (uint64_t)(-value) : (uint64_t)value;
     char tmp[70];
@@ -5663,7 +5663,7 @@ const char* fastpy_format_spec_float(double value, const char *spec) {
     char tmp[128];
     int tlen = snprintf(tmp, sizeof(tmp), fmt_buf, value);
     if (tlen < 0) tlen = 0;
-    char *buf = (char*)malloc((width > tlen ? width : tlen) + 1);
+    char *buf = fpy_str_buf((width > tlen ? width : tlen) + 1);
     if (tlen >= width) {
         memcpy(buf, tmp, tlen);
         buf[tlen] = '\0';
@@ -5830,7 +5830,7 @@ const char* fastpy_format_spec_int(int64_t value, const char *spec) {
     int tlen = sign_len + plen + glen;
 
     int outsize = (width > tlen ? width : tlen) + 1;
-    char *buf = (char*)malloc(outsize);
+    char *buf = fpy_str_buf(outsize);
 
     /* No padding needed */
     if (tlen >= width) {
@@ -5915,7 +5915,7 @@ const char* fastpy_format_spec_str(const char *value, const char *spec) {
     if (precision >= 0 && precision < len) len = precision;
 
     int outsize = (width > len ? width : len) + 1;
-    char *buf = (char*)malloc(outsize);
+    char *buf = fpy_str_buf(outsize);
 
     if (width <= len) {
         memcpy(buf, value, len);
@@ -6438,7 +6438,7 @@ int64_t fastpy_call_ptr2(void *func, int64_t a, int64_t b) {
 
 /* Convert dict to string for f-strings */
 const char* fastpy_dict_to_str(FpyDict *dict) {
-    char *buf = (char*)malloc(4096);
+    char *buf = fpy_str_buf(4096);
     int pos = 0;
     pos += snprintf(buf + pos, 4096 - pos, "{");
     for (int64_t i = 0; i < dict->length; i++) {
@@ -7708,7 +7708,7 @@ const char* fastpy_obj_type_repr(FpyObj *obj) {
     size_t len = strlen(name);
     /* Match Python's output: "<class '__main__.ClassName'>" */
     size_t buflen = len + 22; /* "<class '__main__.'>" + name + NUL */
-    char *buf = (char*)malloc(buflen);
+    char *buf = fpy_str_buf((int64_t)buflen);
     snprintf(buf, buflen, "<class '__main__.%s'>", name);
     return buf;
 }
@@ -7735,7 +7735,7 @@ const char* fastpy_obj_to_str(FpyObj *obj) {
         }
     }
     /* Default: <ClassName object> */
-    char *buf = (char*)malloc(256);
+    char *buf = fpy_str_buf(256);
     snprintf(buf, 256, "<%s object>", fpy_classes[obj->class_id].name);
     return buf;
 }
@@ -7750,7 +7750,7 @@ const char* fastpy_obj_to_repr(FpyObj *obj) {
         return (const char*)result;
     }
     /* Default: <ClassName object> */
-    char *buf = (char*)malloc(256);
+    char *buf = fpy_str_buf(256);
     snprintf(buf, 256, "<%s object>", fpy_classes[obj->class_id].name);
     return buf;
 }
@@ -7872,7 +7872,7 @@ void fpy_complex_print(FpyComplex *c) {
 }
 
 char* fpy_complex_to_str(FpyComplex *c) {
-    char *buf = (char*)malloc(128);
+    char *buf = fpy_str_buf(128);
     if (c->real == 0.0 && !signbit(c->real)) {
         snprintf(buf, 128, "%gj", c->imag);
     } else if (c->imag >= 0.0 || c->imag != c->imag) {
@@ -8256,7 +8256,7 @@ void fastpy_json_loads(const char *json_str, int32_t *out_tag, int64_t *out_data
 #endif
 
 const char* fastpy_os_getcwd(void) {
-    char *buf = (char*)malloc(4096);
+    char *buf = fpy_str_buf(4096);
 #ifdef _WIN32
     _getcwd(buf, 4096);
 #else
