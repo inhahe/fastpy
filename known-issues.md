@@ -8,53 +8,6 @@ how to reproduce it, and what the proper fix looks like.
 
 ## Active Bugs
 
-### BUG-VERSIONINFO-TUPLE-STR-INCREF. Assigning `sys.version_info` to a variable increfs the tuple pointer via the STR path → OOB read + refcount imbalance — 2026-07-24
-
-**What:** `sys.version_info` is statically typed `TUPLE(elem=INT)` by
-`_native_module_attr_vtype` (codegen.py:39411-39412), but the *store-incref*
-emitted for `a = sys.version_info` uses the **STR** refcount path, not the list
-path. So codegen emits `fpy_rc_incref(FPY_TAG_STR, <FpyList*>)` on the tuple
-pointer, and `fpy_str_header((char*)list - 8)` reads 8 bytes before the
-`fpy_list_new` struct allocation.
-
-**Reproduce (native-ASan harness):**
-```python
-import sys
-a = sys.version_info
-print(a[0])
-```
-→ `heap-buffer-overflow READ of size 4 in fpy_str_header`, 8 bytes before the
-104-byte (`sizeof(FpyList)`) region allocated by `fastpy_sys_version_info`
-(runtime.c:1377). The bad incref is emitted directly in `fastpy_main`.
-
-**Impact:** benign in production (non-ASan) — the stray 4 bytes almost never
-equal the `"STRC"` magic, so `fpy_str_header` returns NULL and the incref is
-silently skipped. That's why the differential suite (314) passes. But it's (a) a
-genuine UB read, and (b) a **refcount-model violation**: the tuple's refcount is
-never incremented on assignment (and would be decref'd via the same wrong STR
-path), so the ownership bookkeeping for a variable holding `version_info` is
-wrong. Narrow trigger: only assigning the *whole* tuple to a variable; the
-common `sys.version_info.major` / inline `sys.version_info[0]` don't hit the
-store-incref.
-
-**Root cause:** the RHS-type inference at the assignment/incref site doesn't
-consult `_native_module_attr_vtype` for `sys.version_info`; an `i8*`-returning
-native call defaults to STR for the incref decision. Same *class* of "scalar/
-container kind lost on native-module-call assign" as the already-fixed
-BUG-SCALARKIND-LOST-ON-NATIVE-MODULE-CALL-ASSIGN, but for the container (TUPLE)
-kind and specifically the store-incref.
-
-**Proper fix:** make the assignment path resolve the RHS `ValueType` via
-`_native_module_attr_vtype` (or the general native-call return-type table) so
-the store-incref for `a = sys.version_info` uses the list/tuple refcount path
-(`fpy_list_incref`). Then re-run the native-ASan harness on the reproducer above
-plus `sys.argv`/`sys.path` assignment (same code path) and the full differential
-suite. Note: also a *heterogeneous* tuple — `elem=INT` is a lie (index 3 is STR
-"final"), so `b = a[3]` is typed INT while holding a STR value; a complete fix
-should model version_info's element types per-index or fall back to a dynamic
-element kind. (The STR element itself is now header-backed — see
-STR-CONSTANT/PRODUCERS fixes under Recently Fixed.)
-
 ### BUG-CODEGEN-OWNED-TEMP-OVER-INCREF. `_store_variable` unconditionally increfs the stored value, so freshly-produced owned values leak a refcount on every assignment (real leak for STR; GC-masked for containers) — 2026-07-24
 
 **What:** `_store_variable` (codegen.py:21434) *always* increfs the new value
@@ -279,6 +232,40 @@ reason.
 
 ## Recently Fixed
 
+### BUG-VERSIONINFO-TUPLE-STR-INCREF (fixed 2026-07-24)
+
+Assigning `sys.version_info` to a variable (`a = sys.version_info`) emitted the
+store-incref via the **STR** refcount path on the tuple pointer, so codegen ran
+`fpy_rc_incref(FPY_TAG_STR, <FpyList*>)` and `fpy_str_header((char*)list - 8)`
+read 8 bytes before the `fpy_list_new` struct — a `heap-buffer-overflow READ of
+size 4 in fpy_str_header` (confirmed under native ASan: 8 bytes before the
+104-byte `sizeof(FpyList)` region allocated by `fastpy_sys_version_info`,
+runtime.c:1377). Benign in production (the stray bytes rarely equal the `"STRC"`
+magic, so the incref was silently skipped — the differential suite passed) but a
+genuine UB read and a refcount-model violation.
+
+**Root cause:** `_infer_type_tag`'s `ast.Attribute` branch (codegen.py:19668)
+never consulted `_native_module_attr_vtype`, so the `i8*`-returning
+`sys_version_info` call defaulted to the STR tag for the store-incref decision,
+even though `sys.version_info` is statically typed `TUPLE(elem=INT)` (which maps
+to `FPY_TAG_LIST` in `_wrap_bare_to_fv`, correctly increfing the `FpyList`).
+
+**Fix:** consult `_native_module_attr_vtype` first in `_infer_type_tag`'s
+`ast.Attribute` branch. It returns non-None only for `sys.argv`/`sys.path`
+(→ `list[str]`) and `sys.version_info` (→ `tuple`), so the store-incref now uses
+the list refcount path; inert for every other attribute access. Validated:
+native-ASan reproducer (`import sys; a = sys.version_info; print(a[0])`) goes
+`heap-buffer-overflow` → EXIT=0 / leak-free (prints `3`, `14`); full differential
+suite 314 passes. (Confirmed the OOB by stashing the fix and re-running the same
+harness — reproduced the exact `fpy_str_header` overflow, then restored.)
+
+**Remaining (separate, lower priority):** `version_info` is a *heterogeneous*
+tuple but is typed `elem=INT`, which is a lie at index 3 (STR `"final"`), so
+`b = a[3]` is typed INT while holding a STR value. A complete fix would model
+per-index element types or fall back to a dynamic element kind. (The STR element
+itself is now header-backed — see the STR-PRODUCERS fix below.) Not tracked as an
+active bug yet; log one if it bites.
+
 ### BUG-RUNTIME-STR-PRODUCERS-BARE-MALLOC (fixed 2026-07-24)
 
 Most runtime string-*producing* functions returned bare `malloc`'d/`fpy_strdup`'d
@@ -317,9 +304,10 @@ for the `sys.version_info` "final" literal *before* the fix, and EXIT=0 /
 LeakSanitizer-clean *after* for json/glob/version_info paths. Commits: `902912e`,
 `bf01314`, `190114e`, `99f6f8d`, `56831be`, `004bcbd`.
 
-Two orthogonal bugs surfaced during this work and were logged separately under
-Active Bugs: BUG-CODEGEN-STR-TEMP-NOT-DECREFFED (codegen leak) and
-BUG-VERSIONINFO-TUPLE-STR-INCREF (assignment type-inference).
+Two orthogonal bugs surfaced during this work and were logged separately:
+BUG-CODEGEN-OWNED-TEMP-OVER-INCREF (codegen leak, still Active) and
+BUG-VERSIONINFO-TUPLE-STR-INCREF (assignment type-inference — now fixed, see its
+Recently Fixed entry above).
 
 ### STR-CONSTANT-BARE-HEADER (fixed 2026-07-24)
 

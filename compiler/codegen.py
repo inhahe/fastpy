@@ -19666,6 +19666,17 @@ class CodeGen:
         # Attribute access: detect container (list/dict) and object attrs
         # so len(), print, and binops dispatch correctly.
         if isinstance(node, ast.Attribute):
+            # Native-module container attributes (sys.argv/path → list[str];
+            # sys.version_info → tuple).  Consult this FIRST so the
+            # store-incref uses the correct container tag (LIST) instead of
+            # the i8* STR default.  With the STR default, rc_incref/decref
+            # would misread the FpyString header at data-8 (OOB read) and
+            # skip proper list refcounting.  _native_module_attr_vtype
+            # returns None for every non-sys attribute, so this is inert
+            # for all other attribute accesses.
+            _nm_vt = self._native_module_attr_vtype(node)
+            if _nm_vt is not None:
+                return _nm_vt
             # ClassName.__mro__ → tuple of type proxy objects
             if (isinstance(node.value, ast.Name)
                     and node.value.id in self._user_classes
