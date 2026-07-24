@@ -55,36 +55,70 @@ should model version_info's element types per-index or fall back to a dynamic
 element kind. (The STR element itself is now header-backed — see
 STR-CONSTANT/PRODUCERS fixes under Recently Fixed.)
 
-### BUG-CODEGEN-STR-TEMP-NOT-DECREFFED. Owned STR expression results are incref'd on store but never temp-decref'd → +1 leak per assignment — 2026-07-24
+### BUG-CODEGEN-OWNED-TEMP-OVER-INCREF. `_store_variable` unconditionally increfs the stored value, so freshly-produced owned values leak a refcount on every assignment (real leak for STR; GC-masked for containers) — 2026-07-24
 
-**What:** on `x = <str-returning-expr>`, codegen decref's the old value of `x`,
-increfs the new value, and stores it — but for STR-*producing* expressions (str
-concat, `str()`/`fv_str`, `json.dumps`, `hex`/`oct`/`bin`, format-spec, etc.) it
-**omits** the trailing temp-decref that it *does* emit for LIST-returning calls
-(e.g. `str.split`). A runtime STR producer returns a fresh string at refcount 1;
-the store-incref bumps it to 2; with no temp-decref the refcount never returns
-to 1 for the single owner → the string leaks (refcount stuck at 2).
+**What:** `_store_variable` (codegen.py:21434) *always* increfs the new value
+(unless `steal=True`), treating every RHS as a **borrowed** reference from which
+it must take a fresh ref. But many RHS expressions produce an **owned** value
+that already carries refcount 1 — string concat (`fastpy_str_concat`), `str()`/
+`fv_str`, `str.upper()`/`.lower()`/etc., `json.dumps`, `hex`/`oct`/`bin`,
+format-spec, **and** container producers like `str.split()`, list/dict literals.
+For these the store bumps rc 1→2, and the only later decref (the scope-exit
+`_emit_scope_decref`, or the next loop iteration's decref-old) brings it back to
+1, not 0 → **the object is never freed.** The bug is *symmetric* across STR and
+containers in codegen (identical IR: decref-old + incref-new, no temp release —
+verified by dumping IR and counting: both `c = "x"+"y"` and `p = "a b c".split()`
+emit exactly incref=1/decref=1).
+
+**Why STR leaks but list/dict/obj don't (the subtlety):** `fpy_list_new`/
+`fpy_dict_new`/object alloc register the object with the mark/sweep GC
+(`fpy_gc_track`, objects.c:320/1870/6957), so a *leaked refcount* on a container
+is still reachable-from-GC and gets swept at collection/shutdown. **Strings are
+pure-refcounted — `fpy_str_alloc` has no `gc_node` and is never GC-tracked** — so
+a leaked string refcount is a genuine, permanent leak. (This corrects an earlier
+version of this entry which wrongly said "the LIST path emits a balancing
+temp-decref"; it does not — split leaks a refcount too, the GC just hides it.)
 
 **Reproduce (native-ASan harness, `ASAN_OPTIONS=detect_leaks=1`):**
 ```python
-for i in range(1000):
-    s = "x" + str(i)     # str concat: fresh STR at rc 1, store increfs to 2, no temp-decref
+c = "x" + "y"      # LSan: "11 byte(s) leaked" (8-byte header + "xy\0"); rc stuck at 1
 ```
-→ LeakSanitizer reports direct leaks in `fastpy_str_concat` (runtime.c). Proven
-this session with a minimal `_cmp.py` harness. (Container-element producers like
-`split` are *not* affected — the LIST path already emits the balancing
-temp-decref, and LSan confirms split/partition/glob are balanced.)
+`str(i)`, `"abc".upper()` leak likewise; `"a b c".split()` and `[1,2,3]` report
+0 leaks (GC-swept). Confirmed this session by building each under
+`clang -DFPY_PURE_MODE -fsanitize=address` in WSL.
 
-**Impact:** a per-assignment memory leak for every owned STR expression result.
-Low impact for short-lived AOT binaries but a real leak; independent of the
-now-fixed runtime header work (it only became *observable* once producers were
-headered, because before that `fpy_str_decref` no-oped on unheadered strings).
+**Impact:** a per-assignment refcount leak for every owned-value assignment.
+Only *observable* as an ASan leak for STR (containers are GC-masked), and only
+became observable at all once STR producers were headered (before that
+`fpy_str_decref` no-oped on unheadered strings — see the fixed
+BUG-RUNTIME-STR-PRODUCERS-BARE-MALLOC). Low impact for short-lived AOT binaries,
+but a real leak, and it also means container refcounts are systematically wrong
+(kept alive only by the GC, not by their refcount) — fragile if the GC is ever
+disabled or made optional.
 
-**Proper fix:** in codegen's assignment lowering, emit the trailing
-temp-decref for owned STR temporaries after the store, matching the existing
-LIST-result path. Care: only for *owned* (freshly produced, refcount-1) STR
-temporaries — borrowed STR fast-paths (e.g. dict f-string value hits) must not
-be decref'd. Validate with the ASan leak harness above + full differential.
+**Proper fix (design-level, corruption risk — do deliberately, not inline):**
+introduce a proper **owned-vs-borrowed** distinction at the store site. Two
+viable designs:
+1. **Steal owned producers:** classify each RHS expression as owned (call to a
+   runtime producer, concat, literal, comprehension) vs borrowed (`ast.Name`
+   load, `ast.Subscript`/`ast.Attribute` element/slot borrow, dict f-string
+   value fast-path). Pass `steal=True` to `_store_variable` for owned RHS so no
+   incref happens; the existing scope-exit decref then balances it (rc 1→0).
+2. **Wire up the dormant `_rc_temps`/`_flush_rc_temps` machinery** (codegen.py:
+   1231/25579) — it was clearly built for exactly this ("Decref any temporary
+   values created during expression evaluation … intermediate strings from
+   concat") but is **dead code**: `_rc_temps` is never appended to and
+   `_flush_rc_temps` is never called. Have owned-producer expression emitters
+   push their result onto `_rc_temps`, and call `_flush_rc_temps()` at each
+   statement boundary (after the store has taken its own ref).
+   
+Either way the classification must be **conservative** — mis-tagging a borrowed
+reference as owned → premature free → use-after-free/double-free (far worse than
+the leak). Validate with a broad native-ASan leak sweep (concat/str()/upper/
+lower/replace/strip/format/split/join/dict-build/comprehension, in and out of
+loops, borrowed re-assignment `a = b`, subscript `a = lst[0]`, attr `a = o.x`)
+**plus** the full differential suite. Because of the blast radius this is logged
+as a dedicated task rather than patched at one site.
 
 ### BUG-BIGINT-MUL-INT-NULL. A bigint × small-int multiply passes a NULL operand into `fpy_bigint_mul` and segfaults — 2026-07-21
 
