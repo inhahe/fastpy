@@ -2073,7 +2073,11 @@ FpyList* fastpy_glob_glob(const char *pattern) {
                 snprintf(full, sizeof(full), "%s\\%s", dir, fd.cFileName);
             else
                 snprintf(full, sizeof(full), "%s", fd.cFileName);
-            FpyValue v; v.tag = FPY_TAG_STR; v.data.s = fpy_strdup(full);
+            /* Header-backed STR so the list element has a valid FpyString
+             * header for fpy_str_header/decref. Matches the str.split idiom
+             * (refcount 1, append increfs). See
+             * BUG-RUNTIME-STR-PRODUCERS-BARE-MALLOC. */
+            FpyValue v; v.tag = FPY_TAG_STR; v.data.s = fpy_str_from_cstr(full);
             fpy_list_append(result, v);
         } while (FindNextFileA(h, &fd));
         FindClose(h);
@@ -2096,7 +2100,11 @@ FpyList* fastpy_glob_glob(const char *pattern) {
                 snprintf(full, sizeof(full), "%s/%s", dir, ent->d_name);
             else
                 snprintf(full, sizeof(full), "%s", ent->d_name);
-            FpyValue v; v.tag = FPY_TAG_STR; v.data.s = fpy_strdup(full);
+            /* Header-backed STR so the list element has a valid FpyString
+             * header for fpy_str_header/decref. Matches the str.split idiom
+             * (refcount 1, append increfs). See
+             * BUG-RUNTIME-STR-PRODUCERS-BARE-MALLOC. */
+            FpyValue v; v.tag = FPY_TAG_STR; v.data.s = fpy_str_from_cstr(full);
             fpy_list_append(result, v);
         }
         closedir(d);
