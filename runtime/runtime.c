@@ -1380,7 +1380,10 @@ FpyList* fastpy_sys_version_info(void) {
     v.tag = FPY_TAG_INT; v.data.i = 3; fpy_list_append(t, v);  /* major */
     v.tag = FPY_TAG_INT; v.data.i = 14; fpy_list_append(t, v); /* minor */
     v.tag = FPY_TAG_INT; v.data.i = 0; fpy_list_append(t, v);  /* micro */
-    v.tag = FPY_TAG_STR; v.data.s = "final"; fpy_list_append(t, v);
+    /* Header-backed STR: a bare string literal has no FpyString header, so
+     * fpy_str_header/decref on version_info[3] would read out of bounds.
+     * See BUG-RUNTIME-STR-PRODUCERS-BARE-MALLOC. */
+    v.tag = FPY_TAG_STR; v.data.s = fpy_str_from_cstr("final"); fpy_list_append(t, v);
     v.tag = FPY_TAG_INT; v.data.i = 0; fpy_list_append(t, v);
     return t;
 }
