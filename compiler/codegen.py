@@ -17501,6 +17501,20 @@ class CodeGen:
                         and isinstance(node.value.func, ast.Name)
                         and node.value.func.id in self._user_classes):
                     _steal = True
+                # String concat (str + str) returns a fresh owned string:
+                # fastpy_str_concat always does a new fpy_str_alloc (rc 1,
+                # verified in runtime.c — no borrowed-operand shortcut).  A
+                # BinOp(Add) whose inferred type is STR can *only* be str
+                # concat (bytes+bytes → BYTES, list+list → LIST, path+str →
+                # PATH are typed elsewhere), so stealing here is safe: the
+                # variable adopts the producer's +1 instead of over-increfing
+                # (rc 1→2) and leaking on scope exit.  Constant-folded
+                # concats yield an immortal constant, for which steal is a
+                # no-op (no incref; scope-exit decref no-ops on immortal).
+                if (not _steal and isinstance(node.value, ast.BinOp)
+                        and isinstance(node.value.op, ast.Add)
+                        and type_tag.kind == VKind.STR):
+                    _steal = True
                 if class_name:
                     self._store_variable(target.id, value,
                                          ValueType(VKind.OBJ, class_name=class_name),
