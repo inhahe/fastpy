@@ -50,6 +50,16 @@ build-a-list-of-strings-by-append pattern and list literals with computed string
 elements. Same root family as the (fixed) BUG-VERSIONINFO-TUPLE-STR-INCREF
 (bare-pointer element tag inference).
 
+**Store-side UAF now guarded (2026-07-25, Model-2 Stage 3.1):** the write side of
+this mis-inference (`lst[0] = <str>` on a list typed `list[int]`) used the
+no-refcount `_inline_list_set` fast path, storing the str pointer with no incref.
+Once str-builtin results became Model-2 owned temps, the boundary flush freed the
+value while the list still held it → **UAF** at list destroy. `_emit_subscript_store`
+now gates `_inline_list_set` on a scalar value tag (`_SCALAR_TAGS_CLS`); heap-tagged
+values route through the refcounting `list_set_fv`. This removes the UAF but the
+**read-side** facet (inline *get* returning a str element as a raw int → wrong
+output / here `len()`→0) is unchanged and remains this bug's open problem.
+
 **Refcount entanglement (do with the container Model-2 stage):** fixing facet
 (a) so `[a+b]` is typed `list[str]` is NOT purely additive — it interacts with
 BUG-CODEGEN-OWNED-TEMP-OVER-INCREF. Today `[a+b]` is "safe" only because the
@@ -63,7 +73,7 @@ element (Model 2: all consumers incref); do facet (a) in lockstep with convertin
 containers to Model 2, with a native-ASan check on `[a+b]`, `[str(i) for ...]`,
 and `lst.append(a+b)` read-back.
 
-### BUG-CODEGEN-OWNED-TEMP-OVER-INCREF. Owned expression temps leak a refcount; being migrated to Model 2 (borrowed-at-boundary). Stage 1 done: str-concat temps released at statement boundary — 2026-07-24 (partially fixed)
+### BUG-CODEGEN-OWNED-TEMP-OVER-INCREF. Owned expression temps leak a refcount; being migrated to Model 2 (borrowed-at-boundary). Stage 1 (str-concat) + Stage 3.1 (str/repr/hex/oct/bin/chr builtins + scalar f-string interpolants) done — 2026-07-24/25 (partially fixed)
 
 **What:** `_store_variable` (codegen.py:~21434) increfs the stored value unless
 its caller passes `steal=True`, treating the RHS as **borrowed**. But many
@@ -99,11 +109,45 @@ str-concat producers converted.
   concat in if/while conditions + break + nested loops are all **leak-free with no
   UAF/double-free** (values correct); differential suite **314 passed**.
 
+**Stage 3.1 — str/repr/hex/oct/bin/chr builtins + scalar f-string interpolants — DONE (2026-07-25):**
+- **str-producing builtins registered** (codegen.py): `repr`/`hex`/`oct`/`bin`/`chr`
+  are unconditionally-owned (`fpy_str_buf`/`fastpy_fv_repr` etc. always return a
+  fresh +1 buffer), so their call results are wrapped in `_register_owned_str_ptr`
+  in `_emit_builtin_repr/hex/oct/bin/chr`. `str()` is runtime-conditional
+  (`fastpy_fv_str`: STR tag → borrowed passthrough, OBJ → conditional user
+  `__str__`, else → fresh owned buf), so it is registered **only** when the arg is
+  statically a scalar (int/float/bool) via `_call_arg0_is_static_scalar` →
+  `_expr_is_static_scalar`. Conservative: a non-scalar arg is never registered
+  (→ at worst a leak, never a UAF, per the owned→borrowed-only-leaks asymmetry).
+- **f-string scalar interpolants registered**: the `_emit_fstring` generic `else`
+  branch calls `_fv_call_str` (runtime tag dispatch); for a statically-scalar
+  interpolant that routes through `fastpy_fv_str`'s fresh-buffer (+1) branch, so it
+  is now registered under the same `_expr_is_static_scalar` gate. (`{int}`/`{float}`
+  interpolation previously leaked ~4 KB/occurrence.) STR/OBJ interpolants take the
+  borrowed/conditional paths and are correctly NOT registered.
+- **Steal-collision exclusions (avoid register+steal → UAF):**
+  - *Attribute store*: str-builtin `Call` nodes (in `_STR_PRODUCING_BUILTINS`, and
+    not user fns/aliases) are excluded from the attr-store `_steal` (codegen.py
+    ~19063) → the slot *retains* (increfs) instead. Superset-safe.
+  - *Inline list set*: `_emit_subscript_store` now only uses the no-refcount
+    `_inline_list_set` fast path when the stored value's tag is scalar
+    (`_SCALAR_TAGS_CLS`). A list mis-inferred as scalar-element that actually holds
+    strings (**BUG-LIST-ELEM-STR-TAG-LOST**) previously stole a registered str temp
+    with no incref; the boundary flush then freed it while the list still held it →
+    UAF at list destroy. Heap-tagged values now route through the refcounting
+    `list_set_fv` setter. (The read-side facet — inline *get* mis-reading a str
+    element as int → wrong output — is unchanged and still tracked under
+    BUG-LIST-ELEM-STR-TAG-LOST.)
+- **Verified (native ASan, pure mode)**: dropped/var/attr/dict/typed-list stores of
+  `str/repr/hex/oct/bin/chr`, `str(float)`, scalar+str f-string interpolation, and
+  str-var reuse after interpolation (no UAF) are all **leak-free with no
+  UAF/double-free**, outputs match CPython; differential suite **314 passed**.
+
 **Still leaking (later Model-2 stages):**
-- **str()-family owned producers** (Stage 2): `str()`, `repr`, `hex/oct/bin`,
-  `.upper()/.lower()/.strip()/.replace()/.split()/.join()/.format()`, `json.dumps`,
-  format-spec, f-strings (`ast.JoinedStr`), bytes concat. Not yet registered.
-  (`str(k)` still leaks ~4 KB per call — `fastpy_fv_str` over-allocs a large buf.)
+- **str()-family owned producers** (Stage 2 remainder): `.upper()/.lower()/.strip()/
+  .replace()/.split()/.join()/.format()`, `json.dumps`, dynamic format-spec, bytes
+  concat, and `str()`/f-string interpolation of **non-static-scalar** values (e.g.
+  `str(<obj with owned __str__>)`, a call-returned int). Not yet registered.
 - **Function-call results dropped at the call site** (Stage 3): `foo()` /
   `print(ret(a+b))` — a user-function that returns an owned value has its result
   neither registered nor released at the *caller*. Note this means returning a

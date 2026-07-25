@@ -17985,9 +17985,17 @@ class CodeGen:
                 self.builder.call(self.runtime["dict_set_fv"],
                                   [obj, index, ir.Constant(i32, tag), data])
         else:
-            # Inline fast path for scalar element lists (int/float)
+            # Inline fast path for scalar element lists (int/float). Only
+            # valid when the STORED value is itself a scalar (needs no
+            # refcounting): a list mis-inferred as scalar-element
+            # (BUG-LIST-ELEM-STR-TAG-LOST) could otherwise store a heap value
+            # (str/list/...) with no incref. Combined with Model-2 owned-temp
+            # registration (which flushes the value's +1 at the statement
+            # boundary) that frees the value while the list still holds it —
+            # a UAF. Route heap-tagged values through the refcounting runtime
+            # setter instead.
             _inline_et = self._can_inline_list_access(target.value)
-            if _inline_et is not None:
+            if _inline_et is not None and tag in self._SCALAR_TAGS_CLS:
                 self._inline_list_set(obj, index, tag, data)
             else:
                 # List set: fallback to runtime call
@@ -19053,6 +19061,19 @@ class CodeGen:
         _steal = isinstance(value_node, (
             ast.Call, ast.List, ast.ListComp,
             ast.Dict, ast.DictComp, ast.Set, ast.SetComp))
+        # Model-2: str-producing builtins (str/repr/hex/oct/bin/chr) register
+        # their owned result as a temp released at the statement boundary. If
+        # the slot STOLE that temp (no incref), the boundary flush would free
+        # the string the slot still references → UAF. Exclude them so the slot
+        # increfs (retains) instead. The exclusion is a superset of the
+        # actually-registered cases (see _STR_PRODUCING_BUILTINS): excluding an
+        # unregistered one only turns a steal into a retain → at worst a leak.
+        if (_steal and isinstance(value_node, ast.Call)
+                and isinstance(value_node.func, ast.Name)
+                and value_node.func.id in self._STR_PRODUCING_BUILTINS
+                and value_node.func.id not in self._user_functions
+                and value_node.func.id not in self._func_aliases):
+            _steal = False
         tag_const = ir.Constant(i32, tag)
         # Tags that have no heap allocation — no refcounting needed for
         # the NEW value.  Old slot value may still need decref (it could
@@ -25633,6 +25654,49 @@ class CodeGen:
             data = self.builder.ptrtoint(result, i64)
             self._register_owned_temp(ir.Constant(i32, FPY_TAG_STR), data)
         return result
+
+    # Built-in calls that produce a string. Their result is registered as an
+    # owned temp (Model 2) via _register_owned_str_ptr where the runtime
+    # producer is unconditionally owned. This name set is ALSO used to EXCLUDE
+    # them from the attribute-store Call `_steal` (a registered temp that a
+    # slot steals would be freed by the boundary flush while the slot still
+    # holds it → UAF). The exclusion set is a deliberate SUPERSET of the
+    # actually-registered cases: excluding one we didn't register only turns a
+    # steal into a retain (incref) — at worst a leak, never a UAF.
+    _STR_PRODUCING_BUILTINS = frozenset({"str", "repr", "hex", "oct", "bin", "chr"})
+
+    # Tags with no heap allocation — storing/overwriting one needs no
+    # refcounting on the NEW value. Used to gate the no-refcount inline
+    # list/attr store fast paths: a heap-tagged value (str/list/dict/obj)
+    # must go through the refcounting runtime setter even when the container
+    # is (mis)inferred as scalar-element (see BUG-LIST-ELEM-STR-TAG-LOST).
+    _SCALAR_TAGS_CLS = frozenset({FPY_TAG_INT, FPY_TAG_FLOAT,
+                                  FPY_TAG_BOOL, FPY_TAG_NONE})
+
+    def _call_arg0_is_static_scalar(self, node) -> bool:
+        """True when a 1-arg call's argument is statically a scalar (int/
+        float/bool). For str()/repr() such an argument routes through
+        fastpy_fv_str's fresh-buffer (owned) branch — never the borrowed
+        `return (const char*)data` STR passthrough nor the runtime-conditional
+        OBJ→obj_to_str path (whose user __str__ may return a borrowed attr).
+        Conservative: anything not provably scalar returns False (→ not
+        registered → at worst a leak, never a UAF)."""
+        if (not isinstance(node, ast.Call) or len(node.args) != 1
+                or node.keywords):
+            return False
+        return self._expr_is_static_scalar(node.args[0])
+
+    def _expr_is_static_scalar(self, arg) -> bool:
+        """True when `arg` is statically an int/float/bool. Such a value routes
+        through fastpy_fv_str's fresh-buffer (owned) branch — never the borrowed
+        STR passthrough nor the runtime-conditional OBJ→obj_to_str path.
+        Conservative: anything not provably scalar returns False (→ not
+        registered → at worst a leak, never a UAF)."""
+        if isinstance(arg, ast.Name):
+            return self._var_kind(arg.id) in (VKind.INT, VKind.FLOAT, VKind.BOOL)
+        if self._is_float_expr(arg):
+            return True
+        return self._infer_expr_kind(arg) in (VKind.INT, VKind.FLOAT, VKind.BOOL)
 
     def _owned_str_concat(self, args) -> ir.Value:
         """Emit a str_concat call and register its (freshly-allocated, +1)
@@ -35999,7 +36063,15 @@ class CodeGen:
             # Use FV dispatch so runtime tag drives the conversion
             # (e.g. dict values whose compile-time tag is wrong).
             fv = self._load_or_wrap_fv(node.args[0])
-            return self._fv_call_str(fv)
+            result = self._fv_call_str(fv)
+            # Model-2: register the owned result only when the argument is a
+            # static scalar — then fastpy_fv_str allocates a fresh buffer
+            # (owned). For str/obj/unknown args it may return borrowed, so we
+            # conservatively leave it unregistered (see
+            # _call_arg0_is_static_scalar).
+            if self._call_arg0_is_static_scalar(node):
+                self._register_owned_str_ptr(result)
+            return result
         # str(bytes, encoding) → just return the first arg as string
         if len(node.args) >= 1:
             return self._emit_expr_value(node.args[0])
@@ -36341,7 +36413,9 @@ class CodeGen:
     def _emit_builtin_chr(self, node):
         if len(node.args) == 1:
             val = self._emit_expr_value(node.args[0])
-            return self.builder.call(self.runtime["chr"], [val])
+            # fastpy_chr always allocates a fresh owned FpyString (Model 2).
+            return self._register_owned_str_ptr(
+                self.builder.call(self.runtime["chr"], [val]))
         raise CodeGenError("chr() takes exactly one argument", node)
 
     def _emit_builtin_open(self, node):
@@ -36375,19 +36449,25 @@ class CodeGen:
     def _emit_builtin_hex(self, node):
         if len(node.args) == 1:
             val = self._emit_expr_value(node.args[0])
-            return self.builder.call(self.runtime["hex"], [val])
+            # fastpy_hex always allocates a fresh owned FpyString (Model 2).
+            return self._register_owned_str_ptr(
+                self.builder.call(self.runtime["hex"], [val]))
         raise CodeGenError("hex() takes exactly one argument", node)
 
     def _emit_builtin_oct(self, node):
         if len(node.args) == 1:
             val = self._emit_expr_value(node.args[0])
-            return self.builder.call(self.runtime["oct"], [val])
+            # fastpy_oct always allocates a fresh owned FpyString (Model 2).
+            return self._register_owned_str_ptr(
+                self.builder.call(self.runtime["oct"], [val]))
         raise CodeGenError("oct() takes exactly one argument", node)
 
     def _emit_builtin_bin(self, node):
         if len(node.args) == 1:
             val = self._emit_expr_value(node.args[0])
-            return self.builder.call(self.runtime["bin"], [val])
+            # fastpy_bin always allocates a fresh owned FpyString (Model 2).
+            return self._register_owned_str_ptr(
+                self.builder.call(self.runtime["bin"], [val]))
         raise CodeGenError("bin() takes exactly one argument", node)
 
     def _emit_builtin_round(self, node):
@@ -36455,7 +36535,10 @@ class CodeGen:
                 return self._ensure_ptr(result)
             # Use FV dispatch so runtime tag drives the conversion.
             fv = self._load_or_wrap_fv(node.args[0])
-            return self._fv_call_repr(fv)
+            # Model-2: fastpy_fv_repr always allocates a fresh owned buffer
+            # (even for str input — it adds quotes), so its result is always
+            # owned. Register it for release at the statement boundary.
+            return self._register_owned_str_ptr(self._fv_call_repr(fv))
         raise CodeGenError("repr() takes exactly one argument", node)
 
     def _emit_builtin_sum(self, node):
@@ -46140,6 +46223,15 @@ class CodeGen:
                         # conversion (handles mixed-type containers).
                         fv = self._load_or_wrap_fv(value.value)
                         str_val = self._fv_call_str(fv)
+                        # A statically-scalar interpolant routes through
+                        # fastpy_fv_str's fresh-buffer (owned +1) branch — the
+                        # concat that consumes it only copies bytes, so register
+                        # it for release at the statement boundary (Model 2).
+                        # STR/OBJ interpolants take the borrowed/conditional
+                        # paths and must NOT be registered (→ UAF), hence the
+                        # conservative static-scalar gate.
+                        if self._expr_is_static_scalar(value.value):
+                            self._register_owned_str_ptr(str_val)
 
                 # Apply conversion if requested
                 if conversion in (114, 97):  # !r or !a
