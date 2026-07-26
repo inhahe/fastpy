@@ -33510,7 +33510,9 @@ class CodeGen:
                     # ── BIGINT path: dispatch through fv_binop ──
                     self.builder.position_at_end(_big_bb)
                     _fv_ops = {ast.Add: 0, ast.Sub: 1, ast.Mult: 2,
-                               ast.Div: 3, ast.FloorDiv: 4, ast.Mod: 5}
+                               ast.Div: 3, ast.FloorDiv: 4, ast.Mod: 5,
+                               ast.BitAnd: 6, ast.BitOr: 7, ast.BitXor: 8,
+                               ast.LShift: 9, ast.RShift: 10}
                     _opc = _fv_ops.get(op, 0)
                     _big_ot = self._create_entry_alloca(i32, "ubig.tag")
                     _big_od = self._create_entry_alloca(i64, "ubig.data")
@@ -33600,8 +33602,15 @@ class CodeGen:
         # When both operands are UNKNOWN FpyValue structs (e.g. two
         # dict.get() calls), check if both are INT at runtime and use
         # integer arithmetic if so.
+        # Exclude bitwise/shift ops here: the int/float split below can't
+        # handle a BIGINT operand at runtime (the both-INT check fails and
+        # it would route a BigInt pointer through _emit_float_binop).  Let
+        # bitwise ops fall through to the general fv_binop dispatch, which
+        # promotes to BigInt correctly (BUG-BIGINT-BITWISE-DYNAMIC).
+        _BITWISE_UNKN = (ast.BitAnd, ast.BitOr, ast.BitXor,
+                         ast.LShift, ast.RShift)
         if (lk == VKind.UNKNOWN and rk == VKind.UNKNOWN
-                and op != ast.Div):
+                and op != ast.Div and op not in _BITWISE_UNKN):
             _lraw = ltv.val
             _rraw = rtv.val
             _ltag = _rtag = None
@@ -33727,7 +33736,9 @@ class CodeGen:
         # (str concat, repeat, TypeError for invalid combos, and
         # proper INT→FLOAT promotion for truediv).
         _fv_op_map = {ast.Add: 0, ast.Sub: 1, ast.Mult: 2, ast.Div: 3,
-                      ast.FloorDiv: 4, ast.Mod: 5}
+                      ast.FloorDiv: 4, ast.Mod: 5,
+                      ast.BitAnd: 6, ast.BitOr: 7, ast.BitXor: 8,
+                      ast.LShift: 9, ast.RShift: 10}
         _gf_opc = _fv_op_map.get(op)
         if _gf_opc is not None:
             _gf_lt = _gf_ld = _gf_rt = _gf_rd = None
@@ -34141,19 +34152,33 @@ class CodeGen:
                 return self._fv_build_from_slots(
                     self.builder.load(out_tag),
                     self.builder.load(out_data))
-            # Bitwise/shift ops on FpyValue: extract the i64 data and
-            # dispatch through _emit_int_binop.  This handles the common
-            # case where an earlier checked_* (BigInt-capable) arithmetic
-            # result feeds a bitwise/shift operator — the FpyValue struct
-            # must not reach cpython_binop (which treats it as PyObject*).
-            _BITWISE_OPS = (ast.BitAnd, ast.BitOr, ast.BitXor,
-                            ast.LShift, ast.RShift)
-            if op in _BITWISE_OPS:
-                l_i64 = (self.builder.extract_value(ltv.val, 1)
-                         if _l_is_fv else ltv.as_i64(self.builder))
-                r_i64 = (self.builder.extract_value(rtv.val, 1)
-                         if _r_is_fv else rtv.as_i64(self.builder))
-                return self._emit_int_binop(node.op, l_i64, r_i64, node)
+            # Bitwise/shift ops on FpyValue: dispatch through fv_binop
+            # (opcodes 6..10) so a BIGINT-tagged operand is handled with
+            # correct Python semantics.  Using _emit_int_binop here would
+            # treat a BigInt pointer as a raw i64 and corrupt it — the bug
+            # behind BUG-BIGINT-BITWISE-DYNAMIC.  fv_binop promotes to
+            # BigInt as needed and demotes the result if it fits an i64.
+            _fv_bitwise = {ast.BitAnd: 6, ast.BitOr: 7, ast.BitXor: 8,
+                           ast.LShift: 9, ast.RShift: 10}
+            if op in _fv_bitwise:
+                lt_tag, lt_data = (self.builder.extract_value(ltv.val, 0),
+                                   self.builder.extract_value(ltv.val, 1)) \
+                    if _l_is_fv else (ir.Constant(i32, ltv.vtype.kind.fpy_tag),
+                                       ltv.as_i64(self.builder))
+                rt_tag, rt_data = (self.builder.extract_value(rtv.val, 0),
+                                   self.builder.extract_value(rtv.val, 1)) \
+                    if _r_is_fv else (ir.Constant(i32, rtv.vtype.kind.fpy_tag),
+                                       rtv.as_i64(self.builder))
+                out_tag = self._create_entry_alloca(i32, "fvbw.tag")
+                out_data = self._create_entry_alloca(i64, "fvbw.data")
+                self.builder.call(self.runtime["fv_binop"],
+                                  [lt_tag, lt_data, rt_tag, rt_data,
+                                   ir.Constant(i32, _fv_bitwise[op]),
+                                   out_tag, out_data])
+                self._emit_try_bail_if_exc()
+                return self._fv_build_from_slots(
+                    self.builder.load(out_tag),
+                    self.builder.load(out_data))
 
         # ── Fast path: PYOBJ binary ops — dispatch to CPython ──────────
         if lk == VKind.PYOBJ or rk == VKind.PYOBJ:

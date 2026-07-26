@@ -1098,6 +1098,58 @@ void fastpy_fv_binop(int32_t lt, int64_t ld, int32_t rt, int64_t rd,
         }
         return;
     }
+    /* Bitwise / shift ops (op: 6=and, 7=or, 8=xor, 9=lshift, 10=rshift)
+     * on integer-like operands.  Promote everything to BigInt so Python's
+     * infinite-width two's-complement / floor-shift semantics are honored
+     * uniformly (the bigint helpers implement them), then demote the
+     * result back to a native INT when it fits.  This is the dynamic
+     * fallback path (statically-typed int&int uses the inline i64 path in
+     * codegen); correctness matters more than the bigint alloc overhead. */
+    if (op >= 6 && op <= 10
+        && (lt == FPY_TAG_INT || lt == FPY_TAG_BOOL || lt == FPY_TAG_BIGINT)
+        && (rt == FPY_TAG_INT || rt == FPY_TAG_BOOL || rt == FPY_TAG_BIGINT)) {
+        extern FpyBigInt* fpy_bigint_from_i64(int64_t);
+        extern FpyBigInt* fpy_bigint_and(FpyBigInt*, FpyBigInt*);
+        extern FpyBigInt* fpy_bigint_or(FpyBigInt*, FpyBigInt*);
+        extern FpyBigInt* fpy_bigint_xor(FpyBigInt*, FpyBigInt*);
+        extern FpyBigInt* fpy_bigint_lshift(FpyBigInt*, FpyBigInt*);
+        extern FpyBigInt* fpy_bigint_rshift(FpyBigInt*, FpyBigInt*);
+        extern int fpy_bigint_fits_i64(FpyBigInt*);
+        extern int64_t fpy_bigint_to_i64(FpyBigInt*, int*);
+        extern void fpy_bigint_free(FpyBigInt*);
+        /* Only the operands we promote via from_i64 are owned here and must
+         * be freed; a caller-provided BigInt (tag==BIGINT) is not. */
+        int l_own = (lt != FPY_TAG_BIGINT);
+        int r_own = (rt != FPY_TAG_BIGINT);
+        FpyBigInt *la = (lt == FPY_TAG_BIGINT) ? (FpyBigInt*)(intptr_t)ld
+            : fpy_bigint_from_i64((lt == FPY_TAG_BOOL) ? (ld != 0) : ld);
+        FpyBigInt *ra = (rt == FPY_TAG_BIGINT) ? (FpyBigInt*)(intptr_t)rd
+            : fpy_bigint_from_i64((rt == FPY_TAG_BOOL) ? (rd != 0) : rd);
+        FpyBigInt *result = NULL;
+        switch (op) {
+            case 6:  result = fpy_bigint_and(la, ra);    break;
+            case 7:  result = fpy_bigint_or(la, ra);     break;
+            case 8:  result = fpy_bigint_xor(la, ra);    break;
+            case 9:  result = fpy_bigint_lshift(la, ra); break;
+            case 10: result = fpy_bigint_rshift(la, ra); break;
+            default: break;
+        }
+        if (l_own) fpy_bigint_free(la);
+        if (r_own) fpy_bigint_free(ra);
+        if (result) {
+            if (fpy_bigint_fits_i64(result)) {
+                int ov = 0;
+                int64_t iv = fpy_bigint_to_i64(result, &ov);
+                fpy_bigint_free(result);
+                *out_tag = FPY_TAG_INT;
+                *out_data = iv;
+            } else {
+                *out_tag = FPY_TAG_BIGINT;
+                *out_data = (int64_t)(intptr_t)result;
+            }
+            return;
+        }
+    }
     /* BigInt arithmetic — promote INT/BOOL to BigInt if needed */
     if (lt == FPY_TAG_BIGINT || rt == FPY_TAG_BIGINT) {
         extern FpyBigInt* fpy_bigint_from_i64(int64_t);
@@ -1180,14 +1232,15 @@ void fastpy_fv_binop(int32_t lt, int64_t ld, int32_t rt, int64_t rd,
         lt == FPY_TAG_BYTES || rt == FPY_TAG_BYTES) {
         /* If we reach here, no valid handler matched (e.g. list+int, dict-int,
          * str+list, etc.) — raise TypeError like CPython does. */
-        static const char *_op_syms[] = {"+", "-", "*", "/", "//", "%"};
+        static const char *_op_syms[] = {"+", "-", "*", "/", "//", "%",
+                                         "&", "|", "^", "<<", ">>"};
         static const char *_tnames[] = {
             "int", "float", "str", "bool", "NoneType",
             "list", "object", "dict", "bytes", "set",
             "bigint", "complex", "Decimal"};
         const char *ln = (lt >= 0 && lt <= 12) ? _tnames[lt] : "object";
         const char *rn = (rt >= 0 && rt <= 12) ? _tnames[rt] : "object";
-        const char *on = (op >= 0 && op <= 5) ? _op_syms[op] : "?";
+        const char *on = (op >= 0 && op <= 10) ? _op_syms[op] : "?";
         snprintf(_err_buf, sizeof(_err_buf),
                  "unsupported operand type(s) for %s: '%.40s' and '%.40s'",
                  on, ln, rn);

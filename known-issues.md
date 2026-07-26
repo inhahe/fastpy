@@ -298,7 +298,49 @@ operand's *inferred* vtype is FVALUE/UNKNOWN (e.g. a negated bigint variable
 path still has no bigint-bitwise handling, so inline `(-B) & 255` etc. produce
 wrong output. Tracked separately.
 
-### BUG-BIGINT-BITWISE-DYNAMIC. Bitwise ops on a runtime-tagged (FVALUE/UNKNOWN) bigint go through `_emit_binop_unknown` / `fastpy_fv_binop`, which lacks bigint-bitwise handling — 2026-07-26
+### BUG-BIGINT-BITWISE-DYNAMIC. [FIXED] Bitwise ops on a runtime-tagged (FVALUE/UNKNOWN) bigint go through `_emit_binop_unknown` / `fastpy_fv_binop`, which lacked bigint-bitwise handling — 2026-07-26
+
+**Fix (committed):** (1) `fastpy_fv_binop` (objects.c) now handles bitwise/shift
+opcodes 6=and,7=or,8=xor,9=lshift,10=rshift for integer-like operands by
+promoting to BigInt, calling `fpy_bigint_and/or/xor/lshift/rshift`, and
+demoting the result to a native INT when it fits (the promoted int operands
+are freed; a caller BigInt is not). (2) codegen routes bitwise ops through
+fv_binop with those opcodes in every dynamic sub-path of `_emit_binop`/
+`_emit_binop_unknown`: the FpyValue-operand branch (was `_emit_int_binop`,
+which corrupted a BigInt pointer), the UNKNOWN+INT BigInt branch (`_fv_ops`
+lacked bitwise → defaulted to opcode 0=Add), and the general
+"UNKNOWN-with-extractable-tags" dispatch (`_fv_op_map` lacked bitwise). The
+both-UNKNOWN int/float fast path now *excludes* bitwise so a runtime-BigInt
+operand doesn't get routed through `_emit_float_binop`. Validated: `(-B)&k`,
+`mask & x` (int var), the 64-bit FNV-1a hash loop, and 314 differential tests
+all pass.
+
+**Known remaining (separate bug):** see BUG-INT-LSHIFT-OVERFLOW below —
+`7 << 70` (pure int<<int that overflows i64) still gives garbage because the
+static `_emit_int_binop` LShift is a bare `shl`. That is orthogonal to the
+dynamic-dispatch bug fixed here.
+
+### BUG-INT-LSHIFT-OVERFLOW. Static `int << int` that overflows i64 is not promoted to BigInt — `7 << 70` gives garbage — 2026-07-26
+
+**What:** `_emit_int_binop` (codegen ~34482) lowers `ast.LShift` to a bare
+`self.builder.shl(left, right)`. When the shift amount is >= 64 (or the result
+exceeds i64), LLVM `shl` is poison/UB and the result is garbage (e.g. `7 << 70`
+→ `20` instead of `8264141345021879123968`). Unlike `+`/`-`/`*` (which route
+through `fpy_checked_*` and promote to BigInt), shift has no overflow-checked
+path.
+
+**Reproduce:**
+```python
+print(7 << 70)     # CPython: 8264141345021879123968 ; fastpy: 20
+```
+
+**Proper fix:** add `fpy_checked_lshift(int64_t a, int64_t b, FpyBigInt **big)`
+(bigint.c/.h) mirroring `fpy_checked_mul`: if `a << b` fits i64 return it, else
+set `*big` to the BigInt result. Route `ast.LShift` in `_emit_int_binop`
+through it (localized to shift only, so non-shift arithmetic keeps its
+`_program_uses_bigint` gating), and ensure the AST bigint detector flags
+programs using `<<` with a large/limit-exceeding shift so `_program_uses_bigint`
+is set. RShift, And, Or, Xor cannot grow past i64, so they stay bare ops.
 
 **What:** the static fix above (`_bigint_ops`) only fires when codegen has
 *statically* inferred a BIGINT vtype for an operand. When an operand's inferred
