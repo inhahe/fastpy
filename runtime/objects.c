@@ -173,6 +173,8 @@ void fpy_rc_incref(int32_t tag, int64_t data) {
         }
         case FPY_TAG_STR:
             fpy_str_incref((const char*)(intptr_t)data); break;
+        case FPY_TAG_BYTES:
+            fpy_bytes_incref((const char*)(intptr_t)data); break;
         default: break;  /* INT, FLOAT, BOOL, NONE — not heap-allocated */
     }
 }
@@ -183,6 +185,12 @@ void fpy_rc_decref(int32_t tag, int64_t data) {
         case FPY_TAG_STR:
             if (fpy_str_decref((const char*)(intptr_t)data)) {
                 FpyString *h = fpy_str_header((const char*)(intptr_t)data);
+                if (h) free(h);
+            }
+            break;
+        case FPY_TAG_BYTES:
+            if (fpy_bytes_decref((const char*)(intptr_t)data)) {
+                FpyBytes *h = fpy_bytes_header((const char*)(intptr_t)data);
                 if (h) free(h);
             }
             break;
@@ -1038,16 +1046,17 @@ void fastpy_fv_binop(int32_t lt, int64_t ld, int32_t rt, int64_t rd,
         *out_data = (int64_t)(intptr_t)result;
         return;
     }
-    /* Bytes + Bytes → concat */
+    /* Bytes + Bytes → concat.  Header-backed (fpy_bytes_alloc) and
+     * length-aware (fpy_bytes_len) so embedded null bytes survive and the
+     * result carries an FpyBytes header (refcount=1) for correct free. */
     if (lt == FPY_TAG_BYTES && rt == FPY_TAG_BYTES && op == 0) {
         const char *a = (const char*)(intptr_t)ld;
         const char *b = (const char*)(intptr_t)rd;
-        size_t la = a ? strlen(a) : 0;
-        size_t lb = b ? strlen(b) : 0;
-        char *result = (char*)malloc(la + lb + 1);
-        if (a) memcpy(result, a, la);
-        if (b) memcpy(result + la, b, lb);
-        result[la + lb] = '\0';
+        int64_t la = a ? fpy_bytes_len(a) : 0;
+        int64_t lb = b ? fpy_bytes_len(b) : 0;
+        char *result = fpy_bytes_alloc(la + lb);
+        if (la > 0) memcpy(result, a, (size_t)la);
+        if (lb > 0) memcpy(result + la, b, (size_t)lb);
         *out_tag = FPY_TAG_BYTES;
         *out_data = (int64_t)(intptr_t)result;
         return;
@@ -1055,26 +1064,24 @@ void fastpy_fv_binop(int32_t lt, int64_t ld, int32_t rt, int64_t rd,
     /* Bytes * Int/Bool or Int/Bool * Bytes → repeat */
     if (lt == FPY_TAG_BYTES && (rt == FPY_TAG_INT || rt == FPY_TAG_BOOL) && op == 2) {
         const char *a = (const char*)(intptr_t)ld;
-        size_t la = a ? strlen(a) : 0;
+        int64_t la = a ? fpy_bytes_len(a) : 0;
         int64_t n = rd > 0 ? rd : 0;
-        size_t total = la * (size_t)n;
-        char *result = (char*)malloc(total + 1);
+        int64_t total = la * n;
+        char *result = fpy_bytes_alloc(total);
         for (int64_t i = 0; i < n; i++)
-            memcpy(result + i * la, a, la);
-        result[total] = '\0';
+            if (la > 0) memcpy(result + i * la, a, (size_t)la);
         *out_tag = FPY_TAG_BYTES;
         *out_data = (int64_t)(intptr_t)result;
         return;
     }
     if ((lt == FPY_TAG_INT || lt == FPY_TAG_BOOL) && rt == FPY_TAG_BYTES && op == 2) {
         const char *a = (const char*)(intptr_t)rd;
-        size_t la = a ? strlen(a) : 0;
+        int64_t la = a ? fpy_bytes_len(a) : 0;
         int64_t n = ld > 0 ? ld : 0;
-        size_t total = la * (size_t)n;
-        char *result = (char*)malloc(total + 1);
+        int64_t total = la * n;
+        char *result = fpy_bytes_alloc(total);
         for (int64_t i = 0; i < n; i++)
-            memcpy(result + i * la, a, la);
-        result[total] = '\0';
+            if (la > 0) memcpy(result + i * la, a, (size_t)la);
         *out_tag = FPY_TAG_BYTES;
         *out_data = (int64_t)(intptr_t)result;
         return;

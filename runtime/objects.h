@@ -349,6 +349,18 @@ static inline int64_t fpy_bytes_len(const char *s) {
     if (bh) return bh->length;
     return (int64_t)strlen(s);  /* fallback for plain char* */
 }
+/* Refcount ops for header-backed bytes. A non-headered (constant) bytes
+ * pointer has no FpyBytes header → these are no-ops (immortal), mirroring
+ * fpy_str_incref/decref. */
+static inline void fpy_bytes_incref(const char *s) {
+    FpyBytes *h = fpy_bytes_header(s);
+    if (h && h->refcount != FPY_RC_IMMORTAL) h->refcount++;
+}
+static inline int fpy_bytes_decref(const char *s) {
+    FpyBytes *h = fpy_bytes_header(s);
+    if (!h || h->refcount == FPY_RC_IMMORTAL) return 0;
+    return (--h->refcount == 0);  /* returns 1 if should be freed */
+}
 
 /* Return the byte-length of the UTF-8 code point starting at *p.
  * p must point to a leading byte (not a continuation byte). */

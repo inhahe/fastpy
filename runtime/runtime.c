@@ -213,6 +213,30 @@ int64_t fastpy_bytes_get(const char *b, int64_t index) {
     return (int64_t)(unsigned char)b[index];
 }
 
+/* bytes + bytes → concat.  FpyBytes-aware (uses stored length, so embedded
+ * null bytes are preserved) and header-backed via fpy_bytes_alloc so the
+ * result carries a valid FpyBytes header (refcount=1) — incref/decref and
+ * fpy_bytes_len work correctly and it is freed exactly once. */
+const char* fastpy_bytes_concat(const char *a, const char *b) {
+    int64_t la = fpy_bytes_len(a);
+    int64_t lb = fpy_bytes_len(b);
+    char *out = fpy_bytes_alloc(la + lb);
+    if (la > 0) memcpy(out, a, (size_t)la);
+    if (lb > 0) memcpy(out + la, b, (size_t)lb);
+    return out;
+}
+
+/* bytes * int → repetition.  Same header-backed, embedded-null-safe rules. */
+const char* fastpy_bytes_repeat(const char *b, int64_t n) {
+    int64_t lb = fpy_bytes_len(b);
+    if (n < 0) n = 0;
+    int64_t total = lb * n;
+    char *out = fpy_bytes_alloc(total);
+    for (int64_t i = 0; i < n; i++)
+        if (lb > 0) memcpy(out + i * lb, b, (size_t)lb);
+    return out;
+}
+
 const char* fastpy_str_slice(const char *s, int64_t start, int64_t stop, int64_t has_start, int64_t has_stop) {
     int64_t len = fastpy_str_len(s);  /* code point count */
     if (!has_start) start = 0;

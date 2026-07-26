@@ -1798,6 +1798,12 @@ class CodeGen:
         # bytes length (FpyBytes-aware, handles embedded null bytes)
         ft = ir.FunctionType(i64, [i8_ptr])
         self.runtime["bytes_len"] = ir.Function(self.module, ft, name="fastpy_bytes_len")
+        # bytes + bytes → concat (FpyBytes-aware, embedded-null safe, header-backed)
+        ft = ir.FunctionType(i8_ptr, [i8_ptr, i8_ptr])
+        self.runtime["bytes_concat"] = ir.Function(self.module, ft, name="fastpy_bytes_concat")
+        # bytes * int → repeat
+        ft = ir.FunctionType(i8_ptr, [i8_ptr, i64])
+        self.runtime["bytes_repeat"] = ir.Function(self.module, ft, name="fastpy_bytes_repeat")
         # dict.fromkeys(keys, value) and dict.fromkeys(keys)
         ft = ir.FunctionType(i8_ptr, [i8_ptr, i32, i64])
         self.runtime["dict_fromkeys"] = ir.Function(self.module, ft, name="fastpy_dict_fromkeys")
@@ -2915,6 +2921,55 @@ class CodeGen:
         return self.builder.gep(
             global_str,
             [ir.Constant(i32, 0), ir.Constant(i32, 2), ir.Constant(i32, 0)],
+            inbounds=True,
+        )
+
+    _FPY_BYTES_MAGIC = 0x42595445  # "BYTE" — must match FPY_BYTES_MAGIC (objects.h)
+
+    def _make_bytes_constant(self, value: bytes) -> ir.Constant:
+        """Create a global bytes constant and return an i8* to its data.
+
+        The global is an FpyBytes-compatible struct: an immortal
+        `{i32 magic, i32 refcount, i64 length}` header followed by the raw
+        bytes (+ a trailing NUL for C-compat). Returns a GEP to the first
+        data byte, so `fpy_bytes_header(ptr)` (ptr-16) reads a real header and
+        `fpy_bytes_len`/incref/decref work correctly — including embedded null
+        bytes (the length field, not strlen, is authoritative). refcount is
+        FPY_RC_IMMORTAL so incref/decref are no-ops and the read-only global is
+        never written to or freed. Deduplicates on value.
+
+        Bytes literals were previously emitted via `_make_string_constant`
+        (an FpyString header at offset -8), so any `fpy_bytes_*` access read a
+        bogus header 16 bytes before the data — an out-of-bounds read (ASan
+        global-buffer-overflow) and a length bug for embedded nulls. This gives
+        bytes their own correct header. See BUG-BYTES-REPR-AS-STRING.
+        """
+        if not hasattr(self, '_bytes_constants'):
+            self._bytes_constants: dict[bytes, ir.GlobalVariable] = {}
+        global_b = self._bytes_constants.get(value)
+        if global_b is None:
+            raw = bytes(value) + b"\x00"
+            data_type = ir.ArrayType(i8, len(raw))
+            # FpyBytes layout: { i32 magic, i32 refcount, i64 length, i8 data[] }.
+            struct_type = ir.LiteralStructType([i32, i32, i64, data_type])
+            name = f".bytes.{self._str_counter}"
+            self._str_counter += 1
+            global_b = ir.GlobalVariable(self.module, struct_type, name=name)
+            global_b.global_constant = True
+            global_b.linkage = "private"
+            global_b.initializer = ir.Constant(struct_type, [
+                ir.Constant(i32, self._FPY_BYTES_MAGIC),
+                ir.Constant(i32, self._FPY_RC_IMMORTAL),
+                ir.Constant(i64, len(value)),
+                ir.Constant(data_type, bytearray(raw)),
+            ])
+            global_b.unnamed_addr = True
+            self._bytes_constants[value] = global_b
+
+        # GEP to the first byte of the data[] field (struct field index 3).
+        return self.builder.gep(
+            global_b,
+            [ir.Constant(i32, 0), ir.Constant(i32, 3), ir.Constant(i32, 0)],
             inbounds=True,
         )
 
@@ -25715,6 +25770,23 @@ class CodeGen:
             self._register_owned_temp(ir.Constant(i32, FPY_TAG_STR), data)
         return r
 
+    def _owned_bytes_result(self, fn_name, args) -> ir.Value:
+        """Emit a bytes-producing runtime call (bytes_concat/bytes_repeat) and
+        register its freshly-allocated, +1 owned FpyBytes as a Model-2 owned
+        temp (tag FPY_TAG_BYTES) so it is released at the statement boundary.
+        fpy_rc_incref/decref handle FPY_TAG_BYTES (via fpy_bytes_incref/decref
+        on the FpyBytes header), so retaining consumers incref and the boundary
+        flush frees the +1. Bytes are pure-refcount (not GC-tracked), so
+        without this the result would be a genuine leak."""
+        r = self._rt_call(fn_name, args)
+        if (self._USE_REFCOUNT and self.builder is not None
+                and self.builder.block is not None
+                and not self.builder.block.is_terminated):
+            rp = self._ensure_ptr(r)
+            data = self.builder.ptrtoint(rp, i64)
+            self._register_owned_temp(ir.Constant(i32, FPY_TAG_BYTES), data)
+        return r
+
     def _flush_rc_temps_to(self, mark: int) -> None:
         """Release every owned temp registered since `mark`, popping the list
         back down to `mark`. Emits `rc_decref` for each temp ONLY when the
@@ -33747,13 +33819,18 @@ class CodeGen:
             return self._rt_call("str_repeat", [ltv, rtv])
         if lk in (VKind.INT, VKind.BOOL) and rk == VKind.STR and op == ast.Mult:
             return self._rt_call("str_repeat", [rtv, ltv])
-        # bytes + bytes → concat, bytes * int → repetition (same runtime as str)
+        # bytes + bytes → concat, bytes * int → repetition. Use dedicated
+        # FpyBytes-aware runtime funcs (length-preserving for embedded nulls,
+        # header-backed so incref/decref work), NOT the str_* funcs (which
+        # strlen-truncate on embedded nulls and produce an FpyString whose
+        # header layout differs from FpyBytes → OOB reads via fpy_bytes_len).
+        # Result is an owned (+1) FpyBytes registered as a Model-2 temp.
         if lk == VKind.BYTES and rk == VKind.BYTES and op == ast.Add:
-            return self._rt_call("str_concat", [ltv, rtv])
+            return self._owned_bytes_result("bytes_concat", [ltv, rtv])
         if lk == VKind.BYTES and rk in (VKind.INT, VKind.BOOL) and op == ast.Mult:
-            return self._rt_call("str_repeat", [ltv, rtv])
+            return self._owned_bytes_result("bytes_repeat", [ltv, rtv])
         if lk in (VKind.INT, VKind.BOOL) and rk == VKind.BYTES and op == ast.Mult:
-            return self._rt_call("str_repeat", [rtv, ltv])
+            return self._owned_bytes_result("bytes_repeat", [rtv, ltv])
         # str + i64 or i64 + str from a closure/function-pointer call:
         # the i64 is likely a string pointer whose type tag was lost through
         # the closure calling convention (common in decorator wrappers doing
@@ -37724,8 +37801,12 @@ class CodeGen:
         if func_name == "dumps" and len(node.args) == 1 and not node.keywords:
             val = self._emit_expr_value(node.args[0])
             tag, data = self._bare_to_tag_data(val, node.args[0])
-            return self.builder.call(self.runtime["json_dumps"],
-                                     [ir.Constant(i32, tag), data])
+            # fastpy_json_dumps_fv always returns a fresh owned (+1) FpyString
+            # (fpy_str_copy) — register it for release at the statement
+            # boundary (Model 2).
+            return self._register_owned_str_ptr(
+                self.builder.call(self.runtime["json_dumps"],
+                                  [ir.Constant(i32, tag), data]))
         elif func_name == "loads" and len(node.args) == 1:
             arg = self._emit_expr_value(node.args[0])
             arg = self._ensure_ptr(arg)
@@ -46403,6 +46484,16 @@ class CodeGen:
             result = self._owned_str_concat([result, part])
         return result
 
+    def _fmt_spec_call(self, fn_name: str, args) -> ir.Value:
+        """Call a format_spec_* runtime fn (fastpy_format_spec_str/int/float —
+        each unconditionally returns a fresh, owned (+1) FpyString via
+        fpy_str_buf in every branch) and register the result as a Model-2 owned
+        temp so it is released at the statement boundary. The obj __format__
+        dispatch path is deliberately NOT routed through here (a user
+        __format__ may return a borrowed value)."""
+        return self._register_owned_str_ptr(
+            self.builder.call(self.runtime[fn_name], args))
+
     def _apply_format_spec(self, value: ir.Value, spec: str, arg_node: ast.expr, node: ast.AST) -> ir.Value:
         """Apply a format spec like .2f, 5d, <10 to a value, returning a string."""
         spec_ptr = self._make_string_constant(spec)
@@ -46424,7 +46515,7 @@ class CodeGen:
             str_result = self.builder.call(
                 self.runtime["obj_call_method0"], [value, str_name])
             str_ptr = self._ensure_ptr(str_result)
-            return self.builder.call(self.runtime["format_spec_str"], [str_ptr, spec_ptr])
+            return self._fmt_spec_call("format_spec_str", [str_ptr, spec_ptr])
         # If the spec ends with f/e/g, treat as float
         if last in ("f", "e", "g", "F", "E", "G"):
             # Convert int to float if needed
@@ -46435,16 +46526,16 @@ class CodeGen:
                 as_i64 = self.builder.ptrtoint(value, i64)
                 value = self.builder.bitcast(as_i64, double)
             if isinstance(value.type, ir.DoubleType):
-                return self.builder.call(self.runtime["format_spec_float"], [value, spec_ptr])
+                return self._fmt_spec_call("format_spec_float", [value, spec_ptr])
         # If value is a float, use float spec
         if isinstance(value.type, ir.DoubleType):
-            return self.builder.call(self.runtime["format_spec_float"], [value, spec_ptr])
+            return self._fmt_spec_call("format_spec_float", [value, spec_ptr])
         # Integer format
         elif isinstance(value.type, ir.IntType) and value.type.width == 64:
-            return self.builder.call(self.runtime["format_spec_int"], [value, spec_ptr])
+            return self._fmt_spec_call("format_spec_int", [value, spec_ptr])
         # String format
         elif isinstance(value.type, ir.PointerType):
-            return self.builder.call(self.runtime["format_spec_str"], [value, spec_ptr])
+            return self._fmt_spec_call("format_spec_str", [value, spec_ptr])
         # FpyValue struct: dispatch by format spec type.
         # Float specs (f/e/g): extract data as double.
         # Int specs (d/b/o/x/X): extract data as i64.
@@ -46460,15 +46551,15 @@ class CodeGen:
                 int_as_f = self.builder.sitofp(data, double)
                 float_raw = self.builder.bitcast(data, double)
                 float_val = self.builder.select(is_int, int_as_f, float_raw)
-                return self.builder.call(
-                    self.runtime["format_spec_float"], [float_val, spec_ptr])
+                return self._fmt_spec_call(
+                    "format_spec_float", [float_val, spec_ptr])
             elif last in ("d", "b", "o", "x", "X", "c", "n"):
-                return self.builder.call(
-                    self.runtime["format_spec_int"], [data, spec_ptr])
+                return self._fmt_spec_call(
+                    "format_spec_int", [data, spec_ptr])
             else:
                 str_val = self._fv_call_str(value)
-                return self.builder.call(
-                    self.runtime["format_spec_str"], [str_val, spec_ptr])
+                return self._fmt_spec_call(
+                    "format_spec_str", [str_val, spec_ptr])
         return self._make_string_constant("")  # Phase 4: unsupported format spec → empty string
 
     def _apply_format_spec_dynamic(self, value: ir.Value, spec_ptr: ir.Value,
@@ -46476,11 +46567,11 @@ class CodeGen:
         """Like _apply_format_spec but spec_ptr is a runtime i8* string."""
         # Dispatch based on the value's LLVM type
         if isinstance(value.type, ir.DoubleType):
-            return self.builder.call(self.runtime["format_spec_float"],
-                                     [value, spec_ptr])
+            return self._fmt_spec_call("format_spec_float",
+                                       [value, spec_ptr])
         elif isinstance(value.type, ir.IntType) and value.type.width == 64:
-            return self.builder.call(self.runtime["format_spec_int"],
-                                     [value, spec_ptr])
+            return self._fmt_spec_call("format_spec_int",
+                                       [value, spec_ptr])
         elif isinstance(value.type, ir.PointerType):
             if self._is_obj_expr(arg_node):
                 # Convert object to string first, then apply str format
@@ -46488,16 +46579,16 @@ class CodeGen:
                 str_result = self.builder.call(
                     self.runtime["obj_call_method0"], [value, str_name])
                 str_ptr = self._ensure_ptr(str_result)
-                return self.builder.call(self.runtime["format_spec_str"],
-                                         [str_ptr, spec_ptr])
-            return self.builder.call(self.runtime["format_spec_str"],
-                                     [value, spec_ptr])
+                return self._fmt_spec_call("format_spec_str",
+                                           [str_ptr, spec_ptr])
+            return self._fmt_spec_call("format_spec_str",
+                                       [value, spec_ptr])
         # FpyValue: convert to string, then apply format
         elif (isinstance(value.type, ir.LiteralStructType)
                 and value.type == fpy_val):
             str_val = self._fv_call_str(value)
-            return self.builder.call(self.runtime["format_spec_str"],
-                                     [str_val, spec_ptr])
+            return self._fmt_spec_call("format_spec_str",
+                                       [str_val, spec_ptr])
         else:
             return self._make_string_constant("")
 
@@ -46540,8 +46631,9 @@ class CodeGen:
             # Ellipsis — represented as a sentinel value
             return ir.Constant(i64, 0)
         elif isinstance(value, bytes):
-            # bytes literal — store as string for now (limited support)
-            return self._make_string_constant(value.decode('latin-1', errors='replace'))
+            # bytes literal — real FpyBytes constant (immortal header at -16),
+            # so fpy_bytes_len/incref/decref work and embedded nulls survive.
+            return self._make_bytes_constant(value)
         elif isinstance(value, complex):
             # Complex literal — create FpyComplex at runtime
             real = ir.Constant(double, value.real)

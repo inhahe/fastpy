@@ -143,11 +143,33 @@ str-concat producers converted.
   str-var reuse after interpolation (no UAF) are all **leak-free with no
   UAF/double-free**, outputs match CPython; differential suite **314 passed**.
 
+**Stage 3.3 — format-spec + json.dumps + bytes concat/repeat — DONE (2026-07-26):**
+- **str.format()/f-string `{:spec}` format-spec results registered** (codegen.py):
+  the 13 `format_spec_{str,int,float}` call sites in `_apply_format_spec` /
+  `_apply_format_spec_dynamic` now go through the new `_fmt_spec_call` helper,
+  which wraps the result in `_register_owned_str_ptr` (each `fastpy_format_spec_*`
+  is unconditionally-owned — `fpy_str_buf`). The obj `__format__` path and the
+  empty-constant returns are excluded (may be borrowed / not heap). Was ~4 KB/leak.
+- **json.dumps registered**: `_emit_json_call` "dumps" branch wraps the
+  `fastpy_json_dumps_fv` result (unconditionally-owned, `fpy_str_copy`) in
+  `_register_owned_str_ptr`. Was ~5 KB/leak.
+- **bytes concat/repeat** now use dedicated `fastpy_bytes_concat`/`fastpy_bytes_repeat`
+  runtime funcs (header-backed `fpy_bytes_alloc`, length-preserving `fpy_bytes_len`)
+  registered as owned FPY_TAG_BYTES temps via `_owned_bytes_result`. See
+  **BUG-BYTES-REPR-AS-STRING** below for the underlying representation fix that made
+  this correct (bytes were formerly FpyString-headered → OOB header reads + strlen
+  length bug + a genuine leak since bytes are pure-refcount, not GC-tracked).
+- **Verified (native ASan, pure mode)**: `str.format`/f-string specs, `json.dumps`,
+  and `b1+b2` / `b*n` / embedded-null concat in a 1000-iter drop loop are all
+  **leak-free**, outputs match CPython; differential suite **314 passed**.
+
 **Still leaking (later Model-2 stages):**
-- **str()-family owned producers** (Stage 2 remainder): `.upper()/.lower()/.strip()/
-  .replace()/.split()/.join()/.format()`, `json.dumps`, dynamic format-spec, bytes
-  concat, and `str()`/f-string interpolation of **non-static-scalar** values (e.g.
-  `str(<obj with owned __str__>)`, a call-returned int). Not yet registered.
+- **str()-family owned producers** (Stage 2 remainder): `str()`/f-string interpolation
+  of **non-static-scalar** values (e.g. `str(<obj with owned __str__>)`, a
+  call-returned int). Not yet registered. (str-methods `.upper()/.lower()/.strip()/
+  .replace()/.split()/.join()` etc. and `.format()` are already registered — Stage
+  3.2/3.3.) **Note:** *bytes* methods are a separate exception — see
+  BUG-BYTES-METHODS-STR-RUNTIME below.
 - **Function-call results dropped at the call site** (Stage 3): `foo()` /
   `print(ret(a+b))` — a user-function that returns an owned value has its result
   neither registered nor released at the *caller*. Note this means returning a
@@ -175,6 +197,61 @@ sweep (concat/str()/upper/lower/replace/strip/format/split/join/dict-build/
 comprehension/f-string/user-fn-return, nested & discarded temps, in & out of loops,
 if/while conditions, break/continue/return, borrowed re-assignment `a=b`, subscript
 `a=lst[0]`, attr `a=o.x`) **plus** the full differential suite.
+
+### BUG-BYTES-REPR-AS-STRING. Bytes literals were emitted as FpyString constants (wrong header) — FIXED 2026-07-26
+
+**What (was):** `_emit_constant_value` emitted a `bytes` literal via
+`_make_string_constant(value.decode('latin-1'))`, producing an **FpyString**
+constant — header `{i32 magic=STRC, i32 refcount}` 8 bytes before the data —
+but the value was tagged `FPY_TAG_BYTES`. Every `fpy_bytes_*` accessor reads an
+**FpyBytes** header `{i32 magic=BYTE, i32 refcount, i64 length}` **16** bytes
+before the data. So on any bytes literal:
+- `fpy_bytes_header` (ptr-16) read 8 bytes off the front of the global → an
+  **out-of-bounds read** (ASan `global-buffer-overflow`; on the concat result it
+  was a heap-buffer-overflow via `len(b1+b2)`);
+- `fpy_bytes_len` found no BYTE magic → fell back to `strlen`, so **embedded null
+  bytes truncated the length** (`len(b"a\x00b")` gave 1, not 3);
+- registering a bytes value as a refcount temp crashed in `fpy_bytes_incref`.
+
+**Fix:** new `_make_bytes_constant(value: bytes)` emits a real FpyBytes-layout
+global — `{i32 magic=BYTE, i32 refcount=IMMORTAL, i64 length, i8 data[]}` (data
+NUL-terminated for C-compat) — and returns a GEP to `data` (field 3). `refcount
+= FPY_RC_IMMORTAL` so incref/decref are no-ops and the read-only global is never
+written/freed. `_emit_constant_value`'s bytes branch now calls it. Also added
+`FPY_TAG_BYTES` cases to `fpy_rc_incref`/`fpy_rc_decref` (via new inline
+`fpy_bytes_incref`/`fpy_bytes_decref` on the FpyBytes header) so bytes temps are
+refcounted, and rewrote the dynamic `fastpy_fv_binop` bytes concat/repeat blocks
+(objects.c) to use `fpy_bytes_alloc`+`fpy_bytes_len` instead of bare
+`malloc`+`strlen` (were leaking + null-truncating). Verified: `b1+b2`, `b*n`,
+embedded-null concat, `len`, index, `==` all leak-free under ASan and match
+CPython; differential suite 314 passed.
+
+### BUG-BYTES-METHODS-STR-RUNTIME. bytes methods route through str runtime helpers → leak + wrong element type + embedded-null truncation — 2026-07-26 (open)
+
+**What:** methods on a `bytes` value (e.g. `b"Hello".lower()`, `b"a,b,c".split(b",")`)
+are lowered to the **str** runtime helpers (`fastpy_str_lower`, str split, …),
+which:
+1. **Leak** — `fastpy_str_lower` returns a fresh owned `fpy_str_buf` FpyString that
+   is *not* registered as a Model-2 owned temp (LSan: 14-byte direct leak from
+   `fastpy_str_lower` on `b"Hello".lower()`).
+2. **Produce the wrong element type** — `b"a,b,c".split(b",")` yields a list of
+   **str** elements; fastpy prints `['a','b','c']` where CPython prints
+   `[b'a',b'b',b'c']`.
+3. Would **truncate on embedded nulls** (str helpers are `strlen`-based), and the
+   FpyString result carries a STRC header while tagged BYTES (same class of
+   header-mismatch as BUG-BYTES-REPR-AS-STRING, but on the *result*).
+
+**Where:** the bytes-method dispatch in codegen (search `_bytes_to_bytes_methods`
+and the str-method dispatch tables) maps bytes methods onto `str_*` runtime funcs
+instead of bytes-specific ones. `bytes.split`'s element tagging is in the split
+runtime.
+
+**Proper fix:** give bytes their own method runtime (or make the shared helpers
+FpyBytes-aware and length-based, allocating results via `fpy_bytes_alloc` with
+`FPY_TAG_BYTES` element/result tags), and register the owned results as
+`FPY_TAG_BYTES` temps (mirroring `_owned_bytes_result`). Until then, bytes-method
+results leak and mis-type. Non-method bytes ops (concat/repeat/index/len/compare)
+are correct as of BUG-BYTES-REPR-AS-STRING.
 
 ### BUG-BIGINT-MUL-INT-NULL. A bigint × small-int multiply passes a NULL operand into `fpy_bigint_mul` and segfaults — 2026-07-21
 
