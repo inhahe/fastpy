@@ -168,8 +168,9 @@ str-concat producers converted.
   of **non-static-scalar** values (e.g. `str(<obj with owned __str__>)`, a
   call-returned int). Not yet registered. (str-methods `.upper()/.lower()/.strip()/
   .replace()/.split()/.join()` etc. and `.format()` are already registered — Stage
-  3.2/3.3.) **Note:** *bytes* methods are a separate exception — see
-  BUG-BYTES-METHODS-STR-RUNTIME below.
+  3.2/3.3.) **Note:** *bytes* methods now have their own leak-free bytes-native
+  runtime and register as `FPY_TAG_BYTES` owned temps — see
+  BUG-BYTES-METHODS-STR-RUNTIME below (FIXED).
 - **Function-call results dropped at the call site** (Stage 3): `foo()` /
   `print(ret(a+b))` — a user-function that returns an owned value has its result
   neither registered nor released at the *caller*. Note this means returning a
@@ -226,32 +227,40 @@ refcounted, and rewrote the dynamic `fastpy_fv_binop` bytes concat/repeat blocks
 embedded-null concat, `len`, index, `==` all leak-free under ASan and match
 CPython; differential suite 314 passed.
 
-### BUG-BYTES-METHODS-STR-RUNTIME. bytes methods route through str runtime helpers → leak + wrong element type + embedded-null truncation — 2026-07-26 (open)
+### BUG-BYTES-METHODS-STR-RUNTIME. bytes methods route through str runtime helpers → leak + wrong element type + embedded-null truncation — FIXED 2026-07-26
 
-**What:** methods on a `bytes` value (e.g. `b"Hello".lower()`, `b"a,b,c".split(b",")`)
-are lowered to the **str** runtime helpers (`fastpy_str_lower`, str split, …),
-which:
-1. **Leak** — `fastpy_str_lower` returns a fresh owned `fpy_str_buf` FpyString that
-   is *not* registered as a Model-2 owned temp (LSan: 14-byte direct leak from
-   `fastpy_str_lower` on `b"Hello".lower()`).
-2. **Produce the wrong element type** — `b"a,b,c".split(b",")` yields a list of
-   **str** elements; fastpy prints `['a','b','c']` where CPython prints
+**What (was):** methods on a `bytes` value (e.g. `b"Hello".lower()`,
+`b"a,b,c".split(b",")`) were lowered to the **str** runtime helpers
+(`fastpy_str_lower`, str split, …), which:
+1. **Leaked** — `fastpy_str_lower` returns a fresh owned `fpy_str_buf` FpyString
+   that was *not* registered as a Model-2 owned temp (LSan: 14-byte direct leak
+   from `fastpy_str_lower` on `b"Hello".lower()`).
+2. **Produced the wrong element type** — `b"a,b,c".split(b",")` yielded a list of
+   **str** elements; fastpy printed `['a','b','c']` where CPython prints
    `[b'a',b'b',b'c']`.
-3. Would **truncate on embedded nulls** (str helpers are `strlen`-based), and the
-   FpyString result carries a STRC header while tagged BYTES (same class of
-   header-mismatch as BUG-BYTES-REPR-AS-STRING, but on the *result*).
+3. **Truncated on embedded nulls** (str helpers are `strlen`-based), and the
+   FpyString result carried a STRC header while tagged BYTES.
 
-**Where:** the bytes-method dispatch in codegen (search `_bytes_to_bytes_methods`
-and the str-method dispatch tables) maps bytes methods onto `str_*` runtime funcs
-instead of bytes-specific ones. `bytes.split`'s element tagging is in the split
-runtime.
+**Fix:** added bytes-native runtime helpers in `runtime/runtime.c`
+(`fastpy_bytes_upper/lower/strip/lstrip/rstrip`, `fastpy_bytes_replace`,
+`fastpy_bytes_split_sep`, `fastpy_bytes_join`, plus helpers
+`fpy_bytes_is_ws`/`fpy_bytes_find`/`fpy_bytes_strip_impl`/
+`fpy_bytes_list_append_slice`). All are `fpy_bytes_len`-based (embedded-null
+safe), allocate results via `fpy_bytes_alloc` (real FpyBytes header), and
+`split`/`join` build/read lists of `fpy_bytes_val` elements. `_emit_method_call_bytes`
+(codegen.py) now routes `upper/lower/strip/lstrip/rstrip/replace/split/join`
+to these and wraps the single-bytes results in `_owned_bytes_result` so they
+register as `FPY_TAG_BYTES` Model-2 owned temps. Also fixed the bytes **repr**
+in `objects.c` (both `fpy_value_repr` and `fpy_value_write` paths) to use
+`fpy_bytes_len` instead of `strlen`, so `b"a\x00b".upper()` reprs as `b'A\x00B'`.
+Verified leak-free under ASan/LSan and byte-exact vs CPython for upper/lower/
+strip/lstrip/rstrip/replace/split(sep)/split()/join incl. embedded-null cases;
+314 differential tests pass.
 
-**Proper fix:** give bytes their own method runtime (or make the shared helpers
-FpyBytes-aware and length-based, allocating results via `fpy_bytes_alloc` with
-`FPY_TAG_BYTES` element/result tags), and register the owned results as
-`FPY_TAG_BYTES` temps (mirroring `_owned_bytes_result`). Until then, bytes-method
-results leak and mis-type. Non-method bytes ops (concat/repeat/index/len/compare)
-are correct as of BUG-BYTES-REPR-AS-STRING.
+**Known remaining gaps (minor):** `bytes.replace(old, new, count)` ignores the
+`count` argument (always full replace); `bytes.split(sep, maxsplit)` ignores
+`maxsplit` (always full split). Both were also imperfect under the old str
+routing; tracked as small follow-ups.
 
 ### BUG-BIGINT-MUL-INT-NULL. A bigint × small-int multiply passes a NULL operand into `fpy_bigint_mul` and segfaults — 2026-07-21
 

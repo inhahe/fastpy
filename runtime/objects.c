@@ -529,7 +529,7 @@ void fpy_value_repr(FpyValue val, char *buf, int bufsize) {
             int pos = 0;
             pos += snprintf(buf + pos, bufsize - pos, "b'");
             if (data) {
-                size_t len = strlen(data);
+                size_t len = (size_t)fpy_bytes_len(data);  /* embedded-null safe */
                 for (size_t i = 0; i < len && pos < bufsize - 6; i++) {
                     unsigned char c = (unsigned char)data[i];
                     if (c == '\\') pos += snprintf(buf + pos, bufsize - pos, "\\\\");
@@ -1281,7 +1281,7 @@ void fpy_value_write(FpyValue val) {
             const char *data = val.data.s;
             if (!data) { printf("b''"); break; }
             printf("b'");
-            size_t len = strlen(data);
+            size_t len = (size_t)fpy_bytes_len(data);  /* embedded-null safe */
             for (size_t i = 0; i < len; i++) {
                 unsigned char c = (unsigned char)data[i];
                 if (c == '\\') printf("\\\\");
@@ -1633,9 +1633,8 @@ FpyList* fastpy_bytes_split(const char *s) {
         const char *start = p;
         while (*p && *p != ' ' && *p != '\t' && *p != '\n' && *p != '\r') p++;
         int64_t len = p - start;
-        char *word = (char*)malloc(len + 1);
+        char *word = fpy_bytes_alloc(len);  /* header-backed FpyBytes */
         memcpy(word, start, len);
-        word[len] = '\0';
         fpy_list_append(result, fpy_bytes_val(word));
     }
     return result;

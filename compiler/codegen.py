@@ -1804,6 +1804,23 @@ class CodeGen:
         # bytes * int → repeat
         ft = ir.FunctionType(i8_ptr, [i8_ptr, i64])
         self.runtime["bytes_repeat"] = ir.Function(self.module, ft, name="fastpy_bytes_repeat")
+        # bytes-native methods (FpyBytes-aware, embedded-null safe, header-backed).
+        # Single-bytes → bytes results:
+        ft = ir.FunctionType(i8_ptr, [i8_ptr])
+        self.runtime["bytes_upper"] = ir.Function(self.module, ft, name="fastpy_bytes_upper")
+        self.runtime["bytes_lower"] = ir.Function(self.module, ft, name="fastpy_bytes_lower")
+        self.runtime["bytes_strip"] = ir.Function(self.module, ft, name="fastpy_bytes_strip")
+        self.runtime["bytes_lstrip"] = ir.Function(self.module, ft, name="fastpy_bytes_lstrip")
+        self.runtime["bytes_rstrip"] = ir.Function(self.module, ft, name="fastpy_bytes_rstrip")
+        # bytes.replace(old, new) → bytes
+        ft = ir.FunctionType(i8_ptr, [i8_ptr, i8_ptr, i8_ptr])
+        self.runtime["bytes_replace"] = ir.Function(self.module, ft, name="fastpy_bytes_replace")
+        # bytes.split(sep) → FpyList of bytes
+        ft = ir.FunctionType(i8_ptr, [i8_ptr, i8_ptr])
+        self.runtime["bytes_split_sep"] = ir.Function(self.module, ft, name="fastpy_bytes_split_sep")
+        # bytes.join(list) → bytes
+        ft = ir.FunctionType(i8_ptr, [i8_ptr, i8_ptr])
+        self.runtime["bytes_join"] = ir.Function(self.module, ft, name="fastpy_bytes_join")
         # dict.fromkeys(keys, value) and dict.fromkeys(keys)
         ft = ir.FunctionType(i8_ptr, [i8_ptr, i32, i64])
         self.runtime["dict_fromkeys"] = ir.Function(self.module, ft, name="fastpy_dict_fromkeys")
@@ -42730,30 +42747,28 @@ class CodeGen:
             # bytes.decode() → str (same UTF-8 content)
             return self._rt_call("bytes_decode", [obj])
         elif method == "upper" and len(node.args) == 0:
-            return self._rt_call("str_upper", [obj])
+            return self._owned_bytes_result("bytes_upper", [obj])
         elif method == "lower" and len(node.args) == 0:
-            return self._rt_call("str_lower", [obj])
+            return self._owned_bytes_result("bytes_lower", [obj])
         elif method == "strip" and len(node.args) == 0:
-            return self._rt_call("str_strip", [obj])
+            return self._owned_bytes_result("bytes_strip", [obj])
         elif method == "lstrip" and len(node.args) == 0:
-            return self._rt_call("str_lstrip", [obj])
+            return self._owned_bytes_result("bytes_lstrip", [obj])
         elif method == "rstrip" and len(node.args) == 0:
-            return self._rt_call("str_rstrip", [obj])
+            return self._owned_bytes_result("bytes_rstrip", [obj])
         elif method == "replace" and len(node.args) >= 2:
+            # bytes.replace(old, new) — bytes-native (no maxcount variant yet;
+            # a count arg falls through to full replace, matching prior behavior).
             old = self._emit_expr_value(node.args[0])
             new = self._emit_expr_value(node.args[1])
-            if len(node.args) == 3:
-                cnt = self._emit_expr_value(node.args[2])
-                return self._rt_call("str_replace3", [obj, old, new, cnt])
-            return self._rt_call("str_replace", [obj, old, new])
+            return self._owned_bytes_result("bytes_replace", [obj, old, new])
         elif method == "split" and len(node.args) <= 2:
+            # bytes.split() / bytes.split(sep): both yield a list of bytes.
+            # (maxsplit not yet honored for the sep path — full split.)
             if len(node.args) == 0:
                 return self._rt_call("bytes_split", [obj])
             sep = self._emit_expr_value(node.args[0])
-            if len(node.args) == 2:
-                maxsplit = self._emit_expr_value(node.args[1])
-                return self._rt_call("str_split_max", [obj, sep, maxsplit])
-            return self._rt_call("str_split_max", [obj, sep, ir.Constant(i64, -1)])
+            return self._rt_call("bytes_split_sep", [obj, sep])
         elif method == "join" and len(node.args) == 1:
             if self._is_obj_expr(node.args[0]):
                 _jobj = self._emit_expr_value(node.args[0])
@@ -42761,7 +42776,7 @@ class CodeGen:
                 lst = self._rt_call("list_from_obj_iter", [_jobj])
             else:
                 lst = self._emit_expr_value(node.args[0])
-            return self._rt_call("str_join", [obj, lst])
+            return self._owned_bytes_result("bytes_join", [obj, lst])
         elif method == "find" and len(node.args) >= 1:
             sub = self._emit_expr_value(node.args[0])
             return self._rt_call("str_find", [obj, sub])

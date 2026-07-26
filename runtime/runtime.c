@@ -237,6 +237,127 @@ const char* fastpy_bytes_repeat(const char *b, int64_t n) {
     return out;
 }
 
+/* ── bytes methods (FpyBytes-native: length-aware, embedded-null safe,
+ *    header-backed results, ASCII-only case/whitespace per CPython). ───── */
+
+static inline int fpy_bytes_is_ws(unsigned char c) {
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r'
+        || c == '\v' || c == '\f';
+}
+
+const char* fastpy_bytes_upper(const char *b) {
+    int64_t n = fpy_bytes_len(b);
+    char *out = fpy_bytes_alloc(n);
+    for (int64_t i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)b[i];
+        out[i] = (c >= 'a' && c <= 'z') ? (char)(c - 32) : (char)c;
+    }
+    return out;
+}
+
+const char* fastpy_bytes_lower(const char *b) {
+    int64_t n = fpy_bytes_len(b);
+    char *out = fpy_bytes_alloc(n);
+    for (int64_t i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)b[i];
+        out[i] = (c >= 'A' && c <= 'Z') ? (char)(c + 32) : (char)c;
+    }
+    return out;
+}
+
+/* mode: 0=strip both, 1=lstrip, 2=rstrip.  ASCII whitespace only. */
+static const char* fpy_bytes_strip_impl(const char *b, int mode) {
+    int64_t n = fpy_bytes_len(b);
+    int64_t start = 0, end = n;
+    if (mode != 2)  /* strip left */
+        while (start < end && fpy_bytes_is_ws((unsigned char)b[start])) start++;
+    if (mode != 1)  /* strip right */
+        while (end > start && fpy_bytes_is_ws((unsigned char)b[end - 1])) end--;
+    int64_t len = end - start;
+    char *out = fpy_bytes_alloc(len);
+    if (len > 0) memcpy(out, b + start, (size_t)len);
+    return out;
+}
+const char* fastpy_bytes_strip(const char *b)  { return fpy_bytes_strip_impl(b, 0); }
+const char* fastpy_bytes_lstrip(const char *b) { return fpy_bytes_strip_impl(b, 1); }
+const char* fastpy_bytes_rstrip(const char *b) { return fpy_bytes_strip_impl(b, 2); }
+
+/* Find sub (length ls) within b (length lb) starting at `from`; -1 if absent. */
+static int64_t fpy_bytes_find(const char *b, int64_t lb,
+                              const char *sub, int64_t ls, int64_t from) {
+    if (ls == 0) return from <= lb ? from : -1;
+    for (int64_t i = from; i + ls <= lb; i++)
+        if (memcmp(b + i, sub, (size_t)ls) == 0) return i;
+    return -1;
+}
+
+const char* fastpy_bytes_replace(const char *b, const char *old, const char *neu) {
+    int64_t lb = fpy_bytes_len(b), lo = fpy_bytes_len(old), ln = fpy_bytes_len(neu);
+    /* Count non-overlapping occurrences first to size the result. */
+    int64_t count = 0;
+    if (lo > 0) {
+        int64_t i = 0;
+        while ((i = fpy_bytes_find(b, lb, old, lo, i)) != -1) { count++; i += lo; }
+    }
+    int64_t out_len = lb + count * (ln - lo);
+    char *out = fpy_bytes_alloc(out_len);
+    int64_t si = 0, oi = 0;
+    if (lo > 0) {
+        int64_t pos;
+        while ((pos = fpy_bytes_find(b, lb, old, lo, si)) != -1) {
+            int64_t chunk = pos - si;
+            if (chunk > 0) { memcpy(out + oi, b + si, (size_t)chunk); oi += chunk; }
+            if (ln > 0) { memcpy(out + oi, neu, (size_t)ln); oi += ln; }
+            si = pos + lo;
+        }
+    }
+    if (lb - si > 0) { memcpy(out + oi, b + si, (size_t)(lb - si)); oi += lb - si; }
+    return out;
+}
+
+/* Append a fresh header-backed bytes slice [start,start+len) to `list`. */
+static void fpy_bytes_list_append_slice(FpyList *list, const char *b,
+                                        int64_t start, int64_t len) {
+    char *piece = fpy_bytes_alloc(len);
+    if (len > 0) memcpy(piece, b + start, (size_t)len);
+    fpy_list_append(list, fpy_bytes_val(piece));
+}
+
+/* bytes.split(sep): split on exact `sep`, keeping empty fields (CPython). */
+FpyList* fastpy_bytes_split_sep(const char *b, const char *sep) {
+    FpyList *result = fpy_list_new(8);
+    int64_t lb = fpy_bytes_len(b), ls = fpy_bytes_len(sep);
+    if (ls == 0) {  /* empty separator → ValueError in CPython; be lenient */
+        fpy_bytes_list_append_slice(result, b, 0, lb);
+        return result;
+    }
+    int64_t si = 0, pos;
+    while ((pos = fpy_bytes_find(b, lb, sep, ls, si)) != -1) {
+        fpy_bytes_list_append_slice(result, b, si, pos - si);
+        si = pos + ls;
+    }
+    fpy_bytes_list_append_slice(result, b, si, lb - si);
+    return result;
+}
+
+/* bytes.join(list): concatenate the bytes elements of `list` with `sep`. */
+const char* fastpy_bytes_join(const char *sep, FpyList *list) {
+    int64_t ls = fpy_bytes_len(sep);
+    int64_t total = 0;
+    for (int64_t i = 0; i < list->length; i++) {
+        total += fpy_bytes_len(list->items[i].data.s);
+        if (i > 0) total += ls;
+    }
+    char *out = fpy_bytes_alloc(total);
+    int64_t pos = 0;
+    for (int64_t i = 0; i < list->length; i++) {
+        if (i > 0 && ls > 0) { memcpy(out + pos, sep, (size_t)ls); pos += ls; }
+        int64_t el = fpy_bytes_len(list->items[i].data.s);
+        if (el > 0) { memcpy(out + pos, list->items[i].data.s, (size_t)el); pos += el; }
+    }
+    return out;
+}
+
 const char* fastpy_str_slice(const char *s, int64_t start, int64_t stop, int64_t has_start, int64_t has_stop) {
     int64_t len = fastpy_str_len(s);  /* code point count */
     if (!has_start) start = 0;
