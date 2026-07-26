@@ -19573,6 +19573,14 @@ class CodeGen:
                 and isinstance(node.func, ast.Attribute)
                 and self._is_path_expr(node)):
             return ValueType(VKind.PATH)
+        # p.iterdir() → list[Path].  Both runtimes materialize the directory
+        # listing eagerly and return an FpyList* of OBJ-tagged Paths (bridge:
+        # PySequence_List over CPython's generator; pure: readdir into
+        # fpy_list_append).  Typing it as an opaque PYOBJ instead would send
+        # the for-loop through the CPython iterator protocol, which in pure
+        # mode is a link error against the absent fpy_cpython_iter* symbols.
+        if self._is_path_iterdir_call(node):
+            return ValueType(VKind.LIST, elem_type=ValueType(VKind.PATH))
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
             if node.func.id in self._user_classes:
                 return ValueType(VKind.OBJ, class_name=node.func.id)
@@ -31858,6 +31866,11 @@ class CodeGen:
 
     def _get_list_elem_type(self, node: ast.expr) -> 'ValueType':
         """Get the element type of a list expression."""
+        # p.iterdir() yields Paths — checked first so the loop variable keeps
+        # its PATH tag and .name/str()/read_text() on it hit the native Path
+        # entry points instead of the generic FpyValue/bridge dispatch.
+        if self._is_path_iterdir_call(node):
+            return ValueType(VKind.PATH)
         # ClassName.__mro__ → elements are type proxy FpyObj instances
         if (isinstance(node, ast.Attribute)
                 and node.attr == "__mro__"
@@ -32460,6 +32473,17 @@ class CodeGen:
                 and isinstance(node.value, ast.Name)
                 and node.value.id == "pathlib")
 
+    def _is_path_iterdir_call(self, node: ast.expr) -> bool:
+        """True for `<path expr>.iterdir()` — the one Path method returning a
+        list.  Both runtimes materialize the listing into an FpyList* of
+        OBJ-tagged Paths, so it is a native list expression whose elements are
+        Paths, not an opaque CPython iterator."""
+        return (isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "iterdir"
+                and not node.args
+                and self._is_path_expr(node.func.value))
+
     def _is_list_expr(self, node: ast.expr) -> bool:
         """Check if an AST expression evaluates to a list."""
         if isinstance(node, (ast.List, ast.ListComp, ast.GeneratorExp)):
@@ -32495,6 +32519,12 @@ class CodeGen:
         if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
                 and node.func.attr in ("split", "rsplit", "keys", "values", "items",
                                       "splitlines", "copy", "partition", "rpartition")):
+            return True
+        # Path.iterdir() returns an FpyList* of Paths in both runtimes — see
+        # _infer_type_tag.  Recognising it here is what routes `for e in
+        # p.iterdir()` to _emit_for_list instead of the CPython iterator
+        # protocol (which does not link in pure mode).
+        if self._is_path_iterdir_call(node):
             return True
         # dict.setdefault(key, default) / dict.get(key, default) — if the
         # default is a list, the result is a list.  Recognising this lets

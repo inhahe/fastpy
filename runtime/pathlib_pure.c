@@ -15,27 +15,26 @@
  *
  * ## Pure-mode Path representation
  *
- * A Path is simply a heap-allocated NUL-terminated C string holding the path
- * text (an `i8*` at the IR level — exactly what `fastpy_path_new` already
- * returns to the codegen, and what the already-native `fastpy_path_with_suffix`
- * in runtime.c already assumes). Every function here therefore treats its
- * `void *self` argument as `const char *`. Path-returning functions hand back a
- * fresh heap string; property getters (name/suffix/stem/str) do the same. This
- * mirrors the host bridge's strdup-based ownership convention (the returned
- * pointers are treated as borrowed C strings by the codegen, exactly as the
- * bridge's were), so there is no new lifetime hazard versus host mode.
+ * A Path is an `FpyPurePath` header block (see the long comment above the
+ * struct): magic at offset 0, a zero guard word at offset 32, and the
+ * NUL-terminated path text at offset 40. The pointer handed to the codegen is
+ * the header base, NOT the text — the offsets exist specifically so the
+ * OBJ refcount dispatcher's blind magic probes can never mistake path text for
+ * an object. Use `_p()` internally, or the exported `fastpy_path_as_cstr()`
+ * from another translation unit; never cast a Path straight to `char *`.
+ *
+ * Path-returning functions hand back a fresh header block; property getters
+ * (name/suffix/stem/str) hand back a fresh `fpy_str_alloc`-headed string. Both
+ * are treated as borrowed by the codegen, mirroring the host bridge's
+ * ownership convention, so there is no new lifetime hazard versus host mode.
  *
  * Filesystem predicates (exists/is_file/is_dir) delegate to the native
  * os.path.* helpers in objects.c (fastpy_os_path_exists/isfile/isdir), which
  * are already compiled into the pure build and proven on-target — so this file
  * introduces no new struct-stat ABI dependency of its own.
  *
- * ## Deferred
- *
- * `Path.iterdir()` (a directory listing yielding Path objects) needs the
- * runtime list-builder API and is not yet wired here; in pure mode it raises a
- * catchable RuntimeError rather than silently returning wrong data. Everything
- * else has full parity with the bridge.
+ * The whole pathlib.Path surface the codegen emits is implemented here; there
+ * is full parity with the bridge.
  */
 
 #include <stdint.h>
@@ -43,6 +42,14 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <dirent.h>
+
+/* The real object-system header, for FpyValue / FpyList / fpy_str_alloc. This
+ * TU used to hand-copy those declarations to avoid objects.h's threading.h and
+ * gc.h includes, but objects.c itself is compiled into every pure build with
+ * the same flags, so the header is known to build here — and a hand-copied
+ * struct layout is an ABI duplicate waiting to drift. */
+#include "objects.h"
 
 /* Native os.path.* predicates (objects.c) — struct-stat-backed, proven on-target. */
 extern int64_t fastpy_os_path_exists(const char *path);
@@ -54,9 +61,8 @@ extern void fastpy_raise(int exc_type, const char *msg);
 #define FPY_PURE_EXC_RUNTIMEERROR 6
 
 /*
- * fastpy refcounted-string ABI (mirrors runtime/objects.h — kept as a local
- * forward-declaration so this TU doesn't have to pull in objects.h's
- * threading.h/gc.h dependencies; the layout is stable ABI).
+ * String results and the refcounted-string ABI (FpyString / fpy_str_alloc,
+ * from objects.h).
  *
  * CRITICAL: every value the codegen tags FPY_TAG_STR (str) — which is what it
  * assigns to the results of Path.name/.suffix/.stem/str(Path)/read_text — MUST
@@ -73,17 +79,11 @@ extern void fastpy_raise(int exc_type, const char *msg);
  * Allocating through `fpy_str_alloc` gives the header a well-defined magic +
  * refcount so incref/decref manage and free the string correctly.
  */
-typedef struct {
-    int32_t magic;
-    int32_t refcount;
-    char data[];   /* flexible array member — NUL-terminated UTF-8 */
-} FpyPureString;
-extern FpyPureString *fpy_str_alloc(int64_t len);
 
 /* Copy `n` bytes of `src` into a fresh, properly-headed refcounted fastpy
  * string and return its `data` pointer (what the codegen treats as the STR). */
 static const char *_str_n(const char *src, size_t n) {
-    FpyPureString *s = fpy_str_alloc((int64_t)n);
+    FpyString *s = fpy_str_alloc((int64_t)n);
     if (s) {
         if (n) memcpy(s->data, src, n);
         /* fpy_str_alloc already wrote the terminating NUL at data[n]. */
@@ -91,7 +91,7 @@ static const char *_str_n(const char *src, size_t n) {
     }
     /* OOM: fall back to an empty headed string so the caller still hands back
      * an RC-safe STR (never a bare literal that would break fpy_str_header). */
-    FpyPureString *e = fpy_str_alloc(0);
+    FpyString *e = fpy_str_alloc(0);
     return e ? e->data : "";
 }
 static const char *_str_dup(const char *src) { return _str_n(src, strlen(src)); }
@@ -356,11 +356,64 @@ void fastpy_path_write_text(void *self, const char *content) {
     fclose(f);
 }
 
-/* --- Deferred ----------------------------------------------------------- */
+/* --- Directory listing --------------------------------------------------- *
+ *
+ * The codegen types `p.iterdir()` as list[Path] (see _infer_type_tag in
+ * compiler/codegen.py), so BOTH runtimes materialize the listing eagerly and
+ * return an FpyList* whose elements are OBJ-tagged Path pointers. The bridge
+ * has always been eager too (PySequence_List over the generator), so this is
+ * not a behavioural change versus host mode — CPython's laziness is the thing
+ * neither runtime ever had.
+ *
+ * Entries are yielded in readdir() order, exactly like CPython's iterdir();
+ * '.' and '..' are skipped, again matching CPython.
+ *
+ * Element ownership: fpy_list_append increfs each element, which for an OBJ
+ * routes through fpy_rc_incref. Thanks to the FpyPurePath header that probe
+ * deterministically misses and lands on the pure-mode bridge no-op, so a Path
+ * is neither freed nor double-counted by list bookkeeping — the same
+ * allocate-and-leak lifetime every other pure-mode Path already has. */
 
 void *fastpy_path_iterdir(void *self) {
-    (void)self;
-    fastpy_raise(FPY_PURE_EXC_RUNTIMEERROR,
-        "Path.iterdir() is not yet supported in pure-mode (no-CPython) builds");
-    return (void *)0;
+    const char *p = _p(self);
+    DIR *d = opendir(p);
+    if (!d) {
+        /* Unlike read_text (which degrades to "" on a missing file), there is
+         * no lenient answer here: an empty list is indistinguishable from a
+         * genuinely empty directory, so a caller would silently skip work. */
+        fastpy_raise(FPY_PURE_EXC_RUNTIMEERROR,
+                     "Path.iterdir(): cannot open directory");
+        return (void *)0;
+    }
+    FpyList *out = fpy_list_new(8);
+    if (!out) { closedir(d); return (void *)0; }
+
+    /* Precompute the parent prefix so each entry is one join, not a strlen
+     * per iteration. Path('/') already ends in '/', so don't double it. */
+    size_t plen = strlen(p);
+    int need_slash = (plen > 0 && p[plen - 1] != '/');
+
+    struct dirent *ent;
+    while ((ent = readdir(d)) != NULL) {
+        const char *nm = ent->d_name;
+        if (nm[0] == '.' && (nm[1] == '\0' || (nm[1] == '.' && nm[2] == '\0')))
+            continue;
+        size_t nlen = strlen(nm);
+        size_t total = plen + (size_t)need_slash + nlen;
+        char *joined = (char *)malloc(total + 1);
+        if (!joined) continue;   /* skip this entry rather than abort the walk */
+        memcpy(joined, p, plen);
+        if (need_slash) joined[plen] = '/';
+        memcpy(joined + plen + (size_t)need_slash, nm, nlen);
+        joined[total] = '\0';
+        void *child = _path_alloc_n(joined, total);
+        free(joined);
+        if (!child) continue;
+        FpyValue v;
+        v.tag = FPY_TAG_OBJ;
+        v.data.obj = (FpyObj *)child;
+        fpy_list_append(out, v);
+    }
+    closedir(d);
+    return (void *)out;
 }

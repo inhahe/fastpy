@@ -716,8 +716,18 @@ checks → `ok == 1023`, no RuntimeError) and on-target: the SlateOS
   `joinpath()` / `p / other` through `path_str` first
   (`_emit_path_join_operand`). Regression test:
   `tests/pure/path_magic_collision_checks.py` (bitmask 127).
-- *`Path.iterdir()` deferred in pure mode:* needs a runtime list-builder API to
-  materialize the directory entries as an FpyValue list.
+- *`Path.iterdir()` in pure mode — **FIXED** 2026-07-26.* Implemented with
+  opendir/readdir into `fpy_list_new`/`fpy_list_append`, yielding an FpyList of
+  OBJ-tagged `FpyPurePath` entries joined against the parent (readdir order,
+  `.`/`..` skipped, like CPython). Codegen now types `p.iterdir()` as
+  `list[Path]` (`_is_path_iterdir_call` feeds `_infer_type_tag`,
+  `_is_list_expr` and `_get_list_elem_type`), so `for e in p.iterdir()` uses
+  `_emit_for_list` and the loop variable keeps its PATH tag. Because codegen is
+  mode-agnostic, `cpython_bridge.c`'s `fastpy_path_iterdir` was changed to
+  return an FpyList too instead of the raw PyObject* list. Regression test:
+  `tests/pure/path_iterdir_checks.py` (bitmask 63). Unlike `read_text`, a
+  failed `opendir` raises RuntimeError rather than degrading — an empty list
+  would be indistinguishable from an empty directory.
 
 **Other pure-mode gaps found while testing this (pre-existing, not
 regressions):**
