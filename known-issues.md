@@ -124,6 +124,109 @@ Regression test: `tests/regressions/rc_native_slot_retain.py` (ASan/UBSan/LSan
 clean under `tools/pure_harness.py`; the same file aborts ASan at the parent
 commit).
 
+### BUG-DECORATOR-WRAPPER-STATIC-RET-TAG. A decorator `wrapper` reused for several callees publishes one statically-inferred return tag for all of them — 2026-07-26
+
+**What:** a decorator's inner `wrapper(*args)` is a single `fastpy.closure.*`
+body, emitted once and shared by every function that decorator is applied to.
+Its `return result` goes through `_emit_return`'s `_needs_ret_tag` path, which
+falls back to `_infer_ret_tag_for_value` when `result` is not an FpyValue local.
+That inference sees one merged set of call-site types, so the wrapper publishes
+a *single* tag — wrong for whichever decorated callee returns a different kind:
+
+```python
+def deco(fn):
+    def wrapper(*args):
+        return fn(*args)          # one body, one static ret tag
+    return wrapper
+
+@deco
+def as_int(n):  return n * 2
+@deco
+def as_str(n):  return "v" + str(n)
+```
+
+**Currently latent, not observable.** Call sites for decorated names do not read
+`get_ret_tag()` — they use the *static* `ret_tag` of the undecorated function,
+which happens to be right. It becomes live the moment any call site trusts the
+side channel for a decorated name; that is exactly what happened when the
+BUG-INDIRECT-CALL-RET-TAG-INT recovery was first written without the decorated-
+name exclusion, and it broke `tests/regressions/decorator_star_args.py` (case 5,
+chained decorators over a str-returning `get_greeting`, printed a pointer).
+
+**Where:** `_emit_return` in `compiler/codegen.py`, the `_needs_ret_tag` blocks
+(~25790 and ~25890); the exclusion that keeps it latent is in
+`_recover_closure_ret_tag`.
+
+**Proper fix:** make the forwarded value dynamic rather than statically tagged —
+`return fn(*args)` inside a closure should forward the inner callee's
+`get_ret_tag()` (the machinery exists: `_emit_return` already does exactly this
+for `return <closure_var>(...)`, but only when the callee name is a
+`VKind.CLOSURE` *variable*, which a `*args`-forwarding parameter is not). Once
+the wrapper forwards the runtime tag, the decorated-name exclusion in
+`_recover_closure_ret_tag` can be dropped and decorated calls get the same
+runtime-tag treatment as everything else.
+
+**Regression coverage:** `shared_decorator_wrapper()` in
+`tests/regressions/indirect_call_ret_tag.py` pins the boundary — it passes today
+via the static path and would fail if the exclusion were removed before the
+wrapper is taught to forward.
+
+### BUG-NESTED-DEF-NAME-COLLISION. Two sibling nested `def`s that share a name silently resolve to one another — 2026-07-26
+
+**What:** a nested `def` with no free variables is *hoisted* to module scope and
+registered in `self._user_functions` under its **bare** name. Two different
+enclosing functions each containing a `def build(...)` therefore collide: the
+second registration hits the `if key_name in self._user_functions: return`
+early-out in `_declare_user_function`, and the second `build` is silently typed
+from the first one's `FuncInfo`.
+
+**Reproduce** (should print `[10, 11, 12] 3 10 12` / `xv 1`):
+```python
+def list_return():
+    def build(n):
+        return [n, n + 1, n + 2]
+    a = build(10)
+    print(a, len(a), a[0], a[2])
+
+def dict_return():
+    def build(k):
+        return {k: str(k) + "v"}
+    d = build("x")
+    print(d["x"], len(d))
+
+list_return()
+dict_return()
+```
+prints
+```
+[10, 11, 12] 3 10 12
+0 2064512507584
+IndexError: list index out of range
+```
+`d` is typed LIST from `list_return`'s `build`, so `d["x"]` compiles to a list
+index. Renaming either helper makes it pass.
+
+**Not a total absence of handling.** `_scan_for_closures` (~4614) *does* check
+for the collision — `_name_collides` forces the second def down the
+zero-capture-closure path so it gets a qualified name — and that half works: a
+probe shows `dict_return.build` registered as a closure alongside the hoisted
+bare `build`. The failure is downstream, in the **call-site type inference**,
+which looks the callee up by bare name (`if node.func.id in self._user_functions`
+in `_infer_call_value_type`, ~19655, and ~40 similar sites) without first trying
+the scope-qualified key. So the call dispatches correctly but the *result type*
+comes from the sibling.
+
+**Proper fix:** a single `_resolve_callee_info(name)` helper that tries
+`f"{self._current_func_name}.{name}"` before the bare name, used at every
+`self._user_functions[...]` call-site lookup. `_recover_closure_ret_tag` already
+resolves scope-first this way (added for BUG-INDIRECT-CALL-RET-TAG-INT) and is
+the model to generalise. The wider audit is what makes this more than a
+five-minute change — the lookups are scattered.
+
+**Not a regression:** reproduces identically at the parent commit. Called out in
+the docstring of `tests/regressions/indirect_call_ret_tag.py`, which gives every
+nested helper a unique name so it tests the tag bug rather than this one.
+
 ### BUG-EXC-MSG-NOT-OWNED. A raised exception borrows its message string, so every dynamic message must leak — 2026-07-26
 
 **What:** `fastpy_raise` (runtime/runtime.c:818) stores the message pointer
@@ -193,9 +296,9 @@ Whichever is chosen, it also removes the special-case temp-dropping in
 try-body flush made the previously invisible leak visible as an invalid-IR
 failure in `assert_fstring_msg.py`.
 
-### BUG-INDIRECT-CALL-RET-TAG-INT. A nested `def`'s return value is tagged INT at the call site, so a returned str prints as a pointer — 2026-07-26
+### ~~BUG-INDIRECT-CALL-RET-TAG-INT. A nested `def`'s return value is tagged INT at the call site, so a returned str prints as a pointer~~ — FIXED 2026-07-26
 
-**What:** a nested function is lowered to a closure object and invoked
+**What it was:** a nested function is lowered to a closure object and invoked
 indirectly through `fastpy_call_ptrN`, which returns a bare `i64`. The call site
 then wraps that `i64` into an `FpyValue` with a **hardcoded** tag of `0` (INT)
 instead of consulting the callee's return tag. Any non-int return — `str`,
@@ -241,18 +344,50 @@ sites also hardcode the return type: `_scan_for_closures` sets
 with an ad-hoc `bool` special case at ~4739–4764 but nothing for `str`/`list`/
 `dict`.
 
-**Proper fix:** have the `__i64_wrap` thunk publish the callee's runtime return
-tag (the mechanism `fpy_ret_tag`/`get_ret_tag()` already provides for bare-ABI
-returns) and read it at the indirect call site instead of hardcoding `0`. The
-static half — teaching `_scan_for_closures` to infer a nested def's return kind
-via `_expr_is_str` / `_is_list_expr` rather than the `bool`-only special case —
-is a worthwhile complement (it would let the closure keep an `i8_ptr` return
-type, as the closure-*lambda* path at ~5464 already does), but the runtime tag
-is the general fix, since a nested def can return different kinds per branch.
+**Why a static tag could not fix it.** `FuncInfo.ret_tag` stays `"int"` for
+FpyValue-ABI functions *by design* — their real tag travels inside the returned
+`{i32, i64}` struct — and this is true of module-level defs too (verified: both
+the nested and the module-level `make` carry `ret_tag == "int"`,
+`uses_fv_abi == True`; the module-level case only works because a *direct* call
+reads the tag out of the struct). On top of that a function may return different
+kinds on different branches. The tag has to come from the runtime.
 
-**Not a regression:** reproduces identically at the parent commit. Called out in
-the docstring of `tests/regressions/rc_native_slot_retain.py`, which
-deliberately uses module-level helpers to avoid it.
+**Fixed** by `_recover_closure_ret_tag` (`compiler/codegen.py`, just above
+`_emit_closure_call`), called from the `VKind.CLOSURE` arm of `_emit_call_expr`.
+It reads `get_ret_tag()` back and rebuilds an `FpyValue`. Three parts:
+
+1. **Recovery is gated on the callee actually publishing a tag.** Two lowerings
+   qualify: `uses_fv_abi` functions, which go through the `__i64_wrap` thunk
+   (that thunk already called `set_ret_tag` before discarding the struct — the
+   tag existed, nobody read it); and `fastpy.closure.*` bodies, which return
+   `i64` directly but whose `return` emitter already calls `set_ret_tag` on
+   every path. The first covers zero-capture nested defs (hoisted to module
+   scope), the second covers capturing closures. Decorator-returned closures and
+   function-pointer parameters resolve to no `FuncInfo` and keep the plain `i64`
+   path.
+2. **Lambdas now publish a tag too** (`_emit_lambda_body`). They previously
+   returned `i64` in silence — and silence is *not* "assume int", because call
+   sites that already used `get_ret_tag()` then read whatever `fpy_ret_tag` held
+   from an earlier, unrelated call. A str-returning nested def anywhere before
+   the lambda call was enough to make `print(f(1))` interpret an int as a
+   `char*` and **segfault**. That crash reproduced at the parent commit; it is a
+   second facet of the same bug, not a regression.
+3. **Callee lookup is scope-first** (`outer.inner` before `inner`), since
+   zero-capture nested defs are registered under their bare name, and
+   **decorated names are excluded**: for `@deco def f(...)`,
+   `_user_functions["f"]` describes the *undecorated* function while the
+   variable `f` holds the decorator's wrapper — a different callee. Missing
+   this exclusion regressed `tests/regressions/decorator_star_args.py` (see
+   BUG-DECORATOR-WRAPPER-STATIC-RET-TAG).
+
+**Verified:** `tests/regressions/indirect_call_ret_tag.py` (17 cases: str/list/
+dict/float/bool/None returns, per-branch mixed kinds, a rebound slot, a
+100-iteration loop, capturing and two-deep nesting, plus lambda/decorator/
+`sorted(key=)` cases proving the plain-`i64` path did not regress) fails at the
+parent commit and passes now; ASan/UBSan/LSan clean; full suite green.
+
+**Follow-up:** the docstring note in `tests/regressions/rc_native_slot_retain.py`
+that explains why it uses module-level helpers is now stale.
 
 ### ~~BUG-FV-STORE-DECREF-BEFORE-INCREF. The FpyValue store path releases the old value before retaining the new one~~ — FIXED 2026-07-26
 

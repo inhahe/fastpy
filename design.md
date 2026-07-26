@@ -148,6 +148,41 @@ FpyValue boxing, `is` comparison, variable type inference), it must ask
 back as the integer `0`. A void method also never calls `set_ret_tag()`, so the
 `get_ret_tag()` recovery used for obj-method calls does not apply to it.
 
+**Indirect calls: the ret-tag side channel is a protocol, and silence is not a
+default.** `fastpy_call_ptrN` returns a bare `i64`, so a callee reached through a
+function pointer — a nested `def` lowered to a closure object, a lambda, a
+decorator result — loses its Python type unless it publishes one. The channel is
+the single global `fpy_ret_tag`, written by `set_ret_tag()` and read by
+`get_ret_tag()`. Two consequences follow, and both have bitten:
+
+- *Every* indirectly-callable body must call `set_ret_tag()` on every return
+  path. Not publishing does **not** mean "the caller assumes int" — it means the
+  caller reads a value left by some earlier, unrelated call. A str-returning
+  nested def executed before a lambda call was enough to make `print(f(1))`
+  interpret an int as a `char*` and segfault. Closure bodies
+  (`fastpy.closure.*`) and the `__i64_wrap` thunk already did this; lambda
+  bodies were the hole.
+- Symmetrically, a call site may only *read* the tag when it knows the callee
+  publishes a *trustworthy* one. `_recover_closure_ret_tag` therefore recovers
+  only for callees it can resolve to a `FuncInfo` that is either `uses_fv_abi`
+  (reached through `__i64_wrap`) or a `fastpy.closure.*` body; unknown callees
+  keep the plain `i64` path. **Decorated names are excluded** — `f` in
+  `@deco def f(...)` is bound to the decorator's wrapper, not to the function
+  `_user_functions["f"]` describes, and a wrapper shared across several
+  decorated callees publishes one statically-inferred tag for all of them
+  (BUG-DECORATOR-WRAPPER-STATIC-RET-TAG).
+
+A *static* return tag is not an alternative here. `FuncInfo.ret_tag` stays
+`"int"` for FpyValue-ABI functions by design — their real tag rides inside the
+returned `{i32, i64}` struct, which only a direct call can see — and a function
+may return different kinds on different branches regardless.
+
+**Callee lookup must be scope-first.** A nested `def` with no free variables is
+hoisted to module scope and registered in `_user_functions` under its **bare**
+name, so two sibling nested defs sharing a name collide. Resolve
+`f"{_current_func_name}.{name}"` before `name` (`_recover_closure_ret_tag` does;
+most other call-site lookups still do not — see BUG-NESTED-DEF-NAME-COLLISION).
+
 ## Targets (codegen backends)
 
 By default fastpy emits for the **host** triple and links against the host

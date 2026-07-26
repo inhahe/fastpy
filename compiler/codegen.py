@@ -8943,6 +8943,8 @@ class CodeGen:
         # Evaluate body and return
         result = self._emit_expr_value(lam.body)
         expected_ret = func.return_value.type
+        _pre_conv = result
+        _dyn_ret_tag = None
         if result.type != expected_ret:
             if (isinstance(result.type, ir.LiteralStructType)
                     and result.type == fpy_val
@@ -8954,6 +8956,7 @@ class CodeGen:
                 _ret_tag = self.builder.extract_value(result, 0)
                 self.builder.call(self.runtime["set_arg_tag"],
                                   [ir.Constant(i32, 99), _ret_tag])
+                _dyn_ret_tag = _ret_tag
                 result = self.builder.extract_value(result, 1)
             elif isinstance(expected_ret, ir.IntType) and isinstance(result.type, ir.DoubleType):
                 result = self.builder.fptosi(result, expected_ret)
@@ -8963,6 +8966,26 @@ class CodeGen:
                 result = self.builder.ptrtoint(result, expected_ret)
             elif isinstance(expected_ret, ir.PointerType) and isinstance(result.type, ir.IntType):
                 result = self.builder.inttoptr(result, expected_ret)
+        # Publish the return tag, exactly as closure bodies do. A lambda is
+        # reached through `fastpy_call_ptrN`, which returns a bare `i64`, so
+        # call sites recover the kind with `get_ret_tag()`. Staying silent
+        # here does not mean "assume int" — it means the caller reads whatever
+        # `fpy_ret_tag` happens to hold from some *earlier* unrelated call.
+        # A str-returning nested def anywhere before the lambda call was
+        # enough to make `print(f(1))` interpret an int as a `char*` and
+        # segfault (BUG-INDIRECT-CALL-RET-TAG-INT, lambda facet).
+        if _dyn_ret_tag is not None:
+            self.builder.call(self.runtime["set_ret_tag"], [_dyn_ret_tag])
+        else:
+            _tag_value = (result
+                          if (isinstance(expected_ret, ir.PointerType)
+                              and isinstance(_pre_conv.type, ir.IntType))
+                          else _pre_conv)
+            self.builder.call(
+                self.runtime["set_ret_tag"],
+                [ir.Constant(i32,
+                             self._infer_ret_tag_for_value(_tag_value,
+                                                           lam.body))])
         self.builder.ret(result)
 
         # Now that body is emitted, safe to set internal linkage + inline
@@ -29418,6 +29441,80 @@ class CodeGen:
             # Non-FV mode: return the object pointer as i64 (0 if dead)
             return self.builder.ptrtoint(obj_ptr, i64)
 
+    def _recover_closure_ret_tag(self, name: str, result: ir.Value) -> ir.Value:
+        """Rebuild an FpyValue from an indirect call's `i64` result.
+
+        `fastpy_call_ptrN` returns a bare `i64`, so a callee returning a str /
+        list / dict comes back untagged and the caller would treat it as an
+        int — printing a pointer as a decimal number
+        (BUG-INDIRECT-CALL-RET-TAG-INT).
+
+        A *static* tag is no help: `FuncInfo.ret_tag` is left at `"int"` for
+        FpyValue-ABI functions because their real tag travels in the returned
+        `{i32, i64}` struct, and a function can return different kinds per
+        branch anyway. The tag must come from the runtime — the `__i64_wrap`
+        thunk already publishes it with `set_ret_tag` before discarding the
+        struct, so we only have to read it back.
+
+        Applied narrowly: only when the callee is a nested `def` that really
+        does publish a tag. Two lowerings qualify:
+
+          * FpyValue-ABI functions (`uses_fv_abi`), reached through the
+            `__i64_wrap` thunk described above — this covers the zero-capture
+            nested defs that get hoisted to module scope; and
+          * `fastpy.closure.*` bodies, which return `i64` directly but whose
+            `return` emitter already calls `set_ret_tag` on every path (see
+            the `_needs_ret_tag` logic in `_emit_return`) — this covers
+            capturing closures.
+
+        Everything else — lambdas, decorator-returned closures, function-
+        pointer parameters — keeps the plain `i64` path, because for those
+        `fpy_ret_tag` holds a stale value left by some earlier call.
+
+        The callee is resolved scope-first (`outer.inner` before `inner`):
+        zero-capture nested defs are registered under their bare name, so a
+        bare lookup can land on a same-named sibling in another scope.
+
+        A **decorated** name is excluded even though the lookup succeeds: for
+        `@deco def f(...)`, `_user_functions["f"]` describes the *undecorated*
+        function while the variable `f` holds the decorator's wrapper. The
+        wrapper is a different callee with a different (and, when the same
+        wrapper is reused for several callees, statically-inferred and
+        therefore unreliable) return tag.
+        """
+        if (isinstance(result.type, ir.LiteralStructType)
+                and result.type == fpy_val):
+            return result  # already tagged (e.g. the kwargs path)
+        info = None
+        _scope = getattr(self, "_current_func_name", None)
+        _qual = f"{_scope}.{name}" if _scope else None
+        if _qual:
+            info = self._user_functions.get(_qual)
+        if info is None:
+            info = self._user_functions.get(name)
+        if info is None:
+            return result
+        _def_node = getattr(self, "_function_def_nodes", {}).get(
+            _qual if (_qual and _qual in self._user_functions) else name)
+        if _def_node is not None and getattr(_def_node, "decorator_list", None):
+            return result  # name is bound to the decorator's result, not this
+        _publishes_tag = (
+            getattr(info, "uses_fv_abi", False)
+            or info.func.name.startswith("fastpy.closure."))
+        if not _publishes_tag:
+            return result
+        ret_tag = self.builder.call(self.runtime["get_ret_tag"], [])
+        if isinstance(result.type, ir.PointerType):
+            result = self.builder.ptrtoint(result, i64)
+        elif isinstance(result.type, ir.DoubleType):
+            result = self.builder.bitcast(result, i64)
+        elif (isinstance(result.type, ir.IntType)
+                and result.type.width != 64):
+            result = self.builder.zext(result, i64)
+        elif not isinstance(result.type, ir.IntType):
+            return result  # void or something unexpected — leave it alone
+        return self._fv_build_from_slots(ret_tag, result)
+
     def _emit_closure_call(self, node: ast.Call) -> ir.Value:
         """Call a closure or function-pointer variable."""
         name = node.func.id
@@ -37817,7 +37914,8 @@ class CodeGen:
             elif name in self.variables:
                 _vk = self._var_kind(name)
                 if _vk == VKind.CLOSURE:
-                    return self._emit_closure_call(node)
+                    result = self._emit_closure_call(node)
+                    return self._recover_closure_ret_tag(name, result)
                 # OBJ variable with __call__ → direct dispatch
                 if _vk == VKind.OBJ:
                     _call_cls = self._obj_var_class.get(name)

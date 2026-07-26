@@ -144,11 +144,12 @@ def returned_value_survives():
     print(_make(4))
     q = _make_via_local(5)
     print(q)
-    # NOTE: deliberately module-level rather than nested inside this function.
-    # A *nested* def is lowered to a closure object and called indirectly, and
-    # the indirect call hardcodes the result tag to INT — so `r = make(3)`
-    # would print the string pointer as an integer. That is
-    # BUG-INDIRECT-CALL-RET-TAG-INT, unrelated to refcounting.
+    # NOTE: `_make` / `_make_via_local` are module-level rather than nested
+    # inside this function so that this test exercises one thing — the retain
+    # on the store — over the *direct*-call path only. A nested def is lowered
+    # to a closure object and called indirectly, which used to drop the result
+    # tag (BUG-INDIRECT-CALL-RET-TAG-INT, since fixed); the indirect path is
+    # covered by tests/regressions/indirect_call_ret_tag.py.
 
 
 def param_stays_borrowed(s):
