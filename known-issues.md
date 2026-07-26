@@ -739,6 +739,17 @@ regressions):**
   `fpy_cpython_to_fv`, `fpy_fv_call_method0`). These should either accept PATH
   by converting through `path_str` in codegen, or produce a clean compile-time
   diagnostic — a link error is the worst of the three outcomes.
+- `os.mkdir(p)` / `os.remove(p)` / `os.rmdir(p)` **fail silently**, returning
+  `-1` instead of raising `OSError`. CPython raises; pure mode swallows. This is
+  not merely cosmetic — it cost a full SlateOS boot cycle to diagnose: a
+  capability-denied `os.mkdir` produced no error at all, and the failure only
+  surfaced two statements later as `Path.iterdir()` raising "cannot open
+  directory", which pointed the investigation at `opendir` rather than at
+  `mkdir`. The proper fix is an `OSError`/`FileNotFoundError` exception kind in
+  the pure runtime (`FPY_EXC_*` in runtime.c has no OS-error member today —
+  only GENERIC/RUNTIMEERROR are available) and raising it from the `os.*`
+  mutators on a negative return. Until then, pure-mode programs that mutate the
+  filesystem should check the result explicitly rather than assume success.
 
 ### BUG-SCALARKIND-LOST-ON-NATIVE-MODULE-CALL-ASSIGN (fixed 2026-07-22)
 
