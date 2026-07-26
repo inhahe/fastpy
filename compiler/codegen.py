@@ -16772,6 +16772,12 @@ class CodeGen:
         self.builder.cbranch(cond, pass_block, fail_block)
 
         self.builder.position_at_end(fail_block)
+        # Owned temps produced by the message expression belong to *this arm*.
+        # `fail_block` always terminates (ret, or a branch to the except
+        # target), so it never dominates `pass_block` where the enclosing
+        # statement flush runs — letting them escape emits a decref whose
+        # operand does not dominate it (BUG-DECREF-DOES-NOT-DOMINATE).
+        _rc_mark_msg = len(self._rc_temps)
         # Raise AssertionError — evaluate the message expression
         # (only executed when the assertion fails)
         if node.msg is not None:
@@ -16815,6 +16821,13 @@ class CodeGen:
             else:
                 self.builder.branch(pass_block)
 
+        # Drop the arm's temps. The block is terminated by now, so this pops
+        # them *without* emitting decrefs — which is not merely convenient but
+        # required: `fastpy_raise` stores the message pointer (`fpy_exc_msg =
+        # msg`) rather than copying it, so the handler reads it later via
+        # `fastpy_exc_get_msg()`. Releasing here would be a use-after-free.
+        # The message therefore leaks by design, exactly as it did before.
+        self._flush_rc_temps_to(_rc_mark_msg)
         self.builder.position_at_end(pass_block)
 
     def _emit_expr_stmt(self, node: ast.Expr) -> None:
@@ -21701,6 +21714,26 @@ class CodeGen:
         _new_is_scalar = (isinstance(type_tag, ValueType)
                           and type_tag.kind in _SCALAR_VKINDS)
 
+        # Incref the new value being stored (skip if stealing an owned ref).
+        # This MUST happen before the old value is released below: when both
+        # are the same object and the slot holds the last reference, releasing
+        # first would free it and leave the incref resurrecting freed memory.
+        #   s = str(7)
+        #   s = s        # decref(old) -> 0 -> freed; then incref(freed)
+        # The native-slot path (_retain_native_store) applies the same rule.
+        # See BUG-FV-STORE-DECREF-BEFORE-INCREF.
+        if self._USE_REFCOUNT and not steal and not _new_is_scalar:
+            new_tag = self.builder.extract_value(fv, 0)
+            new_data = self.builder.extract_value(fv, 1)
+            # Inline fast path for OBJ: direct refcount increment as IR
+            _new_kind = (type_tag.kind if isinstance(type_tag, ValueType)
+                         else self._tag_kind(type_tag))
+            if _new_kind == VKind.OBJ:
+                self._emit_inline_obj_incref(new_data)
+            else:
+                self.builder.call(self.runtime["rc_incref"],
+                                  [new_tag, new_data])
+
         if name in self.variables:
             alloca, old_tag = self.variables[name]
             _old_kind_s = (old_tag.kind if isinstance(old_tag, ValueType)
@@ -21757,18 +21790,6 @@ class CodeGen:
                 else:
                     self.builder.call(self.runtime["rc_decref"],
                                       [old_tag_val, old_data])
-        # Incref the new value being stored (skip if stealing an owned ref)
-        if self._USE_REFCOUNT and not steal and not _new_is_scalar:
-            new_tag = self.builder.extract_value(fv, 0)
-            new_data = self.builder.extract_value(fv, 1)
-            # Inline fast path for OBJ: direct refcount increment as IR
-            _new_kind = (type_tag.kind if isinstance(type_tag, ValueType)
-                         else self._tag_kind(type_tag))
-            if _new_kind == VKind.OBJ:
-                self._emit_inline_obj_incref(new_data)
-            else:
-                self.builder.call(self.runtime["rc_incref"],
-                                  [new_tag, new_data])
         self.variables[name] = (alloca, type_tag)
         self.builder.store(fv, alloca)
         # Track that this variable has been assigned a real value.  Inside
@@ -23341,8 +23362,12 @@ class CodeGen:
             for stmt in node.body:
                 if self.builder.block.is_terminated:
                     break
+                # Per-statement watermark flush — see `_emit_try` for why the
+                # flush lands in `cont_block`, not before the pending check.
+                _rc_mark = len(self._rc_temps)
                 self._emit_stmt(stmt)
                 if self.builder.block.is_terminated:
+                    self._flush_rc_temps_to(_rc_mark)  # pops, no decref
                     break
                 # Check for pending exception after each statement
                 pending = self.builder.call(
@@ -23352,6 +23377,7 @@ class CodeGen:
                 cont_block = self._new_block("with.cont")
                 self.builder.cbranch(is_exc, finally_block, cont_block)
                 self.builder.position_at_end(cont_block)
+                self._flush_rc_temps_to(_rc_mark)
 
             self._in_try_block = saved_in_try
             self._try_except_target = saved_exc_target
@@ -24356,14 +24382,19 @@ class CodeGen:
         for stmt in node.body:
             if self.builder.block.is_terminated:
                 break
+            # Per-statement watermark flush — see `_emit_try` for why the flush
+            # lands in `cont_block` rather than before the pending check.
+            _rc_mark = len(self._rc_temps)
             self._emit_stmt(stmt)
             if self.builder.block.is_terminated:
+                self._flush_rc_temps_to(_rc_mark)  # terminated: pops, no decref
                 break
             pending = self.builder.call(self.runtime["exc_pending"], [])
             is_exc = self.builder.icmp_signed("!=", pending, ir.Constant(i32, 0))
             cont_block = self._new_block("trystar.cont")
             self.builder.cbranch(is_exc, exc_target, cont_block)
             self.builder.position_at_end(cont_block)
+            self._flush_rc_temps_to(_rc_mark)
 
         self._in_try_block = saved_in_try
         self._try_except_target = saved_exc_target
@@ -25099,8 +25130,14 @@ class CodeGen:
         for stmt in node.body:
             if self.builder.block.is_terminated:
                 break
+            # Per-statement watermark flush, exactly as `_emit_stmts` does.
+            # Without it the whole try body's temps accumulate and are released
+            # in a block that does not dominate their definitions —
+            # BUG-DECREF-DOES-NOT-DOMINATE facet (c).
+            _rc_mark = len(self._rc_temps)
             self._emit_stmt(stmt)
             if self.builder.block.is_terminated:
+                self._flush_rc_temps_to(_rc_mark)  # terminated: pops, no decref
                 break
             # Check for pending exception after each statement
             pending = self.builder.call(self.runtime["exc_pending"], [])
@@ -25109,6 +25146,12 @@ class CodeGen:
             exc_target = except_block if except_block else (finally_block if finally_block else end_block)
             self.builder.cbranch(is_exc, exc_target, cont_block)
             self.builder.position_at_end(cont_block)
+            # Flush in `cont_block`, i.e. on the *no-exception* path only. On
+            # the raising path a partially-executed statement may have left a
+            # registered temp holding an undefined value, and decref'ing that
+            # is a UAF; leaking it is the safe direction (see the owned/borrowed
+            # asymmetry note in design.md).
+            self._flush_rc_temps_to(_rc_mark)
 
         self._in_try_block = saved_in_try
         self._try_except_target = saved_exc_target

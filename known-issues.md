@@ -101,9 +101,9 @@ ownership tracked compiler-side because a bare alloca carries no runtime tag:
   don't have to know about it.
 - `_retain_native_store` increfs the incoming value **before** decref'ing the
   old contents, so `s = s` (and `s = f(s)`, `s = s[1:]`) can't drop the last
-  reference before taking the new one. *The FV path at ~21603 still has the
-  reverse order — decref-old then incref-new — and is a latent self-assignment
-  UAF; see BUG-FV-STORE-DECREF-BEFORE-INCREF.*
+  reference before taking the new one. *(The FV path had the reverse order and
+  was a latent self-assignment UAF; it was brought into line the same day — see
+  BUG-FV-STORE-DECREF-BEFORE-INCREF.)*
 - `_entry_store_null` zeroes a native alloca in the entry block (after all
   allocas, `ir.Constant` only so dominance holds), so a slot assigned on only
   one branch releases NULL rather than stack garbage — `fpy_rc_decref`'s
@@ -123,6 +123,50 @@ pointers the bridge owns, not `fpy_rc_*`.
 Regression test: `tests/regressions/rc_native_slot_retain.py` (ASan/UBSan/LSan
 clean under `tools/pure_harness.py`; the same file aborts ASan at the parent
 commit).
+
+### BUG-EXC-MSG-NOT-OWNED. A raised exception borrows its message string, so every dynamic message must leak — 2026-07-26
+
+**What:** `fastpy_raise` (runtime/runtime.c:818) stores the message pointer
+rather than copying it:
+
+```c
+void fastpy_raise(int exc_type, const char *msg) {
+    fpy_exc_type = exc_type;
+    fpy_exc_msg  = msg;          /* borrowed — no copy, no incref */
+```
+
+The handler reads it back much later via `fastpy_exc_get_msg()`. So a
+*heap-allocated* message — an f-string, a concatenation, `str(x)` — must stay
+alive across the entire raise/unwind/handle path, but nothing owns it. Codegen's
+only safe option is to **drop the owned temp without releasing it**, i.e. leak
+it. `_emit_assert` does exactly that (see the note under
+BUG-DECREF-DOES-NOT-DOMINATE), and `_emit_raise` is in the same position.
+
+**Impact:** a bounded leak per raised exception with a computed message. Not a
+correctness bug and not observable in output, but it does mean a program that
+raises in a hot loop with an f-string message grows without bound:
+
+```python
+for i in range(1_000_000):
+    try:
+        raise ValueError(f"bad {i}")   # each message string is leaked
+    except ValueError:
+        pass
+```
+
+**Proper fix:** make the exception state *own* its message —
+`fpy_exc_msg = fpy_str_retain(msg)` (or `strdup`) on raise, released in
+`fastpy_exc_clear()` and whenever a new exception overwrites the slot. Then
+codegen can register the message like any other argument and let the normal
+statement-boundary flush release it, which also removes the special-case
+temp-dropping in `_emit_assert`. Care is needed for the common case where the
+message is a **string constant** (`.str.N` global): those must not be freed, so
+either the retain must be tag-aware or all messages must be copied
+unconditionally.
+
+**Discovered** while fixing BUG-DECREF-DOES-NOT-DOMINATE facet (c) — the
+try-body flush made the previously invisible leak visible as an invalid-IR
+failure in `assert_fstring_msg.py`.
 
 ### BUG-INDIRECT-CALL-RET-TAG-INT. A nested `def`'s return value is tagged INT at the call site, so a returned str prints as a pointer — 2026-07-26
 
@@ -185,32 +229,35 @@ is the general fix, since a nested def can return different kinds per branch.
 the docstring of `tests/regressions/rc_native_slot_retain.py`, which
 deliberately uses module-level helpers to avoid it.
 
-### BUG-FV-STORE-DECREF-BEFORE-INCREF. The FpyValue store path releases the old value before retaining the new one — 2026-07-26
+### ~~BUG-FV-STORE-DECREF-BEFORE-INCREF. The FpyValue store path releases the old value before retaining the new one~~ — FIXED 2026-07-26
 
-**What:** in `_store_variable`'s FV path, `compiler/codegen.py` decrefs the
-slot's previous contents (~21579/21601) and only *then* increfs the value being
-stored (~21604). When both are the same object and the slot holds the last
-reference, the decref frees it and the incref resurrects freed memory:
+**What it was:** in `_store_variable`'s FV path, `compiler/codegen.py` decrefed
+the slot's previous contents and only *then* increfed the value being stored.
+When both are the same object and the slot holds the last reference, the decref
+frees it and the incref resurrects freed memory:
 
 ```python
 s = str(7)
 s = s          # decref(old s) -> refcount 0 -> freed; then incref(freed)
 ```
 
-**Status:** latent — not currently observed to fire, because the producers whose
-results reach the FV path with a refcount of exactly 1 are still the minority
-while the Model-2 migration is in progress, and `s = s` is usually optimised
-away before codegen. It becomes live as more producers are converted.
+It was latent rather than firing in the suite: the producers whose results reach
+the FV path with a refcount of exactly 1 were still the minority while the
+Model-2 migration was in progress. It would have become live as more producers
+converted — the reason to fix it now rather than wait for it to bite.
 
-**Where:** `compiler/codegen.py`, `_store_variable`, the `_USE_FV_LOCALS` branch:
-the decref at ~21579 (new-alloca case) and ~21601 (existing-alloca case) both
-precede the incref at ~21604.
+**Fixed** by hoisting the incref block above the `if name in self.variables:`
+decref blocks, so the incoming value is retained before anything is released —
+matching the native-slot path (`_retain_native_store`, added for
+BUG-BARE-ABI-STORE-NO-RETAIN), so the two paths now agree on ordering. The
+inline OBJ fast path (`_emit_inline_obj_incref`) moved with it.
 
-**Proper fix:** swap the order — incref the incoming value first, then release
-the old contents. This is exactly what the native-slot path already does
-(`_retain_native_store`, added for BUG-BARE-ABI-STORE-NO-RETAIN), so the two
-paths should agree. The inline fast paths (`_emit_inline_obj_incref` /
-`_emit_inline_obj_decref`) need the same reordering.
+**Verified** on a methods-based test (`s = s`, `t = s`, `s = t` round-trips,
+container slots, a 200-iteration rebind loop) — methods are never bare-ABI, so
+they exercise the FV path. IR valid, output matches CPython, ASan/UBSan/LSan
+clean. Note this could *not* be verified via a try-block test at the time: try
+bodies were independently emitting invalid IR (BUG-DECREF-DOES-NOT-DOMINATE
+facet (c), fixed in the same commit).
 
 ### ~~BUG-RETTAG-STR-VIA-LOCAL. `s = str(n); return s` infers an `int` return, so the caller prints the string pointer as a number~~ — FIXED 2026-07-26
 
@@ -332,6 +379,76 @@ element, allocating filter, both, a generator expression fed to `str.join` (the
 self-hosting shape), allocating dict comprehensions with and without a filter, a
 two-generator comprehension, and a 200-iteration loop building both a list and a
 dict. ASan/UBSan/LSan-clean under `tools/pure_harness.py`.
+
+**Third facet — try/except*/with bodies — also fixed 2026-07-26.** The same
+shape once more, in the one place where statements are emitted *without* going
+through `_emit_stmts`. Three loops iterated `node.body` calling `_emit_stmt`
+directly and never flushed:
+
+- `_emit_try` (~25107, `try.cont`)
+- `_emit_try_star` (~24364, `trystar.cont`)
+- the with-statement body loop (~23349, `with.cont`)
+
+Each statement in such a body is followed by a pending-exception check that
+opens a **new** block, so a value defined in `try.cont.4` was released by the
+enclosing statement flush in `try.end.2` — which does not dominate it. Two
+heap-producing statements in one try body were enough:
+
+```python
+def f():
+    try:
+        s = str(7)
+        s = str(8)
+        print(s)
+    except ValueError:
+        print("no")
+```
+```
+Instruction does not dominate all uses!
+  %.36 = ptrtoint ptr %.35 to i64
+  call void @fpy_rc_decref(i32 2, i64 %.36)
+```
+
+**Fix:** mirror `_emit_stmts` — take `_rc_mark = len(self._rc_temps)` before
+`_emit_stmt` and flush after it — with one deliberate difference: the flush is
+emitted **in `cont_block`**, after `position_at_end`, rather than immediately
+after the statement. On the raising path a partially executed statement may
+have registered a temp whose value is undefined (a runtime call that sets an
+exception still *returns* something), and decref'ing that is a UAF; leaking it
+is the safe direction under the owned/borrowed asymmetry. Definitions dominate
+`cont_block` either way, so the IR is valid regardless of which site is used.
+The `is_terminated` early-outs call the flush too, so the temps are popped from
+the compiler-side list — `_flush_rc_temps_to` emits no decrefs into a
+terminated block.
+
+**Follow-on — `assert` with a dynamic message.** Adding the flush above
+immediately exposed a *latent* instance of the same defect one level down, in
+`tests/regressions/assert_fstring_msg.py`. `_emit_assert` splits into
+`assert.pass` / `assert.fail` and builds the message expression inside the
+**fail** arm, which always terminates (a `ret`, or a branch straight to the
+except target). It then repositions to `assert.pass` leaving the message's
+owned temps still pending — and `assert.fail` does not dominate `assert.pass`.
+Before the try-body flush existed those temps quietly rode up to a flush that
+never fired, so they only *leaked*; with a flush in `try.cont` they became a
+hard verifier error.
+
+`_emit_assert` now takes its own watermark before the message expression and
+calls `_flush_rc_temps_to` after the arm's terminator. Because the block is
+terminated by then, this **pops the temps without emitting decrefs** — which is
+required, not merely convenient: `fastpy_raise` does `fpy_exc_msg = msg`, i.e.
+it stores the pointer rather than copying it, and the handler reads it back
+later via `fastpy_exc_get_msg()`. Releasing at the raise site would be a
+use-after-free. So the message deliberately leaks, exactly as it did before.
+*(Making the exception machinery own its message string is the real cure and is
+tracked separately as BUG-EXC-MSG-NOT-OWNED below.)*
+
+**Regression test:** `tests/regressions/rc_try_body_stmt_flush.py` — the
+two-producer repro, six producers in one body, handler-taken, `finally`, `else`,
+`return` inside try, nested try, a 50-iteration try-in-loop, with-statement
+bodies both standalone and in a 20-iteration loop, and `assert` with an f-string
+and a concatenated message inside a try. Fails (invalid IR) at the parent
+commit, passes with the fix, ASan/UBSan/LSan-clean under
+`tools/pure_harness.py`.
 
 **Process note:** this hid behind a SKIP for as long as it did because
 `test_self_compile_real_module` treats *every* compile failure as "self-hosting

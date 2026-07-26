@@ -43,7 +43,7 @@ retain**, and the registered `+1` is released by a **watermark flush**
 classifying an owned value as borrowed only leaks; classifying a borrowed value
 as owned is a use-after-free — so *retain* is always the safe direction.
 
-Three structural rules follow, and all have been the source of real bugs:
+Four structural rules follow, and all have been the source of real bugs:
 
 - **A temp must be released in a block that its definition dominates.** An owned
   temp created inside one arm of a conditional *expression* — an if-expression
@@ -55,6 +55,12 @@ Three structural rules follow, and all have been the source of real bugs:
   each temp as a (tag, data) phi pair that is `0` on every other incoming edge —
   `fpy_rc_decref` no-ops on `data == 0`, so exactly the arm that ran is released.
   This moves the release site only; the `+1` itself is untouched.
+  A *terminating* arm — one that returns or raises rather than reaching a merge
+  — is simpler: take a watermark before it and call `_flush_rc_temps_to` after
+  its terminator, which pops the temps without emitting anything. `_emit_assert`
+  does this for the message expression it builds in the `assert.fail` arm, and
+  must: `fastpy_raise` borrows the message pointer instead of copying it, so
+  releasing there would be a use-after-free (BUG-EXC-MSG-NOT-OWNED).
 - **A loop body must release its own temps before the back-edge.** The same
   dominance failure appears in comprehensions — a temp allocated in the body is
   invisible to the block where the enclosing statement flushes, after the loop.
@@ -92,9 +98,22 @@ Three structural rules follow, and all have been the source of real bugs:
   path with no refcount traffic at all.
 
   **Ordering:** the retain must come *before* the release of the old value, or
-  `s = s` drops the last reference and then stores a dangling pointer. The
-  native path does this; the FV path still decrefs first
-  (**BUG-FV-STORE-DECREF-BEFORE-INCREF**).
+  `s = s` drops the last reference and then stores a dangling pointer. Both
+  paths now do this — `_retain_native_store` by construction, and the FV path
+  since the incref block was hoisted above the decref blocks in
+  `_store_variable`.
+- **Every statement-list emitter must flush per statement.** `_emit_stmts` takes
+  a watermark before each statement and flushes after it; any code that emits a
+  statement list *without* going through it inherits none of that. The try-like
+  bodies (`_emit_try`, `_emit_try_star`, and the with-statement body) each open a
+  fresh `*.cont` block after every statement for the pending-exception check, so
+  letting temps accumulate to the enclosing flush produced releases in a block
+  that did not dominate them. They now mirror `_emit_stmts`, with the flush
+  emitted **in the `cont` block** rather than immediately after the statement:
+  on the raising path a partially executed statement can leave a registered temp
+  holding an undefined value, and decref'ing that is a UAF, whereas leaking it is
+  the safe direction. Dominance holds at either site. If a new construct emits a
+  statement list, it must do the same.
 
 ## Runtime
 
