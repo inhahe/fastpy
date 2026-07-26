@@ -42,6 +42,19 @@ The two codegen/link entry points live in `compiler/toolchain.py`:
   `py314`) embeds a real CPython so programs using unsupported stdlib still run.
   The bridge drags `libpython` into the binary.
 
+**Method dispatch ABI.** User classes register their methods with
+`fastpy_register_method(class_id, name, func, arg_count, returns_value)`, and
+the string dispatchers (`fastpy_obj_call_methodN`) call the stored pointer
+through a function-pointer cast. That cast must match the callee's real
+signature: a Python method with no `return <expr>` is compiled to a **void**
+LLVM function, and calling it through an `int64_t`-returning type yields
+whatever is in the return register, not 0. Hence the `returns_value` flag and
+the `FpyMethod*VoidFunc` typedefs in `objects.h` — the dispatchers branch on it.
+The same rule holds anywhere else a method pointer is called (the vtable path in
+codegen checks `direct_func.return_value.type` for exactly this reason). Getting
+it wrong is not a crash but a wrong *value*, and `with` turns a wrong value into
+lost control flow: a truthy `__exit__` result means "suppress the exception".
+
 ## Targets (codegen backends)
 
 By default fastpy emits for the **host** triple and links against the host
@@ -288,11 +301,22 @@ session (the offset-32 heap-buffer-overflow and a misaligned `FpyObj` access
 from `Path.cwd()`) were pinpointed this way. Regression programs live in
 `tests/pure/*.py` and print a bitmask (Linux truncates exit codes to 8 bits;
 SlateOS does not, which is why the on-target tools exit with theirs). They
-currently cover the `Path` surface (`pathlib_checks`, `path_boundary_checks`,
-`path_magic_collision_checks`, `path_iterdir_checks`) and exception handling
-(`exception_checks`) — the latter establishes that pure mode really does catch
-a `fastpy_raise` raised from inside a runtime function, which is the premise
-any runtime error-reporting design depends on.
+currently cover the `Path` surface — its construction and accessors
+(`pathlib_checks`, `path_boundary_checks`, `path_magic_collision_checks`,
+`path_iterdir_checks`), its *display* through the generic OBJ consumers
+(`path_display_checks`), and its use *as an argument* to `os.*` / `os.path.*` /
+the builtin `open()` (`path_arg_checks`) — plus exception handling
+(`exception_checks`), which establishes that pure mode really does catch a
+`fastpy_raise` raised from inside a runtime function, the premise any runtime
+error-reporting design depends on.
+
+The argument case deserves its own file because the conversion is per-call-site:
+a Path is a headed object, so a runtime entry point taking `const char *` must
+receive `fastpy_path_str(p)`, not the Path pointer. Codegen does this with
+`_emit_path_text_arg`; **any new runtime entry point that takes a path string
+must emit its argument the same way.** Miss one and the callee reads the
+header — historically answering about a file literally named `PATH` — which is
+silent, per-call-site, and invisible to a suite written with string paths.
 
 ## Tests
 

@@ -36725,7 +36725,11 @@ class CodeGen:
         # kwargs (encoding=, buffering=, ...) route to the bridge.
         if len(node.args) < 1 or len(node.args) > 2 or node.keywords:
             return self._emit_unknown_builtin_call(node, "open")
-        path = self._ensure_ptr(self._emit_expr_value(node.args[0]), "open.path")
+        # `open(Path(...))` is ordinary Python. fastpy_io_open takes the path as
+        # a C string, and in pure mode a Path pointer is a header, not text —
+        # passing it through unconverted made fopen() try to open a file named
+        # "PATH" (the header's magic word). See _emit_path_text_arg.
+        path = self._emit_path_text_arg(node.args[0], "open.path")
         if len(node.args) >= 2:
             mode = self._ensure_ptr(self._emit_expr_value(node.args[1]), "open.mode")
         else:
@@ -40870,7 +40874,7 @@ class CodeGen:
                               [callable_ptr, t_ir, d_ir, out_tag, out_data])
         return
 
-    def _emit_path_text_arg(self, arg_node) -> ir.Value:
+    def _emit_path_text_arg(self, arg_node, name: str = "") -> ir.Value:
         """Emit an argument for a runtime parameter that is *path text*.
 
         Many runtime entry points take a filesystem path as a plain C string
@@ -40888,9 +40892,9 @@ class CodeGen:
         """
         if self._is_path_expr(arg_node):
             other = self._emit_expr_value(arg_node)
-            other = self._ensure_ptr(other)
+            other = self._ensure_ptr(other, name)
             return self.builder.call(self.runtime["path_str"], [other])
-        return self._ensure_ptr(self._emit_expr_value(arg_node))
+        return self._ensure_ptr(self._emit_expr_value(arg_node), name)
 
     def _emit_method_call_path(self, node):
         """Emit pathlib.Path method calls. Always returns."""

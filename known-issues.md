@@ -8,6 +8,98 @@ how to reproduce it, and what the proper fix looks like.
 
 ## Active Bugs
 
+### BUG-DECREF-DOES-NOT-DOMINATE. Compiling `compiler/pipeline.py` emits invalid IR — a `fpy_rc_decref` whose operand doesn't dominate it — 2026-07-26
+
+**What:** the self-hosting progress test
+`tests/test_comprehensive.py::test_self_compile_real_module[pipeline]` skips
+with a **verifier** failure, not a "feature not supported" message:
+
+```
+Can't compile yet: Build failed: Instruction does not dominate all uses!
+  %.895 = ptrtoint ptr %.894 to i64
+  call void @fpy_rc_decref(i32 2, i64 %.895)
+```
+
+That is a genuine codegen defect: a refcount-release (tag 2 = STR) is emitted in
+a block that the string temp's definition does not dominate — i.e. the cleanup
+was placed on a path where the value may not have been produced. It is filed as
+a SKIP only because the enclosing test treats every compile failure as
+"self-hosting isn't there yet", so it does not show up as a red test.
+
+**Reproduce:**
+```
+python -c "import sys; sys.path.insert(0,'.'); from compiler.pipeline import compile_source; \
+  print(compile_source(open('compiler/pipeline.py').read(), source_filename='compiler/pipeline.py').errors[:3])"
+```
+
+**Where:** the Model-2 owned-temp cleanup in `compiler/codegen.py` (the same
+machinery tracked by BUG-CODEGEN-OWNED-TEMP-OVER-INCREF). Almost certainly a
+cleanup emitted after a branch/merge — e.g. a temp created in one arm of a
+conditional expression and released at the join point, or a `try`/`with` exit
+path that releases a temp created inside the protected region.
+
+**Proper fix:** the temp's release has to be emitted in (or dominated by) the
+block that defines it — for values that cross a merge, spill to an entry alloca
+(the pattern `_create_entry_alloca` already exists for exactly this) and release
+by loading from the slot, so every path has a defined value. Narrowing this to a
+minimal repro is the first step; `pipeline.py` is far too large to bisect by
+eye, but the verifier names the value, so dumping the IR and locating `%.894`'s
+defining block will point at the construct.
+
+### BUG-VOID-RETURNS-ZERO-NOT-NONE. A function or method with no `return <expr>` yields `0`, not `None` — 2026-07-26
+
+**What:** fastpy compiles a Python function whose body never executes
+`return <expr>` to an LLVM function with a `void` return type, and every call
+site substitutes the placeholder `ir.Constant(i64, 0)` for its value. That
+placeholder is tagged INT, so the value reads back as the integer `0` rather
+than `None`. It affects plain functions and methods equally.
+
+**Reproduce (all three differ from CPython):**
+```python
+def f():
+    x = 1
+print(f())            # fastpy 0, CPython None
+
+class C:
+    def m(self):
+        x = 1
+print(C().m())        # fastpy 0, CPython None
+
+def g():
+    pass
+r = g()
+print(r, r is None)   # fastpy "0 False", CPython "None True"
+```
+
+**Where:** the `isinstance(ret_type, ir.VoidType)` branches in
+`compiler/codegen.py` — the direct method call (~42190,
+`# void methods — return placeholder`), the vtable path (~42038/42050), the CHA
+path (~42292), and the plain-function paths (~39402, ~42422, and others; `grep
+-n "VoidType" compiler/codegen.py` lists about twenty sites).
+
+**Proper fix:** return a NONE-tagged `fpy_val` (tag `FPY_TAG_NONE`, data 0)
+instead of a bare `i64 0` at each of those sites, so the value carries its type
+the way every other dynamically-typed result does. The reason this is filed
+rather than fixed: the placeholder is consumed as a plain `i64` by a lot of
+surrounding code (statement-expression discard, argument coercion, `set_arg_tag`
+inference), so the change has to be made at every site at once and re-gated on
+the full differential suite. A narrower alternative — keep the `i64` but mark
+the expression's ValueType as NONE — would fix `print()`/`is None` without
+touching the calling convention, and is probably the better first step.
+
+**Related, and already fixed:** the *runtime* side of this had a much worse
+symptom. `fastpy_obj_call_methodN` called every registered method through an
+`int64_t`-returning pointer type, including void ones, so the "return value" was
+whatever the callee left in the return register. `with` reads that value as
+"should I suppress the exception?", so a `__exit__` returning None **swallowed
+exceptions** — `tests/regressions/with_statement.py` failed with `caught: oops`
+missing. It reproduced only when `__exit__` did enough work to leave a non-zero
+value behind (touching `self` sufficed), which disguised it as a self-reference
+bug. Fixed 2026-07-26 by dispatching on the `returns_value` flag that
+`fastpy_register_method` already records (`FpyMethod*VoidFunc` in
+`runtime/objects.h`); regression test
+`tests/regressions/void_method_return_value.py`.
+
 ### BUG-LIST-ELEM-STR-TAG-LOST. A list whose string element type isn't statically visible as a `str` Constant is typed `list[int]`, so reading the element back mis-tags it (e.g. `len()` → 0) — 2026-07-24
 
 **What:** list element-type inference only recognises **constant** string
@@ -739,11 +831,25 @@ regressions):**
   fallback (`fastpy_obj_write`, `fastpy_fv_str`, `fpy_value_repr`). `repr`
   matches CPython's `PosixPath('...')`. Regression test:
   `tests/pure/path_display_checks.py` (bitmask 255).
-- `os.path.exists(p)` / `os.path.getsize(p)` / `open(p)` with a Path argument
-  fail to **link** in pure mode (`undefined reference to fpy_cpython_call1_raw`,
-  `fpy_cpython_to_fv`, `fpy_fv_call_method0`). These should either accept PATH
-  by converting through `path_str` in codegen, or produce a clean compile-time
-  diagnostic — a link error is the worst of the three outcomes.
+- ~~`os.path.exists(p)` / `os.path.getsize(p)` / `open(p)` with a Path argument
+  fail to **link** in pure mode~~ — **FIXED 2026-07-26**, and the original
+  description was wrong in a way worth recording: this was never a link error.
+  The runtime entry points take the path as a `const char *`, and after the
+  `FpyPurePath` header landed a Path pointer no longer points at its text, so
+  the callee read the header. `os.path.exists(Path('/tmp/x'))` returned **False**
+  — a silently wrong answer, which is worse than a link error, not better. The
+  builtin `open()` was the loud member of the family: `fopen` was handed the
+  header and reported `FileNotFoundError: [Errno 2] No such file or directory:
+  'PATH'` — the magic word, read as a filename. Fixed by generalising
+  `_emit_path_join_operand` into `_emit_path_text_arg` in codegen and routing
+  every *path text* parameter through `fastpy_path_str()`: the `os.path.*`
+  table, 20 `os.*` argument sites, and `_emit_builtin_open`. Method receivers
+  are deliberately untouched — those take a Path proper. Regression test:
+  `tests/pure/path_arg_checks.py` (bitmask 131071). **When adding a runtime
+  entry point that takes a path string, emit its argument with
+  `_emit_path_text_arg`** — the failure mode is per-call-site, silent, and only
+  reproduces with a Path argument, so a suite written with string paths will not
+  catch it.
 - `os.mkdir(p)` / `os.remove(p)` / `os.rmdir(p)` **fail silently**, returning
   `-1` instead of raising `OSError`. CPython raises; pure mode swallows. This is
   not merely cosmetic — it cost a full SlateOS boot cycle to diagnose: a
