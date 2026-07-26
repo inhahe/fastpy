@@ -347,6 +347,14 @@ class ValueType:
             "path": VKind.PATH, "native_func": VKind.NATIVE_FUNC,
             "native_mod": VKind.NATIVE_MOD, "cls": VKind.CLS,
             "cell": VKind.CELL, "namedtuple_type": VKind.INT,
+            # A function with no `return <expr>` carries ret_tag "void" and
+            # compiles to an LLVM `void` function; call sites substitute the
+            # placeholder `i64 0`.  "void" used to be absent from this map, so it
+            # fell through to UNKNOWN — whose old_tag is "int" — and the
+            # placeholder read back as the integer 0 instead of None.  NONE is
+            # not is_ptr, so llvm_type stays i64 and only the *tag* changes
+            # (fpy_tag 4 == FPY_TAG_NONE).  See BUG-VOID-RETURNS-ZERO-NOT-NONE.
+            "void": VKind.NONE,
         }
         if tag.startswith("list"):
             if ":" in tag:
@@ -18193,6 +18201,14 @@ class CodeGen:
                         and value_node.func.id in self.variables
                         and self._var_kind(value_node.func.id) == VKind.PYOBJ):
                     return FPY_TAG_OBJ, value
+                # Call to a user function that never executes `return <expr>`:
+                # it compiles to a void LLVM function and the call site hands us
+                # the placeholder `i64 0`, whose IR type says INT even though the
+                # Python value is None.  Tag it NONE so print()/`is None`/`==`
+                # see None rather than the integer 0.  The data stays 0 — only
+                # the tag is corrected.  See BUG-VOID-RETURNS-ZERO-NOT-NONE.
+                elif value_node is not None and self._call_is_void(value_node):
+                    return FPY_TAG_NONE, ir.Constant(i64, 0)
                 # BigInt constant: large int that was folded at compile time
                 elif (value_node is not None
                         and isinstance(value_node, ast.Constant)
@@ -19322,6 +19338,16 @@ class CodeGen:
                             and self._is_dict_expr(arg.func.value)):
                         return ValueType(VKind.LIST, elem_type=ValueType(VKind.INT))
                 return ValueType(VKind.LIST, elem_type=ValueType(VKind.INT))
+            # A user function whose body never executes `return <expr>` compiles
+            # to a *void* LLVM function, and the call site substitutes the
+            # placeholder `i64 0`.  Nothing populates _func_ret_types for it, so
+            # the tag used to fall through to the placeholder's own LLVM type —
+            # INT — and `f()` read back as the integer 0 rather than None.  NONE
+            # is not is_ptr, so the emitted value is still the same i64; only the
+            # static tag changes.  See BUG-VOID-RETURNS-ZERO-NOT-NONE.
+            _uf = getattr(self, '_user_functions', {}).get(node.func.id)
+            if _uf is not None and getattr(_uf, 'ret_tag', None) == "void":
+                return ValueType(VKind.NONE)
             # User function with known return type (from return-type propagation)
             frt = getattr(self, '_func_ret_types', {})
             if node.func.id in frt:
@@ -19709,6 +19735,11 @@ class CodeGen:
 
     def _infer_type_tag(self, node: ast.expr, value: ir.Value) -> 'ValueType':
         """Infer the Python type from an AST node and LLVM value."""
+        # A call to a function/method with no `return <expr>` yields the
+        # placeholder `i64 0`, so `value` alone says INT — but the Python value
+        # is None. See BUG-VOID-RETURNS-ZERO-NOT-NONE.
+        if self._call_is_void(node):
+            return ValueType(VKind.NONE)
         if isinstance(node, ast.Constant):
             if node.value is None:
                 return ValueType(VKind.NONE)
@@ -27521,8 +27552,19 @@ class CodeGen:
         if _TYPE_CHECK is not None:
             return _TYPE_CHECK
 
-        tv_left = self._emit_expr(node.left)
-        left = tv_left.val
+        # `is` / `is not` are emitted from the AST node rather than from an
+        # already-computed value (they need the node to reach the FpyValue tag,
+        # which the unwrapped value has lost), so _emit_is_compare emits the left
+        # operand itself.  Emitting it eagerly here as well ran any call in it
+        # twice — `val() is val()` bumped a global three times instead of twice.
+        # Skip the eager emission when every operator is an identity test; `in`
+        # and the ordering/equality operators still need the value.
+        if all(isinstance(o, (ast.Is, ast.IsNot)) for o in node.ops):
+            tv_left = None
+            left = None
+        else:
+            tv_left = self._emit_expr(node.left)
+            left = tv_left.val
         result = None
 
         for op, comparator_node in zip(node.ops, node.comparators):
@@ -27960,6 +28002,17 @@ class CodeGen:
             return self.builder.icmp_signed("==", left, right)
         # Determine if the non-None side is statically known to be None
         other = left_node if isinstance(right_node, ast.Constant) and right_node.value is None else right_node
+
+        # A call to a function/method with no `return <expr>` is None by
+        # definition, so fold the comparison — there is no runtime tag to test
+        # (the call site substitutes the untyped placeholder `i64 0`, which
+        # would compare equal to a null pointer and read as "not None" here).
+        # The call is still emitted, for its side effects.
+        # See BUG-VOID-RETURNS-ZERO-NOT-NONE.
+        if self._call_is_void(other):
+            self._emit_expr_value(other)
+            return ir.Constant(ir.IntType(1),
+                               0 if isinstance(op, ast.IsNot) else 1)
 
         # For FV-backed variables, compare the runtime tag with FPY_TAG_NONE.
         # This handles functions that return None on some paths but not others.
@@ -31319,6 +31372,12 @@ class CodeGen:
                     and isinstance(_recv.func, ast.Name)
                     and _recv.func.id in self._user_classes):
                 _is_obj_method_call = True
+        # ...but a method with no `return <expr>` never calls set_ret_tag at
+        # all, so get_ret_tag() would hand back whatever the last tagged return
+        # left behind. Fall through to _wrap_for_print, which knows the answer
+        # is None. See BUG-VOID-RETURNS-ZERO-NOT-NONE.
+        if _is_obj_method_call and self._call_is_void(node):
+            _is_obj_method_call = False
         if _is_obj_method_call:
             data = self._emit_expr_value(node)
             if (isinstance(data.type, ir.LiteralStructType)
@@ -31347,6 +31406,11 @@ class CodeGen:
         if (isinstance(value.type, ir.LiteralStructType)
                 and value.type == fpy_val):
             return value
+        # A call to a function/method with no `return <expr>` yields the
+        # placeholder `i64 0`, whose IR type says INT even though the Python
+        # value is None.  Print it as None.
+        if self._call_is_void(node):
+            return self._fv_none()
         # Constants: inline the tag
         if isinstance(node, ast.Constant):
             if node.value is None:
@@ -43865,6 +43929,43 @@ class CodeGen:
                         and n.value.value.id == "self"
                         and n.value.attr in dict_attrs):
                     return True
+        return False
+
+    def _call_is_void(self, node: ast.expr) -> bool:
+        """True when `node` calls a user function/method that never executes
+        `return <expr>`.
+
+        Such a callee compiles to a **void** LLVM function, so the call site has
+        no value to hand back and substitutes the placeholder `i64 0`.  The
+        placeholder's IR type says INT, which made `print(f())` say `0` and
+        `f() is None` say False — the Python answer is None in both cases.  Call
+        sites that need a *tag* rather than an LLVM type ask this and emit NONE.
+        See BUG-VOID-RETURNS-ZERO-NOT-NONE in known-issues.md.
+        """
+        if not isinstance(node, ast.Call):
+            return False
+        if isinstance(node.func, ast.Name):
+            # A local of the same name shadows the function (closure/callable
+            # variable), and its callee isn't statically known.
+            if node.func.id in self.variables:
+                return False
+            info = getattr(self, '_user_functions', {}).get(node.func.id)
+            return info is not None and getattr(info, 'ret_tag', None) == "void"
+        if isinstance(node.func, ast.Attribute):
+            # Resolve through the receiver's own class only.  Deliberately not
+            # _find_method_return_type: that falls back to scanning *every* user
+            # class when the receiver's class can't be inferred, which would let
+            # an unrelated class's void method answer for e.g. a str or pyobj
+            # receiver that happens to share a method name.  Answering "not
+            # void" for an unknown receiver is the safe direction — it only
+            # restores the old behaviour.
+            cls = self._infer_object_class(node.func.value)
+            while cls and cls in self._user_classes:
+                cls_info = self._user_classes[cls]
+                m = cls_info.methods.get(node.func.attr)
+                if m is not None:
+                    return isinstance(m.return_value.type, ir.VoidType)
+                cls = cls_info.parent_name
         return False
 
     def _find_method_return_type(self, obj_node: ast.expr, method_name: str) -> ir.Type | None:

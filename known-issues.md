@@ -46,46 +46,94 @@ minimal repro is the first step; `pipeline.py` is far too large to bisect by
 eye, but the verifier names the value, so dumping the IR and locating `%.894`'s
 defining block will point at the construct.
 
-### BUG-VOID-RETURNS-ZERO-NOT-NONE. A function or method with no `return <expr>` yields `0`, not `None` — 2026-07-26
+### ~~BUG-IS-COMPARE-DOUBLE-EVAL. `a is b` evaluated its left operand twice~~ — FIXED 2026-07-26
 
-**What:** fastpy compiles a Python function whose body never executes
+**What it was:** `_emit_compare` emitted the left operand eagerly
+(`tv_left = self._emit_expr(node.left)`) before dispatching per operator, but
+`_emit_is_compare` needs the AST *node* rather than the value — the unwrapped
+value has lost the FpyValue tag it must inspect — so it emitted the left operand
+a second time. Any call on the left of an `is` therefore ran twice.
+
+**Reproduced:**
+```python
+n = 0
+def val():
+    global n
+    n = n + 1
+    return 5
+print(val() is val())
+print(n)              # was 4, CPython 3
+```
+
+Found while fixing BUG-VOID-RETURNS-ZERO-NOT-NONE (the new `_call_is_void` fold
+in `_emit_is_compare` doubled a `c.bump()` side effect, which turned out to be
+the pre-existing hazard rather than a new one).
+
+**Fixed** in `_emit_compare` by skipping the eager emission when *every*
+operator in the comparison is `is`/`is not` — `in` and the ordering/equality
+operators still consume the value, and a chain that mixes them still gets it.
+
+### ~~BUG-VOID-RETURNS-ZERO-NOT-NONE. A function or method with no `return <expr>` yields `0`, not `None`~~ — FIXED 2026-07-26
+
+**What it was:** fastpy compiles a Python function whose body never executes
 `return <expr>` to an LLVM function with a `void` return type, and every call
-site substitutes the placeholder `ir.Constant(i64, 0)` for its value. That
-placeholder is tagged INT, so the value reads back as the integer `0` rather
-than `None`. It affects plain functions and methods equally.
+site substitutes the placeholder `ir.Constant(i64, 0)` for its value. Nothing
+recorded that the placeholder means None, so every consumer fell back to its
+LLVM type — INT — and the value read back as the integer `0`. It affected plain
+functions and methods equally.
 
-**Reproduce (all three differ from CPython):**
+**Reproduced (all three differed from CPython):**
 ```python
 def f():
     x = 1
-print(f())            # fastpy 0, CPython None
+print(f())            # was 0, CPython None
 
 class C:
     def m(self):
         x = 1
-print(C().m())        # fastpy 0, CPython None
+print(C().m())        # was 0, CPython None
 
 def g():
     pass
 r = g()
-print(r, r is None)   # fastpy "0 False", CPython "None True"
+print(r, r is None)   # was "0 False", CPython "None True"
 ```
 
-**Where:** the `isinstance(ret_type, ir.VoidType)` branches in
-`compiler/codegen.py` — the direct method call (~42190,
-`# void methods — return placeholder`), the vtable path (~42038/42050), the CHA
-path (~42292), and the plain-function paths (~39402, ~42422, and others; `grep
--n "VoidType" compiler/codegen.py` lists about twenty sites).
+**Fixed by the narrower of the two options** that were on the table: keep the
+`i64 0` placeholder (so the calling convention is untouched) and correct only
+the *tag*. `CodeGen._call_is_void(node)` answers "this call's Python value is
+None" for both a `Name` call (`_user_functions[...].ret_tag == "void"`) and an
+`Attribute` call (`_find_method_return_type(...)` is `ir.VoidType`), and the
+four places that produce a tag rather than an LLVM type consult it:
 
-**Proper fix:** return a NONE-tagged `fpy_val` (tag `FPY_TAG_NONE`, data 0)
-instead of a bare `i64 0` at each of those sites, so the value carries its type
-the way every other dynamically-typed result does. The reason this is filed
-rather than fixed: the placeholder is consumed as a plain `i64` by a lot of
-surrounding code (statement-expression discard, argument coercion, `set_arg_tag`
-inference), so the change has to be made at every site at once and re-gated on
-the full differential suite. A narrower alternative — keep the `i64` but mark
-the expression's ValueType as NONE — would fix `print()`/`is None` without
-touching the calling convention, and is probably the better first step.
+| site | what it used to do |
+|---|---|
+| `_wrap_for_print` | fell through to the placeholder's INT type → printed `0` |
+| `_bare_to_tag_data` | boxed the placeholder as `FPY_TAG_INT` |
+| `_emit_is_compare` | compared the placeholder to null → `f() is None` was False |
+| `_infer_type_tag` | typed `r = f()` as INT, so `print(r)` said `0` |
+
+Plus one guard in `_load_or_wrap_fv`: the obj-method-call branch recovers a
+method's runtime type with `get_ret_tag()`, but a void method never calls
+`set_ret_tag`, so that read back a stale tag — void method calls now fall
+through to `_wrap_for_print` instead. `"void"` was also added to
+`ValueType.from_old_tag` (→ `VKind.NONE`, whose `llvm_type` is still `i64`, so
+nothing about the emitted value changes).
+
+Regression test: `tests/regressions/void_return_is_none.py`.
+
+**Still open, but a different bug:** a void call *as a list element* —
+`[f(), g()]` prints `[0, 0]`. That is not about void returns; list element
+tagging loses NONE generally (`x = None; print([x, x])` prints `[0, 0]` too).
+See BUG-LIST-ELEM-STR-TAG-LOST below, which is the same inference gap for `str`.
+
+**The wider fix is still available if it's ever needed:** return a NONE-tagged
+`fpy_val` from the ~20 `isinstance(ret_type, ir.VoidType)` branches in
+`compiler/codegen.py` instead of a bare `i64 0`, so the value carries its type
+the way every other dynamically-typed result does. That was not done because the
+placeholder is consumed as a plain `i64` by a lot of surrounding code
+(statement-expression discard, argument coercion, `set_arg_tag` inference), so
+it has to be changed at every site at once.
 
 **Related, and already fixed:** the *runtime* side of this had a much worse
 symptom. `fastpy_obj_call_methodN` called every registered method through an

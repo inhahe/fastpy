@@ -55,6 +55,16 @@ codegen checks `direct_func.return_value.type` for exactly this reason). Getting
 it wrong is not a crash but a wrong *value*, and `with` turns a wrong value into
 lost control flow: a truthy `__exit__` result means "suppress the exception".
 
+**The compiler-side counterpart: a void call's Python value is `None`.** Because
+a function/method with no `return <expr>` compiles to a void LLVM function,
+codegen has nothing to hand back and substitutes the placeholder `i64 0`. That
+placeholder's LLVM type says INT, which is a lie — the Python value is `None`.
+Anywhere codegen derives a *tag* rather than an LLVM type (print wrapping,
+FpyValue boxing, `is` comparison, variable type inference), it must ask
+`CodeGen._call_is_void(node)` rather than look at the value, or the call reads
+back as the integer `0`. A void method also never calls `set_ret_tag()`, so the
+`get_ret_tag()` recovery used for obj-method calls does not apply to it.
+
 ## Targets (codegen backends)
 
 By default fastpy emits for the **host** triple and links against the host
