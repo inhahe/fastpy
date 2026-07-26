@@ -22778,6 +22778,9 @@ class CodeGen:
             elif vtype.kind == VKind.STR:
                 self._emit_for_string(node)
                 return
+            elif vtype.kind == VKind.BYTES:
+                self._emit_for_bytes(node)
+                return
             elif vtype.kind in (VKind.DICT, VKind.SET, VKind.DEFAULTDICT, VKind.COUNTER):
                 self._emit_for_dict(node)
                 return
@@ -22829,6 +22832,13 @@ class CodeGen:
         # Check for `for ch in string`
         if isinstance(node.iter, ast.Constant) and isinstance(node.iter.value, str):
             self._emit_for_string(node)
+            return
+        # `for b in b"..."` — bytes literal or any expression inferred BYTES
+        if isinstance(node.iter, ast.Constant) and isinstance(node.iter.value, (bytes, bytearray)):
+            self._emit_for_bytes(node)
+            return
+        if self._infer_type_tag(node.iter, None).kind == VKind.BYTES:
+            self._emit_for_bytes(node)
             return
         if self._is_dict_expr(node.iter):
             self._emit_for_dict(node)
@@ -26498,6 +26508,63 @@ class CodeGen:
         if not _is_named_var and self._USE_REFCOUNT:
             _tag = ir.Constant(i32, FPY_TAG_STR)
             _data = self.builder.ptrtoint(str_val, i64)
+            self.builder.call(self.runtime["rc_decref"], [_tag, _data])
+
+    def _emit_for_bytes(self, node: ast.For) -> None:
+        """Emit `for b in bytes_obj`: iterate yielding int byte values.
+
+        Mirrors _emit_for_string but uses the length-aware bytes helpers
+        (fastpy_bytes_len / fastpy_bytes_get) so embedded null bytes are
+        handled, and binds the loop variable as an INT (0..255) — Python
+        iterates bytes as ints, not 1-length bytes objects.
+        """
+        var_name = node.target.id
+        b_tv = self._emit_expr(node.iter)
+        b_val = b_tv.as_ptr(self.builder)
+        b_len = self._rt_call("bytes_len", [b_val])
+
+        idx_name = f"__idx_bytes_{var_name}"
+        self._store_variable(idx_name, ir.Constant(i64, 0), ValueType(VKind.INT))
+
+        cond_block = self._new_block("forb.cond")
+        body_block = self._new_block("forb.body")
+        incr_block = self._new_block("forb.incr")
+        end_block = self._new_block("forb.end")
+
+        self.builder.branch(cond_block)
+        self.builder.position_at_end(cond_block)
+        idx = self._load_variable(idx_name, node)
+        cond = self.builder.icmp_signed("<", idx, b_len)
+        self.builder.cbranch(cond, body_block, end_block)
+
+        self.builder.position_at_end(body_block)
+        idx = self._load_variable(idx_name, node)
+        byte_val = self._rt_call("bytes_get", [b_val, idx])
+        self._store_variable(var_name, byte_val, ValueType(VKind.INT))
+
+        self._loop_stack.append((end_block, incr_block))
+        _prev_hot = self._in_hot_loop
+        self._in_hot_loop = True
+        self._emit_stmts(node.body)
+        self._in_hot_loop = _prev_hot
+        self._loop_stack.pop()
+        if not self.builder.block.is_terminated:
+            self.builder.branch(incr_block)
+
+        self.builder.position_at_end(incr_block)
+        idx = self._load_variable(idx_name, node)
+        self._store_variable(idx_name, self.builder.add(idx, ir.Constant(i64, 1)), ValueType(VKind.INT))
+        self.builder.branch(cond_block)
+
+        self.builder.position_at_end(end_block)
+
+        # Decref temporary bytes iterables (e.g. `for b in get_bytes():`)
+        _is_named_var = (isinstance(node.iter, ast.Name)
+                         and (node.iter.id in self.variables
+                              or node.iter.id in self._global_vars))
+        if not _is_named_var and self._USE_REFCOUNT:
+            _tag = ir.Constant(i32, FPY_TAG_BYTES)
+            _data = self.builder.ptrtoint(b_val, i64)
             self.builder.call(self.runtime["rc_decref"], [_tag, _data])
 
     def _emit_for_iter_protocol(self, node: ast.For) -> None:

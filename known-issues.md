@@ -327,7 +327,13 @@ route bitwise ops through `fastpy_fv_binop` when a BIGINT tag is possible,
 instead of the unconditional i64 `_emit_int_binop`. Add regression tests for
 `(-big) & k`, `(-big) | k`, `(-big) ^ k`, `(-big) << k`, `(-big) >> k`.
 
-### BUG-BYTES-ITER-CRASH. `for c in some_bytes:` crashes — `_emit_for` has no BYTES branch — 2026-07-26
+### BUG-BYTES-ITER-CRASH. [FIXED] `for c in some_bytes:` crashes — `_emit_for` has no BYTES branch — 2026-07-26
+
+**Fix (committed):** added `_emit_for_bytes` (mirrors `_emit_for_string` but
+uses `fastpy_bytes_len`/`fastpy_bytes_get` and binds the loop var as INT), and
+wired `_emit_for` dispatch for VKind.BYTES named vars, `b"..."` literals, and
+any expression inferred BYTES. Validated: `for c in b"ABC"` yields 65/66/67,
+embedded-null bytes iterate correctly, 314 differential tests pass.
 
 **What:** iterating a `bytes` object in a `for` loop crashes. `_emit_for`
 (codegen ~22736) dispatches on the iterable's VKind and has branches for
