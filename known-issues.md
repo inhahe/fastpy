@@ -8,10 +8,92 @@ how to reproduce it, and what the proper fix looks like.
 
 ## Active Bugs
 
-### BUG-DECREF-DOES-NOT-DOMINATE. Compiling `compiler/pipeline.py` emits invalid IR — a `fpy_rc_decref` whose operand doesn't dominate it — 2026-07-26
+### BUG-BARE-ABI-STORE-NO-RETAIN. Assigning an owned str temp to a local inside a bare-ABI function is a use-after-free — 2026-07-26
 
-**What:** the self-hosting progress test
-`tests/test_comprehensive.py::test_self_compile_real_module[pipeline]` skips
+**What:** inside a function compiled with the bare-type ABI, storing a
+Model-2 **owned** temp into a local emits no incref, but the statement-boundary
+flush still emits the release — so the variable is left pointing at freed
+memory. Every later read is garbage.
+
+**Reproduce** (prints a garbage line instead of `7`):
+```python
+def f():
+    s = str(7)
+    print(s)
+
+f()
+```
+The emitted IR shows the problem directly:
+```llvm
+%".6" = call i8* @"fastpy_fv_str"(i32 %".4", i64 %".5")  ; owned +1 temp
+%".7" = ptrtoint i8* %".6" to i64
+store i8* %".6", i8** %"s"                               ; stored, NO incref
+call void @"fpy_rc_decref"(i32 2, i64 %".7")             ; boundary flush frees it
+%"s.1" = load i8*, i8** %"s"                             ; dangling
+```
+Any producer registered as an owned temp triggers it — `str()`/`repr()`/`hex()`/
+`oct()`/`bin()`/`chr()` on a static scalar, and scalar f-string interpolants
+(the Stage 3.1 producers). `s = "a" + str(n)` does **not**, because the concat
+path already retains. Module scope is unaffected: module-level names take the
+early-return global path in `_store_variable`, which emits neither incref nor
+decref.
+
+**Where:** `compiler/codegen.py`, `_store_variable`. Two of its branches do a
+plain `builder.store` and return with no refcount traffic at all:
+- the bare-ABI/legacy branch,
+  `if not self._USE_FV_LOCALS or self._current_fn_bare_abi:` (~21444);
+- the `_native_vars` annotated/typed fast path (~21393), checked *before* it.
+
+Contrast the FV path (~21603), which does the right thing: decref the slot's old
+value, then incref the new one unless `steal=True`.
+
+**What the symptom tracks:** the failure follows `_current_fn_bare_abi`, not the
+annotation. Measured:
+
+| case | result |
+|---|---|
+| `def f(): s = str(7); print(s)` (bare-ABI) | **fail** |
+| `def f(): s: str = str(7); print(s)` (bare-ABI, `_native_vars`) | **fail** |
+| same, plus a `try/except` so the function is no longer bare-ABI | pass |
+| `s = str(7); print(s)` at module scope | pass |
+
+so both no-retain branches are reachable only from bare-ABI functions in
+practice; a non-bare-ABI function routes to the FV path, which retains.
+
+**Proper fix** — three parts, all gated on the slot's static VKind being a heap
+kind so the typed fast path stays refcount-traffic-free for scalars:
+
+1. **Null-initialize heap-kind native allocas** in the entry block, mirroring
+   `_entry_store_fv_none` (~21289), which exists for exactly this reason on the
+   FV side. Without it the *first* store's decref reads an uninitialized slot.
+   `_create_entry_alloca` (~21275) deliberately does not initialize, so this
+   needs a sibling `_entry_store_null` plus a set tracking which slots got it.
+2. **Retain/release on store** in both no-retain branches: decref the slot's old
+   contents (tag = the slot's static `fpy_tag`, data = `ptrtoint(load(alloca))`),
+   then incref the incoming value unless `steal=True` — i.e. the same discipline
+   the FV path already applies at ~21603.
+3. **Release at function exit.** `_emit_scope_decref` (~25951) explicitly
+   `continue`s on anything whose alloca isn't `fpy_val` (~25970), so native slots
+   are never released. It must also walk heap-kind native slots, keeping the
+   existing exclusions (parameters are borrowed; the returned variable transfers
+   ownership).
+
+Doing (2) without (3) converts the UAF into a leak on every reassignment — still
+an improvement, per the documented asymmetry (owned-treated-as-borrowed leaks,
+borrowed-treated-as-owned is a UAF), so the retain is the safe half to land
+first if they must be split. Verify with `tools/pure_harness.py` (ASan + LSan
+catches both halves) before and after.
+
+**Note:** the existing "Verified (native ASan, pure mode): dropped/var/attr/
+dict/typed-list stores of `str/repr/hex/oct/bin/chr` … no UAF/double-free" claim
+under BUG-CODEGEN-OWNED-TEMP-OVER-INCREF Stage 3.1 is **too strong** — those
+checks were written at module scope, which takes the global path and so never
+exercised this branch.
+
+### ~~BUG-DECREF-DOES-NOT-DOMINATE. Compiling `compiler/pipeline.py` emits invalid IR — a `fpy_rc_decref` whose operand doesn't dominate it~~ — FIXED 2026-07-26
+
+**What it was:** the self-hosting progress test
+`tests/test_comprehensive.py::test_self_compile_real_module[pipeline]` skipped
 with a **verifier** failure, not a "feature not supported" message:
 
 ```
@@ -20,31 +102,103 @@ Can't compile yet: Build failed: Instruction does not dominate all uses!
   call void @fpy_rc_decref(i32 2, i64 %.895)
 ```
 
-That is a genuine codegen defect: a refcount-release (tag 2 = STR) is emitted in
-a block that the string temp's definition does not dominate — i.e. the cleanup
-was placed on a path where the value may not have been produced. It is filed as
-a SKIP only because the enclosing test treats every compile failure as
-"self-hosting isn't there yet", so it does not show up as a red test.
+**Root cause:** an owned (+1) temporary created *inside a conditional expression
+arm* lives in that arm's own basic block, but the enclosing statement's Model-2
+flush runs in the **merge** block — which the arm does not dominate. The
+offending construct in `pipeline.py` was line 134,
+`msg = str(e)[:200] if str(e) else f"{type(e).__name__} in codegen"`: the
+f-string in the `else` arm allocates, and its release was emitted at the join.
 
-**Reproduce:**
+Minimal repro (7 lines):
+```python
+def f(e):
+    n = str(e)
+    msg = n if n else f"{n} fallback"
+    return msg
 ```
-python -c "import sys; sys.path.insert(0,'.'); from compiler.pipeline import compile_source; \
-  print(compile_source(open('compiler/pipeline.py').read(), source_filename='compiler/pipeline.py').errors[:3])"
-```
+The same defect affected the `and`/`or` short-circuit operands, where *every*
+operand block is a predecessor of the merge — so `a or f"{a}"` produced the same
+invalid IR. It went unnoticed for so long because it only fires when an arm
+**allocates**; the many `x if c else y` tests over ints and literals register no
+temp and so stayed valid.
 
-**Where:** the Model-2 owned-temp cleanup in `compiler/codegen.py` (the same
-machinery tracked by BUG-CODEGEN-OWNED-TEMP-OVER-INCREF). Almost certainly a
-cleanup emitted after a branch/merge — e.g. a temp created in one arm of a
-conditional expression and released at the join point, or a `try`/`with` exit
-path that releases a temp created inside the protected region.
+**Fix:** two helpers in `compiler/codegen.py` next to `_flush_rc_temps`:
+- `_capture_arm_rc_temps(mark)` — pops the temps registered since `mark` while
+  the builder is still positioned in the arm, so the enclosing statement's flush
+  can no longer see them.
+- `_rejoin_arm_rc_temps(arms)` — called at the *top* of the merge block, before
+  any non-phi instruction. It rebuilds each captured temp as a pair of phis
+  (tag, data) whose incoming value from every *other* predecessor is `0`;
+  `fpy_rc_decref` already no-ops on `data == 0`, so exactly the arm that ran is
+  released. The +1 is untouched — only the release *site* moves — so Model-2
+  semantics are unchanged.
 
-**Proper fix:** the temp's release has to be emitted in (or dominated by) the
-block that defines it — for values that cross a merge, spill to an entry alloca
-(the pattern `_create_entry_alloca` already exists for exactly this) and release
-by loading from the slot, so every path has a defined value. Narrowing this to a
-minimal repro is the first step; `pipeline.py` is far too large to bisect by
-eye, but the verifier names the value, so dumping the IR and locating `%.894`'s
-defining block will point at the construct.
+Wired into `_emit_ifexp` (both the FpyValue-output path and the same-type path)
+and into `_emit_short_circuit_and` / `_emit_short_circuit_or` (one arm entry per
+operand). Dominance holds because a pending temp's defining block always
+dominates `self.builder.block` at capture time, and that block is the
+predecessor registered in the phi.
+
+**Regression test:** `tests/regressions/rc_temp_in_conditional_arm.py` — both
+arms taken, the result consumed after the merge, 200- and 100-iteration loops
+(a double-free would crash, a leak would grow), 3-operand `or`, nested
+conditionals, arms as call arguments, and the mixed-type FpyValue path.
+`test_self_compile_real_module[pipeline]` now **passes** rather than skipping.
+
+**Second facet — comprehension bodies — also fixed 2026-07-26.** Reclassifying
+verifier errors as failures (BUG-SKIP-MASKS-VERIFIER-ERRORS) immediately exposed
+the same defect in a different shape:
+`test_self_compile_ir_builder_pattern` failed on
+`ops = ", ".join(str(o) for o in self.operands)`. A comprehension is lowered to a
+cond/body/incr/end loop; a temp allocated in the **body** was left pending for
+the statement flush that runs in the **end** block, which the body does not
+dominate.
+
+This needed a *different* fix from the conditional-arm case. The phi trick is
+wrong here: the body runs N times, so there is no single merged value — releasing
+at the merge would free only the last iteration's temp and leak the other N-1.
+The correct fix is a **per-iteration flush** at the end of the body, before the
+back-edge. It is safe because every container store retains: `fpy_list_append`
+and `fastpy_dict_set_fv` both incref what they store, so the body's +1 really is
+surplus once the element is in.
+
+A filter (`if` clause) forks the body into keep/skip paths that both reach the
+incr block, so a third helper `_release_rc_temps_since(mark)` emits the release
+on the skip arm *without* popping the pending list — the arms are mutually
+exclusive and the fork block dominates both, so each path releases exactly once.
+
+Applied to `_emit_lc_body` (shared by the single-generator and tuple-unpack list
+comprehensions), `_emit_list_comprehension_multi`,
+`_emit_list_comprehension_nested` (per *outer* iteration, for the inner
+iterable), both single-generator dict-comprehension loops (`dc.*` and `dcl.*`)
+and `_emit_dict_comprehension_multi`.
+
+**Regression test:** `tests/regressions/rc_temp_in_comprehension.py` — allocating
+element, allocating filter, both, a generator expression fed to `str.join` (the
+self-hosting shape), allocating dict comprehensions with and without a filter, a
+two-generator comprehension, and a 200-iteration loop building both a list and a
+dict. ASan/UBSan/LSan-clean under `tools/pure_harness.py`.
+
+**Process note:** this hid behind a SKIP for as long as it did because
+`test_self_compile_real_module` treats *every* compile failure as "self-hosting
+isn't there yet". A verifier error is categorically different from an
+unsupported-feature error and should be a hard failure — see
+BUG-SKIP-MASKS-VERIFIER-ERRORS below.
+
+### BUG-SKIP-MASKS-VERIFIER-ERRORS. Invalid-IR failures are reported as skips, not failures — 2026-07-26
+
+**What:** the diff-test harness and `test_self_compile_real_module` both map any
+build failure to "compiler can't compile this yet" (a SKIP). That is right for
+an unsupported Python feature, but wrong for an **LLVM verifier** error, which
+always means codegen emitted invalid IR — a real defect that will never be fixed
+by adding a feature. BUG-DECREF-DOES-NOT-DOMINATE sat green in the suite this
+way; the new `rc_temp_in_conditional_arm.py` regression test likewise reports
+`skip`, not `fail`, when the fix is reverted.
+
+**Proper fix:** in `tests/harness.py`, classify a build failure whose message
+contains an LLVM verifier signature (`Instruction does not dominate all uses`,
+`Invalid operand types`, `Broken module`, …) as a hard FAIL rather than a SKIP,
+so this class of bug can never hide again.
 
 ### ~~BUG-IS-COMPARE-DOUBLE-EVAL. `a is b` evaluated its left operand twice~~ — FIXED 2026-07-26
 
@@ -213,6 +367,69 @@ element (Model 2: all consumers incref); do facet (a) in lockstep with convertin
 containers to Model 2, with a native-ASan check on `[a+b]`, `[str(i) for ...]`,
 and `lst.append(a+b)` read-back.
 
+**Facet (c) — list *comprehensions* — newly visible 2026-07-26.** The same
+mis-inference applies to `[str(n) for n in nums]`: the result list is typed
+`list[int]`, so `g[0]` is emitted as a raw `i64` load of the element's data field
+with a hardcoded `i32 0` (INT) tag, and `len(g[0])` returns 0.
+```python
+def go():
+    nums = [1, 2, 3]
+    g = [str(n) for n in nums]
+    print(len(g) + len(g[0]))   # CPython 4, fastpy 3
+go()
+```
+It also reproduces at module scope, and with `[x + "y" for x in ...]`. A
+comprehension whose element is a **constant** str (`["vv" for n in nums]`) or a
+plain `Name` of a str element (`[x for x in words]`) is fine, matching facets
+(a)/(b): only computed string elements are lost. This facet was invisible until
+2026-07-26 because every allocating comprehension crashed the LLVM verifier first
+(BUG-DECREF-DOES-NOT-DOMINATE, comprehension facet) — the module never got as far
+as producing wrong output. Fix belongs with facets (a)/(b): teach
+`_infer_list_elem_type` (and the comprehension result-type inference that feeds
+the assignment's `var_types`, codegen.py ~8369) to recognise a statically-str
+element expression.
+
+### BUG-NESTED-LISTCOMP-OUTER-ELEM-TAG. A two-generator list comprehension over a flat list mis-tags the outer variable as a list, giving wrong output or an access violation — 2026-07-26
+
+**What:** `_emit_list_comprehension_nested` (codegen.py ~45880) hardcodes the
+outer element type to `list:int`:
+```python
+_nlc_outer_elem = (ValueType(VKind.FVALUE) if _outer_is_obj
+                   else ValueType.from_old_tag("list:int"))
+```
+That is only right for the nested-list shape `[y for row in rows for y in row]`.
+For a flat outer iterable — `[f(x, y) for x in nums for y in nums]`, the usual
+Cartesian-product idiom — the outer variable `x` is bound as a **list pointer**
+built from an `int`, so any use of `x` reinterprets an integer as a pointer.
+
+**Reproduce:**
+```python
+nums = [1, 2, 3]
+f = [x * 10 + y for x in nums for y in nums if x != y]
+print(len(f), f[0], f[-1])   # CPython: 6 12 32
+```
+fastpy: exits `3221225477` (0xC0000005, access violation) with no output. With a
+string element expression it instead raises
+`TypeError: '<' not supported between instances of 'list' and 'int'`, or silently
+drops the filter (`[str(x) + "-" + str(y) for x in nums for y in nums if x != y]`
+yields 9 elements instead of 6, first element `1-1`).
+
+**Verified pre-existing:** reproduces unchanged on the parent commit, before the
+BUG-DECREF-DOES-NOT-DOMINATE work. It stayed hidden because the differential
+suite's nested comprehensions all iterate a list of lists.
+
+**Proper fix:** infer the outer element type from `gen0.iter` the way the
+single-generator path does (`_infer_list_elem_type` / `_infer_for_elem_type`)
+instead of assuming `list:int`; fall back to `FVALUE` when the element type isn't
+statically known, so the runtime tag is preserved. Audit the same hardcoded
+assumption in `_emit_list_comprehension_multi` (`_mlc_elem`, ~45830) and
+`_emit_dict_comprehension_multi` (`_elem_tag`, ~46412), which use `int` rather
+than `list:int` but are equally unconditional.
+
+**Regression coverage:** `tests/regressions/rc_temp_in_comprehension.py`
+deliberately iterates a list of lists and carries a comment pointing here, so the
+refcount regression test isn't blocked on this bug.
+
 ### BUG-CODEGEN-OWNED-TEMP-OVER-INCREF. Owned expression temps leak a refcount; being migrated to Model 2 (borrowed-at-boundary). Stage 1 (str-concat) + Stage 3.1 (str/repr/hex/oct/bin/chr builtins + scalar f-string interpolants) done — 2026-07-24/25 (partially fixed)
 
 **What:** `_store_variable` (codegen.py:~21434) increfs the stored value unless
@@ -282,6 +499,11 @@ str-concat producers converted.
   `str/repr/hex/oct/bin/chr`, `str(float)`, scalar+str f-string interpolation, and
   str-var reuse after interpolation (no UAF) are all **leak-free with no
   UAF/double-free**, outputs match CPython; differential suite **314 passed**.
+  **Correction (2026-07-26): this verification was written entirely at module
+  scope**, which takes the early-return global path in `_store_variable` and
+  therefore emits neither incref nor decref. The same stores *inside a function*
+  hit the bare-ABI/native store paths, which retain nothing while the boundary
+  flush still releases → use-after-free. See **BUG-BARE-ABI-STORE-NO-RETAIN**.
 
 **Stage 3.3 — format-spec + json.dumps + bytes concat/repeat — DONE (2026-07-26):**
 - **str.format()/f-string `{:spec}` format-spec results registered** (codegen.py):

@@ -32,6 +32,50 @@ The two codegen/link entry points live in `compiler/toolchain.py`:
   executable. Windows uses MSVC `link.exe` (via vcvars); POSIX uses `cc`.
 - **`compile_and_link(...)`** — the full IR→exe convenience wrapper.
 
+### Refcounting in codegen: the Model-2 owned-temp rule
+
+Heap values (strings, lists, dicts, objects) are reference counted. Codegen uses
+the **Model-2 "borrowed-at-boundary"** discipline: a producer that hands back a
+freshly-allocated `+1` value *registers* it as an **owned temp**
+(`_register_owned_temp`), every consumer that wants to keep it **increfs to
+retain**, and the registered `+1` is released by a **watermark flush**
+(`_flush_rc_temps_to(mark)`) at the next statement/expression boundary. Mis-
+classifying an owned value as borrowed only leaks; classifying a borrowed value
+as owned is a use-after-free — so *retain* is always the safe direction.
+
+Three structural rules follow, and all have been the source of real bugs:
+
+- **A temp must be released in a block that its definition dominates.** An owned
+  temp created inside one arm of a conditional *expression* — an if-expression
+  branch, an `and`/`or` short-circuit operand — lives in that arm's own basic
+  block, but the enclosing statement flushes in the **merge** block, which the
+  arm does not dominate. Emitting the release there is invalid IR. Such arms must
+  call `_capture_arm_rc_temps(mark)` while the builder is still inside the arm,
+  and `_rejoin_arm_rc_temps(arms)` at the top of the merge block, which rebuilds
+  each temp as a (tag, data) phi pair that is `0` on every other incoming edge —
+  `fpy_rc_decref` no-ops on `data == 0`, so exactly the arm that ran is released.
+  This moves the release site only; the `+1` itself is untouched.
+- **A loop body must release its own temps before the back-edge.** The same
+  dominance failure appears in comprehensions — a temp allocated in the body is
+  invisible to the block where the enclosing statement flushes, after the loop.
+  Here the phi rebuild would be *wrong*: the body runs N times, so releasing one
+  merged value would leak N-1 iterations. The rule is a **per-iteration flush**
+  (`_flush_rc_temps_to(mark)` with `mark` taken at the top of the body, emitted
+  immediately before the branch to the incr block). It is only correct because
+  every container store retains — `fpy_list_append` and `fastpy_dict_set_fv`
+  incref what they store — so the container's reference outlives the body's. When
+  a filter forks the body into keep/skip arms that both reach the incr block,
+  `_release_rc_temps_since(mark)` emits the release on the skip arm *without*
+  consuming the pending list, so each mutually exclusive path releases once.
+- **Every store path must retain, or the flush frees a live variable.** The FV
+  local path decrefs the slot's old contents and increfs the new value unless the
+  caller passes `steal=True`. The bare-ABI and `_native_vars` store paths in
+  `_store_variable` currently do neither, which makes `s = str(7)` inside a
+  function a use-after-free (see `known-issues.md`,
+  **BUG-BARE-ABI-STORE-NO-RETAIN**). Module scope escapes it only because
+  module-level names take an early-return global path with no refcount traffic
+  at all.
+
 ## Runtime
 
 `runtime/` holds the C runtime linked into every fastpy binary:

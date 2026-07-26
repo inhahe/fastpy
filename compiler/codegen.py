@@ -25901,6 +25901,73 @@ class CodeGen:
         helper retained for callers that want a full flush."""
         self._flush_rc_temps_to(0)
 
+    def _release_rc_temps_since(self, mark: int) -> None:
+        """Emit `rc_decref` for every temp registered since `mark` WITHOUT
+        popping them from the pending list.
+
+        For a fork into mutually exclusive paths (a comprehension filter's
+        skip-vs-keep arms): the temps created before the fork must be released
+        on *whichever* path runs, so each path emits its own release and the
+        pending list stays intact for the sibling. The definitions dominate
+        both arms — the fork's block is their only predecessor — so this is
+        valid IR. See BUG-DECREF-DOES-NOT-DOMINATE."""
+        if not self._USE_REFCOUNT:
+            return
+        if len(self._rc_temps) <= mark:
+            return
+        if (self.builder is None or self.builder.block is None
+                or self.builder.block.is_terminated):
+            return
+        for tag_val, data_val in self._rc_temps[mark:]:
+            self.builder.call(self.runtime["rc_decref"], [tag_val, data_val])
+
+    def _capture_arm_rc_temps(self, mark: int) -> list:
+        """Pop and return every owned temp registered since `mark`.
+
+        A conditional *expression* arm (an if-expression branch, an `and`/`or`
+        short-circuit tail) is emitted into its own basic block, but the
+        enclosing statement's flush happens later, in the merge block — which
+        the arm does NOT dominate.  Emitting the arm's `rc_decref` there is
+        invalid IR ("Instruction does not dominate all uses"), so the arm's
+        temps are lifted out of the pending list here and re-registered in the
+        merge block by _rejoin_arm_rc_temps().  Call this while the builder is
+        still positioned in the arm.  See BUG-DECREF-DOES-NOT-DOMINATE."""
+        if not self._USE_REFCOUNT:
+            return []
+        temps = self._rc_temps[mark:]
+        del self._rc_temps[mark:]
+        return temps
+
+    def _rejoin_arm_rc_temps(self, arms: list) -> None:
+        """Re-register conditional-arm owned temps in the current merge block.
+
+        `arms` is a list of (pred_block, temps) pairs: the block that branched
+        into the merge point, and the temps captured from it by
+        _capture_arm_rc_temps().  Each temp is rebuilt as a pair of phis whose
+        incoming value from every *other* predecessor is 0.  fpy_rc_decref
+        treats data == 0 as a no-op, so the merged temp releases exactly the
+        arm that actually executed, and the release is now emitted on a value
+        that dominates its use.  The +1 itself is untouched — Model-2 semantics
+        are preserved, the release is merely relocated to the merge point.
+
+        Must be called with the builder at the TOP of the merge block, before
+        any non-phi instruction is emitted there."""
+        if not self._USE_REFCOUNT:
+            return
+        if not any(temps for _blk, temps in arms):
+            return
+        zero32 = ir.Constant(i32, 0)
+        zero64 = ir.Constant(i64, 0)
+        for owner, temps in arms:
+            for tag_val, data_val in temps:
+                tag_phi = self.builder.phi(i32, "rc.arm.tag")
+                data_phi = self.builder.phi(i64, "rc.arm.data")
+                for blk, _t in arms:
+                    own = blk is owner
+                    tag_phi.add_incoming(tag_val if own else zero32, blk)
+                    data_phi.add_incoming(data_val if own else zero64, blk)
+                self._register_owned_temp(tag_phi, data_phi)
+
     def _emit_scope_decref(self, exclude_var: str | None = None) -> None:
         """Emit decref for all FV-local variables in the current scope.
         Called before every function exit (return/implicit return).
@@ -28404,7 +28471,14 @@ class CodeGen:
         result_alloca = self._create_entry_alloca(result_type, "and.result")
         merge_block = self._new_block("and.end")
 
+        # Each operand is emitted into its own block, and every one of those
+        # blocks is a predecessor of the merge. Owned temps created by an
+        # operand must therefore be released at the merge, not left pending for
+        # the enclosing statement's flush — which would decref a value its own
+        # block doesn't dominate. See BUG-DECREF-DOES-NOT-DOMINATE.
+        _arms: list[tuple] = []
         for i, val_node in enumerate(values):
+            _arm_mark = len(self._rc_temps)
             val = self._emit_expr_value(val_node)
             if i < len(values) - 1:
                 # Test truthiness BEFORE coercion so the original type
@@ -28415,6 +28489,8 @@ class CodeGen:
                 truthy = self._value_truthiness(val, is_list=is_list)
             coerced = self._coerce_to_type(val, result_type)
             self.builder.store(coerced, result_alloca)
+            _arms.append((self.builder.block,
+                          self._capture_arm_rc_temps(_arm_mark)))
             if i < len(values) - 1:
                 next_block = self._new_block("and.next")
                 # If truthy, continue; else short-circuit with current value
@@ -28424,6 +28500,7 @@ class CodeGen:
                 self.builder.branch(merge_block)
 
         self.builder.position_at_end(merge_block)
+        self._rejoin_arm_rc_temps(_arms)
         return self.builder.load(result_alloca)
 
     def _emit_short_circuit_or(self, values: list[ast.expr]) -> ir.Value:
@@ -28435,7 +28512,10 @@ class CodeGen:
         result_alloca = self._create_entry_alloca(result_type, "or.result")
         merge_block = self._new_block("or.end")
 
+        # Per-operand owned-temp capture — see _emit_short_circuit_and.
+        _arms: list[tuple] = []
         for i, val_node in enumerate(values):
+            _arm_mark = len(self._rc_temps)
             val = self._emit_expr_value(val_node)
             if i < len(values) - 1:
                 # Test truthiness BEFORE coercion (see _emit_short_circuit_and).
@@ -28443,6 +28523,8 @@ class CodeGen:
                 truthy = self._value_truthiness(val, is_list=is_list)
             coerced = self._coerce_to_type(val, result_type)
             self.builder.store(coerced, result_alloca)
+            _arms.append((self.builder.block,
+                          self._capture_arm_rc_temps(_arm_mark)))
             if i < len(values) - 1:
                 next_block = self._new_block("or.next")
                 # If truthy, short-circuit; else continue
@@ -28452,6 +28534,7 @@ class CodeGen:
                 self.builder.branch(merge_block)
 
         self.builder.position_at_end(merge_block)
+        self._rejoin_arm_rc_temps(_arms)
         return self.builder.load(result_alloca)
 
     def _common_boolop_type(self, values: list[ast.expr]) -> ir.Type:
@@ -45601,17 +45684,31 @@ class CodeGen:
         return result_list
 
     def _emit_lc_body(self, gen, node, result_list, incr_block):
-        """Emit the body of a list comprehension (conditions + append)."""
+        """Emit the body of a list comprehension (conditions + append).
+
+        Owned temps created by the filter conditions or by the element
+        expression live in *this iteration's* blocks. They must be released
+        before the back-edge, not left pending for the enclosing statement's
+        flush: that flush runs after the loop, in a block the body does not
+        dominate ("Instruction does not dominate all uses"), and even if it
+        did it would release only the final iteration's value and leak the
+        rest. `fpy_list_append` increfs, so the list keeps its own reference
+        and the per-iteration release is correct. See
+        BUG-DECREF-DOES-NOT-DOMINATE.
+        """
+        _mark = len(self._rc_temps)
         for if_clause in gen.ifs:
             cond = self._emit_condition(if_clause)
             skip_block = self._new_block("lc.skip")
             append_block = self._new_block("lc.append")
             self.builder.cbranch(cond, append_block, skip_block)
             self.builder.position_at_end(skip_block)
+            self._release_rc_temps_since(_mark)
             self.builder.branch(incr_block)
             self.builder.position_at_end(append_block)
 
         self._emit_list_append_expr(result_list, node.elt)
+        self._flush_rc_temps_to(_mark)
         self.builder.branch(incr_block)
 
     def _emit_list_comp_tuple_unpack(self, node: ast.ListComp,
@@ -45734,6 +45831,12 @@ class CodeGen:
                              else ValueType.from_old_tag("int"))
                 self._fv_store_from_list(var, iter_val, idx, _mlc_elem)
 
+            # Owned temps made by this iteration's conditions, inner iterable
+            # or element expression are released before the back-edge — a
+            # post-loop flush would neither dominate them nor cover more than
+            # the last iteration. See BUG-DECREF-DOES-NOT-DOMINATE.
+            _mark = len(self._rc_temps)
+
             # Apply 'if' conditions for this generator
             if gen.ifs:
                 for cond_node in gen.ifs:
@@ -45741,7 +45844,11 @@ class CodeGen:
                     if isinstance(cond_val.type, ir.IntType) and cond_val.type.width > 1:
                         cond_val = self.builder.icmp_signed("!=", cond_val, ir.Constant(cond_val.type, 0))
                     pass_b = self._new_block(f"{lbl}.pass")
-                    self.builder.cbranch(cond_val, pass_b, incr_b)
+                    skip_b = self._new_block(f"{lbl}.skip")
+                    self.builder.cbranch(cond_val, pass_b, skip_b)
+                    self.builder.position_at_end(skip_b)
+                    self._release_rc_temps_since(_mark)
+                    self.builder.branch(incr_b)
                     self.builder.position_at_end(pass_b)
 
             if gen_idx + 1 < len(node.generators):
@@ -45751,6 +45858,7 @@ class CodeGen:
                 # Innermost: append the element expression
                 self._emit_list_append_expr(result_list, node.elt)
 
+            self._flush_rc_temps_to(_mark)
             if not self.builder.block.is_terminated:
                 self.builder.branch(incr_b)
 
@@ -45816,6 +45924,12 @@ class CodeGen:
             self.builder.cbranch(self.builder.icmp_signed("<", idx0, outer_len), outer_body, outer_end)
 
         self.builder.position_at_end(outer_body)
+        # Temps created per outer iteration (notably the *inner* iterable, when
+        # it is a materialised generator) are released at inner_end, before the
+        # outer back-edge: outer_body does not dominate outer_end, so the
+        # enclosing statement's flush could not legally release them there.
+        # See BUG-DECREF-DOES-NOT-DOMINATE.
+        _outer_mark = len(self._rc_temps)
         if not is_range0:
             # Load element from outer list into var0
             idx0 = self._load_variable(idx0_name, node)
@@ -45883,6 +45997,7 @@ class CodeGen:
         self.builder.branch(inner_cond)
 
         self.builder.position_at_end(inner_end)
+        self._flush_rc_temps_to(_outer_mark)
         self.builder.branch(outer_incr)
 
         self.builder.position_at_end(outer_incr)
@@ -46027,12 +46142,17 @@ class CodeGen:
                         self._store_variable(tgt.id, self.builder.load(d2), _var_tag)
             # Handle filter conditions (if clauses)
             incr_block = self._new_block("dc.incr")
+            # Per-iteration release: the dict retains both key and value
+            # (fastpy_dict_set_fv increfs), and a post-loop flush would be
+            # invalid IR. See BUG-DECREF-DOES-NOT-DOMINATE.
+            _mark = len(self._rc_temps)
             for if_clause in gen.ifs:
                 cond_val = self._emit_condition(if_clause)
                 skip_block = self._new_block("dc.skip")
                 add_block = self._new_block("dc.add")
                 self.builder.cbranch(cond_val, add_block, skip_block)
                 self.builder.position_at_end(skip_block)
+                self._release_rc_temps_since(_mark)
                 self.builder.branch(incr_block)
                 self.builder.position_at_end(add_block)
             # Evaluate key and value expressions
@@ -46050,6 +46170,7 @@ class CodeGen:
             else:
                 return self._bridge_fallback_expr(
                     node, "dict comprehension key type")
+            self._flush_rc_temps_to(_mark)
             self.builder.branch(incr_block)
             self.builder.position_at_end(incr_block)
             next_idx = self.builder.add(idx, ir.Constant(i64, 1))
@@ -46128,12 +46249,15 @@ class CodeGen:
             else:
                 self._fv_store_from_list(var_name, list_ptr, idx, var_tag)
             # Handle filter conditions
+            # Per-iteration release — see BUG-DECREF-DOES-NOT-DOMINATE.
+            _mark = len(self._rc_temps)
             for if_clause in gen.ifs:
                 cond_val = self._emit_condition(if_clause)
                 skip_block = self._new_block("dcl.skip")
                 add_block = self._new_block("dcl.add")
                 self.builder.cbranch(cond_val, add_block, skip_block)
                 self.builder.position_at_end(skip_block)
+                self._release_rc_temps_since(_mark)
                 self.builder.branch(incr_block)
                 self.builder.position_at_end(add_block)
             key = self._emit_expr_value(node.key)
@@ -46152,6 +46276,7 @@ class CodeGen:
                                   [dict_ptr,
                                    self._ensure_ptr(key),
                                    ir.Constant(i32, v_tag), v_data])
+            self._flush_rc_temps_to(_mark)
             self.builder.branch(incr_block)
             self.builder.position_at_end(incr_block)
             next_idx = self.builder.add(
@@ -46189,12 +46314,15 @@ class CodeGen:
         self.builder.position_at_end(body_block)
 
         # Handle filter conditions: {k: v for x in range(n) if cond}
+        # Per-iteration release — see BUG-DECREF-DOES-NOT-DOMINATE.
+        _mark = len(self._rc_temps)
         for if_clause in gen.ifs:
             cond_val = self._emit_condition(if_clause)
             skip_block = self._new_block("dc.skip")
             add_block = self._new_block("dc.add")
             self.builder.cbranch(cond_val, add_block, skip_block)
             self.builder.position_at_end(skip_block)
+            self._release_rc_temps_since(_mark)
             self.builder.branch(incr_block)
             self.builder.position_at_end(add_block)
 
@@ -46211,6 +46339,7 @@ class CodeGen:
                                ir.Constant(i32, tag), data])
         else:
             return self._bridge_fallback_expr(node, "dict comprehension key/value types")
+        self._flush_rc_temps_to(_mark)
         self.builder.branch(incr_block)
 
         self.builder.position_at_end(incr_block)
@@ -46288,6 +46417,9 @@ class CodeGen:
                              else ValueType.from_old_tag("int"))
                 self._fv_store_from_list(var, iter_val, idx, _elem_tag)
 
+            # Per-iteration release — see BUG-DECREF-DOES-NOT-DOMINATE.
+            _mark = len(self._rc_temps)
+
             # Apply 'if' conditions for this generator
             if gen.ifs:
                 for cond_node in gen.ifs:
@@ -46298,7 +46430,11 @@ class CodeGen:
                             "!=", cond_val,
                             ir.Constant(cond_val.type, 0))
                     pass_b = self._new_block(f"{lbl}.pass")
-                    self.builder.cbranch(cond_val, pass_b, incr_b)
+                    skip_b = self._new_block(f"{lbl}.skip")
+                    self.builder.cbranch(cond_val, pass_b, skip_b)
+                    self.builder.position_at_end(skip_b)
+                    self._release_rc_temps_since(_mark)
+                    self.builder.branch(incr_b)
                     self.builder.position_at_end(pass_b)
 
             if gen_idx + 1 < len(node.generators):
@@ -46319,6 +46455,7 @@ class CodeGen:
                         [result_dict, key,
                          ir.Constant(i32, tag), data])
 
+            self._flush_rc_temps_to(_mark)
             if not self.builder.block.is_terminated:
                 self.builder.branch(incr_b)
 
@@ -46428,6 +46565,12 @@ class CodeGen:
 
         self.builder.cbranch(cond, then_block, else_block)
 
+        # Owned temps created *inside* an arm live in that arm's block, but the
+        # enclosing statement flushes in the merge block, which the arm does not
+        # dominate. Capture them per-arm and re-register them as phis at the
+        # merge point. See BUG-DECREF-DOES-NOT-DOMINATE.
+        _arm_mark = len(self._rc_temps)
+
         if needs_fv_output:
             # Return a full FpyValue so the tag (NONE vs other) is preserved.
             # Then branch
@@ -46446,6 +46589,7 @@ class CodeGen:
                 elif isinstance(then_data.type, ir.IntType) and then_data.type.width != 64:
                     then_data = self.builder.zext(then_data, i64)
             then_block_end = self.builder.block
+            then_temps = self._capture_arm_rc_temps(_arm_mark)
             self.builder.branch(merge_block)
 
             # Else branch
@@ -46464,9 +46608,12 @@ class CodeGen:
                 elif isinstance(else_data.type, ir.IntType) and else_data.type.width != 64:
                     else_data = self.builder.zext(else_data, i64)
             else_block_end = self.builder.block
+            else_temps = self._capture_arm_rc_temps(_arm_mark)
             self.builder.branch(merge_block)
 
             self.builder.position_at_end(merge_block)
+            self._rejoin_arm_rc_temps([(then_block_end, then_temps),
+                                       (else_block_end, else_temps)])
             phi_tag = self.builder.phi(i32, "ifexp.tag")
             phi_tag.add_incoming(then_tag_ir, then_block_end)
             phi_tag.add_incoming(else_tag_ir, else_block_end)
@@ -46481,6 +46628,7 @@ class CodeGen:
         if isinstance(then_val.type, ir.LiteralStructType) and then_val.type == fpy_val:
             then_val = self.builder.extract_value(then_val, 1)
         then_block_end = self.builder.block
+        then_temps = self._capture_arm_rc_temps(_arm_mark)
         self.builder.branch(merge_block)
 
         # Else branch
@@ -46534,9 +46682,12 @@ class CodeGen:
                 else_val = self.builder.zext(else_val, i64)
 
         else_block_end = self.builder.block
+        else_temps = self._capture_arm_rc_temps(_arm_mark)
         self.builder.branch(merge_block)
 
         self.builder.position_at_end(merge_block)
+        self._rejoin_arm_rc_temps([(then_block_end, then_temps),
+                                   (else_block_end, else_temps)])
         phi = self.builder.phi(then_val.type)
         phi.add_incoming(then_val, then_block_end)
         phi.add_incoming(else_val, else_block_end)
