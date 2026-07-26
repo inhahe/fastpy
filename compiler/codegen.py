@@ -32423,7 +32423,42 @@ class CodeGen:
                 and isinstance(node.op, ast.Div)
                 and self._is_path_expr(node.left)):
             return True
+        # Path classmethod constructors: Path.cwd() yields a Path.
+        if (isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr in self._PATH_CLASSMETHODS
+                and not node.args
+                and self._is_path_class_ref(node.func.value)):
+            return True
         return False
+
+    # pathlib.Path classmethods with a native runtime entry point. These are
+    # called on the CLASS, not on an instance, so they need a separate
+    # dispatch from _is_path_expr's instance-method handling.
+    _PATH_CLASSMETHODS = {"cwd": "path_cwd"}
+
+    def _is_path_class_ref(self, node: ast.expr) -> bool:
+        """True if `node` names the pathlib.Path CLASS itself (not an instance).
+
+        `Path.cwd()` looks like a method call whose receiver is `Path`, but that
+        receiver is a class, not a value. Without this check the generic
+        object-method path evaluates the bare name and hands
+        `fastpy_obj_call_method0` a non-object pointer (observed: 0x1), which is
+        undefined behavior — UBSan flags a misaligned FpyObj access.
+        """
+        if isinstance(node, ast.Name):
+            entry = getattr(self, '_native_imports', {}).get(node.id)
+            if entry and entry[0] == "pathlib" and entry[1] == "Path":
+                # `from pathlib import Path` also binds `Path` as a variable, so
+                # presence in self.variables does not disqualify it. Only a
+                # rebinding to an actual Path *instance* shadows the class.
+                return (node.id not in self.variables
+                        or self._var_kind(node.id) != VKind.PATH)
+            return False
+        # Module-qualified: pathlib.Path.cwd()
+        return (isinstance(node, ast.Attribute) and node.attr == "Path"
+                and isinstance(node.value, ast.Name)
+                and node.value.id == "pathlib")
 
     def _is_list_expr(self, node: ast.expr) -> bool:
         """Check if an AST expression evaluates to a list."""
@@ -40804,6 +40839,13 @@ class CodeGen:
         """Emit pathlib.Path method calls. Always returns."""
         attr = node.func
         method = node.func.attr
+        # Classmethod constructors (Path.cwd()) take no receiver: the "object"
+        # is the Path class itself, so evaluating it would yield a non-object
+        # pointer. Emit the zero-argument runtime entry point directly.
+        if (method in self._PATH_CLASSMETHODS and not node.args
+                and self._is_path_class_ref(attr.value)):
+            return self.builder.call(
+                self.runtime[self._PATH_CLASSMETHODS[method]], [])
         obj = self._emit_expr_value(attr.value)
         obj = self._ensure_ptr(obj)
         # Attribute access (properties): .name, .parent, .suffix, .stem
@@ -43287,6 +43329,14 @@ class CodeGen:
                 return self.builder.call(func, coerced)
         # --- pathlib.Path method calls ---
         if self._is_path_expr(attr.value):
+            return self._emit_method_call_path(node)
+        # Natively-supported Path CLASSmethods (Path.cwd()). The receiver is the
+        # class, not an instance, so the generic object-method path below would
+        # evaluate it to a non-object pointer and invoke UB; route it here
+        # instead. Unrecognized Path classmethods deliberately fall through to
+        # the existing behavior rather than being silently mistranslated.
+        if (attr.attr in self._PATH_CLASSMETHODS and not node.args
+                and self._is_path_class_ref(attr.value)):
             return self._emit_method_call_path(node)
 
         # --- pyobj method calls ---
