@@ -42,14 +42,9 @@ done this; the bare-ABI path was the hole.
 
 Note this is *not* the `len()` dispatch being wrong. `_emit_builtin_len` already
 falls back to `fastpy_fv_len`, which switches on the tag. The crash was in the
-assignment, which is why the module-level cases below only print the value:
-`len()` on a *module-level* mixed-kind variable is a separate, still-open bug
-(BUG-MODULE-DOCSTRING-UNBOXES-GLOBAL — a module docstring is a module-level
-string constant, which disables bare-ABI for module code, which routes the load
-through `_unwrap_fv_for_tag`, which unboxes to a bare pointer using the static
-LIST tag and drops the runtime one). It bites this file because every regression
-test has a docstring. Inside a function the same expression is fine, so the
-`len()` coverage lives there.
+assignment. `len()` on a *module-level* mixed-kind variable was separately
+broken while this test was written (BUG-MODULE-DOCSTRING-UNBOXES-GLOBAL, since
+fixed); `mixed_return_tag.py` covers that side.
 """
 
 
@@ -68,16 +63,15 @@ def pick3(n):
 
 
 # ── Module scope: where the original crash landed ──
-# The retain happens on the assignment, so binding is enough to reproduce; the
-# crash was before any of these printed.  See the docstring on why `len()` is
-# exercised inside functions rather than here.
+# The retain happens on the assignment, so binding alone is enough to
+# reproduce; the crash was before any of these printed.
 
 r = pick(True)
-print(r)
+print(r, len(r))
 s = pick(False)
-print(s)
+print(s, len(s))
 t = pick3(1)
-print(t)
+print(t, len(t))
 
 
 # ── Function scope, and rebinding one slot across kinds ──

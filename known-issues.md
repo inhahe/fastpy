@@ -8,7 +8,83 @@ how to reproduce it, and what the proper fix looks like.
 
 ## Active Bugs
 
-### BUG-MODULE-DOCSTRING-UNBOXES-GLOBAL. `_load_variable` unboxes an FpyValue local using its (wrong) static tag, so a mixed-kind module-level value loses its runtime tag — 2026-07-26
+### BUG-DIRECT-CALL-LEN-STATIC-TAG. `len(f(x))` ignores the callee's `mixed` return tag; only `v = f(x); len(v)` is correct — 2026-07-26
+
+**What:** with BUG-MODULE-DOCSTRING-UNBOXES-GLOBAL fixed, a mixed-kind return
+bound to a variable is tagged `mixed` and `len()` dispatches on the runtime tag.
+Calling it *inline* still takes a static path and prints garbage.
+
+**Reproduce** — should print `2 2`:
+```python
+"""Doc."""
+
+def str_or_dict(f):
+    if f:
+        return "xy"
+    return {"a": 1, "b": 2}
+
+print(len(str_or_dict(True)), len(str_or_dict(False)))   # 9223372033957843523 2
+v = str_or_dict(True)
+print(len(v))                                            # 2 — correct
+```
+
+**Where:** the fix for the variable case lands in
+`_assign_fv_fast_path` (~17170), which reads `_func_ret_types` when *storing*
+to a name. The call-expression path used by `len(<call>)` never consults it, so
+it still uses the coarse `info.ret_tag` from the declaration pass. Both `len()`
+arms of a mixed function are affected, not just the "wrong" one — the first
+call above is wrong for `True` and right for `False` purely by which kind the
+guess happened to land on.
+
+**Proper fix:** route the call-expression result through the same
+`_func_ret_types` consultation that `_assign_fv_fast_path` does, so a `mixed`
+callee yields an FVALUE-typed expression rather than a bare pointer. Ideally
+factor the tag choice out of `_assign_fv_fast_path` into one helper both call
+sites use, since having two places decide a callee's result type is what let
+them drift apart.
+
+**Not a regression:** identical garbage at the parent commit — verified by
+stashing the fix and re-running. The `mixed` work neither caused nor fixed it.
+
+**Where it bites:** `tests/regressions/mixed_return_tag.py` binds every mixed
+call to a name before measuring it, for this reason.
+
+### BUG-MIXED-SCALAR-RETURN-TAG. A function returning an int on one branch and a float on another prints the float's bit pattern — 2026-07-26
+
+**What:** mixed *scalar* returns are not reconciled at all; the float comes back
+reinterpreted as an i64.
+
+**Reproduce** — should print `1 2.5`:
+```python
+"""Doc."""
+
+def int_or_float(f):
+    if f:
+        return 1
+    return 2.5
+
+print(int_or_float(True), int_or_float(False))   # 1 4612811918334230528
+```
+`4612811918334230528` is the IEEE-754 bit pattern of `2.5`. Binding to a
+variable does not help; inside a function it degrades differently
+(`5e-324 2.5` — the int reinterpreted as a double), which is the same confusion
+in the other direction.
+
+**Where:** the LLVM return type is one of i64 / double, chosen once per
+function, and there is no branch-sensitive reconciliation. `_csa_returns_disagree`
+(added for BUG-MODULE-DOCSTRING-UNBOXES-GLOBAL) deliberately does **not** cover
+this: it is scoped to pointer kinds because scalar returns are settled by that
+separate i64-vs-double mechanism, and forcing them to `"mixed"` would change
+the ABI of a great many functions.
+
+**Proper fix:** a function whose returns mix INT and FLOAT has to return an
+FpyValue (`uses_fv_abi`) rather than a bare scalar, so the tag travels with the
+value. That is an ABI change for the affected functions, hence out of scope for
+the pointer-kind fix.
+
+**Not a regression:** identical output at the parent commit.
+
+### ~~BUG-MODULE-DOCSTRING-UNBOXES-GLOBAL. `_load_variable` unboxes an FpyValue local using its (wrong) static tag, so a mixed-kind module-level value loses its runtime tag~~ — FIXED 2026-07-26
 
 **What:** a module-level variable holding a value whose kind is only known at
 runtime is loaded as a bare `i8*` typed LIST, so `len()` takes the static
@@ -107,6 +183,18 @@ everywhere, and INT/FLOAT returns are decided by a separate scalar mechanism
 disagreeing pointer kinds fixes the actual breakage with minimal blast radius.
 An unclassifiable return must count as *no* constraint, never as disagreement —
 otherwise every `return helper()` would go MIXED.
+
+**Fixed as described**, via `_csa_literal_ptr_kind` / `_csa_returns_disagree`
+and a post-pass at the end of `_csa_propagate_ret_types`'s per-function loop.
+No consumer change was needed. Regression test:
+`tests/regressions/mixed_return_tag.py`, which covers every pointer-kind
+pairing at both module and function scope, both exclusions, uniform-kind
+functions, rebinding one slot across kinds, and a 30-iteration loop.
+
+Two adjacent bugs surfaced while testing this and are **not** covered by the
+fix — both verified pre-existing at the parent commit: `len(f(x))` without an
+intermediate variable (BUG-DIRECT-CALL-LEN-STATIC-TAG) and mixed int/float
+returns (BUG-MIXED-SCALAR-RETURN-TAG).
 
 Note the `"ptr"` tag is separately overloaded — it means both "definitely
 list/tuple" (annotations at ~10408/~10414) and "a pointer, kind unknown"

@@ -6601,6 +6601,64 @@ class CodeGen:
     # _analyze_call_sites helper methods (D2 extraction)
     # ------------------------------------------------------------------
 
+    # Return expressions whose *pointer* kind is readable straight off the
+    # AST.  Used only to detect returns that disagree with each other — see
+    # _csa_returns_disagree — so it is deliberately narrow: anything not
+    # listed here reads as "no constraint", never as disagreement.
+    _CSA_LITERAL_PTR_KIND: dict[type, str] = {
+        ast.List: "list", ast.ListComp: "list",
+        ast.Dict: "dict", ast.DictComp: "dict",
+        ast.Set: "set", ast.SetComp: "set",
+        ast.Tuple: "tuple",
+        ast.JoinedStr: "str",
+    }
+
+    @classmethod
+    def _csa_literal_ptr_kind(cls, expr: ast.expr) -> 'str | None':
+        """The pointer kind of *expr* when it is evident from the AST alone.
+
+        Returns None for anything else — a name, a call, a binop, a scalar,
+        or `None`.  None means "this return tells us nothing", which is the
+        only safe reading: treating an unclassifiable return as a *conflict*
+        would send every `return helper()` to MIXED.
+        """
+        k = cls._CSA_LITERAL_PTR_KIND.get(type(expr))
+        if k is not None:
+            return k
+        if isinstance(expr, ast.Constant):
+            if isinstance(expr.value, str):
+                return "str"
+            if isinstance(expr.value, bytes):
+                return "bytes"
+        return None
+
+    @classmethod
+    def _csa_returns_disagree(cls, fnode: ast.AST) -> bool:
+        """True when *fnode*'s returns commit to more than one pointer kind.
+
+        Such a function cannot be described by any single static tag: the
+        kind depends on which branch runs.  The per-return loop below picks
+        the last return it can classify and silently drops the rest, so
+        `def pick(f): return "abcd" if f else [1,2,3]` is typed `list` and
+        every static list fast path then fires on a string.
+
+        Scoped to pointer kinds on purpose.  `return None` beside
+        `return [...]` is ubiquitous and already tolerated everywhere, and
+        int/float returns are settled by a separate mechanism (the i64 vs
+        double LLVM return type) that "mixed" would disrupt.  Restricting to
+        disagreeing *pointer* kinds fixes the breakage that is real without
+        perturbing either of those.
+        """
+        kinds = set()
+        for n in ast.walk(fnode):
+            if isinstance(n, ast.Return) and n.value is not None:
+                k = cls._csa_literal_ptr_kind(n.value)
+                if k is not None:
+                    kinds.add(k)
+                    if len(kinds) > 1:
+                        return True
+        return False
+
     def _csa_propagate_ret_types(
         self, tree: ast.Module,
         func_asts: dict[str, ast.FunctionDef],
@@ -6964,6 +7022,15 @@ class CodeGen:
                         # return func() — propagate callee's return type
                         elif n.value.func.id in _func_ret_types:
                             _func_ret_types[fname] = _func_ret_types[n.value.func.id]
+
+            # The loop above is last-classifiable-return-wins, which is a lie
+            # for a function whose returns commit to different pointer kinds.
+            # Say so instead: "mixed" -> VKind.MIXED, which _unwrap_fv_for_tag
+            # already passes through as a whole FpyValue so the runtime tag
+            # survives the load.  BUG-MODULE-DOCSTRING-UNBOXES-GLOBAL.
+            if self._csa_returns_disagree(fnode):
+                _func_ret_types[fname] = "mixed"
+
         # Propagate return types back to module-level var_types
         for node in ast.walk(tree):
             if (isinstance(node, ast.Assign) and len(node.targets) == 1

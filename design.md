@@ -158,14 +158,39 @@ The two paths are **not** interchangeable, and the difference is tag fidelity:
   a value whose kind is only known at runtime survives, *by accident*.
 - The FpyValue path calls `_unwrap_fv_for_tag(fv, type_tag)`, which for any
   pointer kind returns `_fv_as_ptr(fv)` and **discards the runtime tag** in
-  favour of the compiler's static one. When the static kind is a guess (a
-  callee returning a str on one branch and a list on another) everything
-  downstream sees the wrong kind. See BUG-MODULE-DOCSTRING-UNBOXES-GLOBAL.
+  favour of the compiler's static one.
 
-The general rule: **a static kind is only safe to act on when it is a fact, not
-an inference.** `VKind.MIXED` exists to say "runtime dispatch needed"; a
-producer that cannot commit to one kind should use it rather than picking a
-plausible one.
+So a wrong static tag is invisible on the bare-ABI path and fatal on the
+FpyValue one. The general rule that follows: **a static kind is only safe to
+act on when it is a fact, not an inference.** `VKind.MIXED` exists to say
+"runtime dispatch needed", and `_unwrap_fv_for_tag` passes MIXED (and FVALUE)
+through as a whole FpyValue rather than unboxing it — so a producer that cannot
+commit to one kind must say `mixed` rather than pick a plausible kind.
+
+`_csa_propagate_ret_types` is the cautionary example. Its per-function loop
+walks every `ast.Return` and *overwrites* the recorded return type each time,
+so it is last-classifiable-return-wins — a function returning a str on one
+branch and a list on another was typed `list`, and the str return, which
+matched no arm of the chain, lost silently. `_csa_returns_disagree` now runs
+after that loop and records `"mixed"` when the returns commit to more than one
+**pointer** kind.
+
+Two limits on that check are deliberate and load-bearing:
+
+- **An unclassifiable return is no constraint, not a conflict.** Only kinds
+  readable straight off the AST count (literals, comprehensions, f-strings).
+  If `return helper()` counted as a distinct kind, nearly every function would
+  go MIXED and lose its static paths.
+- **Scalars and `None` are out of scope.** `return None` beside `return [...]`
+  is ubiquitous and already tolerated everywhere; int-vs-float returns are
+  settled by a different mechanism (the i64-vs-double LLVM return type), and
+  forcing those to MIXED would change the ABI of many functions. Mixed scalar
+  returns are consequently still broken — see BUG-MIXED-SCALAR-RETURN-TAG.
+
+Note the tag is consulted when *storing* to a name (`_assign_fv_fast_path`),
+not when emitting a bare call expression, so `v = f(x); len(v)` is correct
+while `len(f(x))` is not — BUG-DIRECT-CALL-LEN-STATIC-TAG. Having two places
+decide a callee's result type is what let them drift apart.
 
 ## Runtime
 
