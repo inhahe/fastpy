@@ -177,11 +177,38 @@ A *static* return tag is not an alternative here. `FuncInfo.ret_tag` stays
 returned `{i32, i64}` struct, which only a direct call can see — and a function
 may return different kinds on different branches regardless.
 
-**Callee lookup must be scope-first.** A nested `def` with no free variables is
-hoisted to module scope and registered in `_user_functions` under its **bare**
-name, so two sibling nested defs sharing a name collide. Resolve
-`f"{_current_func_name}.{name}"` before `name` (`_recover_closure_ret_tag` does;
-most other call-site lookups still do not — see BUG-NESTED-DEF-NAME-COLLISION).
+**Function names are made unique before analysis, because the analysis maps are
+flat.** Nearly every map the compiler builds about a function —
+`_csa_func_asts`, `_func_ret_types`, `_call_site_param_types`, `_monomorphized`,
+`_user_functions`, `_function_def_nodes` — is keyed by the function's **bare**
+name, and `_csa_func_asts` is populated with a `setdefault` over `ast.walk`, so
+the first `def` with a given name wins module-wide. Two sibling nested
+`def build(...)`s in different enclosing functions therefore shared one analysis:
+its return type, its call-site parameter types, its string-param detection
+(BUG-NESTED-DEF-NAME-COLLISION).
+
+`_uniquify_nested_def_names(tree)` runs as the **first** statement of
+`generate()`, ahead of `_gen_prescan` and so ahead of every one of those maps. It
+alpha-renames a nested `def` whose bare name is used by another `def` anywhere in
+the module to `name__nK` and rewrites references throughout the owner scope. The
+alternative — re-keying every map by scope — would have meant auditing dozens of
+lookup sites and would have left the flat ones as latent traps.
+
+The pass is conservative by design and keeps the original name whenever renaming
+would be unsafe: a `global`/`nonlocal` names it, the owner scope rebinds it
+(another def, an assignment, a parameter, an import), or the def is module-level
+or a class method — those names are externally visible. `_rewrite` also stops
+descending into a nested scope that shadows the name with a parameter of its own.
+Two defs of the same name in *one* scope are declined too; resolving a use there
+needs flow analysis (BUG-SAME-SCOPE-DEF-REBIND).
+
+**Callee lookup is scope-first regardless.** A nested `def` with no free
+variables is hoisted to module scope and registered in `_user_functions` under
+its bare name, while a capturing one is registered as `outer.inner`.
+`_lookup_user_function(name)` tries `f"{_current_func_name}.{name}"` before
+`name` and returns the key it hit, so callers can index `_function_def_nodes`
+consistently. That is what Python scoping says anyway, and it covers the cases
+the renaming pass declines.
 
 ## Targets (codegen backends)
 

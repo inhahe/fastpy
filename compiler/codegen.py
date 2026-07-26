@@ -4073,11 +4073,133 @@ class CodeGen:
                            "module-level code as simple scalar arithmetic",
             )
 
+    def _uniquify_nested_def_names(self, tree: ast.Module) -> None:
+        """Alpha-rename nested `def`s whose bare name is used by another `def`.
+
+        Nearly every analysis map in this compiler is keyed by a function's
+        **bare** name — `_csa_func_asts`, `_func_ret_types`,
+        `_call_site_param_types`, `_monomorphized`, `_user_functions` — and
+        `_csa_func_asts` is built with a flat `setdefault(node.name, node)` over
+        `ast.walk`, so the *first* `def build(...)` in the file wins and every
+        other `build` silently inherits its analysis. That mistyped a
+        dict-returning nested `build` as a list, compiling `d["x"]` into a list
+        index (BUG-NESTED-DEF-NAME-COLLISION).
+
+        Re-keying all of those maps by scope would touch dozens of lookup sites
+        and leave the flat ones as latent traps. Uniquifying the names once, up
+        front, fixes every consumer by construction — the standard
+        alpha-renaming a compiler does before a flat-namespace analysis.
+
+        Deliberately conservative. Only *nested* defs are renamed (module-level
+        names are externally visible and class methods live in their own
+        namespace), and a name is left alone if anything makes the rewrite
+        unsafe: a `global`/`nonlocal` declaring it, or an assignment rebinding
+        it in the owner scope. Leaving a collision unrenamed reproduces the old
+        behaviour; renaming something we shouldn't would be a new bug.
+        """
+        FUNC = (ast.FunctionDef, ast.AsyncFunctionDef)
+        parents: dict[ast.AST, ast.AST] = {}
+        for _n in ast.walk(tree):
+            for _c in ast.iter_child_nodes(_n):
+                parents[_c] = _n
+
+        counts: dict[str, int] = {}
+        for _n in ast.walk(tree):
+            if isinstance(_n, FUNC):
+                counts[_n.name] = counts.get(_n.name, 0) + 1
+        if not any(c > 1 for c in counts.values()):
+            return
+
+        unsafe: set[str] = set()
+        for _n in ast.walk(tree):
+            if isinstance(_n, (ast.Global, ast.Nonlocal)):
+                unsafe.update(_n.names)
+
+        taken = set(counts)
+        for _n in ast.walk(tree):
+            if isinstance(_n, ast.Name):
+                taken.add(_n.id)
+            elif isinstance(_n, ast.ClassDef):
+                taken.add(_n.name)
+
+        def _owner_scope(node):
+            """Nearest enclosing `def`, or None. None also for methods — a
+            `ClassDef` between the def and its owner means it is a method."""
+            cur = parents.get(node)
+            while cur is not None:
+                if isinstance(cur, ast.ClassDef):
+                    return None
+                if isinstance(cur, FUNC):
+                    return cur
+                cur = parents.get(cur)
+            return None
+
+        def _rebound_elsewhere(scope, name, target):
+            """True if `name` is bound in `scope` by anything other than
+            `target` — another def, an assignment, a parameter, an import."""
+            for _n in ast.walk(scope):
+                if _n is target:
+                    continue
+                if isinstance(_n, FUNC) and _n.name == name and _n is not scope:
+                    return True
+                if isinstance(_n, ast.Name) and isinstance(_n.ctx, ast.Store):
+                    if _n.id == name:
+                        return True
+                if isinstance(_n, ast.arg) and _n.arg == name:
+                    return True
+                if isinstance(_n, (ast.Import, ast.ImportFrom)):
+                    for _a in _n.names:
+                        if (_a.asname or _a.name.split(".")[0]) == name:
+                            return True
+            return False
+
+        def _rewrite(node, old, new, target):
+            """Rename `old` → `new` throughout `node`, without descending into
+            a nested scope that shadows `old` with a parameter of its own."""
+            if isinstance(node, ast.Name) and node.id == old:
+                node.id = new
+                return
+            if isinstance(node, FUNC):
+                if node is target:
+                    node.name = new
+                elif any(a.arg == old
+                         for a in (node.args.posonlyargs + node.args.args
+                                   + node.args.kwonlyargs)):
+                    return  # parameter shadows the name in this scope
+            elif isinstance(node, ast.Lambda):
+                if any(a.arg == old
+                       for a in (node.args.posonlyargs + node.args.args
+                                 + node.args.kwonlyargs)):
+                    return
+            for child in ast.iter_child_nodes(node):
+                _rewrite(child, old, new, target)
+
+        counter = 0
+        for node in list(ast.walk(tree)):
+            if not isinstance(node, FUNC):
+                continue
+            if counts.get(node.name, 0) < 2 or node.name in unsafe:
+                continue
+            scope = _owner_scope(node)
+            if scope is None:
+                continue  # module-level def or class method — leave the name
+            if _rebound_elsewhere(scope, node.name, node):
+                continue
+            old = node.name
+            counter += 1
+            new = f"{old}__n{counter}"
+            while new in taken:
+                counter += 1
+                new = f"{old}__n{counter}"
+            taken.add(new)
+            _rewrite(scope, old, new, node)
+
     def generate(self, tree: ast.Module) -> str:
         """Generate LLVM IR from a Python AST. Returns IR as string."""
         import os as _os
         if _os.environ.get("FASTPY_COERCION_DEBUG"):
             _SafeIRBuilder.enable_coercion_debug()
+        self._uniquify_nested_def_names(tree)
         self._gen_prescan(tree)
 
         # Pass 1: forward-declare all user functions and class methods
@@ -19674,9 +19796,11 @@ class CodeGen:
             for full_name in self._closure_info:
                 if full_name.startswith(f"{node.func.id}."):
                     return ValueType(VKind.CLOSURE)
-            # Check if function returns a pointer (tuple, list, or dict)
-            if node.func.id in self._user_functions:
-                info = self._user_functions[node.func.id]
+            # Check if function returns a pointer (tuple, list, or dict).
+            # Scope-first: a nested `def` shadows a same-named sibling that was
+            # hoisted to module scope (BUG-NESTED-DEF-NAME-COLLISION).
+            info, _ = self._lookup_user_function(node.func.id)
+            if info is not None:
                 _rtk = self._tag_kind(info.ret_tag)
                 if _rtk == VKind.DICT:
                     return ValueType(VKind.DICT)
@@ -29441,6 +29565,35 @@ class CodeGen:
             # Non-FV mode: return the object pointer as i64 (0 if dead)
             return self.builder.ptrtoint(obj_ptr, i64)
 
+    def _lookup_user_function(self, name: str):
+        """Resolve a call-site name to its `FuncInfo`, scope-qualified first.
+
+        Returns `(info, key)`, or `(None, None)`. `key` is the dict key the
+        lookup actually hit, so callers can index the parallel
+        `_function_def_nodes` map consistently.
+
+        Nested `def`s are registered under two different key shapes. One with
+        no free variables is *hoisted* to module scope and keyed by its **bare**
+        name; a capturing one — or one whose bare name is already taken — is
+        keyed `outer.inner`. A bare-name-only lookup therefore resolves a nested
+        `def build(...)` to a same-named sibling in a completely different
+        enclosing function, and the caller silently inherits the sibling's
+        return type: BUG-NESTED-DEF-NAME-COLLISION, where a dict-returning
+        `build` was typed `list` and `d["x"]` compiled to a list index.
+
+        Trying `f"{_current_func_name}.{name}"` first lets the local definition
+        win, which is also what Python scoping says. The bare name stays as the
+        fallback, for module-level functions and for the hoisted nested defs
+        that legitimately live under it.
+        """
+        _scope = getattr(self, "_current_func_name", None)
+        if _scope:
+            _qual = f"{_scope}.{name}"
+            info = self._user_functions.get(_qual)
+            if info is not None:
+                return info, _qual
+        return self._user_functions.get(name), name
+
     def _recover_closure_ret_tag(self, name: str, result: ir.Value) -> ir.Value:
         """Rebuild an FpyValue from an indirect call's `i64` result.
 
@@ -29485,17 +29638,10 @@ class CodeGen:
         if (isinstance(result.type, ir.LiteralStructType)
                 and result.type == fpy_val):
             return result  # already tagged (e.g. the kwargs path)
-        info = None
-        _scope = getattr(self, "_current_func_name", None)
-        _qual = f"{_scope}.{name}" if _scope else None
-        if _qual:
-            info = self._user_functions.get(_qual)
-        if info is None:
-            info = self._user_functions.get(name)
+        info, _key = self._lookup_user_function(name)
         if info is None:
             return result
-        _def_node = getattr(self, "_function_def_nodes", {}).get(
-            _qual if (_qual and _qual in self._user_functions) else name)
+        _def_node = getattr(self, "_function_def_nodes", {}).get(_key)
         if _def_node is not None and getattr(_def_node, "decorator_list", None):
             return result  # name is bound to the decorator's result, not this
         _publishes_tag = (

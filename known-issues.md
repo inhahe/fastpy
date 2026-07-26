@@ -8,6 +8,65 @@ how to reproduce it, and what the proper fix looks like.
 
 ## Active Bugs
 
+### BUG-PTR-RET-TAG-MEANS-LIST. A function returning more than one pointer kind is typed `list`, so `len()` on a returned str crashes — 2026-07-26
+
+**What:** when a function's LLVM return type is `i8*` and the inferrer cannot
+prove it is a dict, str or obj, `_infer_ret_tag` falls through to
+
+```python
+else:
+    ret_tag = "ptr"  # list/tuple          # compiler/codegen.py ~10337
+```
+
+and `ValueType.from_old_tag` maps `"ptr"` to **`VKind.LIST`**
+(compiler/codegen.py:346, plus the `ptr:<elem>` prefix at :364). So the tag that
+means *"a pointer, kind unknown"* is indistinguishable from the tag that means
+*"definitely a list"*. Every static LIST fast path then fires on a value that may
+be a str or a dict at runtime.
+
+**Reproduce** (should print `abcd 4` / `[1, 2, 3] 3`):
+```python
+def pick(flag):
+    if flag:
+        return "abcd"
+    return [1, 2, 3]
+
+r = pick(True)
+print(r, len(r))
+s = pick(False)
+print(s, len(s))
+```
+Compiled output is empty and the process dies with an access violation
+(Windows exit code 3221225477): `len(r)` took the
+`kind in (VKind.LIST, VKind.TUPLE)` fast path in `_emit_builtin_len` (~40669)
+and called `fastpy_list_length` on a string pointer.
+
+**Not a missing fallback.** `_emit_builtin_len` already ends in a correct
+runtime dispatch — `fv_len(tag, data)` switches on the FpyValue tag and handles
+STR/LIST/DICT/SET/BYTES/OBJ. The value reaching it *is* a properly tagged
+FpyValue; `print(r)` renders `abcd` correctly through `fastpy_fv_write` on the
+same variable in the same statement. The static fast path simply wins first and
+never consults the tag it already has.
+
+**Proper fix:** stop overloading `"ptr"`. At the `_infer_ret_tag` fallback,
+collect the set of pointer kinds actually returned; emit `"ptr"` only when they
+agree on list/tuple, and `"mixed"` (→ `VKind.MIXED`, which routes through the
+runtime-dispatch paths) when they disagree or when a returned callee's tag is
+untrustworthy — e.g. a decorated name, whose `_user_functions` entry describes
+the undecorated function (BUG-DECORATOR-WRAPPER-STATIC-RET-TAG). Remapping
+`"ptr"` itself to UNKNOWN is *not* the fix: several call sites use it to mean
+list/tuple deliberately (annotation handling at ~10408/10414 maps `list[int]`
+and `tuple[...]` to `"ptr"`), so the meaning has to be split at the producer.
+
+**Not a regression:** both the `pick` repro above and the decorator variant
+reproduce identically at the parent commit.
+
+**How it was found:** chasing BUG-DECORATOR-WRAPPER-STATIC-RET-TAG. A closure
+returning a decorated call (`def inner(n): return _ds(n)`) gets `ret_tag='ptr'`
+because `_ds` is decorated and its `'str'` cannot be trusted — that fallback is
+correct and conservative; the damage happens downstream in the LIST mapping.
+Decorators are incidental, as the repro above shows.
+
 ### ~~BUG-BARE-ABI-STORE-NO-RETAIN. Assigning an owned str temp to a local inside a bare-ABI function is a use-after-free~~ — FIXED 2026-07-26
 
 **What:** inside a function compiled with the bare-type ABI, storing a
@@ -171,7 +230,7 @@ runtime-tag treatment as everything else.
 via the static path and would fail if the exclusion were removed before the
 wrapper is taught to forward.
 
-### BUG-NESTED-DEF-NAME-COLLISION. Two sibling nested `def`s that share a name silently resolve to one another — 2026-07-26
+### ~~BUG-NESTED-DEF-NAME-COLLISION. Two sibling nested `def`s that share a name silently resolve to one another~~ — FIXED 2026-07-26
 
 **What:** a nested `def` with no free variables is *hoisted* to module scope and
 registered in `self._user_functions` under its **bare** name. Two different
@@ -210,22 +269,88 @@ index. Renaming either helper makes it pass.
 for the collision — `_name_collides` forces the second def down the
 zero-capture-closure path so it gets a qualified name — and that half works: a
 probe shows `dict_return.build` registered as a closure alongside the hoisted
-bare `build`. The failure is downstream, in the **call-site type inference**,
-which looks the callee up by bare name (`if node.func.id in self._user_functions`
-in `_infer_call_value_type`, ~19655, and ~40 similar sites) without first trying
-the scope-qualified key. So the call dispatches correctly but the *result type*
-comes from the sibling.
+bare `build`. So the call *dispatches* correctly; what came from the sibling was
+the result *type*.
 
-**Proper fix:** a single `_resolve_callee_info(name)` helper that tries
-`f"{self._current_func_name}.{name}"` before the bare name, used at every
-`self._user_functions[...]` call-site lookup. `_recover_closure_ret_tag` already
-resolves scope-first this way (added for BUG-INDIRECT-CALL-RET-TAG-INT) and is
-the model to generalise. The wider audit is what makes this more than a
-five-minute change — the lookups are scattered.
+**Root cause — deeper than `_user_functions`.** The first attempt was a
+scope-first `_lookup_user_function(name)` helper (try `f"{_current_func_name}.{name}"`,
+fall back to the bare name) wired into `_recover_closure_ret_tag` and the
+call-site type inferrer. It made the closure and the caller individually
+correct, and the repro *still* failed: `d["x"]` compiled to `fastpy_list_get_fv`.
+Tracing bare-name lookups with a logging `dict` subclass found the real source —
+`_csa_func_asts` is built with a flat
 
-**Not a regression:** reproduces identically at the parent commit. Called out in
-the docstring of `tests/regressions/indirect_call_ret_tag.py`, which gives every
-nested helper a unique name so it tests the tag bug rather than this one.
+```python
+func_asts.setdefault(node.name, node)     # over ast.walk(tree)
+```
+
+so the **first** `def build` in the module wins for every consumer of that map
+(`_func_ret_types`, `_call_site_param_types`, `_monomorphized`, string-param
+detection, …). Every one of those maps is keyed by a function's bare name.
+
+**Fix:** `_uniquify_nested_def_names(tree)` (compiler/codegen.py ~4076), an
+alpha-renaming pass run as the very first statement of `generate()`, before
+`_gen_prescan` and therefore before any analysis map is built. A nested `def`
+whose bare name is used by another `def` anywhere in the module is renamed to
+`name__nK`, and references are rewritten throughout the owner scope. Re-keying
+every map by scope was rejected: it would have meant auditing dozens of lookup
+sites and would have left the flat ones as latent traps for the next bug.
+
+The pass is deliberately conservative and bails out — leaving the name alone —
+when renaming would be unsafe: a `global`/`nonlocal` names it, the owner scope
+rebinds it (another def, an assignment, a parameter, an import), or the def is
+module-level or a class method. `_rewrite` also stops descending into a nested
+scope that shadows the name with a parameter of its own. The scope-first
+`_lookup_user_function` was kept as well — it is the right thing independently,
+and it covers the cases the renaming pass declines.
+
+**Not a regression:** reproduced identically at the parent commit.
+
+**Regression coverage:** `tests/regressions/nested_def_name_collision.py` — the
+original list/dict repro plus str/int siblings, a nested def shadowing a
+module-level one, recursion inside a renamed def, capturing closures, collisions
+two levels deep, the name as a parameter elsewhere, a class method of the same
+name, an owner-scope rebinding (the bail-out), and a loop body. Fails at the
+parent commit; ASan/UBSan/LSan clean.
+
+### BUG-SAME-SCOPE-DEF-REBIND. Two `def`s with the same name in one scope both resolve to the first — 2026-07-26
+
+**What:** Python rebinds a name on each `def`, so a later `def f` shadows an
+earlier one for uses that follow it. The compiler keeps only the first.
+
+**Reproduce** (should print `8 12`, prints `8 8`):
+```python
+def collide_in_branch(flag):
+    if flag:
+        def step(n):
+            return n * 2
+        return step(4)
+    def step(n):
+        return n * 3
+    return step(4)
+
+print(collide_in_branch(True), collide_in_branch(False))
+```
+
+**Why the alpha-renaming pass does not cover it.** `_uniquify_nested_def_names`
+renames a def and then rewrites *every* reference in the owner scope, which is
+only sound when exactly one def binds the name in that scope. Here both do, so
+`_rebound_elsewhere` returns true and the pass declines. Resolving a use to the
+right def needs flow analysis, not a scope-wide rewrite.
+
+**Proper fix:** replace the scope-wide `_rewrite` with a structured
+environment walk over the owner scope's statements — carry a
+`name -> current binding` map, rename each `def` to a fresh name as it is
+encountered, rewrite `Name` loads to whatever the map holds, and recurse into
+compound statements with a copy of the map (marking a name ambiguous when
+`if`/`else` arms disagree, when a loop body rebinds it, or when a non-`def`
+binding intervenes). Ambiguous names fall back to today's behaviour. This
+subsumes the current conservative bail-outs.
+
+**Not a regression:** reproduces identically at the parent commit, and before
+the alpha-renaming pass existed. Called out in the docstring of
+`tests/regressions/nested_def_name_collision.py`, whose `collide_in_branch`
+case is written to stay inside the cross-scope collision this pass does fix.
 
 ### BUG-EXC-MSG-NOT-OWNED. A raised exception borrows its message string, so every dynamic message must leak — 2026-07-26
 
