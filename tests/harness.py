@@ -12,6 +12,13 @@ Three possible outcomes for each test:
 
 A SKIP is expected while the compiler is under development. A FAIL is
 always a bug — either in the compiler or in the test.
+
+One important exception to "a compile failure is a SKIP": an **LLVM verifier**
+error is not an unsupported feature, it is invalid IR that codegen should never
+have emitted, and no amount of feature work will turn it into a PASS. Those are
+classified as FAIL — see `_VERIFIER_ERROR_SIGNS` / `_is_verifier_error`. This
+matters: BUG-DECREF-DOES-NOT-DOMINATE sat green in the suite as a SKIP for a
+long time precisely because it was indistinguishable from "not implemented yet".
 """
 
 from __future__ import annotations
@@ -29,6 +36,35 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 from compiler.pipeline import compile_source, CompileResult
+
+
+# Substrings that identify an LLVM *verifier* rejection rather than a fastpy
+# "feature not supported" message. Invalid IR is always a codegen bug, so these
+# are reported as FAIL instead of being absorbed into the SKIP bucket.
+_VERIFIER_ERROR_SIGNS = (
+    "does not dominate all uses",
+    "Broken module found",
+    "Instruction referencing instruction not embedded in a basic block",
+    "PHI node entries do not match predecessors",
+    "Invalid operand types",
+    "Basic Block does not have terminator",
+    "Terminator found in the middle of a basic block",
+    "Instruction does not dominate",
+)
+
+
+def _is_verifier_error(compile_result: CompileResult) -> bool:
+    """True when a failed compile was rejected by the LLVM verifier.
+
+    A verifier error means codegen emitted structurally invalid IR — a
+    different category from "this Python feature isn't implemented yet" — so
+    the caller must surface it as a failure, never as a skip.
+    """
+    for err in getattr(compile_result, "errors", None) or ():
+        msg = getattr(err, "message", None) or str(err)
+        if any(sign in msg for sign in _VERIFIER_ERROR_SIGNS):
+            return True
+    return False
 
 
 @dataclass
@@ -74,6 +110,11 @@ class DiffResult:
         """Multi-line detail for failure diagnosis."""
         lines = [self.summary()]
         if self.failed:
+            # A failure with no compiled run is an invalid-IR rejection: the
+            # compiler errors are the whole story.
+            if self.compiled is None and self.compile_result:
+                for err in self.compile_result.errors:
+                    lines.append(f"  {err}")
             if self.cpython and self.compiled:
                 if self.cpython.stdout != self.compiled.stdout:
                     lines.append("--- CPython stdout ---")
@@ -213,6 +254,14 @@ def diff_test(
     compile_result = compile_source(source, **extra_kwargs)
 
     if not compile_result.success:
+        # Invalid IR is a codegen bug, not a missing feature — never a skip.
+        if _is_verifier_error(compile_result):
+            return DiffResult(
+                status="fail",
+                reason="Codegen emitted invalid IR (LLVM verifier rejected it)",
+                cpython=cpython_result,
+                compile_result=compile_result,
+            )
         # Compiler can't handle this yet — that's a skip, not a failure
         return DiffResult(
             status="skip",
