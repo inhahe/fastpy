@@ -287,7 +287,12 @@ allocation site instead of a silently wrong answer. Both live Path bugs this
 session (the offset-32 heap-buffer-overflow and a misaligned `FpyObj` access
 from `Path.cwd()`) were pinpointed this way. Regression programs live in
 `tests/pure/*.py` and print a bitmask (Linux truncates exit codes to 8 bits;
-SlateOS does not, which is why the on-target tools exit with theirs).
+SlateOS does not, which is why the on-target tools exit with theirs). They
+currently cover the `Path` surface (`pathlib_checks`, `path_boundary_checks`,
+`path_magic_collision_checks`, `path_iterdir_checks`) and exception handling
+(`exception_checks`) — the latter establishes that pure mode really does catch
+a `fastpy_raise` raised from inside a runtime function, which is the premise
+any runtime error-reporting design depends on.
 
 ## Tests
 
