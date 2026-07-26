@@ -42,6 +42,14 @@ FpyBigInt* fpy_bigint_pow(FpyBigInt *base, FpyBigInt *exp);
 FpyBigInt* fpy_bigint_neg(FpyBigInt *a);
 FpyBigInt* fpy_bigint_abs(FpyBigInt *a);
 
+/* Bitwise / shift (Python two's-complement / floor semantics).
+ * For shifts, `b` is the shift count (as a BigInt). */
+FpyBigInt* fpy_bigint_and(FpyBigInt *a, FpyBigInt *b);
+FpyBigInt* fpy_bigint_or(FpyBigInt *a, FpyBigInt *b);
+FpyBigInt* fpy_bigint_xor(FpyBigInt *a, FpyBigInt *b);
+FpyBigInt* fpy_bigint_lshift(FpyBigInt *a, FpyBigInt *b);
+FpyBigInt* fpy_bigint_rshift(FpyBigInt *a, FpyBigInt *b);
+
 /* Comparison: returns -1, 0, or 1 */
 int fpy_bigint_cmp(FpyBigInt *a, FpyBigInt *b);
 

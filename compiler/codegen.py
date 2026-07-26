@@ -2590,6 +2590,12 @@ class CodeGen:
         self.runtime["bigint_floordiv"] = ir.Function(self.module, ft, name="fpy_bigint_floordiv")
         self.runtime["bigint_mod"] = ir.Function(self.module, ft, name="fpy_bigint_mod")
         self.runtime["bigint_pow"] = ir.Function(self.module, ft, name="fpy_bigint_pow")
+        # BigInt bitwise / shift (two FpyBigInt* → FpyBigInt*)
+        self.runtime["bigint_and"] = ir.Function(self.module, ft, name="fpy_bigint_and")
+        self.runtime["bigint_or"] = ir.Function(self.module, ft, name="fpy_bigint_or")
+        self.runtime["bigint_xor"] = ir.Function(self.module, ft, name="fpy_bigint_xor")
+        self.runtime["bigint_lshift"] = ir.Function(self.module, ft, name="fpy_bigint_lshift")
+        self.runtime["bigint_rshift"] = ir.Function(self.module, ft, name="fpy_bigint_rshift")
         # BigInt comparison (returns i32: -1, 0, 1)
         ft = ir.FunctionType(i32, [i8_ptr, i8_ptr])
         self.runtime["bigint_cmp"] = ir.Function(self.module, ft, name="fpy_bigint_cmp")
@@ -33783,6 +33789,13 @@ class CodeGen:
                 ast.Add: "bigint_add", ast.Sub: "bigint_sub",
                 ast.Mult: "bigint_mul", ast.FloorDiv: "bigint_floordiv",
                 ast.Mod: "bigint_mod", ast.Pow: "bigint_pow",
+                # Bitwise / shift: Python two's-complement / floor semantics.
+                # Without these, a mixed bigint⊕int bitwise op fell through
+                # to the CPython bridge slow path, which dereferenced the int
+                # operand as a pointer → access violation (BUG-BIGINT-BITWISE).
+                ast.BitAnd: "bigint_and", ast.BitOr: "bigint_or",
+                ast.BitXor: "bigint_xor", ast.LShift: "bigint_lshift",
+                ast.RShift: "bigint_rshift",
             }
             rt_name = _bigint_ops.get(op)
             if rt_name:

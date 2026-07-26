@@ -302,6 +302,167 @@ FpyBigInt* fpy_bigint_abs(FpyBigInt *a) {
     return r;
 }
 
+/* ── Bitwise operations (Python two's-complement semantics) ─────────
+ * Python ints are conceptually infinite-width two's complement, so a
+ * negative operand's bits are all-1s above its magnitude.  We widen both
+ * operands to a common limb count (max length + 1 guard limb), materialize
+ * each in two's complement, apply the op limb-wise, derive the result's
+ * sign from the operands' sign bits, then convert back to sign+magnitude. */
+
+/* Write the two's-complement representation of (sign, mag[len]) into
+ * out[0..n) (n >= len). */
+static void bigint_to_twoscomp(int32_t sign, const uint64_t *mag,
+                               int32_t len, uint64_t *out, int32_t n) {
+    if (sign >= 0) {
+        for (int32_t i = 0; i < n; i++)
+            out[i] = (i < len) ? mag[i] : 0;
+    } else {
+        /* two's complement = ~mag + 1 across n limbs */
+        uint64_t carry = 1;
+        for (int32_t i = 0; i < n; i++) {
+            uint64_t v = (i < len) ? mag[i] : 0;
+            uint64_t inv = ~v;
+            uint64_t s = inv + carry;
+            carry = (s < inv) ? 1 : 0;
+            out[i] = s;
+        }
+    }
+}
+
+/* opcode: 0 = AND, 1 = OR, 2 = XOR */
+static FpyBigInt* bigint_bitwise(FpyBigInt *a, FpyBigInt *b, int opcode) {
+    int32_t sa = a->sign < 0 ? 1 : 0;
+    int32_t sb = b->sign < 0 ? 1 : 0;
+    int32_t n = (a->length > b->length ? a->length : b->length) + 1;
+    if (n < 2) n = 2;
+    uint64_t *ta = (uint64_t*)calloc((size_t)n, sizeof(uint64_t));
+    uint64_t *tb = (uint64_t*)calloc((size_t)n, sizeof(uint64_t));
+    bigint_to_twoscomp(a->sign, a->limbs, a->length, ta, n);
+    bigint_to_twoscomp(b->sign, b->limbs, b->length, tb, n);
+
+    FpyBigInt *r = bigint_alloc(n);
+    int32_t sr;
+    switch (opcode) {
+        case 0: sr = sa & sb; break;
+        case 1: sr = sa | sb; break;
+        default: sr = sa ^ sb; break;
+    }
+    for (int32_t i = 0; i < n; i++) {
+        uint64_t v;
+        switch (opcode) {
+            case 0: v = ta[i] & tb[i]; break;
+            case 1: v = ta[i] | tb[i]; break;
+            default: v = ta[i] ^ tb[i]; break;
+        }
+        r->limbs[i] = v;
+    }
+    r->length = n;
+    if (sr) {
+        /* negative result: magnitude = ~result + 1 (two's complement) */
+        uint64_t carry = 1;
+        for (int32_t i = 0; i < n; i++) {
+            uint64_t inv = ~r->limbs[i];
+            uint64_t s = inv + carry;
+            carry = (s < inv) ? 1 : 0;
+            r->limbs[i] = s;
+        }
+        r->sign = -1;
+    } else {
+        r->sign = 1;
+    }
+    bigint_normalize(r);
+    free(ta);
+    free(tb);
+    return r;
+}
+
+FpyBigInt* fpy_bigint_and(FpyBigInt *a, FpyBigInt *b) {
+    return bigint_bitwise(a, b, 0);
+}
+FpyBigInt* fpy_bigint_or(FpyBigInt *a, FpyBigInt *b) {
+    return bigint_bitwise(a, b, 1);
+}
+FpyBigInt* fpy_bigint_xor(FpyBigInt *a, FpyBigInt *b) {
+    return bigint_bitwise(a, b, 2);
+}
+
+/* Left shift by `shift` bits. Sign is preserved (Python: -5 << 2 == -20). */
+FpyBigInt* fpy_bigint_lshift(FpyBigInt *a, FpyBigInt *b) {
+    int overflow = 0;
+    int64_t shift = fpy_bigint_to_i64(b, &overflow);
+    if (overflow || shift < 0) {
+        /* Negative or absurd shift → treat as 0 (a << negative is a
+         * ValueError in Python; be lenient and return a copy). */
+        return fpy_bigint_copy(a);
+    }
+    if (a->length == 0 || shift == 0) return fpy_bigint_copy(a);
+    int32_t limb_shift = (int32_t)(shift / 64);
+    int32_t bit_shift = (int32_t)(shift % 64);
+    int32_t new_len = a->length + limb_shift + 1;
+    FpyBigInt *r = bigint_alloc(new_len);
+    for (int32_t i = 0; i < a->length; i++) {
+        uint64_t v = a->limbs[i];
+        int32_t lo = i + limb_shift;
+        if (bit_shift == 0) {
+            r->limbs[lo] |= v;
+        } else {
+            r->limbs[lo] |= (v << bit_shift);
+            r->limbs[lo + 1] |= (v >> (64 - bit_shift));
+        }
+    }
+    r->length = new_len;
+    r->sign = a->sign;
+    bigint_normalize(r);
+    return r;
+}
+
+/* Right shift by `shift` bits — arithmetic (floor) shift, matching
+ * Python: -5 >> 1 == -3 (floor(-2.5)). */
+FpyBigInt* fpy_bigint_rshift(FpyBigInt *a, FpyBigInt *b) {
+    int overflow = 0;
+    int64_t shift = fpy_bigint_to_i64(b, &overflow);
+    if (overflow || shift < 0) return fpy_bigint_copy(a);
+    if (a->length == 0 || shift == 0) return fpy_bigint_copy(a);
+    int32_t limb_shift = (int32_t)(shift / 64);
+    int32_t bit_shift = (int32_t)(shift % 64);
+    if (limb_shift >= a->length) {
+        /* Everything shifted out: 0 for positive, -1 for negative. */
+        return fpy_bigint_from_i64(a->sign < 0 ? -1 : 0);
+    }
+    int32_t new_len = a->length - limb_shift;
+    FpyBigInt *r = bigint_alloc(new_len);
+    /* Detect whether any 1-bits are shifted out (needed to floor negatives). */
+    int lost_bits = 0;
+    for (int32_t i = 0; i < limb_shift; i++)
+        if (a->limbs[i]) { lost_bits = 1; break; }
+    for (int32_t i = 0; i < new_len; i++) {
+        uint64_t lo = a->limbs[i + limb_shift];
+        uint64_t hi = (i + limb_shift + 1 < a->length)
+                      ? a->limbs[i + limb_shift + 1] : 0;
+        if (bit_shift == 0) {
+            r->limbs[i] = lo;
+        } else {
+            if ((lo & (((uint64_t)1 << bit_shift) - 1)) != 0) lost_bits = 1;
+            r->limbs[i] = (lo >> bit_shift) | (hi << (64 - bit_shift));
+        }
+    }
+    r->length = new_len;
+    r->sign = a->sign;
+    bigint_normalize(r);
+    /* For negatives, logical shift truncates toward zero; Python floors,
+     * so subtract 1 (add 1 to magnitude) when any bits were lost. */
+    if (a->sign < 0 && lost_bits) {
+        FpyBigInt *one = fpy_bigint_from_i64(1);
+        FpyBigInt *adj = mag_add(r, one);  /* |r| + 1 */
+        adj->sign = -1;
+        bigint_normalize(adj);
+        fpy_bigint_free(one);
+        fpy_bigint_free(r);
+        return adj;
+    }
+    return r;
+}
+
 /* Simple power by repeated squaring */
 FpyBigInt* fpy_bigint_pow(FpyBigInt *base, FpyBigInt *exp) {
     if (exp->sign < 0) {
