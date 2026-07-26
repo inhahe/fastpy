@@ -34067,6 +34067,12 @@ class CodeGen:
 
         # ── Fast path: Path / str → path join ─────────────────────────
         if op == ast.Div and (lk == VKind.PATH or self._is_path_expr(node.left)):
+            # path_join takes its right operand as plain text; a Path there
+            # (p / other_path) must be converted, since in pure mode a Path's
+            # text does not start at the pointer. See _emit_path_join_operand.
+            if rk == VKind.PATH or self._is_path_expr(node.right):
+                rtv = TypedValue(self._rt_call("path_str", [rtv]),
+                                 ValueType(VKind.STR))
             return self._rt_call("path_join", [ltv, rtv])
 
         # ── Fast path: Decimal arithmetic ──────────────────────────────
@@ -40835,6 +40841,23 @@ class CodeGen:
                               [callable_ptr, t_ir, d_ir, out_tag, out_data])
         return
 
+    def _emit_path_join_operand(self, arg_node) -> ir.Value:
+        """Emit the right-hand operand of a path join as plain text.
+
+        `fastpy_path_join` takes its second argument as a C string, but
+        `p.joinpath(other)` / `p / other` accept a Path as well as a str. In
+        pure mode a Path is a headed object whose text does not start at the
+        pointer (see FpyPurePath in runtime/pathlib_pure.c), so a Path operand
+        must be converted with fastpy_path_str() rather than reinterpreted as
+        text. The receiver side needs no conversion — path_join takes it as a
+        Path proper.
+        """
+        if self._is_path_expr(arg_node):
+            other = self._emit_expr_value(arg_node)
+            other = self._ensure_ptr(other)
+            return self.builder.call(self.runtime["path_str"], [other])
+        return self._ensure_ptr(self._emit_expr_value(arg_node))
+
     def _emit_method_call_path(self, node):
         """Emit pathlib.Path method calls. Always returns."""
         attr = node.func
@@ -40884,8 +40907,7 @@ class CodeGen:
         elif method == "joinpath" and len(node.args) >= 1:
             result = obj
             for arg_node in node.args:
-                other = self._emit_expr_value(arg_node)
-                other = self._ensure_ptr(other)
+                other = self._emit_path_join_operand(arg_node)
                 result = self.builder.call(self.runtime["path_join"],
                                            [result, other])
             return result

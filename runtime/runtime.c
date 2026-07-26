@@ -2072,7 +2072,14 @@ extern FpyList* fastpy_os_statvfs(const char *path);
  * Declarations are extern — implementations live in cpython_bridge.c
  * where Python.h is available. */
 
-/* path.with_suffix(suffix) → new path with different extension */
+/* path.with_suffix(suffix) → new path with different extension.
+ *
+ * Pure mode supplies its own implementation in pathlib_pure.c: there a Path
+ * carries a real header (see FpyPurePath) so that the OBJ refcount dispatcher's
+ * magic probes at offsets 0/32 can never alias path text, which means both the
+ * incoming pointer and the PATH-tagged result must be headed objects rather
+ * than bare strings. */
+#ifndef FPY_PURE_MODE
 const char* fastpy_path_with_suffix(const char *self, const char *suffix) {
     /* Find the last dot in basename */
     const char *base_start = self;
@@ -2090,6 +2097,7 @@ const char* fastpy_path_with_suffix(const char *self, const char *suffix) {
     memcpy(buf + prefix_len, suffix, suffix_len + 1);
     return buf;
 }
+#endif  /* !FPY_PURE_MODE */
 
 /* ============================================================
  * textwrap module

@@ -96,10 +96,59 @@ static const char *_str_n(const char *src, size_t n) {
 }
 static const char *_str_dup(const char *src) { return _str_n(src, strlen(src)); }
 
+/* --- Pure-mode Path object layout -------------------------------------- *
+ *
+ * The codegen tags a pathlib.Path as FPY_TAG_OBJ (tag 6) and wraps every use in
+ * fpy_rc_incref/decref. For an OBJ, that dispatcher (objects.c) has no type
+ * information, so it *probes* the pointer: it reads a would-be FpyObj magic at
+ * BYTE OFFSET 32 and a would-be FpyClosure magic at OFFSET 0, and only when
+ * neither matches does it fall through to the pure-mode bridge no-ops
+ * (bridge_stub.c) that correctly leave a Path alone.
+ *
+ * Storing the path text at offset 0 (the obvious "a Path is just a char*"
+ * representation) makes both probes read path *text*:
+ *   - offset 32 is out of bounds for any path shorter than 36 bytes, so the
+ *     dispatcher reads adjacent heap bytes; when those spuriously equal
+ *     FPY_OBJ_MAGIC the decref treats the Path as a real object and FREES it.
+ *   - even with zero padding to keep that read in bounds, a path of >= 36 bytes
+ *     puts real text under the probe, so a path whose bytes 32..35 happen to
+ *     spell "SJBO" (FPY_OBJ_MAGIC == 0x4F424A53) still misfires.
+ *
+ * Fix: give a Path a real header and put the text at offset 40, past BOTH
+ * probe sites. Every byte the dispatcher inspects is then one we control:
+ * offset 0 holds FPY_PURE_PATH_MAGIC (never FPY_CLOSURE_MAGIC) and offset 32
+ * holds a zero guard (never FPY_OBJ_MAGIC). The OBJ incref/decref therefore
+ * take the bridge no-op path deterministically, for every possible path string.
+ *
+ * The pointer handed to the codegen is the header base, so anything that wants
+ * the text must go through _p() / fastpy_path_as_cstr(). */
+#define FPY_PURE_PATH_MAGIC 0x48544150  /* "PATH" */
+
+typedef struct {
+    int32_t magic;         /* offset 0  — FPY_PURE_PATH_MAGIC, != CLOSURE magic */
+    int32_t _pad0;
+    char    _reserved[24];
+    int32_t guard;         /* offset 32 — always 0, != FPY_OBJ_MAGIC */
+    int32_t _pad1;
+    char    data[];        /* offset 40 — NUL-terminated path text */
+} FpyPurePath;
+
 /* A NULL/empty path behaves like CPython's Path('') / Path('.') == '.'. */
 static const char *_p(void *self) {
-    const char *s = (const char *)self;
-    return (s && *s) ? s : ".";
+    if (!self) return ".";
+    const FpyPurePath *h = (const FpyPurePath *)self;
+    /* Every Path reaching here was built by _path_alloc_n below, so the header
+     * is always present; the magic check is a cheap assertion that also keeps
+     * the accessor honest if a non-Path ever reaches a Path entry point. */
+    if (h->magic != FPY_PURE_PATH_MAGIC) return ".";
+    return *h->data ? h->data : ".";
+}
+
+/* Public accessor: lets Path consumers compiled into OTHER translation units
+ * (runtime.c's fastpy_path_with_suffix) reach the text without duplicating the
+ * layout. Host builds don't compile this TU and keep their own representation. */
+const char *fastpy_path_as_cstr(const void *self) {
+    return _p((void *)(uintptr_t)self);
 }
 
 /* Locate the basename within `p`, honoring trailing-slash stripping the way
@@ -114,39 +163,21 @@ static const char *_basename(const char *p, size_t *blen) {
     return p + i;
 }
 
-/* --- Path (OBJ-tagged) allocation --------------------------------------- *
- *
- * CRITICAL: the codegen tags a pathlib.Path as FPY_TAG_OBJ (tag 6) and wraps
- * every use in fpy_rc_incref/decref. For an OBJ, that dispatcher (objects.c)
- * inspects a would-be `FpyObj` magic at BYTE OFFSET 32 and a would-be
- * `FpyClosure` magic at offset 0; only if neither matches does it fall through
- * to the pure-mode bridge no-ops (bridge_stub.c) that correctly leave the Path
- * alone. A bare `strdup`'d path (e.g. "/tmp/fpy-pathlib.txt", 21 bytes) is
- * SHORTER than 36 bytes, so that offset-32 read is OUT OF BOUNDS: it reads
- * whatever adjacent heap bytes happen to sit there, and when those spuriously
- * equal FPY_OBJ_MAGIC the decref treats the Path as a real object and FREES it
- * — corrupting every subsequent Path operation. Because the colliding bytes
- * depend on heap layout, the failure is order-dependent: a program that reads
- * the file first then checks exists()/name() saw the Path freed after the first
- * statement (only the first check passed), while the same checks reordered
- * ahead of read_text() all passed.
- *
- * Fix: allocate every Path buffer with enough ZEROED padding that offset 32 is
- * always in-bounds and reads as 0 (never FPY_OBJ_MAGIC), while offset 0 holds
- * the path text (never FPY_CLOSURE_MAGIC == "SOLC" for a real path). The OBJ
- * incref/decref then deterministically take the pure-mode bridge no-op path, so
- * a Path is never freed out from under the program. (STR results — name/suffix/
- * stem/str/read_text — go through fpy_str_alloc instead and are unaffected.) */
-#define FPY_PURE_PATH_MIN 40  /* > offset 32 + sizeof(int32_t), with slack */
-
+/* --- Path allocation ----------------------------------------------------- *
+ * Builds the headed layout documented at FpyPurePath above: caller-visible
+ * pointer is the header base, path text lives at offset 40. (STR results —
+ * name/suffix/stem/str/read_text — are NOT Paths; they go through
+ * fpy_str_alloc and carry the FpyString refcount header instead.) */
 static void *_path_alloc_n(const char *s, size_t n) {
-    size_t cap = n + 1;
-    if (cap < FPY_PURE_PATH_MIN) cap = FPY_PURE_PATH_MIN;
-    char *out = (char *)malloc(cap);
-    if (!out) return NULL;
-    memset(out, 0, cap);       /* zero the padding so offset 32 reads as 0 */
-    if (n) memcpy(out, s, n);  /* terminating NUL already present from memset */
-    return (void *)out;
+    FpyPurePath *h = (FpyPurePath *)malloc(sizeof(FpyPurePath) + n + 1);
+    if (!h) return NULL;
+    /* Zero the whole header so `guard` (offset 32) and the reserved bytes can
+     * never coincide with FPY_OBJ_MAGIC, then stamp the identifying magic. */
+    memset(h, 0, sizeof(FpyPurePath));
+    h->magic = FPY_PURE_PATH_MAGIC;
+    if (n) memcpy(h->data, s, n);
+    h->data[n] = '\0';
+    return (void *)h;
 }
 
 static void *_path_alloc(const char *s) {
@@ -185,6 +216,35 @@ void *fastpy_path_join(void *self, void *other) {
     if (need_sep) tmp[pos++] = '/';
     memcpy(tmp + pos, b, lb + 1);
     void *out = _path_alloc_n(tmp, total);
+    free(tmp);
+    return out;
+}
+
+/* path.with_suffix(suffix) -> Path with the basename's extension replaced.
+ *
+ * Pure-mode override of the runtime.c implementation (which is compiled only
+ * for non-pure builds). Both differences matter here: `self` is a headed Path,
+ * not bare text, and the codegen tags the RESULT as a Path too — so this must
+ * hand back a headed Path rather than the plain string buffer runtime.c
+ * returns, or every subsequent operation on it would fail the header check. */
+void *fastpy_path_with_suffix(void *self, const char *suffix) {
+    const char *p = _p(self);
+    if (!suffix) suffix = "";
+    size_t bl;
+    const char *b = _basename(p, &bl);
+    /* Last dot that is neither first nor last char of the basename (PurePath). */
+    long d = -1;
+    for (long i = 0; i < (long)bl; i++)
+        if (b[i] == '.') d = i;
+    size_t keep = (d > 0 && d < (long)bl - 1) ? (size_t)d : bl;
+    size_t prefix_len = (size_t)(b - p) + keep;   /* dirname + stem */
+    size_t sl = strlen(suffix);
+
+    char *tmp = (char *)malloc(prefix_len + sl + 1);
+    if (!tmp) return _path_alloc(p);
+    memcpy(tmp, p, prefix_len);
+    memcpy(tmp + prefix_len, suffix, sl + 1);
+    void *out = _path_alloc_n(tmp, prefix_len + sl);
     free(tmp);
     return out;
 }

@@ -695,16 +695,40 @@ Linux AddressSanitizer build of the real codegen IR + pure runtime (all 10
 checks → `ok == 1023`, no RuntimeError) and on-target: the SlateOS
 `self_test_fastpy_slateos_pathlib` reports bitmask 1023 (all checks pass).
 
-**Residual tech-debt (not yet fixed):**
-- *Path-header collision (low risk):* pure-mode Path buffers are zero-padded to
-  ≥40 bytes so the OBJ incref/decref dispatcher's offset-32 magic read is
-  in-bounds and reads 0 (`runtime/pathlib_pure.c` `_path_alloc_n`). A path
-  whose bytes 32–35 happen to equal `FPY_OBJ_MAGIC` ("SJBO") could still
-  misfire. Proper fix: give pure-mode Path a real header struct (magic at a
-  controlled offset) instead of a bare `char*`, so the path text never sits at
-  offset 0/32.
+**Residual tech-debt:**
+- *Path-header collision — **FIXED** 2026-07-26, and it was NOT low risk.* The
+  original note called this a 1-in-4-billion curiosity; it is actually
+  deterministic and user-controllable by filename. `Path('/tmp/' + 'a'*27 +
+  'SJBO-collide.txt')` puts `FPY_OBJ_MAGIC` ("SJBO") at bytes 32–35, so
+  `fpy_rc_incref`/`fpy_rc_decref` treat the path text as an `FpyObj` and
+  decrement bytes of the filename as a refcount. Measured: 4 of 31 checks pass
+  under the old layout (read_text/exists/parent/is_file all corrupt) vs 31 of
+  31 with the fix.
+  **Fix:** pure-mode Path is now a real header struct (`FpyPurePath` in
+  `runtime/pathlib_pure.c`): `magic` at offset 0 (`0x48544150` "PATH", chosen
+  to differ from `FPY_CLOSURE_MAGIC`), a zero `guard` word at offset 32 (where
+  the OBJ probe reads), and the NUL-terminated text at offset 40. `_p()`
+  validates the magic before returning text; `fastpy_path_as_cstr()` is
+  exported for cross-TU consumers. Because the text no longer starts at the
+  pointer, two call sites had to convert: `fastpy_path_with_suffix` now has a
+  pure-mode implementation in `pathlib_pure.c` (the `runtime.c` one is
+  `#ifndef FPY_PURE_MODE`), and codegen routes a Path right-hand operand of
+  `joinpath()` / `p / other` through `path_str` first
+  (`_emit_path_join_operand`). Regression test:
+  `tests/pure/path_magic_collision_checks.py` (bitmask 127).
 - *`Path.iterdir()` deferred in pure mode:* needs a runtime list-builder API to
   materialize the directory entries as an FpyValue list.
+
+**Other pure-mode gaps found while testing this (pre-existing, not
+regressions):**
+- `print(Path(...))` raises `RuntimeError: operation requires the CPython
+  bridge` — `print` of an OBJ-tagged value goes through the bridge repr path
+  instead of specializing PATH to `path_str`. Workaround: `print(str(p))`.
+- `os.path.exists(p)` / `os.path.getsize(p)` / `open(p)` with a Path argument
+  fail to **link** in pure mode (`undefined reference to fpy_cpython_call1_raw`,
+  `fpy_cpython_to_fv`, `fpy_fv_call_method0`). These should either accept PATH
+  by converting through `path_str` in codegen, or produce a clean compile-time
+  diagnostic — a link error is the worst of the three outcomes.
 
 ### BUG-SCALARKIND-LOST-ON-NATIVE-MODULE-CALL-ASSIGN (fixed 2026-07-22)
 
