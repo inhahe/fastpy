@@ -154,15 +154,40 @@ for i in range(1_000_000):
         pass
 ```
 
-**Proper fix:** make the exception state *own* its message —
-`fpy_exc_msg = fpy_str_retain(msg)` (or `strdup`) on raise, released in
-`fastpy_exc_clear()` and whenever a new exception overwrites the slot. Then
-codegen can register the message like any other argument and let the normal
-statement-boundary flush release it, which also removes the special-case
-temp-dropping in `_emit_assert`. Care is needed for the common case where the
-message is a **string constant** (`.str.N` global): those must not be freed, so
-either the retain must be tag-aware or all messages must be copied
-unconditionally.
+**Proper fix:** make the exception state *own* its message, released in
+`fastpy_exc_clear()` and whenever a new raise overwrites the slot. The obvious
+one-liner — `fpy_str_incref(msg)` inside `fastpy_raise` — is **wrong**, and the
+reason is worth writing down because it is easy to miss:
+
+`fpy_str_incref` finds the refcount by reading the 8 bytes *before* the char
+pointer (`fpy_str_header`). That is safe for anything the project treats as a
+STR value, because those are all header-backed: heap strings come from
+`fpy_str_copy`/`fpy_str_buf` (BUG-RUNTIME-STR-PRODUCERS-BARE-MALLOC is the rule
+that enforces this), and codegen emits string *constants* as
+`{i32 FPY_STR_MAGIC, i32 FPY_RC_IMMORTAL, [N x i8]}` globals so incref/decref
+no-op on them. But `fastpy_raise` is also called from the runtime's own C code
+with **plain C literals** (`fpy_pure_unsupported()`, the arithmetic/index/key
+errors, …), which have no such header — so a blanket incref would read out of
+bounds on a `.rodata` literal and ASan would flag a global-buffer-overflow.
+
+Three shapes that do work, in rough order of preference:
+
+1. **Split the entry point.** Keep `fastpy_raise` borrowing (for the runtime's
+   own literal messages) and add `fastpy_raise_owned(exc_type, msg)` that takes
+   ownership of a header-backed string, with a companion `fpy_exc_msg_owned`
+   flag so `fastpy_exc_clear` frees only what it owns. Codegen emits
+   `raise_owned` for computed messages, increfing first so a *borrowed* message
+   (`assert False, msg` where `msg` is a live variable) is retained rather than
+   stolen. No cost on the internal raise path.
+2. **Copy unconditionally** — `fpy_exc_msg = fpy_str_from_cstr(msg)`. Simplest
+   and uniformly correct (no header read on the incoming pointer at all), but
+   adds a malloc+copy to *every* raise, including the `StopIteration` that ends
+   every iterator loop.
+3. Codegen-side ownership, keeping the message alive across the unwind. Most
+   fragile; mentioned only for completeness.
+
+Whichever is chosen, it also removes the special-case temp-dropping in
+`_emit_assert`.
 
 **Discovered** while fixing BUG-DECREF-DOES-NOT-DOMINATE facet (c) — the
 try-body flush made the previously invisible leak visible as an invalid-IR
