@@ -401,6 +401,29 @@ void fastpy_set_write(FpyDict *set);
 
 /* --- Value repr (for list elements: strings get quotes) --- */
 
+/* Is this OBJ-tagged pointer actually a pure-mode pathlib.Path?
+ *
+ * Codegen tags a Path OBJ, so every generic OBJ consumer below (print / write /
+ * str / repr) receives a pointer it cannot type. Its fallback is the CPython
+ * bridge, which in a pure build is a stub that RAISES — so without this check
+ * `print(Path(...))` fails even though the value is perfectly printable.
+ * runtime/pathlib_pure.c (compiled only into pure builds) can answer the
+ * question from the Path header's magic word; in bridged builds a Path really
+ * IS a PyObject*, so the bridge fallback is correct and this returns NULL.
+ *
+ * Returns the path text, or NULL if it is not a Path. */
+#ifdef FPY_PURE_MODE
+extern const char *fpy_pure_path_text(const void *p);
+static inline const char *_fpy_obj_as_path_text(const void *p) {
+    return fpy_pure_path_text(p);
+}
+#else
+static inline const char *_fpy_obj_as_path_text(const void *p) {
+    (void)p;
+    return NULL;
+}
+#endif
+
 void fpy_value_repr(FpyValue val, char *buf, int bufsize) {
     switch (val.tag) {
         case FPY_TAG_INT:
@@ -467,6 +490,15 @@ void fpy_value_repr(FpyValue val, char *buf, int bufsize) {
         case FPY_TAG_OBJ: {
             /* Could be FpyObj or CPython PyObject* — detect via magic */
             void *ptr = val.data.obj;
+            /* Pure-mode pathlib.Path: check first, since its magic is neither
+             * the closure magic nor in the small-int range the FpyObj probe
+             * uses, so it would otherwise fall through to the bridge (which
+             * raises in a pure build). CPython reprs a Path as PosixPath('…'). */
+            const char *_pt = _fpy_obj_as_path_text(ptr);
+            if (_pt) {
+                snprintf(buf, bufsize, "PosixPath('%s')", _pt);
+                break;
+            }
             int32_t first_word = *(int32_t*)ptr;
             if (first_word == FPY_CLOSURE_MAGIC) {
                 snprintf(buf, bufsize, "<closure>");
@@ -583,6 +615,7 @@ const char* fastpy_fv_repr(int32_t tag, int64_t data) {
 /* Forward declaration: defined later in this file */
 const char* fastpy_obj_to_str(FpyObj *obj);
 
+
 /* Return the str string (allocated) for an FpyValue — strings pass
  * through without quotes; OBJ types use __str__; other types use repr. */
 const char* fastpy_fv_str(int32_t tag, int64_t data) {
@@ -597,6 +630,11 @@ const char* fastpy_fv_str(int32_t tag, int64_t data) {
                 return fastpy_obj_to_str(obj);
             }
         }
+        /* Pure-mode pathlib.Path: printable natively, and the bridge below
+         * would raise. Copy the text so the caller owns a normal FpyString
+         * rather than a pointer into the Path's own header block. */
+        const char *pt = _fpy_obj_as_path_text(ptr);
+        if (pt) return fpy_str_from_cstr(pt);
         /* CPython PyObject* — use PyObject_Str */
         extern const char* fpy_bridge_pyobj_str(void*);
         return fpy_bridge_pyobj_str(ptr);
@@ -7849,6 +7887,8 @@ void fastpy_obj_write(FpyObj *obj) {
      * PyObject* (e.g. numpy arrays returned via the bridge). Without this,
      * accessing class_id on a PyObject* would read ob_refcnt and crash. */
     if (obj->magic != FPY_OBJ_MAGIC) {
+        const char *pt = _fpy_obj_as_path_text((void*)obj);
+        if (pt) { printf("%s", pt); return; }
         fpy_cpython_print_obj((void*)obj);
         return;
     }

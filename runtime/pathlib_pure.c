@@ -151,6 +151,26 @@ const char *fastpy_path_as_cstr(const void *self) {
     return _p((void *)(uintptr_t)self);
 }
 
+/* Identify an arbitrary OBJ-tagged pointer as a Path, or report that it isn't.
+ *
+ * This is what the header bought us beyond collision-safety. Codegen tags a
+ * Path OBJ, so every generic OBJ consumer in objects.c (print / str / repr /
+ * write) reaches a pointer it cannot type, and its fallback is the CPython
+ * bridge — which in a pure build is a stub that RAISES. Before the header there
+ * was no way to tell a Path from a PyObject*, so `print(p)` had to fail; now the
+ * magic at offset 0 answers exactly that question, and the generic paths can
+ * dispatch a Path natively instead of bridging.
+ *
+ * Returns the path text, or NULL if `p` is not an FpyPurePath. Unlike
+ * fastpy_path_as_cstr() this never substitutes "." — callers need to
+ * distinguish "not a Path" from "a Path whose text is empty". */
+const char *fpy_pure_path_text(const void *p) {
+    if (!p) return NULL;
+    const FpyPurePath *h = (const FpyPurePath *)p;
+    if (h->magic != FPY_PURE_PATH_MAGIC) return NULL;
+    return *h->data ? h->data : ".";
+}
+
 /* Locate the basename within `p`, honoring trailing-slash stripping the way
  * PurePath does (Path('/a/b/') == Path('/a/b')). Writes the basename length
  * into *blen and returns a pointer into `p` at the basename start. */
