@@ -731,9 +731,14 @@ checks → `ok == 1023`, no RuntimeError) and on-target: the SlateOS
 
 **Other pure-mode gaps found while testing this (pre-existing, not
 regressions):**
-- `print(Path(...))` raises `RuntimeError: operation requires the CPython
-  bridge` — `print` of an OBJ-tagged value goes through the bridge repr path
-  instead of specializing PATH to `path_str`. Workaround: `print(str(p))`.
+- ~~`print(Path(...))` raises `RuntimeError: operation requires the CPython
+  bridge`~~ — **FIXED 2026-07-26.** `print`/`repr` of an OBJ-tagged value fell
+  through to the bridge because nothing could tell a Path pointer from a
+  `PyObject*`. The Path header's magic now answers that: `pathlib_pure.c`
+  exports `fpy_pure_path_text()` and `objects.c` consults it before each bridge
+  fallback (`fastpy_obj_write`, `fastpy_fv_str`, `fpy_value_repr`). `repr`
+  matches CPython's `PosixPath('...')`. Regression test:
+  `tests/pure/path_display_checks.py` (bitmask 255).
 - `os.path.exists(p)` / `os.path.getsize(p)` / `open(p)` with a Path argument
   fail to **link** in pure mode (`undefined reference to fpy_cpython_call1_raw`,
   `fpy_cpython_to_fv`, `fpy_fv_call_method0`). These should either accept PATH
