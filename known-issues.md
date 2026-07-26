@@ -8,24 +8,16 @@ how to reproduce it, and what the proper fix looks like.
 
 ## Active Bugs
 
-### BUG-PTR-RET-TAG-MEANS-LIST. A function returning more than one pointer kind is typed `list`, so `len()` on a returned str crashes — 2026-07-26
+### BUG-MODULE-DOCSTRING-UNBOXES-GLOBAL. `_load_variable` unboxes an FpyValue local using its (wrong) static tag, so a mixed-kind module-level value loses its runtime tag — 2026-07-26
 
-**What:** when a function's LLVM return type is `i8*` and the inferrer cannot
-prove it is a dict, str or obj, `_infer_ret_tag` falls through to
+**What:** a module-level variable holding a value whose kind is only known at
+runtime is loaded as a bare `i8*` typed LIST, so `len()` takes the static
+`fastpy_list_length` path on what is actually a string.
 
+**Reproduce** — prints `abcd 0` instead of `abcd 4`:
 ```python
-else:
-    ret_tag = "ptr"  # list/tuple          # compiler/codegen.py ~10337
-```
+"""Hello."""
 
-and `ValueType.from_old_tag` maps `"ptr"` to **`VKind.LIST`**
-(compiler/codegen.py:346, plus the `ptr:<elem>` prefix at :364). So the tag that
-means *"a pointer, kind unknown"* is indistinguishable from the tag that means
-*"definitely a list"*. Every static LIST fast path then fires on a value that may
-be a str or a dict at runtime.
-
-**Reproduce** (should print `abcd 4` / `[1, 2, 3] 3`):
-```python
 def pick(flag):
     if flag:
         return "abcd"
@@ -33,39 +25,173 @@ def pick(flag):
 
 r = pick(True)
 print(r, len(r))
-s = pick(False)
-print(s, len(s))
 ```
-Compiled output is empty and the process dies with an access violation
-(Windows exit code 3221225477): `len(r)` took the
-`kind in (VKind.LIST, VKind.TUPLE)` fast path in `_emit_builtin_len` (~40669)
-and called `fastpy_list_length` on a string pointer.
+Delete the docstring line and it prints `abcd 4`. Any docstring triggers it,
+including a one-word one; inserting blank lines, comments or `x = 1` in its
+place does not, so it is not a line-number effect.
 
-**Not a missing fallback.** `_emit_builtin_len` already ends in a correct
-runtime dispatch — `fv_len(tag, data)` switches on the FpyValue tag and handles
-STR/LIST/DICT/SET/BYTES/OBJ. The value reaching it *is* a properly tagged
-FpyValue; `print(r)` renders `abcd` correctly through `fastpy_fv_write` on the
-same variable in the same statement. The static fast path simply wins first and
-never consults the tag it already has.
+**Why the docstring matters — it is only the trigger, not the cause.**
+`_gen_detect_bare_abi` (~4015) disables bare-ABI for module-level code when any
+module-level statement contains a string constant:
 
-**Proper fix:** stop overloading `"ptr"`. At the `_infer_ret_tag` fallback,
-collect the set of pointer kinds actually returned; emit `"ptr"` only when they
-agree on list/tuple, and `"mixed"` (→ `VKind.MIXED`, which routes through the
-runtime-dispatch paths) when they disagree or when a returned callee's tag is
-untrustworthy — e.g. a decorated name, whose `_user_functions` entry describes
-the undecorated function (BUG-DECORATOR-WRAPPER-STATIC-RET-TAG). Remapping
-`"ptr"` itself to UNKNOWN is *not* the fix: several call sites use it to mean
-list/tuple deliberately (annotation handling at ~10408/10414 maps `list[int]`
-and `tuple[...]` to `"ptr"`), so the meaning has to be split at the producer.
+```python
+or (isinstance(n, ast.Constant) and isinstance(n.value, str))   # ~4032
+```
 
-**Not a regression:** both the `pick` repro above and the decorator variant
-reproduce identically at the parent commit.
+A module docstring *is* a module-level `ast.Expr(Constant(str))`, so its
+presence alone flips `_current_fn_bare_abi` from True to False. The two paths
+then diverge in `_load_variable`:
 
-**How it was found:** chasing BUG-DECORATOR-WRAPPER-STATIC-RET-TAG. A closure
-returning a decorated call (`def inner(n): return _ds(n)`) gets `ret_tag='ptr'`
-because `_ds` is decorated and its `'str'` cannot be trusted — that fallback is
-correct and conservative; the damage happens downstream in the LIST mapping.
-Decorators are incidental, as the repro above shows.
+- **bare-ABI (no docstring)** — `return self.builder.load(alloca)` (~22472).
+  The bare-ABI store path stored the callee's whole `{i32, i64}` struct, so the
+  alloca *is* `fpy_val` and the raw load hands back a fully tagged FpyValue.
+  `len()` then dispatches on the tag. **Correct, but by accident.**
+- **FV locals (docstring)** — `return self._unwrap_fv_for_tag(fv, type_tag)`
+  (~22494). `type_tag` is `ValueType(list:int)`, `kind.is_ptr` is true, so it
+  returns `self._fv_as_ptr(fv)` (~22598) and **throws the runtime tag away**.
+  Everything downstream sees a LIST.
+
+`self.variables['r']` is `ValueType(list:int)` in *both* builds — the recorded
+type is identical, so the divergence is purely in the load.
+
+**Where the `list:int` comes from — measured, not guessed.** Monkey-patching
+`_store_variable`/`_load_variable` in a throwaway process gives:
+
+```
+[DOC]   STORE r tag=ValueType(list:int) llvm={i32, i64} bare_abi=False
+[DOC]   LOAD  r -> llvm=i8*        vars=ValueType(list:int) bare_abi=False
+[NODOC] STORE r tag=ValueType(list:int) llvm={i32, i64} bare_abi=True
+[NODOC] LOAD  r -> llvm={i32, i64} vars=ValueType(list:int) bare_abi=True
+```
+
+Identical stores, divergent loads — so the store tag is wrong in *both* builds
+and only the bare-ABI load accidentally survives it. The tag is chosen in
+`_assign_fv_fast_path` (~17170–17176), which prefers the CSA pass's
+`_func_ret_types` over `info.ret_tag`. For `pick` the two disagree and *both*
+are wrong:
+
+```
+_func_ret_types: {'pick': 'list'}      # CSA — wins
+user_fn ret_tag: 'str'                 # _duf_determine_ret_tag — ignored
+```
+
+The CSA loop (~6800–6966) walks every `ast.Return` in the function and
+**overwrites** `_func_ret_types[fname]` each time, so it is last-classifiable-
+return-wins. `return "abcd"` matches no branch in the chain (there is no
+str-Constant arm), so `return [1, 2, 3]` writes `"list"` unopposed.
+
+**Proper fix — producer only; the consumer is already correct.**
+`_unwrap_fv_for_tag` *already* returns the FpyValue unchanged for `VKind.MIXED`
+(:22620, `if kind in (VKind.FVALUE, VKind.MIXED): return fv`), and
+`VKind.MIXED.is_ptr` is False so it never reaches the `_fv_as_ptr` branch. So
+nothing downstream needs touching: it is enough to make the CSA pass *say*
+`"mixed"`.
+
+Add a post-pass after the per-return loop that classifies each return
+independently and records `"mixed"` when they disagree:
+
+```python
+_kinds = {coarse_ptr_kind(n.value) for n in ast.walk(fnode)
+          if isinstance(n, ast.Return) and n.value is not None}
+_kinds.discard(None)
+if len(_kinds) > 1:
+    _func_ret_types[fname] = "mixed"
+```
+
+Deliberately scope `coarse_ptr_kind` to **pointer** kinds only (STR, BYTES,
+LIST, TUPLE, DICT, SET) and return None for everything else, including `None`
+returns, scalars, and any expression it cannot classify. Rationale: `return
+None` alongside `return [...]` is extremely common and already tolerated
+everywhere, and INT/FLOAT returns are decided by a separate scalar mechanism
+(i64 vs double LLVM return types) that `"mixed"` would disrupt. Restricting to
+disagreeing pointer kinds fixes the actual breakage with minimal blast radius.
+An unclassifiable return must count as *no* constraint, never as disagreement —
+otherwise every `return helper()` would go MIXED.
+
+Note the `"ptr"` tag is separately overloaded — it means both "definitely
+list/tuple" (annotations at ~10408/~10414) and "a pointer, kind unknown"
+(the `_duf_determine_ret_tag` fallback at ~10337), and `ValueType.from_old_tag`
+maps both to `VKind.LIST` (:346, :364). That overload wants splitting for the
+same reason, but it is not what mis-types `r` here.
+
+**Severity:** wrong answers, not memory-unsafe — `fastpy_list_length` reads the
+`FpyList` length field of a string, which is in-bounds for the allocation. Every
+regression test has a docstring, so in the test suite the broken path is the
+*normal* one; user code without a docstring silently gets the working one.
+
+**Not a regression:** reproduces identically at the parent commit.
+
+**Where it bites:** `tests/regressions/native_slot_const_rc_tag.py` had to move
+its `len()` coverage inside functions for this reason; the module-level cases
+there only `print()` the value.
+
+### ~~BUG-NATIVE-SLOT-CONST-RC-TAG. A slot holding an FpyValue is refcounted with a compile-time constant tag, so a mixed-kind assignment segfaults~~ — FIXED 2026-07-26
+
+**What:** `_retain_native_store` makes a bare (non-FpyValue) alloca own what it
+holds, and it retained/released with a tag derived from the variable's **static**
+kind:
+
+```python
+self.builder.call(self.runtime["rc_incref"],
+                  [ir.Constant(i32, fpy_tag), self._ptr_as_i64(value)])
+```
+
+That is right for a genuine native slot — one native pointer whose kind the
+compiler knows. But the bare-ABI store path also takes whole `{i32, i64}`
+FpyValues, and there the static kind is a guess. A function returning a str on
+one branch and a list on another is typed `list`, so:
+
+```python
+def pick(flag):
+    if flag:
+        return "abcd"
+    return [1, 2, 3]
+
+r = pick(True)          # fpy_rc_incref(FPY_TAG_LIST, <str pointer>)
+```
+
+retained a string through the `FpyList` header offset and wrote past the end of
+the allocation — an outright segfault at module scope, before anything printed:
+
+```
+AddressSanitizer: SEGV ... caused by a WRITE memory access
+    #0 fpy_rc_incref runtime/objects.c
+```
+
+**The store itself was never wrong.** The emitted IR stored the correct struct,
+and `print(r)` rendered `abcd` through `fastpy_fv_write` on the same variable in
+the same statement; only the *refcount* ops flanking the store used a constant:
+
+```llvm
+%".4" = call {i32, i64} @"fastpy.user.pick"(...)   ; correct runtime tag
+call void @"fpy_rc_incref"(i32 5, i64 %".5")       ; 5 == FPY_TAG_LIST
+store {i32, i64} %".4", {i32, i64}* %"r"           ; correct tag stored
+```
+
+**Fix:** not a better static guess — no static tag can be right here, since the
+kind depends on the branch taken. The slot is tagged at runtime already, so
+retain and release now read that tag. A `_RC_TAG_DYNAMIC = -2` sentinel in the
+native-slot registry marks "this slot holds a whole FpyValue"; the retain in
+`_retain_native_store` and the release in `_release_native_slot` then
+`extract_value` the tag and data out of the struct instead of emitting an
+`ir.Constant`. The `_is_fv` test has to run *before* the `fpy_tag is None`
+early-out, because a static scalar kind says nothing about what the struct
+actually holds. The FpyValue-locals store path had always done this; the
+bare-ABI path was the hole.
+
+**Not the `len()` dispatch.** `_emit_builtin_len` already falls back to
+`fastpy_fv_len`, which switches on the tag; the first diagnosis blamed the
+`"ptr"` → `VKind.LIST` mapping in `ValueType.from_old_tag` and was wrong.
+Re-probing showed both `len()` calls already used `fv_len`, and ASan pinned the
+fault in the *assignment*. (`"ptr"` is still overloaded — it means both
+"definitely list/tuple", from `list[int]`/`tuple[...]` annotations at ~10408 and
+~10414, and "pointer of unknown kind", from the `_infer_ret_tag` fallback at
+~10337 — but that overload was not what crashed this program.)
+
+**Regression test:** `tests/regressions/native_slot_const_rc_tag.py` — mixed
+str/list/dict/int returns through one slot at module scope, in a function,
+rebound across kinds, aliased, and in loops of 30–40 iterations where a wrong
+tag corrupts or leaks every iteration. Fails at the parent commit.
 
 ### ~~BUG-BARE-ABI-STORE-NO-RETAIN. Assigning an owned str temp to a local inside a bare-ABI function is a use-after-free~~ — FIXED 2026-07-26
 

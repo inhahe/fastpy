@@ -21511,6 +21511,16 @@ class CodeGen:
         VKind.OBJ: FPY_TAG_OBJ,
     }
 
+    # Registry sentinel: this slot holds a whole FpyValue, so the tag to
+    # retain/release with is the one *in the value*, not a compile-time
+    # constant.  A bare alloca is normally a single native pointer whose kind
+    # the compiler knows statically, but the bare-ABI store path also takes
+    # `{i32, i64}` values whose kind is only known at runtime — a function
+    # returning a str on one branch and a list on another is typed `list`
+    # statically, and retaining a str pointer as FPY_TAG_LIST writes through
+    # the wrong header offset.  See BUG-NATIVE-SLOT-CONST-RC-TAG.
+    _RC_TAG_DYNAMIC = -2
+
     @classmethod
     def _native_heap_tag(cls, type_tag) -> 'int | None':
         """The fpy_rc_* tag for a native slot of this static kind, or None if
@@ -21582,7 +21592,16 @@ class CodeGen:
         """
         if not self._USE_REFCOUNT:
             return
-        fpy_tag = self._native_heap_tag(type_tag)
+        # An FpyValue-typed slot carries its own tag, and that tag is the only
+        # trustworthy one: the static kind may say LIST for a callee that
+        # returned a str on this path.  Retain and release with the runtime
+        # tag instead of a constant (BUG-NATIVE-SLOT-CONST-RC-TAG).  This has
+        # to precede the `fpy_tag is None` early-out, because a static scalar
+        # kind says nothing about what the struct actually holds.
+        _is_fv = (isinstance(value.type, ir.LiteralStructType)
+                  and value.type == fpy_val)
+        fpy_tag = (self._RC_TAG_DYNAMIC if _is_fv
+                   else self._native_heap_tag(type_tag))
         reg = self._rc_native_slots_for_fn()
         prev = reg.get(name)
 
@@ -21609,8 +21628,15 @@ class CodeGen:
 
         # 1. Retain the incoming value (unless the producer handed us its +1).
         if not steal:
-            self.builder.call(self.runtime["rc_incref"],
-                              [ir.Constant(i32, fpy_tag), self._ptr_as_i64(value)])
+            if fpy_tag == self._RC_TAG_DYNAMIC:
+                self.builder.call(
+                    self.runtime["rc_incref"],
+                    [self.builder.extract_value(value, 0),
+                     self.builder.extract_value(value, 1)])
+            else:
+                self.builder.call(
+                    self.runtime["rc_incref"],
+                    [ir.Constant(i32, fpy_tag), self._ptr_as_i64(value)])
         # 2. Release what the slot held before.
         if prev is None:
             # First store into this slot — the alloca may hold stack garbage,
@@ -21625,8 +21651,18 @@ class CodeGen:
 
     def _release_native_slot(self, name: str, alloca: ir.AllocaInstr,
                               fpy_tag: int) -> None:
-        """Emit `rc_decref(fpy_tag, <current contents of alloca>)`."""
+        """Emit `rc_decref(fpy_tag, <current contents of alloca>)`.
+
+        `fpy_tag == _RC_TAG_DYNAMIC` means the slot holds a whole FpyValue, so
+        the tag to release with travels in the value itself — releasing with a
+        constant would treat, say, a str as an FpyList.
+        """
         old = self.builder.load(alloca, name=f"{name}.rcold")
+        if fpy_tag == self._RC_TAG_DYNAMIC:
+            self.builder.call(self.runtime["rc_decref"],
+                              [self.builder.extract_value(old, 0),
+                               self.builder.extract_value(old, 1)])
+            return
         self.builder.call(self.runtime["rc_decref"],
                           [ir.Constant(i32, fpy_tag), self._ptr_as_i64(old)])
 

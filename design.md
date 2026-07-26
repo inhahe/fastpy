@@ -93,9 +93,25 @@ Four structural rules follow, and all have been the source of real bugs:
     registry at function exit. Gated on `_NATIVE_HEAP_TAGS` so scalar slots stay
     refcount-traffic-free; PYOBJ is excluded because the CPython bridge owns
     those pointers.
+  - **A slot that holds a whole `FpyValue` must be refcounted with the tag *in
+    the value*, never a static one.** The bare-ABI store path is not limited to
+    genuine native slots: it also takes `{i32, i64}` structs, and there the
+    variable's static kind is a guess. A function returning a str on one branch
+    and a list on another is typed `list`, so retaining with a constant
+    `FPY_TAG_LIST` walks a string through the `FpyList` header offset and writes
+    out of bounds. The registry records `_RC_TAG_DYNAMIC` for such slots, and
+    both the retain and the release `extract_value` the tag and data out of the
+    struct instead of emitting an `ir.Constant`. The test has to precede the
+    "no heap tag for this kind" early-out, since a static *scalar* kind likewise
+    says nothing about what the struct actually holds.
 
-  Module scope sits outside both: module-level names take an early-return global
-  path with no refcount traffic at all.
+  Module scope is *not* uniformly outside both, despite how it reads. A
+  module-level name that was promoted to an LLVM global (because a function
+  reads it, or a `global` statement names it) takes an early-return path in
+  `_store_variable` with no refcount traffic at all. Every other module-level
+  name is an ordinary local of `fastpy_main` and gets the same treatment as any
+  other local — which is why the FpyValue-slot crash above landed at module
+  scope.
 
   **Ordering:** the retain must come *before* the release of the old value, or
   `s = s` drops the last reference and then stores a dangling pointer. Both
@@ -114,6 +130,42 @@ Four structural rules follow, and all have been the source of real bugs:
   holding an undefined value, and decref'ing that is a UAF, whereas leaking it is
   the safe direction. Dominance holds at either site. If a new construct emits a
   statement list, it must do the same.
+
+### Two local representations, and how one is chosen
+
+A local is stored either as an **FpyValue** (`{i32 tag, i64 data}` — the slot
+carries its own runtime tag) or **bare** (a naked `i8*`/`i64`/`double`, tag
+known only to the compiler). `_USE_FV_LOCALS` selects FpyValue by default;
+`_current_fn_bare_abi` overrides it per function, and bare-ABI exists for speed:
+plain arithmetic, no shadow stack, no line tracking, so LLVM can optimise tight
+loops at C++ speed.
+
+**For module-level code the choice is made by `_gen_detect_bare_abi`**, which
+scans the non-`def`/non-`class` statements of the module and disables bare-ABI
+if any of them contains a class, a container/comprehension literal, a
+subscript, an attribute access, an f-string, a `try`/`raise`, an import, a
+tuple — **or any string constant**. A module docstring is a module-level
+`ast.Expr(Constant(str))`, so *having a docstring at all* puts module code on
+the FpyValue path. Bear this in mind when a bug reproduces in a scratch file
+but not in a regression test, or vice versa: every regression test has a
+docstring, so the test suite exercises the FpyValue path for module code almost
+exclusively.
+
+The two paths are **not** interchangeable, and the difference is tag fidelity:
+
+- Bare-ABI `_load_variable` does a raw `builder.load(alloca)`. If the store put
+  a whole `{i32, i64}` there, the load hands back a fully tagged FpyValue — so
+  a value whose kind is only known at runtime survives, *by accident*.
+- The FpyValue path calls `_unwrap_fv_for_tag(fv, type_tag)`, which for any
+  pointer kind returns `_fv_as_ptr(fv)` and **discards the runtime tag** in
+  favour of the compiler's static one. When the static kind is a guess (a
+  callee returning a str on one branch and a list on another) everything
+  downstream sees the wrong kind. See BUG-MODULE-DOCSTRING-UNBOXES-GLOBAL.
+
+The general rule: **a static kind is only safe to act on when it is a fact, not
+an inference.** `VKind.MIXED` exists to say "runtime dispatch needed"; a
+producer that cannot commit to one kind should use it rather than picking a
+plausible one.
 
 ## Runtime
 
