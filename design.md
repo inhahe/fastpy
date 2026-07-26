@@ -85,8 +85,8 @@ the CPython bridge for SlateOS later as a superset once CPython is ported.
   + musl libc in one portable download, so no system-wide toolchain and no
   separately vendored musl sysroot is needed (operator approved option A, Q30).
   `_find_zig_cc()` locates it (`$FASTPY_ZIG` / PATH / `D:\utils\zig-*`).
-  `ensure_slateos_runtime_built()` compiles the six pure-mode TUs — `runtime`,
-  `objects`, `threading`, `gc`, `bigint`, **`bridge_stub`** — into
+  `ensure_slateos_runtime_built()` compiles the seven pure-mode TUs — `runtime`,
+  `objects`, `threading`, `gc`, `bigint`, **`bridge_stub`**, **`pathlib_pure`** — into
   `runtime/slateos/*.o` with flags mirroring the codegen ABI (`-mcmodel=large`,
   `-fno-pic -fno-pie`, `-DFPY_PURE_MODE`). Pure-mode specifics:
   - **`bridge_stub.c`** substitutes for `cpython_bridge.c`: refcount hooks are
@@ -235,8 +235,59 @@ the CPython bridge for SlateOS later as a superset once CPython is ported.
   `self_test_fastpy_slateos_<name>` in `kernel/src/proc/spawn.rs`): the tool
   round-trips data through the kernel path and writes the result to a file the
   harness asserts byte-for-byte, so a stub/mis-lowering cannot fake a pass.
+- [x] **Pure-mode `pathlib.Path`** (`runtime/pathlib_pure.c`, on-target verified)
+  — the CPython-free implementation of the whole `Path` surface codegen emits:
+  construction, `/` and `joinpath`, `name`/`stem`/`suffix`/`parent`,
+  `exists`/`is_file`/`is_dir`, `resolve`, `read_text`/`write_text`,
+  `with_suffix`, `iterdir`, and the `Path.cwd()` classmethod. Predicates
+  delegate to the native `fastpy_os_path_*` helpers in `objects.c`, so no new
+  struct-stat ABI dependency.
+
+  **Representation (matters — it is an ABI contract with codegen):** a Path is
+  OBJ-tagged (`FPY_TAG_OBJ`), and fastpy's OBJ refcount dispatcher
+  (`fpy_rc_incref`/`decref`) has no type information, so it *blind-probes* the
+  pointee for an `FpyObj` magic at **byte offset 32** and an `FpyClosure` magic
+  at **offset 0**. The obvious "a Path is just a `char*`" representation puts
+  path *text* under both probes — a filename whose bytes 32..35 spell "SJBO"
+  (`FPY_OBJ_MAGIC`) was therefore mistaken for a live object and had its own
+  bytes decremented as a refcount. That is user-controllable and deterministic,
+  not a rare collision. So a pure-mode Path is an **`FpyPurePath` header block**:
+  magic at offset 0, a zero guard word at offset 32, NUL-terminated text at
+  offset 40. Consumers must use `_p()` / the exported `fastpy_path_as_cstr()`;
+  never cast a Path to `char*`. Two consequences: `fastpy_path_with_suffix` has
+  a pure-mode implementation here (the `runtime.c` one is `#ifndef
+  FPY_PURE_MODE`), and codegen converts a Path right-hand join operand through
+  `path_str` (`_emit_path_join_operand`).
+
+  **String results** (`name`/`stem`/`suffix`/`str()`/`read_text`) are tagged
+  `FPY_TAG_STR` and so must be `fpy_str_alloc`-headed, never bare `strdup` — the
+  refcount machinery reads an 8-byte header at `data - 8`, and on the SlateOS
+  allocator a bare `strdup`'s preceding word can collide with `FPY_STR_MAGIC`
+  and free a wild pointer.
+
+  **`iterdir()`** is typed `list[Path]` by codegen (`_is_path_iterdir_call`),
+  and *both* runtimes return an `FpyList*` of OBJ-tagged Paths — codegen is
+  deliberately mode-agnostic, so the bridge was changed to match rather than
+  returning a raw PyObject* list. CPython's laziness is the one semantic
+  difference; the bridge was always eager too.
 - [ ] **CPython bridge on SlateOS (B)** — later, once CPython is ported, so
   unsupported-stdlib programs also run on-target.
+
+## `tools/pure_harness.py` — fast memory-safety loop for pure mode
+
+Pure-mode bugs used to be found only by a ~6-minute QEMU boot that reports a
+single exit code and no memory-safety signal. `tools/pure_harness.py` closes
+that loop to seconds: it takes a fastpy program, generates IR with the **real**
+`CodeGen`, strips the target triple/datalayout, and builds it under WSL clang
+against the **real** pure-mode runtime TUs (`-DFPY_PURE_MODE`) with
+`-fsanitize=address,undefined -fno-sanitize-recover=all`. Same codegen, same C,
+native Linux instead of SlateOS — so anything that is a genuine out-of-bounds,
+use-after-free, or misaligned access shows up with a stack trace and an
+allocation site instead of a silently wrong answer. Both live Path bugs this
+session (the offset-32 heap-buffer-overflow and a misaligned `FpyObj` access
+from `Path.cwd()`) were pinpointed this way. Regression programs live in
+`tests/pure/*.py` and print a bitmask (Linux truncates exit codes to 8 bits;
+SlateOS does not, which is why the on-target tools exit with theirs).
 
 ## Tests
 
