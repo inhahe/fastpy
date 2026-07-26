@@ -1165,6 +1165,21 @@ class CodeGen:
         # wrapping/unwrapping in _store_variable / _load_variable.
         self._native_vars: dict[str, tuple] = {}
 
+        # Model-2 refcounting for *native* (non-FpyValue) variable slots.
+        # An FV local carries its tag with it, so _store_variable can always
+        # decref whatever the slot held.  A native slot is a bare alloca — the
+        # tag lives only in the compiler — so we remember, per function, the
+        # tag each slot was last retained with:
+        #     {ir.Function: {name: (alloca, fpy_tag)}}
+        # Keyed by function (rather than reset alongside self.variables) so the
+        # several places that swap self.variables in and out don't have to know
+        # about it.  See BUG-BARE-ABI-STORE-NO-RETAIN.
+        self._rc_native_slots: dict = {}
+        # Native allocas already zero-initialized in their entry block, so the
+        # very first decref of a conditionally-assigned slot reads NULL rather
+        # than stack garbage.  Holds the alloca instructions themselves.
+        self._entry_nulled: set = set()
+
         # Pre-initialize attributes that generate() sets later,
         # so early exceptions don't leave them missing.
         self._singledispatch = {}
@@ -9678,6 +9693,13 @@ class CodeGen:
                                 # n = int(x) — always produces an integer,
                                 # even when the argument is a float param.
                                 pass
+                            elif self._expr_is_str(n.value):
+                                # `s = str(n)`, `s = x.upper()`, `s = ",".join(...)`
+                                # — the return-type inference below already knew
+                                # these produce strings when returned *directly*,
+                                # but not via a local, so `return s` inferred i64
+                                # and the caller printed a pointer as an integer.
+                                str_vars.add(tgt.id)
                             else:
                                 for sub in ast.walk(n.value):
                                     if isinstance(sub, ast.Constant) and isinstance(sub.value, float):
@@ -9752,11 +9774,7 @@ class CodeGen:
                     # s.strip(), s.replace(...) etc.
                     if (isinstance(n.value, ast.Call)
                             and isinstance(n.value.func, ast.Attribute)
-                            and n.value.func.attr in (
-                                "upper", "lower", "strip", "lstrip", "rstrip",
-                                "replace", "capitalize", "title", "swapcase",
-                                "center", "ljust", "rjust", "zfill", "join",
-                                "format")):
+                            and n.value.func.attr in self._STR_METHODS):
                         ret_type = i8_ptr
                         break
                     # Returning a list-returning method call like d.keys(),
@@ -9777,8 +9795,7 @@ class CodeGen:
                     # Returning a builtin that produces a string
                     if (isinstance(n.value, ast.Call)
                             and isinstance(n.value.func, ast.Name)
-                            and n.value.func.id in ("str", "repr", "hex",
-                                                     "bin", "oct", "chr")):
+                            and n.value.func.id in self._STR_BUILTINS):
                         ret_type = i8_ptr
                         break
                     # Returning a builtin that produces a list
@@ -21320,6 +21337,139 @@ class CodeGen:
         self.builder.store(undef_fv, alloca)
         self.builder.position_at_end(saved_block)
 
+    # Static kinds whose runtime representation is a refcounted heap pointer,
+    # mapped to the fpy_rc_incref/decref tag that dispatches to the right
+    # object header.  PYOBJ is deliberately absent: those are CPython-bridge
+    # pointers whose lifetime the bridge owns, not fpy_rc_*.
+    _NATIVE_HEAP_TAGS = {
+        VKind.STR: FPY_TAG_STR,
+        VKind.BYTES: FPY_TAG_BYTES,
+        VKind.LIST: FPY_TAG_LIST,
+        VKind.TUPLE: FPY_TAG_LIST,   # tuples are FpyList at runtime
+        VKind.DICT: FPY_TAG_DICT,
+        VKind.SET: FPY_TAG_SET,
+        VKind.OBJ: FPY_TAG_OBJ,
+    }
+
+    @classmethod
+    def _native_heap_tag(cls, type_tag) -> 'int | None':
+        """The fpy_rc_* tag for a native slot of this static kind, or None if
+        the kind is a non-refcounted scalar (INT/FLOAT/BOOL/NONE) or is not
+        managed by fpy_rc_* at all (PYOBJ, CELL, UNKNOWN)."""
+        return cls._NATIVE_HEAP_TAGS.get(cls._tag_kind(type_tag))
+
+    def _ptr_as_i64(self, value: ir.Value) -> ir.Value:
+        """Widen a native heap value to the i64 `data` word that
+        fpy_rc_incref/fpy_rc_decref take."""
+        if isinstance(value.type, ir.PointerType):
+            return self.builder.ptrtoint(value, i64)
+        if isinstance(value.type, ir.IntType):
+            if value.type.width < 64:
+                return self.builder.zext(value, i64)
+            if value.type.width > 64:
+                return self.builder.trunc(value, i64)
+        return value
+
+    def _rc_native_slots_for_fn(self) -> dict:
+        """The native-slot refcount registry for the function being emitted."""
+        return self._rc_native_slots.setdefault(self.function, {})
+
+    def _entry_store_null(self, alloca: ir.AllocaInstr) -> None:
+        """Zero-initialize a *native* (non-FpyValue) alloca in the entry block,
+        after all allocas — the native counterpart of _entry_store_fv_none.
+
+        _create_entry_alloca deliberately leaves slots uninitialized, so a
+        variable assigned only inside an `if` would have the release on its
+        store path (and the one in _emit_scope_decref) read stack garbage and
+        decref a wild pointer.  fpy_rc_decref's `if (data == 0) return;` guard
+        makes a zeroed slot a safe no-op.  Idempotent per alloca.
+        """
+        if alloca in self._entry_nulled:
+            return
+        self._entry_nulled.add(alloca)
+        saved_block = self.builder.block
+        entry_block = self.function.entry_basic_block
+        insert_before = None
+        for inst in entry_block.instructions:
+            if not isinstance(inst, ir.AllocaInstr):
+                insert_before = inst
+                break
+        if insert_before is not None:
+            self.builder.position_before(insert_before)
+        else:
+            self.builder.position_at_end(entry_block)
+        # ir.Constant only — an instruction here could violate dominance.
+        self.builder.store(ir.Constant(alloca.type.pointee, None), alloca)
+        self.builder.position_at_end(saved_block)
+
+    def _retain_native_store(self, name: str, alloca: ir.AllocaInstr,
+                              value: ir.Value, type_tag,
+                              steal: bool = False) -> None:
+        """Make a native slot *own* the reference it is about to hold.
+
+        FV locals get this for free in the FV path of _store_variable; native
+        slots (--typed `_native_vars` and bare-ABI locals) used to be a plain
+        `builder.store`, which under Model-2 is a use-after-free: the producer
+        registered the fresh +1 as an owned temp, the statement-boundary flush
+        released it, and the variable was left pointing at freed memory.
+        See BUG-BARE-ABI-STORE-NO-RETAIN.
+
+        Order matters: **incref the new value before decref'ing the old one**,
+        so `x = x` (and `x = x[0]`, `x = f(x)`, ...) cannot drop the last
+        reference before taking the new one.  The old value is released with
+        the tag it was *retained* with, read from the registry, because a slot
+        can be rebound to a different static kind.
+        """
+        if not self._USE_REFCOUNT:
+            return
+        fpy_tag = self._native_heap_tag(type_tag)
+        reg = self._rc_native_slots_for_fn()
+        prev = reg.get(name)
+
+        # A registry entry of (alloca, None) means "this slot is tracked but
+        # currently holds no reference" — e.g. a heap-typed name overwritten
+        # with an int.  That is distinct from *absent*, which means "never
+        # stored, contents may be stack garbage": the former must not be
+        # released, the latter needs the entry-block zero-init first.
+        if prev is not None and prev[0] is not alloca:
+            # The name was rebound to a *different* alloca (the bare-ABI path
+            # re-allocas on an LLVM type change).  The old one is now
+            # unreachable, so release it and treat this alloca as fresh.
+            if prev[1] is not None:
+                self._release_native_slot(name, *prev)
+            prev = None
+
+        if fpy_tag is None:
+            # Storing a scalar over whatever was there: nothing to retain, but
+            # the old heap value (if any) still has to be released.
+            if prev is not None and prev[1] is not None:
+                self._release_native_slot(name, *prev)
+            reg[name] = (alloca, None)
+            return
+
+        # 1. Retain the incoming value (unless the producer handed us its +1).
+        if not steal:
+            self.builder.call(self.runtime["rc_incref"],
+                              [ir.Constant(i32, fpy_tag), self._ptr_as_i64(value)])
+        # 2. Release what the slot held before.
+        if prev is None:
+            # First store into this slot — the alloca may hold stack garbage,
+            # so make sure the entry block zeroed it, then release whatever it
+            # holds (NULL on the first execution, a real value if this store is
+            # inside a loop).
+            self._entry_store_null(alloca)
+            self._release_native_slot(name, alloca, fpy_tag)
+        elif prev[1] is not None:
+            self._release_native_slot(name, *prev)
+        reg[name] = (alloca, fpy_tag)
+
+    def _release_native_slot(self, name: str, alloca: ir.AllocaInstr,
+                              fpy_tag: int) -> None:
+        """Emit `rc_decref(fpy_tag, <current contents of alloca>)`."""
+        old = self.builder.load(alloca, name=f"{name}.rcold")
+        self.builder.call(self.runtime["rc_decref"],
+                          [ir.Constant(i32, fpy_tag), self._ptr_as_i64(old)])
+
     # Flip this to True to store locals as FpyValue. Globals and closure
     # cells keep their old representation (globals as i64, cells as heap-
     # allocated FpyCell). During the gradual migration, setting this to
@@ -21407,6 +21557,9 @@ class CodeGen:
                     else self.builder.trunc(value, i64)
             elif kind == VKind.STR and isinstance(value.type, ir.IntType):
                 value = self._ensure_ptr(value)
+            # The slot must own what it holds: the producer's +1 belongs to the
+            # pending-temp list and is released at the statement boundary.
+            self._retain_native_store(name, alloca, value, ValueType(kind), steal)
             self.builder.store(value, alloca)
             # Also update self.variables type tag so _emit_expr reads the
             # correct VKind for this variable.
@@ -21452,6 +21605,10 @@ class CodeGen:
             else:
                 alloca = self._create_entry_alloca(value.type, name)
                 self.variables[name] = (alloca, type_tag)
+            # Bare allocas carry no runtime tag, so ownership has to be tracked
+            # compiler-side — otherwise the statement-boundary flush frees the
+            # value out from under the variable.  See BUG-BARE-ABI-STORE-NO-RETAIN.
+            self._retain_native_store(name, alloca, value, type_tag, steal)
             self.builder.store(value, alloca)
             return
 
@@ -26001,6 +26158,26 @@ class CodeGen:
             fv_tag = self.builder.extract_value(fv, 0)
             fv_data = self.builder.extract_value(fv, 1)
             self.builder.call(self.runtime["rc_decref"], [fv_tag, fv_data])
+
+        # Native (non-FpyValue) slots that _retain_native_store made owning.
+        # The loop above skips them because their alloca isn't an fpy_val, so
+        # without this they would retain-on-store and never release.
+        for var_name, (alloca, fpy_tag) in self._rc_native_slots_for_fn().items():
+            if fpy_tag is None:
+                continue  # tracked, but currently holds no reference
+            if var_name == exclude_var:
+                continue
+            if var_name in param_names:
+                continue  # borrowed reference from caller
+            if var_name in self._global_vars:
+                continue  # globals outlive the function
+            # If the name has since been rebound to a different alloca, the
+            # registry entry is stale — the live binding is what self.variables
+            # says, and it was released when it was rebound.
+            cur = self.variables.get(var_name)
+            if cur is None or cur[0] is not alloca:
+                continue
+            self._release_native_slot(var_name, alloca, fpy_tag)
 
     def _infer_ret_tag_for_value(self, value: ir.Value,
                                   node: ast.expr) -> int:
@@ -32630,6 +32807,44 @@ class CodeGen:
                 and node.func.attr == "iterdir"
                 and not node.args
                 and self._is_path_expr(node.func.value))
+
+    # Builtins and str methods that always produce a new string.  Shared by
+    # _expr_is_str and by the return-type inference in
+    # _analyze_function_signature, so the two can't drift out of sync — they
+    # did, and `def f(n): s = str(n); return s` inferred an i64 return and
+    # printed the pointer as an integer.
+    _STR_BUILTINS = frozenset(("str", "repr", "hex", "bin", "oct", "chr"))
+    _STR_METHODS = frozenset((
+        "upper", "lower", "strip", "lstrip", "rstrip", "replace",
+        "capitalize", "title", "swapcase", "center", "ljust", "rjust",
+        "zfill", "join", "format",
+    ))
+
+    def _expr_is_str(self, node: ast.expr) -> bool:
+        """True when an expression statically, unambiguously evaluates to a
+        `str`.  Conservative: a False answer only costs precision."""
+        if isinstance(node, ast.Constant):
+            return isinstance(node.value, str)
+        if isinstance(node, ast.JoinedStr):
+            return True
+        if isinstance(node, ast.Call):
+            if (isinstance(node.func, ast.Name)
+                    and node.func.id in self._STR_BUILTINS):
+                return True
+            if (isinstance(node.func, ast.Attribute)
+                    and node.func.attr in self._STR_METHODS):
+                # `d.items().join`-style false positives aren't possible: these
+                # names are str-only in the supported subset, except `format`
+                # which is also str-only here.
+                return True
+            return False
+        # `a if c else b` — a str only when both arms are.
+        if isinstance(node, ast.IfExp):
+            return self._expr_is_str(node.body) and self._expr_is_str(node.orelse)
+        # Concatenation / repetition of a known str.
+        if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Mult)):
+            return self._expr_is_str(node.left) or self._expr_is_str(node.right)
+        return False
 
     def _is_list_expr(self, node: ast.expr) -> bool:
         """Check if an AST expression evaluates to a list."""

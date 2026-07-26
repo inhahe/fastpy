@@ -67,14 +67,34 @@ Three structural rules follow, and all have been the source of real bugs:
   a filter forks the body into keep/skip arms that both reach the incr block,
   `_release_rc_temps_since(mark)` emits the release on the skip arm *without*
   consuming the pending list, so each mutually exclusive path releases once.
-- **Every store path must retain, or the flush frees a live variable.** The FV
-  local path decrefs the slot's old contents and increfs the new value unless the
-  caller passes `steal=True`. The bare-ABI and `_native_vars` store paths in
-  `_store_variable` currently do neither, which makes `s = str(7)` inside a
-  function a use-after-free (see `known-issues.md`,
-  **BUG-BARE-ABI-STORE-NO-RETAIN**). Module scope escapes it only because
-  module-level names take an early-return global path with no refcount traffic
-  at all.
+- **Every store path must retain, or the flush frees a live variable.** A
+  variable that outlives the statement that produced its value has to take its
+  own reference; otherwise the boundary flush frees it and the next read is
+  garbage. How this is done depends on the slot's representation:
+  - An **FpyValue local** is a `{tag, data}` pair, so the slot carries its own
+    tag: `_store_variable`'s FV path can incref the incoming value and decref
+    whatever the slot held, unless the caller passes `steal=True` to hand over
+    an already-owned `+1`.
+  - A **native slot** — the bare-ABI path and the `--typed` `_native_vars` fast
+    path — is a bare alloca (`i8*`, `i64`) with no runtime tag, so ownership is
+    tracked *compiler-side* in `_rc_native_slots`, a per-`ir.Function` map of
+    `name -> (alloca, tag)` recording the tag each slot was last **retained**
+    with. `_retain_native_store` increfs the new value, then releases the old
+    contents using the recorded tag — necessary because a slot can be rebound
+    across static kinds (`x = str(5)` then `x = 12`). `_entry_store_null` zeroes
+    such allocas in the entry block so a slot assigned on only one branch
+    releases NULL instead of stack garbage, and `_emit_scope_decref` walks the
+    registry at function exit. Gated on `_NATIVE_HEAP_TAGS` so scalar slots stay
+    refcount-traffic-free; PYOBJ is excluded because the CPython bridge owns
+    those pointers.
+
+  Module scope sits outside both: module-level names take an early-return global
+  path with no refcount traffic at all.
+
+  **Ordering:** the retain must come *before* the release of the old value, or
+  `s = s` drops the last reference and then stores a dangling pointer. The
+  native path does this; the FV path still decrefs first
+  (**BUG-FV-STORE-DECREF-BEFORE-INCREF**).
 
 ## Runtime
 

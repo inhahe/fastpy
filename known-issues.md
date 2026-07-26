@@ -8,7 +8,7 @@ how to reproduce it, and what the proper fix looks like.
 
 ## Active Bugs
 
-### BUG-BARE-ABI-STORE-NO-RETAIN. Assigning an owned str temp to a local inside a bare-ABI function is a use-after-free — 2026-07-26
+### ~~BUG-BARE-ABI-STORE-NO-RETAIN. Assigning an owned str temp to a local inside a bare-ABI function is a use-after-free~~ — FIXED 2026-07-26
 
 **What:** inside a function compiled with the bare-type ABI, storing a
 Model-2 **owned** temp into a local emits no incref, but the statement-boundary
@@ -89,6 +89,160 @@ dict/typed-list stores of `str/repr/hex/oct/bin/chr` … no UAF/double-free" cla
 under BUG-CODEGEN-OWNED-TEMP-OVER-INCREF Stage 3.1 is **too strong** — those
 checks were written at module scope, which takes the global path and so never
 exercised this branch.
+
+**Fixed 2026-07-26** exactly as the three-part plan above describes, with
+ownership tracked compiler-side because a bare alloca carries no runtime tag:
+
+- `self._rc_native_slots: dict[ir.Function, dict[str, tuple[alloca, fpy_tag]]]`
+  records, per function, the tag each native slot was last *retained* with — a
+  slot can be rebound across static kinds (`x = str(5)` then `x = 12`), so the
+  release must use the tag from the retain, not the tag being stored now. Keyed
+  by `ir.Function` so the several places that swap `self.variables` in and out
+  don't have to know about it.
+- `_retain_native_store` increfs the incoming value **before** decref'ing the
+  old contents, so `s = s` (and `s = f(s)`, `s = s[1:]`) can't drop the last
+  reference before taking the new one. *The FV path at ~21603 still has the
+  reverse order — decref-old then incref-new — and is a latent self-assignment
+  UAF; see BUG-FV-STORE-DECREF-BEFORE-INCREF.*
+- `_entry_store_null` zeroes a native alloca in the entry block (after all
+  allocas, `ir.Constant` only so dominance holds), so a slot assigned on only
+  one branch releases NULL rather than stack garbage — `fpy_rc_decref`'s
+  `if (data == 0) return;` makes that a no-op.
+- Rebinding a name to a *different* alloca (the bare-ABI path re-allocas on an
+  LLVM type change) releases the old alloca, which is otherwise unreachable.
+- `_emit_scope_decref` gained a second walk over the registry, keeping the
+  existing exclusions (params borrowed, returned var transfers ownership,
+  globals outlive the frame) and skipping stale entries whose name has since
+  been rebound.
+
+`_NATIVE_HEAP_TAGS` gates all of this on the slot's static VKind being a
+refcounted heap kind (STR/BYTES/LIST/TUPLE/DICT/SET/OBJ), so scalar slots stay
+refcount-traffic-free. PYOBJ is deliberately excluded — those are CPython-bridge
+pointers the bridge owns, not `fpy_rc_*`.
+
+Regression test: `tests/regressions/rc_native_slot_retain.py` (ASan/UBSan/LSan
+clean under `tools/pure_harness.py`; the same file aborts ASan at the parent
+commit).
+
+### BUG-INDIRECT-CALL-RET-TAG-INT. A nested `def`'s return value is tagged INT at the call site, so a returned str prints as a pointer — 2026-07-26
+
+**What:** a nested function is lowered to a closure object and invoked
+indirectly through `fastpy_call_ptrN`, which returns a bare `i64`. The call site
+then wraps that `i64` into an `FpyValue` with a **hardcoded** tag of `0` (INT)
+instead of consulting the callee's return tag. Any non-int return — `str`,
+`list`, `dict` — comes back as an integer, so the value prints as a decimal
+pointer.
+
+**Reproduce** (prints e.g. `88098369175608` instead of `3?`):
+```python
+def outer():
+    def make(n):
+        s = str(n) + "?"
+        return s
+    r = make(3)
+    print(r)
+
+outer()
+```
+The emitted IR for `outer` shows the hardcoded tag:
+```llvm
+%".19" = call i64 @"fastpy_call_ptr1"(i8* %".17", i64 3)
+%".20" = insertvalue {i32, i64} undef, i32 0, 0   ; <-- tag 0 = INT, always
+%".21" = insertvalue {i32, i64} %".20", i64 %".19", 1
+store {i32, i64} %".21", {i32, i64}* %"r"
+```
+Note `fastpy.user.make` itself correctly returns `{i32, i64}` — the real tag
+exists, it is thrown away by the `__i64_wrap` thunk and never recovered.
+
+**Scope of the symptom.** It needs *both* a nested def *and* binding the result
+to a name; a direct `print(make(3))` passes because print's argument path
+recovers the tag another way. A module-level `def` is unaffected (it is called
+directly, not through a closure object). Measured:
+
+| case | result |
+|---|---|
+| `def make(...)` top level; `r = make(3); print(r)` | pass |
+| nested `def make(...)`; `print(make(3))` | pass |
+| nested `def make(...)`; `r = make(3); print(r)` | **fail** |
+
+**Where:** `compiler/codegen.py`, the indirect-call emitter that builds
+`fastpy_call_ptrN` calls and wraps the `i64` result. The nested-def registration
+sites also hardcode the return type: `_scan_for_closures` sets
+`ret_type = i64 if has_return else void` and `ret_tag = "int"` at ~4654/4729,
+with an ad-hoc `bool` special case at ~4739–4764 but nothing for `str`/`list`/
+`dict`.
+
+**Proper fix:** have the `__i64_wrap` thunk publish the callee's runtime return
+tag (the mechanism `fpy_ret_tag`/`get_ret_tag()` already provides for bare-ABI
+returns) and read it at the indirect call site instead of hardcoding `0`. The
+static half — teaching `_scan_for_closures` to infer a nested def's return kind
+via `_expr_is_str` / `_is_list_expr` rather than the `bool`-only special case —
+is a worthwhile complement (it would let the closure keep an `i8_ptr` return
+type, as the closure-*lambda* path at ~5464 already does), but the runtime tag
+is the general fix, since a nested def can return different kinds per branch.
+
+**Not a regression:** reproduces identically at the parent commit. Called out in
+the docstring of `tests/regressions/rc_native_slot_retain.py`, which
+deliberately uses module-level helpers to avoid it.
+
+### BUG-FV-STORE-DECREF-BEFORE-INCREF. The FpyValue store path releases the old value before retaining the new one — 2026-07-26
+
+**What:** in `_store_variable`'s FV path, `compiler/codegen.py` decrefs the
+slot's previous contents (~21579/21601) and only *then* increfs the value being
+stored (~21604). When both are the same object and the slot holds the last
+reference, the decref frees it and the incref resurrects freed memory:
+
+```python
+s = str(7)
+s = s          # decref(old s) -> refcount 0 -> freed; then incref(freed)
+```
+
+**Status:** latent — not currently observed to fire, because the producers whose
+results reach the FV path with a refcount of exactly 1 are still the minority
+while the Model-2 migration is in progress, and `s = s` is usually optimised
+away before codegen. It becomes live as more producers are converted.
+
+**Where:** `compiler/codegen.py`, `_store_variable`, the `_USE_FV_LOCALS` branch:
+the decref at ~21579 (new-alloca case) and ~21601 (existing-alloca case) both
+precede the incref at ~21604.
+
+**Proper fix:** swap the order — incref the incoming value first, then release
+the old contents. This is exactly what the native-slot path already does
+(`_retain_native_store`, added for BUG-BARE-ABI-STORE-NO-RETAIN), so the two
+paths should agree. The inline fast paths (`_emit_inline_obj_incref` /
+`_emit_inline_obj_decref`) need the same reordering.
+
+### ~~BUG-RETTAG-STR-VIA-LOCAL. `s = str(n); return s` infers an `int` return, so the caller prints the string pointer as a number~~ — FIXED 2026-07-26
+
+**What:** `_analyze_function_signature`'s return-type inference recognised a
+*direct* `return str(n)` / `return x.upper()` as producing `i8_ptr`, but the
+local-variable classifier that feeds `return <name>` only ever added a name to
+`str_vars` for `s = "literal"`, `s = f"..."` and `s = <str_var> + x`. So routing
+the exact same expression through a local lost the tag:
+
+```python
+def make(n):
+    s = str(n)
+    return s
+
+print(make(3))      # prints e.g. 2639512264584 instead of 3
+```
+`return str(n)` directly worked; `s = str(n) + "?"` worked (the concat rule);
+only the plain builtin-through-a-local form failed.
+
+**Root cause:** two hand-maintained lists of "expressions that produce a str",
+one in the return path and one absent from the assignment path, which drifted.
+
+**Fixed** by extracting the knowledge into a single predicate `_expr_is_str`
+(literals, f-strings, the `str`/`repr`/`hex`/`bin`/`oct`/`chr` builtins, the str
+methods, `+`/`*` with a str operand, and `IfExp` when *both* arms are str),
+using it in the local classifier, and repointing the return path at the same
+`_STR_BUILTINS` / `_STR_METHODS` frozensets so the two cannot drift apart again.
+
+**Related but still open:** BUG-FILEREAD-FN-RETTAG below is the same family —
+`data = f.read(); return data` — but needs open()-derived-receiver tracking that
+`_expr_is_str` deliberately does not attempt, since it can't see which locals
+are file objects.
 
 ### ~~BUG-DECREF-DOES-NOT-DOMINATE. Compiling `compiler/pipeline.py` emits invalid IR — a `fpy_rc_decref` whose operand doesn't dominate it~~ — FIXED 2026-07-26
 
