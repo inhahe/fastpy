@@ -105,6 +105,24 @@ typedef int64_t (*FpyMethod2Func)(FpyObj *self, int64_t a, int64_t b);
 typedef int64_t (*FpyMethod3Func)(FpyObj *self, int64_t a, int64_t b, int64_t c);
 typedef int64_t (*FpyMethod4Func)(FpyObj *self, int64_t a, int64_t b, int64_t c, int64_t d);
 
+/* Void-returning counterparts.  A Python method that never executes a
+ * `return <expr>` is compiled to an LLVM function with a `void` return type,
+ * and codegen records that by passing returns_value=0 to
+ * fastpy_register_method().  Calling such a function through one of the
+ * int64_t-returning pointer types above does not merely produce an unspecified
+ * result — it reads whatever the callee happened to leave in the return
+ * register.  That bit us for real: `with` treated the garbage from a
+ * None-returning __exit__ as a truthy "suppress the exception" answer, and an
+ * exception raised in the with-body vanished instead of reaching its handler
+ * (the value was reliably zero for a trivial __exit__ and non-zero as soon as
+ * the body touched `self`, which is why it looked like a self-reference bug).
+ * Dispatch through these types whenever m->returns_value is 0. */
+typedef void (*FpyMethodVoidFunc)(FpyObj *self);
+typedef void (*FpyMethod1VoidFunc)(FpyObj *self, int64_t a);
+typedef void (*FpyMethod2VoidFunc)(FpyObj *self, int64_t a, int64_t b);
+typedef void (*FpyMethod3VoidFunc)(FpyObj *self, int64_t a, int64_t b, int64_t c);
+typedef void (*FpyMethod4VoidFunc)(FpyObj *self, int64_t a, int64_t b, int64_t c, int64_t d);
+
 /* Method entry in a class */
 typedef struct {
     const char *name;

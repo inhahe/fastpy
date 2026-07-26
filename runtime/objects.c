@@ -6820,6 +6820,13 @@ void fastpy_obj_call_method1_fv(FpyObj *obj, const char *name, int64_t a,
         double d = ((FpyM1DoubleFunc)m->func)(obj, a);
         *out_tag = FPY_TAG_FLOAT;
         memcpy(out_data, &d, sizeof(double));
+    } else if (!m->returns_value) {
+        /* No `return <expr>` anywhere in the method: it is a void function and
+         * its Python value is None.  Reading the return register would produce
+         * a garbage INT.  See FpyMethod1VoidFunc in objects.h. */
+        ((FpyMethod1VoidFunc)m->func)(obj, a);
+        *out_tag = FPY_TAG_NONE;
+        *out_data = 0;
     } else {
         int64_t result = ((FpyMethod1Func)m->func)(obj, a);
         if (m->return_tag >= 0) {
@@ -7343,6 +7350,41 @@ static int64_t _call_vararg_method(FpyMethodDef *m, FpyObj *obj,
         fastpy_list_append_fv(varlist, tag, args[i]);
     }
     int64_t list_as_i64 = (int64_t)(intptr_t)varlist;
+    /* A method with no `return <expr>` is compiled to a void function; calling
+     * it through an int64_t-returning pointer type yields whatever is left in
+     * the return register.  See the FpyMethod*VoidFunc typedefs in objects.h. */
+    if (!m->returns_value) {
+        switch (n_pos) {
+        case 0: {
+            typedef void (*VA0V)(FpyObj*, int64_t);
+            ((VA0V)m->func)(obj, list_as_i64);
+            break;
+        }
+        case 1: {
+            typedef void (*VA1V)(FpyObj*, int64_t, int64_t);
+            ((VA1V)m->func)(obj, args[0], list_as_i64);
+            break;
+        }
+        case 2: {
+            typedef void (*VA2V)(FpyObj*, int64_t, int64_t, int64_t);
+            ((VA2V)m->func)(obj, args[0], args[1], list_as_i64);
+            break;
+        }
+        case 3: {
+            typedef void (*VA3V)(FpyObj*, int64_t, int64_t, int64_t, int64_t);
+            ((VA3V)m->func)(obj, args[0], args[1], args[2], list_as_i64);
+            break;
+        }
+        default: {
+            typedef void (*VA4V)(FpyObj*, int64_t, int64_t, int64_t, int64_t,
+                                 int64_t);
+            ((VA4V)m->func)(obj, args[0], args[1], args[2], args[3],
+                            list_as_i64);
+            break;
+        }
+        }
+        return 0;
+    }
     /* Dispatch based on positional count */
     switch (n_pos) {
     case 0: {
@@ -7390,6 +7432,13 @@ int64_t fastpy_obj_call_method0(FpyObj *obj, const char *name) {
         memcpy(&r, &d, sizeof(double));
         return r;
     }
+    /* void-returning method (no `return <expr>` in the Python source): call it
+     * through a matching pointer type and report None-as-0 rather than reading
+     * a stale return register.  See FpyMethodVoidFunc in objects.h. */
+    if (!m->returns_value) {
+        ((FpyMethodVoidFunc)m->func)(obj);
+        return 0;
+    }
     return ((FpyMethodFunc)m->func)(obj);
 }
 
@@ -7420,6 +7469,10 @@ int64_t fastpy_obj_call_method1(FpyObj *obj, const char *name, int64_t a) {
         memcpy(&r, &d, sizeof(double));
         return r;
     }
+    if (!m->returns_value) {
+        ((FpyMethod1VoidFunc)m->func)(obj, a);
+        return 0;
+    }
     return ((FpyMethod1Func)m->func)(obj, a);
 }
 
@@ -7434,6 +7487,10 @@ int64_t fastpy_obj_call_method2(FpyObj *obj, const char *name, int64_t a, int64_
     if (m->is_vararg) {
         int64_t args_arr[2] = {a, b};
         return _call_vararg_method(m, obj, 2, args_arr);
+    }
+    if (!m->returns_value) {
+        ((FpyMethod2VoidFunc)m->func)(obj, a, b);
+        return 0;
     }
     return ((FpyMethod2Func)m->func)(obj, a, b);
 }
@@ -7450,6 +7507,12 @@ int64_t fastpy_obj_call_method3(FpyObj *obj, const char *name, int64_t a, int64_
         int64_t args_arr[3] = {a, b, c};
         return _call_vararg_method(m, obj, 3, args_arr);
     }
+    /* This is the `with` statement's __exit__ call.  A None-returning __exit__
+     * must read as falsy: a truthy answer means "suppress the exception". */
+    if (!m->returns_value) {
+        ((FpyMethod3VoidFunc)m->func)(obj, a, b, c);
+        return 0;
+    }
     return ((FpyMethod3Func)m->func)(obj, a, b, c);
 }
 
@@ -7464,6 +7527,10 @@ int64_t fastpy_obj_call_method4(FpyObj *obj, const char *name, int64_t a, int64_
     if (m->is_vararg) {
         int64_t args_arr[4] = {a, b, c, d};
         return _call_vararg_method(m, obj, 4, args_arr);
+    }
+    if (!m->returns_value) {
+        ((FpyMethod4VoidFunc)m->func)(obj, a, b, c, d);
+        return 0;
     }
     return ((FpyMethod4Func)m->func)(obj, a, b, c, d);
 }
@@ -7767,30 +7834,44 @@ FpyObj* fastpy_io_open(const char *path, const char *mode) {
     return obj;
 }
 
-/* Call __init__ (void return) */
+/* Call __init__ (its Python return value, if any, is discarded).
+ * __init__ is normally compiled to a void function, so dispatch on
+ * returns_value: calling a void function through an int64_t-returning pointer
+ * type is a signature mismatch even when the result is thrown away, and
+ * -fsanitize=function flags it. */
 void fastpy_obj_call_init0(FpyObj *obj) {
     FpyMethodDef *m = fastpy_find_method(obj->class_id, "__init__");
-    if (m) ((FpyMethodFunc)m->func)(obj);
+    if (!m) return;
+    if (!m->returns_value) ((FpyMethodVoidFunc)m->func)(obj);
+    else ((FpyMethodFunc)m->func)(obj);
 }
 
 void fastpy_obj_call_init1(FpyObj *obj, int64_t a) {
     FpyMethodDef *m = fastpy_find_method(obj->class_id, "__init__");
-    if (m) ((FpyMethod1Func)m->func)(obj, a);
+    if (!m) return;
+    if (!m->returns_value) ((FpyMethod1VoidFunc)m->func)(obj, a);
+    else ((FpyMethod1Func)m->func)(obj, a);
 }
 
 void fastpy_obj_call_init2(FpyObj *obj, int64_t a, int64_t b) {
     FpyMethodDef *m = fastpy_find_method(obj->class_id, "__init__");
-    if (m) ((FpyMethod2Func)m->func)(obj, a, b);
+    if (!m) return;
+    if (!m->returns_value) ((FpyMethod2VoidFunc)m->func)(obj, a, b);
+    else ((FpyMethod2Func)m->func)(obj, a, b);
 }
 
 void fastpy_obj_call_init3(FpyObj *obj, int64_t a, int64_t b, int64_t c) {
     FpyMethodDef *m = fastpy_find_method(obj->class_id, "__init__");
-    if (m) ((FpyMethod3Func)m->func)(obj, a, b, c);
+    if (!m) return;
+    if (!m->returns_value) ((FpyMethod3VoidFunc)m->func)(obj, a, b, c);
+    else ((FpyMethod3Func)m->func)(obj, a, b, c);
 }
 
 void fastpy_obj_call_init4(FpyObj *obj, int64_t a, int64_t b, int64_t c, int64_t d) {
     FpyMethodDef *m = fastpy_find_method(obj->class_id, "__init__");
-    if (m) ((FpyMethod4Func)m->func)(obj, a, b, c, d);
+    if (!m) return;
+    if (!m->returns_value) ((FpyMethod4VoidFunc)m->func)(obj, a, b, c, d);
+    else ((FpyMethod4Func)m->func)(obj, a, b, c, d);
 }
 
 /* isinstance check — walks class hierarchy */
