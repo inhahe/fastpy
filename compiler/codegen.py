@@ -34099,7 +34099,7 @@ class CodeGen:
         if op == ast.Div and (lk == VKind.PATH or self._is_path_expr(node.left)):
             # path_join takes its right operand as plain text; a Path there
             # (p / other_path) must be converted, since in pure mode a Path's
-            # text does not start at the pointer. See _emit_path_join_operand.
+            # text does not start at the pointer. See _emit_path_text_arg.
             if rk == VKind.PATH or self._is_path_expr(node.right):
                 rtv = TypedValue(self._rt_call("path_str", [rtv]),
                                  ValueType(VKind.STR))
@@ -38245,7 +38245,7 @@ class CodeGen:
                 if isinstance(v.type, ir.IntType) and v.type.width != 64:
                     return self.builder.zext(v, i64)
                 return v
-            path = self._ensure_ptr(self._emit_expr_value(node.args[0]))
+            path = self._emit_path_text_arg(node.args[0])
             flags = _fd_i64(self._emit_expr_value(node.args[1]))
             if len(node.args) == 3:
                 mode = _fd_i64(self._emit_expr_value(node.args[2]))
@@ -38332,50 +38332,44 @@ class CodeGen:
             offset = _fd_i64(self._emit_expr_value(node.args[2]))
             return self.builder.call(self.runtime["os_pread"], [fd, n, offset])
         elif func_name == "listdir" and len(node.args) == 1:
-            v = self._emit_expr_value(node.args[0])
-            v = self._ensure_ptr(v)
+            v = self._emit_path_text_arg(node.args[0])
             return self.builder.call(self.runtime["os_listdir"], [v])
         elif func_name == "stat" and len(node.args) == 1:
             # os.stat(path) -> raw FpyList* (10 ints); inference (VKind.LIST,
             # elem INT) makes downstream indexing st[i] treat it as a list,
             # exactly like os.listdir. No FpyValue boxing needed.
-            v = self._emit_expr_value(node.args[0])
-            v = self._ensure_ptr(v)
+            v = self._emit_path_text_arg(node.args[0])
             return self.builder.call(self.runtime["os_stat"], [v])
         elif func_name == "statvfs" and len(node.args) == 1:
             # os.statvfs(path) -> raw FpyList* (10 ints); returned like os.stat
             # so downstream st[i] indexing treats it as a list. No boxing.
-            v = self._emit_expr_value(node.args[0])
-            v = self._ensure_ptr(v)
+            v = self._emit_path_text_arg(node.args[0])
             return self.builder.call(self.runtime["os_statvfs"], [v])
         elif func_name in ("remove", "unlink") and len(node.args) == 1:
             # os.remove/os.unlink(path) -> bare i64 status (0 ok, -1 error).
             # Inference (VKind.INT) makes downstream treat the result as a
             # plain int, so no FpyValue boxing is needed.
-            v = self._emit_expr_value(node.args[0])
-            v = self._ensure_ptr(v)
+            v = self._emit_path_text_arg(node.args[0])
             return self.builder.call(self.runtime["os_remove"], [v])
         elif func_name == "mkdir" and len(node.args) == 1:
             # os.mkdir(path) -> bare i64 status (0 ok, -1 error).
-            v = self._emit_expr_value(node.args[0])
-            v = self._ensure_ptr(v)
+            v = self._emit_path_text_arg(node.args[0])
             return self.builder.call(self.runtime["os_mkdir"], [v])
         elif func_name == "rmdir" and len(node.args) == 1:
             # os.rmdir(path) -> bare i64 status (0 ok, -1 error).
-            v = self._emit_expr_value(node.args[0])
-            v = self._ensure_ptr(v)
+            v = self._emit_path_text_arg(node.args[0])
             return self.builder.call(self.runtime["os_rmdir"], [v])
         elif func_name == "rename" and len(node.args) == 2:
             # os.rename(src, dst) -> bare i64 status (0 ok, -1 error).
-            src = self._ensure_ptr(self._emit_expr_value(node.args[0]))
-            dst = self._ensure_ptr(self._emit_expr_value(node.args[1]))
+            src = self._emit_path_text_arg(node.args[0])
+            dst = self._emit_path_text_arg(node.args[1])
             return self.builder.call(self.runtime["os_rename"], [src, dst])
         elif func_name == "execv" and len(node.args) == 2:
             # os.execv(path, argv) -> only returns on failure (-1); on success
             # the process image is replaced by the new program. path is a str;
             # argv is a list[str] whose elements become the C argv[]
             # (NULL-terminated). Backed by posix execv() -> SYS_EXECVE.
-            path = self._ensure_ptr(self._emit_expr_value(node.args[0]))
+            path = self._emit_path_text_arg(node.args[0])
             argv = self._ensure_ptr(self._emit_expr_value(node.args[1]))
             return self.builder.call(self.runtime["os_execv"], [path, argv])
         elif func_name == "fork" and len(node.args) == 0:
@@ -38416,23 +38410,23 @@ class CodeGen:
             return self.builder.call(self.runtime[rt], [status])
         elif func_name == "symlink" and len(node.args) == 2:
             # os.symlink(target, linkpath) -> bare i64 status (0 ok, -1 error).
-            target = self._ensure_ptr(self._emit_expr_value(node.args[0]))
-            linkpath = self._ensure_ptr(self._emit_expr_value(node.args[1]))
+            target = self._emit_path_text_arg(node.args[0])
+            linkpath = self._emit_path_text_arg(node.args[1])
             return self.builder.call(self.runtime["os_symlink"], [target, linkpath])
         elif func_name == "link" and len(node.args) == 2:
             # os.link(src, dst) -> bare i64 status (0 ok, -1 error) [hard link].
-            src = self._ensure_ptr(self._emit_expr_value(node.args[0]))
-            dst = self._ensure_ptr(self._emit_expr_value(node.args[1]))
+            src = self._emit_path_text_arg(node.args[0])
+            dst = self._emit_path_text_arg(node.args[1])
             return self.builder.call(self.runtime["os_link"], [src, dst])
         elif func_name == "readlink" and len(node.args) == 1:
             # os.readlink(path) -> str (the link's target); returns a valid
             # FpyString pointer (empty string on error).
-            v = self._ensure_ptr(self._emit_expr_value(node.args[0]))
+            v = self._emit_path_text_arg(node.args[0])
             return self.builder.call(self.runtime["os_readlink"], [v])
         elif func_name == "chmod" and len(node.args) == 2:
             # os.chmod(path, mode) -> bare i64 status (0 ok, -1 error).  mode
             # is a plain integer (e.g. 0o644), so coerce it to bare i64.
-            path = self._ensure_ptr(self._emit_expr_value(node.args[0]))
+            path = self._emit_path_text_arg(node.args[0])
             mode = self._emit_expr_value(node.args[1])
             if (isinstance(mode.type, ir.LiteralStructType)
                     and mode.type == fpy_val):
@@ -38450,7 +38444,7 @@ class CodeGen:
             # EINVAL, so the mode argument is genuinely honored (not ignored).
             # Runtime returns a bare i64 (1/0); wrap as a BOOL FpyValue so the
             # inferred VKind.BOOL matches downstream truthiness handling.
-            path = self._ensure_ptr(self._emit_expr_value(node.args[0]))
+            path = self._emit_path_text_arg(node.args[0])
             mode = self._emit_expr_value(node.args[1])
             if (isinstance(mode.type, ir.LiteralStructType)
                     and mode.type == fpy_val):
@@ -38466,7 +38460,7 @@ class CodeGen:
         elif func_name == "truncate" and len(node.args) == 2:
             # os.truncate(path, length) -> bare i64 status (0 ok, -1 error).
             # length is a plain integer, so coerce it to bare i64.
-            path = self._ensure_ptr(self._emit_expr_value(node.args[0]))
+            path = self._emit_path_text_arg(node.args[0])
             length = self._emit_expr_value(node.args[1])
             if (isinstance(length.type, ir.LiteralStructType)
                     and length.type == fpy_val):
@@ -38492,7 +38486,7 @@ class CodeGen:
                 if isinstance(v.type, ir.IntType) and v.type.width != 64:
                     return self.builder.zext(v, i64)
                 return v
-            path = self._ensure_ptr(self._emit_expr_value(node.args[0]))
+            path = self._emit_path_text_arg(node.args[0])
             atime = _to_i64(self._emit_expr_value(node.args[1]))
             mtime = _to_i64(self._emit_expr_value(node.args[2]))
             return self.builder.call(self.runtime["os_utime"], [path, atime, mtime])
@@ -38510,7 +38504,7 @@ class CodeGen:
                 if isinstance(v.type, ir.IntType) and v.type.width != 64:
                     return self.builder.zext(v, i64)
                 return v
-            path = self._ensure_ptr(self._emit_expr_value(node.args[0]))
+            path = self._emit_path_text_arg(node.args[0])
             uid = _to_i64(self._emit_expr_value(node.args[1]))
             gid = _to_i64(self._emit_expr_value(node.args[2]))
             return self.builder.call(self.runtime["os_chown"], [path, uid, gid])
@@ -38549,16 +38543,21 @@ class CodeGen:
         }
         if func_name in _os_path_fns:
             rt_key, n_args = _os_path_fns[func_name]
+            # Every parameter of every os.path.* function above is a path, and
+            # Python accepts a Path wherever it accepts a path string — so each
+            # goes through _emit_path_text_arg instead of being passed as a raw
+            # pointer, which for a headed pure-mode Path is the header (the
+            # callee then reads the magic word "PATH" as the filename).
             # os.path.join supports 2+ args: chain pairwise
             if func_name == "join" and len(node.args) >= 2:
-                result = self._ensure_ptr(self._emit_expr_value(node.args[0]))
+                result = self._emit_path_text_arg(node.args[0])
                 for i in range(1, len(node.args)):
-                    right = self._ensure_ptr(self._emit_expr_value(node.args[i]))
+                    right = self._emit_path_text_arg(node.args[i])
                     result = self.builder.call(self.runtime[rt_key], [result, right])
                 # os.path.join returns a string path — wrap as STR
                 return self._fv_from_str(result)
             if len(node.args) == n_args:
-                args = [self._ensure_ptr(self._emit_expr_value(node.args[i]))
+                args = [self._emit_path_text_arg(node.args[i])
                         for i in range(n_args)]
                 result = self.builder.call(self.runtime[rt_key], args)
                 # Boolean-returning functions: wrap as BOOL FpyValue
@@ -40871,16 +40870,21 @@ class CodeGen:
                               [callable_ptr, t_ir, d_ir, out_tag, out_data])
         return
 
-    def _emit_path_join_operand(self, arg_node) -> ir.Value:
-        """Emit the right-hand operand of a path join as plain text.
+    def _emit_path_text_arg(self, arg_node) -> ir.Value:
+        """Emit an argument for a runtime parameter that is *path text*.
 
-        `fastpy_path_join` takes its second argument as a C string, but
-        `p.joinpath(other)` / `p / other` accept a Path as well as a str. In
-        pure mode a Path is a headed object whose text does not start at the
-        pointer (see FpyPurePath in runtime/pathlib_pure.c), so a Path operand
-        must be converted with fastpy_path_str() rather than reinterpreted as
-        text. The receiver side needs no conversion — path_join takes it as a
-        Path proper.
+        Many runtime entry points take a filesystem path as a plain C string
+        (`fastpy_os_path_exists`, `fastpy_os_mkdir`, `fastpy_path_join`'s second
+        operand, ...), while Python accepts a `Path` anywhere a path string is
+        accepted. In pure mode a Path is a headed object whose text does NOT
+        start at the pointer (see FpyPurePath in runtime/pathlib_pure.c), so
+        passing the Path pointer straight through makes the callee read the
+        header — historically it read the magic word "PATH" and reported that
+        the file did not exist, a silently wrong answer rather than an error.
+        Route a Path through fastpy_path_str() to get the text.
+
+        Use this for every argument documented as a path string. Receivers of
+        Path *methods* need no conversion — those take a Path proper.
         """
         if self._is_path_expr(arg_node):
             other = self._emit_expr_value(arg_node)
@@ -40937,7 +40941,7 @@ class CodeGen:
         elif method == "joinpath" and len(node.args) >= 1:
             result = obj
             for arg_node in node.args:
-                other = self._emit_path_join_operand(arg_node)
+                other = self._emit_path_text_arg(arg_node)
                 result = self.builder.call(self.runtime["path_join"],
                                            [result, other])
             return result
