@@ -914,3 +914,31 @@ int64_t fpy_checked_pow(int64_t base, int64_t exp, FpyBigInt **big) {
     }
     return result;
 }
+
+/* Overflow-checked left shift: `a << b`.  If the result fits in a signed
+ * i64 it is returned and *big is left NULL; otherwise *big receives the
+ * BigInt result.  Python requires b >= 0 (a negative shift count is a
+ * ValueError); b <= 0 here returns a unchanged (b==0 is identity, and the
+ * negative case is a caller-level error we don't crash on). */
+int64_t fpy_checked_lshift(int64_t a, int64_t b, FpyBigInt **big) {
+    *big = NULL;
+    if (b <= 0) return a;
+    if (a == 0) return 0;
+    if (b < 64) {
+        /* `a << b` fits in i64 iff the bits shifted past bit 63 are all
+         * copies of the sign bit — i.e. (a >> (63 - b)) is 0 (non-neg) or
+         * -1 (negative).  Compute the shift on the unsigned value to avoid
+         * signed-left-shift UB; the bit pattern is exact once we know it
+         * fits. */
+        int64_t probe = a >> (63 - b);
+        if (probe == 0 || probe == -1) {
+            return (int64_t)((uint64_t)a << b);
+        }
+    }
+    FpyBigInt *ba = fpy_bigint_from_i64(a);
+    FpyBigInt *bb = fpy_bigint_from_i64(b);
+    *big = fpy_bigint_lshift(ba, bb);
+    fpy_bigint_free(ba);
+    fpy_bigint_free(bb);
+    return 0;
+}

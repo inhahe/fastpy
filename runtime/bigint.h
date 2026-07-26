@@ -68,5 +68,6 @@ int64_t fpy_checked_add(int64_t a, int64_t b, FpyBigInt **big);
 int64_t fpy_checked_sub(int64_t a, int64_t b, FpyBigInt **big);
 int64_t fpy_checked_mul(int64_t a, int64_t b, FpyBigInt **big);
 int64_t fpy_checked_pow(int64_t base, int64_t exp, FpyBigInt **big);
+int64_t fpy_checked_lshift(int64_t a, int64_t b, FpyBigInt **big);
 
 #endif /* FASTPY_BIGINT_H */

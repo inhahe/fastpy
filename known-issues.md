@@ -320,9 +320,20 @@ all pass.
 static `_emit_int_binop` LShift is a bare `shl`. That is orthogonal to the
 dynamic-dispatch bug fixed here.
 
-### BUG-INT-LSHIFT-OVERFLOW. Static `int << int` that overflows i64 is not promoted to BigInt — `7 << 70` gives garbage — 2026-07-26
+### BUG-INT-LSHIFT-OVERFLOW. [FIXED] Static `int << int` that overflows i64 is not promoted to BigInt — `7 << 70` gives garbage — 2026-07-26
 
-**What:** `_emit_int_binop` (codegen ~34482) lowers `ast.LShift` to a bare
+**Fix (committed):** added `fpy_checked_lshift(int64_t a, int64_t b, FpyBigInt **big)`
+(bigint.c/.h) mirroring `fpy_checked_mul` — probes `a >> (63 - b)` for lost bits
+and promotes to BigInt via `fpy_bigint_lshift` on overflow. Declared it in
+codegen (`self.runtime["checked_lshift"]`), routed `ast.LShift` in
+`_emit_int_binop` through `_emit_checked_int_op` (added `ast.LShift` to both
+`plain` dicts → bare `shl` when `_program_uses_bigint` is False, and to the
+`op_map` → `checked_lshift`), and extended the AST bigint detector to flag
+programs using `<<` with a constant shift >= 40. Validated: `7 << 70` →
+`8264141345021879123968`, `1 << 63` → `9223372036854775808`, small shifts
+(`1 << 3`, `x << 2`) unchanged, 314 differential tests pass.
+
+**What:** `_emit_int_binop` (codegen ~34482) lowered `ast.LShift` to a bare
 `self.builder.shl(left, right)`. When the shift amount is >= 64 (or the result
 exceeds i64), LLVM `shl` is poison/UB and the result is garbage (e.g. `7 << 70`
 → `20` instead of `8264141345021879123968`). Unlike `+`/`-`/`*` (which route

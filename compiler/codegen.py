@@ -2577,6 +2577,7 @@ class CodeGen:
         self.runtime["checked_sub"] = ir.Function(self.module, ft, name="fpy_checked_sub")
         self.runtime["checked_mul"] = ir.Function(self.module, ft, name="fpy_checked_mul")
         self.runtime["checked_pow"] = ir.Function(self.module, ft, name="fpy_checked_pow")
+        self.runtime["checked_lshift"] = ir.Function(self.module, ft, name="fpy_checked_lshift")
         # BigInt operations
         ft = ir.FunctionType(i8_ptr, [i8_ptr])
         self.runtime["bigint_to_str"] = ir.Function(self.module, ft, name="fpy_bigint_to_str")
@@ -3768,6 +3769,19 @@ class CodeGen:
                 if (isinstance(n.right, ast.Constant)
                         and isinstance(n.right.value, int)
                         and n.right.value > 30):
+                    self._program_uses_bigint = True
+                    break
+            if isinstance(n, ast.BinOp) and isinstance(n.op, ast.LShift):
+                # x << k with a large constant shift can overflow i64 and
+                # must promote to BigInt (e.g. 7 << 70).  A constant shift
+                # >= 40 clearly risks overflow; small bit-flag shifts (1<<7)
+                # don't and are left on the fast bare-shl path.  Enabling
+                # bigint here makes _emit_int_binop route LShift through
+                # fpy_checked_lshift.  (BUG-INT-LSHIFT-OVERFLOW)
+                if (isinstance(n.right, ast.Constant)
+                        and isinstance(n.right.value, int)
+                        and not isinstance(n.right.value, bool)
+                        and n.right.value >= 40):
                     self._program_uses_bigint = True
                     break
 
@@ -34480,7 +34494,12 @@ class CodeGen:
         elif isinstance(op, ast.BitXor):
             return self.builder.xor(left, right)
         elif isinstance(op, ast.LShift):
-            return self.builder.shl(left, right)
+            # Left shift can overflow i64 (e.g. 7 << 70) and must promote to
+            # BigInt, exactly like +/-/*.  Route through the overflow-checked
+            # path: when _program_uses_bigint is False it degrades to a bare
+            # `shl` (via the `plain` dict), so non-bigint programs pay no
+            # overhead.  (BUG-INT-LSHIFT-OVERFLOW)
+            return self._emit_checked_int_op(op, left, right)
         elif isinstance(op, ast.RShift):
             return self.builder.ashr(left, right)
         else:
@@ -34586,6 +34605,7 @@ class CodeGen:
                 ast.Add: self.builder.add,
                 ast.Sub: self.builder.sub,
                 ast.Mult: self.builder.mul,
+                ast.LShift: self.builder.shl,
             }.get(type(op))
             if plain is not None:
                 return plain(left, right)
@@ -34601,6 +34621,7 @@ class CodeGen:
                 ast.Add: self.builder.add,
                 ast.Sub: self.builder.sub,
                 ast.Mult: self.builder.mul,
+                ast.LShift: self.builder.shl,
             }.get(type(op))
             if plain is not None:
                 return plain(left, right)
@@ -34628,6 +34649,7 @@ class CodeGen:
             ast.Sub: "checked_sub",
             ast.Mult: "checked_mul",
             ast.Pow: "checked_pow",
+            ast.LShift: "checked_lshift",
         }
         rt_name = op_map.get(type(op))
         if rt_name is None:
