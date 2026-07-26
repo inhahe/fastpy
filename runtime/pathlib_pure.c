@@ -376,17 +376,22 @@ void fastpy_path_write_text(void *self, const char *content) {
 
 void *fastpy_path_iterdir(void *self) {
     const char *p = _p(self);
+    FpyList *out = fpy_list_new(8);
     DIR *d = opendir(p);
     if (!d) {
-        /* Unlike read_text (which degrades to "" on a missing file), there is
-         * no lenient answer here: an empty list is indistinguishable from a
-         * genuinely empty directory, so a caller would silently skip work. */
+        /* Unlike read_text (which degrades to "" on a missing file), a failed
+         * listing gets an exception: an empty list is indistinguishable from a
+         * genuinely empty directory, so a caller would silently skip work.
+         *
+         * But still return a valid empty list, never NULL. fastpy_raise only
+         * SETS a pending-exception flag — it does not unwind — and codegen
+         * only tests that flag at statement boundaries, so the caller consumes
+         * this return value first. `for x in p.iterdir()` immediately calls
+         * fastpy_list_length on it, which faults on NULL. */
         fastpy_raise(FPY_PURE_EXC_RUNTIMEERROR,
                      "Path.iterdir(): cannot open directory");
-        return (void *)0;
+        return (void *)out;
     }
-    FpyList *out = fpy_list_new(8);
-    if (!out) { closedir(d); return (void *)0; }
 
     /* Precompute the parent prefix so each entry is one join, not a strlen
      * per iteration. Path('/') already ends in '/', so don't double it. */
