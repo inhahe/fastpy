@@ -38,13 +38,11 @@ try:
 except ZeroDivisionError as e:
     print("caught:", e)
 
-# The modulo producer uses its own static buffer, so it has to be exercised
-# too — but its wording still differs from CPython's, so only the length is
-# compared here (BUG-MODULO-BY-ZERO-MESSAGE-WORDING).
+# The modulo producer uses its own static buffer, so it has to be exercised too.
 try:
     z = 1 % 0
 except ZeroDivisionError as e:
-    print("caught modulo:", len(str(e)) > 0)
+    print("caught modulo:", e)
 
 
 # ── str() and concatenation both incref the message ────────────────────
@@ -77,13 +75,12 @@ try:
 except IndexError as e:
     print("index:", e)
 
-# KeyError's str() is the *repr* of the key, which fastpy does not yet quote
-# (BUG-KEYERROR-STR-NOT-REPR), so again only the incref is what matters here.
+# KeyError's str() is the *repr* of the key, so it comes out quoted.
 try:
     dd = {"a": 1}
     print(dd["missing"])
 except KeyError as e:
-    print("key:", len(str(e)) > 0)
+    print("key:", e)
 
 
 # ── A caught message must still be readable after a *later* raise ───────

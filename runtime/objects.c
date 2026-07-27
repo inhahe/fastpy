@@ -30,18 +30,10 @@ int32_t fastpy_dict_has_int_key(FpyDict *dict, int64_t key);
 static int _fpy_ws_fwd(const unsigned char *p);
 
 /* External APIs (defined in runtime.c) */
-extern void fastpy_raise(int exc_type, const char *msg);
-extern int fastpy_exc_pending(void);
 extern int64_t fastpy_str_len(const char *);
 
-/* Exception type constants (mirror runtime.c) */
-#define FPY_EXC_ZERODIVISION   1
-#define FPY_EXC_VALUEERROR     2
-#define FPY_EXC_TYPEERROR      3
-#define FPY_EXC_INDEXERROR     4
-#define FPY_EXC_KEYERROR       5
-#define FPY_EXC_ATTRIBUTEERROR 11
-#define FPY_EXC_STOPITERATION  7
+/* fastpy_raise / fastpy_exc_pending and the FPY_EXC_* codes. */
+#include "exceptions.h"
 
 /* External: return-tag side channel (defined in runtime.c) */
 extern void fastpy_set_ret_tag(int32_t tag);
@@ -424,6 +416,52 @@ static inline const char *_fpy_obj_as_path_text(const void *p) {
 }
 #endif
 
+/* --- Shared string-repr quoting. BUG-REPR-ALWAYS-SINGLE-QUOTES.
+ *
+ * CPython *picks* the quote character instead of always escaping: a string
+ * that contains ' but no " is repr'd in double quotes, so repr("it's") is
+ * "it's" and not 'it\'s'. Only when both quote characters appear does the
+ * single quote get a backslash. fastpy had two independent repr routines
+ * (fpy_value_repr's STR case and fastpy_str_repr) that both hardcoded a
+ * single quote, and that also disagreed with each other about control
+ * characters — one emitted \xNN, the other passed the raw byte through into
+ * the output. Both now share the two routines below, so there is one answer
+ * to "what does a string look like when repr'd". */
+
+/* Which quote CPython would wrap this string in. */
+static char fpy_repr_quote(const char *s, size_t len) {
+    int has_sq = 0, has_dq = 0;
+    for (size_t i = 0; i < len; i++) {
+        if (s[i] == '\'') has_sq = 1;
+        else if (s[i] == '"') has_dq = 1;
+    }
+    return (has_sq && !has_dq) ? '"' : '\'';
+}
+
+/* Write the escaped *body* of a repr (no surrounding quotes) into buf and
+ * return the count written. Stops early rather than overrunning, always
+ * leaving the caller room for the closing quote and the terminator. Only the
+ * chosen quote is escaped — the other one is literal, which is the whole
+ * point of choosing. Bytes >= 128 pass through: they are UTF-8 continuation
+ * bytes of a character CPython would print as itself. */
+static int fpy_repr_escape_body(const char *s, size_t len, char quote,
+                                char *buf, int bufsize) {
+    int pos = 0;
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (pos > bufsize - 6) break;  /* worst case is \xNN + quote + NUL */
+        if (c == '\\')                      { buf[pos++] = '\\'; buf[pos++] = '\\'; }
+        else if (c == (unsigned char)quote) { buf[pos++] = '\\'; buf[pos++] = (char)c; }
+        else if (c == '\n')                 { buf[pos++] = '\\'; buf[pos++] = 'n'; }
+        else if (c == '\r')                 { buf[pos++] = '\\'; buf[pos++] = 'r'; }
+        else if (c == '\t')                 { buf[pos++] = '\\'; buf[pos++] = 't'; }
+        else if (c < 32 || c == 127)
+            pos += snprintf(buf + pos, (size_t)(bufsize - pos), "\\x%02x", c);
+        else buf[pos++] = (char)c;
+    }
+    return pos;
+}
+
 void fpy_value_repr(FpyValue val, char *buf, int bufsize) {
     switch (val.tag) {
         case FPY_TAG_INT:
@@ -433,24 +471,14 @@ void fpy_value_repr(FpyValue val, char *buf, int bufsize) {
             format_float(val.data.f, buf, bufsize);
             break;
         case FPY_TAG_STR: {
-            /* Escape special characters like CPython's repr() */
+            const char *s = val.data.s ? val.data.s : "";
+            size_t slen = strlen(s);
+            if (bufsize < 4) { if (bufsize > 0) buf[0] = '\0'; break; }
+            char q = fpy_repr_quote(s, slen);
             int pos = 0;
-            const char *s = val.data.s;
-            buf[pos++] = '\'';
-            if (s) {
-                for (; *s && pos < bufsize - 6; s++) {
-                    unsigned char c = (unsigned char)*s;
-                    if (c == '\\')      { buf[pos++] = '\\'; buf[pos++] = '\\'; }
-                    else if (c == '\'') { buf[pos++] = '\\'; buf[pos++] = '\''; }
-                    else if (c == '\n') { buf[pos++] = '\\'; buf[pos++] = 'n'; }
-                    else if (c == '\r') { buf[pos++] = '\\'; buf[pos++] = 'r'; }
-                    else if (c == '\t') { buf[pos++] = '\\'; buf[pos++] = 't'; }
-                    else if (c < 32 || c == 127)
-                        pos += snprintf(buf + pos, bufsize - pos, "\\x%02x", c);
-                    else buf[pos++] = c;
-                }
-            }
-            if (pos < bufsize - 1) buf[pos++] = '\'';
+            buf[pos++] = q;
+            pos += fpy_repr_escape_body(s, slen, q, buf + pos, bufsize - pos);
+            buf[pos++] = q;
             buf[pos] = '\0';
             break;
         }
@@ -563,24 +591,55 @@ void fpy_value_repr(FpyValue val, char *buf, int bufsize) {
             break;
         }
         case FPY_TAG_BYTES: {
-            /* bytes repr: b'...' */
+            /* bytes repr: b'...'. Same quote-choosing rule as str — CPython
+             * reprs b"it's" with double quotes — but the escaping differs:
+             * a byte >= 127 has no character to print, so it stays \xNN. */
             const char *data = val.data.s;
+            size_t len = data ? (size_t)fpy_bytes_len(data) : 0;  /* embedded-null safe */
+            if (bufsize < 5) { if (bufsize > 0) buf[0] = '\0'; break; }
+            char q = data ? fpy_repr_quote(data, len) : '\'';
             int pos = 0;
-            pos += snprintf(buf + pos, bufsize - pos, "b'");
-            if (data) {
-                size_t len = (size_t)fpy_bytes_len(data);  /* embedded-null safe */
-                for (size_t i = 0; i < len && pos < bufsize - 6; i++) {
-                    unsigned char c = (unsigned char)data[i];
-                    if (c == '\\') pos += snprintf(buf + pos, bufsize - pos, "\\\\");
-                    else if (c == '\'') pos += snprintf(buf + pos, bufsize - pos, "\\'");
-                    else if (c >= 32 && c < 127) pos += snprintf(buf + pos, bufsize - pos, "%c", c);
-                    else pos += snprintf(buf + pos, bufsize - pos, "\\x%02x", c);
-                }
+            buf[pos++] = 'b';
+            buf[pos++] = q;
+            for (size_t i = 0; i < len && pos < bufsize - 6; i++) {
+                unsigned char c = (unsigned char)data[i];
+                if (c == '\\')                      { buf[pos++] = '\\'; buf[pos++] = '\\'; }
+                else if (c == (unsigned char)q)     { buf[pos++] = '\\'; buf[pos++] = (char)c; }
+                else if (c == '\n')                 { buf[pos++] = '\\'; buf[pos++] = 'n'; }
+                else if (c == '\r')                 { buf[pos++] = '\\'; buf[pos++] = 'r'; }
+                else if (c == '\t')                 { buf[pos++] = '\\'; buf[pos++] = 't'; }
+                else if (c >= 32 && c < 127)        { buf[pos++] = (char)c; }
+                else pos += snprintf(buf + pos, (size_t)(bufsize - pos), "\\x%02x", c);
             }
-            snprintf(buf + pos, bufsize - pos, "'");
+            buf[pos++] = q;
+            buf[pos] = '\0';
             break;
         }
     }
+}
+
+/* Raise KeyError for a missing key. BUG-KEYERROR-STR-NOT-REPR.
+ *
+ * KeyError is the one built-in whose __str__ is not the message but
+ * `repr(args[0])` — CPython prints `KeyError: 'a'` for a string key and
+ * `KeyError: 5` for an int one. fastpy has no `args`, only the message that
+ * *is* str(e), so the repr has to be applied at the raise site. Doing it in
+ * one helper is what keeps the rule from being reapplied inconsistently: the
+ * dozen dict/set miss paths had drifted into passing the raw key text, a bare
+ * "KeyError", or a snprintf'd integer, three different answers to one
+ * question.
+ *
+ * This also covers the message-shaped ones — `set().pop()` raises
+ * KeyError('pop from an empty set'), and CPython quotes that string like any
+ * other argument, so those sites pass a string value through here too rather
+ * than special-casing themselves.
+ *
+ * A stack buffer suffices because fastpy_raise copies the message into
+ * header-backed storage before returning. */
+static void fpy_raise_key_error(FpyValue key) {
+    char buf[256];
+    fpy_value_repr(key, buf, sizeof(buf));
+    fastpy_raise(FPY_EXC_KEYERROR, buf);
 }
 
 /* --- Value print (str formatting: strings without quotes) --- */
@@ -1480,42 +1539,96 @@ void fastpy_fv_binop(int32_t lt, int64_t ld, int32_t rt, int64_t rd,
         extern FpyBigInt* fpy_bigint_floordiv(FpyBigInt*, FpyBigInt*);
         extern FpyBigInt* fpy_bigint_mod(FpyBigInt*, FpyBigInt*);
         extern FpyBigInt* fpy_bigint_pow(FpyBigInt*, FpyBigInt*);
-        FpyBigInt *la, *ra;
-        if (lt == FPY_TAG_BIGINT) la = (FpyBigInt*)(intptr_t)ld;
-        else la = fpy_bigint_from_i64(ld);
-        if (rt == FPY_TAG_BIGINT) ra = (FpyBigInt*)(intptr_t)rd;
-        else ra = fpy_bigint_from_i64(rd);
-        FpyBigInt *result = NULL;
-        switch (op) {
-            case 0: result = fpy_bigint_add(la, ra); break;
-            case 1: result = fpy_bigint_sub(la, ra); break;
-            case 2: result = fpy_bigint_mul(la, ra); break;
-            case 3: /* truediv — fall through to float */ break;
-            case 4: result = fpy_bigint_floordiv(la, ra); break;
-            case 5: result = fpy_bigint_mod(la, ra); break;
-            default: break;
-        }
-        if (result) {
-            /* Demote to INT if the result fits in i64 — this avoids
-             * leaving a BigInt pointer in the data field when
-             * downstream code (range, print, icmp) extracts it as
-             * a bare i64 integer. */
-            extern int fpy_bigint_fits_i64(FpyBigInt*);
-            extern int64_t fpy_bigint_to_i64(FpyBigInt*, int*);
-            extern void fpy_bigint_free(FpyBigInt*);
-            if (fpy_bigint_fits_i64(result)) {
-                int ov = 0;
-                int64_t iv = fpy_bigint_to_i64(result, &ov);
-                fpy_bigint_free(result);
-                *out_tag = FPY_TAG_INT;
-                *out_data = iv;
-            } else {
-                *out_tag = FPY_TAG_BIGINT;
-                *out_data = (int64_t)(intptr_t)result;
+        extern int fpy_bigint_truediv(FpyBigInt*, FpyBigInt*, double*);
+        extern int fpy_bigint_to_double(FpyBigInt*, double*);
+        extern int fpy_bigint_fits_i64(FpyBigInt*);
+        extern int64_t fpy_bigint_to_i64(FpyBigInt*, int*);
+        extern void fpy_bigint_free(FpyBigInt*);
+
+        /* A float on the other side makes this float arithmetic — (2 ** 80) +
+         * 1.5 is a float in Python.  It has to be split off *before* the
+         * promotion below, which would otherwise hand fpy_bigint_from_i64 the
+         * float's bit pattern and call it an integer.  Converting the BigInt to
+         * a double and re-entering lets the float arm below do the work once. */
+        if (lt == FPY_TAG_FLOAT || rt == FPY_TAG_FLOAT) {
+            FpyBigInt *b = (FpyBigInt*)(intptr_t)(lt == FPY_TAG_BIGINT ? ld : rd);
+            double bd = 0.0;
+            if (fpy_bigint_to_double(b, &bd) != 0) {
+                fastpy_raise(FPY_EXC_OVERFLOWERROR, "int too large to convert to float");
+                *out_tag = FPY_TAG_NONE; *out_data = 0;
+                return;
             }
+            int64_t bits; memcpy(&bits, &bd, sizeof(double));
+            if (lt == FPY_TAG_BIGINT)
+                fastpy_fv_binop(FPY_TAG_FLOAT, bits, rt, rd, op, out_tag, out_data);
+            else
+                fastpy_fv_binop(lt, ld, FPY_TAG_FLOAT, bits, op, out_tag, out_data);
             return;
         }
-        /* truediv falls through (BigInt / BigInt → float not implemented yet) */
+        /* Anything else that is not integer-like has no BigInt handler; leave it
+         * to the TypeError guard below rather than promoting its payload. */
+        if ((lt == FPY_TAG_BIGINT || lt == FPY_TAG_INT || lt == FPY_TAG_BOOL)
+            && (rt == FPY_TAG_BIGINT || rt == FPY_TAG_INT || rt == FPY_TAG_BOOL)) {
+            /* Only the operands promoted here are owned and must be freed; a
+             * caller-provided BigInt still belongs to whoever holds the value. */
+            int l_own = (lt != FPY_TAG_BIGINT);
+            int r_own = (rt != FPY_TAG_BIGINT);
+            FpyBigInt *la = (lt == FPY_TAG_BIGINT) ? (FpyBigInt*)(intptr_t)ld
+                : fpy_bigint_from_i64((lt == FPY_TAG_BOOL) ? (ld != 0) : ld);
+            FpyBigInt *ra = (rt == FPY_TAG_BIGINT) ? (FpyBigInt*)(intptr_t)rd
+                : fpy_bigint_from_i64((rt == FPY_TAG_BOOL) ? (rd != 0) : rd);
+            if (op == 3) {
+                /* True division is the one BigInt op whose result is not a
+                 * BigInt, so it returns here rather than through the
+                 * demote-to-INT tail below.
+                 * BUG-BIGINT-TRUEDIV-UNIMPLEMENTED: this used to be left
+                 * unimplemented and fall out of the arm entirely, reaching the
+                 * CPython bridge, which took the BigInt pointer for a
+                 * PyObject* and crashed. */
+                double q = 0.0;
+                int rc = fpy_bigint_truediv(la, ra, &q);
+                if (l_own) fpy_bigint_free(la);
+                if (r_own) fpy_bigint_free(ra);
+                if (rc != 0) {
+                    fastpy_raise(rc == 1 ? FPY_EXC_ZERODIVISION : FPY_EXC_OVERFLOWERROR,
+                                 rc == 1 ? "division by zero"
+                                         : "integer division result too large for a float");
+                    *out_tag = FPY_TAG_NONE; *out_data = 0;
+                    return;
+                }
+                *out_tag = FPY_TAG_FLOAT;
+                memcpy(out_data, &q, sizeof(double));
+                return;
+            }
+            FpyBigInt *result = NULL;
+            switch (op) {
+                case 0: result = fpy_bigint_add(la, ra); break;
+                case 1: result = fpy_bigint_sub(la, ra); break;
+                case 2: result = fpy_bigint_mul(la, ra); break;
+                case 4: result = fpy_bigint_floordiv(la, ra); break;
+                case 5: result = fpy_bigint_mod(la, ra); break;
+                default: break;
+            }
+            if (l_own) fpy_bigint_free(la);
+            if (r_own) fpy_bigint_free(ra);
+            if (result) {
+                /* Demote to INT if the result fits in i64 — this avoids
+                 * leaving a BigInt pointer in the data field when
+                 * downstream code (range, print, icmp) extracts it as
+                 * a bare i64 integer. */
+                if (fpy_bigint_fits_i64(result)) {
+                    int ov = 0;
+                    int64_t iv = fpy_bigint_to_i64(result, &ov);
+                    fpy_bigint_free(result);
+                    *out_tag = FPY_TAG_INT;
+                    *out_data = iv;
+                } else {
+                    *out_tag = FPY_TAG_BIGINT;
+                    *out_data = (int64_t)(intptr_t)result;
+                }
+                return;
+            }
+        }
     }
     /* Decimal arithmetic — promote INT/BOOL to Decimal.
      *
@@ -1597,10 +1710,15 @@ void fastpy_fv_binop(int32_t lt, int64_t ld, int32_t rt, int64_t rd,
     }
     /* Promote to float if either operand is float AND the other is numeric.
      * Guard: float + container (str, list, dict, set, etc.) is TypeError,
-     * not float promotion. */
+     * not float promotion.
+     *
+     * The op range matters as much as the tags: a float has no bitwise
+     * operators, so `1 & 1.5` is a TypeError in Python.  Without the bound the
+     * switch below fell to its `default` and answered 0.0. */
     if ((lt == FPY_TAG_FLOAT || rt == FPY_TAG_FLOAT)
         && (lt == FPY_TAG_FLOAT || lt == FPY_TAG_INT || lt == FPY_TAG_BOOL)
-        && (rt == FPY_TAG_FLOAT || rt == FPY_TAG_INT || rt == FPY_TAG_BOOL)) {
+        && (rt == FPY_TAG_FLOAT || rt == FPY_TAG_INT || rt == FPY_TAG_BOOL)
+        && op >= 0 && op <= 5) {
         double lf, rf;
         if (lt == FPY_TAG_FLOAT) { memcpy(&lf, &ld, sizeof(double)); }
         else if (lt == FPY_TAG_INT) { lf = (double)ld; }
@@ -1610,31 +1728,49 @@ void fastpy_fv_binop(int32_t lt, int64_t ld, int32_t rt, int64_t rd,
         else if (rt == FPY_TAG_INT) { rf = (double)rd; }
         else if (rt == FPY_TAG_BOOL) { rf = (double)rd; }
         else { rf = 0.0; }
+        /* A zero divisor raises, as it does everywhere else in the language.
+         * These three cases used to substitute 0.0 silently, which turned an
+         * error into a plausible-looking answer. */
+        if (rf == 0.0 && op >= 3 && op <= 5) {
+            fastpy_raise(FPY_EXC_ZERODIVISION, "division by zero");
+            *out_tag = FPY_TAG_NONE; *out_data = 0;
+            return;
+        }
         double result;
         switch (op) {
             case 0: result = lf + rf; break;
             case 1: result = lf - rf; break;
             case 2: result = lf * rf; break;
-            case 3: result = rf != 0.0 ? lf / rf : 0.0; break;
-            case 4: result = rf != 0.0 ? floor(lf / rf) : 0.0; break;
-            case 5: result = rf != 0.0 ? fmod(lf, rf) : 0.0; break;
+            case 3: result = lf / rf; break;
+            case 4: result = floor(lf / rf); break;
+            case 5: {
+                /* Python's % takes the sign of the divisor, C's fmod takes the
+                 * sign of the dividend: -7.0 % 3.0 is 2.0, not -1.0. */
+                double m = fmod(lf, rf);
+                if (m != 0.0 && ((m < 0.0) != (rf < 0.0))) m += rf;
+                result = m;
+                break;
+            }
             default: result = 0.0; break;
         }
         *out_tag = FPY_TAG_FLOAT;
         memcpy(out_data, &result, sizeof(double));
         return;
     }
-    /* Guard: container types or mismatched numeric+container → TypeError */
-    if (lt == FPY_TAG_LIST || lt == FPY_TAG_DICT || lt == FPY_TAG_SET ||
-        rt == FPY_TAG_LIST || rt == FPY_TAG_DICT || rt == FPY_TAG_SET ||
-        lt == FPY_TAG_STR  || rt == FPY_TAG_STR ||
-        lt == FPY_TAG_BYTES || rt == FPY_TAG_BYTES ||
-        /* A DECIMAL or COMPLEX operand that survived the two blocks above is
-         * one they could not handle.  It must stop here: the int/bool
-         * arithmetic below would otherwise do the sum on its pointer.
-         * BUG-FV-BINOP-NO-DECIMAL-COMPLEX. */
-        lt == FPY_TAG_DECIMAL || rt == FPY_TAG_DECIMAL ||
-        lt == FPY_TAG_COMPLEX || rt == FPY_TAG_COMPLEX) {
+    /* Guard: everything past this point is plain int/bool arithmetic, so
+     * anything that is not two integer-like operands has no handler and is a
+     * TypeError.
+     *
+     * This is written as a *positive* check on purpose.  It used to enumerate
+     * the tags that must stop here (list, dict, set, str, bytes, and later
+     * Decimal and complex — BUG-FV-BINOP-NO-DECIMAL-COMPLEX), which meant every
+     * tag anyone forgot to add fell into the i64 arithmetic below and had its
+     * *pointer* added: that is how BIGINT (which was never on the list) turned
+     * `(2 ** 80) / 2` into a crash, and how NONE + NONE quietly answered 0.
+     * Listing what is allowed instead of what is forbidden makes a new tag, or
+     * a newly unhandled combination, fail loudly rather than silently wrong. */
+    if (!((lt == FPY_TAG_INT || lt == FPY_TAG_BOOL)
+          && (rt == FPY_TAG_INT || rt == FPY_TAG_BOOL))) {
         /* If we reach here, no valid handler matched (e.g. list+int, dict-int,
          * str+list, etc.) — raise TypeError like CPython does. */
         static const char *_op_syms[] = {"+", "-", "*", "/", "//", "%",
@@ -1665,18 +1801,51 @@ void fastpy_fv_binop(int32_t lt, int64_t ld, int32_t rt, int64_t rd,
     int64_t ri = (rt == FPY_TAG_BOOL) ? (int64_t)(rd != 0) : rd;
     int64_t result;
     FpyBigInt *big = NULL;
+    /* A zero divisor raises rather than quietly answering 0, which is what the
+     * three ternaries this replaced used to do. */
+    if (ri == 0 && op >= 3 && op <= 5) {
+        fastpy_raise(FPY_EXC_ZERODIVISION, "division by zero");
+        *out_tag = FPY_TAG_NONE; *out_data = 0;
+        return;
+    }
     switch (op) {
         case 0: result = fpy_checked_add(li, ri, &big); break;
         case 1: result = fpy_checked_sub(li, ri, &big); break;
         case 2: result = fpy_checked_mul(li, ri, &big); break;
         case 3: /* truediv returns float */ {
-            double d = ri != 0 ? (double)li / (double)ri : 0.0;
+            double d = (double)li / (double)ri;
             *out_tag = FPY_TAG_FLOAT;
             memcpy(out_data, &d, sizeof(double));
             return;
         }
-        case 4: result = ri != 0 ? li / ri : 0; break;
-        case 5: result = ri != 0 ? li % ri : 0; break;
+        /* Python's // floors and its % takes the divisor's sign; C truncates
+         * toward zero and takes the dividend's.  -7 // 2 is -4, not -3, and
+         * -7 % 2 is 1, not -1. */
+        case 4: {
+            if (li == INT64_MIN && ri == -1) {
+                /* The one i64 division that overflows: -2**63 // -1 is 2**63,
+                 * which is a BigInt in Python and UB in C. */
+                extern FpyBigInt* fpy_bigint_from_i64(int64_t);
+                extern FpyBigInt* fpy_bigint_neg(FpyBigInt*);
+                extern void fpy_bigint_free(FpyBigInt*);
+                FpyBigInt *m = fpy_bigint_from_i64(INT64_MIN);
+                big = fpy_bigint_neg(m);
+                fpy_bigint_free(m);
+                result = 0;
+                break;
+            }
+            int64_t q = li / ri;
+            if ((li % ri != 0) && ((li ^ ri) < 0)) q--;
+            result = q;
+            break;
+        }
+        case 5: {
+            if (li == INT64_MIN && ri == -1) { result = 0; break; }
+            int64_t m = li % ri;
+            if (m != 0 && ((m < 0) != (ri < 0))) m += ri;
+            result = m;
+            break;
+        }
         default: result = 0; break;
     }
     if (big) {
@@ -2410,7 +2579,7 @@ FpyValue fpy_dict_get(FpyDict *dict, FpyValue key) {
             return dict->values[idx];
         slot = (slot + 1) & mask;
     }
-    fastpy_raise(FPY_EXC_KEYERROR, "KeyError");
+    fpy_raise_key_error(key);
     FpyValue _err = {0}; return _err;
 }
 
@@ -2486,7 +2655,7 @@ void fastpy_dict_get_fv(FpyDict *dict, const char *key,
         }
         slot = (slot + 1) & mask;
     }
-    fastpy_raise(FPY_EXC_KEYERROR, key);
+    fpy_raise_key_error(fpy_str(key));
     *out_tag = FPY_TAG_NONE; *out_data = 0; return;
 }
 
@@ -2632,7 +2801,7 @@ void fastpy_dict_get_int_fv(FpyDict *dict, int64_t key,
         }
         slot = (slot + 1) & mask;
     }
-    fastpy_raise(FPY_EXC_KEYERROR, "KeyError");
+    fpy_raise_key_error(fpy_int(key));
     *out_tag = FPY_TAG_NONE; *out_data = 0; return;
 }
 
@@ -2653,7 +2822,7 @@ int64_t fastpy_dict_get_int_val(FpyDict *dict, int64_t key) {
         }
         slot = (slot + 1) & mask;
     }
-    fastpy_raise(FPY_EXC_KEYERROR, "KeyError");
+    fpy_raise_key_error(fpy_int(key));
     return 0;
 }
 
@@ -2719,7 +2888,7 @@ void fastpy_dict_get_kv_fv(FpyDict *dict,
         }
         slot = (slot + 1) & mask;
     }
-    fastpy_raise(FPY_EXC_KEYERROR, "KeyError");
+    fpy_raise_key_error(k);
     *out_tag = FPY_TAG_NONE; *out_data = 0; return;
 }
 
@@ -3013,7 +3182,7 @@ void fastpy_set_clear(FpyDict *set) {
 /* set.pop() — remove and return an arbitrary element (via out params) */
 void fastpy_set_pop_fv(FpyDict *set, int32_t *out_tag, int64_t *out_data) {
     if (set->length == 0) {
-        fastpy_raise(FPY_EXC_KEYERROR, "pop from an empty set");
+        fpy_raise_key_error(fpy_str("pop from an empty set"));
         *out_tag = 0; *out_data = 0;
         return;
     }
@@ -3721,7 +3890,7 @@ void fastpy_dict_delete(FpyDict *dict, const char *key) {
         slot = (slot + 1) & mask;
     }
     FPY_UNLOCK(dict);
-    fastpy_raise(FPY_EXC_KEYERROR, key);
+    fpy_raise_key_error(k);
     return;
 }
 
@@ -3752,9 +3921,7 @@ void fastpy_dict_delete_int(FpyDict *dict, int64_t key) {
         slot = (slot + 1) & mask;
     }
     FPY_UNLOCK(dict);
-    char buf[32];
-    snprintf(buf, sizeof(buf), "%lld", (long long)key);
-    fastpy_raise(FPY_EXC_KEYERROR, buf);
+    fpy_raise_key_error(fpy_int(key));
     return;
 }
 
@@ -3862,7 +4029,7 @@ const char* fastpy_dict_pop(FpyDict *dict, const char *key) {
         slot = (slot + 1) & mask;
     }
     FPY_UNLOCK(dict);
-    fastpy_raise(FPY_EXC_KEYERROR, key);
+    fpy_raise_key_error(k);
     return NULL;
 }
 
@@ -3893,7 +4060,7 @@ int64_t fastpy_dict_pop_int(FpyDict *dict, const char *key) {
         slot = (slot + 1) & mask;
     }
     FPY_UNLOCK(dict);
-    fastpy_raise(FPY_EXC_KEYERROR, key);
+    fpy_raise_key_error(k);
     return 0;
 }
 
@@ -3927,7 +4094,7 @@ void fastpy_dict_pop_nodefault_fv(FpyDict *dict, const char *key,
         slot = (slot + 1) & mask;
     }
     FPY_UNLOCK(dict);
-    fastpy_raise(FPY_EXC_KEYERROR, key);
+    fpy_raise_key_error(k);
     *out_tag = FPY_TAG_NONE;
     *out_data = 0;
 }
@@ -3997,7 +4164,7 @@ void fastpy_dict_pop_nodefault_generic(FpyDict *dict,
         slot = (slot + 1) & mask;
     }
     FPY_UNLOCK(dict);
-    fastpy_raise(FPY_EXC_KEYERROR, "key not found");
+    fpy_raise_key_error(k);
     *out_tag = FPY_TAG_NONE;
     *out_data = 0;
 }
@@ -4110,7 +4277,7 @@ void fastpy_dict_setdefault_generic(FpyDict *dict,
 void fastpy_dict_popitem(FpyDict *dict, int32_t *key_tag, int64_t *key_data,
                           int32_t *val_tag, int64_t *val_data) {
     if (dict->length == 0) {
-        fastpy_raise(FPY_EXC_KEYERROR, "popitem(): dictionary is empty");
+        fpy_raise_key_error(fpy_str("popitem(): dictionary is empty"));
         *key_tag = 0; *key_data = 0; *val_tag = 0; *val_data = 0;
         return;
     }
@@ -5460,27 +5627,19 @@ const char* fastpy_str_format_percent(const char *fmt, FpyList *args) {
 }
 
 const char* fastpy_str_repr(const char *s) {
-    /* Wrap in single quotes with escapes for common chars */
+    if (!s) s = "";
     size_t len = strlen(s);
-    char *buf = fpy_str_buf((int64_t)(len * 2 + 2));
+    /* Worst case is four output chars per input char (\xNN), plus the two
+     * quotes; fpy_str_buf adds the terminator. The old sizing was len*2+2,
+     * which fit the escapes this routine used to emit but leaves no room for
+     * the \xNN form it now shares with fpy_value_repr. */
+    int cap = (int)(len * 4 + 2);
+    char *buf = fpy_str_buf((int64_t)cap);
+    char q = fpy_repr_quote(s, len);
     int out = 0;
-    buf[out++] = '\'';
-    for (size_t i = 0; i < len; i++) {
-        char c = s[i];
-        if (c == '\\' || c == '\'') {
-            buf[out++] = '\\';
-            buf[out++] = c;
-        } else if (c == '\n') {
-            buf[out++] = '\\'; buf[out++] = 'n';
-        } else if (c == '\t') {
-            buf[out++] = '\\'; buf[out++] = 't';
-        } else if (c == '\r') {
-            buf[out++] = '\\'; buf[out++] = 'r';
-        } else {
-            buf[out++] = c;
-        }
-    }
-    buf[out++] = '\'';
+    buf[out++] = q;
+    out += fpy_repr_escape_body(s, len, q, buf + out, cap + 1 - out);
+    buf[out++] = q;
     buf[out] = '\0';
     return buf;
 }
@@ -8466,7 +8625,9 @@ FpyComplex* fpy_complex_mul(FpyComplex *a, FpyComplex *b) {
 FpyComplex* fpy_complex_div(FpyComplex *a, FpyComplex *b) {
     double denom = b->real * b->real + b->imag * b->imag;
     if (denom == 0.0) {
-        fastpy_raise(FPY_EXC_ZERODIVISION, "complex division by zero");
+        /* CPython says plainly "division by zero" here too — the operand type
+         * never appears in the message. */
+        fastpy_raise(FPY_EXC_ZERODIVISION, "division by zero");
         return NULL;
     }
     return fpy_complex_new(
@@ -10634,7 +10795,7 @@ void fastpy_chainmap_get(FpyChainMap *cm, const char *key,
             slot = (slot + 1) & mask;
         }
     }
-    fastpy_raise(FPY_EXC_KEYERROR, key);
+    fpy_raise_key_error(k);
     *out_tag = FPY_TAG_NONE; *out_data = 0; return;
 }
 

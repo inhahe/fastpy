@@ -23,6 +23,7 @@
 #endif
 #include "threading.h"
 #include "objects.h"
+#include "exceptions.h"
 
 /* Forward declaration: the compiled Python module provides this */
 extern void fastpy_main(void);
@@ -659,21 +660,9 @@ double fastpy_pow_float(double base, double exp) {
     return pow(base, exp);
 }
 
-/* --- Exception system (flag-based) --- */
-
-#define FPY_EXC_NONE           0
-#define FPY_EXC_ZERODIVISION   1
-#define FPY_EXC_VALUEERROR     2
-#define FPY_EXC_TYPEERROR      3
-#define FPY_EXC_INDEXERROR     4
-#define FPY_EXC_KEYERROR       5
-#define FPY_EXC_RUNTIMEERROR   6
-#define FPY_EXC_STOPITERATION  7
-#define FPY_EXC_EXCEPTIONGROUP 8
-#define FPY_EXC_NAMEERROR      9
-#define FPY_EXC_OVERFLOWERROR  10
-#define FPY_EXC_ATTRIBUTEERROR 11
-#define FPY_EXC_GENERIC        99
+/* --- Exception system (flag-based) ---
+ * The type codes live in exceptions.h so every runtime .c raises with the
+ * same numbering; see the header for why they aren't per-file #defines. */
 
 /* Per-thread exception state. Each thread has its own exception,
  * so raising in one thread doesn't corrupt another's state. */
@@ -1172,7 +1161,7 @@ int64_t fastpy_safe_div(int64_t a, int64_t b) {
 int64_t fastpy_safe_mod(int64_t a, int64_t b) {
     if (b == 0) {
         if (!fastpy_exc_pending())
-            fastpy_raise(FPY_EXC_ZERODIVISION, "integer modulo by zero");
+            fastpy_raise(FPY_EXC_ZERODIVISION, "division by zero");
         return 0;
     }
     return a % b;
@@ -1184,6 +1173,19 @@ double fastpy_safe_fdiv(double a, double b) {
         return 0.0;
     }
     return a / b;
+}
+
+/* Python's float %, which raises on a zero divisor and takes the sign of the
+ * divisor.  Codegen used to inline a bare `frem` with neither property, so
+ * `1.0 % 0.0` answered nan instead of raising. */
+double fastpy_safe_fmod(double a, double b) {
+    if (b == 0.0) {
+        fastpy_raise(FPY_EXC_ZERODIVISION, "division by zero");
+        return 0.0;
+    }
+    double m = fmod(a, b);
+    if (m != 0.0 && ((m < 0.0) != (b < 0.0))) m += b;
+    return m;
 }
 
 /* int/int "true division" that returns float.  CPython 3.14+ uses

@@ -2551,6 +2551,7 @@ class CodeGen:
         self.runtime["safe_mod"] = ir.Function(self.module, ft, name="fastpy_safe_mod")
         ft = ir.FunctionType(double, [double, double])
         self.runtime["safe_fdiv"] = ir.Function(self.module, ft, name="fastpy_safe_fdiv")
+        self.runtime["safe_fmod"] = ir.Function(self.module, ft, name="fastpy_safe_fmod")
         ft = ir.FunctionType(double, [i64, i64])
         self.runtime["safe_int_fdiv"] = ir.Function(self.module, ft, name="fastpy_safe_int_fdiv")
 
@@ -23365,6 +23366,20 @@ class CodeGen:
             return VKind.TUPLE
         if isinstance(node, ast.JoinedStr):
             return VKind.STR
+        if isinstance(node, ast.BinOp):
+            # `"fmt" % x` and `"a" + x` are strings whenever one side is known
+            # to be one.  The recursion only ever concludes STR from an
+            # unambiguous leaf, so this can't mistype an arithmetic `%`: an
+            # int left operand returns INT and falls through to None here.
+            left = CodeGen._infer_expr_kind(node.left)
+            if isinstance(node.op, ast.Mod):
+                if left == VKind.STR:
+                    return VKind.STR
+            elif isinstance(node.op, ast.Add):
+                if (left == VKind.STR
+                        or CodeGen._infer_expr_kind(node.right) == VKind.STR):
+                    return VKind.STR
+            return None
         return None
 
     def _scan_unsafe_typed_vars(self, body: list[ast.stmt]) -> set[str]:
@@ -27164,8 +27179,8 @@ class CodeGen:
                     # Standard exception or user-class without __init__
                     if node.exc.args:
                         msg = self._emit_expr_value(node.exc.args[0])
-                        if not isinstance(msg.type, ir.PointerType):
-                            msg = self._value_to_str(msg, node)
+                        msg = self._exc_arg_to_message(
+                            msg, node.exc.args[0], exc_name, node)
                     else:
                         msg = self._make_string_constant("")
                     self.builder.call(self.runtime["raise"], [exc_id, msg])
@@ -36577,7 +36592,15 @@ class CodeGen:
             return self._emit_binop_unknown(node, ltv, rtv, lk, rk, op)
 
         # ── Fast path: BigInt arithmetic ───────────────────────────────
-        if lk == VKind.BIGINT or rk == VKind.BIGINT:
+        # Only for integer-like operands.  The promotion below is
+        # `bigint_from_i64(other.as_i64())`, which for a float operand hands
+        # over the double's *bit pattern* as an integer: `(2 ** 80) + 0.5`
+        # came out as 2**80 plus 4602678819172646912.  A float on either side
+        # makes this float arithmetic, and the runtime's fv_binop arm converts
+        # the BigInt properly, so let it fall through to the guard below.
+        _bigint_ok = (VKind.BIGINT, VKind.INT, VKind.BOOL)
+        if ((lk == VKind.BIGINT or rk == VKind.BIGINT)
+                and lk in _bigint_ok and rk in _bigint_ok):
             # Promote INT operand to BigInt if needed
             if lk == VKind.BIGINT:
                 l_ptr = ltv.as_ptr(self.builder)
@@ -36637,13 +36660,28 @@ class CodeGen:
             return self._rt_call("str_format_percent", [ltv, TypedValue(args_list, ValueType(VKind.LIST))])
 
         # ── Fast path: float op float (or int+float promotion) ─────────
-        # Guard: float+container is always TypeError (e.g. "hello" + 1.5).
-        # Only promote to float when the other side is numeric-compatible.
-        _float_incompatible = (VKind.STR, VKind.LIST, VKind.DICT, VKind.SET,
-                               VKind.TUPLE, VKind.BYTES, VKind.OBJ)
+        # The other side must be something `sitofp` is actually meaningful on,
+        # which is only a machine integer.  This used to be a *deny* list of
+        # kinds (str, list, dict, set, tuple, bytes, obj), so every pointer
+        # kind missing from it — BigInt, Decimal, complex — had its pointer
+        # sitofp'd into a double: `(2 ** 80) + 0.5` printed the heap address of
+        # the BigInt plus a half.  Naming what is allowed instead means a new
+        # pointer kind falls through to fv_binop, which knows how to convert.
+        _float_ok = (VKind.FLOAT, VKind.INT, VKind.BOOL)
         if ((lk == VKind.FLOAT or rk == VKind.FLOAT)
-                and lk not in _float_incompatible
-                and rk not in _float_incompatible):
+                and lk in _float_ok and rk in _float_ok):
+            # A float has no bitwise operators; `1 & 1.5` is a TypeError.
+            # Raised here rather than inside _emit_float_binop because only
+            # here are the operand kinds still known well enough to name them.
+            _bit_sym = {ast.BitAnd: "&", ast.BitOr: "|", ast.BitXor: "^",
+                        ast.LShift: "<<", ast.RShift: ">>"}.get(op)
+            if _bit_sym:
+                _tn = {VKind.FLOAT: "float", VKind.INT: "int",
+                       VKind.BOOL: "bool"}
+                self._emit_runtime_type_error(
+                    f"unsupported operand type(s) for {_bit_sym}: "
+                    f"'{_tn[lk]}' and '{_tn[rk]}'")
+                return ir.Constant(double, 0.0)
             left_d = ltv.val if lk == VKind.FLOAT else self.builder.sitofp(ltv.as_i64(self.builder), double)
             right_d = rtv.val if rk == VKind.FLOAT else self.builder.sitofp(rtv.as_i64(self.builder), double)
             return self._emit_float_binop(node.op, left_d, right_d, node)
@@ -36947,13 +36985,23 @@ class CodeGen:
             return self._emit_int_binop(node.op, ltv.as_i64(self.builder),
                                          rtv.as_i64(self.builder), node)
 
-        # ── Guard: native container types must not reach cpython_binop ──
-        # Native containers (FpyList*, FpyDict*, etc.) are not PyObject*;
-        # passing them to cpython_binop causes an access violation.  Route
-        # through fv_binop which handles valid ops (concat, repeat) and
-        # raises TypeError for invalid combinations.
+        # ── Guard: native pointer types must not reach cpython_binop ────
+        # Native values (FpyList*, FpyDict*, FpyBigInt*, ...) are not
+        # PyObject*; passing one to cpython_binop causes an access violation.
+        # Route through fv_binop, which handles the valid ops and raises
+        # TypeError for the rest.
+        #
+        # BigInt, Decimal and complex belong here too and were missing.  The
+        # omission was only *latent* for Decimal and complex, whose fv_binop
+        # arms happen to catch every op the front end sends here — but BigInt
+        # had no true-division arm, so `(2 ** 80) / 2` fell through to the
+        # bridge and handed PyNumber_TrueDivide a raw FpyBigInt*, which
+        # crashed.  The arm exists now; the kinds are listed anyway, because
+        # what makes this safe must be the guard, not a coincidence about
+        # which ops the runtime happens to implement.
         _container_kinds = (VKind.LIST, VKind.DICT, VKind.SET, VKind.TUPLE,
-                            VKind.STR, VKind.BYTES)
+                            VKind.STR, VKind.BYTES,
+                            VKind.BIGINT, VKind.DECIMAL, VKind.COMPLEX)
         if lk in _container_kinds or rk in _container_kinds:
             _fv_ops = {ast.Add: 0, ast.Sub: 1, ast.Mult: 2, ast.Div: 3,
                        ast.FloorDiv: 4, ast.Mod: 5}
@@ -37555,16 +37603,14 @@ class CodeGen:
             floor_fn = self.module.declare_intrinsic("llvm.floor", [double])
             return self.builder.call(floor_fn, [result])
         elif isinstance(op, ast.Mod):
-            # Python-compatible float modulo: result has same sign as divisor.
-            # rem = fmod(a, b); if sign(rem) != sign(b) and rem != 0: rem += b
-            rem = self.builder.frem(left, right)
-            rem_neg = self.builder.fcmp_ordered("<", rem, ir.Constant(double, 0.0))
-            b_neg = self.builder.fcmp_ordered("<", right, ir.Constant(double, 0.0))
-            signs_differ = self.builder.xor(rem_neg, b_neg)
-            rem_nonzero = self.builder.fcmp_ordered("!=", rem, ir.Constant(double, 0.0))
-            needs_adjust = self.builder.and_(signs_differ, rem_nonzero)
-            adjusted = self.builder.fadd(rem, right)
-            return self.builder.select(needs_adjust, adjusted, rem)
+            # Python-compatible float modulo (sign of the divisor) *and* a
+            # raise on a zero divisor.  This used to be an inline frem plus a
+            # sign fixup, which left `1.0 % 0.0` answering nan where CPython
+            # raises ZeroDivisionError; safe_fmod does both.
+            result = self.builder.call(self.runtime["safe_fmod"],
+                                       [left, right])
+            self._emit_try_bail_if_exc()
+            return result
         elif isinstance(op, ast.Div):
             result = self.builder.call(self.runtime["safe_fdiv"],
                                      [left, right])
@@ -37573,7 +37619,30 @@ class CodeGen:
         elif isinstance(op, ast.Pow):
             return self.builder.call(self.runtime["pow_float"], [left, right])
         else:
-            return self._bridge_fallback_expr(node, f"unsupported float operator: {type(op).__name__}")
+            # The only operators left are the bitwise ones, and a float has
+            # none: `1 & 1.5` is a TypeError in Python.  Callers that know the
+            # operand kinds raise with the real type names before getting here;
+            # this is the backstop.  It used to be _bridge_fallback_expr, whose
+            # no-match answer is 0 — so the program silently continued with a
+            # plausible number.
+            _sym = {ast.BitAnd: "&", ast.BitOr: "|", ast.BitXor: "^",
+                    ast.LShift: "<<", ast.RShift: ">>"}.get(type(op), "?")
+            self._emit_runtime_type_error(
+                f"unsupported operand type(s) for {_sym}: 'float' and 'float'")
+            return ir.Constant(double, 0.0)
+
+    def _emit_runtime_type_error(self, message: str) -> None:
+        """Raise TypeError at run time with a message known at compile time.
+
+        fastpy_raise sets the pending-exception flag and returns, so the caller
+        still has to produce *some* value for the expression; the bail check
+        emitted here routes to the handler before that value is used.
+        """
+        exc_name = self._make_string_constant("TypeError")
+        exc_id = self.builder.call(self.runtime["exc_name_to_id"], [exc_name])
+        msg = self._make_string_constant(message)
+        self.builder.call(self.runtime["raise"], [exc_id, msg])
+        self._emit_try_bail_if_exc()
 
     def _try_constant_fold(self, node: ast.expr) -> int | float | str | None:
         """Try to evaluate an expression at compile time. Returns None if not constant."""
@@ -49737,6 +49806,39 @@ class CodeGen:
             is_true = self.builder.icmp_signed("!=", value, ir.Constant(i32, 0))
             return self.builder.select(is_true, true_str, false_str)
         return self._make_string_constant("")  # Phase 4: unconvertible type → empty string
+
+    def _exc_arg_to_message(self, value: ir.Value, arg_node: ast.expr,
+                            exc_name: str, node: ast.AST) -> ir.Value:
+        """Render an exception's first argument as its stored message.
+
+        For every built-in but one this is just str(arg).  KeyError is the
+        exception: its __str__ is `repr(args[0])`, so `raise KeyError("k")`
+        prints `KeyError: 'k'` — quotes included — while `KeyError(5)` prints
+        `KeyError: 5`.  fastpy keeps only the rendered message, never an args
+        tuple, so the repr has to be applied here at the raise, the last point
+        where the argument's type is still known.  The runtime's own dict-miss
+        paths apply the same rule through fpy_raise_key_error.
+        BUG-KEYERROR-STR-NOT-REPR.
+
+        Only arguments whose type is unambiguous get the repr treatment.  One
+        the front end cannot type falls through to str(), which is both what
+        every other exception does and what KeyError did before — so an
+        un-inferable case is no worse than it was, never wrong in a new way.
+        """
+        if exc_name == "KeyError":
+            # A tagged value carries its own type, so the runtime repr is exact.
+            if isinstance(value.type, ir.LiteralStructType):
+                return self._register_owned_str_ptr(self._fv_call_repr(value))
+            kind = self._infer_expr_kind(arg_node)
+            if kind is None and isinstance(arg_node, ast.Name):
+                kind = self._var_kind(arg_node.id)
+            if kind == VKind.STR and isinstance(value.type, ir.PointerType):
+                return self._register_owned_str_ptr(
+                    self._rt_call("str_repr", [value]))
+            # int/float/bool: repr and str agree, so the normal path is right.
+        if not isinstance(value.type, ir.PointerType):
+            return self._value_to_str(value, node)
+        return value
 
     def _emit_str_format(self, node: ast.Call, fmt_str_val: ir.Value) -> ir.Value:
         """Emit str.format() by parsing the format string at compile time."""

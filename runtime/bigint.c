@@ -4,9 +4,12 @@
  */
 
 #include "bigint.h"
+#include "exceptions.h"
 #include <stdio.h>
 #include <string.h>
 #include <limits.h>
+#include <math.h>
+#include <float.h>
 
 #ifdef _MSC_VER
 #include <intrin.h>
@@ -696,8 +699,13 @@ static FpyBigInt* mag_divmod(FpyBigInt *a, FpyBigInt *b,
 /* Floor division and modulo — simple long division */
 FpyBigInt* fpy_bigint_floordiv(FpyBigInt *a, FpyBigInt *b) {
     if (fpy_bigint_is_zero(b)) {
-        fprintf(stderr, "ZeroDivisionError: integer division or modulo by zero\n");
-        exit(1);
+        /* This used to print and exit(1), which made `(2 ** 80) // 0` the one
+         * division by zero in the language that a `try` could not catch. Raise
+         * like every other arithmetic error and hand back a zero, matching
+         * fastpy_safe_div: callers here don't check for NULL, and the pending
+         * flag stops the program at the next check anyway. */
+        fastpy_raise(FPY_EXC_ZERODIVISION, "division by zero");
+        return fpy_bigint_from_i64(0);
     }
     /* Simple case: single limb each */
     if (a->length <= 1 && b->length <= 1) {
@@ -737,6 +745,102 @@ FpyBigInt* fpy_bigint_floordiv(FpyBigInt *a, FpyBigInt *b) {
     bigint_normalize(q);
     if (q->length == 0) q->sign = 1;
     return q;
+}
+
+/* Number of bits in |a| (0 for zero), i.e. Python's int.bit_length(). */
+int64_t fpy_bigint_bit_length(FpyBigInt *a) {
+    if (a->length == 0) return 0;
+    uint64_t top = a->limbs[a->length - 1];
+    int bits = 0;
+    while (top) { bits++; top >>= 1; }
+    return (int64_t)(a->length - 1) * 64 + bits;
+}
+
+/* True division: a / b as a double.  BUG-BIGINT-TRUEDIV-UNIMPLEMENTED.
+ *
+ * Returns 0 on success, 1 for a zero divisor, 2 when the result is too large
+ * for a double.  The caller raises; this file has no opinion about which
+ * exception object that is.
+ *
+ * Converting each side to a double first and dividing would be wrong, not just
+ * imprecise: (10 ** 400) / (10 ** 399) is exactly 10.0 in Python even though
+ * neither operand is representable.  So the quotient is computed from the
+ * magnitudes at 55 bits of precision and then scaled, which is CPython's
+ * long_true_divide (Objects/longobject.c) with the same shift choice.
+ *
+ * The 55 bits matter: a double keeps 53, so 55 leaves a round bit and a place
+ * to park stickiness.  Any nonzero remainder is folded into the low bit of the
+ * quotient, which cannot disturb the top 53 but does turn an exact-looking tie
+ * into a value above the tie — that is what makes the single round-to-nearest
+ * -even performed by the (double) conversion come out the same as rounding the
+ * infinitely precise quotient. */
+int fpy_bigint_truediv(FpyBigInt *a, FpyBigInt *b, double *out) {
+    *out = 0.0;
+    if (fpy_bigint_is_zero(b)) return 1;
+    /* Zero keeps the sign of the quotient: 0 / -5 is -0.0, not 0.0. */
+    int negative = (a->sign != b->sign);
+    if (fpy_bigint_is_zero(a)) { *out = negative ? -0.0 : 0.0; return 0; }
+
+    int64_t a_bits = fpy_bigint_bit_length(a);
+    int64_t b_bits = fpy_bigint_bit_length(b);
+    int64_t diff = a_bits - b_bits;
+    /* |a/b| is in [2^(diff-1), 2^(diff+1)), so these bounds are decided
+     * before any work: past DBL_MAX_EXP nothing is representable, and below
+     * the smallest subnormal everything rounds to zero. */
+    if (diff > DBL_MAX_EXP) return 2;
+    if (diff < DBL_MIN_EXP - DBL_MANT_DIG - 1) { *out = negative ? -0.0 : 0.0; return 0; }
+
+    /* shift = the power of two the 55-bit quotient will be scaled by.  Clamping
+     * at DBL_MIN_EXP is what keeps subnormal results correctly rounded: there
+     * the quotient is computed with *fewer* than 55 bits so that the single
+     * rounding happens in ldexp rather than twice. */
+    int64_t shift = (diff > DBL_MIN_EXP ? diff : DBL_MIN_EXP) - DBL_MANT_DIG - 2;
+
+    FpyBigInt *num, *den;
+    FpyBigInt *sh = fpy_bigint_from_i64(shift < 0 ? -shift : shift);
+    if (shift <= 0) {
+        num = fpy_bigint_lshift(a, sh);
+        den = fpy_bigint_copy(b);
+    } else {
+        num = fpy_bigint_copy(a);
+        den = fpy_bigint_lshift(b, sh);
+    }
+    fpy_bigint_free(sh);
+    num->sign = 1;
+    den->sign = 1;
+
+    FpyBigInt *rem = NULL;
+    FpyBigInt *q = mag_divmod(num, den, &rem);
+    /* Sticky bit: a nonzero remainder means the true quotient sits above the
+     * integer one, and setting the low bit records that without changing which
+     * side of the halfway point the top bits fall on. */
+    if (!fpy_bigint_is_zero(rem)) {
+        if (q->length == 0) { bigint_ensure_capacity(q, 1); q->limbs[0] = 0; q->length = 1; }
+        q->limbs[0] |= 1u;
+    }
+    fpy_bigint_free(rem);
+    fpy_bigint_free(num);
+    fpy_bigint_free(den);
+
+    /* q has at most 56 bits by construction, so it always fits a uint64. */
+    double dq = 0.0;
+    for (int32_t i = q->length - 1; i >= 0; i--)
+        dq = dq * 18446744073709551616.0 + (double)q->limbs[i];
+    fpy_bigint_free(q);
+
+    double result = ldexp(dq, (int)shift);
+    if (isinf(result)) return 2;
+    *out = negative ? -result : result;
+    return 0;
+}
+
+/* |a| as a double, correctly rounded; 0 on success, 2 if out of range.
+ * Dividing by one reuses the rounding above rather than repeating it. */
+int fpy_bigint_to_double(FpyBigInt *a, double *out) {
+    FpyBigInt *one = fpy_bigint_from_i64(1);
+    int rc = fpy_bigint_truediv(a, one, out);
+    fpy_bigint_free(one);
+    return rc;
 }
 
 FpyBigInt* fpy_bigint_mod(FpyBigInt *a, FpyBigInt *b) {

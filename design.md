@@ -452,7 +452,111 @@ the probe well-defined for every producer at once, and keeps the lifetime
 callers already depended on (valid until the next raise). The tempting
 alternative — making `fpy_str_header` more suspicious so it rejects junk — is
 wrong in the other direction: the probe is load-bearing for ordinary strings,
-and any laxer test would start misclassifying real ones.
+and any laxer test would start misclassifying real ones. The cost of that
+choke point is that the buffer is *shared*: `str(e)` hands back a borrowed
+pointer into it, and because it is immortal an incref does not extend its life,
+so a program that collects messages in a list gets N copies of the last one
+(BUG-EXC-MSG-BUFFER-ALIASES-ACROSS-RAISES). Fixing that means publishing a
+fresh owned string per raise — which is only safe once codegen increfs at
+`except … as e`, or a raise inside a handler would free a message the handler
+still holds. Wrong-value is a better failure than use-after-free, so the two
+halves have to land together.
+
+**A wire format that is `#define`d per file will drift.** The `FPY_EXC_*` type
+codes are exactly that: codegen emits them as immediates, `fastpy_raise` maps
+them back to class names for `type(e).__name__`, and each runtime `.c` raises
+with them directly. runtime.c had a copy and objects.c had one labelled "mirror
+runtime.c", which is fine right up until one gains a code the other doesn't and
+a raise starts reporting the wrong class. They now live in
+`runtime/exceptions.h`; the compiler-side copy still has to agree by hand and
+says so. The trigger was bigint.c needing to raise — it had been *printing and
+calling `exit(1)`* on division by zero, which made `(2 ** 80) // 0` the one
+division by zero a `try` could not catch.
+
+That refactor also exposed a build-cache bug worth stating as a rule: **an
+`.obj` must be checked against the headers it includes, not just its `.c`.**
+`_obj_is_current` compared only source to object, so a header-only edit kept a
+stale `.obj` and appeared to do nothing — a miserable thing to debug, and
+exactly the failure mode of a header carrying layout-critical declarations
+(`FpyValue`, `FpyString`, the exception codes). It now also requires the `.obj`
+to be newer than the newest `.h` in the runtime directory. That over-rebuilds —
+any header change rebuilds every `.obj` — and that is the right trade against
+maintaining a per-file dependency list by hand for a build that takes seconds.
+
+**An exception's stored message is its `str()`, so KeyError has to be repr'd at
+the raise.** fastpy keeps a rendered message and never an args tuple, which
+matches every builtin but one: `KeyError.__str__` is `repr(args[0])`, so a
+string key prints quoted and an int key doesn't. With no args tuple there is
+nowhere later to apply that rule — the raise site is the last point that knows
+the key's type. Both sides therefore do it at the raise: `fpy_raise_key_error`
+for the runtime's dozen-odd dict/set miss paths, and `_exc_arg_to_message` in
+codegen for `raise KeyError(x)`. The runtime helper matters for the same reason
+`fastpy_raise`'s copy does — the sites had drifted into three different answers
+(raw key text, a bare `"KeyError"`, a hand-`snprintf`'d integer). The codegen
+half only quotes arguments whose type is unambiguous and otherwise falls
+through to `str()`, so an un-inferable case stays as wrong as it was rather
+than becoming newly wrong.
+
+**One repr, or the container path and `repr()` will disagree.** `fpy_value_repr`
+(what printing a string *inside* a list uses) and `fastpy_str_repr` (what
+`repr()` calls) were independent implementations, and they had diverged: one
+escaped control characters as `\xNN`, the other passed the raw byte through,
+and both hardcoded a single quote where CPython *chooses* — `repr("it's")` is
+`"it's"`, not `'it\'s'`. They now share `fpy_repr_quote` and
+`fpy_repr_escape_body`. The bytes case reuses the quote choice but keeps its
+own escaping, since a byte ≥ 127 has no character to show.
+
+**A fall-through guard must list what is allowed, not what is forbidden.**
+`fastpy_fv_binop` is a chain of arms — str, list, bytes, OBJ→bridge, bitwise,
+BigInt, Decimal, complex, float — and anything reaching the bottom is treated as
+plain i64 arithmetic. The stop-here check in front of that used to *enumerate*
+the tags with no handler (list, dict, set, str, bytes, and later Decimal and
+complex), which means every tag anyone forgot fell into the integer arithmetic
+and had its **pointer** added: BIGINT was never on the list, so an op the BigInt
+arm did not implement left the arm and kept going. The check is now positive —
+two integer-like operands or it is a TypeError — so a new tag, or a newly
+unhandled combination, fails loudly instead of quietly returning a number.
+
+The same shape appeared twice more in codegen's `_emit_binop`, and the two are
+worth naming because they show the failure is not specific to the runtime. Its
+float fast path had a `_float_incompatible` deny-list, so a pointer kind missing
+from it went through `sitofp(as_i64())` — `(2 ** 80) + 0.5` printed the BigInt's
+heap address plus a half. Its BigInt fast path promoted the other operand with
+`bigint_from_i64(as_i64())`, which for a float is the double's bit pattern read
+as an integer. Both are now positive checks (`_float_ok`, `_bigint_ok`) that fall
+through to `fv_binop` when they do not apply. `_container_kinds` — the guard that
+keeps native pointers out of `cpython_binop`, which would read one as a
+`PyObject*` — likewise lists BIGINT, DECIMAL and COMPLEX now, because what makes
+that safe should be the guard rather than a coincidence about which ops the
+runtime happens to implement.
+
+**A big int divided is a float, so it cannot be computed like the other ops.**
+Every other BigInt operator returns a BigInt and shares one demote-to-INT tail;
+`/` returns a double and returns early. The quotient must be computed from the
+magnitudes, not by converting each side to a double first — `(10 ** 400) / (10 **
+399)` is exactly `10.0` though neither operand is representable. `fpy_bigint_truediv`
+follows CPython's `long_true_divide`: shift so the integer quotient carries 55
+bits (53 for the mantissa, one to round on, one to hold stickiness), fold any
+remainder into the low bit, and `ldexp` back. That single-rounding discipline is
+also why `fpy_bigint_to_double` is written as division by one instead of its own
+top-bits extraction.
+
+**Silently substituting a value for an error is worse than the error.** Three
+places in `fastpy_fv_binop` answered `0` for a zero divisor rather than raising,
+and the int and float arms both used C's truncating `/` and `fmod` where Python
+floors and takes the divisor's sign. Both classes produce a plausible number, so
+they survive until something downstream is inexplicably wrong. The dynamic path
+now raises `ZeroDivisionError` and matches Python's sign rules, including the one
+i64 division that is UB in C (`INT64_MIN // -1`, which promotes to BigInt).
+
+Codegen had the same two holes on the *statically typed* side, which is why float
+`%` moved out of an inline `frem` into `fastpy_safe_fmod`: an inline sequence has
+nowhere to raise from, so `1.0 % 0.0` answered `nan`. And `_emit_float_binop`'s
+`else` — reached only by a bitwise operator, which floats do not have — used to
+call `_bridge_fallback_expr`, whose no-match answer is `0`; `1 & 1.5` therefore
+printed `0` instead of raising TypeError. The operand kinds are only still known
+at the *call site*, so that is where the raise is emitted, with
+`_emit_runtime_type_error` as the backstop inside.
 
 **A return that can promote needs both a `mixed` tag and the FV ABI.** These are
 decided in two places and either one alone is useless: `_duf_infer_ret_tag` can

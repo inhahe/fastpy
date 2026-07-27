@@ -8,6 +8,122 @@ how to reproduce it, and what the proper fix looks like.
 
 ## Active Bugs
 
+### ~~BUG-BIGINT-TRUEDIV-UNIMPLEMENTED. `/` on a big int reaches the CPython bridge with a raw `FpyBigInt*` and segfaults~~ — FIXED 2026-07-27
+
+**Fixed:** `fpy_bigint_truediv` in `runtime/bigint.c` implements it the way
+CPython's `long_true_divide` does — shift so the integer quotient carries 55
+bits (53 of mantissa, one to round on, one for stickiness), fold any remainder
+into the low bit, convert once and `ldexp` back — so `(10 ** 400) / (10 ** 399)`
+is exactly `10.0` even though neither operand is representable. A zero divisor
+returns 1 and an out-of-range quotient returns 2, which the caller turns into
+`ZeroDivisionError("division by zero")` and `OverflowError("integer division
+result too large for a float")`. `fpy_bigint_bit_length` and
+`fpy_bigint_to_double` (written as division by one, so the rounding is not
+implemented twice) came with it. The BigInt arm of `fastpy_fv_binop` no longer
+falls through for any op, and the codegen guard that keeps native pointers out
+of `cpython_binop` now lists BIGINT — see
+BUG-BINOP-GUARDS-ENUMERATE-THE-FORBIDDEN, which is the general form of this
+bug and was found while fixing it. Covered by
+`tests/regressions/bigint_truediv.py`.
+
+**What:** `fastpy_fv_binop`'s BigInt arm implements `+ - * // %` and leaves
+`case 3: /* truediv — fall through to float */` empty, with a comment saying
+"BigInt / BigInt → float not implemented yet". The fall-through does not stop
+there: the value continues to the bridge fallback, which hands the
+`FpyBigInt*` to `PyNumber_TrueDivide` as if it were a `PyObject*`.
+
+**Reproduce** — access violation, not a wrong answer:
+
+```python
+big = 2 ** 80
+print(big / 2)      # CPython: 6.044629098073146e+23;  fastpy: segfault
+```
+
+Confirmed under cdb: `python314!PyNumber_TrueDivide+0x23` reading
+`[r8+60h]` where `r8` is the `FpyBigInt*`. The zero divisor is not required —
+any big-int true division crashes.
+
+**Where:** `runtime/objects.c`, the `lt == FPY_TAG_BIGINT || rt ==
+FPY_TAG_BIGINT` arm of `fastpy_fv_binop` (`case 3` and the
+`/* truediv falls through */` comment below the switch). `runtime/bigint.h`
+has no `to_double` and no `bit_length` to build one from.
+
+**Proper fix:** implement it as CPython does, from the magnitudes rather than
+by converting each side to a double first — `(10 ** 400) / (10 ** 399)` is
+`10.0` even though neither operand fits in a double. Take ~64 significant bits
+off the top of each magnitude, divide those, and scale by the difference in
+bit lengths with `ldexp`; raise `ZeroDivisionError("division by zero")` for a
+zero divisor and `OverflowError("integer division result too large for a
+float")` when the scaled exponent leaves double range. Whatever the result,
+the arm must not fall through to the bridge — an unhandled tag combination
+reaching `fpy_cpython_binop` with a native pointer is a crash by
+construction, so the BigInt arm should end in an explicit TypeError rather
+than silently continuing.
+
+**Severity:** high — a hard crash on a basic arithmetic operator.
+
+### ~~BUG-BINOP-GUARDS-ENUMERATE-THE-FORBIDDEN. Three arithmetic guards deny-list the kinds that must stop, so every kind missing from a list is silently mishandled~~ — FIXED 2026-07-27
+
+**What:** the general form of BUG-BIGINT-TRUEDIV-UNIMPLEMENTED, found while
+fixing it. Three independent guards in the arithmetic path were written as
+"these kinds must not continue", and each was missing entries:
+
+1. `compiler/codegen.py`, the float fast path in `_emit_binop`
+   (`_float_incompatible = (STR, LIST, DICT, SET, TUPLE, BYTES, OBJ)`). Every
+   pointer kind absent from that tuple — BIGINT, DECIMAL, COMPLEX — reached
+   `sitofp(as_i64())`, which converts the *pointer* to a double.
+   `print((2 ** 80) + 0.5)` printed `3032756220832.5`: the heap address of the
+   FpyBigInt, plus a half.
+2. `compiler/codegen.py`, the BigInt fast path just above it, which promoted
+   the other operand with `bigint_from_i64(other.as_i64())`. For a float that
+   is the double's bit pattern read as an integer, so `(2 ** 80) + 0.5` gave
+   `2**80 + 4602678819172646912`.
+3. `runtime/objects.c`, the TypeError guard near the end of `fastpy_fv_binop`,
+   which listed the container tags plus DECIMAL and COMPLEX. BIGINT was never
+   on it, so an op with no BigInt arm fell into the plain i64 arithmetic at
+   the bottom and did the sum on the pointer. `None + None` likewise answered
+   `0` instead of raising.
+
+**Fixed:** all three are positive checks now — `_float_ok = (FLOAT, INT,
+BOOL)`, `_bigint_ok = (BIGINT, INT, BOOL)`, and `(lt is INT or BOOL) and (rt
+is INT or BOOL)` — so anything unhandled falls to `fv_binop` or to the
+TypeError instead of into an emitter that assumes a machine integer.
+`_container_kinds` (the codegen guard against handing a native pointer to
+`cpython_binop`) gained BIGINT, DECIMAL and COMPLEX for the same reason, and
+`fastpy_fv_binop` grew a BigInt-times-float arm that converts properly.
+Covered by `tests/regressions/numeric_guard_falls_through.py`.
+
+**Severity:** was high — silently wrong arithmetic, and a crash in the BigInt
+true-division case.
+
+### ~~BUG-ARITH-SILENT-ZERO-AND-C-SIGN-RULES. Zero divisors answer 0 or nan instead of raising, and `//`/`%` follow C's sign rules rather than Python's~~ — FIXED 2026-07-27
+
+**What:** found alongside the guard bugs above, same theme — an error or a
+wrong answer that looks like a plausible number:
+
+- `fastpy_fv_binop` (the dynamic path) had `ri != 0 ? li / ri : 0` for int
+  `/`, `//` and `%` and the same three ternaries in the float arm, so a zero
+  divisor produced `0` rather than `ZeroDivisionError`.
+- The same two arms used C's `/` and `fmod`, which truncate toward zero and
+  take the *dividend's* sign. Python floors and takes the divisor's:
+  `-7 // 2` is `-4` not `-3`, and `-7 % 2` is `1` not `-1`.
+- `INT64_MIN // -1` is UB in C; in Python it is `2 ** 63`, so it has to
+  promote to BigInt.
+- codegen inlined float `%` as a bare `frem` plus a sign fixup with no zero
+  check, so `1.0 % 0.0` answered `nan`.
+- codegen's `_emit_float_binop` sent any bitwise operator to
+  `_bridge_fallback_expr`, whose no-match answer is `0` — so `1 & 1.5`
+  printed `0` where CPython raises TypeError.
+
+**Fixed:** the runtime arms raise `ZeroDivisionError("division by zero")` and
+implement Python's floor/sign rules (including the `INT64_MIN // -1`
+promotion); new `fastpy_safe_fmod` gives codegen a float `%` that raises and
+signs correctly; the float fast path raises TypeError for bit operators, with
+the real operand type names, via the new `_emit_runtime_type_error` helper.
+Covered by `tests/regressions/numeric_guard_falls_through.py`.
+
+**Severity:** was high — wrong arithmetic with no diagnostic.
+
 ### ~~BUG-UNTYPED-PARAM-BARE-ABI. A parameter with no known type is given the bare ABI, so its runtime tag is dropped and `len()` answers 0~~ — FIXED 2026-07-26
 
 **What:** `_duf_select_abi` granted the bare-type ABI whenever every
@@ -3581,7 +3697,7 @@ Regression test `tests/regressions/exc_msg_header_backed.py`; verified by A/B
 under `tools/pure_harness.py` (ASan aborts without the change, clean with it).
 This also unblocked `list_literal_heap_numeric_elems.py` under the harness.
 
-### BUG-MODULO-BY-ZERO-MESSAGE-WORDING. `1 % 0` reports a different message than CPython — 2026-07-27
+### ~~BUG-MODULO-BY-ZERO-MESSAGE-WORDING. `1 % 0` reports a different message than CPython~~ — FIXED 2026-07-27
 
 **What:** fastpy raises `ZeroDivisionError: integer modulo by zero`; CPython
 3.14 says `division by zero` for `%` just as it does for `/` and `//`. (The
@@ -3607,7 +3723,29 @@ in isolation. Cheap, but it needs the message audit to be worth doing once.
 message diverge from CPython — `tests/regressions/exc_msg_header_backed.py`
 has to compare only the length because of it.
 
-### BUG-KEYERROR-STR-NOT-REPR. `str(KeyError)` doesn't quote the key — 2026-07-27
+**Fixed:** the audit found three sites, not one. `fastpy_safe_mod` in
+`runtime/runtime.c` said "integer modulo by zero", `fpy_complex_div` in
+`runtime/objects.c` named the operand type, and `fpy_bigint_floordiv` in
+`runtime/bigint.c` did not raise at all — it printed and called `exit(1)`,
+which made `(2 ** 80) // 0` the one division by zero in the language a `try`
+could not catch. All three now say `division by zero`, and the bigint one
+raises like its siblings and returns zero (callers there don't check for
+NULL, and the pending flag stops the program at the next check anyway).
+Verified against CPython 3.14.6 that `/`, `//`, `%` and `divmod` agree on
+that wording for int, float, bigint and complex; only `0 ** -1` differs
+("zero to a negative power"), and that one already matched.
+
+Making bigint.c able to raise meant giving it the `FPY_EXC_*` codes, which
+had been re-`#define`d per file — runtime.c had a copy and objects.c had one
+labelled "mirror runtime.c". Rather than add a third, the codes moved to a
+new `runtime/exceptions.h` that all three include. That in turn exposed a
+build bug: `_obj_is_current` in `compiler/toolchain.py` compared each runtime
+`.c` against its `.obj` and ignored headers entirely, so a header-only edit
+silently kept a stale `.obj` and appeared to have no effect. It now also
+requires the `.obj` to be newer than the newest `.h` in the runtime
+directory.
+
+### ~~BUG-KEYERROR-STR-NOT-REPR. `str(KeyError)` doesn't quote the key~~ — FIXED 2026-07-27
 
 **What:** CPython's `KeyError.__str__` is the *repr* of the missing key, so a
 string key prints quoted. fastpy stores the bare key text as the message.
@@ -3629,6 +3767,132 @@ builtin exception's `str` really is the plain message.
 
 **Severity:** cosmetic, same caveat as above — the regression test can't
 compare the text.
+
+**Fixed:** the runtime had fourteen `FPY_EXC_KEYERROR` raise sites giving
+three different answers to one question — the raw key text, a bare
+`"KeyError"`, and a hand-`snprintf`'d integer. They now all go through one
+`fpy_raise_key_error(FpyValue)` in `runtime/objects.c`, which reprs the key
+via the existing `fpy_value_repr`, so the type decides the quoting (`'a'` vs
+`5`) instead of the call site. The message-shaped ones are covered by the
+same helper rather than special-cased: `set().pop()` raises
+`KeyError('pop from an empty set')` and CPython quotes that string like any
+other argument.
+
+`raise KeyError(x)` in user code needed the same treatment on the compiler
+side, since fastpy stores only the rendered message and never an args tuple —
+the raise is the last point where the argument's type is known.
+`_exc_arg_to_message` in `compiler/codegen.py` applies the repr for KeyError
+only, and only when the argument's type is unambiguous; anything the front
+end can't type falls through to `str()`, which is what it did before, so an
+un-inferable case is no worse rather than newly wrong. Getting `"fmt-%d" % n`
+into that set meant teaching `_infer_expr_kind` that `str % x` and `str + x`
+are strings, which every other consumer of that helper benefits from too.
+
+Regression test `tests/regressions/keyerror_str_is_repr.py` covers subscript,
+`pop`, `del`, the empty-set/empty-dict messages, and user raises with a
+literal, a variable, an int, a `%`-format and an f-string.
+
+### BUG-REPR-ALWAYS-SINGLE-QUOTES. `repr("it's")` escapes instead of switching quote character — 2026-07-27
+
+**What:** CPython *picks* the quote when it reprs a string: one containing
+`'` but no `"` is wrapped in double quotes, so `repr("it's")` is `"it's"`, not
+`'it\'s'`. Only when both appear does the single quote get a backslash.
+fastpy always used single quotes and always escaped.
+
+**Reproduce:**
+
+```python
+print(repr("a'b"))      # fastpy: 'a\'b'   CPython: "a'b"
+print(["it's"])         # fastpy: ['it\'s'] CPython: ["it's"]
+```
+
+**Where:** `runtime/objects.c` had *two* independent repr routines —
+`fpy_value_repr`'s `FPY_TAG_STR` case (the container path) and
+`fastpy_str_repr` (what `repr()` itself calls). Both hardcoded the quote, and
+they also disagreed with each other about control characters: the first
+emitted `\xNN`, the second passed the raw byte straight through.
+
+**Fixed 2026-07-27:** both now share `fpy_repr_quote` (which quote CPython
+would use) and `fpy_repr_escape_body` (the escaping), so there is one answer
+to what a repr'd string looks like. The `FPY_TAG_BYTES` case follows the same
+quote rule with its own escaping, since a byte ≥ 127 has no character to
+print and stays `\xNN`. `fastpy_str_repr`'s buffer also had to grow from
+`len*2+2` to `len*4+2`, which the `\xNN` form it previously never emitted now
+needs. Regression test `tests/regressions/repr_quote_choice.py` covers str,
+bytes, and the container path for each.
+
+### BUG-EXC-MSG-BUFFER-ALIASES-ACROSS-RAISES. `str(e)` returns a borrowed pointer into a buffer the next raise overwrites — 2026-07-27
+
+**What:** the exception message lives in one reused, thread-local,
+*immortal* header-backed buffer (see BUG-STR-HEADER-PROBES-BEFORE-RUNTIME-
+STATIC-BUFFERS above). `str(e)` hands back a pointer into it. Because the
+buffer is immortal, increfing it is a no-op, so storing the result keeps a
+pointer to storage the *next* raise rewrites — every stored message ends up
+reading as the most recent one.
+
+**Reproduce:**
+
+```python
+seen = []
+for d in [0, 1, 2]:
+    try:
+        raise ValueError("v%d" % d)
+    except ValueError as e:
+        seen.append(str(e))
+print(seen)     # fastpy: ['v2', 'v2', 'v2']   CPython: ['v0', 'v1', 'v2']
+```
+
+Concatenating (`seen.append("" + str(e))`) copies and gives the right answer,
+which is why this went unnoticed — the existing tests all happened to
+concatenate.
+
+**Where:** `fpy_exc_msg_store` / `fpy_exc_msg_inline` / `fpy_exc_msg_big` in
+`runtime/runtime.c` (~line 700), published via `fpy_exc_msg`.
+
+**Proper fix:** make each raise publish a *fresh, owned* header-backed string
+(refcount 1) instead of rewriting a shared immortal one, and release the
+previous one when a new raise replaces it. Then a normal incref really does
+extend the lifetime and the aliasing disappears.
+
+This cannot be done in the runtime alone. Today the immortal buffer is
+memory-*safe* and only gives a wrong value; a mortal one introduces a
+use-after-free unless the handler's binding of `e` takes a reference. So the
+fix has to land together with an incref where codegen saves the message at
+`except ... as e` (`_saved_exc_msg` in `compiler/codegen.py`) — otherwise a
+raise *inside* a handler would free the message the handler still holds.
+Trading a wrong value for a UAF would be a regression, so the two halves must
+go in as one change.
+
+**Severity:** silent wrong output. Any program that collects exception
+messages in a list or dict gets N copies of the last one.
+
+### BUG-STR-EMBEDDED-NUL-TRUNCATES. A `str` containing `\x00` is cut at the null — 2026-07-27
+
+**What:** fastpy's `str` is a NUL-terminated C string, so `"\x00\x1f"` is
+length 0 and reprs as `''`. CPython's `str` carries an explicit length and
+round-trips the null.
+
+**Reproduce:**
+
+```python
+s = "\x00abc"
+print(len(s), repr(s))   # fastpy: 0 '';   CPython: 4 '\x00abc'
+```
+
+**Where:** the representation itself — `FpyString` stores `char data[]` and
+every str helper is `strlen`-based. Note `bytes` does *not* have this
+problem: `FpyBytes` keeps a length field and `fpy_bytes_len` uses it, which
+is why `repr(b"\x00\xff")` is already correct (see BUG-BYTES-EMBEDDED-NULL
+work above).
+
+**Proper fix:** give `FpyString` the explicit length field `FpyBytes` already
+has and move the str helpers off `strlen`, the same migration the bytes side
+already went through. That is a large, mechanical change across every str
+producer and consumer.
+
+**Severity:** low in practice — embedded nulls in text are rare — but it is a
+silent truncation, not an error. Noted here because
+`tests/regressions/repr_quote_choice.py` has to skip the `\x00` case for it.
 
 ### BUG-SUITE-DEFAULT-TIMEOUT-FLAKES-UNDER-LOAD. Regression tests spuriously fail on a busy machine — 2026-07-27
 

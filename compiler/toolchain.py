@@ -789,11 +789,40 @@ def _env_path_value(env: dict[str, str]) -> str:
     return ""
 
 
+def _newest_runtime_header_mtime() -> float:
+    """Newest mtime among the runtime's headers.
+
+    Every runtime .c includes some of these, and several of them carry
+    layout-critical declarations (`FpyValue`, `FpyString`, the FPY_EXC_*
+    constants) that the .obj bakes in. Comparing a .c against its .obj alone
+    therefore silently keeps a stale .obj whenever only a header changed — the
+    edit appears to have no effect, which is a miserable thing to debug. Using
+    the newest header in the directory over-rebuilds a little (any header
+    change rebuilds every .obj) and that is the right trade: a runtime build is
+    seconds, and the alternative is trusting a hand-maintained per-file
+    dependency list to stay correct.
+    """
+    newest = 0.0
+    try:
+        for h in RUNTIME_DIR.glob("*.h"):
+            m = h.stat().st_mtime
+            if m > newest:
+                newest = m
+    except OSError:
+        # An unreadable runtime dir is the build's problem, not the cache's;
+        # returning 0 just means "no header constraint".
+        return 0.0
+    return newest
+
+
 def _obj_is_current(src: Path, obj: Path) -> bool:
-    """Check if an object file exists and is newer than its source."""
+    """Check if an object file exists and is newer than its source *and headers*."""
     if not obj.exists():
         return False
-    return obj.stat().st_mtime >= src.stat().st_mtime
+    obj_mtime = obj.stat().st_mtime
+    if obj_mtime < src.stat().st_mtime:
+        return False
+    return obj_mtime >= _newest_runtime_header_mtime()
 
 
 def _compile_shared_runtime_windows(vcvars_cmd: str) -> None:
