@@ -596,6 +596,38 @@ says so. The trigger was bigint.c needing to raise — it had been *printing and
 calling `exit(1)`* on division by zero, which made `(2 ** 80) // 0` the one
 division by zero a `try` could not catch.
 
+**A type code answers "which class is this", not "does this handler catch
+it".** `except` matched by comparing the raised exception's code to the code of
+the handler's name, which works only for the classes something actually raises.
+The abstract builtins have no code of their own — `ArithmeticError` is the
+parent of the three things that raise, not one of them — so
+`fastpy_exc_name_to_id` answered `FPY_EXC_GENERIC` for it, the equality failed,
+and `except ArithmeticError:` did not catch `1 / 0`. `except LookupError:`
+missed IndexError and KeyError the same way. There were three arms doing this
+comparison — bare name, tuple element, dotted attribute — and each had drifted
+from the others: the tuple arm compared codes and nothing else, so
+`except (LookupError, X):` could not catch a user class at all, and the
+bare-name arm gated its user-class walk on *both* sides being GENERIC, so
+`except ValueError:` missed a user class derived from ValueError.
+
+They now share `_emit_exc_handler_matches`, which asks two questions: does the
+code match exactly, and does `fastpy_exc_class_matches` find the handler's name
+while walking up from the raised class. The walk consults a new
+`fpy_builtin_exc_parent` — one table, in the runtime, next to the code
+definitions it has to agree with — so a builtin parent and a user-declared base
+are answered by the same code and `except LookupError:` catches
+`class MyLookup(LookupError)` without either side special-casing the other. The
+matching predicate is what makes UnboundLocalError implementable as a distinct
+code (`FPY_EXC_UNBOUNDLOCAL`) while still being caught by `except NameError:`,
+which is what CPython does and what the unbound-local work above depends on.
+
+The other half of the fix is a *removal*: a handler name that resolves to
+GENERIC no longer matches on the code alone. It used to, and since every
+user-raised exception also carries GENERIC, every unknown name caught
+everything — `except Nonsense:` was a bare `except:`. Codes now only ever match
+codes that mean something; a name the runtime doesn't know reaches the class
+walk, and the walk answers no.
+
 That refactor also exposed a build-cache bug worth stating as a rule: **an
 `.obj` must be checked against the headers it includes, not just its `.c`.**
 `_obj_is_current` compared only source to object, so a header-only edit kept a

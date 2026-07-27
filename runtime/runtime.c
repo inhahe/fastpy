@@ -977,9 +977,10 @@ void fastpy_raise(int exc_type, const char *msg) {
             "ExceptionGroup",   /* 8 */
             "NameError",        /* 9 */
             "OverflowError",    /* 10 */
-            "AttributeError"    /* 11 */
+            "AttributeError",   /* 11 */
+            "UnboundLocalError" /* 12 */
         };
-        if (exc_type >= 1 && exc_type <= 11)
+        if (exc_type >= 1 && exc_type <= FPY_EXC_MAX_BUILTIN)
             fpy_exc_class_name = builtin_names[exc_type];
         /* For FPY_EXC_GENERIC (99), the compiler sets the name explicitly
          * via fastpy_exc_set_class_name — don't overwrite it here. */
@@ -1108,7 +1109,79 @@ int fastpy_exc_name_to_id(const char *name) {
     if (strcmp(name, "NameError") == 0) return FPY_EXC_NAMEERROR;
     if (strcmp(name, "OverflowError") == 0) return FPY_EXC_OVERFLOWERROR;
     if (strcmp(name, "AttributeError") == 0) return FPY_EXC_ATTRIBUTEERROR;
+    if (strcmp(name, "UnboundLocalError") == 0) return FPY_EXC_UNBOUNDLOCAL;
     return FPY_EXC_GENERIC;
+}
+
+/* ---- The builtin exception hierarchy ----
+ *
+ * `except` matching used to be an equality test on the type code, which is
+ * only the right answer when the handler names the exact class that was
+ * raised.  Python's builtin exceptions form a tree, and the abstract nodes of
+ * that tree — ArithmeticError, LookupError — are the whole reason it exists:
+ * `except ArithmeticError:` did not catch `1 / 0`, and `except LookupError:`
+ * did not catch a missing dict key, because neither name has a code of its
+ * own and the equality test had nothing to compare.
+ *
+ * The tree lives here rather than in codegen because the same walk answers
+ * for user-defined classes: fastpy_exc_class_matches checks the registered
+ * classes first, so `class MyError(ValueError)` walks up through its own
+ * entry and then continues into this table.
+ */
+static const char *fpy_builtin_exc_parent(const char *name) {
+    static const struct { const char *child; const char *parent; } tree[] = {
+        {"ZeroDivisionError",   "ArithmeticError"},
+        {"OverflowError",       "ArithmeticError"},
+        {"FloatingPointError",  "ArithmeticError"},
+        {"ArithmeticError",     "Exception"},
+        {"IndexError",          "LookupError"},
+        {"KeyError",            "LookupError"},
+        {"LookupError",         "Exception"},
+        {"UnboundLocalError",   "NameError"},
+        {"NameError",           "Exception"},
+        {"NotImplementedError", "RuntimeError"},
+        {"RecursionError",      "RuntimeError"},
+        {"RuntimeError",        "Exception"},
+        {"FileNotFoundError",   "OSError"},
+        {"FileExistsError",     "OSError"},
+        {"PermissionError",     "OSError"},
+        {"IsADirectoryError",   "OSError"},
+        {"NotADirectoryError",  "OSError"},
+        {"BrokenPipeError",     "OSError"},
+        {"OSError",             "Exception"},
+        {"ModuleNotFoundError", "ImportError"},
+        {"ImportError",         "Exception"},
+        {"UnicodeDecodeError",  "UnicodeError"},
+        {"UnicodeEncodeError",  "UnicodeError"},
+        {"UnicodeError",        "ValueError"},
+        {"ValueError",          "Exception"},
+        {"IndentationError",    "SyntaxError"},
+        {"SyntaxError",         "Exception"},
+        {"TypeError",           "Exception"},
+        {"AttributeError",      "Exception"},
+        {"StopIteration",       "Exception"},
+        {"StopAsyncIteration",  "Exception"},
+        {"AssertionError",      "Exception"},
+        {"BufferError",         "Exception"},
+        {"EOFError",            "Exception"},
+        {"MemoryError",         "Exception"},
+        {"ReferenceError",      "Exception"},
+        {"ExceptionGroup",      "Exception"},
+        {"SystemExit",          "BaseException"},
+        {"KeyboardInterrupt",   "BaseException"},
+        {"GeneratorExit",       "BaseException"},
+        {"Exception",           "BaseException"},
+    };
+    /* OSError absorbed IOError and EnvironmentError in Python 3; they are
+     * the same class, not subclasses of it, so normalize rather than
+     * making `except IOError:` miss an OSError. */
+    if (strcmp(name, "IOError") == 0
+        || strcmp(name, "EnvironmentError") == 0)
+        name = "OSError";
+    for (size_t i = 0; i < sizeof(tree) / sizeof(tree[0]); i++)
+        if (strcmp(tree[i].child, name) == 0)
+            return tree[i].parent;
+    return NULL;
 }
 
 /* ---- Exception class hierarchy registry ---- */
@@ -1133,9 +1206,17 @@ void fastpy_exc_register_class(const char *name, const char *parent) {
  * Returns 1 if raised_name IS handler_name, or if raised_name inherits
  * from handler_name through the registered class hierarchy. */
 int fastpy_exc_class_matches(const char *raised_name, const char *handler_name) {
+    if (!raised_name || !handler_name || !raised_name[0]) return 0;
     /* Direct match */
     if (strcmp(raised_name, handler_name) == 0) return 1;
-    /* Walk up the inheritance chain */
+    /* IOError and EnvironmentError name the same class as OSError. */
+    if ((strcmp(handler_name, "IOError") == 0
+         || strcmp(handler_name, "EnvironmentError") == 0)
+        && strcmp(raised_name, "OSError") == 0) return 1;
+    /* Walk up the inheritance chain.  A registered (user-defined) class wins
+     * over the builtin table, so a `class ValueError(...)` of the program's
+     * own does not inherit the builtin one's parent; when neither knows the
+     * name the walk is over. */
     const char *current = raised_name;
     for (int depth = 0; depth < FPY_MAX_EXC_CLASSES; depth++) {
         /* Find the parent of current */
@@ -1146,6 +1227,7 @@ int fastpy_exc_class_matches(const char *raised_name, const char *handler_name) 
                 break;
             }
         }
+        if (!parent) parent = fpy_builtin_exc_parent(current);
         if (!parent) break;
         if (strcmp(parent, handler_name) == 0) return 1;
         current = parent;
@@ -1159,13 +1241,14 @@ void fastpy_exc_unhandled(void) {
     const char *names[] = {
         "Exception", "ZeroDivisionError", "ValueError", "TypeError",
         "IndexError", "KeyError", "RuntimeError", "StopIteration",
-        "ExceptionGroup", "NameError", "OverflowError", "AttributeError"
+        "ExceptionGroup", "NameError", "OverflowError", "AttributeError",
+        "UnboundLocalError"
     };
     const char *name;
     if (fpy_exc_class_name[0] != '\0') {
         name = fpy_exc_class_name;
     } else {
-        name = (fpy_exc_type >= 1 && fpy_exc_type <= 11)
+        name = (fpy_exc_type >= 1 && fpy_exc_type <= FPY_EXC_MAX_BUILTIN)
             ? names[fpy_exc_type] : "Exception";
     }
     fpy_shadow_print_traceback();
@@ -1630,8 +1713,13 @@ int main(int argc, char *argv[]) {
             case FPY_EXC_NAMEERROR:    name = "NameError"; break;
             case FPY_EXC_OVERFLOWERROR: name = "OverflowError"; break;
             case FPY_EXC_ATTRIBUTEERROR: name = "AttributeError"; break;
+            case FPY_EXC_UNBOUNDLOCAL: name = "UnboundLocalError"; break;
             default: break;
         }
+        /* A user-defined class supplies its own name, and so does any raise
+         * that set one explicitly; the switch above is only the fallback. */
+        if (fpy_exc_class_name[0] != '\0')
+            name = fpy_exc_class_name;
         fpy_shadow_print_traceback();
         fprintf(stderr, "%s: %s\n", name, fpy_exc_msg ? fpy_exc_msg : "");
         return 1;

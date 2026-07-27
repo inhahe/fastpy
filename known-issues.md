@@ -8,6 +8,53 @@ how to reproduce it, and what the proper fix looks like.
 
 ## Active Bugs
 
+### BUG-BUILTIN-EXC-HIERARCHY-NOT-MATCHED. `except ArithmeticError:` did not catch `1 / 0` — 2026-07-27 — **FIXED**
+
+**Fixed:** an `except` clause matched by comparing the raised exception's *type
+code* to the code of the handler's name. That works only for classes something
+actually raises. The abstract builtins have no code of their own —
+`ArithmeticError` is the parent of the three things that raise, not one of them
+— so `fastpy_exc_name_to_id` answered `FPY_EXC_GENERIC`, the equality failed,
+and the handler never fired. `except LookupError:` missed IndexError and
+KeyError the same way.
+
+There were three arms doing this comparison — bare name, tuple element, dotted
+attribute — and each had drifted from the others. The tuple arm compared codes
+and nothing else, so `except (LookupError, X):` could not catch a user class at
+all; the bare-name arm gated its user-class walk on *both* sides being GENERIC,
+so `except ValueError:` missed a user class derived from ValueError.
+
+All three now share `_emit_exc_handler_matches`, which asks two questions: does
+the code match exactly, and does `fastpy_exc_class_matches` find the handler's
+name while walking up from the raised class. The walk consults a new
+`fpy_builtin_exc_parent` — one table, in the runtime, next to the code
+definitions it has to agree with — so a builtin parent and a user-declared base
+are answered by the same code, and `except LookupError:` catches
+`class MyLookup(LookupError)` without either side special-casing the other.
+
+The other half is a removal: a handler name that resolves to GENERIC no longer
+matches on the code alone. It used to, and since every user-raised exception
+also carries GENERIC, every unknown name caught everything — `except Nonsense:`
+was a bare `except:`.
+
+The predicate is also what makes `FPY_EXC_UNBOUNDLOCAL` implementable as a
+distinct code that `except NameError:` still catches, which
+BUG-UNBOUND-NATIVE-LOCAL-READS-STACK depends on.
+
+Regression coverage in `tests/regressions/builtin_exception_hierarchy.py`.
+
+<details><summary>Original report</summary>
+
+```python
+try:
+    1 / 0
+except ArithmeticError:      # never fired
+    print("caught")
+```
+Same for `except LookupError:` over a missing dict key or a list index.
+
+</details>
+
 ### BUG-FLOAT-KEY-DICT-LITERAL-SEGFAULTS. A dict literal with a float key produces something `len()` crashes on — 2026-07-27 — **FIXED**
 
 **Fixed:** float arms added to both sides, and the dispatch consolidated the

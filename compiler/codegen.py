@@ -17228,6 +17228,52 @@ class CodeGen:
         self._compiling_init, self._init_stored_slots = saved_init
         self._current_func_explicit_globals = saved_explicit_globals
 
+    def _emit_exc_handler_matches(self, exc_type: ir.Value,
+                                   handler_name: str) -> ir.Value:
+        """Does the pending exception satisfy `except <handler_name>:`?
+
+        Every handler shape — a bare name, a name in a tuple, a dotted
+        `module.Error` — asks this one question, and each used to answer it
+        with its own inline test.  They disagreed: the tuple arm compared
+        type codes and nothing else, so `except (LookupError, X):` could not
+        catch a KeyError, and the bare-name arm gated its hierarchy walk on
+        *both* sides being FPY_EXC_GENERIC, so `except ValueError:` did not
+        catch a user class derived from ValueError either.
+
+        The rule is one rule: the codes match exactly, or the raised class
+        name inherits from the handler's through `fastpy_exc_class_matches`,
+        which walks the registered user classes and then the builtin tree.
+        The code comparison is kept as well as the walk because it needs no
+        class name to have been published, and it folds to a constant when
+        the handler names a builtin.
+        """
+        exc_name = self._make_string_constant(handler_name)
+        # `except Exception:` / `except BaseException:` catch everything, and
+        # saying so as a constant lets LLVM drop the whole test.
+        if handler_name in ("Exception", "BaseException"):
+            return ir.Constant(ir.IntType(1), 1)
+        expected_id = self.builder.call(
+            self.runtime["exc_name_to_id"], [exc_name])
+        id_match = self.builder.icmp_signed("==", exc_type, expected_id)
+        # An abstract builtin (ArithmeticError, LookupError) has no code of
+        # its own — exc_name_to_id answers GENERIC — so a code comparison
+        # can never be what catches it.  The name walk is.
+        raised_name = self.builder.call(
+            self.runtime["exc_get_class_name"], [])
+        class_match = self.builder.call(
+            self.runtime["exc_class_matches"], [raised_name, exc_name])
+        class_match_bool = self.builder.icmp_signed(
+            "!=", class_match, ir.Constant(i32, 0))
+        # A handler that is itself GENERIC (a user class name) must not be
+        # matched by the code test — every user-raised exception carries
+        # GENERIC — or `except MyError:` would catch `class YourError`.
+        _EXC_GENERIC = ir.Constant(i32, 99)   # FPY_EXC_GENERIC
+        handler_is_generic = self.builder.icmp_signed(
+            "==", expected_id, _EXC_GENERIC)
+        id_match = self.builder.and_(
+            id_match, self.builder.not_(handler_is_generic))
+        return self.builder.or_(id_match, class_match_bool)
+
     def _emit_exc_class_hierarchy(self) -> None:
         """Register user-defined exception classes and their parents so
         the runtime can match except handlers via inheritance."""
@@ -17235,7 +17281,8 @@ class CodeGen:
             "Exception", "BaseException", "ZeroDivisionError",
             "ValueError", "TypeError", "IndexError", "KeyError",
             "RuntimeError", "StopIteration", "ExceptionGroup",
-            "NameError", "OverflowError", "AttributeError",
+            "NameError", "UnboundLocalError", "OverflowError",
+            "AttributeError",
             "AssertionError", "NotImplementedError", "FileNotFoundError",
             "OSError", "IOError", "ArithmeticError", "LookupError",
         }
@@ -23951,6 +23998,7 @@ class CodeGen:
                          "GeneratorExit", "SystemExit",
                          "KeyboardInterrupt", "ArithmeticError",
                          "LookupError", "SyntaxError", "NameError",
+                         "UnboundLocalError",
                          "ModuleNotFoundError", "RecursionError",
                          "BrokenPipeError", "EOFError",
                          "BufferError", "AssertionError"):
@@ -25792,6 +25840,7 @@ class CodeGen:
         "GeneratorExit", "SystemExit",
         "KeyboardInterrupt", "ArithmeticError",
         "LookupError", "SyntaxError", "NameError",
+        "UnboundLocalError",
         "ModuleNotFoundError", "RecursionError",
         "BrokenPipeError", "EOFError",
         "BufferError", "AssertionError",
@@ -26941,63 +26990,27 @@ class CodeGen:
                     next_handler = self._new_block("except.next")
 
                     if isinstance(handler.type, ast.Name):
-                        handler_type_name = handler.type.id
-                        exc_name = self._make_string_constant(handler_type_name)
-                        expected_id = self.builder.call(
-                            self.runtime["exc_name_to_id"], [exc_name])
-                        # "Exception"/"BaseException" catch everything
-                        if handler_type_name in ("Exception", "BaseException"):
-                            matches = ir.Constant(ir.IntType(1), 1)
-                        else:
-                            # FPY_EXC_GENERIC = 99 in the runtime
-                            _EXC_GENERIC = ir.Constant(i32, 99)
-                            is_generic = self.builder.icmp_signed(
-                                "==", exc_type, _EXC_GENERIC)
-                            handler_is_generic = self.builder.icmp_signed(
-                                "==", expected_id, _EXC_GENERIC)
-                            both_generic = self.builder.and_(
-                                is_generic, handler_is_generic)
-                            # For user-defined exceptions: match via class hierarchy
-                            raised_name = self.builder.call(
-                                self.runtime["exc_get_class_name"], [])
-                            class_match = self.builder.call(
-                                self.runtime["exc_class_matches"],
-                                [raised_name, exc_name])
-                            class_match_bool = self.builder.icmp_signed(
-                                "!=", class_match, ir.Constant(i32, 0))
-                            hierarchy_match = self.builder.and_(
-                                both_generic, class_match_bool)
-                            # For builtin exceptions: match via ID
-                            builtin_match = self.builder.and_(
-                                self.builder.not_(is_generic),
-                                self.builder.icmp_signed("==", exc_type, expected_id))
-                            matches = self.builder.or_(
-                                builtin_match, hierarchy_match)
+                        matches = self._emit_exc_handler_matches(
+                            exc_type, handler.type.id)
                         self.builder.cbranch(matches, handler_block, next_handler)
                     elif isinstance(handler.type, ast.Tuple):
                         # except (TypeError, ValueError): — OR chain of type checks
                         any_match = ir.Constant(ir.IntType(1), 0)
                         for elt in handler.type.elts:
                             if isinstance(elt, ast.Name):
-                                elt_name = self._make_string_constant(elt.id)
-                                elt_id = self.builder.call(
-                                    self.runtime["exc_name_to_id"], [elt_name])
-                                elt_match = self.builder.icmp_signed(
-                                    "==", exc_type, elt_id)
-                                any_match = self.builder.or_(any_match, elt_match)
+                                any_match = self.builder.or_(
+                                    any_match,
+                                    self._emit_exc_handler_matches(
+                                        exc_type, elt.id))
                             elif isinstance(elt, ast.Attribute):
-                                elt_name = self._make_string_constant(elt.attr)
-                                elt_id = self.builder.call(
-                                    self.runtime["exc_name_to_id"], [elt_name])
-                                elt_match = self.builder.icmp_signed(
-                                    "==", exc_type, elt_id)
-                                any_match = self.builder.or_(any_match, elt_match)
+                                any_match = self.builder.or_(
+                                    any_match,
+                                    self._emit_exc_handler_matches(
+                                        exc_type, elt.attr))
                         self.builder.cbranch(any_match, handler_block, next_handler)
                     elif isinstance(handler.type, ast.Attribute):
-                        exc_name = self._make_string_constant(handler.type.attr)
-                        expected_id = self.builder.call(
-                            self.runtime["exc_name_to_id"], [exc_name])
-                        matches = self.builder.icmp_signed("==", exc_type, expected_id)
+                        matches = self._emit_exc_handler_matches(
+                            exc_type, handler.type.attr)
                         self.builder.cbranch(matches, handler_block, next_handler)
                     else:
                         self.builder.branch(handler_block)
