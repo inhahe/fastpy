@@ -603,6 +603,33 @@ the one statically-typed string producer whose owned result nobody registered
 `s = "m" * 350`. Both are invisible to an output-diffing test suite; peak
 working set is the only thing that shows them.
 
+**A raise message built with `malloc` was correct only while the message was
+borrowed.** Six sites in `runtime/objects.c` allocated their error text
+specifically so it would outlive the call — the comment said "persistent". Once
+`fastpy_raise` copies, that allocation has no second owner and is simply lost,
+one per failed conversion. They use the shared `_err_buf` now. This is the
+general hazard in changing an ownership rule: the code that was written *around*
+the old rule does not fail, it just quietly stops being necessary.
+
+**A conversion builtin that inlines a two-way branch will be wrong for the
+other five tags.** `int()` and `float()` each open-coded a three-way branch over
+an FV-backed variable whose else arm used the payload raw — a BigInt's pointer
+returned as the integer, `sitofp` applied to a Decimal's pointer — and returned
+a tagged argument arriving any other way completely unchanged, so `int(v[1])`
+on `[1, -2.5]` printed `-2.5`. `fastpy_int_fv`/`fastpy_float_fv` join
+`fastpy_abs_fv` and `fastpy_neg_fv` for the reason all four exist: seven tags
+can convert and the rest must raise, which is more arms than an inlined
+dispatch ever gets right. `int()` consequently returns a *tagged* value, since
+a float past 2^63 and a BigInt argument both produce a BigInt.
+
+**`fptosi` is undefined outside the target's range, so it cannot be the whole
+lowering of `int(float)`.** `int(1e30)` gave 20 and `int(float("nan"))` gave
+INT64_MIN. `_emit_int_of_double` keeps the single instruction for the common
+case and guards it with an *ordered* comparison against ±2^63 — ordered
+precisely so NaN, which compares false against everything, takes the other
+edge — leaving the runtime to widen a large magnitude to a BigInt and to raise
+for NaN and infinity.
+
 **A return that can promote needs both a `mixed` tag and the FV ABI.** These are
 decided in two places and either one alone is useless: `_duf_infer_ret_tag` can
 say `mixed` while `_duf_select_abi` still hands the function a bare i64, which

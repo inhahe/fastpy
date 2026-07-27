@@ -1506,6 +1506,12 @@ class CodeGen:
                                     ir.PointerType(i64)])
         self.runtime["abs_fv"] = ir.Function(self.module, ft, name="fastpy_abs_fv")
         self.runtime["neg_fv"] = ir.Function(self.module, ft, name="fastpy_neg_fv")
+        # int()/float() of a tagged value, for the same reason: seven tags can
+        # convert (int, bool, float, str, bytes, bigint, Decimal) and the rest
+        # must raise, which is more arms than anyone inlines correctly.
+        # BUG-INT-FLOAT-OF-TAGGED-VALUE.
+        self.runtime["int_fv"] = ir.Function(self.module, ft, name="fastpy_int_fv")
+        self.runtime["float_fv"] = ir.Function(self.module, ft, name="fastpy_float_fv")
         ft = ir.FunctionType(void, [i8_ptr, i8_ptr, i32, i64])
         self.runtime["dict_set_fv"] = ir.Function(self.module, ft, name="fastpy_dict_set_fv")
         ft = ir.FunctionType(void, [i8_ptr, i8_ptr, ir.PointerType(i32), ir.PointerType(i64)])
@@ -38710,6 +38716,76 @@ class CodeGen:
             return self._rt_call("list_reversed", [arg])
         raise CodeGenError("reversed() takes exactly one argument", node)
 
+    def _emit_int_float_fv(self, rt_name: str, fv: ir.Value, label: str):
+        """Convert a runtime-tagged value with `fastpy_int_fv`/`fastpy_float_fv`.
+
+        The two differ in what they hand back. `float()` always produces a
+        FLOAT, so the double is unpacked and returned bare — the shape every
+        caller of `_emit_builtin_float` already expects. `int()` cannot: a
+        float past 2^63 and a BigInt argument both yield a BigInt, so the
+        result stays tagged, the way `abs()`'s does.
+
+        Either call can raise — a str that will not parse, a list argument —
+        so the try-bail goes here rather than at each call site.
+        BUG-INT-FLOAT-OF-TAGGED-VALUE.
+        """
+        tag_slot = self._create_entry_alloca(i32, f"{label}.tag")
+        data_slot = self._create_entry_alloca(i64, f"{label}.data")
+        self.builder.call(
+            self.runtime[rt_name],
+            [self.builder.extract_value(fv, 0),
+             self.builder.extract_value(fv, 1), tag_slot, data_slot])
+        self._emit_try_bail_if_exc()
+        if rt_name == "float_fv":
+            return self.builder.bitcast(self.builder.load(data_slot), double)
+        return self._fv_build_from_slots(self.builder.load(tag_slot),
+                                         self.builder.load(data_slot))
+
+    def _emit_int_of_double(self, val: ir.Value) -> ir.Value:
+        """`int()` of a naked double, without the undefined behaviour.
+
+        `fptosi` is only defined when the truncated value fits the target, so
+        the plain lowering was wrong in three ways at once: `int(1e30)` gave
+        20, `int(float("nan"))` and `int(float("inf"))` both gave INT64_MIN
+        where CPython raises ValueError and OverflowError. Those are not exotic
+        inputs — `float("inf")` is what a parse of an overflowing literal
+        yields.
+
+        The in-range case still lowers to a bare `fptosi`, guarded by an
+        *ordered* comparison so NaN (unordered against everything) takes the
+        other edge. Only the edge calls the runtime, which promotes a big
+        magnitude to a BigInt and raises for NaN/infinity. The result is
+        therefore tagged rather than a bare i64, since it may be either.
+        BUG-INT-FLOAT-OF-TAGGED-VALUE.
+        """
+        # 2^63 and -2^63 are both exactly representable, so these bounds are
+        # exact; `< 2^63` is the right test because 2^63 itself does not fit.
+        lo = ir.Constant(double, -9223372036854775808.0)
+        hi = ir.Constant(double, 9223372036854775808.0)
+        in_range = self.builder.and_(
+            self.builder.fcmp_ordered(">=", val, lo),
+            self.builder.fcmp_ordered("<", val, hi))
+        tag_slot = self._create_entry_alloca(i32, "intd.tag")
+        data_slot = self._create_entry_alloca(i64, "intd.data")
+        fast_bb = self._new_block("intd.fast")
+        slow_bb = self._new_block("intd.slow")
+        merge_bb = self._new_block("intd.merge")
+        self.builder.cbranch(in_range, fast_bb, slow_bb)
+        self.builder.position_at_end(fast_bb)
+        self.builder.store(ir.Constant(i32, FPY_TAG_INT), tag_slot)
+        self.builder.store(self.builder.fptosi(val, i64), data_slot)
+        self.builder.branch(merge_bb)
+        self.builder.position_at_end(slow_bb)
+        self.builder.call(
+            self.runtime["int_fv"],
+            [ir.Constant(i32, FPY_TAG_FLOAT), self.builder.bitcast(val, i64),
+             tag_slot, data_slot])
+        self.builder.branch(merge_bb)
+        self.builder.position_at_end(merge_bb)
+        self._emit_try_bail_if_exc()
+        return self._fv_build_from_slots(self.builder.load(tag_slot),
+                                         self.builder.load(data_slot))
+
     def _emit_builtin_int(self, node):
         if len(node.args) == 1:
             arg_node = node.args[0]
@@ -38754,70 +38830,20 @@ class CodeGen:
                                    self.builder.ptrtoint(ptr, i64),
                                    out_tag, out_data])
                 return self.builder.load(out_data)
-            # FV-backed variables: dispatch by runtime tag
-            # to handle int, float, and str arguments.
+            # FV-backed variables: dispatch by runtime tag in the runtime.
+            # This used to be an inlined three-way branch — float → fptosi,
+            # str → str_to_int, everything else → the raw `data` — whose else
+            # arm returned a BigInt's or a Decimal's *pointer* as though it
+            # were the integer, and turned `int([1])` into a nonsense number
+            # instead of a TypeError.  BUG-INT-FLOAT-OF-TAGGED-VALUE.
             if (self._USE_FV_LOCALS
                     and isinstance(arg_node, ast.Name)
                     and arg_node.id in self.variables):
                 alloca, tag = self.variables[arg_node.id]
                 if (isinstance(alloca.type, ir.PointerType)
                         and alloca.type.pointee is fpy_val):
-                    fv = self.builder.load(alloca)
-                    fv_tag = self.builder.extract_value(fv, 0)
-                    fv_data = self.builder.extract_value(fv, 1)
-                    # 3-way branch: float → fptosi, str → str_to_int, else → data
-                    is_float = self.builder.icmp_unsigned(
-                        "==", fv_tag, ir.Constant(i32, FPY_TAG_FLOAT))
-                    result_alloca = self._create_entry_alloca(i64, "int.res")
-                    float_bb = self._new_block("int.float")
-                    check_str_bb = self._new_block("int.chkstr")
-                    str_bb = self._new_block("int.str")
-                    else_bb = self._new_block("int.else")
-                    merge_bb = self._new_block("int.merge")
-                    self.builder.cbranch(is_float, float_bb, check_str_bb)
-                    # Float path
-                    self.builder.position_at_end(float_bb)
-                    float_val = self.builder.bitcast(fv_data, double)
-                    int_from_float = self.builder.fptosi(float_val, i64)
-                    self.builder.store(int_from_float, result_alloca)
-                    self.builder.branch(merge_bb)
-                    # Check string tag
-                    self.builder.position_at_end(check_str_bb)
-                    is_str = self.builder.icmp_unsigned(
-                        "==", fv_tag, ir.Constant(i32, FPY_TAG_STR))
-                    self.builder.cbranch(is_str, str_bb, else_bb)
-                    # String path
-                    self.builder.position_at_end(str_bb)
-                    str_ptr = self._ensure_ptr(fv_data)
-                    int_from_str = self._rt_call("str_to_int", [str_ptr])
-                    self._emit_try_bail_if_exc()
-                    self.builder.store(int_from_str, result_alloca)
-                    self.builder.branch(merge_bb)
-                    # Else path: check for None/unsupported types → TypeError
-                    self.builder.position_at_end(else_bb)
-                    is_none = self.builder.icmp_unsigned(
-                        "==", fv_tag, ir.Constant(i32, FPY_TAG_NONE))
-                    none_bb = self._new_block("int.none")
-                    ok_bb = self._new_block("int.ok")
-                    self.builder.cbranch(is_none, none_bb, ok_bb)
-                    # None → TypeError
-                    self.builder.position_at_end(none_bb)
-                    exc_name = self._make_string_constant("TypeError")
-                    exc_id = self.builder.call(
-                        self.runtime["exc_name_to_id"], [exc_name])
-                    msg_ptr = self._make_string_constant(
-                        "int() argument must be a string, a bytes-like "
-                        "object or a real number, not 'NoneType'")
-                    self.builder.call(self.runtime["raise"], [exc_id, msg_ptr])
-                    self.builder.store(ir.Constant(i64, 0), result_alloca)
-                    self.builder.branch(merge_bb)
-                    # OK path (already int/bool)
-                    self.builder.position_at_end(ok_bb)
-                    self.builder.store(fv_data, result_alloca)
-                    self.builder.branch(merge_bb)
-                    # Merge
-                    self.builder.position_at_end(merge_bb)
-                    return self.builder.load(result_alloca)
+                    return self._emit_int_float_fv(
+                        "int_fv", self.builder.load(alloca), "int")
             # int(None) → TypeError at compile time
             if isinstance(arg_node, ast.Constant) and arg_node.value is None:
                 exc_name = self._make_string_constant("TypeError")
@@ -38829,8 +38855,14 @@ class CodeGen:
                 self.builder.call(self.runtime["raise"], [exc_id, msg_ptr])
                 return ir.Constant(i64, 0)
             val = self._emit_expr_value(arg_node)
+            if val.type == fpy_val:
+                # A tagged argument that is not a bare variable — a list
+                # element, a "mixed"-returning call — used to fall past every
+                # branch here and be returned *unchanged*, so `int(v[1])` on
+                # `[1, -2.5]` printed `-2.5`.  BUG-INT-FLOAT-OF-TAGGED-VALUE.
+                return self._emit_int_float_fv("int_fv", val, "int")
             if isinstance(val.type, ir.DoubleType):
-                return self.builder.fptosi(val, i64)
+                return self._emit_int_of_double(val)
             if isinstance(val.type, ir.IntType) and val.type.width < 64:
                 return self.builder.zext(val, i64)
             if isinstance(val.type, ir.PointerType):
@@ -39114,53 +39146,24 @@ class CodeGen:
                                    out_tag, out_data])
                 data = self.builder.load(out_data)
                 return self.builder.bitcast(data, double)
-            # FV-backed variables: dispatch by runtime tag
-            # to handle int, float, str, and bool arguments.
+            # FV-backed variables: dispatch by runtime tag in the runtime.
+            # The inlined version's else arm ran `sitofp` on the raw `data`,
+            # which for a BigInt or a Decimal converts the *pointer* to a
+            # double and for a list or None invents a number where CPython
+            # raises.  BUG-INT-FLOAT-OF-TAGGED-VALUE.
             if (self._USE_FV_LOCALS
                     and isinstance(arg_node, ast.Name)
                     and arg_node.id in self.variables):
                 alloca, _ftag = self.variables[arg_node.id]
                 if (isinstance(alloca.type, ir.PointerType)
                         and alloca.type.pointee is fpy_val):
-                    fv = self.builder.load(alloca)
-                    fv_tag = self.builder.extract_value(fv, 0)
-                    fv_data = self.builder.extract_value(fv, 1)
-                    is_str = self.builder.icmp_unsigned(
-                        "==", fv_tag, ir.Constant(i32, FPY_TAG_STR))
-                    is_float = self.builder.icmp_unsigned(
-                        "==", fv_tag, ir.Constant(i32, FPY_TAG_FLOAT))
-                    result_alloca = self._create_entry_alloca(
-                        double, "float.res")
-                    str_bb = self._new_block("float.str")
-                    check_float_bb = self._new_block("float.chkflt")
-                    float_bb = self._new_block("float.flt")
-                    else_bb = self._new_block("float.else")
-                    merge_bb = self._new_block("float.merge")
-                    self.builder.cbranch(is_str, str_bb, check_float_bb)
-                    # String path
-                    self.builder.position_at_end(str_bb)
-                    str_ptr = self._ensure_ptr(fv_data)
-                    f_from_str = self._rt_call("str_to_float", [str_ptr])
-                    self._emit_try_bail_if_exc()
-                    self.builder.store(f_from_str, result_alloca)
-                    self.builder.branch(merge_bb)
-                    # Check float
-                    self.builder.position_at_end(check_float_bb)
-                    self.builder.cbranch(is_float, float_bb, else_bb)
-                    # Float path (already float)
-                    self.builder.position_at_end(float_bb)
-                    already_f = self.builder.bitcast(fv_data, double)
-                    self.builder.store(already_f, result_alloca)
-                    self.builder.branch(merge_bb)
-                    # Else (int/bool → sitofp)
-                    self.builder.position_at_end(else_bb)
-                    f_from_int = self.builder.sitofp(fv_data, double)
-                    self.builder.store(f_from_int, result_alloca)
-                    self.builder.branch(merge_bb)
-                    # Merge
-                    self.builder.position_at_end(merge_bb)
-                    return self.builder.load(result_alloca)
+                    return self._emit_int_float_fv(
+                        "float_fv", self.builder.load(alloca), "float")
             val = self._emit_expr_value(arg_node)
+            if val.type == fpy_val:
+                # A tagged argument that is not a bare variable was returned
+                # unchanged, so `float(v[0])` on `[1, -2.5]` printed `1`.
+                return self._emit_int_float_fv("float_fv", val, "float")
             if isinstance(val.type, ir.IntType):
                 return self.builder.sitofp(val, double)
             if isinstance(val.type, ir.PointerType):

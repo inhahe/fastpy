@@ -3399,7 +3399,7 @@ ASan/UBSan/LSan.
 fixed here, each verified by A/B against HEAD: BUG-BOOL-PLUS-INT-YIELDS-FLOAT
 and BUG-BIGINT-RETURNED-FROM-FUNCTION-LOSES-TAG.
 
-### BUG-INT-FLOAT-OF-TAGGED-VALUE. `int()` and `float()` of a tagged value are no-ops — 2026-07-27
+### ~~BUG-INT-FLOAT-OF-TAGGED-VALUE. `int()` and `float()` of a tagged value are no-ops~~ — FIXED 2026-07-27
 
 **What:** `int(x)` and `float(x)` where `x` is an `fpy_val` pass the value
 straight through, tag and all, instead of converting it.
@@ -3418,6 +3418,40 @@ tag-dispatching runtime entry point, which additionally has to get
 truncation-toward-zero right for FLOAT→INT and raise for the non-numeric tags.
 
 **Severity:** silently wrong values, and wrong *types* downstream.
+
+**FIXED 2026-07-27** with `fastpy_int_fv` / `fastpy_float_fv`, the entry
+points that note asks for. Writing them turned up that the pass-through was
+only half the bug — the *other* half was the path that looked correct:
+
+- The inlined FV-**variable** branch (a three-way float/str/else in `int()`, a
+  three-way str/float/else in `float()`) fell into its else arm for every
+  remaining tag. `int()` returned that arm's raw payload, which for a BigInt
+  or Decimal is the **pointer**; `float()` ran `sitofp` on it, converting the
+  pointer to a double. `int(None)` was special-cased to raise, but
+  `int([1])`, `int({})` and every `float()` of a non-number answered a number.
+  Both branches are gone; both shapes now call the runtime.
+- `int()` of a *naked double* lowered to a bare `fptosi`, which is undefined
+  outside the target range. `int(1e30)` gave **20**; `int(float("nan"))` and
+  `int(float("inf"))` both gave INT64_MIN where CPython raises ValueError and
+  OverflowError. `_emit_int_of_double` keeps the `fptosi` for the in-range
+  case — guarded by an *ordered* compare, so NaN takes the other edge — and
+  calls the runtime otherwise.
+
+Because a float past 2^63 and a BigInt argument both convert to a BigInt,
+`int()` now yields a *tagged* result rather than a bare i64, the way `abs()`
+already did. `float()` keeps returning a bare double, since it has only one
+result kind. The runtime handles seven convertible tags (int, bool, float,
+str, bytes, bigint, Decimal) and raises CPython's message for the rest;
+Decimal→int truncates on the coefficient rather than through a double, so
+`int(Decimal("0.9999999999999999999"))` is 0 and not 1.
+
+One leak fixed alongside, since `fastpy_int_fv` calls into it: six sites in
+`runtime/objects.c` built their error message with a fresh `malloc` and handed
+it to `fastpy_raise` — correct when the message was borrowed, a straight leak
+per failed conversion now that the raise copies. All six use `_err_buf` with a
+`%.160s` bound, which no parseable number reaches.
+
+Pinned by `tests/regressions/int_float_of_tagged_value.py`.
 
 ### ~~BUG-LIST-LITERAL-BIGINT-DECIMAL-ELEM. A BigInt or Decimal stored into a list literal loses its tag~~ — FIXED 2026-07-27
 

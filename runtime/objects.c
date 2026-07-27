@@ -5343,11 +5343,14 @@ int64_t fastpy_str_to_int(const char *s) {
     if (*p == '+' || *p == '-') p++;
     /* Must have at least one digit */
     if (*p < '0' || *p > '9') {
-        /* Allocate a persistent error message matching CPython's format */
-        char *msg = (char*)malloc(64 + strlen(s));
-        snprintf(msg, 64 + strlen(s),
-                 "invalid literal for int() with base 10: '%s'", s);
-        fastpy_raise(FPY_EXC_VALUEERROR, msg);
+        /* The message goes in the shared buffer, not a fresh malloc: since
+         * `fastpy_raise` copies it into the exception slot's own refcounted
+         * string, a malloc here would be a straight leak — one per failed
+         * conversion. The literal is truncated at 160 chars, which no
+         * *parseable* number ever reaches. */
+        snprintf(_err_buf, sizeof(_err_buf),
+                 "invalid literal for int() with base 10: '%.160s'", s);
+        fastpy_raise(FPY_EXC_VALUEERROR, _err_buf);
         return 0;
     }
     char *end;
@@ -5355,10 +5358,9 @@ int64_t fastpy_str_to_int(const char *s) {
     /* Check for trailing garbage (other than whitespace) */
     while (*end == ' ' || *end == '\t' || *end == '\n' || *end == '\r') end++;
     if (*end != '\0') {
-        char *msg = (char*)malloc(64 + strlen(s));
-        snprintf(msg, 64 + strlen(s),
-                 "invalid literal for int() with base 10: '%s'", s);
-        fastpy_raise(FPY_EXC_VALUEERROR, msg);
+        snprintf(_err_buf, sizeof(_err_buf),
+                 "invalid literal for int() with base 10: '%.160s'", s);
+        fastpy_raise(FPY_EXC_VALUEERROR, _err_buf);
         return 0;
     }
     return result;
@@ -5375,11 +5377,10 @@ int64_t fastpy_str_to_int_base(const char *s, int64_t base) {
     int64_t result = (int64_t)strtoll(p, &end, (int)base);
     while (*end == ' ' || *end == '\t') end++;
     if (*end != '\0') {
-        char *msg = (char*)malloc(64 + strlen(s));
-        snprintf(msg, 64 + strlen(s),
-                 "invalid literal for int() with base %lld: '%s'",
+        snprintf(_err_buf, sizeof(_err_buf),
+                 "invalid literal for int() with base %lld: '%.160s'",
                  (long long)base, s);
-        fastpy_raise(FPY_EXC_VALUEERROR, msg);
+        fastpy_raise(FPY_EXC_VALUEERROR, _err_buf);
         return 0;
     }
     return result;
@@ -5394,20 +5395,18 @@ double fastpy_str_to_float(const char *s) {
     const char *p = s;
     while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
     if (*p == '\0') {
-        char *msg = (char*)malloc(64 + strlen(s));
-        snprintf(msg, 64 + strlen(s),
-                 "could not convert string to float: '%s'", s);
-        fastpy_raise(FPY_EXC_VALUEERROR, msg);
+        snprintf(_err_buf, sizeof(_err_buf),
+                 "could not convert string to float: '%.160s'", s);
+        fastpy_raise(FPY_EXC_VALUEERROR, _err_buf);
         return 0.0;
     }
     char *end;
     double result = strtod(p, &end);
     while (*end == ' ' || *end == '\t' || *end == '\n' || *end == '\r') end++;
     if (*end != '\0' || end == p) {
-        char *msg = (char*)malloc(64 + strlen(s));
-        snprintf(msg, 64 + strlen(s),
-                 "could not convert string to float: '%s'", s);
-        fastpy_raise(FPY_EXC_VALUEERROR, msg);
+        snprintf(_err_buf, sizeof(_err_buf),
+                 "could not convert string to float: '%.160s'", s);
+        fastpy_raise(FPY_EXC_VALUEERROR, _err_buf);
         return 0.0;
     }
     return result;
@@ -6208,12 +6207,11 @@ void fastpy_list_slice_step_assign(FpyList *list, int64_t start, int64_t stop,
     /* CPython: extended slice assignment requires exact size match */
     if (new_values->length != slice_len) {
         FPY_UNLOCK(list);
-        char *msg = (char*)malloc(128);
-        snprintf(msg, 128,
+        snprintf(_err_buf, sizeof(_err_buf),
                  "attempt to assign sequence of size %lld "
                  "to extended slice of size %lld",
                  (long long)new_values->length, (long long)slice_len);
-        fastpy_raise(FPY_EXC_VALUEERROR, msg);
+        fastpy_raise(FPY_EXC_VALUEERROR, _err_buf);
         return;
     }
 
@@ -8989,6 +8987,213 @@ void fastpy_neg_fv(int32_t tag, int64_t data,
         return;
     }
     }
+}
+
+/* The type name a conversion error should print for a tag. BIGINT is "int",
+ * because a big integer is not a separate Python type. */
+static const char *_fpy_tag_name(int32_t tag) {
+    static const char *_tnames[] = {
+        "int", "float", "str", "bool", "NoneType",
+        "list", "object", "dict", "bytes", "set",
+        "int", "complex", "Decimal"};
+    return (tag >= 0 && tag <= 12) ? _tnames[tag] : "object";
+}
+
+/* Copy a bytes object's data into `buf` as a C string, or return 0 if it does
+ * not fit. `int(b"...")`/`float(b"...")` accept only a numeric literal, which
+ * is far shorter than any sane buffer, so refusing to grow is not a limit that
+ * bites — a rejected long input was never going to parse. */
+static int _fpy_bytes_cstr(int64_t data, char *buf, size_t cap) {
+    FpyBytes *b = (FpyBytes*)(intptr_t)data;
+    if (!b || (size_t)b->length + 1 > cap) return 0;
+    memcpy(buf, b->data, (size_t)b->length);
+    buf[b->length] = '\0';
+    return 1;
+}
+
+/* int() of a runtime-tagged value.
+ *
+ * `_emit_builtin_int` knew two shapes: naked scalars, and an inlined three-way
+ * branch (float / str / everything-else) over an FV-backed *variable*. A tagged
+ * value arriving any other way — a heterogeneous list element, a "mixed"
+ * return — matched neither and was returned unchanged, so `int(v[1])` on
+ * `[1, -2.5]` printed `-2.5`. The inlined branch was wrong in its own way: its
+ * else arm handed back `data` verbatim, which for a BIGINT or Decimal is the
+ * *pointer*, and for None or a list is a nonsense integer instead of a
+ * TypeError.  BUG-INT-FLOAT-OF-TAGGED-VALUE.
+ *
+ * Both now come here, for the reason `fastpy_abs_fv` exists: the numeric tags
+ * outnumber the arms anyone inlines, so dispatch belongs in one place that
+ * handles all of them and raises for the rest. */
+void fastpy_int_fv(int32_t tag, int64_t data,
+                   int32_t *out_tag, int64_t *out_data) {
+    switch (tag) {
+    case FPY_TAG_BOOL:
+        *out_tag = FPY_TAG_INT;
+        *out_data = (data != 0) ? 1 : 0;
+        return;
+    case FPY_TAG_INT:
+        *out_tag = FPY_TAG_INT;
+        *out_data = data;
+        return;
+    case FPY_TAG_FLOAT: {
+        double d;
+        memcpy(&d, &data, sizeof(double));
+        if (isnan(d)) {
+            fastpy_raise(FPY_EXC_VALUEERROR,
+                         "cannot convert float NaN to integer");
+            *out_tag = FPY_TAG_NONE; *out_data = 0;
+            return;
+        }
+        if (isinf(d)) {
+            fastpy_raise(FPY_EXC_OVERFLOWERROR,
+                         "cannot convert float infinity to integer");
+            *out_tag = FPY_TAG_NONE; *out_data = 0;
+            return;
+        }
+        d = trunc(d);                       /* Python truncates toward zero */
+        /* 2^63 exactly, so the comparison is exact in double arithmetic. */
+        if (d >= 9223372036854775808.0 || d < -9223372036854775808.0) {
+            /* CPython's int(1e30) is exact, so widen rather than saturate. */
+            *out_tag = FPY_TAG_BIGINT;
+            *out_data = (int64_t)(intptr_t)_fpy_bigint_from_large_double(d);
+            return;
+        }
+        *out_tag = FPY_TAG_INT;
+        *out_data = (int64_t)d;
+        return;
+    }
+    case FPY_TAG_STR:
+        *out_tag = FPY_TAG_INT;
+        *out_data = fastpy_str_to_int((const char*)(intptr_t)data);
+        return;
+    case FPY_TAG_BYTES: {
+        char buf[128];
+        if (!_fpy_bytes_cstr(data, buf, sizeof(buf))) {
+            fastpy_raise(FPY_EXC_VALUEERROR,
+                         "invalid literal for int() with base 10");
+            *out_tag = FPY_TAG_NONE; *out_data = 0;
+            return;
+        }
+        *out_tag = FPY_TAG_INT;
+        *out_data = fastpy_str_to_int(buf);
+        return;
+    }
+    case FPY_TAG_BIGINT:
+        /* A fresh copy, not the argument: every tagged result this file hands
+         * back is owned by the caller, and returning the input would give the
+         * value two owners with one refcount. */
+        *out_tag = FPY_TAG_BIGINT;
+        *out_data = (int64_t)(intptr_t)
+            fpy_bigint_copy((FpyBigInt*)(intptr_t)data);
+        return;
+    case FPY_TAG_DECIMAL: {
+        /* Truncate toward zero exactly. Going through a double would round —
+         * `int(Decimal("0.9999999999999999999"))` must be 0, not 1. */
+        FpyDecimal *dc = (FpyDecimal*)(intptr_t)data;
+        int64_t coeff = dc->coefficient;
+        int32_t e = dc->exponent;
+        if (dc->sign == 0) { *out_tag = FPY_TAG_INT; *out_data = 0; return; }
+        if (e < 0) {
+            /* The coefficient is at most 10^18, so 19 divisions clear it. */
+            for (int32_t i = 0; i < -e && coeff != 0; i++) coeff /= 10;
+            *out_tag = FPY_TAG_INT;
+            *out_data = dc->sign < 0 ? -coeff : coeff;
+            return;
+        }
+        if (e > 0) {
+            /* coeff * 10^e can outgrow an i64; build it as text and let the
+             * BigInt parser decide, then narrow back if it fits. */
+            char buf[64];
+            int n = snprintf(buf, sizeof(buf), "%s%lld",
+                             dc->sign < 0 ? "-" : "", (long long)coeff);
+            if (n > 0 && (size_t)n + (size_t)e < sizeof(buf)) {
+                memset(buf + n, '0', (size_t)e);
+                buf[n + e] = '\0';
+                FpyBigInt *b = fpy_bigint_from_str(buf);
+                int ovf = 0;
+                int64_t v = fpy_bigint_to_i64(b, &ovf);
+                if (!ovf) {
+                    fpy_bigint_free(b);
+                    *out_tag = FPY_TAG_INT;
+                    *out_data = v;
+                    return;
+                }
+                *out_tag = FPY_TAG_BIGINT;
+                *out_data = (int64_t)(intptr_t)b;
+                return;
+            }
+        }
+        *out_tag = FPY_TAG_INT;
+        *out_data = dc->sign < 0 ? -coeff : coeff;
+        return;
+    }
+    default:
+        snprintf(_err_buf, sizeof(_err_buf),
+                 "int() argument must be a string, a bytes-like object or a "
+                 "real number, not '%.40s'", _fpy_tag_name(tag));
+        fastpy_raise(FPY_EXC_TYPEERROR, _err_buf);
+        *out_tag = FPY_TAG_NONE;
+        *out_data = 0;
+        return;
+    }
+}
+
+/* float() of a runtime-tagged value — the sibling of fastpy_int_fv, and broken
+ * the same two ways: `float(v[0])` on `[1, -2.5]` returned the int unchanged,
+ * and the inlined variable path's else arm ran `sitofp` on whatever was in
+ * `data`, which for a BigInt or Decimal is a pointer converted to a double.
+ * BUG-INT-FLOAT-OF-TAGGED-VALUE. */
+void fastpy_float_fv(int32_t tag, int64_t data,
+                     int32_t *out_tag, int64_t *out_data) {
+    double d;
+    switch (tag) {
+    case FPY_TAG_BOOL:
+        d = (data != 0) ? 1.0 : 0.0;
+        break;
+    case FPY_TAG_INT:
+        d = (double)data;
+        break;
+    case FPY_TAG_FLOAT:
+        *out_tag = FPY_TAG_FLOAT;
+        *out_data = data;
+        return;
+    case FPY_TAG_STR:
+        d = fastpy_str_to_float((const char*)(intptr_t)data);
+        break;
+    case FPY_TAG_BYTES: {
+        char buf[128];
+        if (!_fpy_bytes_cstr(data, buf, sizeof(buf))) {
+            fastpy_raise(FPY_EXC_VALUEERROR,
+                         "could not convert string to float");
+            *out_tag = FPY_TAG_NONE; *out_data = 0;
+            return;
+        }
+        d = fastpy_str_to_float(buf);
+        break;
+    }
+    case FPY_TAG_BIGINT:
+        if (fpy_bigint_to_double((FpyBigInt*)(intptr_t)data, &d) != 0) {
+            fastpy_raise(FPY_EXC_OVERFLOWERROR,
+                         "int too large to convert to float");
+            *out_tag = FPY_TAG_NONE; *out_data = 0;
+            return;
+        }
+        break;
+    case FPY_TAG_DECIMAL:
+        d = _fpy_decimal_to_double((FpyDecimal*)(intptr_t)data);
+        break;
+    default:
+        snprintf(_err_buf, sizeof(_err_buf),
+                 "float() argument must be a string or a real number, "
+                 "not '%.40s'", _fpy_tag_name(tag));
+        fastpy_raise(FPY_EXC_TYPEERROR, _err_buf);
+        *out_tag = FPY_TAG_NONE;
+        *out_data = 0;
+        return;
+    }
+    *out_tag = FPY_TAG_FLOAT;
+    memcpy(out_data, &d, sizeof(double));
 }
 
 char* fpy_decimal_to_str(FpyDecimal *d) {

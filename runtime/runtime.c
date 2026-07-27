@@ -1263,6 +1263,8 @@ extern void fastpy_list_get_fv(FpyList*, int64_t, int32_t*, int64_t*);
 extern void fastpy_list_set_fv(FpyList*, int64_t, int32_t, int64_t);
 extern void fastpy_abs_fv(int32_t, int64_t, int32_t*, int64_t*);
 extern void fastpy_neg_fv(int32_t, int64_t, int32_t*, int64_t*);
+extern void fastpy_int_fv(int32_t, int64_t, int32_t*, int64_t*);
+extern void fastpy_float_fv(int32_t, int64_t, int32_t*, int64_t*);
 extern int64_t fastpy_list_length(FpyList*);
 extern FpyList* fastpy_list_sorted(FpyList*);
 extern FpyList* fastpy_list_from_obj_iter(void*);
@@ -1459,7 +1461,7 @@ static FpySymEntry fpy_jit_symbols[] = {
     SYM(fastpy_exc_register_class), SYM(fastpy_exc_class_matches),
     SYM(fastpy_list_new), SYM(fastpy_list_append_fv),
     SYM(fastpy_list_get_fv), SYM(fastpy_list_set_fv), SYM(fastpy_abs_fv),
-    SYM(fastpy_neg_fv),
+    SYM(fastpy_neg_fv), SYM(fastpy_int_fv), SYM(fastpy_float_fv),
     SYM(fastpy_list_length), SYM(fastpy_list_sorted), SYM(fastpy_list_from_obj_iter), SYM(fastpy_list_reversed),
     SYM(fastpy_list_reverse_prefix), SYM(fastpy_list_reverse),
     SYM(fastpy_list_copy), SYM(fastpy_list_clear),
