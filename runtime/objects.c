@@ -2421,10 +2421,18 @@ static uint64_t fpy_hash_value(FpyValue v) {
     if (v.tag == FPY_TAG_FLOAT) {
         /* Hash doubles: if it's an exact integer, hash like the int.
          * Otherwise use raw bits. This matches Python semantics where
-         * hash(1) == hash(1.0). */
+         * hash(1) == hash(1.0).
+         *
+         * The bound is the int64 range, not 2^53.  A narrower bound would
+         * hash 1e18 by its bits while hashing the int 1000000000000000000
+         * as an int, so two keys that fpy_key_equal() calls equal would land
+         * in different buckets and both survive in the table.  Converting an
+         * integral in-range double to int64 is exact, so there is no
+         * precision argument for stopping at 2^53 — only the conversion's
+         * own UB above 2^63, which is what this guard is for. */
         double d = v.data.f;
-        if (d == (double)(int64_t)d && d >= -9.007199254740992e15
-                && d <= 9.007199254740992e15) {
+        if (d >= -9223372036854775808.0 && d < 9223372036854775808.0
+                && d == (double)(int64_t)d) {
             return fpy_hash_int((int64_t)d);
         }
         uint64_t bits;
@@ -2452,7 +2460,51 @@ static uint64_t fpy_hash_value(FpyValue v) {
     return (uint64_t)v.data.i;  /* fallback for other types */
 }
 
+/* True when a tag takes part in Python's numeric tower for key identity.
+ * bool is a subclass of int, and int/float compare across types, so all
+ * three name the same key when they are numerically equal: `{1: 'a'}[1.0]`
+ * is 'a' and `{1: 'a', True: 'b'}` has one entry. */
+static int fpy_key_tag_is_numeric(int32_t tag) {
+    return tag == FPY_TAG_INT || tag == FPY_TAG_BOOL || tag == FPY_TAG_FLOAT;
+}
+
+static int fpy_key_numeric_equal(FpyValue a, FpyValue b) {
+    /* Exact comparison, the way CPython does it — never by widening the
+     * integer to a double, which would make 2**60 and 2**60 + 1 the same
+     * key.  An integral double in int64 range converts back exactly, so
+     * comparing in int64 is the exact answer; a non-integral or
+     * out-of-range double cannot equal any int. */
+    double d;
+    int64_t i;
+    int a_is_float = (a.tag == FPY_TAG_FLOAT);
+    int b_is_float = (b.tag == FPY_TAG_FLOAT);
+    if (a_is_float && b_is_float) return a.data.f == b.data.f;
+    if (!a_is_float && !b_is_float) {
+        int64_t ai = (a.tag == FPY_TAG_BOOL) ? (int64_t)a.data.b : a.data.i;
+        int64_t bi = (b.tag == FPY_TAG_BOOL) ? (int64_t)b.data.b : b.data.i;
+        return ai == bi;
+    }
+    if (a_is_float) {
+        d = a.data.f;
+        i = (b.tag == FPY_TAG_BOOL) ? (int64_t)b.data.b : b.data.i;
+    } else {
+        d = b.data.f;
+        i = (a.tag == FPY_TAG_BOOL) ? (int64_t)a.data.b : a.data.i;
+    }
+    if (!(d >= -9223372036854775808.0 && d < 9223372036854775808.0))
+        return 0;
+    if (d != (double)(int64_t)d) return 0;   /* has a fractional part */
+    return (int64_t)d == i;
+}
+
 static int fpy_key_equal(FpyValue a, FpyValue b) {
+    /* Across the numeric tags this has to agree with fpy_hash_value(), which
+     * already hashes True as 1 and an integral 1.0 as 1.  It used to reject
+     * any tag mismatch outright, so `1` and `1.0` hashed into the same bucket
+     * and then compared unequal — the dict kept both, and `{1: 'a'}[1.0]`
+     * raised a KeyError on a key Python says is present. */
+    if (fpy_key_tag_is_numeric(a.tag) && fpy_key_tag_is_numeric(b.tag))
+        return fpy_key_numeric_equal(a, b);
     if (a.tag != b.tag) return 0;
     if (a.tag == FPY_TAG_INT) return a.data.i == b.data.i;
     if (a.tag == FPY_TAG_STR) {
@@ -2470,6 +2522,22 @@ static int fpy_key_equal(FpyValue a, FpyValue b) {
         return 1;
     }
     return a.data.i == b.data.i;  /* fallback */
+}
+
+/* The int-specialized dict paths (`_int_fv`, `_int_val`, `has_int_key`, the
+ * int delete) each inlined `tag == FPY_TAG_INT && data.i == key`.  That is a
+ * *narrower* rule than fpy_key_equal(): it cannot see a float or bool key
+ * naming the same slot, so `{2.0: 'two'}[2]` raised a KeyError while
+ * `{2: 'two'}[2.0]` — which goes through the general path — worked.  They all
+ * defer here now, so there is one rule for what makes two keys the same.
+ * BUG-FLOAT-KEY-DICT-LITERAL-SEGFAULTS. */
+static int fpy_key_equal_int(FpyValue stored, int64_t key) {
+    if (stored.tag == FPY_TAG_INT) return stored.data.i == key;
+    if (!fpy_key_tag_is_numeric(stored.tag)) return 0;
+    FpyValue k;
+    k.tag = FPY_TAG_INT;
+    k.data.i = key;
+    return fpy_key_numeric_equal(stored, k);
 }
 
 static void fpy_dict_init_indices(FpyDict *dict) {
@@ -2726,8 +2794,7 @@ void fastpy_dict_set_int_int(FpyDict *dict, int64_t key, int64_t value) {
         if (idx == FPY_DICT_EMPTY) break;
         if (idx == FPY_DICT_DELETED) {
             if (first_deleted < 0) first_deleted = slot;
-        } else if (dict->keys[idx].tag == FPY_TAG_INT
-                   && dict->keys[idx].data.i == key) {
+        } else if (fpy_key_equal_int(dict->keys[idx], key)) {
             dict->values[idx] = v;
             return;
         }
@@ -2766,8 +2833,7 @@ void fastpy_dict_set_int_fv(FpyDict *dict, int64_t key,
         if (idx == FPY_DICT_EMPTY) break;
         if (idx == FPY_DICT_DELETED) {
             if (first_deleted < 0) first_deleted = slot;
-        } else if (dict->keys[idx].tag == FPY_TAG_INT
-                   && dict->keys[idx].data.i == key) {
+        } else if (fpy_key_equal_int(dict->keys[idx], key)) {
             FPY_VAL_DECREF(dict->values[idx]);
             dict->values[idx] = v;
             return;
@@ -2800,8 +2866,7 @@ void fastpy_dict_get_int_fv(FpyDict *dict, int64_t key,
         int64_t idx = dict->indices[slot];
         if (idx == FPY_DICT_EMPTY) break;
         if (idx != FPY_DICT_DELETED
-                && dict->keys[idx].tag == FPY_TAG_INT
-                && dict->keys[idx].data.i == key) {
+                && fpy_key_equal_int(dict->keys[idx], key)) {
             *out_tag = dict->values[idx].tag;
             *out_data = dict->values[idx].data.i;
             return;
@@ -2823,8 +2888,7 @@ int64_t fastpy_dict_get_int_val(FpyDict *dict, int64_t key) {
         int64_t idx = dict->indices[slot];
         if (idx == FPY_DICT_EMPTY) break;
         if (idx != FPY_DICT_DELETED
-                && dict->keys[idx].tag == FPY_TAG_INT
-                && dict->keys[idx].data.i == key) {
+                && fpy_key_equal_int(dict->keys[idx], key)) {
             return dict->values[idx].data.i;
         }
         slot = (slot + 1) & mask;
@@ -2921,8 +2985,7 @@ int32_t fastpy_dict_has_int_key(FpyDict *dict, int64_t key) {
         int64_t idx = dict->indices[slot];
         if (idx == FPY_DICT_EMPTY) return 0;
         if (idx != FPY_DICT_DELETED
-                && dict->keys[idx].tag == FPY_TAG_INT
-                && dict->keys[idx].data.i == key)
+                && fpy_key_equal_int(dict->keys[idx], key))
             return 1;
         slot = (slot + 1) & mask;
     }
@@ -3911,8 +3974,7 @@ void fastpy_dict_delete_int(FpyDict *dict, int64_t key) {
         int64_t idx = dict->indices[slot];
         if (idx == FPY_DICT_EMPTY) break;
         if (idx != FPY_DICT_DELETED
-            && dict->keys[idx].tag == FPY_TAG_INT
-            && dict->keys[idx].data.i == key) {
+            && fpy_key_equal_int(dict->keys[idx], key)) {
             FPY_VAL_DECREF(dict->keys[idx]);
             FPY_VAL_DECREF(dict->values[idx]);
             dict->indices[slot] = FPY_DICT_DELETED;

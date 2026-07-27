@@ -19379,36 +19379,14 @@ class CodeGen:
                 or self._is_defaultdict_expr(target.value)
                 or self._is_counter_expr(target.value)):
             tag, data = self._to_tag_data_ir(value, value_node)
-            # Tuple/list keys: use generic FpyValue-keyed setter
-            _key_is_tuple = (isinstance(target.slice, (ast.Tuple, ast.List))
-                             or (isinstance(target.slice, ast.Name)
-                                 and target.slice.id in self.variables
-                                 and self._var_kind(target.slice.id)
-                                 in (VKind.LIST, VKind.TUPLE)))
-            if _key_is_tuple:
-                key_tag, key_data = self._bare_to_tag_data(index, target.slice)
-                if not isinstance(key_data, ir.Constant) and isinstance(key_data.type, ir.PointerType):
-                    key_data = self.builder.ptrtoint(key_data, i64)
-                self.builder.call(self.runtime["dict_set_kv_fv"],
-                                  [obj, ir.Constant(i32, key_tag), key_data,
-                                   tag, data])
-            # Int keys use the int-keyed setter so the dict stores them
-            # natively (vs converting to strings, which would affect
-            # printed representation).
-            elif isinstance(index.type, ir.IntType):
-                self.builder.call(self.runtime["dict_set_int_fv"],
-                                  [obj, index, tag, data])
-            elif index.type == fpy_val:
-                # FpyValue key (e.g. from list.pop(), for-each iteration)
-                kt = self.builder.extract_value(index, 0, "dset.kt")
-                kd = self.builder.extract_value(index, 1, "dset.kd")
-                self.builder.call(self.runtime["dict_set_kv_fv"],
-                                  [obj, kt, kd, tag, data])
-            else:
-                if not isinstance(index.type, ir.PointerType):
-                    return self._bridge_fallback_expr(node, "dict access with non-string key")
-                self.builder.call(self.runtime["dict_set_fv"],
-                                  [obj, index, tag, data])
+            # `d[k] = v` is the sixth emitter that used to dispatch on the
+            # key's shape inline, and it had drifted the same way the other
+            # five had — no float arm, so `d[2.5] = x` bailed to the bridge
+            # mid-statement.  It shares the one dispatch now.
+            if not self._emit_dict_store_by_key(obj, index, tag, data,
+                                                target.slice):
+                return self._bridge_fallback_expr(
+                    node, "dict access with non-string key")
         else:
             # Inline fast path for scalar element lists (int/float). Only
             # valid when the STORED value is itself a scalar (needs no
@@ -33550,57 +33528,9 @@ class CodeGen:
             obj = self._emit_expr_value(node.value)
             obj = self._ensure_ptr(obj)
             key = self._emit_expr_value(node.slice)
-            # Tuple/list keys: use generic FpyValue-keyed getter
-            _key_is_tuple = (isinstance(node.slice, (ast.Tuple, ast.List))
-                             or (isinstance(node.slice, ast.Name)
-                                 and node.slice.id in self.variables
-                                 and self._var_kind(node.slice.id)
-                                 in (VKind.LIST, VKind.TUPLE)))
-            if _key_is_tuple:
-                kt, kd = self._bare_to_tag_data(key, node.slice)
-                if (not isinstance(kd, ir.Constant)
-                        and isinstance(kd.type, ir.PointerType)):
-                    kd = self.builder.ptrtoint(kd, i64)
-                tag_slot = self._create_entry_alloca(i32, "dget.tag")
-                data_slot = self._create_entry_alloca(i64, "dget.data")
-                self.builder.call(self.runtime["dict_get_kv_fv"],
-                                  [obj, ir.Constant(i32, kt), kd,
-                                   tag_slot, data_slot])
-                return self._fv_build_from_slots(
-                    self.builder.load(tag_slot),
-                    self.builder.load(data_slot))
-            # FpyValue key (from fpy_val variable, e.g. key from dict
-            # iteration stored in an fpy_val alloca): extract tag+data and
-            # use the generic kv_fv getter which handles all key types.
-            if (isinstance(key.type, ir.LiteralStructType)
-                    and key.type == fpy_val):
-                key_tag = self.builder.extract_value(key, 0)
-                key_data = self.builder.extract_value(key, 1)
-                tag_slot = self._create_entry_alloca(i32, "dget.tag")
-                data_slot = self._create_entry_alloca(i64, "dget.data")
-                self.builder.call(self.runtime["dict_get_kv_fv"],
-                                  [obj, key_tag, key_data,
-                                   tag_slot, data_slot])
-                return self._fv_build_from_slots(
-                    self.builder.load(tag_slot),
-                    self.builder.load(data_slot))
-            if isinstance(key.type, ir.PointerType):
-                tag_slot = self._create_entry_alloca(i32, "dget.tag")
-                data_slot = self._create_entry_alloca(i64, "dget.data")
-                self.builder.call(self.runtime["dict_get_fv"],
-                                  [obj, key, tag_slot, data_slot])
-                return self._fv_build_from_slots(
-                    self.builder.load(tag_slot),
-                    self.builder.load(data_slot))
-            # i64 integer key (e.g. from sorted(dict) with int keys)
-            if isinstance(key.type, ir.IntType) and key.type.width == 64:
-                tag_slot = self._create_entry_alloca(i32, "dget.tag")
-                data_slot = self._create_entry_alloca(i64, "dget.data")
-                self.builder.call(self.runtime["dict_get_int_fv"],
-                                  [obj, key, tag_slot, data_slot])
-                return self._fv_build_from_slots(
-                    self.builder.load(tag_slot),
-                    self.builder.load(data_slot))
+            _loaded = self._emit_dict_load_by_key(obj, key, node.slice)
+            if _loaded is not None:
+                return self._fv_build_from_slots(*_loaded)
         # List / tuple subscript: load FV directly for runtime-tag print.
         # Tuples can have heterogeneous types (int, str, float, etc.),
         # so the only correct way to access an element is via the runtime
@@ -47983,38 +47913,11 @@ class CodeGen:
                     self.runtime["dict_get_int_val"], [obj, key])
                 return data
 
-            tag_slot = self._create_entry_alloca(i32, "dget.tag")
-            data_slot = self._create_entry_alloca(i64, "dget.data")
-            # Tuple/list keys: use generic FpyValue-keyed getter
-            _key_is_tuple = (isinstance(node.slice, (ast.Tuple, ast.List))
-                             or (isinstance(node.slice, ast.Name)
-                                 and node.slice.id in self.variables
-                                 and self._var_kind(node.slice.id)
-                                 in (VKind.LIST, VKind.TUPLE)))
-            if _key_is_tuple:
-                kt, kd = self._bare_to_tag_data(key, node.slice)
-                if not isinstance(kd, ir.Constant) and isinstance(kd.type, ir.PointerType):
-                    kd = self.builder.ptrtoint(kd, i64)
-                self.builder.call(self.runtime["dict_get_kv_fv"],
-                                  [obj, ir.Constant(i32, kt), kd,
-                                   tag_slot, data_slot])
-            # Int keys use the int-keyed getter (native int keys in dict).
-            elif isinstance(key.type, ir.IntType):
-                self.builder.call(self.runtime["dict_get_int_fv"],
-                                  [obj, key, tag_slot, data_slot])
-            elif isinstance(key.type, ir.PointerType):
-                self.builder.call(self.runtime["dict_get_fv"],
-                                  [obj, key, tag_slot, data_slot])
-            elif key.type == fpy_val:
-                # Key is an FpyValue (e.g. from list.pop(), for-each, etc.)
-                kt = self.builder.extract_value(key, 0, "dkey.tag")
-                kd = self.builder.extract_value(key, 1, "dkey.data")
-                self.builder.call(self.runtime["dict_get_kv_fv"],
-                                  [obj, kt, kd, tag_slot, data_slot])
-            else:
-                return self._bridge_fallback_expr(node, "dict access with non-string key")
-            tag = self.builder.load(tag_slot)
-            data = self.builder.load(data_slot)
+            _loaded = self._emit_dict_load_by_key(obj, key, node.slice)
+            if _loaded is None:
+                return self._bridge_fallback_expr(
+                    node, "dict access with non-string key")
+            tag, data = _loaded
             # Find the base dict variable name, walking through nested
             # subscripts: d["a"]["b"] → base is "d".
             base_name = None
@@ -49129,22 +49032,8 @@ class CodeGen:
             key = self._emit_expr_value(key_node)
             val = self._emit_expr_value(val_node)
             tag, data = self._to_tag_data_ir(val, val_node)
-            # Tuple/list keys: use generic FpyValue-keyed setter
-            _key_is_tuple = isinstance(key_node, (ast.Tuple, ast.List))
-            if not _key_is_tuple and isinstance(key_node, ast.Name):
-                if (key_node.id in self.variables
-                        and self._var_kind(key_node.id)
-                        in (VKind.LIST, VKind.TUPLE)):
-                    _key_is_tuple = True
-            if _key_is_tuple:
-                kt, kd = self._bare_to_tag_data(key, key_node)
-                if not isinstance(kd, ir.Constant) and isinstance(kd.type, ir.PointerType):
-                    kd = self.builder.ptrtoint(kd, i64)
-                self.builder.call(self.runtime["dict_set_kv_fv"],
-                                  [dict_ptr, ir.Constant(i32, kt), kd,
-                                   tag, data])
-            elif not self._emit_dict_store_by_key(dict_ptr, key, tag, data,
-                                                  key_node):
+            if not self._emit_dict_store_by_key(dict_ptr, key, tag, data,
+                                                key_node):
                 # Truly unsupported key type — bridge fallback
                 return self._bridge_fallback_expr(
                     node, f"dict literal with {key.type} key type")
@@ -49169,6 +49058,17 @@ class CodeGen:
         single helper is what stops the arms from drifting apart again.
         BUG-DICTCOMP-FV-KEY-EMITS-BROKEN-IR.
         """
+        # A tuple key is a pointer, and so is a str key, so the pointer arm
+        # below cannot tell them apart — this has to be settled from the AST
+        # before shape dispatch, or `{(1, 2): v}` would be strcmp'd.
+        if key_node is not None and self._key_node_is_tuple(key_node):
+            kt, kd = self._bare_to_tag_data(key, key_node)
+            if (not isinstance(kd, ir.Constant)
+                    and isinstance(kd.type, ir.PointerType)):
+                kd = self.builder.ptrtoint(kd, i64)
+            self.builder.call(self.runtime["dict_set_kv_fv"],
+                              [dict_ptr, ir.Constant(i32, kt), kd, tag, data])
+            return True
         # A key carries a tag into the table exactly as a value does, and it is
         # subject to the same trap: an FV-backed variable arrives here as a
         # bare i64 payload, which would land in the *int*-keyed table under the
@@ -49181,9 +49081,38 @@ class CodeGen:
                                   [dict_ptr, _kt, _kd, tag, data])
                 return True
         if isinstance(key.type, ir.IntType):
+            # A bool key is an int key as far as *identity* goes, but not as
+            # far as printing goes: Python keeps the key object that was
+            # inserted first, so `{True: 1}` prints `{True: 1}` and stays that
+            # way when `d[1] = 2` overwrites it.  Storing it untagged printed
+            # `{1: 1}` and made `sorted(d.keys())` yield ints.  This is only
+            # safe to store as BOOL because `fpy_key_equal` now unifies the
+            # numeric tags — otherwise it would split the key in two.
+            # BUG-BOOL-DICT-KEY-PRINTS-AS-INT.
+            if (key_node is not None
+                    and self._static_type_of(key_node) == "bool"):
+                bkey = key
+                if key.type.width != 64:
+                    bkey = self.builder.zext(key, i64)
+                self.builder.call(self.runtime["dict_set_kv_fv"],
+                                  [dict_ptr, ir.Constant(i32, FPY_TAG_BOOL),
+                                   bkey, tag, data])
+                return True
             # Int-keyed dict — native int-key storage
             self.builder.call(self.runtime["dict_set_int_fv"],
                               [dict_ptr, key, tag, data])
+            return True
+        if isinstance(key.type, ir.DoubleType):
+            # A float key was simply a missing arm, not a missing capability:
+            # the table hashes a FLOAT-tagged value already (`fpy_hash_value`),
+            # and the read side reaches it through the same `_kv_` entry point
+            # every other tagged key uses.  Without this, `{2.5: "a"}` fell to
+            # the bridge and the PyObject that came back was then consumed as a
+            # native `FpyDict*` — `len(d)` on it segfaulted.
+            # BUG-FLOAT-KEY-DICT-LITERAL-SEGFAULTS.
+            self.builder.call(self.runtime["dict_set_kv_fv"],
+                              [dict_ptr, ir.Constant(i32, FPY_TAG_FLOAT),
+                               self.builder.bitcast(key, i64), tag, data])
             return True
         if isinstance(key.type, ir.PointerType):
             self.builder.call(self.runtime["dict_set_fv"],
@@ -49201,6 +49130,87 @@ class CodeGen:
                                tag, data])
             return True
         return False
+
+    def _key_node_is_tuple(self, key_node: 'ast.expr') -> bool:
+        """True when a subscript/dict key is a tuple or list, per the AST.
+
+        The LLVM type cannot answer this — a tuple key and a str key are both
+        pointers — so the decision has to come from the source shape.
+        """
+        if isinstance(key_node, (ast.Tuple, ast.List)):
+            return True
+        return (isinstance(key_node, ast.Name)
+                and key_node.id in self.variables
+                and self._var_kind(key_node.id) in (VKind.LIST, VKind.TUPLE))
+
+    def _emit_dict_load_by_key(self, dict_ptr: ir.Value, key: ir.Value,
+                                key_node: 'ast.expr | None' = None):
+        """Load the (tag, data) stored under *key*, dispatching on its shape.
+
+        Returns a `(tag_ir, data_ir)` pair, or None — without emitting
+        anything — when the key shape has no getter, so the caller can fall
+        back before it has built a partial load.
+
+        This is the read-side twin of `_emit_dict_store_by_key`, and exists
+        for the same reason: the two dict-subscript emitters (the FV-producing
+        one and the value-producing one) each grew their own copy of this
+        dispatch, and each was missing a different arm.  A store arm with no
+        matching load arm is worse than neither, because the value goes in and
+        cannot come out.  BUG-FLOAT-KEY-DICT-LITERAL-SEGFAULTS.
+        """
+        tag_slot = self._create_entry_alloca(i32, "dget.tag")
+        data_slot = self._create_entry_alloca(i64, "dget.data")
+
+        def _done():
+            return (self.builder.load(tag_slot), self.builder.load(data_slot))
+
+        if key_node is not None and self._key_node_is_tuple(key_node):
+            kt, kd = self._bare_to_tag_data(key, key_node)
+            if (not isinstance(kd, ir.Constant)
+                    and isinstance(kd.type, ir.PointerType)):
+                kd = self.builder.ptrtoint(kd, i64)
+            self.builder.call(self.runtime["dict_get_kv_fv"],
+                              [dict_ptr, ir.Constant(i32, kt), kd,
+                               tag_slot, data_slot])
+            return _done()
+        # An FV-backed variable used as a key arrives as a bare payload, so it
+        # has to be recovered from its slot before the shape arms below see an
+        # i64 and file it under the int-keyed table.  BUG-DICT-VALUE-STATIC-KIND.
+        if key_node is not None:
+            _kt, _kd = self._to_tag_data_ir(key, key_node)
+            if not isinstance(_kt, ir.Constant):
+                self.builder.call(self.runtime["dict_get_kv_fv"],
+                                  [dict_ptr, _kt, _kd, tag_slot, data_slot])
+                return _done()
+        if isinstance(key.type, ir.LiteralStructType) and key.type == fpy_val:
+            self.builder.call(self.runtime["dict_get_kv_fv"],
+                              [dict_ptr,
+                               self.builder.extract_value(key, 0, "dkey.tag"),
+                               self.builder.extract_value(key, 1, "dkey.data"),
+                               tag_slot, data_slot])
+            return _done()
+        if isinstance(key.type, ir.DoubleType):
+            # The float arm the store side was also missing.  `d[2.5]` used to
+            # fall to the bridge here even when the dict was built natively.
+            # BUG-FLOAT-KEY-DICT-LITERAL-SEGFAULTS.
+            self.builder.call(self.runtime["dict_get_kv_fv"],
+                              [dict_ptr, ir.Constant(i32, FPY_TAG_FLOAT),
+                               self.builder.bitcast(key, i64),
+                               tag_slot, data_slot])
+            return _done()
+        if isinstance(key.type, ir.IntType):
+            ikey = key
+            if key.type.width != 64:
+                ikey = (self.builder.zext(key, i64) if key.type.width == 1
+                        else self.builder.sext(key, i64))
+            self.builder.call(self.runtime["dict_get_int_fv"],
+                              [dict_ptr, ikey, tag_slot, data_slot])
+            return _done()
+        if isinstance(key.type, ir.PointerType):
+            self.builder.call(self.runtime["dict_get_fv"],
+                              [dict_ptr, key, tag_slot, data_slot])
+            return _done()
+        return None
 
     def _emit_dict_comprehension(self, node: ast.DictComp) -> ir.Value:
         """Emit {key: val for x in range(n)}."""

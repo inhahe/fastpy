@@ -461,6 +461,42 @@ cases: every setter stores keys as tagged `FpyValue`s in one table, so
 misses on a tag that was never stored. The typed entry points are a fast path,
 and a fast path that is *also* the only path is where these bugs live.
 
+Six emitters, in the end: the subscript store `d[k] = v` had drifted too, and
+so had *both* dict-subscript getters (the one producing an `FpyValue` and the
+one producing a bare value), each with its own arm set. They share
+`_emit_dict_store_by_key` and `_emit_dict_load_by_key` now. Pairing them is
+the point — **a store arm with no matching load arm is worse than neither**,
+because the value goes in and cannot come back out. None of the six had a
+*float* arm at all, so `{2.5: "a"}` fell to the CPython bridge and the
+`PyObject` that came back was then consumed as a native `FpyDict*`: `len(d)`
+segfaulted on a two-entry dict literal. Nothing was missing from the table —
+`fpy_hash_value` had hashed FLOAT keys all along.
+
+**Key identity is one rule, and every specialization of it must be the same
+rule.** Making float keys reachable immediately exposed that the runtime
+disagreed with itself: `fpy_hash_value` deliberately hashed an integral `1.0`
+as `1` (and `True` as `1`), while `fpy_key_equal` opened with `if (a.tag !=
+b.tag) return 0`. So `1` and `1.0` hashed into the same bucket and then
+compared unequal — the dict kept both, which Python says is impossible.
+`fpy_key_equal` now compares across the numeric tags exactly, the way CPython
+does: never by widening the int to a double (that would make `2**60` and
+`2**60 + 1` the same key), but by converting an integral in-range double back
+to `int64`, which is lossless. The hash's range guard had to widen from 2^53
+to the `int64` range to match, or `1e18` and `10**18` — equal keys — would
+land in different buckets and both survive. One level further down, the
+int-specialized paths (`_int_fv`, `_int_val`, `has_int_key`, the int delete)
+each inlined `tag == FPY_TAG_INT && data.i == key`, a *narrower* rule that
+cannot see a float or bool key naming the same slot; that asymmetry is why
+`{2.0: "x"}[2]` raised KeyError while `{2: "x"}[2.0]` worked. They defer to
+`fpy_key_equal` now.
+
+Numeric key identity is also what makes it safe to store a bool key *as* a
+bool. Python keeps the key object inserted first — `{True: 1}` stays
+`{True: 1}` after `d[1] = 2` — so a bool key stored untagged printed `{1: 1}`
+and made `sorted(d.keys())` yield ints. Storing `FPY_TAG_BOOL` would have
+split the key in two under the old tag-strict equality; under the new rule it
+is just the correct tag.
+
 The predicates that remain are for *syntactic* evidence and must answer for
 every expression form that can carry the kind — notably `ast.Subscript`, which
 both `_is_complex_expr` and `_is_decimal_expr` were missing. That gap is subtle

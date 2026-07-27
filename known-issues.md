@@ -8,7 +8,45 @@ how to reproduce it, and what the proper fix looks like.
 
 ## Active Bugs
 
-### BUG-FLOAT-KEY-DICT-LITERAL-SEGFAULTS. A dict literal with a float key produces something `len()` crashes on — 2026-07-27
+### BUG-FLOAT-KEY-DICT-LITERAL-SEGFAULTS. A dict literal with a float key produces something `len()` crashes on — 2026-07-27 — **FIXED**
+
+**Fixed:** float arms added to both sides, and the dispatch consolidated the
+rest of the way. `_emit_dict_store_by_key` gained a `DoubleType` arm that
+bitcasts to i64 and stores via `dict_set_kv_fv` with `FPY_TAG_FLOAT`; a new
+`_emit_dict_load_by_key` is its read-side twin and carries the same arm. Two
+more emitters turned out to have their own copies of this dispatch and now
+share the helpers: the subscript store `d[k] = v` (which also had no float
+arm) and *both* dict-subscript getters — the `FpyValue`-producing one and the
+bare-value one, each with a different arm set. Pairing store and load is the
+point: a store arm with no matching load arm is worse than neither, because
+the value goes in and cannot come out. The tuple-key special case, previously
+duplicated at four call sites, moved into the helpers behind
+`_key_node_is_tuple` (the AST has to answer it — a tuple key and a str key are
+both pointers).
+
+Making float keys reachable then exposed that the runtime disagreed with
+itself about key identity, so that was fixed in the same change:
+
+* `fpy_hash_value` deliberately hashed an integral `1.0` as `1` and `True` as
+  `1`, while `fpy_key_equal` opened with `if (a.tag != b.tag) return 0`. The
+  two hashed into one bucket and compared unequal, so `{1: "a"}` grew a second
+  entry under `1.0`. `fpy_key_equal` now compares across INT/BOOL/FLOAT
+  exactly the way CPython does — by converting an integral in-range double
+  back to `int64` (lossless), never by widening the int to a double, so
+  `2**60` and `2**60 + 1` stay distinct keys.
+* The hash's range guard widened from 2^53 to the `int64` range to agree with
+  that: otherwise `1e18` and `10**18` are equal keys that hash to different
+  buckets, and both survive in the table.
+* The int-specialized paths (`fastpy_dict_set_int_fv`, `_get_int_fv`,
+  `_get_int_val`, `fastpy_dict_has_int_key`, `set_int_int`, the int delete)
+  each inlined `tag == FPY_TAG_INT && data.i == key` — a *narrower* rule that
+  cannot see a float or bool key naming the same slot. That asymmetry is why
+  `{2.0: "x"}[2]` raised KeyError while `{2: "x"}[2.0]` worked. All six defer
+  to `fpy_key_equal` through `fpy_key_equal_int` now.
+
+Regression coverage in `tests/regressions/dict_key_shapes_that_are_not_strings.py`.
+
+<details><summary>Original report</summary>
 
 **What:** `_emit_dict_literal` dispatches on the key's LLVM type and has no arm
 for `DoubleType`, so it returns `_bridge_fallback_expr` for the whole literal.
@@ -37,6 +75,39 @@ returns `0` rather than crashing, which is the same gap seen without the
 fallback. Audit the bridge-fallback-returns-a-PyObject assumption while there.
 
 **Severity:** segfault on valid Python.
+
+</details>
+
+**Still open from this entry:** the bridge-fallback assumption itself — every
+caller of `_bridge_fallback_expr` for a container still treats the returned
+`PyObject` as interchangeable with a native `FpyDict*`. The float arm removed
+the trigger, not the hazard; the next unsupported key shape will land on it
+the same way. Tracked as DEBT-BRIDGE-FALLBACK-NOT-A-NATIVE-CONTAINER below.
+
+### BUG-BOOL-DICT-KEY-PRINTS-AS-INT. A bool dict key loses its tag and prints as 0/1 — 2026-07-27 — **FIXED**
+
+**What:** `_emit_dict_store_by_key` routed any integer-typed key through
+`fastpy_dict_set_int_fv`, which stores it as `FPY_TAG_INT`. Python keeps the
+key object that was inserted first, so the tag is observable:
+
+```python
+d = {True: 1, False: 0}
+print(d)                    # was {1: 1, 0: 0}, want {True: 1, False: 0}
+print(sorted(d.keys()))     # was [0, 1],       want [False, True]
+b = {True: "bool"}
+b[1] = "int"
+print(b)                    # was {1: 'int'},   want {True: 'int'}
+```
+
+Lookups were always right — `d[True]`, `d[1]` and `d[1.0]` all found the entry
+— so this was a fidelity bug in what gets printed, not a correctness bug in
+what gets found.
+
+**Fixed:** a key whose `_static_type_of` is `"bool"` now stores through
+`dict_set_kv_fv` with `FPY_TAG_BOOL`. This was only safe once `fpy_key_equal`
+unified the numeric tags (see BUG-FLOAT-KEY-DICT-LITERAL-SEGFAULTS above) —
+under the old tag-strict rule it would have split `True` and `1` into two
+entries, trading a display bug for a real one.
 
 ### BUG-DICTCOMP-FV-KEY-EMITS-BROKEN-IR. A dict comprehension whose key becomes FV-typed leaves a block unterminated and the build fails — 2026-07-27 — **FIXED**
 
@@ -255,6 +326,39 @@ Covered by `tests/regressions/numeric_guard_falls_through.py`.
 
 **Severity:** was high — silently wrong arithmetic, and a crash in the BigInt
 true-division case.
+
+### DEBT-BRIDGE-FALLBACK-NOT-A-NATIVE-CONTAINER. A container that fell back to the CPython bridge is still treated as a native one by everything downstream — 2026-07-27
+
+**What:** when an emitter cannot handle a container expression it returns
+`_bridge_fallback_expr(node, reason)`, which yields a CPython `PyObject*`. The
+value's *static kind* is unchanged, so every downstream consumer — `len`,
+subscript, `in`, iteration — goes on emitting native `FpyDict*`/`FpyList*`
+calls against it. Those read the PyObject's header as if it were a fastpy
+object.
+
+This is the mechanism behind BUG-FLOAT-KEY-DICT-LITERAL-SEGFAULTS: the crash
+was not at the unsupported operation (`{2.5: "a"}` "succeeded") but two
+statements later at `len(d)`. Adding the float arm removed that trigger; the
+hazard is untouched and the next unsupported key or value shape reaches it the
+same way, again crashing somewhere other than where the fallback happened.
+
+**Reproduce:** no live repro since the float arm landed — every remaining
+`_bridge_fallback_expr` path for a dict literal needs a key shape none of the
+arms accept. Reintroduce artificially by making `_emit_dict_store_by_key`
+return False for some shape and then calling `len()` on the result.
+
+**Where:** `_bridge_fallback_expr` in `compiler/codegen.py` and its callers in
+`_emit_dict_literal`, `_emit_subscript_store` and the comprehension emitters.
+
+**Proper fix:** the fallback must either (a) convert back — call
+`cpython_to_dict` / `cpython_to_list` so the value really is native and the
+static kind stays true, which is what the `**dict` unpacking path in
+`_emit_dict_literal` already does deliberately — or (b) mark the resulting
+value as PyObject-kind so downstream emitters route through the bridge too.
+(a) is the smaller change and keeps the kind system honest; (b) is more
+general but touches every consumer.
+
+**Severity:** latent segfault. Silent, and it crashes far from its cause.
 
 ### DEBT-FV-BINOP-HAS-NO-POW-OPCODE. `**` cannot be routed through the dynamic binop, so the `_container_kinds` guard has no fallback for it — 2026-07-27
 
