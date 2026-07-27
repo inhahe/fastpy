@@ -167,7 +167,19 @@ void fpy_rc_incref(int32_t tag, int64_t data) {
             fpy_str_incref((const char*)(intptr_t)data); break;
         case FPY_TAG_BYTES:
             fpy_bytes_incref((const char*)(intptr_t)data); break;
-        default: break;  /* INT, FLOAT, BOOL, NONE — not heap-allocated */
+        case FPY_TAG_BIGINT:
+            /* Must mirror the FPY_TAG_BIGINT arm of fpy_rc_decref below.
+             * Omitting it made every BigInt incref a silent no-op while
+             * the matching decref still decremented, so a BigInt with two
+             * owners (e.g. a list element also bound to a loop variable)
+             * was freed by the first release and the second one read
+             * freed memory.  See BUG-BIGINT-INCREF-MISSING. */
+            fpy_incref(&((FpyBigInt*)(intptr_t)data)->refcount); break;
+        default: break;  /* INT, FLOAT, BOOL, NONE — not heap-allocated.
+                          * COMPLEX and DECIMAL are heap-allocated but are
+                          * refcounted by neither incref nor decref, so they
+                          * leak rather than dangle — DEBT-COMPLEX-DECIMAL-
+                          * NOT-REFCOUNTED. */
     }
 }
 
@@ -300,7 +312,13 @@ void fpy_rc_decref(int32_t tag, int64_t data) {
                 fpy_bigint_free(bi);
             break;
         }
-        default: break;
+        default: break;  /* Must stay arm-for-arm with fpy_rc_incref above:
+                          * a tag handled here but not there turns every
+                          * balanced incref/decref pair in the program into a
+                          * use-after-free.  INT, FLOAT, BOOL and NONE fall
+                          * through on purpose (unboxed); COMPLEX and DECIMAL
+                          * fall through by omission and leak — DEBT-COMPLEX-
+                          * DECIMAL-NOT-REFCOUNTED. */
     }
 }
 
