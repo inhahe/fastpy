@@ -2994,14 +2994,22 @@ essentially nothing (no call, still vectorisable) and branch to a promotion slow
 path only on actual overflow. That gets correctness *and* keeps the speed, and
 would let Pass 0.9's whole-program flag be deleted rather than patched.
 
-**Blocked on BUG-BIGINT-FV-RESULT-NOT-CONSUMED.** Deleting the flag means every
-program's integer arithmetic can promote, so BIGINT-tagged `FpyValue`s stop
-being confined to programs that mention a big literal and start flowing through
-ordinary code — and every consumer that fails to narrow one back to a pointer
-becomes wrong on textbook arithmetic. The same flag also drives the slot scan's
-widening, so turning it on everywhere widens every integer local. Both effects
-are safe only once a BIGINT-tagged value is narrowed correctly wherever it is
-consumed. Fix that first.
+**Blocked on the BigInt consumers.** Deleting the flag means every program's
+integer arithmetic can promote, so BIGINT-tagged `FpyValue`s stop being confined
+to programs that mention a big literal and start flowing through ordinary code —
+and every consumer that fails to narrow one back to a pointer becomes wrong on
+textbook arithmetic. The same flag also drives the slot scan's widening, so
+turning it on everywhere widens every integer local. Both effects are safe only
+once a BIGINT-tagged value is narrowed correctly wherever it is consumed.
+
+BUG-BIGINT-FV-RESULT-NOT-CONSUMED was the first of these and is now fixed
+(comparison and arithmetic). The remaining one that this bug's own repros walk
+straight into is **BUG-BIGINT-RETURNED-FROM-FUNCTION-LOSES-TAG** — note that
+`fact` and `f` above both `return` the accumulator, which is exactly the
+boundary that drops the tag. BUG-LIST-LITERAL-BIGINT-DECIMAL-ELEM and
+BUG-INT-FLOAT-OF-TAGGED-VALUE are the other two known holes; they are narrower
+but would go from "corner case" to "reachable from ordinary code" the moment the
+flag is deleted.
 
 **Severity: high — silently wrong arithmetic on ordinary code,** and it violates
 a core language guarantee rather than an edge case. `fact(25)` and `fib(100)`
@@ -3098,7 +3106,7 @@ BUG-SKIP-MASKS-VERIFIER-ERRORS. Excluded with a comment in
 
 **Severity:** compile failure (loud), but invisible in the suite.
 
-### BUG-BIGINT-FV-RESULT-NOT-CONSUMED. A BIGINT-tagged FpyValue is not narrowed back to a pointer by comparison or arithmetic — 2026-07-27
+### ~~BUG-BIGINT-FV-RESULT-NOT-CONSUMED. A BIGINT-tagged FpyValue is not narrowed back to a pointer by comparison or arithmetic~~ — FIXED 2026-07-27
 
 **What:** runtime helpers that return a BigInt do so as a *tagged* `FpyValue`
 carrying the pointer in `data`. Consumers that expect a bare BigInt pointer —
@@ -3147,7 +3155,7 @@ it. Excluded with a comment in `tests/regressions/abs_of_tagged_value.py`.
 
 **Severity:** silently wrong comparisons and arithmetic on big integers.
 
-**This blocks BUG-INT-OVERFLOW-WRAPS-WITHOUT-BIG-LITERAL, and should be fixed
+**This blocked BUG-INT-OVERFLOW-WRAPS-WITHOUT-BIG-LITERAL, and was fixed
 first.** Fixing the wrap means checking every integer operation, which means
 `_program_uses_bigint` is effectively on for every program, which means
 BIGINT-tagged `FpyValue`s flow through *ordinary* code rather than only through
@@ -3156,6 +3164,51 @@ would then be wrong on textbook arithmetic instead of on a corner. It is also
 the same limit that forced `_is_constant_arith` in
 BUG-BIGINT-PROGRAM-HANGS-WHILE-COUNTER — a wide slot is only safe for kinds the
 tagged paths handle, so making BigInt one of them unblocks both.
+
+**FIXED 2026-07-27**, in four parts. Regression test:
+`tests/regressions/bigint_fv_result_consumed.py`, also clean under
+ASan/UBSan/LSan.
+
+1. **`fastpy_fv_compare` got a BIGINT branch**, placed *before* the FLOAT and
+   default-integer branches so neither can claim a BigInt operand first. Two
+   BIGINTs go to `fpy_bigint_cmp`; an INT/BOOL operand is promoted with
+   `fpy_bigint_from_i64` into a temporary that is freed; a FLOAT operand goes to
+   a new `_fpy_bigint_cmp_double`.
+2. **That float comparison is exact, in both directions.** Converting the BigInt
+   to a double would round every value past 2^53 together, making
+   `2**80 + 1 == 2.0**80` true — so the *double* is converted to an integer
+   instead, which is always lossless. Below 2^63 it goes through an `int64_t`
+   with the fraction breaking the tie; at or above 2^63 a finite double is
+   necessarily an exact `mantissa * 2^k`, and the new
+   `_fpy_bigint_from_large_double` recovers both halves with `frexp`/`ldexp`
+   (53-bit mantissa into an i64, leftover exponent as a `fpy_bigint_lshift`).
+   NaN answers "unordered", so only `!=` is true.
+   Also **FLOAT was missing from the BIGINT row of
+   `_fpy_tags_order_compatible`**, so `2 ** 80 < 1.5` used to raise TypeError.
+   Adding it is what exposed the exactness question: at HEAD `==` between a
+   BigInt and a float answered False *by accident*, because the pair was
+   "incompatible".
+3. **The three inlined two-way dispatches in codegen got a third edge.** There
+   were three, not one: `_emit_binop_unknown`'s Add-specific `unkn.num_*` split,
+   its general `_uu` split, and the unary-minus FpyValue path. Each tested
+   "both tags == INT" and sent *everything else* to float arithmetic, bitcasting
+   a pointer to a double. The int and float fast paths stay inline; the float
+   edge is now guarded by a real `_fv_tag_is_plain_scalar` check on both
+   operands (INT/FLOAT/BOOL — the tags whose `data` really is a number), and
+   anything else takes a new third edge to `fastpy_fv_binop`, which already
+   handled BigInt, Decimal, string concatenation and the TypeErrors correctly
+   and simply was not being called. A shared `_FV_BINOP_OPCODES` table replaced
+   two copies of the operator→opcode map that had to agree.
+4. **Unary minus needed a runtime entry point that did not exist.** It had been
+   an inlined `select(tag == FLOAT, fneg, 0 - data)`, which negated a BigInt's
+   *pointer* while keeping tag 10 — `-(-b)` handed garbage to the printer and
+   took an access violation. New `fastpy_neg_fv` in `runtime/objects.c`, modelled
+   on `fastpy_abs_fv`: BOOL→INT, INT with the `INT64_MIN` widening to BIGINT,
+   FLOAT, BIGINT, DECIMAL, COMPLEX, and a TypeError for the rest.
+
+**Two pre-existing bugs were found and excluded from the test** rather than
+fixed here, each verified by A/B against HEAD: BUG-BOOL-PLUS-INT-YIELDS-FLOAT
+and BUG-BIGINT-RETURNED-FROM-FUNCTION-LOSES-TAG.
 
 ### BUG-INT-FLOAT-OF-TAGGED-VALUE. `int()` and `float()` of a tagged value are no-ops — 2026-07-27
 
@@ -3203,3 +3256,66 @@ BUG-LIST-ELEM-STR-TAG-LOST and probably wants fixing alongside it.
 element-store paths disagree — which is itself worth collapsing.
 
 **Severity:** silently wrong output; the Decimal case loses the value entirely.
+
+### BUG-BOOL-PLUS-INT-YIELDS-FLOAT. Adding two tagged values takes the float edge unless *both* are INT — 2026-07-27
+
+**What:** `True + 3` on two runtime-tagged values gives `4.0`, not `4`. The value
+is right; only its type is wrong, so it prints with a spurious `.0` and infects
+everything downstream.
+
+**Reproduce** — should print `4 4.5`:
+```python
+m = [3, 4.5, True]
+print(m[2] + m[0], m[2] * m[1])   # prints "4.0 4.5"
+```
+
+**Where:** the inlined fast paths in `_emit_binop_unknown` (`compiler/codegen.py`)
+split on `both tags == INT`, and everything that is not that pair goes down the
+float edge. BOOL is a perfectly good integer — CPython's `bool` is a subclass of
+`int`, and `True + 3` is `4` — but it fails the `both == INT` test, so it is
+converted with `sitofp` and comes back a double.
+
+Note this is *not* the same hole as BUG-BIGINT-FV-RESULT-NOT-CONSUMED, which was
+about non-scalar tags reaching the float edge and having a *pointer* bitcast to a
+double. That one is fixed: the float edge is now guarded by a real "both operands
+are plain scalars" check, and BOOL genuinely is a plain scalar, so it still takes
+it. The remaining fix is narrower — widen the integer test from "both INT" to
+"both INT-or-BOOL", and make the result tag INT — but it has to be done in every
+inlined split (the Add-specific `unkn.num_*` path and the general `_uu` path),
+and it must not disturb `True / 2`, which really is a float.
+
+**Severity:** silently wrong *type*; `print` shows it, and an int-only consumer
+downstream (indexing, `range`, `%` formatting) may reject or mis-handle it.
+
+### BUG-BIGINT-RETURNED-FROM-FUNCTION-LOSES-TAG. A BigInt returned through a call comes back as a number — 2026-07-27
+
+**What:** a function that returns a BigInt hands the caller the *pointer* with a
+plain integer tag. Arithmetic on it then operates on the address.
+
+**Reproduce** — should print `0`:
+```python
+b = 2 ** 80
+
+def neg(x):
+    return -x
+
+print(neg(b) + b)          # prints e.g. 1208925819617242555011456
+```
+The number printed is `2**80` plus a heap address, which is exactly what you get
+by adding a pointer to a BigInt. It varies run to run.
+
+**Where:** the return-tag machinery, same family as BUG-MIXED-SCALAR-RETURN-TAG
+and BUG-RETTAG-STR-VIA-LOCAL. `-x` inside `neg` correctly produces a BIGINT-tagged
+`fpy_val` (that is what `fastpy_neg_fv` was added for), but the function's
+inferred return type is a scalar int, so the tag is dropped at the boundary and
+the caller unboxes `data` as a number. Interestingly `eq(neg(b), neg(c))` is
+*correct* — passing a tagged value as an argument preserves it — so the loss is
+specifically on the return path.
+
+The fix is to have return-type inference recognise that an expression which can
+produce a BigInt is `mixed`, and give the function the FV return ABI. The
+`_program_uses_bigint` flag already knows the program can produce BigInts;
+return inference does not consult it.
+
+**Severity:** silently wrong values that depend on the heap address, so they are
+nondeterministic across runs. Only reachable in programs that use big integers.

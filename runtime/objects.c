@@ -678,12 +678,66 @@ static int _fpy_tags_order_compatible(int32_t tag1, int32_t tag2) {
         (tag2 == FPY_TAG_INT || tag2 == FPY_TAG_BOOL)) return 1;
     if (tag2 == FPY_TAG_FLOAT &&
         (tag1 == FPY_TAG_INT || tag1 == FPY_TAG_BOOL)) return 1;
-    /* BIGINT with INT/BOOL */
+    /* BIGINT with INT/BOOL/FLOAT — all four are numbers, and CPython orders
+     * any pair of them.  FLOAT was missing here, so `2 ** 80 < 1.5` raised
+     * TypeError instead of answering. */
     if (tag1 == FPY_TAG_BIGINT &&
-        (tag2 == FPY_TAG_INT || tag2 == FPY_TAG_BOOL)) return 1;
+        (tag2 == FPY_TAG_INT || tag2 == FPY_TAG_BOOL
+         || tag2 == FPY_TAG_FLOAT)) return 1;
     if (tag2 == FPY_TAG_BIGINT &&
-        (tag1 == FPY_TAG_INT || tag1 == FPY_TAG_BOOL)) return 1;
+        (tag1 == FPY_TAG_INT || tag1 == FPY_TAG_BOOL
+         || tag1 == FPY_TAG_FLOAT)) return 1;
     return 0;
+}
+
+/* A finite double whose magnitude is at least 2^63, as an exact BigInt.
+ *
+ * Such a double is always an integer, and always exactly `mantissa * 2^k`:
+ * `frexp` splits it into m * 2^e with 0.5 <= |m| < 1, `ldexp(m, 53)` is then
+ * an integer of at most 53 bits (so it fits an i64 exactly), and the leftover
+ * exponent is a shift.  No rounding happens anywhere. */
+static FpyBigInt *_fpy_bigint_from_large_double(double d) {
+    int e;
+    double m = frexp(d, &e);
+    int64_t mant = (int64_t)ldexp(m, 53);
+    FpyBigInt *b = fpy_bigint_from_i64(mant);
+    e -= 53;                       /* |d| >= 2^63 means e >= 64, so e > 0 */
+    if (e > 0) {
+        FpyBigInt *sh = fpy_bigint_from_i64(e);
+        FpyBigInt *r = fpy_bigint_lshift(b, sh);
+        fpy_bigint_free(b);
+        fpy_bigint_free(sh);
+        return r;
+    }
+    return b;
+}
+
+/* Compare a BigInt against a double: -1 / 0 / 1 for a < d, a == d, a > d,
+ * and 2 for "unordered" (NaN), which every comparison must answer False to.
+ *
+ * Converting the BigInt to a double and comparing would be wrong in exactly
+ * the cases that matter: every integer past 2^53 rounds, so `2**80 + 1` and
+ * `2.0**80` would compare equal.  Converting the *double* to an integer is
+ * lossless in both directions — below 2^63 through an i64 with the fraction
+ * breaking the tie, and above it through the mantissa/exponent split. */
+static int _fpy_bigint_cmp_double(FpyBigInt *a, double d) {
+    if (isnan(d)) return 2;
+    if (isinf(d)) return d > 0 ? -1 : 1;
+    double t = trunc(d);
+    if (t >= -9223372036854775808.0 && t < 9223372036854775808.0) {
+        FpyBigInt *bt = fpy_bigint_from_i64((int64_t)t);
+        int c = fpy_bigint_cmp(a, bt);
+        fpy_bigint_free(bt);
+        if (c != 0) return c;
+        double frac = d - t;          /* a == trunc(d), so the fraction decides */
+        if (frac > 0.0) return -1;
+        if (frac < 0.0) return 1;
+        return 0;
+    }
+    FpyBigInt *bd = _fpy_bigint_from_large_double(d);
+    int c = fpy_bigint_cmp(a, bd);
+    fpy_bigint_free(bd);
+    return c;
 }
 
 int32_t fastpy_fv_compare(int32_t tag1, int64_t data1,
@@ -723,6 +777,48 @@ int32_t fastpy_fv_compare(int32_t tag1, int64_t data1,
             case 4: return cmp > 0;
             case 5: return cmp >= 0;
         }
+    }
+    /* BigInt comparison: at least one is BIGINT.  This has to come before the
+     * FLOAT and default-integer branches, both of which would read the BigInt
+     * *pointer* as a number — the default one compared the two pointers, so
+     * `-b == -c` on equal BigInts was False, and the float one bitcast a
+     * pointer to a double.  BUG-BIGINT-FV-RESULT-NOT-CONSUMED. */
+    if (tag1 == FPY_TAG_BIGINT || tag2 == FPY_TAG_BIGINT) {
+        int cmp;
+        if (tag1 == FPY_TAG_BIGINT && tag2 == FPY_TAG_BIGINT) {
+            cmp = fpy_bigint_cmp((FpyBigInt*)(intptr_t)data1,
+                                 (FpyBigInt*)(intptr_t)data2);
+        } else if (tag1 == FPY_TAG_FLOAT || tag2 == FPY_TAG_FLOAT) {
+            double d;
+            int64_t fdata = (tag1 == FPY_TAG_FLOAT) ? data1 : data2;
+            memcpy(&d, &fdata, sizeof(d));
+            FpyBigInt *big = (FpyBigInt*)(intptr_t)
+                ((tag1 == FPY_TAG_BIGINT) ? data1 : data2);
+            cmp = _fpy_bigint_cmp_double(big, d);
+            if (cmp == 2) return (op == 1);   /* NaN: only != is true */
+            if (tag2 == FPY_TAG_BIGINT) cmp = -cmp;
+        } else {
+            /* The other side is INT or BOOL — promote it and compare.
+             * Not named `small`: Windows' rpcndr.h has `#define small char`. */
+            int64_t narrow = (tag1 == FPY_TAG_BIGINT) ? data2 : data1;
+            if ((tag1 == FPY_TAG_BIGINT ? tag2 : tag1) == FPY_TAG_BOOL)
+                narrow = (narrow != 0);
+            FpyBigInt *tmp = fpy_bigint_from_i64(narrow);
+            FpyBigInt *big = (FpyBigInt*)(intptr_t)
+                ((tag1 == FPY_TAG_BIGINT) ? data1 : data2);
+            cmp = (tag1 == FPY_TAG_BIGINT) ? fpy_bigint_cmp(big, tmp)
+                                           : fpy_bigint_cmp(tmp, big);
+            fpy_bigint_free(tmp);
+        }
+        switch (op) {
+            case 0: return cmp == 0;
+            case 1: return cmp != 0;
+            case 2: return cmp < 0;
+            case 3: return cmp <= 0;
+            case 4: return cmp > 0;
+            case 5: return cmp >= 0;
+        }
+        return 0;
     }
     /* Float comparison: at least one is FLOAT */
     if (tag1 == FPY_TAG_FLOAT || tag2 == FPY_TAG_FLOAT) {
@@ -8462,6 +8558,73 @@ void fastpy_abs_fv(int32_t tag, int64_t data,
         const char *tn = (tag >= 0 && tag <= 12) ? _tnames[tag] : "object";
         snprintf(_err_buf, sizeof(_err_buf),
                  "bad operand type for abs(): '%.40s'", tn);
+        fastpy_raise(FPY_EXC_TYPEERROR, _err_buf);
+        *out_tag = FPY_TAG_NONE;
+        *out_data = 0;
+        return;
+    }
+    }
+}
+
+/* Unary minus on a runtime-tagged value.
+ *
+ * Codegen open-coded this as `select(tag == FLOAT, fneg, 0 - data)`, which is
+ * the same two-way-dispatch-over-six-numeric-tags mistake as
+ * BUG-ABS-OF-TAGGED-VALUE.  A BIGINT operand kept its tag but had its
+ * *pointer* negated, so `-(-b)` handed a garbage pointer to the printer and
+ * took an access violation.  BUG-BIGINT-FV-RESULT-NOT-CONSUMED. */
+void fastpy_neg_fv(int32_t tag, int64_t data,
+                   int32_t *out_tag, int64_t *out_data) {
+    switch (tag) {
+    case FPY_TAG_BOOL:
+        /* CPython: -True is -1, an int. */
+        *out_tag = FPY_TAG_INT;
+        *out_data = (data != 0) ? -1 : 0;
+        return;
+    case FPY_TAG_INT:
+        if (data == INT64_MIN) {
+            /* -(-2**63) does not fit an i64; negating in place is UB. */
+            FpyBigInt *b = fpy_bigint_from_i64(data);
+            FpyBigInt *r = fpy_bigint_neg(b);
+            fpy_bigint_free(b);
+            *out_tag = FPY_TAG_BIGINT;
+            *out_data = (int64_t)(intptr_t)r;
+            return;
+        }
+        *out_tag = FPY_TAG_INT;
+        *out_data = -data;
+        return;
+    case FPY_TAG_FLOAT: {
+        double d;
+        memcpy(&d, &data, sizeof(double));
+        d = -d;
+        *out_tag = FPY_TAG_FLOAT;
+        memcpy(out_data, &d, sizeof(double));
+        return;
+    }
+    case FPY_TAG_BIGINT:
+        *out_tag = FPY_TAG_BIGINT;
+        *out_data = (int64_t)(intptr_t)
+            fpy_bigint_neg((FpyBigInt*)(intptr_t)data);
+        return;
+    case FPY_TAG_DECIMAL:
+        *out_tag = FPY_TAG_DECIMAL;
+        *out_data = (int64_t)(intptr_t)
+            fpy_decimal_neg((FpyDecimal*)(intptr_t)data);
+        return;
+    case FPY_TAG_COMPLEX:
+        *out_tag = FPY_TAG_COMPLEX;
+        *out_data = (int64_t)(intptr_t)
+            fpy_complex_neg((FpyComplex*)(intptr_t)data);
+        return;
+    default: {
+        static const char *_tnames[] = {
+            "int", "float", "str", "bool", "NoneType",
+            "list", "object", "dict", "bytes", "set",
+            "int", "complex", "Decimal"};
+        const char *tn = (tag >= 0 && tag <= 12) ? _tnames[tag] : "object";
+        snprintf(_err_buf, sizeof(_err_buf),
+                 "bad operand type for unary -: '%.40s'", tn);
         fastpy_raise(FPY_EXC_TYPEERROR, _err_buf);
         *out_tag = FPY_TAG_NONE;
         *out_data = 0;

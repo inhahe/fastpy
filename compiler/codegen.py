@@ -1505,6 +1505,7 @@ class CodeGen:
         ft = ir.FunctionType(void, [i32, i64, ir.PointerType(i32),
                                     ir.PointerType(i64)])
         self.runtime["abs_fv"] = ir.Function(self.module, ft, name="fastpy_abs_fv")
+        self.runtime["neg_fv"] = ir.Function(self.module, ft, name="fastpy_neg_fv")
         ft = ir.FunctionType(void, [i8_ptr, i8_ptr, i32, i64])
         self.runtime["dict_set_fv"] = ir.Function(self.module, ft, name="fastpy_dict_set_fv")
         ft = ir.FunctionType(void, [i8_ptr, i8_ptr, ir.PointerType(i32), ir.PointerType(i64)])
@@ -35547,6 +35548,31 @@ class CodeGen:
             return self.builder.sitofp(val, double)
         return val
 
+    # Operator → `fastpy_fv_binop` opcode.  Shared by the generic dispatch at
+    # the end of `_emit_binop_unknown` and by the fallback edge of its inlined
+    # fast paths, which must agree on the encoding.
+    _FV_BINOP_OPCODES = {ast.Add: 0, ast.Sub: 1, ast.Mult: 2, ast.Div: 3,
+                         ast.FloorDiv: 4, ast.Mod: 5,
+                         ast.BitAnd: 6, ast.BitOr: 7, ast.BitXor: 8,
+                         ast.LShift: 9, ast.RShift: 10}
+
+    def _fv_tag_is_plain_scalar(self, tag: 'ir.Value') -> 'ir.Value':
+        """i1: is *tag* INT, FLOAT or BOOL — a value that fits in an i64/double?
+
+        The inlined arithmetic fast paths convert their operands with
+        `sitofp`/`bitcast`, which is meaningful only for these three.  BIGINT,
+        DECIMAL, COMPLEX and every non-numeric tag carry a *pointer* in `data`
+        and must be routed to the runtime instead.
+        """
+        return self.builder.or_(
+            self.builder.or_(
+                self.builder.icmp_unsigned(
+                    "==", tag, ir.Constant(i32, FPY_TAG_INT)),
+                self.builder.icmp_unsigned(
+                    "==", tag, ir.Constant(i32, FPY_TAG_FLOAT))),
+            self.builder.icmp_unsigned(
+                "==", tag, ir.Constant(i32, FPY_TAG_BOOL)))
+
     def _emit_binop_unknown(self, node, ltv, rtv, lk, rk, op):
         """Handle binop when either operand has VKind.UNKNOWN or FVALUE (runtime-tag dispatch)."""
         # Normalize FVALUE → UNKNOWN — both are runtime-tagged FpyValue
@@ -35637,7 +35663,20 @@ class CodeGen:
                 _n_int_blk = self._new_block("unkn.num_int")
                 _n_flt_blk = self._new_block("unkn.num_flt")
                 _n_join = self._new_block("unkn.num_join")
-                self.builder.cbranch(_n_both_int, _n_int_blk, _n_flt_blk)
+                # As in the `_uu` split below: the float edge is only correct
+                # for tags whose `data` really is a number, so anything else
+                # goes to the runtime rather than having its pointer bitcast
+                # to a double.  `abs(-b) + abs(b)` on a BigInt landed here —
+                # both operands are BIGINT-tagged — and printed a float.
+                # BUG-BIGINT-FV-RESULT-NOT-CONSUMED.
+                _n_gen_blk = self._new_block("unkn.num_gen")
+                _n_pick = self._new_block("unkn.num_pick")
+                self.builder.cbranch(_n_both_int, _n_int_blk, _n_pick)
+                self.builder.position_at_end(_n_pick)
+                self.builder.cbranch(
+                    self.builder.and_(self._fv_tag_is_plain_scalar(l_tag),
+                                      self._fv_tag_is_plain_scalar(r_tag)),
+                    _n_flt_blk, _n_gen_blk)
                 # ── both-INT sub-path: integer addition ──
                 self.builder.position_at_end(_n_int_blk)
                 _n_ires = self._emit_int_binop(
@@ -35693,13 +35732,29 @@ class CodeGen:
                         else self.builder.ptrtoint(_n_fres, i64)
                 self.builder.branch(_n_join)
                 _n_flt_end = self.builder.block
+                # ── generic sub-path: BigInt, Decimal, complex, … ──
+                self.builder.position_at_end(_n_gen_blk)
+                _n_ot = self._create_entry_alloca(i32, "ngen.tag")
+                _n_od = self._create_entry_alloca(i64, "ngen.data")
+                self.builder.call(
+                    self.runtime["fv_binop"],
+                    [l_tag, _nl_i64, r_tag, _nr_i64,
+                     ir.Constant(i32, self._FV_BINOP_OPCODES[ast.Add]),
+                     _n_ot, _n_od])
+                self._emit_try_bail_if_exc()
+                _n_gtag = self.builder.load(_n_ot)
+                _n_gdata = self.builder.load(_n_od)
+                self.builder.branch(_n_join)
+                _n_gen_end = self.builder.block
                 # ── numeric merge ──
                 self.builder.position_at_end(_n_join)
                 _n_tphi = self.builder.phi(i32, "unkn.num.tag")
                 _n_tphi.add_incoming(_n_itag, _n_int_end)
                 _n_tphi.add_incoming(
                     ir.Constant(i32, FPY_TAG_FLOAT), _n_flt_end)
+                _n_tphi.add_incoming(_n_gtag, _n_gen_end)
                 _n_dphi = self.builder.phi(i64, "unkn.num.data")
+                _n_dphi.add_incoming(_n_gdata, _n_gen_end)
                 _n_dphi.add_incoming(_n_idata, _n_int_end)
                 _n_dphi.add_incoming(_n_fdata, _n_flt_end)
                 num_as_i64 = _n_dphi
@@ -35924,7 +35979,31 @@ class CodeGen:
                 _uu_int = self._new_block("unkn_uu.iarith")
                 _uu_flt = self._new_block("unkn_uu.farith")
                 _uu_mrg = self._new_block("unkn_uu.merge")
-                self.builder.cbranch(_both_int, _uu_int, _uu_flt)
+                # A two-way int-vs-float split is wrong: six tags are numeric,
+                # not two.  A BIGINT operand (tag 10) took the float edge and
+                # had its *pointer* bitcast to a double, so `-b - -c` on two
+                # equal BigInts printed 1024.0 — the same "inlined binary
+                # dispatch over six numeric tags" shape as
+                # BUG-ABS-OF-TAGGED-VALUE.  The float edge is now guarded by
+                # an actual check that both operands are plain scalars, and
+                # anything else goes to the runtime's `fv_binop`, which
+                # already handles BigInt, Decimal, str concat and the
+                # TypeErrors correctly.  The int and float fast paths stay
+                # inline; only the cases that were wrong pay for a call.
+                # BUG-BIGINT-FV-RESULT-NOT-CONSUMED.
+                _uu_gen_opc = self._FV_BINOP_OPCODES.get(op)
+                _uu_gen = (self._new_block("unkn_uu.gen")
+                           if _uu_gen_opc is not None else None)
+                if _uu_gen is not None:
+                    _uu_pick = self._new_block("unkn_uu.pick")
+                    self.builder.cbranch(_both_int, _uu_int, _uu_pick)
+                    self.builder.position_at_end(_uu_pick)
+                    self.builder.cbranch(
+                        self.builder.and_(self._fv_tag_is_plain_scalar(_ltag),
+                                          self._fv_tag_is_plain_scalar(_rtag)),
+                        _uu_flt, _uu_gen)
+                else:
+                    self.builder.cbranch(_both_int, _uu_int, _uu_flt)
                 # ── both-INT path ──
                 self.builder.position_at_end(_uu_int)
                 _uires = self._emit_int_binop(
@@ -35983,6 +36062,21 @@ class CodeGen:
                         else self.builder.ptrtoint(_ufres, i64)
                 self.builder.branch(_uu_mrg)
                 _uu_flt_end = self.builder.block
+                # ── generic path: everything the two fast paths misread ──
+                _uu_gen_end = _uu_gtag = _uu_gdata = None
+                if _uu_gen is not None:
+                    self.builder.position_at_end(_uu_gen)
+                    _uu_ot = self._create_entry_alloca(i32, "uugen.tag")
+                    _uu_od = self._create_entry_alloca(i64, "uugen.data")
+                    self.builder.call(
+                        self.runtime["fv_binop"],
+                        [_ltag, _li64, _rtag, _ri64,
+                         ir.Constant(i32, _uu_gen_opc), _uu_ot, _uu_od])
+                    self._emit_try_bail_if_exc()
+                    _uu_gtag = self.builder.load(_uu_ot)
+                    _uu_gdata = self.builder.load(_uu_od)
+                    self.builder.branch(_uu_mrg)
+                    _uu_gen_end = self.builder.block
                 # ── merge ──
                 self.builder.position_at_end(_uu_mrg)
                 _uu_tphi = self.builder.phi(i32, "unkn_uu.tag")
@@ -35992,6 +36086,9 @@ class CodeGen:
                 _uu_dphi = self.builder.phi(i64, "unkn_uu.data")
                 _uu_dphi.add_incoming(_uidata, _uu_int_end)
                 _uu_dphi.add_incoming(_ufdata, _uu_flt_end)
+                if _uu_gen_end is not None:
+                    _uu_tphi.add_incoming(_uu_gtag, _uu_gen_end)
+                    _uu_dphi.add_incoming(_uu_gdata, _uu_gen_end)
                 return self._fv_build_from_slots(_uu_tphi, _uu_dphi)
 
         # ── UNKNOWN with extractable tags: fv_binop dispatch ─────
@@ -36002,11 +36099,7 @@ class CodeGen:
         # C fv_binop which handles ALL type combinations correctly
         # (str concat, repeat, TypeError for invalid combos, and
         # proper INT→FLOAT promotion for truediv).
-        _fv_op_map = {ast.Add: 0, ast.Sub: 1, ast.Mult: 2, ast.Div: 3,
-                      ast.FloorDiv: 4, ast.Mod: 5,
-                      ast.BitAnd: 6, ast.BitOr: 7, ast.BitXor: 8,
-                      ast.LShift: 9, ast.RShift: 10}
-        _gf_opc = _fv_op_map.get(op)
+        _gf_opc = self._FV_BINOP_OPCODES.get(op)
         if _gf_opc is not None:
             _gf_lt = _gf_ld = _gf_rt = _gf_rd = None
             # Extract left tag + data
@@ -37206,20 +37299,23 @@ class CodeGen:
                 return self.builder.fneg(operand)
             elif (isinstance(operand.type, ir.LiteralStructType)
                   and operand.type == fpy_val):
-                # FpyValue: runtime dispatch based on tag (INT vs FLOAT)
+                # FpyValue: dispatch on the tag in the runtime.  This used to
+                # be an inlined `select(tag == FLOAT, fneg, 0 - data)`, which
+                # is the same mistake as BUG-ABS-OF-TAGGED-VALUE: six tags are
+                # numeric, not two.  A BIGINT operand kept its tag and had its
+                # *pointer* negated, so `-(-b)` handed a garbage pointer to
+                # the printer and took an access violation; Decimal and
+                # complex were silently wrong the same way.
+                # BUG-BIGINT-FV-RESULT-NOT-CONSUMED.
                 tag = self.builder.extract_value(operand, 0)
                 data = self.builder.extract_value(operand, 1)
-                is_float = self.builder.icmp_unsigned(
-                    "==", tag, ir.Constant(i32, FPY_TAG_FLOAT))
-                int_neg = self.builder.neg(data)
-                float_val = self.builder.bitcast(data, double)
-                float_neg = self.builder.fneg(float_val)
-                float_neg_i64 = self.builder.bitcast(float_neg, i64)
-                neg_data = self.builder.select(is_float, float_neg_i64, int_neg)
-                result = ir.Constant(fpy_val, ir.Undefined)
-                result = self.builder.insert_value(result, tag, 0)
-                result = self.builder.insert_value(result, neg_data, 1)
-                return result
+                _nt = self._create_entry_alloca(i32, "neg.tag")
+                _nd = self._create_entry_alloca(i64, "neg.data")
+                self.builder.call(self.runtime["neg_fv"],
+                                  [tag, data, _nt, _nd])
+                self._emit_try_bail_if_exc()
+                return self._fv_build_from_slots(
+                    self.builder.load(_nt), self.builder.load(_nd))
             return self._bridge_fallback_expr(node, "unsupported unary operand type")
         elif isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.UAdd):
             # __pos__ on user-class objects

@@ -288,7 +288,9 @@ does not implement at all. So all-constant arithmetic (`_is_constant_arith`)
 and mode-pinned names are both exempt, as is anything `maybe_int` rules out
 (which incidentally also stopped floats being widened: `t + 1.5` has a float
 constant operand). The rule to carry forward: *a wide slot is correct for any
-value the FV paths handle correctly, and BigInt is not yet one of them.*
+value the FV paths handle correctly.* BigInt has since become one of them for
+comparison and arithmetic (below), but not yet at a return boundary or inside a
+list literal, so both exemptions stand.
 
 Because `_int_mode_vars` is only filled during emission, the scan recognises
 `unchecked_int`/`checked_int` and the `Unchecked`/`Checked` markers
@@ -322,6 +324,43 @@ The general lesson is that **a silent fallback is what let this live**: a
 compile. `divmod`, `pow`, `round`, `int`, `float`, `min` and `max` share the
 naked-scalar shape and are known or suspected to have the same hole — see
 BUG-MINMAX-OF-TAGGED-VALUE and BUG-INT-FLOAT-OF-TAGGED-VALUE.
+
+**The same rule holds for *binary* dispatch, where it is worse.** A unary
+fallback yields a quiet zero; a binary one reinterprets a pointer. Three places
+in codegen inlined a two-way `both tags == INT` test and sent everything that
+failed it to *float* arithmetic — `_emit_binop_unknown`'s Add-specific fast
+path, its general one, and the unary-minus FpyValue path. BIGINT is tag 10, so a
+BigInt took the float edge and had its pointer bitcast to a double: `-b - -c`
+printed `1024.0`, and `-(-b)` negated an address and took an access violation.
+
+The answer is the same shape as `abs`, and does not cost the fast paths. The
+int edge and the float edge stay inline; what changes is that the float edge is
+now guarded by a real *"both operands are plain scalars"* test —
+`_fv_tag_is_plain_scalar`, true for INT, FLOAT and BOOL, the three tags whose
+`data` really is a number — and everything else takes a third edge to
+`fastpy_fv_binop`. That runtime helper already handled BigInt, Decimal, string
+concatenation and the TypeErrors correctly; it simply was never called. Unary
+minus had no such helper, so `fastpy_neg_fv` was added alongside `fastpy_abs_fv`,
+including the `-(-2**63)` widening that an i64 cannot express. Codegen and the
+runtime now share one `_FV_BINOP_OPCODES` table instead of two copies that had
+to agree.
+
+**Comparing a BigInt to a float must convert the float, never the BigInt.**
+`fastpy_fv_compare` had no BIGINT case at all: it fell through to a default
+integer compare of the two *pointers*, so `-b == -c` on equal BigInts was False.
+Adding the case exposed a second question, because `_fpy_tags_order_compatible`
+had also been treating BIGINT ⊕ FLOAT as *incompatible* — `2 ** 80 < 1.5` raised
+TypeError, and `==` answered False by accident rather than by arithmetic.
+
+Once those two are ordered, the direction of conversion decides correctness.
+Going BigInt → double rounds every value past 2^53, collapsing `2**80 - 1`,
+`2**80` and `2**80 + 1` onto one double and answering "equal" to all three.
+Going double → integer is always exact: below 2^63 through an `int64_t` with the
+fraction breaking a tie on the integer part, and at or above 2^63 by the
+observation that a finite double that large *is* an exact `mantissa * 2^k`,
+which `frexp`/`ldexp` recover as a 53-bit i64 plus a shift. NaN answers
+"unordered", which every operator but `!=` reads as False. The general form: when
+two representations have different precision, convert toward the *wider* one.
 
 **Two call sites must agree on the MIXED tag.** A callee's result type is
 decided in two independent places, and both consult `_func_ret_types`:
