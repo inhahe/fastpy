@@ -8,13 +8,63 @@ how to reproduce it, and what the proper fix looks like.
 
 ## Active Bugs
 
-### BUG-STARARG-SPLAT-DEFAULT-PARAM. `f(*xs)` raises IndexError when `f` has a default parameter — 2026-07-26
+### BUG-SPLAT-DEFAULTED-SLOT-TYPE. A defaulted parameter reached by `f(*seq)` is typed from the default even when the sequence supplies it — 2026-07-26
 
-**What:** splatting into a function that has *any* default parameter fails at
-runtime. Nothing to do with the element type — a list of plain ints fails the
+**What:** when a splat can reach a slot that *also* has a default, the slot's
+static type is taken from the default, so an element of a different kind
+landing there is converted to the wrong type.
+
+**Reproduce** — should print `4.0`, prints `3.5`:
+```python
+"""Doc."""
+
+def g(a, b=0):
+    return a + b
+
+xs = [1.5, 2.5]
+print(g(*xs))
+```
+`a` is correctly `float` (a required slot, see BUG-STARARG-SPLAT-DEFAULT-PARAM
+below), but `b` is typed `int` from `b=0`, so the 2.5 the sequence actually
+supplies is truncated to 2.
+
+**Why it is not simply "let the element win":** whether the slot receives the
+element or the default depends on the sequence's *runtime* length, so neither
+static answer is safe. Element-wins breaks the mirror case — `d_list(v, n=1)`
+splatted from a one-element list of lists would declare `n` a pointer and then
+read the integer default `1` as one. Both directions were tried and measured;
+each fixes one case and breaks the other.
+
+**What the correct fix is:** such a slot has to carry its own runtime tag, i.e.
+take the FV ABI. `_splat_elem_or_default` already builds the value as a
+correctly tagged `FpyValue`, so the caller side is ready. The blocker is on the
+callee side: tagging the slot `"mixed"` gets cleared to `None` by the
+pre-cleanup in `_analyze_call_sites` (~line 7880, "Clear to None so the param
+uses generic FV-ABI runtime dispatch"), and that comment does not hold — a
+`None` slot still lands on a bare `i64` parameter, which is why the `"mixed"`
+variant printed a float's bit pattern rather than dispatching. Making a `None`
+/ `"mixed"` parameter genuinely force FV-ABI for that parameter is the real
+fix, and it would also settle the wider "untyped parameter answers 0 for
+`len()`" class of silent wrongness (see the note under
+BUG-PARAM-TYPE-FROM-USER-CALL-ARG).
+
+**Where:** the splat block in `_analyze_call_sites` guarded by `_sp_elem`
+(~line 7770) deliberately fills only slots below `off` (= `min_args`); the
+`else` arm that would decide the ambiguous slots is the thing that cannot be
+written soundly today.
+
+**Partly mitigated:** `_splat_fv_as_double` / `_splat_fv_as_i64` make the
+bare-ABI unwrap in `_splat_elem_or_default` tag-aware, so the value is at least
+*converted* rather than bit-reinterpreted. Before that this case printed
+`4.6e18`.
+
+### ~~BUG-STARARG-SPLAT-DEFAULT-PARAM. `f(*xs)` raises IndexError when `f` has a default parameter~~ — FIXED 2026-07-26
+
+**What:** splatting into a function that has *any* default parameter failed at
+runtime. Nothing to do with the element type — a list of plain ints failed the
 same way.
 
-**Reproduce** — should print `6`, raises:
+**Reproduce** — should print `6`, raised:
 ```python
 """Doc."""
 
@@ -30,24 +80,43 @@ Traceback (most recent call last):
 IndexError: list index out of range
 ```
 
-**Narrowing already done:** `two_pos(*[3, 4])` into `def two_pos(a, b)` works,
-and `d_int(5)` works, so neither splatting nor defaults is broken alone — it is
-the combination. The IndexError is raised by the compiled program itself, so
-the splat is being expanded against the *call site's* argument count rather
-than the callee's parameter count, and the defaulted slot is then read off the
-end of the splatted sequence.
+**Root cause:** the splat expansion extracted exactly `info.param_count`
+elements — `remaining = info.param_count - len(args)` — so a sequence shorter
+than the callee's arity was read off the end. `two_pos(*[3, 4])` into
+`def two_pos(a, b)` worked and `d_int(5)` worked, so neither splatting nor
+defaults was broken alone; it was the combination.
 
-**Where:** the star-args expansion in the call-emission path (`_emit_user_call`
-and the `_expand_starargs` handling ahead of it). The fix is to expand only as
-many positions as the sequence actually has and let the normal default-filling
-supply the rest, rather than expanding to the callee's arity.
+**Fix:** `_splat_positional_args` extracts required parameters unconditionally
+(a too-short sequence is a TypeError in Python, and the existing `min_args`
+check reports it) and resolves each *defaulted* slot at runtime via
+`_splat_elem_or_default`, which emits `seq[i] if i < len(seq) else <default>`
+as an `FpyValue` — the two arms need a common LLVM type and an element need not
+agree with the default. Mutable defaults still go through
+`_load_cached_default`, so `def f(x=[])` is not re-evaluated per call.
 
-**Not a regression:** identical IndexError at `9ba4c3c` and its parent —
-verified by stashing.
+**The expansion existed twice.** `_emit_user_call` and `_emit_user_call_fv`
+each carried their own copy of the loop, so the first fix left the FV path
+still crashing. They now share `_splat_positional_args`; the FV caller only has
+to pad its parallel `arg_source_nodes` list.
 
-**Where it bites:** `tests/regressions/param_type_from_call_arg.py` wanted a
-star-args call site to prove refinement is disabled for one; it has to use a
-no-default callee instead, and says so.
+**A second bug fell out of it:** a parameter fed *only* by a splat had no type
+at all, because the per-argument classification in `_analyze_call_sites` had no
+arm for `ast.Starred`. `no_default(*lists)` left `v` untyped and `len(v)`
+answered 0 instead of 3 — the same silent-zero as
+BUG-PARAM-TYPE-FROM-USER-CALL-ARG, reached from the argument side.
+`_csa_splat_elem_tag` / `_csa_build_seq_binds` now trace a splatted *name* back
+to the sequence literal it was bound to (`_csa_var_types` records only the
+coarse kind `"list"`, never the element type) and hand that element tag to
+every *required* slot from the splat's position on. A name rebound anywhere is
+poisoned rather than guessed at. The defaulted slots are left alone — see
+BUG-SPLAT-DEFAULTED-SLOT-TYPE above.
+
+**Test:** `tests/regressions/stararg_splat_default_param.py`. Verified to
+IndexError at `2482ae6`. Clean under ASan/UBSan/LSan.
+
+**Follow-up done:** `tests/regressions/param_type_from_call_arg.py` says a
+star-args call site cannot be exercised because of this bug; that note is now
+stale and the file can use a defaulted callee.
 
 ### ~~BUG-PARAM-TYPE-FROM-USER-CALL-ARG. A parameter whose only call-site evidence is a user call is left untyped, and `len()` on it returns 0~~ — FIXED 2026-07-26
 

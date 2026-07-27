@@ -226,6 +226,29 @@ Coverage is bounded by what `_func_ret_types` records: list/dict/tuple/float
 and MIXED, but not str/bytes/set, since the propagation chain has no arm for a
 plain `return "abcd"`. Widening that belongs on the callee side.
 
+**A splat is evidence too, but only about the required slots.** `f(*seq)` had
+no arm in the per-argument classification at all, so a parameter fed only that
+way hit the same silent-zero. `_csa_build_seq_binds` maps each name to the
+sequence literal it was bound to — `_csa_var_types` records only the coarse
+kind `"list"`, never the element type — and `_csa_splat_elem_tag` resolves that
+to an element tag, poisoning any name that is rebound anywhere. The tag is
+given to every slot from the splat's position up to `min_args`, and no further:
+a slot with a default may take the element or the default depending on the
+sequence's runtime length, and committing to either reinterprets the other's
+bits (BUG-SPLAT-DEFAULTED-SLOT-TYPE).
+
+**Splat expansion lives in one place.** `_splat_positional_args` is shared by
+`_emit_user_call` and `_emit_user_call_fv`, which previously each had a copy —
+so BUG-STARARG-SPLAT-DEFAULT-PARAM had to be fixed twice and one copy was
+missed. A splatted sequence supplies as many arguments as it *has*, so required
+parameters are extracted unconditionally (a short sequence is a TypeError, and
+the `min_args` check reports it) while each defaulted slot is resolved at
+runtime by `_splat_elem_or_default` as `seq[i] if i < len(seq) else <default>`.
+That value is built as an `FpyValue` because the two arms need a common LLVM
+type; unwrapping it back for a bare-ABI callee goes through
+`_splat_fv_as_double` / `_splat_fv_as_i64`, which consult the runtime tag
+rather than reinterpreting the bits.
+
 ## Runtime
 
 `runtime/` holds the C runtime linked into every fastpy binary:

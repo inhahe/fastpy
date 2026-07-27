@@ -156,17 +156,22 @@ def kw_called(v, n=1):
 print(kw_called(always_list(3), n=2), kw_called(w))
 
 
-# Star-args call sites are blocked for the same reason, but cannot be exercised
-# here: `f(*xs)` into a function with a default parameter raises IndexError at
-# runtime, independently of any of this — see BUG-STARARG-SPLAT-DEFAULT-PARAM.
-# A splat into a no-default function is fine, so that is what is used.
+# Star-args call sites are blocked for the same reason. Both a no-default and a
+# defaulted callee are exercised; the latter used to raise IndexError at runtime
+# independently of any of this (BUG-STARARG-SPLAT-DEFAULT-PARAM, since fixed —
+# `stararg_splat_default_param.py` covers it).
 
 def splat_target(a, b):
     return a + b
 
 
+def splat_defaulted(a, b=10):
+    return a + b
+
+
 _pair = [3, 4]
-print(splat_target(*_pair))
+_one = [3]
+print(splat_target(*_pair), splat_defaulted(*_one), splat_defaulted(*_pair))
 
 
 # ── The same shapes inside a function, and across a loop ──

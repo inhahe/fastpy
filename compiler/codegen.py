@@ -6706,6 +6706,83 @@ class CodeGen:
                 return "bytes"
         return None
 
+    def _csa_elem_tag(self, elts: list, var_types: dict) -> 'str | None':
+        """The common tag of a sequence literal's elements, or None.
+
+        None means "no usable evidence": an empty literal, an element whose
+        kind cannot be read, or elements that disagree.  Only a sequence
+        every one of whose elements agrees can say anything about the
+        parameters a `f(*seq)` call fills.
+        """
+        if not elts:
+            return None
+        tag: str | None = None
+        for e in elts:
+            k = self._csa_literal_ptr_kind(e)
+            if k is None and isinstance(e, ast.Constant):
+                v = e.value
+                if isinstance(v, bool):
+                    k = "bool"
+                elif isinstance(v, float):
+                    k = "float"
+                elif isinstance(v, int):
+                    k = "int"
+            if k is None and isinstance(e, ast.Name):
+                k = var_types.get(e.id)
+            if k is None:
+                return None
+            if tag is None:
+                tag = k
+            elif tag != k:
+                return None
+        return tag
+
+    def _csa_splat_elem_tag(
+        self, expr: ast.expr, var_types: dict,
+    ) -> 'str | None':
+        """Element tag of the sequence a `f(*seq)` call splats, if evident.
+
+        `_csa_var_types` records only the coarse kind ("list"), never the
+        element type, so a splatted *name* has to be traced back to the
+        literal it was bound to.  `_csa_seq_binds` is that map, built once
+        over the whole tree; it stores the literal's element nodes rather
+        than a tag, because resolving a `Name` element needs the variable
+        types, which are not known when the map is built.
+
+        A name rebound anywhere — to a second literal, to a call result, by a
+        `for` loop — is poisoned to None rather than guessed at.  Flattening
+        every scope into one namespace is deliberately coarse: it can only
+        ever *lose* evidence, since a same-named local elsewhere poisons the
+        entry.
+        """
+        if isinstance(expr, (ast.List, ast.Tuple)):
+            return self._csa_elem_tag(expr.elts, var_types)
+        if isinstance(expr, ast.Name):
+            elts = getattr(self, "_csa_seq_binds", {}).get(expr.id)
+            if elts:
+                return self._csa_elem_tag(elts, var_types)
+        return None
+
+    def _csa_build_seq_binds(self, tree: ast.AST) -> None:
+        """Populate `_csa_seq_binds` — see `_csa_splat_elem_tag`."""
+        binds: dict[str, list | None] = {}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign):
+                targets, value = node.targets, node.value
+            elif isinstance(node, (ast.AugAssign, ast.AnnAssign)):
+                targets, value = [node.target], node.value
+            elif isinstance(node, (ast.For, ast.comprehension)):
+                targets, value = [node.target], None
+            else:
+                continue
+            for t in targets:
+                if not isinstance(t, ast.Name):
+                    continue
+                elts = (value.elts
+                        if isinstance(value, (ast.List, ast.Tuple)) else None)
+                binds[t.id] = None if t.id in binds else elts
+        self._csa_seq_binds = binds
+
     @classmethod
     def _csa_returns_disagree(cls, fnode: ast.AST) -> bool:
         """True when *fnode*'s returns commit to more than one pointer kind.
@@ -7675,6 +7752,14 @@ class CodeGen:
             # when calls mix positional and keyword args:
             #   f(2.5, factor=4.0)  →  ("float", "float") not just ("float",)
             sig_arg_types = list(arg_types)
+            # Position of a `*seq` argument and the element tag it hands to
+            # every slot from there on.  An unresolvable sequence stays None,
+            # which simply means this call site adds no evidence.
+            _sp_at = next((i for i, a in enumerate(node.args)
+                           if isinstance(a, ast.Starred)), None)
+            _sp_elem: str | None = (
+                self._csa_splat_elem_tag(node.args[_sp_at].value, var_types)
+                if _sp_at is not None else None)
             if func_name in self._csa_func_asts:
                 fn_def = self._csa_func_asts[func_name]
                 fn_params = [a.arg for a in fn_def.args.args]
@@ -7697,6 +7782,29 @@ class CodeGen:
                     return None
                 # Regular param defaults (apply to last N params)
                 off = n_regular - len(defaults)
+                # `f(*seq)` fills every remaining positional slot from the
+                # sequence, so the sequence's *element* type is what those
+                # parameters actually receive.  A parameter fed only by a
+                # splat otherwise had no evidence at all and stayed untyped,
+                # which silently made len() answer 0 rather than fault.
+                # BUG-SPLAT-ARG-PARAM-UNTYPED.
+                #
+                # Only the *required* slots are claimed.  A slot at or past
+                # `off` may take the element or the default depending on the
+                # sequence's runtime length, and neither answer is safe to
+                # assume: typing it from the element reinterprets the
+                # default's bits when the sequence stops short, and typing it
+                # from the default does the reverse.  That ambiguity is left
+                # exactly as it was — see BUG-SPLAT-DEFAULTED-SLOT-TYPE.
+                #
+                # This must run *before* the default-type fill below, which
+                # only writes into slots that are still None.
+                if _sp_elem is not None:
+                    for pi in range(_sp_at, min(off, n_regular)):
+                        if pi >= len(sig_arg_types):
+                            break
+                        if sig_arg_types[pi] is None:
+                            sig_arg_types[pi] = _sp_elem
                 for di, d in enumerate(defaults):
                     pi = off + di
                     if pi < len(sig_arg_types) and sig_arg_types[pi] is None:
@@ -8793,6 +8901,10 @@ class CodeGen:
         # Store shared context for use by helper methods
         self._csa_class_parents = class_parents
         self._csa_func_asts = func_asts
+        # Element tags of sequence literals, keyed by the name they were bound
+        # to — the only evidence a `f(*seq)` call site can offer about the
+        # parameters it fills.  See _csa_splat_elem_tag.
+        self._csa_build_seq_binds(tree)
 
         # ── Pre-scan: detect functions used as first-class values ──
         # A function "used as a value" is one that appears as a Name reference
@@ -30757,12 +30869,8 @@ class CodeGen:
                         self.builder.position_at_end(_sl_end)
                         args.append(sub)
                 else:
-                    remaining = info.param_count - len(args)
-                    elem_type = self._get_list_elem_type(arg_node.value)
-                    for i in range(remaining):
-                        elem = self._list_get_as_bare(
-                            list_val, ir.Constant(i64, i), elem_type)
-                        args.append(elem)
+                    self._splat_positional_args(
+                        list_val, arg_node.value, info, args)
                 break  # starred must be last
             val = self._emit_expr_value(arg_node)
             args.append(val)
@@ -31126,12 +31234,10 @@ class CodeGen:
         for arg_node in node.args:
             if isinstance(arg_node, ast.Starred):
                 list_val = self._emit_expr_value(arg_node.value)
-                remaining = info.param_count - len(args)
-                elem_type = self._get_list_elem_type(arg_node.value)
-                for i in range(remaining):
-                    elem = self._list_get_as_bare(list_val, ir.Constant(i64, i), elem_type)
-                    args.append(elem)
-                    arg_source_nodes.append(None)
+                _before = len(args)
+                self._splat_positional_args(
+                    list_val, arg_node.value, info, args)
+                arg_source_nodes.extend([None] * (len(args) - _before))
                 break
             val = self._emit_expr_value(arg_node)
             args.append(val)
@@ -31228,6 +31334,160 @@ class CodeGen:
                 and default_globals[default_idx] is not None):
             return self.builder.load(default_globals[default_idx])
         return None
+
+    def _splat_positional_args(
+        self, list_val: ir.Value, seq_node: ast.expr, info: "FuncInfo",
+        args: list,
+    ) -> None:
+        """Expand `f(*seq)` into positional arguments, appending onto *args*.
+
+        A splatted sequence supplies as many arguments as it has elements, not
+        as many as the callee happens to declare.  Extracting `param_count` of
+        them read past the end of a shorter sequence, which is an outright
+        IndexError for any callee with a default
+        (BUG-STARARG-SPLAT-DEFAULT-PARAM).
+
+        Required parameters are still extracted unconditionally: a too-short
+        sequence is a TypeError in Python, and the caller's `min_args` check is
+        what reports it.  Only the defaulted slots are ambiguous, and the
+        sequence's length is not known until runtime, so each of those is
+        resolved against the real length there.
+
+        `_emit_user_call` and `_emit_user_call_fv` each carried their own copy
+        of this loop, so the bug had to be fixed twice and one copy was missed.
+        They share this one instead; the FV variant only has to pad its
+        parallel `arg_source_nodes` list afterwards.
+        """
+        remaining = info.param_count - len(args)
+        elem_type = self._get_list_elem_type(seq_node)
+        splat_len = None
+        for i in range(remaining):
+            pos = len(args)
+            if pos < info.min_args:
+                args.append(self._list_get_as_bare(
+                    list_val, ir.Constant(i64, i), elem_type))
+                continue
+            if splat_len is None:
+                splat_len = self.builder.sext(
+                    self.builder.call(self.runtime["list_length"], [list_val]),
+                    i64)
+            args.append(self._splat_elem_or_default(
+                list_val, i, splat_len, info, pos, elem_type))
+
+    def _splat_elem_or_default(
+        self, list_val: ir.Value, idx: int, splat_len: ir.Value,
+        info: "FuncInfo", pos: int, elem_type,
+    ) -> ir.Value:
+        """One defaulted parameter filled from `f(*seq)`, chosen at runtime.
+
+        Position *pos* has a default, so whether the splatted sequence reaches
+        it is a property of the sequence's length -- which is a runtime value.
+        Emits the equivalent of ``seq[idx] if idx < len(seq) else <default>``.
+        See BUG-STARARG-SPLAT-DEFAULT-PARAM.
+
+        The value is built as an FpyValue regardless of the element's static
+        kind, because the two arms need a common LLVM type and an element and
+        its default need not agree (``def f(v, n=1)`` splatted from a list of
+        strings).  For an FV-ABI callee that is also exactly what the argument
+        coercion wants -- `_wrap_arg_value` passes an FpyValue through
+        untouched -- so it is unwrapped again only for the bare-ABI path.
+
+        Mutable defaults go through `_load_cached_default` like everywhere
+        else: Python evaluates a default once at def-time, so re-evaluating
+        ``def f(x=[])`` per call would hand out a fresh list each time.
+        """
+        _blk_take = self._new_block("splat.take")
+        _blk_def = self._new_block("splat.default")
+        _blk_join = self._new_block("splat.join")
+
+        in_range = self.builder.icmp_signed(
+            "<", ir.Constant(i64, idx), splat_len)
+        self.builder.cbranch(in_range, _blk_take, _blk_def)
+
+        # The sequence is long enough — take the element, tag and all.
+        self.builder.position_at_end(_blk_take)
+        _tag_slot = self._create_entry_alloca(i32, "splat.el.tag")
+        _data_slot = self._create_entry_alloca(i64, "splat.el.data")
+        self.builder.call(
+            self.runtime["list_get_fv"],
+            [list_val, ir.Constant(i64, idx), _tag_slot, _data_slot])
+        _take_fv = self._fv_build_from_slots(self.builder.load(_tag_slot),
+                                             self.builder.load(_data_slot))
+        _blk_take_end = self.builder.block
+        self.builder.branch(_blk_join)
+
+        # The sequence stopped short — use the declared default.
+        self.builder.position_at_end(_blk_def)
+        di = pos - info.min_args
+        default_node = (info.defaults[di]
+                        if di < len(info.defaults) else None)
+        cached = self._load_cached_default(info.default_globals, di)
+        if cached is not None:
+            _def_fv = self._wrap_for_print(cached, default_node)
+        elif default_node is not None:
+            _def_fv = self._load_or_wrap_fv(default_node)
+        else:
+            _def_fv = self._fv_none()
+        _blk_def_end = self.builder.block
+        self.builder.branch(_blk_join)
+
+        self.builder.position_at_end(_blk_join)
+        phi = self.builder.phi(fpy_val, name="splat.arg")
+        phi.add_incoming(_take_fv, _blk_take_end)
+        phi.add_incoming(_def_fv, _blk_def_end)
+
+        if info.uses_fv_abi:
+            return phi
+        # Bare ABI wants a naked value.  The type to unwrap to is the
+        # *parameter's*, not the splatted sequence's element type: this slot
+        # holds a default as often as an element, and `def f(v, n=1)` splatted
+        # from a list of lists would otherwise read the integer 1 back as a
+        # pointer.
+        _pt = None
+        if info.static_param_types and pos < len(info.static_param_types):
+            _pt = info.static_param_types[pos]
+        if _pt is None:
+            _pt = elem_type
+        if isinstance(_pt, ir.DoubleType):
+            return self._splat_fv_as_double(phi)
+        if isinstance(_pt, ir.IntType):
+            _iv = self._splat_fv_as_i64(phi)
+            return (self.builder.trunc(_iv, i32)
+                    if _pt.width == 32 else _iv)
+        if isinstance(_pt, ir.PointerType):
+            return self._fv_as_ptr(phi)
+        _ek = _pt.kind if isinstance(_pt, ValueType) else self._tag_kind(_pt)
+        if _ek == VKind.FLOAT:
+            return self._splat_fv_as_double(phi)
+        if _ek in (VKind.INT, VKind.BOOL):
+            return self._splat_fv_as_i64(phi)
+        return self._fv_as_ptr(phi)
+
+    def _splat_fv_is_float(self, fv: ir.Value) -> ir.Value:
+        """i1: does *fv* carry the FLOAT tag?"""
+        return self.builder.icmp_signed(
+            "==", self._fv_tag(fv), ir.Constant(i32, FPY_TAG_FLOAT))
+
+    def _splat_fv_as_double(self, fv: ir.Value) -> ir.Value:
+        """Read *fv* as a double, converting when it holds an int.
+
+        The two arms of the splat phi need not agree on kind — `f(v, n=1.5)`
+        fed from a list of ints takes the element on a long sequence and the
+        float default on a short one — so unwrapping to the parameter's
+        declared type has to consult the runtime tag.  Reinterpreting the
+        bits instead is how a splatted 2.5 came back as 4.6e18.
+        """
+        return self.builder.select(
+            self._splat_fv_is_float(fv),
+            self._fv_as_float(fv),
+            self.builder.sitofp(self._fv_data_i64(fv), double))
+
+    def _splat_fv_as_i64(self, fv: ir.Value) -> ir.Value:
+        """Read *fv* as an i64, truncating when it holds a float."""
+        return self.builder.select(
+            self._splat_fv_is_float(fv),
+            self.builder.fptosi(self._fv_as_float(fv), i64),
+            self._fv_data_i64(fv))
 
     def _wrap_arg_value(self, val: ir.Value, arg_node: ast.expr | None) -> ir.Value:
         """Wrap a bare argument value into an FpyValue for the FV-ABI call.
