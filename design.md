@@ -403,6 +403,39 @@ them fall through to the INT default and become an inline i64 load of the
 pointer. The corollary is that **the store side and the read side must derive
 the kind the same way**, or the tag written and the tag expected diverge.
 
+**A static tag is a guess, and a container store must not make one.** There are
+two converters, and the difference between them is the whole bug class:
+`_bare_to_tag_data` returns a *Python int* tag decided at compile time, while
+`_to_tag_data_ir` returns an `ir.Value` and can therefore carry a tag that is
+only known at runtime. Every container store used the first one and wrapped its
+answer in `ir.Constant(i32, tag)`, so a value whose kind the compiler could not
+name went in as `FPY_TAG_INT`: a dict built from tagged locals stored `4.5` as
+`4616752568008179712` and a `str` as its address, and `s.add(fl)` followed by
+`fl in s` answered False because the probe was tagged FLOAT and the entry was
+not. The load side was already correct — `fastpy_dict_get_fv` has tag
+out-params — which is why `print` of the dict was wrong in a way that looked
+like a *load* bug. The stores now use `_to_tag_data_ir`.
+
+That helper had a hole of its own worth naming: it recognised an `fpy_val`
+*struct* but not an FV-backed **variable**, because `_emit_expr_value` hands a
+`Name` back as the bare i64 payload. It now reloads the variable's alloca for
+both halves rather than pairing a fresh runtime tag with an already-emitted
+payload, so the two can never describe different values.
+
+The one store that deliberately keeps the static tag is the **list** element
+store, where the tag is not just recorded but *decides the code path*: a heap
+tag must go through the refcounting setter rather than the inline fast path, so
+a runtime tag there would mean a runtime branch, not a different constant.
+
+The same "guess replaces the truth" shape appeared one level up, in **binding**
+rather than storing. The comprehension tuple-unpack paths hand-rolled the
+element fetch and stored only the payload under a positionally-inferred kind,
+behind a line that rewrote every honest `"unknown"` into `"int"`. The statement
+`for` loop had been right all along because it delegates to
+`_fv_store_from_list`; the comprehensions now do too. The lesson is the recurring
+one — when a helper exists that preserves the tag, a second hand-rolled copy of
+the same fetch is where the tag gets lost.
+
 The predicates that remain are for *syntactic* evidence and must answer for
 every expression form that can carry the kind — notably `ast.Subscript`, which
 both `_is_complex_expr` and `_is_decimal_expr` were missing. That gap is subtle

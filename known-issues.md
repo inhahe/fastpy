@@ -8,6 +8,101 @@ how to reproduce it, and what the proper fix looks like.
 
 ## Active Bugs
 
+### BUG-DICTCOMP-FV-KEY-EMITS-BROKEN-IR. A dict comprehension whose key becomes FV-typed leaves a block unterminated and the build fails — 2026-07-27
+
+**What:** `_emit_dict_comprehension`'s range path dispatches on the key's LLVM
+type — `IntType` → `dict_set_int_fv`, `PointerType` → `dict_set_fv`, and
+anything else `return self._bridge_fallback_expr(...)`. That `return` happens
+with the builder positioned *inside the loop body*, after `dc.incr` and `dc.end`
+have already been created, so those blocks are never terminated and the module
+fails to parse. The fallback is reached whenever the loop variable gets promoted
+to an `fpy_val` struct, which a BigInt anywhere in the function is enough to do.
+
+**Reproduce** — a compile failure, not a wrong answer:
+```python
+m = [2 ** 80]
+c = {i: m[i] for i in range(1)}
+print(c)
+```
+```
+Error: Build failed: LLVM IR parsing error
+<string>:1364:1: error: expected instruction opcode
+dc.end.8:
+```
+Drop the `2 ** 80` (`m = [7]`) and it compiles and runs correctly, which is what
+identifies the promotion as the trigger rather than the comprehension shape.
+
+**Where:** `compiler/codegen.py`, the key-type dispatch near the end of
+`_emit_dict_comprehension`'s range path (and the same `else: return
+self._bridge_fallback_expr(...)` shape in its list-iteration path).
+
+**Proper fix:** two parts, and both are wanted. (1) Add the missing
+`elif key.type == fpy_val:` arm that extracts the tag/data pair and calls
+`dict_set_kv_fv` — the dict *literal* emitter already has exactly this arm, so
+the comprehension is just missing a case that exists elsewhere. (2) Decide to
+fall back to the bridge *before* emitting any of the loop, so an unsupported key
+type can never strand half-built blocks; a mid-loop `return` out of an emitter
+is structurally unsafe regardless of which types reach it.
+
+**Severity:** loud (the build fails), but it fails on valid Python.
+
+### BUG-SORTED-KEY-DROPS-TAG. `sorted(xs, key=f)` over a heterogeneous list calls `f` on the raw payload — 2026-07-27
+
+**What:** the key function is applied to the element's i64 payload with the tag
+discarded, so it sees a float's bit pattern or a string's address as an int.
+Homogeneous lists are fine; it is specifically FV-tagged elements.
+
+**Reproduce** — should print `[10, 2.5, 9, 'a']`:
+```python
+xs = [10, 9, "a", 2.5]
+print(sorted(xs, key=str))   # prints [10, 'a', 2.5, 9]
+```
+The wrong order is exactly what you get by sorting `str(payload)`
+lexicographically: `"10" < "140702223754920" < "4612811918334230528" < "9"`,
+i.e. `10, 'a', 2.5, 9`. That arithmetic is the proof of the diagnosis — the key
+function really is receiving the untagged word.
+
+Same list with the key removed, or the same key over a homogeneous list
+(`sorted([10, 9, 2, 100], key=str)`, `sorted(["bb","a","ccc"], key=len)`,
+`sorted([10,9,2,100], key=lambda v: -v)`), is all correct.
+
+**Where:** the `sorted`/`list.sort` `key=` emitter in `compiler/codegen.py`,
+which builds the call argument from the bare element instead of the `(tag, data)`
+pair `fastpy_list_get_fv` returned. Same family as
+BUG-DICT-VALUE-STATIC-KIND and BUG-MINMAX-OF-TAGGED-VALUE: a consumer that
+assumes naked scalars.
+
+**Severity:** silently wrong order.
+
+### BUG-IS-NONE-ON-TAGGED-VALUE. `is None` and `== None` against a runtime-tagged expression are always False — 2026-07-27
+
+**What:** `_emit_is_compare` decides `is None` from *AST-level* inference — a
+`None` literal, or a `Name` whose `VKind` is `NONE`. A subscript or any other
+expression whose noneness is only known from its runtime tag can never satisfy
+that test, so it folds to a constant `False`. `== None` is wrong in more cases
+than `is None`: even the `Name` form fails.
+
+**Reproduce** — should print `True True True` then `None True True`:
+```python
+m = [1, None]
+no = m[1]
+print(no is None, m[1] is None, no == None)   # prints True False False
+d = {"o": no}
+print(d["o"], d["o"] is None, d["o"] == None) # prints None False False
+```
+
+**Where:** `_emit_is_compare` in `compiler/codegen.py`. It bails to AST
+inference precisely because the unwrapped value has lost the tag.
+
+**Proper fix:** when either side is the `None` literal and the other emits to an
+`fpy_val` (or to a variable whose alloca is `fpy_val`-backed), compare the
+extracted tag against `FPY_TAG_NONE` at runtime rather than folding. The
+equality path needs the same treatment, since `x == None` must agree with
+`x is None` for the built-in `None`.
+
+**Severity:** silently wrong branch — a `None` guard on a value read out of a
+container simply never fires.
+
 ### ~~BUG-BIGINT-TRUEDIV-UNIMPLEMENTED. `/` on a big int reaches the CPython bridge with a raw `FpyBigInt*` and segfaults~~ — FIXED 2026-07-27
 
 **Fixed:** `fpy_bigint_truediv` in `runtime/bigint.c` implements it the way
@@ -3244,7 +3339,44 @@ failed at HEAD before BUG-BIGINT-PROGRAM-HANGS-WHILE-COUNTER was fixed.
 Excluded with a comment in
 `tests/regressions/bigint_program_while_counter.py`.
 
-### BUG-DICT-VALUE-STATIC-KIND. A dict value is loaded with the static kind of the first store — 2026-07-27
+### BUG-DICT-VALUE-STATIC-KIND. A dict value is loaded with the static kind of the first store — 2026-07-27 — **store half FIXED, load half OPEN**
+
+**Store half fixed 2026-07-27.** Every container store now carries the value's
+*runtime* tag. The stores reached for `_bare_to_tag_data`, whose contract is
+"bare value in, **static** tag out", and wrapped its answer in
+`ir.Constant(i32, tag)` — so an FV-backed local went in as `FPY_TAG_INT` and
+the container kept the payload word under the wrong type. They now go through
+`_to_tag_data_ir`, which was extended to recognise the shape that actually
+matters: an FV-backed **variable**. `_emit_expr_value` hands a `Name` back as
+the bare i64 payload, so that helper's `isinstance(value.type,
+ir.LiteralStructType)` test used to miss it and fall through to the same static
+guess; it now reloads the variable's `fpy_val` alloca for *both* halves, so tag
+and payload always describe the same value. Converted sites: `_emit_dict_literal`,
+`_emit_set_literal`, the `_emit_subscript_store` dict/ChainMap/pyobj arms, all
+three `_emit_dict_comprehension` shapes plus `_emit_dict_comprehension_multi`,
+`set.add`/`.discard`/`.remove`, and the `in` probe against a set (which has to
+match what `add` stored — a static INT guess there made `4.5 in s` compare a bit
+pattern against a FLOAT-tagged entry and answer False). The list store keeps the
+*static* tag deliberately: it is what decides whether the inline fast path is
+safe, since a heap tag must go through the refcounting setter.
+
+Two adjacent defects fell out of the same fix. The **comprehension** tuple-unpack
+paths (`_emit_list_comp_tuple_unpack` and the `ast.Tuple`-target arm of
+`_emit_dict_comprehension`) hand-rolled the element fetch — `list_get_fv` into
+scratch slots, then `_store_variable(load(d2), pos_tag)` — and threw the runtime
+tag away, after a `pos_tags = [t if t != "unknown" else "int" ...]` line rewrote
+every honest "unknown" into a wrong "int". The statement `for` loop had been
+right all along because it uses `_fv_store_from_list`; both comprehensions now
+call the same helper and keep "unknown" unknown. That is why
+`{k: v for k, v in [("a", fl)]}` stored `4616752568008179712` while the
+equivalent `for` loop printed `4.5`.
+
+Covered by `tests/regressions/dict_and_set_keep_the_runtime_tag.py`.
+
+**Still open: the load half**, which is the original repro below. A dict whose
+values have differing *static* kinds still loads through the kind of the first
+store. `print` is right (it has a tagged path) and any arithmetic consumer is
+wrong.
 
 **What:** subscripting a dict whose values have differing kinds yields a *bare*
 scalar typed from whatever was stored first, rather than a tagged `FpyValue`.
@@ -3264,28 +3396,30 @@ consumer is wrong. `abs(d[1])` is wrong for the same reason and was originally
 filed under BUG-ABS-OF-TAGGED-VALUE, but it is abs-independent — the repro above
 has no `abs()` in it.
 
-**Sharper repro (2026-07-27) — `print` is wrong too.** When the values being
-stored are themselves *runtime-tagged* (an `FpyValue` variable rather than a
-literal), the tag is dropped on the way in and the load hands back a bare i64
-tagged INT, so even `print` shows the raw payload. Should print
-`3 True 4.5 s None`:
+**~~Sharper repro (2026-07-27) — `print` is wrong too.~~ — this half is FIXED.**
+When the values being stored were themselves *runtime-tagged* (an `FpyValue`
+variable rather than a literal), the tag was dropped on the way in and the load
+handed back a bare i64 tagged INT, so even `print` showed the raw payload:
 ```python
 m = [3, True, 4.5, "s", None]
 n, t, fl, st, no = m[0], m[1], m[2], m[3], m[4]
 d = {"n": n, "t": t, "f": fl, "s": st, "o": no}
 print(d["n"], d["t"], d["f"], d["s"], d["o"])
-# prints: 3 1 4616752568008179712 140701479720616 0
+# was:  3 1 4616752568008179712 140701479720616 0
+# now:  3 True 4.5 s None
 ```
 `4616752568008179712` is the bit pattern of `4.5` and `140701479720616` is the
-string's address. A *literal*-valued dict (`{"a": True, "b": 3, "c": 4.5}`) is
-fine, and so is the list equivalent — it is specifically an FV-tagged value
-crossing the dict store/load boundary. This is the same missing
-`fastpy_dict_get_fv` as above, seen from the store side.
+string's address. Note the diagnosis this misled me toward was wrong: the load
+was *not* missing `fastpy_dict_get_fv` — an IR dump showed the load already
+calling it with tag out-params, and every store passing a literal `i32 0`
+alongside. Sets had it too (`s.add(fl)` then `fl in s` was False), which is what
+established this was a store-side rule and not a dict-specific one.
 
-**Where:** the dict-subscript load path in `CodeGen`. The list equivalent is
-already correct (`fastpy_list_get_fv` returns a tag), so the fix is presumably
-the same shape: a `fastpy_dict_get_fv` and a `_scan_fv_forced_locals` that knows
-a heterogeneous dict's element is mixed.
+**Where (load half, still open):** the dict-subscript load path in `CodeGen`
+picks a bare kind from the dict's inferred value type instead of consuming the
+`fastpy_dict_get_fv` tag. The likely fix is a `_scan_fv_forced_locals` that
+knows a heterogeneous dict's value is mixed, so the destination is an FV local
+and the tagged load is kept rather than unwrapped.
 
 **Severity:** silently wrong arithmetic.
 

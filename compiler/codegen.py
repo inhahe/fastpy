@@ -19269,8 +19269,11 @@ class CodeGen:
             obj = self._load_variable(target.value.id, target)
             obj = self._ensure_ptr(obj)
             key = self._emit_expr_value(target.slice)
-            key_tag, key_data = self._bare_to_tag_data(key, target.slice)
-            val_tag, val_data = self._bare_to_tag_data(value, value_node)
+            # Runtime tags: the bridge reconstructs a Python object from the
+            # tag, so a compile-time guess of INT would hand CPython the raw
+            # bit pattern of a tagged float.  BUG-DICT-VALUE-STATIC-KIND.
+            key_tag, key_data = self._to_tag_data_ir(key, target.slice)
+            val_tag, val_data = self._to_tag_data_ir(value, value_node)
             setitem = self._make_string_constant("__setitem__")
             callable_ptr = self.builder.call(
                 self.runtime["cpython_getattr"], [obj, setitem])
@@ -19278,8 +19281,8 @@ class CodeGen:
             out_data = self._create_entry_alloca(i64, "si.data")
             self.builder.call(self.runtime["cpython_call2"],
                               [callable_ptr,
-                               ir.Constant(i32, key_tag), key_data,
-                               ir.Constant(i32, val_tag), val_data,
+                               key_tag, key_data,
+                               val_tag, val_data,
                                out_tag, out_data])
             return
         # Slice assignment: a[start:stop] = new_values
@@ -19360,15 +19363,22 @@ class CodeGen:
         obj = self._emit_expr_value(target.value)
         obj = self._ensure_ptr(obj)
         index = self._emit_expr_value(target.slice)
-        tag, data = self._bare_to_tag_data(value, value_node=value_node)
+        # The mapping stores carry the value's tag into the container, so they
+        # need the *runtime* tag when the value is FV-backed — a compile-time
+        # guess of INT is how `d[k] = fl` stored a float's bit pattern.  The
+        # list store below still wants the static tag, because that is what
+        # decides whether its inline fast path is safe (a heap tag must go
+        # through the refcounting setter).  BUG-DICT-VALUE-STATIC-KIND.
         if self._is_chainmap_expr(target.value):
             # ChainMap set uses its own runtime function
+            tag, data = self._to_tag_data_ir(value, value_node)
             key = self._ensure_ptr(index)
             self.builder.call(self.runtime["chainmap_set"],
-                              [obj, key, ir.Constant(i32, tag), data])
+                              [obj, key, tag, data])
         elif (self._is_dict_expr(target.value)
                 or self._is_defaultdict_expr(target.value)
                 or self._is_counter_expr(target.value)):
+            tag, data = self._to_tag_data_ir(value, value_node)
             # Tuple/list keys: use generic FpyValue-keyed setter
             _key_is_tuple = (isinstance(target.slice, (ast.Tuple, ast.List))
                              or (isinstance(target.slice, ast.Name)
@@ -19381,25 +19391,24 @@ class CodeGen:
                     key_data = self.builder.ptrtoint(key_data, i64)
                 self.builder.call(self.runtime["dict_set_kv_fv"],
                                   [obj, ir.Constant(i32, key_tag), key_data,
-                                   ir.Constant(i32, tag), data])
+                                   tag, data])
             # Int keys use the int-keyed setter so the dict stores them
             # natively (vs converting to strings, which would affect
             # printed representation).
             elif isinstance(index.type, ir.IntType):
                 self.builder.call(self.runtime["dict_set_int_fv"],
-                                  [obj, index, ir.Constant(i32, tag), data])
+                                  [obj, index, tag, data])
             elif index.type == fpy_val:
                 # FpyValue key (e.g. from list.pop(), for-each iteration)
                 kt = self.builder.extract_value(index, 0, "dset.kt")
                 kd = self.builder.extract_value(index, 1, "dset.kd")
                 self.builder.call(self.runtime["dict_set_kv_fv"],
-                                  [obj, kt, kd,
-                                   ir.Constant(i32, tag), data])
+                                  [obj, kt, kd, tag, data])
             else:
                 if not isinstance(index.type, ir.PointerType):
                     return self._bridge_fallback_expr(node, "dict access with non-string key")
                 self.builder.call(self.runtime["dict_set_fv"],
-                                  [obj, index, ir.Constant(i32, tag), data])
+                                  [obj, index, tag, data])
         else:
             # Inline fast path for scalar element lists (int/float). Only
             # valid when the STORED value is itself a scalar (needs no
@@ -19410,6 +19419,7 @@ class CodeGen:
             # boundary) that frees the value while the list still holds it —
             # a UAF. Route heap-tagged values through the refcounting runtime
             # setter instead.
+            tag, data = self._bare_to_tag_data(value, value_node=value_node)
             _inline_et = self._can_inline_list_access(target.value)
             if _inline_et is not None and tag in self._SCALAR_TAGS_CLS:
                 self._inline_list_set(obj, index, tag, data)
@@ -19695,6 +19705,23 @@ class CodeGen:
             tag_ir = self.builder.extract_value(value, 0)
             data_ir = self.builder.extract_value(value, 1)
             return tag_ir, data_ir
+        # An FV-backed *variable* is the other tagged shape, and it does not
+        # look like one here: `_emit_expr_value` hands a Name back as the bare
+        # i64 payload, so the struct test above misses it and the fallback
+        # below invents a compile-time tag for it.  That is how a dict built
+        # from tagged locals stored every value as INT — a float came back as
+        # its bit pattern (`4.5` → `4616752568008179712`) and a str as its
+        # address.  Reload the slot for both halves rather than pairing the
+        # runtime tag with the already-emitted payload, so the two always
+        # describe the same value.  BUG-DICT-VALUE-STATIC-KIND.
+        if (isinstance(value_node, ast.Name)
+                and value_node.id in self.variables):
+            _alloca, _ = self.variables[value_node.id]
+            if (isinstance(_alloca.type, ir.PointerType)
+                    and _alloca.type.pointee is fpy_val):
+                _fv = self.builder.load(_alloca, name=f"{value_node.id}.fv.td")
+                return (self.builder.extract_value(_fv, 0),
+                        self.builder.extract_value(_fv, 1))
         # Fall back to compile-time tag from _bare_to_tag_data
         tag_int, data_ir = self._bare_to_tag_data(value, value_node)
         return ir.Constant(i32, tag_int), data_ir
@@ -30260,10 +30287,14 @@ class CodeGen:
         if c_kind == VKind.SET or self._is_set_expr(container_node):
             container = self._emit_expr_value(container_node)
             container = self._ensure_ptr(container)
-            tag, data = self._bare_to_tag_data(left_val, None)
+            # The probe is hashed against what `set.add` stored, so it needs
+            # the same runtime tag the store side now uses — a static INT
+            # guess here made `4.5 in s` compare a bit pattern against a
+            # FLOAT-tagged entry and miss.  BUG-DICT-VALUE-STATIC-KIND.
+            tag, data = self._to_tag_data_ir(left_val, node.left)
             result = self.builder.call(
                 self.runtime["set_contains_fv"],
-                [container, ir.Constant(i32, tag), data])
+                [container, tag, data])
             result = self.builder.trunc(result, ir.IntType(1))
             if isinstance(op, ast.NotIn):
                 result = self.builder.not_(result)
@@ -44496,31 +44527,34 @@ class CodeGen:
 
     # ---- Set method handlers (B3) ----
 
+    # All three of these carry the element's tag into (or match it against)
+    # the set's hash table, so the tag has to be the runtime one: a static
+    # guess of INT made `s.add(fl)` store a float's bit pattern, and then
+    # `fl in s` compared that pattern against a correctly-tagged probe and
+    # said False.  BUG-DICT-VALUE-STATIC-KIND.
+
     def _emit_set_method_add(self, node, obj):
         if len(node.args) != 1:
             return None
         val = self._emit_expr_value(node.args[0])
-        tag, data = self._bare_to_tag_data(val, node.args[0])
-        self.builder.call(self.runtime["set_add_fv"],
-                          [obj, ir.Constant(i32, tag), data])
+        tag, data = self._to_tag_data_ir(val, node.args[0])
+        self.builder.call(self.runtime["set_add_fv"], [obj, tag, data])
         return obj
 
     def _emit_set_method_discard(self, node, obj):
         if len(node.args) != 1:
             return None
         val = self._emit_expr_value(node.args[0])
-        tag, data = self._bare_to_tag_data(val, node.args[0])
-        self.builder.call(self.runtime["set_discard_fv"],
-                          [obj, ir.Constant(i32, tag), data])
+        tag, data = self._to_tag_data_ir(val, node.args[0])
+        self.builder.call(self.runtime["set_discard_fv"], [obj, tag, data])
         return obj
 
     def _emit_set_method_remove(self, node, obj):
         if len(node.args) != 1:
             return None
         val = self._emit_expr_value(node.args[0])
-        tag, data = self._bare_to_tag_data(val, node.args[0])
-        self.builder.call(self.runtime["set_discard_fv"],
-                          [obj, ir.Constant(i32, tag), data])
+        tag, data = self._to_tag_data_ir(val, node.args[0])
+        self.builder.call(self.runtime["set_discard_fv"], [obj, tag, data])
         return obj
 
     def _emit_set_method_union(self, node, obj):
@@ -48750,7 +48784,10 @@ class CodeGen:
         """Emit [expr for a, b, ... in iterable] with tuple unpacking."""
         n_targets = len(gen.target.elts)
         pos_tags = self._infer_for_tuple_elem_types(gen.iter, n_targets)
-        pos_tags = [t if t != "unknown" else "int" for t in pos_tags]
+        # "unknown" stays unknown.  Rewriting it to "int" here is what made a
+        # tuple of mixed values unpack into int-kinded locals holding raw
+        # payloads; `_fv_store_from_list` keeps the element's runtime tag, and
+        # an honest "unknown" is what tells it to.  BUG-DICT-VALUE-STATIC-KIND.
 
         iter_val = self._emit_expr_value(gen.iter)
         if self._is_obj_expr(gen.iter):
@@ -48780,22 +48817,14 @@ class CodeGen:
         data_s = self._create_entry_alloca(i64, "lc_tu.data")
         self._rt_call("list_get_fv", [iter_val, idx, tag_s, data_s])
         elem_ptr = self._ensure_ptr(self.builder.load(data_s))
-        # Unpack tuple into individual variables
+        # Unpack tuple into individual variables.  Same helper the statement
+        # for-loop uses (`_unpack_targets_from_list`), so the element's runtime
+        # tag survives instead of being replaced by a positional guess.
         for ti, tgt in enumerate(gen.target.elts):
             if isinstance(tgt, ast.Name):
-                t2 = self._create_entry_alloca(i32, f"lc_tu.t{ti}")
-                d2 = self._create_entry_alloca(i64, f"lc_tu.d{ti}")
-                self._rt_call("list_get_fv", [elem_ptr, ir.Constant(i64, ti), t2, d2])
-                _var_tag = pos_tags[ti] if ti < len(pos_tags) else "int"
-                _vt_tag = (_var_tag if isinstance(_var_tag, ValueType)
-                           else ValueType.from_old_tag(_var_tag))
-                if _vt_tag.kind.is_ptr:
-                    self._store_variable(
-                        tgt.id,
-                        self._ensure_ptr(self.builder.load(d2)),
-                        _var_tag)
-                else:
-                    self._store_variable(tgt.id, self.builder.load(d2), _var_tag)
+                _var_tag = pos_tags[ti] if ti < len(pos_tags) else "unknown"
+                self._fv_store_from_list(tgt.id, elem_ptr,
+                                         ir.Constant(i64, ti), _var_tag)
 
         # Emit body (conditions + append)
         self._emit_lc_body(gen, node, result_list, incr_block)
@@ -49055,9 +49084,13 @@ class CodeGen:
         set_ptr = self.builder.call(self.runtime["dict_new"], [])
         for elem_node in node.elts:
             val = self._emit_expr_value(elem_node)
-            tag, data = self._bare_to_tag_data(val, elem_node)
+            # A set element is stored tag-and-all, exactly like a dict value,
+            # so it needs the runtime tag for the same reason: `{fl}` for a
+            # tagged `fl = 4.5` otherwise holds the float's bit pattern as an
+            # int.  BUG-DICT-VALUE-STATIC-KIND.
+            tag, data = self._to_tag_data_ir(val, elem_node)
             self.builder.call(self.runtime["set_add_fv"],
-                              [set_ptr, ir.Constant(i32, tag), data])
+                              [set_ptr, tag, data])
         return set_ptr
 
     def _emit_dict_literal(self, node: ast.Dict) -> ir.Value:
@@ -49065,8 +49098,10 @@ class CodeGen:
 
         Routes through `dict_set_fv` so the value's exact runtime tag is
         preserved (including LIST/DICT/OBJ pointer values). The AST node
-        is passed to `_bare_to_tag_data` so pointer values are tagged
-        correctly rather than falling through to STR.
+        is passed to `_to_tag_data_ir` so pointer values are tagged
+        correctly rather than falling through to STR, and so a value whose
+        tag is only known at runtime contributes that tag instead of a
+        compile-time guess.  BUG-DICT-VALUE-STATIC-KIND.
         """
         dict_ptr = self.builder.call(self.runtime["dict_new"], [])
         for key_node, val_node in zip(node.keys, node.values):
@@ -49085,7 +49120,7 @@ class CodeGen:
                 continue
             key = self._emit_expr_value(key_node)
             val = self._emit_expr_value(val_node)
-            tag, data = self._bare_to_tag_data(val, val_node)
+            tag, data = self._to_tag_data_ir(val, val_node)
             # Tuple/list keys: use generic FpyValue-keyed setter
             _key_is_tuple = isinstance(key_node, (ast.Tuple, ast.List))
             if not _key_is_tuple and isinstance(key_node, ast.Name):
@@ -49099,16 +49134,14 @@ class CodeGen:
                     kd = self.builder.ptrtoint(kd, i64)
                 self.builder.call(self.runtime["dict_set_kv_fv"],
                                   [dict_ptr, ir.Constant(i32, kt), kd,
-                                   ir.Constant(i32, tag), data])
+                                   tag, data])
             elif isinstance(key.type, ir.IntType):
                 # Int-keyed dict — native int-key storage
                 self.builder.call(self.runtime["dict_set_int_fv"],
-                                  [dict_ptr, key,
-                                   ir.Constant(i32, tag), data])
+                                  [dict_ptr, key, tag, data])
             elif isinstance(key.type, ir.PointerType):
                 self.builder.call(self.runtime["dict_set_fv"],
-                                  [dict_ptr, key,
-                                   ir.Constant(i32, tag), data])
+                                  [dict_ptr, key, tag, data])
             elif isinstance(key.type, ir.LiteralStructType):
                 # FpyValue key (e.g. a boxed variable used as dict key).
                 # Extract the i64 data field and use it as an int key.
@@ -49116,8 +49149,7 @@ class CodeGen:
                 # is captured by the data word.
                 key_data = self.builder.extract_value(key, 1)
                 self.builder.call(self.runtime["dict_set_int_fv"],
-                                  [dict_ptr, key_data,
-                                   ir.Constant(i32, tag), data])
+                                  [dict_ptr, key_data, tag, data])
             else:
                 # Truly unsupported key type — bridge fallback
                 return self._bridge_fallback_expr(
@@ -49151,8 +49183,8 @@ class CodeGen:
             # dict.items(), sorted(d.items()), and literal list of tuples).
             n_targets = len(gen.target.elts)
             pos_tags = self._infer_for_tuple_elem_types(gen.iter, n_targets)
-            # Replace "unknown" defaults with "int" for backward compat
-            pos_tags = [t if t != "unknown" else "int" for t in pos_tags]
+            # "unknown" stays unknown — see _emit_list_comp_tuple_unpack.
+            # BUG-DICT-VALUE-STATIC-KIND.
             # Get the tuple element and unpack
             tag_s = self._create_entry_alloca(i32, "dc.tag")
             data_s = self._create_entry_alloca(i64, "dc.data")
@@ -49160,20 +49192,9 @@ class CodeGen:
             elem_ptr = self._ensure_ptr(self.builder.load(data_s))
             for ti, tgt in enumerate(gen.target.elts):
                 if isinstance(tgt, ast.Name):
-                    t2 = self._create_entry_alloca(i32, f"dc.t{ti}")
-                    d2 = self._create_entry_alloca(i64, f"dc.d{ti}")
-                    self._rt_call("list_get_fv", [elem_ptr, ir.Constant(i64, ti), t2, d2])
-                    _var_tag = pos_tags[ti] if ti < len(pos_tags) else "int"
-                    _vt_tag = (_var_tag if isinstance(_var_tag, ValueType)
-                               else ValueType.from_old_tag(_var_tag))
-                    if _vt_tag.kind.is_ptr:
-                        # Pointer types: convert i64 data to pointer
-                        self._store_variable(
-                            tgt.id,
-                            self._ensure_ptr(self.builder.load(d2)),
-                            _var_tag)
-                    else:
-                        self._store_variable(tgt.id, self.builder.load(d2), _var_tag)
+                    _var_tag = pos_tags[ti] if ti < len(pos_tags) else "unknown"
+                    self._fv_store_from_list(tgt.id, elem_ptr,
+                                             ir.Constant(i64, ti), _var_tag)
             # Handle filter conditions (if clauses)
             incr_block = self._new_block("dc.incr")
             # Per-iteration release: the dict retains both key and value
@@ -49192,15 +49213,13 @@ class CodeGen:
             # Evaluate key and value expressions
             key_val = self._emit_expr_value(node.key)
             val_val = self._emit_expr_value(node.value)
-            v_tag, v_data = self._bare_to_tag_data(val_val, node.value)
+            v_tag, v_data = self._to_tag_data_ir(val_val, node.value)
             if isinstance(key_val.type, ir.IntType):
                 self.builder.call(self.runtime["dict_set_int_fv"],
-                                  [result_dict, key_val,
-                                   ir.Constant(i32, v_tag), v_data])
+                                  [result_dict, key_val, v_tag, v_data])
             elif isinstance(key_val.type, ir.PointerType):
                 self.builder.call(self.runtime["dict_set_fv"],
-                                  [result_dict, key_val,
-                                   ir.Constant(i32, v_tag), v_data])
+                                  [result_dict, key_val, v_tag, v_data])
             else:
                 return self._bridge_fallback_expr(
                     node, "dict comprehension key type")
@@ -49296,20 +49315,18 @@ class CodeGen:
                 self.builder.position_at_end(add_block)
             key = self._emit_expr_value(node.key)
             val = self._emit_expr_value(node.value)
-            v_tag, v_data = self._bare_to_tag_data(val, node.value)
+            v_tag, v_data = self._to_tag_data_ir(val, node.value)
             if isinstance(key.type, ir.PointerType):
                 self.builder.call(self.runtime["dict_set_fv"],
-                                  [dict_ptr, key,
-                                   ir.Constant(i32, v_tag), v_data])
+                                  [dict_ptr, key, v_tag, v_data])
             elif isinstance(key.type, ir.IntType):
                 self.builder.call(self.runtime["dict_set_int_fv"],
-                                  [dict_ptr, key,
-                                   ir.Constant(i32, v_tag), v_data])
+                                  [dict_ptr, key, v_tag, v_data])
             else:
                 self.builder.call(self.runtime["dict_set_fv"],
                                   [dict_ptr,
                                    self._ensure_ptr(key),
-                                   ir.Constant(i32, v_tag), v_data])
+                                   v_tag, v_data])
             self._flush_rc_temps_to(_mark)
             self.builder.branch(incr_block)
             self.builder.position_at_end(incr_block)
@@ -49362,15 +49379,13 @@ class CodeGen:
 
         key = self._emit_expr_value(node.key)
         val = self._emit_expr_value(node.value)
-        tag, data = self._bare_to_tag_data(val, node.value)
+        tag, data = self._to_tag_data_ir(val, node.value)
         if isinstance(key.type, ir.IntType):
             self.builder.call(self.runtime["dict_set_int_fv"],
-                              [dict_ptr, key,
-                               ir.Constant(i32, tag), data])
+                              [dict_ptr, key, tag, data])
         elif isinstance(key.type, ir.PointerType):
             self.builder.call(self.runtime["dict_set_fv"],
-                              [dict_ptr, key,
-                               ir.Constant(i32, tag), data])
+                              [dict_ptr, key, tag, data])
         else:
             return self._bridge_fallback_expr(node, "dict comprehension key/value types")
         self._flush_rc_temps_to(_mark)
@@ -49477,17 +49492,15 @@ class CodeGen:
                 # Innermost: insert key/value into dict
                 key = self._emit_expr_value(node.key)
                 val = self._emit_expr_value(node.value)
-                tag, data = self._bare_to_tag_data(val, node.value)
+                tag, data = self._to_tag_data_ir(val, node.value)
                 if isinstance(key.type, ir.IntType):
                     self.builder.call(
                         self.runtime["dict_set_int_fv"],
-                        [result_dict, key,
-                         ir.Constant(i32, tag), data])
+                        [result_dict, key, tag, data])
                 elif isinstance(key.type, ir.PointerType):
                     self.builder.call(
                         self.runtime["dict_set_fv"],
-                        [result_dict, key,
-                         ir.Constant(i32, tag), data])
+                        [result_dict, key, tag, data])
 
             self._flush_rc_temps_to(_mark)
             if not self.builder.block.is_terminated:
