@@ -107,7 +107,7 @@ the bare `"int"` default, skips bare-ABI ones, and is confined to a direct
 **Test:** `tests/regressions/returns_untyped_param_ret_tag.py`. Verified wrong
 at `24bfaa4`. Clean under ASan/UBSan/LSan.
 
-### BUG-BYTES-RETURN-TAG-LOST. A `bytes`-returning function loses its tag, so `len()` answers 0 and `print()` shows a pointer — 2026-07-26
+### ~~BUG-BYTES-RETURN-TAG-LOST. A `bytes`-returning function loses its tag, so `len()` answers 0 and `print()` shows a pointer~~ — FIXED 2026-07-26
 
 **What:** `_csa_propagate_ret_types` records list/dict/tuple/float/mixed but has
 no arm for `return b"abc"` (nor for a plain `return "abcd"` — the str half of
@@ -140,13 +140,185 @@ answer goes to 0. That is the same "one good call site hides it" property as
 BUG-PARAM-TYPE-FROM-USER-CALL-ARG.
 
 **Where:** the return-type propagation chain in `_analyze_call_sites`
-(`_csa_propagate_ret_types`, ~line 8900) and `_duf_determine_ret_tag`. Adding
-`str`/`bytes`/`set` arms is the fix; it was deliberately deferred once already
-because the blast radius is wide — a great deal of code depends on the current
-(silent) behaviour of an unrecorded return.
+(`_csa_propagate_ret_types`) and the declaration pass
+(`_duf_detect_ret_type`, `_duf_determine_ret_tag`).
 
-**Where it bites:** `tests/regressions/untyped_param_fv_abi.py` covers `str`
-only, and says why.
+**Fix:** three places in that chain had to learn `bytes`, and each was hiding
+the next behind it.
+
+* `_csa_propagate_ret_types` now records `bytes` (and `set`) for a literal,
+  a `.encode()`, and a `bytes`/`bytearray`/`set`/`frozenset` call, and
+  propagates them through `var_types` like the kinds it already knew. Without
+  this nothing downstream could classify a call site that passed one.
+* `_duf_detect_ret_type` now returns `i8_ptr` for those same shapes. It used
+  to leave the function declared returning `i64`, and every pointer-gated
+  path then declined to fire — the BYTES arm of the subscript emitter is
+  behind `isinstance(obj.type, ir.PointerType)`, so `ob()[0]` fell through to
+  the generic CPython `__getitem__` bridge and faulted.
+* `_duf_determine_ret_tag`'s `i8_ptr` arm had no `bytes`/`set` case, so once
+  the type *was* a pointer it fell through to the `"ptr"` default — which
+  means list. `ob() + b"d"` concatenated as a list and printed `()`. Its
+  `return <param>` arm had the same gap, so `len(echo(ob()))` measured a
+  bytes object as a list.
+
+Two consumers of the kind were separately blind to it. `_is_bytes_expr` knew
+a *variable* could hold bytes but not that a *call* could, so
+`b = ob(); b + b"d"` worked while `ob() + b"d"` produced a str; it now reads
+the callee's declared return tag, and `_infer_type_tag`'s private duplicate of
+the same predicate was deleted in favour of it. The bytes-subscript arm of
+`_infer_type_tag` gained the same call case, so `ob()[1:]` is a bytes slice
+rather than a str one.
+
+The `str` half of the original gap turned out not to bite: `_duf_detect_ret_type`
+and `_duf_determine_ret_tag` both have direct arms for a str literal, and the
+forward-referenced case resolves through `_func_ret_types` for the tags it does
+record. `tests/regressions/bytes_return_tag.py` pins the str behaviour anyway.
+
+**Test:** `tests/regressions/bytes_return_tag.py`. Verified wrong at `e781cfb`.
+Clean under ASan/UBSan/LSan.
+
+### ~~BUG-BYTES-CONTAINS-NO-ARM. `x in b"..."` has no arm in the emitter and faults through the CPython bridge~~ — FIXED 2026-07-26
+
+**What:** found while writing the test above. `_emit_in_compare` dispatches on
+the container's kind and had arms for set, list/tuple, ChainMap, dict,
+mixed/FVALUE, str, pyobj and obj — but none for `bytes`. A bytes container is a
+pointer, so it slid past all of them into the legacy fallback and then the
+CPython `__contains__` bridge: an access violation on Windows, NULL in pure
+mode. `97 in b"abc"` was enough to crash; it did not need a function return
+anywhere.
+
+**Fix:** a `VKind.BYTES` arm placed before the STR one (both are pointers, and
+the str path would stop at the first NUL) calling a new
+`fastpy_bytes_contains(hay, tag, data)`. The left operand arrives tagged
+because Python gives the two forms different meanings — an int asks whether
+that byte value occurs, a bytes/str asks whether it occurs as a contiguous
+subsequence, and the empty one always does. Everything is length-aware, so an
+embedded null byte is matched rather than ending the search, and an int outside
+`range(0, 256)` raises `ValueError` as CPython does instead of answering False.
+
+**Test:** covered by `tests/regressions/bytes_return_tag.py`.
+
+### ~~BUG-BYTES-CTOR-BRIDGE-ONLY. `bytes(x)` has no native lowering and returns NULL in pure mode~~ — FIXED 2026-07-26
+
+**What:** also found while writing the test above. The `bytes` builtin was not
+in the emitter's dispatch table at all, so every `bytes([65, 66, 67])` went to
+the CPython bridge. In pure mode (`-DFPY_PURE_MODE`, i.e. the SlateOS target)
+the bridge is compiled out and answers NULL, and the next `fpy_bytes_len` then
+subtracted the header offset from a null pointer — UBSan reported *applying
+non-zero offset -16 to null pointer* and the read that followed was into
+unmapped memory.
+
+**Fix:** `_emit_builtin_bytes` plus a runtime `fastpy_fv_to_bytes(tag, data)`.
+The argument is handed over *tagged* so one helper covers all four CPython
+behaviours: an int is a zero-fill count, a bytes is a copy, a str without an
+encoding is a `TypeError`, and anything else is routed through
+`fastpy_fv_to_list` so sets, dicts, ranges and generators need no separate arm.
+`fpy_bytes_header`/`fpy_bytes_len` also grew NULL guards, since callers do
+legitimately reach them with NULL from other bridge-only operations.
+
+**Deliberately not fixed here:** `bytearray` stays on the bridge. fastpy has no
+mutable bytes type, so answering with an `FpyBytes` would make it print
+`b'AB'` rather than `bytearray(b'AB')`. See BUG-NO-BYTEARRAY-TYPE below.
+
+**Second half of the fix, found by the full suite:** `_emit_assign` keeps a
+`native_builtins` set and tags `x = f(...)` `pyobj` for every builtin *not* in
+it, on the reasoning that anything else came back from the bridge as a
+`PyObject*`. Adding the lowering without adding `"bytes"` to that set left
+`x = bytes(3)` declared `pyobj` while the emitter produced a native `FpyBytes`,
+so `print(x)` handed the buffer to `PyObject_Str` — an access violation, caught
+by the `binascii`, `gzip` and `zlib` stdlib-import tests. Note for next time:
+a new native builtin lowering is two edits, the dispatch table *and* that set.
+
+**Test:** covered by `tests/regressions/bytes_return_tag.py`; the pyobj-tag half
+is covered by the `binascii`/`gzip`/`zlib` cases in `tests/test_full_suite.py`.
+
+### ~~BUG-BYTES-SLICE-VIA-STR. Slicing a bytes produced an `FpyString` that was then tagged BYTES — heap-buffer-overflow on every later length probe~~ — FIXED 2026-07-26
+
+**What:** `bytes` and `str` are both `i8*` to the compiler, and that similarity
+was taken one step too far: *every* slice was lowered to `fastpy_str_slice` /
+`fastpy_str_slice_step`, and a bytes slice was simply re-tagged BYTES
+afterwards. Two things are wrong with that. The str helpers walk the buffer by
+*code point*, so `"é".encode()[0:1]` gave two bytes where CPython gives one.
+And they allocate an `FpyString`, whose header is smaller than an `FpyBytes`
+header — so tagging that allocation BYTES made every later `fpy_bytes_len` read
+the magic field 16 bytes before the buffer. ASan caught it as a
+heap-buffer-overflow read on `b = b"abcd"; print(b[1:3])`; without a sanitizer
+it silently read whatever the allocator left there, so the length was garbage
+or, more often, accidentally plausible. Verified wrong at `e781cfb`.
+
+**Fix:** real byte-indexed `fastpy_bytes_slice` / `fastpy_bytes_slice_step`
+backed by `fpy_bytes_alloc`, selected at all three lowering sites — the static
+path when the receiver is known to be bytes, the pointer fallback, and
+`fastpy_fv_slice`'s runtime dispatch for a receiver whose kind is only known
+then.
+
+Fixing the slice exposed the consumers downstream of it, which had the same
+shape of gap: each asked "is this bytes?" with its own partial predicate that
+only recognised a *variable*. `_is_bytes_expr` is now the single definition —
+taught about slices, and given an optional name-table argument so the static
+pre-passes can use it instead of re-implementing it — and the receiver check in
+`_infer_type_tag`, the `list()` builtin and the pointer slice fallback all call
+it.
+
+**Test:** `tests/regressions/bytes_slice.py`. Clean under ASan/UBSan/LSan.
+
+### ~~BUG-BYTES-IN-LIST-TAG-LOST. A `bytes` stored in a list came back out as a `str` (or as a raw pointer)~~ — FIXED 2026-07-26
+
+**What:** found while writing the test above, and independent of it —
+`z = b"abcd"; print([z])` printed `['abcd']` at `e781cfb`. Three separate gaps,
+all the same shape:
+
+- `_emit_list_append_expr` has arms that tag the element LIST, DICT, OBJ,
+  CLOSURE, PYOBJ, BIGINT and COMPLEX, then falls through to
+  `_emit_list_append_value`, which tags *every* unrecognised pointer STR. There
+  was no bytes arm, so the element went in mislabelled.
+- `_infer_list_elem_type` had no bytes arm either, so `[b"ab", b"cd"]` was typed
+  `list:int` and `for p in parts` handed the loop body the raw pointer as an
+  integer — `140696617395776 0`.
+- the `.append()` pre-pass that types a list built from `[]` had no bytes arm,
+  and its own name table never recorded a bytes assignment, so
+  `parts.append(b[i:i+2])` left the list typed `list:int` as well.
+
+**Fix:** a bytes arm in each of the three, all calling `_is_bytes_expr`. The
+pre-pass passes its `local_var_types`/`loop_var_types` in through the new `env`
+argument rather than re-deriving the answer, and `b = b"..."` is now recorded in
+`local_var_types` so it can be found there.
+
+**Not fixed, deliberately:** the new append arm does not `rc_decref` the
+temporary, mirroring the str pointer path beside it, which also hands its
+creation reference to the list. Adding a decref on only one of the two would be
+an asymmetry, and the general question of owned temporaries is tracked as
+BUG-CODEGEN-OWNED-TEMP-OVER-INCREF.
+
+**Test:** covered by `tests/regressions/bytes_slice.py`.
+
+### BUG-NO-BYTEARRAY-TYPE. `bytearray` has no native type — it prints as a list of ints — 2026-07-26
+
+**What:** fastpy has no mutable bytes type. `bytearray([65, 66])` prints
+`[65, 66]` where CPython prints `bytearray(b'AB')`. Verified the same at
+`e781cfb`, so this is long-standing rather than a regression; it is recorded
+here because the neighbouring `bytes()` work (BUG-BYTES-CTOR-BRIDGE-ONLY above)
+deliberately left `bytearray` alone and it would otherwise look like an
+oversight.
+
+**Reproduce** — should print `bytearray(b'AB')`, prints `[65, 66]`:
+```python
+"""Doc."""
+
+print(bytearray([65, 66]))
+```
+
+**Where:** no `bytearray` entry in the builtin dispatch table in
+`compiler/codegen.py`; it reaches the CPython bridge, which is also why it
+cannot work in pure mode.
+
+**Proper fix:** a real `FpyByteArray` object — a header, a length, a capacity
+and a `data[]` — with its own tag, its own `repr`, in-place `__setitem__`,
+`append`/`extend`, and the mutating slice assignment. That is a genuinely new
+runtime type rather than a patch, which is why it was not folded into the
+`bytes()` change. Until then `bytearray` should arguably raise rather than
+silently answer with a list, but changing that is a user-visible behaviour
+decision.
 
 ### BUG-SPLAT-DEFAULTED-SLOT-TYPE. A defaulted parameter reached by `f(*seq)` is typed from the default even when the sequence supplies it — 2026-07-26
 

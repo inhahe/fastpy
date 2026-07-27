@@ -1003,6 +1003,10 @@ extern const char* fastpy_str_slice(const char*, int64_t, int64_t,
                                     int64_t, int64_t);
 extern const char* fastpy_str_slice_step(const char*, int64_t, int64_t,
                                          int64_t, int64_t, int64_t);
+extern const char* fastpy_bytes_slice(const char*, int64_t, int64_t,
+                                      int64_t, int64_t);
+extern const char* fastpy_bytes_slice_step(const char*, int64_t, int64_t,
+                                           int64_t, int64_t, int64_t);
 
 void fastpy_fv_slice(int32_t c_tag, int64_t c_data,
                      int64_t start, int64_t stop, int64_t step,
@@ -1024,8 +1028,7 @@ void fastpy_fv_slice(int32_t c_tag, int64_t c_data,
             *out_data = (int64_t)(intptr_t)res;
             return;
         }
-        case FPY_TAG_STR:
-        case FPY_TAG_BYTES: {
+        case FPY_TAG_STR: {
             const char *s = (const char*)(intptr_t)c_data;
             const char *res;
             if (has_step) {
@@ -1033,6 +1036,23 @@ void fastpy_fv_slice(int32_t c_tag, int64_t c_data,
                                             has_start, has_stop);
             } else {
                 res = fastpy_str_slice(s, start, stop, has_start, has_stop);
+            }
+            *out_tag = c_tag;
+            *out_data = (int64_t)(intptr_t)res;
+            return;
+        }
+        case FPY_TAG_BYTES: {
+            /* Byte-indexed and FpyBytes-backed: the str path is code-point
+             * indexed and hands back an FpyString, which a BYTES tag then
+             * makes every fpy_bytes_len probe out of bounds.
+             * BUG-BYTES-SLICE-VIA-STR. */
+            const char *b = (const char*)(intptr_t)c_data;
+            const char *res;
+            if (has_step) {
+                res = fastpy_bytes_slice_step(b, start, stop, step,
+                                              has_start, has_stop);
+            } else {
+                res = fastpy_bytes_slice(b, start, stop, has_start, has_stop);
             }
             *out_tag = c_tag;
             *out_data = (int64_t)(intptr_t)res;
@@ -4521,6 +4541,102 @@ const char* fastpy_str_removesuffix(const char *s, const char *suffix) {
 /* String contains (for 'in' operator) */
 int fastpy_str_contains(const char *haystack, const char *needle) {
     return strstr(haystack, needle) != NULL;
+}
+
+/* `x in b"..."` — dispatches on the tag of the left operand, because Python
+ * gives the two forms different meanings: an int asks whether that byte value
+ * occurs, a bytes/str asks whether it occurs as a contiguous subsequence
+ * (and the empty one always does).  Length-aware throughout, so an embedded
+ * null byte is matched rather than ending the search.  `in` on a bytes had no
+ * arm at all in the emitter and fell through to the CPython `__contains__`
+ * bridge, which faults on Windows and returns NULL in pure mode.
+ * BUG-BYTES-CONTAINS-NO-ARM. */
+int fastpy_bytes_contains(const char *hay, int32_t tag, int64_t data) {
+    if (hay == NULL) return 0;
+    int64_t n = fpy_bytes_len(hay);
+    if (tag == FPY_TAG_INT || tag == FPY_TAG_BOOL) {
+        /* CPython rejects an out-of-range int rather than answering False. */
+        if (data < 0 || data > 255) {
+            fastpy_raise(FPY_EXC_VALUEERROR, "byte must be in range(0, 256)");
+            return 0;
+        }
+        for (int64_t i = 0; i < n; i++)
+            if ((unsigned char)hay[i] == (unsigned char)data) return 1;
+        return 0;
+    }
+    if (tag == FPY_TAG_BYTES || tag == FPY_TAG_STR) {
+        const char *needle = (const char *)(intptr_t)data;
+        if (needle == NULL) return 0;
+        int64_t m = (tag == FPY_TAG_BYTES) ? fpy_bytes_len(needle)
+                                           : (int64_t)strlen(needle);
+        if (m == 0) return 1;
+        if (m > n) return 0;
+        for (int64_t i = 0; i + m <= n; i++)
+            if (memcmp(hay + i, needle, (size_t)m) == 0) return 1;
+        return 0;
+    }
+    fastpy_raise(FPY_EXC_TYPEERROR,
+                 "a bytes-like object is required for 'in'");
+    return 0;
+}
+
+/* `bytes(x)` / `bytearray(x)` — the builtin had no native lowering at all and
+ * went through the CPython bridge, so in pure mode (SlateOS) it answered NULL
+ * and the next `fpy_bytes_len` walked off a null pointer.  Dispatches on the
+ * runtime tag because the argument's kind is often only known then; the shape
+ * mirrors `fastpy_fv_to_list`, and anything iterable is routed through that
+ * so sets, dicts, ranges and generators need no separate arm here.
+ * BUG-BYTES-CTOR-BRIDGE-ONLY. */
+extern FpyList* fastpy_fv_to_list(int32_t tag, int64_t data);
+
+const char* fastpy_fv_to_bytes(int32_t tag, int64_t data) {
+    if (tag == FPY_TAG_INT || tag == FPY_TAG_BOOL) {
+        /* bytes(n) → n zero bytes. */
+        int64_t n = data;
+        if (n < 0) {
+            fastpy_raise(FPY_EXC_VALUEERROR, "negative count");
+            n = 0;
+        }
+        char *out = fpy_bytes_alloc(n);
+        if (n > 0) memset(out, 0, (size_t)n);
+        return out;
+    }
+    if (tag == FPY_TAG_BYTES) {
+        const char *src = (const char *)(intptr_t)data;
+        if (src == NULL) return fpy_bytes_alloc(0);
+        int64_t n = fpy_bytes_len(src);
+        char *out = fpy_bytes_alloc(n);
+        if (n > 0) memcpy(out, src, (size_t)n);
+        return out;
+    }
+    if (tag == FPY_TAG_STR) {
+        fastpy_raise(FPY_EXC_TYPEERROR,
+                     "string argument without an encoding");
+        return fpy_bytes_alloc(0);
+    }
+    if (tag == FPY_TAG_NONE) {
+        fastpy_raise(FPY_EXC_TYPEERROR,
+                     "cannot convert 'NoneType' object to bytes");
+        return fpy_bytes_alloc(0);
+    }
+    FpyList *items = fastpy_fv_to_list(tag, data);
+    if (items == NULL) return fpy_bytes_alloc(0);
+    int64_t n = items->length;
+    char *out = fpy_bytes_alloc(n);
+    for (int64_t i = 0; i < n; i++) {
+        FpyValue v = items->items[i];
+        if (v.tag != FPY_TAG_INT && v.tag != FPY_TAG_BOOL) {
+            fastpy_raise(FPY_EXC_TYPEERROR,
+                         "bytes must be an iterable of integers");
+            return out;
+        }
+        if (v.data.i < 0 || v.data.i > 255) {
+            fastpy_raise(FPY_EXC_VALUEERROR, "bytes must be in range(0, 256)");
+            return out;
+        }
+        out[i] = (char)(unsigned char)v.data.i;
+    }
+    return out;
 }
 
 /* Dict get with default — returns value as string, or default if key not found */

@@ -48,10 +48,11 @@ for a plain `return "abcd"`; a list- or dict-returning callee gets its
 parameter typed by `_csa_refine_params_from_call_returns` and so never reached
 the bare ABI in the first place.
 
-One neighbour is deliberately absent, verified to behave identically before and
-after this change: `bytes` flowing through an untyped parameter loses its tag,
-so `len()` on it answers 0 and `print()` shows a pointer.
-BUG-BYTES-RETURN-TAG-LOST.
+One neighbour was deliberately absent here, verified at the time to behave
+identically before and after this change: `bytes` flowing through an untyped
+parameter lost its tag, so `len()` on it answered 0 and `print()` showed a
+pointer. That was BUG-BYTES-RETURN-TAG-LOST, since fixed;
+`bytes_return_tag.py` covers it directly.
 
 `len(echo(opaque_str()))`, where `echo` just returns its own untyped parameter,
 was also wrong here at the time — the declaration pass guessed `ret_tag="int"`

@@ -1464,6 +1464,16 @@ class CodeGen:
         self.runtime["str_slice"] = ir.Function(self.module, ft, name="fastpy_str_slice")
         ft = ir.FunctionType(i8_ptr, [i8_ptr, i64, i64, i64, i64, i64])
         self.runtime["str_slice_step"] = ir.Function(self.module, ft, name="fastpy_str_slice_step")
+        # Slicing a bytes needs its own pair: the str versions index by code
+        # point and hand back an FpyString, whose header is a different size —
+        # so a BYTES-tagged FpyString makes every later fpy_bytes_len probe out
+        # of bounds.  These are byte-indexed and FpyBytes-backed.
+        # BUG-BYTES-SLICE-VIA-STR.
+        ft = ir.FunctionType(i8_ptr, [i8_ptr, i64, i64, i64, i64])
+        self.runtime["bytes_slice"] = ir.Function(self.module, ft, name="fastpy_bytes_slice")
+        ft = ir.FunctionType(i8_ptr, [i8_ptr, i64, i64, i64, i64, i64])
+        self.runtime["bytes_slice_step"] = ir.Function(
+            self.module, ft, name="fastpy_bytes_slice_step")
         ft = ir.FunctionType(i8_ptr, [i8_ptr, i64])
         self.runtime["str_repeat"] = ir.Function(self.module, ft, name="fastpy_str_repeat")
         ft = ir.FunctionType(i8_ptr, [i8_ptr])
@@ -1556,6 +1566,11 @@ class CodeGen:
         self.runtime["str_endswith"] = ir.Function(self.module, ft, name="fastpy_str_endswith")
         ft = ir.FunctionType(i32, [i8_ptr, i8_ptr])
         self.runtime["str_contains"] = ir.Function(self.module, ft, name="fastpy_str_contains")
+        # `x in b"..."` — the left operand arrives tagged so the runtime can
+        # tell an int (byte value) from a bytes/str (subsequence).
+        ft = ir.FunctionType(i32, [i8_ptr, i32, i64])
+        self.runtime["bytes_contains"] = ir.Function(
+            self.module, ft, name="fastpy_bytes_contains")
         ft = ir.FunctionType(i8_ptr, [i8_ptr, i8_ptr])
         self.runtime["str_removeprefix"] = ir.Function(self.module, ft, name="fastpy_str_removeprefix")
         self.runtime["str_removesuffix"] = ir.Function(self.module, ft, name="fastpy_str_removesuffix")
@@ -2351,6 +2366,11 @@ class CodeGen:
         # Convert any FpyValue (tag, data) to native FpyList* (dispatches by tag)
         ft = ir.FunctionType(i8_ptr, [i32, i64])
         self.runtime["fv_to_list"] = ir.Function(self.module, ft, name="fastpy_fv_to_list")
+        # bytes(x) — dispatches on the tag the same way, so an
+        # iterable of any kind, an int count, a bytes copy and the str error
+        # all resolve in one place instead of via the CPython bridge.
+        self.runtime["fv_to_bytes"] = ir.Function(
+            self.module, ft, name="fastpy_fv_to_bytes")
         # Convert CPython dict (PyObject*) to native FpyDict*
         self.runtime["cpython_to_dict"] = ir.Function(self.module, ft, name="fpy_cpython_to_dict")
         # pyobj subscript: getitem(obj, key_tag, key_data) → PyObject*
@@ -7054,6 +7074,26 @@ class CodeGen:
                                                    else "list")
                     elif isinstance(n.value, (ast.Dict, ast.DictComp)):
                         _func_ret_types[fname] = "dict"
+                    elif isinstance(n.value, (ast.Set, ast.SetComp)):
+                        _func_ret_types[fname] = "set"
+                    elif (isinstance(n.value, ast.Constant)
+                          and isinstance(n.value.value, bytes)):
+                        # `return b"abc"` had no arm at all, so the value
+                        # crossed the return untagged: `len()` answered 0 and
+                        # `print()` showed a pointer.  BUG-BYTES-RETURN-TAG-LOST.
+                        _func_ret_types[fname] = "bytes"
+                    elif (isinstance(n.value, ast.Call)
+                          and isinstance(n.value.func, ast.Attribute)
+                          and n.value.func.attr == "encode"):
+                        _func_ret_types[fname] = "bytes"
+                    elif (isinstance(n.value, ast.Call)
+                          and isinstance(n.value.func, ast.Name)
+                          and n.value.func.id == "bytes"):
+                        _func_ret_types[fname] = "bytes"
+                    elif (isinstance(n.value, ast.Call)
+                          and isinstance(n.value.func, ast.Name)
+                          and n.value.func.id in ("set", "frozenset")):
+                        _func_ret_types[fname] = "set"
                     elif isinstance(n.value, ast.Name):
                         ret_var = n.value.id
                         # Check append-based element type FIRST — it's more
@@ -7210,7 +7250,8 @@ class CodeGen:
                 _rtk = self._tag_kind(rt)
                 tgt = node.targets[0]
                 if isinstance(tgt, ast.Name):
-                    if _rtk in (VKind.LIST, VKind.DICT, VKind.STR):
+                    if _rtk in (VKind.LIST, VKind.DICT, VKind.STR,
+                                VKind.BYTES, VKind.SET):
                         var_types[tgt.id] = rt
                 elif (isinstance(tgt, ast.Tuple)
                       and _tk(rt) == VKind.TUPLE
@@ -10170,6 +10211,28 @@ class CodeGen:
                             and isinstance(n.value.value, str)):
                         ret_type = i8_ptr
                         break
+                    # Direct bytes-literal return.  A bytes object is a
+                    # pointer exactly like a str, but had no arm here, so
+                    # `return b"abc"` was declared i64 and every pointer-gated
+                    # path downstream (subscript, concat, len) saw an integer.
+                    # BUG-BYTES-RETURN-TAG-LOST.
+                    if (isinstance(n.value, ast.Constant)
+                            and isinstance(n.value.value, bytes)):
+                        ret_type = i8_ptr
+                        break
+                    # `return s.encode()` / `return bytes(...)` — same thing
+                    # reached through a call.
+                    if (isinstance(n.value, ast.Call)
+                            and isinstance(n.value.func, ast.Attribute)
+                            and n.value.func.attr in ("encode", "decode")):
+                        ret_type = i8_ptr
+                        break
+                    if (isinstance(n.value, ast.Call)
+                            and isinstance(n.value.func, ast.Name)
+                            and n.value.func.id in (
+                                "bytes", "set", "frozenset")):
+                        ret_type = i8_ptr
+                        break
                     # Check if returning a list/dict/string/obj variable
                     if isinstance(n.value, ast.Name) and n.value.id in list_vars:
                         ret_type = i8_ptr
@@ -10506,12 +10569,22 @@ class CodeGen:
         _ann_params |= {a.arg for a in node.args.kwonlyargs
                         if a.annotation is not None}
         returns_untyped_param = False
+        # `bytes` and `set` had no arm here either, so a function returning
+        # one was typed `int` and the caller read the pointer as an integer.
+        # BUG-BYTES-RETURN-TAG-LOST.
+        returns_bytes = False
+        returns_set = False
         for n in ast.walk(node):
             if isinstance(n, ast.Return) and n.value is not None:
                 if isinstance(n.value, ast.JoinedStr):
                     returns_str = True
+                elif (isinstance(n.value, ast.Constant)
+                        and isinstance(n.value.value, bytes)):
+                    returns_bytes = True
                 elif isinstance(n.value, ast.Constant) and isinstance(n.value.value, str):
                     returns_str = True
+                elif isinstance(n.value, (ast.Set, ast.SetComp)):
+                    returns_set = True
                 elif isinstance(n.value, ast.Name) and n.value.id in str_vars:
                     returns_str = True
                 elif isinstance(n.value, (ast.Dict, ast.DictComp)):
@@ -10536,10 +10609,22 @@ class CodeGen:
                                                    "split", "splitlines")):
                     returns_list = True
                 elif (isinstance(n.value, ast.Call)
+                        and isinstance(n.value.func, ast.Attribute)
+                        and n.value.func.attr == "encode"):
+                    returns_bytes = True
+                elif (isinstance(n.value, ast.Call)
                         and isinstance(n.value.func, ast.Name)
                         and n.value.func.id in ("str", "repr", "hex",
                                                  "bin", "oct", "chr")):
                     returns_str = True
+                elif (isinstance(n.value, ast.Call)
+                        and isinstance(n.value.func, ast.Name)
+                        and n.value.func.id == "bytes"):
+                    returns_bytes = True
+                elif (isinstance(n.value, ast.Call)
+                        and isinstance(n.value.func, ast.Name)
+                        and n.value.func.id in ("set", "frozenset")):
+                    returns_set = True
                 elif (isinstance(n.value, ast.Call)
                         and isinstance(n.value.func, ast.Name)
                         and n.value.func.id in ("sorted", "reversed", "list",
@@ -10614,6 +10699,16 @@ class CodeGen:
                             returns_dict = True
                         elif _ctk == VKind.LIST:
                             returns_list = True
+                        elif _ctk == VKind.BYTES:
+                            # `def echo(v): return v` called with bytes.  The
+                            # LLVM type was already widened to a pointer by
+                            # `_duf_detect_ret_type`, but with no tag here the
+                            # i8_ptr arm read "ptr" — i.e. list — and
+                            # `len(echo(ob()))` measured a bytes object as a
+                            # list.  BUG-BYTES-RETURN-TAG-LOST.
+                            returns_bytes = True
+                        elif _ctk == VKind.SET:
+                            returns_set = True
                     else:
                         # Fallback: use local type tracking (from defaults,
                         # assignments, or .append calls) for param variables.
@@ -10644,7 +10739,11 @@ class CodeGen:
                     break
 
         if ret_type == i64:
-            if returns_str:
+            if returns_bytes:
+                ret_tag = "bytes"
+            elif returns_set:
+                ret_tag = "set"
+            elif returns_str:
                 ret_tag = "str"
             elif (returns_untyped_param
                   and not returns_dict and not returns_list
@@ -10659,6 +10758,14 @@ class CodeGen:
         elif ret_type == i8_ptr:
             if (has_kwarg and returns_param) or returns_dict:
                 ret_tag = "dict"
+            elif returns_bytes:
+                # Without this arm a bytes-returning function fell through to
+                # the "ptr" default, which means list/tuple — so `ob() + b"d"`
+                # concatenated as a list and printed `()`.
+                # BUG-BYTES-RETURN-TAG-LOST.
+                ret_tag = "bytes"
+            elif returns_set and not returns_list:
+                ret_tag = "set"
             elif returns_str:
                 ret_tag = "str"
             elif returns_obj:
@@ -18117,6 +18224,11 @@ class CodeGen:
                 "issubclass", "id", "input", "open",
                 "locals", "globals", "eval", "exec", "complex",
                 "frozenset", "iter", "next",
+                # `bytes` gained a native lowering (BUG-BYTES-CTOR-BRIDGE-ONLY);
+                # leaving it off this list tagged `x = bytes(3)` pyobj, so
+                # `print(x)` handed a native FpyBytes to PyObject_Str.
+                # `bytearray` stays off it — that one really is bridge-only.
+                "bytes",
             }
             if builtin_name not in native_builtins:
                 type_tag = ValueType(VKind.PYOBJ)
@@ -20515,12 +20627,9 @@ class CodeGen:
             return ValueType(VKind.DICT)
         # bytes * int, int * bytes → bytes; bytes + bytes → bytes
         if isinstance(node, ast.BinOp):
-            def _is_bytes(n):
-                if isinstance(n, ast.Constant) and isinstance(n.value, bytes):
-                    return True
-                if isinstance(n, ast.Name) and n.id in self.variables:
-                    return self._var_kind(n.id) == VKind.BYTES
-                return False
+            # One definition of "is this bytes?", so a call-valued operand is
+            # recognised here exactly as it is on the TypedValue fast path.
+            _is_bytes = self._is_bytes_expr
             if isinstance(node.op, ast.Mult):
                 if _is_bytes(node.left) or _is_bytes(node.right):
                     return ValueType(VKind.BYTES)
@@ -20544,14 +20653,13 @@ class CodeGen:
                 return ValueType(VKind.DECIMAL)
         # Subscript on bytes: slice → bytes, index → int
         if isinstance(node, ast.Subscript):
-            recv = node.value
-            is_bytes_recv = False
-            if isinstance(recv, ast.Constant) and isinstance(recv.value, bytes):
-                is_bytes_recv = True
-            elif (isinstance(recv, ast.Name) and recv.id in self.variables
-                    and self._var_kind(recv.id) == VKind.BYTES):
-                is_bytes_recv = True
-            if is_bytes_recv:
+            # One definition of "is this bytes?", so a call- or slice-valued
+            # receiver is recognised here exactly as it is everywhere else:
+            # `ob()[1:]` is as much a bytes slice as `b[1:]` is, and `b[1:3]`
+            # is as much a bytes receiver as `b` is.  Both used to come back
+            # tagged str and print `bc` instead of `b'bc'`.
+            # BUG-BYTES-RETURN-TAG-LOST / BUG-BYTES-SLICE-VIA-STR.
+            if self._is_bytes_expr(node.value):
                 if isinstance(node.slice, ast.Slice):
                     return ValueType(VKind.BYTES)
                 return ValueType(VKind.INT)  # single index returns byte value
@@ -20840,6 +20948,11 @@ class CodeGen:
                           and isinstance(node.value.value, str)):
                         local_var_types[tgt] = "str"
                     elif (isinstance(node.value, ast.Constant)
+                          and isinstance(node.value.value, bytes)):
+                        # Recorded so `parts.append(b[i:i+2])` below can tell
+                        # that `b` is bytes.  BUG-BYTES-IN-LIST-TAG-LOST.
+                        local_var_types[tgt] = "bytes"
+                    elif (isinstance(node.value, ast.Constant)
                           and isinstance(node.value.value, float)):
                         local_var_types[tgt] = "float"
                     elif isinstance(node.value, ast.JoinedStr):
@@ -20932,6 +21045,14 @@ class CodeGen:
                     continue
                 var_name = call.func.value.id
                 arg = call.args[0]
+                # Bytes appends had no arm anywhere in this chain, so a list
+                # built by `parts.append(b[i:i+2])` was typed list:int and the
+                # loop that read it back got raw pointers.
+                # BUG-BYTES-IN-LIST-TAG-LOST.
+                if self._is_bytes_expr(arg, {**local_var_types,
+                                             **loop_var_types}):
+                    self._list_append_types[var_name] = ValueType(VKind.BYTES)
+                    continue
                 # Infer what type is being appended
                 if isinstance(arg, (ast.List, ast.ListComp)):
                     # Detect inner list element type for list-of-lists
@@ -21122,6 +21243,12 @@ class CodeGen:
                     return ValueType(VKind.NONE)
                 elif isinstance(first.value, bool):
                     return ValueType(VKind.BOOL)
+            # Bytes elements.  There was no arm for them anywhere here, so
+            # `[b"ab", b"cd"]` fell all the way through to the int default and
+            # `for p in parts` handed the loop body a raw pointer as an
+            # integer.  BUG-BYTES-IN-LIST-TAG-LOST.
+            if self._is_bytes_expr(first):
+                return ValueType(VKind.BYTES)
             # Handle negative float literals: -1.0 is parsed as
             # UnaryOp(USub, Constant(1.0)), not Constant(-1.0).
             if (isinstance(first, ast.UnaryOp)
@@ -29262,6 +29389,23 @@ class CodeGen:
                 result = self.builder.not_(result)
             return result
 
+        # Bytes 'in': `97 in b"abc"` (byte value) or `b"bc" in b"abc"`
+        # (subsequence).  Must precede the STR arm and the legacy pointer
+        # fallback — a bytes object is a pointer too, and both of those would
+        # treat it as a NUL-terminated string.  BUG-BYTES-CONTAINS-NO-ARM.
+        if c_kind == VKind.BYTES:
+            container = self._emit_expr_value(container_node)
+            container = self._ensure_ptr(container)
+            tag, data = self._bare_to_tag_data(left_val, node.left)
+            result = self.builder.call(
+                self.runtime["bytes_contains"],
+                [container, ir.Constant(i32, tag), data])
+            result_i1 = self.builder.icmp_signed(
+                "!=", result, ir.Constant(i32, 0))
+            if isinstance(op, ast.NotIn):
+                result_i1 = self.builder.not_(result_i1)
+            return result_i1
+
         # String 'in': "x" in "hello"
         if c_kind == VKind.STR:
             container = self._emit_expr_value(container_node)
@@ -34657,15 +34801,46 @@ class CodeGen:
             return self._is_complex_expr(node.operand)
         return False
 
-    def _is_bytes_expr(self, node: ast.expr) -> bool:
-        """Check if an expression evaluates to a bytes value."""
+    def _is_bytes_expr(self, node: ast.expr, env: dict | None = None) -> bool:
+        """Check if an expression evaluates to a bytes value.
+
+        `env` is an optional name → type-tag map consulted ahead of
+        `self.variables`.  The static pre-passes (list element-type inference,
+        for one) run before any variable has been emitted, so they carry their
+        own name table; without a way to hand it in they had to re-implement
+        this predicate and inevitably re-implemented it incompletely.
+        """
         if isinstance(node, ast.Constant) and isinstance(node.value, bytes):
             return True
-        if isinstance(node, ast.Name) and node.id in self.variables:
-            return self._var_kind(node.id) == VKind.BYTES
+        if isinstance(node, ast.Name):
+            if env is not None and node.id in env:
+                return self._tag_kind(env[node.id]) == VKind.BYTES
+            if node.id in self.variables:
+                return self._var_kind(node.id) == VKind.BYTES
         if isinstance(node, ast.BinOp):
-            return (self._is_bytes_expr(node.left)
-                    or self._is_bytes_expr(node.right))
+            return (self._is_bytes_expr(node.left, env)
+                    or self._is_bytes_expr(node.right, env))
+        if isinstance(node, ast.Call):
+            # `ob() + b"d"` used to lose the kind that `b = ob(); b + b"d"`
+            # kept, because only a *variable* could be known to hold bytes.
+            # The declared return tag says the same thing one step earlier.
+            # BUG-BYTES-RETURN-TAG-LOST.
+            if isinstance(node.func, ast.Attribute):
+                return node.func.attr == "encode"
+            if isinstance(node.func, ast.Name):
+                if node.func.id == "bytes":
+                    return True
+                _fn = self._user_functions.get(node.func.id)
+                if _fn is not None:
+                    return self._tag_kind(_fn.ret_tag) == VKind.BYTES
+                _frt = getattr(self, '_func_ret_types', {}).get(node.func.id)
+                if _frt is not None:
+                    return self._tag_kind(_frt) == VKind.BYTES
+        if isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Slice):
+            # A slice keeps the kind of what it came from, so `b[1:3] + b"XY"`
+            # is a bytes concat.  An *integer* index does not — `b[0]` is an
+            # int — hence the Slice test.  BUG-BYTES-SLICE-VIA-STR.
+            return self._is_bytes_expr(node.value, env)
         return False
 
     def _emit_complex_binop(self, node: ast.BinOp,
@@ -36699,6 +36874,8 @@ class CodeGen:
 
         "bool": "_emit_builtin_bool",
 
+        "bytes": "_emit_builtin_bytes",
+
         "callable": "_emit_builtin_callable",
 
         "chr": "_emit_builtin_chr",
@@ -36996,6 +37173,33 @@ class CodeGen:
             raise CodeGenError("range() takes 1-3 arguments", node)
         return self.builder.call(self.runtime["range"], [start, stop, step])
 
+    def _emit_builtin_bytes(self, node):
+        """bytes(x) → a native FpyBytes buffer.
+
+        The constructor had no native lowering and went through the CPython
+        bridge: unavailable in pure mode, where it answered NULL and the next
+        `fpy_bytes_len` then walked off a null pointer. The argument is handed
+        to the runtime *tagged* so one helper covers an int count, a bytes
+        copy, the str-without-encoding error and any iterable of ints.
+        `bytearray` deliberately stays on the bridge — fastpy has no mutable
+        bytes type, so answering with an FpyBytes would print it as `b'..'`
+        rather than `bytearray(b'..')`. BUG-BYTES-CTOR-BRIDGE-ONLY.
+        """
+        if node.keywords:
+            # bytes(s, "utf-8") / bytes(s, encoding=...) — an encode by
+            # another name, and str.encode already has a native path.
+            return self._emit_unknown_builtin_call(node, "bytes")
+        if len(node.args) == 0:
+            return self.builder.call(
+                self.runtime["fv_to_bytes"],
+                [ir.Constant(i32, FPY_TAG_INT), ir.Constant(i64, 0)])
+        if len(node.args) != 1:
+            return self._emit_unknown_builtin_call(node, "bytes")
+        arg_node = node.args[0]
+        val = self._emit_expr_value(arg_node)
+        tag, data = self._to_tag_data_ir(val, arg_node)
+        return self.builder.call(self.runtime["fv_to_bytes"], [tag, data])
+
     def _emit_builtin_list(self, node):
         # list(dict) → list of keys
         if len(node.args) == 1 and self._is_dict_expr(node.args[0]):
@@ -37009,12 +37213,12 @@ class CodeGen:
         # list(bytes) → list of byte values (ints)
         if len(node.args) == 1:
             arg = node.args[0]
-            # Check if argument is a bytes-typed variable
-            is_bytes = False
-            if isinstance(arg, ast.Name) and arg.id in self.variables:
-                _, vtag = self.variables[arg.id]
-                is_bytes = (self._tag_kind(vtag) == VKind.BYTES)
-            if is_bytes:
+            # One definition of "is this bytes?": a literal, a slice
+            # (`list(z[1:4])`) and a call result are all as much a bytes as a
+            # variable is.  Only the variable case was recognised, so the rest
+            # fell through to the str/pyobj arms below and answered `()`.
+            # BUG-BYTES-SLICE-VIA-STR.
+            if self._is_bytes_expr(arg):
                 b = self._emit_expr_value(arg)
                 b = self._ensure_ptr(b)
                 return self.builder.call(self.runtime["bytes_to_list"], [b])
@@ -46436,7 +46640,8 @@ class CodeGen:
             # Bytes slicing: b"hello"[1:3] → b'el' (same char* slice, but
             # stored with BYTES type tag so print shows b'...' prefix)
             if _vt_tag == VKind.BYTES and isinstance(node.slice, ast.Slice):
-                return self._emit_string_slice(obj, node.slice, node)
+                return self._emit_string_slice(obj, node.slice, node,
+                                               is_bytes=True)
             # Tuple/list pointer from chained subscript or expression:
             # route through list_get_fv to preserve runtime element tag.
             if _vt_tag in (VKind.LIST, VKind.TUPLE):
@@ -46466,10 +46671,14 @@ class CodeGen:
             stop = self._emit_expr_value(slc.upper) if slc.upper else ir.Constant(i64, -1)
             has_start = ir.Constant(i64, 1 if slc.lower else 0)
             has_stop = ir.Constant(i64, 1 if slc.upper else 0)
+            # A bytes receiver needs the byte-indexed pair — the str one
+            # returns an FpyString that a BYTES tag then reads as an FpyBytes.
+            # BUG-BYTES-SLICE-VIA-STR.
+            _pfx = "bytes" if self._is_bytes_expr(node.value) else "str"
             if slc.step:
                 step = self._emit_expr_value(slc.step)
-                return self._rt_call("str_slice_step", [obj, start, stop, step, has_start, has_stop])
-            return self._rt_call("str_slice", [obj, start, stop, has_start, has_stop])
+                return self._rt_call(_pfx + "_slice_step", [obj, start, stop, step, has_start, has_stop])
+            return self._rt_call(_pfx + "_slice", [obj, start, stop, has_start, has_stop])
 
         # Fallback: treat as pyobj __getitem__ via bridge
         obj = self._emit_expr_value(node.value)
@@ -46532,8 +46741,18 @@ class CodeGen:
             self.runtime["list_slice"], [lst, start, stop, has_start, has_stop]
         )
 
-    def _emit_string_slice(self, s: ir.Value, sl: ast.Slice, node: ast.AST) -> ir.Value:
-        """Emit string slicing: s[start:stop]."""
+    def _emit_string_slice(self, s: ir.Value, sl: ast.Slice, node: ast.AST,
+                           is_bytes: bool = False) -> ir.Value:
+        """Emit string slicing: s[start:stop].
+
+        `is_bytes` swaps in the byte-indexed pair.  A bytes slice used to be
+        produced by `fastpy_str_slice`, which indexes by code point and returns
+        an *FpyString* — and the result was then tagged BYTES, so every later
+        `fpy_bytes_len` probed for the bytes magic 16 bytes before a
+        smaller-header allocation.  BUG-BYTES-SLICE-VIA-STR.
+        """
+        _slice = "bytes_slice" if is_bytes else "str_slice"
+        _slice_step = "bytes_slice_step" if is_bytes else "str_slice_step"
         if sl.lower is not None:
             start = self._emit_expr_value(sl.lower)
             has_start = ir.Constant(i64, 1)
@@ -46551,12 +46770,12 @@ class CodeGen:
         if sl.step is not None:
             step = self._emit_expr_value(sl.step)
             return self.builder.call(
-                self.runtime["str_slice_step"],
+                self.runtime[_slice_step],
                 [s, start, stop, step, has_start, has_stop]
             )
 
         return self.builder.call(
-            self.runtime["str_slice"], [s, start, stop, has_start, has_stop]
+            self.runtime[_slice], [s, start, stop, has_start, has_stop]
         )
 
     def _emit_list_literal(self, node: ast.List) -> ir.Value:
@@ -46628,6 +46847,20 @@ class CodeGen:
             if isinstance(node, (ast.Call, ast.List, ast.ListComp,
                                  ast.Tuple)):
                 self.builder.call(self.runtime["rc_decref"], [tag_c, data])
+            return
+        # Bytes elements: a bytes is a pointer like a str, and the fallback
+        # below tags every unrecognised pointer STR — so `[b"ab"]` printed
+        # `['ab']` and the element came back out of the list unable to
+        # concatenate with another bytes.  BUG-BYTES-IN-LIST-TAG-LOST.
+        # No decref here, deliberately: this mirrors the str pointer path,
+        # which also hands its creation reference to the list.
+        if self._is_bytes_expr(node):
+            value = self._emit_expr_value(node)
+            value = self._ensure_ptr(value)
+            self.builder.call(
+                self.runtime["list_append_fv"],
+                [list_ptr, ir.Constant(i32, FPY_TAG_BYTES),
+                 self.builder.ptrtoint(value, i64)])
             return
         if self._is_dict_expr(node):
             value = self._emit_expr_value(node)

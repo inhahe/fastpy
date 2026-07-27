@@ -358,11 +358,15 @@ static inline char* fpy_bytes_alloc(int64_t len) {
 }
 /* Get the FpyBytes header from a char* data pointer. Returns NULL if not bytes. */
 static inline FpyBytes* fpy_bytes_header(const char *s) {
+    /* Subtracting from a null pointer is UB, and callers do reach here with
+     * NULL when a bridge-only operation returned nothing in pure mode. */
+    if (s == NULL) return NULL;
     FpyBytes *h = (FpyBytes*)((char*)s - offsetof(FpyBytes, data));
     return (h->magic == FPY_BYTES_MAGIC) ? h : NULL;
 }
 /* Get bytes length (FpyBytes-aware, falls back to strlen for plain strings) */
 static inline int64_t fpy_bytes_len(const char *s) {
+    if (s == NULL) return 0;
     FpyBytes *bh = fpy_bytes_header(s);
     if (bh) return bh->length;
     return (int64_t)strlen(s);  /* fallback for plain char* */

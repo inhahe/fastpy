@@ -444,6 +444,64 @@ const char* fastpy_str_slice_step(const char *s, int64_t start, int64_t stop,
     return r->data;
 }
 
+/* Slicing a bytes used to go through fastpy_str_slice, which is code-point
+ * indexed and returns an *FpyString*.  The result was then tagged BYTES, so
+ * every later fpy_bytes_len probed for an FpyBytes magic 16 bytes before an
+ * FpyString allocation — a heap-buffer-overflow read that only happened to
+ * land somewhere harmless.  These are byte-indexed and header-backed.
+ * BUG-BYTES-SLICE-VIA-STR. */
+const char* fastpy_bytes_slice(const char *b, int64_t start, int64_t stop,
+                                int64_t has_start, int64_t has_stop) {
+    int64_t len = fpy_bytes_len(b);
+    if (!has_start) start = 0;
+    if (!has_stop) stop = len;
+    if (start < 0) start += len;
+    if (stop < 0) stop += len;
+    if (start < 0) start = 0;
+    if (stop > len) stop = len;
+    if (start >= stop) return fpy_bytes_alloc(0);
+    int64_t n = stop - start;
+    char *out = fpy_bytes_alloc(n);
+    memcpy(out, b + start, (size_t)n);
+    return out;
+}
+
+const char* fastpy_bytes_slice_step(const char *b, int64_t start, int64_t stop,
+                                     int64_t step, int64_t has_start,
+                                     int64_t has_stop) {
+    int64_t len = fpy_bytes_len(b);
+    if (step == 0) step = 1;
+    if (step > 0) {
+        if (!has_start) start = 0;
+        if (!has_stop) stop = len;
+        if (start < 0) start += len;
+        if (stop < 0) stop += len;
+        if (start < 0) start = 0;
+        if (stop > len) stop = len;
+    } else {
+        if (!has_start) start = len - 1;
+        if (has_stop && stop < 0) stop += len;
+        if (!has_stop) stop = -1;  /* sentinel past the beginning */
+        if (start < 0) start += len;
+        if (start >= len) start = len - 1;
+    }
+    int64_t n = 0;
+    if (step > 0) {
+        for (int64_t i = start; i < stop; i += step) n++;
+    } else {
+        for (int64_t i = start; i > stop && i >= 0; i += step) n++;
+    }
+    if (n < 0) n = 0;
+    char *out = fpy_bytes_alloc(n);
+    int64_t o = 0;
+    if (step > 0) {
+        for (int64_t i = start; i < stop; i += step) out[o++] = b[i];
+    } else {
+        for (int64_t i = start; i > stop && i >= 0; i += step) out[o++] = b[i];
+    }
+    return out;
+}
+
 const char* fastpy_str_repeat(const char *s, int64_t n) {
     /* Header-backed buffers so the returned STR value has a valid FpyString
        header (no OOB header read / leak). See BUG-RUNTIME-STR-PRODUCERS-BARE-MALLOC. */

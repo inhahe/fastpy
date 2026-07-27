@@ -292,6 +292,60 @@ across back edges — and `_store_variable` gives those an `FpyValue` slot and a
 slot holds any value, it is merely wider than it needs to be. Parameters are
 excluded, since `_efd_store_parameters` creates their slots first.
 
+**`bytes` and `set` are pointer kinds, and every step of the return chain has
+to say so.** `str`, `list`, `dict` and `tuple` had arms in all three stages of
+the return-type chain; `bytes` had none anywhere and `set` had only half of
+one, and each missing arm hid the next behind it. `_csa_propagate_ret_types`
+now records `bytes`/`set` (literal, `.encode()`, `bytes`/`set`/`frozenset`
+call — `bytearray` is deliberately excluded, since fastpy has no mutable bytes
+type and answering with an `FpyBytes` would make it print as `b'..'`) so a call
+site passing one can be classified;
+`_duf_detect_ret_type` returns `i8_ptr` for those shapes, because leaving the
+function declared `i64` makes every pointer-gated path decline to fire — the
+bytes arm of the subscript emitter is behind an `isinstance(obj.type,
+PointerType)` test, so `ob()[0]` fell into the CPython `__getitem__` bridge and
+faulted; and `_duf_determine_ret_tag`'s pointer arm names them, since its
+fall-through default `"ptr"` means *list*, which made `ob() + b"d"`
+concatenate as a list and print `()`. The consumers of the kind follow the same
+rule: `_is_bytes_expr` reads the callee's declared return tag rather than only
+recognising variables, and it is the single definition — `_infer_type_tag`'s
+private duplicate was deleted. `in` on a bytes had no arm in `_emit_in_compare`
+either; the new `fastpy_bytes_contains` takes the left operand *tagged*, since
+an int asks about a byte value and a bytes/str about a contiguous subsequence,
+and works from stored lengths so an embedded null byte is matched rather than
+ending the search.
+
+**A `bytes` is not a `str` that happens to be tagged differently.** The two
+share an LLVM type and nothing else, and every place that blurred them was a
+bug. `bytes(x)` had no native lowering at all and went to the CPython bridge,
+which answers NULL in pure mode; `fastpy_fv_to_bytes` takes the argument
+*tagged* so one helper covers the int count, the bytes copy, the
+str-without-encoding `TypeError` and — by routing through `fastpy_fv_to_list` —
+every iterable, without an arm per container. Slicing went through
+`fastpy_str_slice`, which indexes by code point and returns an `FpyString`;
+tagging that allocation BYTES made every later `fpy_bytes_len` probe for the
+bytes magic 16 bytes before a smaller-header buffer, a heap-buffer-overflow read
+that usually landed somewhere plausible. `fastpy_bytes_slice` /
+`fastpy_bytes_slice_step` are byte-indexed and `fpy_bytes_alloc`-backed, and
+all three lowering sites choose them from the receiver's kind. And a bytes
+stored in a list came back out as a `str`, because the element-tagging fallback
+labels every unrecognised pointer STR and neither the list-literal element
+inference nor the `.append()` pre-pass had a bytes arm. The lesson each time is
+the same: the answer to "is this bytes?" belongs in exactly one function.
+`_is_bytes_expr` is it, and it takes an optional name table so the static
+pre-passes — which run before any variable exists — can consult it rather than
+re-deriving a weaker version of it.
+
+**Giving a builtin a native lowering is two edits, not one.** `_emit_assign`
+keeps a `native_builtins` set and tags `x = f(...)` as `pyobj` for every builtin
+*not* in it, on the reasoning that anything else came back from the CPython
+bridge as a `PyObject*`. Adding `_emit_builtin_bytes` without adding `"bytes"`
+to that set left `x = bytes(3)` declared `pyobj` while the emitter produced a
+native `FpyBytes`, so `print(x)` handed the buffer to `PyObject_Str` and took an
+access violation — the `binascii`/`gzip`/`zlib` stdlib tests caught it. The set
+is the authoritative list of "builtins whose result is a native value"; a new
+native lowering has to appear in both places or the two disagree.
+
 **A splat is evidence too, but only about the required slots.** `f(*seq)` had
 no arm in the per-argument classification at all, so a parameter fed only that
 way hit the same silent-zero. `_csa_build_seq_binds` maps each name to the
