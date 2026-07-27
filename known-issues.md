@@ -117,7 +117,7 @@ segfaults on the first line; post-fix it matches CPython exactly).
 
 **Two neighbours this uncovered but did not fix** — both pre-existing and
 independent of globals, verified by compiling the same programs with the
-committed compiler: `BUG-TUPLE-RETURN-SEGFAULTS` and
+committed compiler: `BUG-TUPLE-RETURN-SEGFAULTS` (since fixed) and
 `BUG-RETURN-OF-BYTES-OR-BIGINT-VAR-PRINTS-POINTER`, below.
 
 ### BUG-GLOBAL-KIND-CHANGING-REBIND-USES-STALE-TAG. A module-level name reassigned to a different kind keeps the first kind's tag forever — 2026-07-27
@@ -169,41 +169,165 @@ since `_csa_list_literal_tag` was already split out of it for the same reason.
 Once that exists, `_csa_global_single_bind` can be replaced by "the bindings
 all agree", which is strictly more precise than "there is only one".
 
-### BUG-TUPLE-RETURN-SEGFAULTS. A function that returns a tuple crashes on any use of the result — 2026-07-27
+### BUG-TUPLE-RETURN-SEGFAULTS. A function that returns a tuple crashes on any use of the result — 2026-07-27 — **FIXED 2026-07-27**
 
-**Reproduce** (compiles clean; CPython prints `(10, 20) 2 10` twice):
+**Reproduce** (compiles clean; CPython prints `(10, 20) 2 10`):
 
 ```python
 def loc_t():
     q = (10, 20)
     return q
 
-def lit_t():
-    return (10, 20)
-
 print(loc_t(), len(loc_t()), loc_t()[0])   # segfault, no output at all
 ```
 
-Not about globals: the *literal* form `lit_t` crashes too, so nothing in the
-scope-resolution path is involved. Found while checking whether
-`_scope_global_tags` should seed `list_vars` for a global tuple — it does, and
-a global tuple then behaves exactly like these two, i.e. still broken.
+The original report guessed this was about the *tag* — that a returned tuple
+is tagged `list` and the caller unpacks an `FpyTuple` as an `FpyList`. That
+guess was wrong in an instructive way. Tagging a tuple `list` is exactly
+right: `VKind.TUPLE` maps to `FPY_TAG_LIST` at runtime (codegen.py ~20447), so
+the two are the same object as far as the tag is concerned. The report also
+claimed the *literal* form `return (10, 20)` crashed too; it never did. One
+`print` with three calls on it dies as a unit, and the crashing call was
+`loc_t()[0]` in both halves of the line — the literal form was collateral in
+the output, not a second failure.
 
-**Also missing, and probably the first thing to fix:** `_csa_build_var_types`
-(codegen.py ~9722) has arms for `ast.List`/`ast.ListComp`, `ast.Dict`,
-`ast.Set` and the scalar `ast.Constant`s, but **no `ast.Tuple` arm**, so a
-module-level `t = (10, 20)` gets no entry in `_csa_var_types` at all. Adding
-one is a producer-side change that every consumer of `_csa_var_types` sees, so
-it wants the full suite behind it — and it is pointless until the segfault
-above is fixed, since the tag would only route the crash differently.
+The real hole was that **one assignment before the return lost everything**.
+`return (10, 20)` was always correct because the return-tag chain lists
+`ast.Tuple` beside `ast.List`. The scan that records "which local holds what"
+did not: it had arms for `ast.List`, `ast.ListComp`, `ast.Set`, `ast.SetComp`,
+`ast.Dict` and `ast.DictComp` — every container literal except `ast.Tuple`. So
+`q` joined no set, the `return <Name>` arms matched nothing, and the function
+was given a bare i64 return. `print` kept working throughout because it reads
+the runtime tag rather than the static one, which is what made the gap easy to
+miss for so long.
 
-**Where to look:** `returns_list = True` is set for `ast.Tuple` returns at
-`_duf_determine_ret_tag` (codegen.py ~11738, the
-`isinstance(n.value, (ast.List, ast.ListComp, ast.Tuple))` arm), so a returned
-tuple is *tagged* as a list. If the callee actually builds an `FpyTuple` and
-the caller unpacks it as an `FpyList`, that is the crash — the same
-"guessing list for an unrecognised pointer" failure named in
-BUG-BIGINT-COMPARES-BY-POINTER, here in the producer rather than the consumer.
+**Fixed by** four separate arms plus a widened guard, none of which is
+sufficient alone:
+
+- `_duf_detect_ret_type`'s local-assignment scan (codegen.py ~11270) now
+  admits `ast.Tuple` to `list_vars` beside `ast.List`/`ast.Set`. This is the
+  one that stops the segfault: it is what widens the LLVM return type to a
+  pointer, and `_duf_select_abi` reads the same inference, so a fix that set
+  only the tag would still have handed the caller a return slot with nowhere
+  to put a pointer.
+- `_build_local_vt` (~8227) and `_csa_build_var_types` (~9751) gained
+  `ast.Tuple` arms, both routed through `_csa_list_literal_tag`. These give a
+  returned tuple its *element* kind; without them `_func_ret_types` had no
+  entry for the function and the caller's `f()[0]` fell to the `VKind.INT`
+  element default, so `(1.5, 2.5)[0]` read a double's bits as an integer and
+  printed `4.6094342186137027e+18`.
+- `_csa_propagate_ret_types`' own `local_types` scan (~7802) — a **fourth**
+  hand-rolled copy of the same sequence-literal classifier, found only by
+  chasing why the element kind was still wrong after the first three. Its
+  element-refining block just below (~8013) had `VKind.LIST` hard-coded and
+  now accepts `VKind.TUPLE` too, carrying the head through so a tuple stays a
+  tuple.
+
+`_csa_list_elem_tag` and `_csa_list_literal_tag` were generalized from `ast.List`
+to `(ast.List, ast.Tuple)` to serve those call sites. `_csa_list_literal_tag`
+answers with a `"tuple:<elem>"` head rather than folding tuples into `"list"`:
+`VKind.TUPLE` exists and `ValueType.from_old_tag` already parses it, and the
+single place the distinction is invisible is not a reason to discard it
+everywhere else.
+
+Deliberately **not** done: replacing the refine block at ~8013 with a call to
+`_csa_list_literal_tag`. That block has a `"ptr:list"` special case for a list
+of lists, and unifying would have spelled it `"list:list"`; nothing cheaply
+proves no downstream string comparison depends on the exact spelling. The
+fourth-copy problem is therefore reduced, not closed.
+
+Regression test:
+`tests/regressions/a_tuple_held_in_a_variable_is_still_a_tuple.py`.
+
+**It woke a consumer** — see BUG-TUPLE-SUBSCRIPT-ELEM-KIND-LOST immediately
+below, which the full suite caught as an access violation in
+`test_self_compile_codegen_subset`. That is the expected shape here and not a
+reason to back the producer out: once `_csa_build_var_types` started recording
+tuples, a tuple arrived at `_infer_type_tag` carrying an element kind for the
+first time, and the arm that reads element kinds had never been taught the
+word "tuple".
+
+### BUG-TUPLE-SUBSCRIPT-ELEM-KIND-LOST. An element read out of a tuple is typed `int` whatever it holds — 2026-07-27 — **FIXED 2026-07-27**
+
+**Reproduce** (CPython prints `1` / `2` / `3`; the list spelling of the same
+program is correct):
+
+```python
+def walk(node):
+    for stmt in node[1]:      # segfault
+        print(stmt)
+
+program = ("block", [1, 2, 3])
+walk(program)
+```
+
+Found by `test_self_compile_codegen_subset`, whose `program = ("block", [...])`
+plus `for stmt in node[1]: self.generate(stmt)` is exactly this shape. Two
+independent omissions, both the same word missing:
+
+- `_infer_type_tag`'s "subscript on a name" arm (codegen.py ~22336) tested
+  `_vt.kind == VKind.LIST` before believing `_vt.elem_type`. A tuple
+  subscripts to an element in exactly the same way and carries exactly the
+  same fact, so `node[1]` on a `tuple:mixed` parameter matched nothing and
+  fell through to `_llvm_type_tag`, which reports the loaded i64 as `int`.
+  `for` picks its loop shape from that answer: `mixed` routes to the
+  runtime-dispatched loop, `int` routes to the native list loop, which calls
+  `list_length` on an FpyValue. Now `_vt.kind in _LIST_LIKE`.
+- `_infer_type_tag`'s tuple *literal* arm (~22142) returned a bare
+  `ValueType(VKind.TUPLE)` while the list arm one line up returned
+  `ValueType(VKind.LIST, elem_type=self._infer_list_elem_type(node))`. So even
+  a module-level `nested = ("head", [10, 20, 30])` had no element kind to
+  lose. `_infer_list_elem_type` has handled `ast.Tuple` all along and was
+  simply never asked.
+
+`_LIST_LIKE = (VKind.LIST, VKind.TUPLE, VKind.DEQUE)` sits a few lines below
+`VKind` with a comment saying it groups the kinds that "support iteration,
+append, len". Before this fix it was referenced **zero** times — defined for
+precisely this class of test and never once used. Worth grepping for other
+`kind == VKind.LIST` tests that should be `kind in _LIST_LIKE`; this fix
+converts only the one that was demonstrably wrong.
+
+Regression test:
+`tests/regressions/subscripting_a_tuple_keeps_the_element_kind.py`.
+
+### BUG-RETURN-OF-LOCAL-SET-TAGGED-LIST. A set held in a variable and then returned is measured as a list — 2026-07-27
+
+**Reproduce** (compiles clean; CPython prints `3` then `[1, 2, 3]`):
+
+```python
+def lit_set():
+    return {1, 2, 3}
+
+def loc_set():
+    q = {1, 2, 3}
+    return q
+
+print(len(lit_set()), sorted(lit_set()))   # 3 [1, 2, 3]  — correct
+print(len(loc_set()))                      # 2497630041616
+print(sorted(loc_set()))                   # segfault
+```
+
+Same asymmetry as BUG-TUPLE-RETURN-SEGFAULTS and found by the section of that
+bug's regression test written to catch collateral damage — but it is older
+than the tuple work and reproduces identically on the pre-fix compiler, so it
+is not fallout from it.
+
+Here the local-assignment scan *does* have an `ast.Set`/`ast.SetComp` arm; the
+problem is what it can say. It adds `q` to **`list_vars`**, the set that
+cannot spell "set", so the kind is destroyed at the moment it is recorded.
+`_duf_determine_ret_tag` then has no `return <Name in list_vars>` arm at all —
+a returned local *list* works only by accident, because the `i8_ptr` branch's
+fall-through default is `"ptr"`, which downstream reads as list. A set gets
+that same default and is wrong. `return {1, 2, 3}` written directly has its
+own `ast.Set` arm one level up and is correct.
+
+**The proper fix is not a fifth boolean set.** `set_vars` beside `str_vars`,
+`list_vars`, `dict_vars`, `obj_vars` and `float_vars` would work and is about
+fifteen lines, but it is one more room in a vocabulary already documented as
+the thing to demolish — see BUG-RETURN-OF-BYTES-OR-BIGINT-VAR-PRINTS-POINTER
+below for the `dict[str, ValueType]` replacement that subsumes this bug, the
+bytes/BigInt one, and the missing `Name in list_vars` arm all at once. This
+entry exists so that refactor has a third test to satisfy.
 
 ### BUG-RETURN-OF-BYTES-OR-BIGINT-VAR-PRINTS-POINTER. A bytes or BigInt held in a variable and then returned comes back as its address — 2026-07-27
 
@@ -248,8 +372,9 @@ complex, so `q = b"abc"` records nothing and `return q` matches no arm. The
 proper fix is the one this family keeps pointing at: stop expressing "which
 kind is this local" as four ad-hoc boolean sets and carry a `dict[str,
 ValueType]` instead, which has a slot for every `VKind` by construction. Doing
-that would subsume this entry, most of BUG-RETURN-OF-GLOBAL-LOSES-ITS-KIND's
-machinery, and the `elem_type=VKind.INT` conflation below.
+that would subsume this entry, BUG-RETURN-OF-LOCAL-SET-TAGGED-LIST above, most
+of BUG-RETURN-OF-GLOBAL-LOSES-ITS-KIND's machinery, and the
+`elem_type=VKind.INT` conflation below.
 
 **The refactor is bounded.** `str_vars`, `list_vars`, `dict_vars`, `obj_vars`
 and `float_vars` are mentioned at 66 lines, all of them inside

@@ -7662,7 +7662,7 @@ class CodeGen:
                         if isinstance(nm, ast.Name):
                             scope.pop(nm.id, None)
             return self._csa_elem_tag_of(node.elt, scope)
-        if not isinstance(node, ast.List) or not node.elts:
+        if not isinstance(node, (ast.List, ast.Tuple)) or not node.elts:
             return None
         tags = {self._csa_elem_tag_of(e, local_types) for e in node.elts}
         if len(tags) == 1:
@@ -7682,7 +7682,7 @@ class CodeGen:
 
     def _csa_list_literal_tag(self, node: ast.expr,
                               local_types: dict[str, str]) -> str:
-        """The `"list:<elem>"` tag of a list literal / comprehension.
+        """The `"list:<elem>"` / `"tuple:<elem>"` tag of a sequence literal.
 
         Three separate scans used to answer this question with their own
         hand-rolled first-element guess, each recognising a *different* subset
@@ -7701,14 +7701,23 @@ class CodeGen:
         The classifier declines as soon as *any* element is unclassified, so it
         cannot see the heterogeneity in `[1, some_name]`; the coarser test
         still can, and "mixed" beats the INT default.
+
+        A tuple literal answers with a `"tuple"` head rather than a `"list"`
+        one.  Tuples reached this classifier late — nothing recorded a tuple's
+        kind at all until BUG-TUPLE-RETURN-SEGFAULTS — and while a tuple *is*
+        an FPY_TAG_LIST at runtime, saying "list" here would be the same
+        compression this whole family is made of: `VKind.TUPLE` exists,
+        `from_old_tag` parses `"tuple:X"`, and the one place the distinction
+        is invisible is not a reason to throw it away everywhere else.
         """
+        head = "tuple" if isinstance(node, ast.Tuple) else "list"
         elem = self._csa_list_elem_tag(node, local_types)
         if elem:
-            return f"list:{elem}"
-        if isinstance(node, ast.List) and node.elts and \
+            return f"{head}:{elem}"
+        if isinstance(node, (ast.List, ast.Tuple)) and node.elts and \
                 self._csa_list_is_mixed(node.elts):
-            return "list:mixed"
-        return "list"
+            return f"{head}:mixed"
+        return head
 
     def _csa_merge_param_tag(self, existing: str, incoming: str) -> str:
         """The single tag that describes two callers of one parameter.
@@ -7792,6 +7801,12 @@ class CodeGen:
                         tgt = n.targets[0].id
                         if isinstance(n.value, (ast.List, ast.ListComp)):
                             local_types[tgt] = "list"
+                        elif isinstance(n.value, ast.Tuple):
+                            # Tuples had no arm here at all, so a function
+                            # returning a local tuple got no `_func_ret_types`
+                            # entry and the caller's `f()[0]` fell to the INT
+                            # element default.  BUG-TUPLE-RETURN-SEGFAULTS.
+                            local_types[tgt] = "tuple"
                         elif isinstance(n.value, (ast.Dict, ast.DictComp)):
                             local_types[tgt] = "dict"
                         elif isinstance(n.value, ast.Constant) and isinstance(n.value.value, str):
@@ -8008,8 +8023,15 @@ class CodeGen:
                             # path above — "is it a list of lists" — and so
                             # lost every other element kind the same way.
                             # BUG-RETURNED-LIST-ELEM-TAG-LOST.
-                            if (_tk(local_types[ret_var]) == VKind.LIST
+                            # `VKind.TUPLE` joins `VKind.LIST` here rather than
+                            # being folded into it: the head is carried through
+                            # from `local_types` so a tuple stays a tuple, and
+                            # only the element kind is recovered.
+                            # BUG-TUPLE-RETURN-SEGFAULTS.
+                            if (_tk(local_types[ret_var]) in (VKind.LIST,
+                                                              VKind.TUPLE)
                                     and ":" not in local_types[ret_var]):
+                                _head = local_types[ret_var]
                                 for a2 in ast.walk(fnode):
                                     if (isinstance(a2, ast.Assign)
                                             and len(a2.targets) == 1
@@ -8021,7 +8043,7 @@ class CodeGen:
                                             _func_ret_types[fname] = "ptr:list"
                                         elif _elem:
                                             _func_ret_types[fname] = (
-                                                f"list:{_elem}")
+                                                f"{_head}:{_elem}")
                                         break
                         elif ret_var in var_types:
                             _func_ret_types[fname] = var_types[ret_var]
@@ -8224,7 +8246,16 @@ class CodeGen:
                 if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1:
                     tgt = stmt.targets[0]
                     if isinstance(tgt, ast.Name):
-                        if isinstance(stmt.value, (ast.List, ast.ListComp)):
+                        if isinstance(stmt.value, (ast.List, ast.ListComp,
+                                                   ast.Tuple)):
+                            # `ast.Tuple` here is what gives a returned local
+                            # tuple its element kind: without it `_func_ret_types`
+                            # had no entry for the function at all, so the
+                            # caller's `f()[0]` fell to the INT element default
+                            # and read a double's bits.  The *list* spelling of
+                            # the same function was always right, which is the
+                            # asymmetry that names the bug.
+                            # BUG-TUPLE-RETURN-SEGFAULTS.
                             local_vt[tgt.id] = self._csa_list_literal_tag(
                                 stmt.value, local_vt)
                         elif isinstance(stmt.value, (ast.Dict, ast.DictComp)):
@@ -9750,6 +9781,13 @@ class CodeGen:
                             var_types[tgt.id] = "dict"
                     elif isinstance(node.value, ast.Set):
                         var_types[tgt.id] = "list"
+                    elif isinstance(node.value, ast.Tuple):
+                        # The one container literal with no arm here, so a
+                        # module-level `t = (10, 20)` had no recorded kind at
+                        # all and every consumer fell back to its int default.
+                        # BUG-TUPLE-RETURN-SEGFAULTS.
+                        var_types[tgt.id] = self._csa_list_literal_tag(
+                            node.value, var_types)
                     elif isinstance(node.value, ast.Constant):
                         if isinstance(node.value.value, str):
                             var_types[tgt.id] = "str"
@@ -11267,7 +11305,21 @@ class CodeGen:
                 if isinstance(n, ast.Assign):
                     for tgt in n.targets:
                         if isinstance(tgt, ast.Name):
-                            if isinstance(n.value, (ast.List, ast.ListComp, ast.Set, ast.SetComp)):
+                            if isinstance(n.value, (ast.List, ast.ListComp,
+                                                    ast.Set, ast.SetComp,
+                                                    ast.Tuple)):
+                                # `ast.Tuple` belongs here for the same reason
+                                # the *direct* return arm below already lists
+                                # it beside `ast.List`: a tuple is an
+                                # FPY_TAG_LIST at runtime, so "returns a
+                                # pointer, tagged list" is the right answer for
+                                # both.  Without it `q = (10, 20); return q`
+                                # recorded nothing, matched no arm, and
+                                # returned i64 — `len()` then measured the
+                                # address as 0 and `[0]` dereferenced it.
+                                # `return (10, 20)` written directly was always
+                                # correct, which is what made the omission hard
+                                # to see.  BUG-TUPLE-RETURN-SEGFAULTS.
                                 list_vars.add(tgt.id)
                             elif isinstance(n.value, (ast.Dict, ast.DictComp)):
                                 list_vars.add(tgt.id)
@@ -22088,7 +22140,16 @@ class CodeGen:
         elif isinstance(node, (ast.Dict, ast.DictComp)):
             return ValueType(VKind.DICT)
         elif isinstance(node, ast.Tuple):
-            return ValueType(VKind.TUPLE)
+            # The element type comes from the same classifier the list arm
+            # above uses — `_infer_list_elem_type` has handled `ast.Tuple`
+            # all along and was simply never asked.  A bare
+            # `ValueType(VKind.TUPLE)` meant every read of an element fell
+            # through to `_llvm_type_tag`, i.e. INT, so `for v in nested[1]:`
+            # on `nested = ("head", [10, 20, 30])` iterated an FpyValue as a
+            # native list and crashed.  The list spelling of the identical
+            # program was right.  BUG-TUPLE-SUBSCRIPT-ELEM-KIND-LOST.
+            return ValueType(VKind.TUPLE,
+                             elem_type=self._infer_list_elem_type(node))
         # dict | dict → dict
         if (isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr)
                 and self._is_dict_expr(node.left) and self._is_dict_expr(node.right)):
@@ -22281,7 +22342,19 @@ class CodeGen:
             if isinstance(node.value, ast.Name) and node.value.id in self.variables:
                 _vt = self.variables[node.value.id][1]
                 _vt = _vt if isinstance(_vt, ValueType) else ValueType.from_old_tag(_vt)
-                if _vt.kind == VKind.LIST and _vt.elem_type is not None:
+                if _vt.kind in _LIST_LIKE and _vt.elem_type is not None:
+                    # `_LIST_LIKE`, not `VKind.LIST`: a tuple and a deque
+                    # subscript to an element exactly as a list does, and the
+                    # elem_type they carry is the same kind of fact.  With
+                    # only LIST here, `node[1]` on a `tuple:mixed` parameter
+                    # fell past every arm to `_llvm_type_tag`, which reports
+                    # the loaded i64 as INT — so `for stmt in node[1]:` chose
+                    # the native list loop over the runtime-dispatched one and
+                    # called `list_length` on an FpyValue.  The identical
+                    # program written with a list literal was correct, which
+                    # is the asymmetry that found it.  `_LIST_LIKE` was
+                    # defined for precisely this and had never once been used.
+                    # BUG-TUPLE-SUBSCRIPT-ELEM-KIND-LOST.
                     return _vt.elem_type  # element type is already ValueType
             elif isinstance(node.value, (ast.Call, ast.Subscript,
                                         ast.Attribute)):

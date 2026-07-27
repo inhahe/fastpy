@@ -1060,7 +1060,11 @@ name fell to a bare `"list"`, which its consumer defaults to `VKind.INT`, so a
 BigInt argument compared by address and a float argument was read as its own
 bits. All three now go through `_csa_list_literal_tag`, a thin wrapper over the
 `_csa_list_elem_tag` classifier the return path already used, so a literal is
-typed by the same rules wherever it is written. `_csa_list_is_mixed` survives as
+typed by the same rules wherever it is written. (A **fourth** copy came to light
+later, inside `_csa_propagate_ret_types`' own `local_types` scan — see the tuple
+paragraph below — so "three" was itself an undercount, which is the usual shape
+of this problem: you find the copies by watching a fix fail to take effect.)
+`_csa_list_is_mixed` survives as
 a *fallback* rather than being replaced: the classifier declines as soon as any
 element is unclassified and so cannot see the heterogeneity in `[1, some_name]`,
 where the coarser test still can, and "mixed" beats the INT default.
@@ -1135,6 +1139,52 @@ a complex records nothing at all and `q = b"abc"; return q` returns an address.
 The replacement is a single `dict[str, ValueType]`, which has a slot for every
 `VKind` by construction; it would subsume this hole, most of the machinery
 above, and the `elem_type=VKind.INT` conflation described earlier.
+
+**One assignment is enough to lose a kind, and the literal form keeps working
+to hide it.** `return (10, 20)` was always right — the return-tag chain lists
+`ast.Tuple` beside `ast.List`, and that is correct, because a tuple *is* an
+`FPY_TAG_LIST` at runtime. `q = (10, 20); return q` segfaulted, because the
+scan that records which local holds what had arms for every container literal
+except `ast.Tuple`: `q` joined no set, matched no `return <Name>` arm, and the
+function got a bare i64 return, so `len()` measured the address and `[0]`
+dereferenced it. The diagnostic that finds bugs of this shape is an
+**asymmetry between two spellings of the same value** — the direct form
+correct, the one-assignment form wrong — and the reason it survives so long is
+that `print` reads the *runtime* tag and therefore keeps printing `(10, 20)`
+throughout.
+
+Closing it took four arms, and only the first stops the crash: the return-type
+scan (which also decides the ABI, so a tag-only fix would still have had no
+slot for the pointer), `_build_local_vt`, `_csa_build_var_types`, and the
+fourth classifier copy inside `_csa_propagate_ret_types`. The last three carry
+the *element* kind rather than the pointer-ness, and without them
+`(1.5, 2.5)[0]` still read a double's bits as an integer. This is the recurring
+count in this subsystem: one hole is never one hole, because the same question
+is asked at three or four points on a path and each answer tests clean in
+isolation.
+
+`_csa_list_literal_tag` answers `"tuple:<elem>"` rather than folding tuples
+into `"list"`. `VKind.TUPLE` exists and `ValueType.from_old_tag` already parses
+the head; the one place downstream where the distinction is invisible is not a
+reason to destroy it everywhere else — that compression is precisely what the
+rest of this section is a list of.
+
+Teaching the producer to record tuples then broke a consumer, which is the
+expected direction of damage and worth stating as a rule: **a producer that
+starts telling the truth wakes every consumer that was relying on it staying
+quiet.** `_infer_type_tag` asked `kind == VKind.LIST` before believing a
+variable's `elem_type`, and returned a bare `ValueType(VKind.TUPLE)` — no
+element kind at all — for a tuple literal, where the list arm one line above
+called `_infer_list_elem_type`. Neither could misfire while no tuple ever
+carried an element kind. The moment one did, `node[1]` on a `tuple:mixed`
+parameter fell through to `_llvm_type_tag`, which reports the loaded i64 as
+INT; `for` chooses its loop shape from that answer, so the native list loop
+called `list_length` on an FpyValue. `_LIST_LIKE = (VKind.LIST, VKind.TUPLE,
+VKind.DEQUE)` had been sitting a few lines under `VKind` since it was
+introduced, commented as the kinds that "support iteration, append, len", with
+**zero** references anywhere in the file. Its first use is this fix. A grouping
+constant that nothing consults is not an abstraction, it is a note-to-self —
+and the note was right.
 
 **A call's type is the callee's return type — never its arguments'.** Three
 independent passes classify an expression's kind, and all three ended a chain of
