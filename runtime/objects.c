@@ -1521,7 +1521,14 @@ void fastpy_fv_binop(int32_t lt, int64_t ld, int32_t rt, int64_t rd,
                 int ov = 0;
                 int64_t iv = fpy_bigint_to_i64(result, &ov);
                 fpy_bigint_free(result);
-                *out_tag = FPY_TAG_INT;
+                /* `&`, `|` and `^` of two bools stay a bool in CPython --
+                 * `True & False` is `False`, not `0` -- while the shifts
+                 * widen to int (`True << 1` is `2`), and so does a mixed
+                 * bool/int pair (`True | 3` is `3`).  Tagging every result
+                 * INT printed `0` and `1` where CPython prints `False` and
+                 * `True`.  BUG-BOOL-PLUS-INT-YIELDS-FLOAT. */
+                *out_tag = (op <= 8 && lt == FPY_TAG_BOOL && rt == FPY_TAG_BOOL)
+                    ? FPY_TAG_BOOL : FPY_TAG_INT;
                 *out_data = iv;
             } else {
                 *out_tag = FPY_TAG_BIGINT;

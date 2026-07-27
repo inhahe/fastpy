@@ -630,6 +630,29 @@ precisely so NaN, which compares false against everything, takes the other
 edge — leaving the runtime to widen a large magnitude to a BigInt and to raise
 for NaN and infinity.
 
+**A bool is an int, so it belongs on the integer edge — in every copy of the
+split.** The inlined arithmetic fast paths choose between an integer edge and a
+float edge by testing the runtime tags, and they tested `== INT`, which a BOOL
+operand fails. The float edge is not merely a mislabelling for a bool: it
+answered `True % 2` with `5e-324` (an integer result handed back as an i64 and
+then tagged FLOAT, so its payload was read as a denormal) and made `True << 2`
+*raise*, because a float has no shift. `_fv_tag_is_integral` (INT or BOOL) is
+now the test, and it had to be applied in **three** places — the Add-specific
+split, the UNKNOWN-op-static-INT split, and the general `_uu` split. That
+count is the recurring lesson in this file: the same two-way split exists in
+several inlined copies plus the runtime, and a rule fixed in one copy is still
+wrong in the others (compare BUG-BIGINT-FV-RESULT-NOT-CONSUMED, which was the
+same shape).
+
+`True / 2` needs no special case, because the integer edge already returns a
+double for `Div` and the result is tagged from the *result type*, not from the
+edge taken. The genuine exception runs the other way: `&`, `|` and `^` of two
+bools stay a bool (`True & False` is `False`), while the shifts and any mixed
+bool/int pair widen — so the integer edge's result tag is a `select` on "both
+tags were BOOL", in codegen and in `fastpy_fv_binop` alike. Unary `+` is the
+same trap in miniature: it is the identity on the value but not on the type
+(`+True` is `1`), so emitting it as a no-op kept the BOOL tag.
+
 **A return that can promote needs both a `mixed` tag and the FV ABI.** These are
 decided in two places and either one alone is useless: `_duf_infer_ret_tag` can
 say `mixed` while `_duf_select_abi` still hands the function a bare i64, which

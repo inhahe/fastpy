@@ -36035,6 +36035,46 @@ class CodeGen:
             self.builder.icmp_unsigned(
                 "==", tag, ir.Constant(i32, FPY_TAG_BOOL)))
 
+    def _fv_tag_is_integral(self, tag: 'ir.Value') -> 'ir.Value':
+        """i1: does *tag* denote a value the integer edge can handle?
+
+        That is INT **or BOOL**.  CPython's `bool` is a subclass of `int` and
+        behaves as one in arithmetic — `True + 3` is `4`, `True << 2` is `4`,
+        `True % 2` is `1` — so a BOOL operand belongs on the same edge as an
+        INT one.  The inlined splits used to test `== INT` alone, which sent
+        every bool down the *float* edge: `[3, 4.5, True][2] + 3` printed
+        `4.0`, `True % 2` bitcast the integer result and printed `5e-324`,
+        and `True << 2` raised `unsupported operand type(s) for <<: 'float'
+        and 'float'`.  BUG-BOOL-PLUS-INT-YIELDS-FLOAT.
+        """
+        return self.builder.or_(
+            self.builder.icmp_unsigned(
+                "==", tag, ir.Constant(i32, FPY_TAG_INT)),
+            self.builder.icmp_unsigned(
+                "==", tag, ir.Constant(i32, FPY_TAG_BOOL)))
+
+    def _fv_int_result_tag(self, op, ltag, rtag) -> 'ir.Value':
+        """Tag for a result computed on the integer edge of an FV binop.
+
+        Almost always INT.  The one exception is CPython's rule that `&`, `|`
+        and `^` of two *bools* stay a bool — `True & False` is `False`, not
+        `0` — while every other operator on bools widens to a plain int
+        (`True + True` is `2`, `True << 1` is `2`).  So the bool result tag
+        is conditional on both operands being BOOL at runtime, which is only
+        knowable here as a `select`.
+        """
+        if (op not in (ast.BitAnd, ast.BitOr, ast.BitXor)
+                or ltag is None or rtag is None):
+            return ir.Constant(i32, FPY_TAG_INT)
+        both_bool = self.builder.and_(
+            self.builder.icmp_unsigned(
+                "==", ltag, ir.Constant(i32, FPY_TAG_BOOL)),
+            self.builder.icmp_unsigned(
+                "==", rtag, ir.Constant(i32, FPY_TAG_BOOL)))
+        return self.builder.select(both_bool,
+                                   ir.Constant(i32, FPY_TAG_BOOL),
+                                   ir.Constant(i32, FPY_TAG_INT))
+
     def _emit_binop_unknown(self, node, ltv, rtv, lk, rk, op):
         """Handle binop when either operand has VKind.UNKNOWN or FVALUE (runtime-tag dispatch)."""
         # Normalize FVALUE → UNKNOWN — both are runtime-tagged FpyValue
@@ -36116,12 +36156,11 @@ class CodeGen:
                           and _nr.type.width == 64
                           else self.builder.sext(_nr, i64)
                           if isinstance(_nr.type, ir.IntType) else _nr)
-                # Check if both are INT
+                # Check if both are integral (INT or BOOL — see
+                # `_fv_tag_is_integral`; a bool is an int in CPython)
                 _n_both_int = self.builder.and_(
-                    self.builder.icmp_unsigned(
-                        "==", l_tag, ir.Constant(i32, FPY_TAG_INT)),
-                    self.builder.icmp_unsigned(
-                        "==", r_tag, ir.Constant(i32, FPY_TAG_INT)))
+                    self._fv_tag_is_integral(l_tag),
+                    self._fv_tag_is_integral(r_tag))
                 _n_int_blk = self._new_block("unkn.num_int")
                 _n_flt_blk = self._new_block("unkn.num_flt")
                 _n_join = self._new_block("unkn.num_join")
@@ -36275,8 +36314,7 @@ class CodeGen:
                     _unkn_i64 = unkn_raw if unkn_raw.type.width == 64 \
                         else self.builder.sext(unkn_raw, i64)
             if _rt_tag is not None and _unkn_i64 is not None:
-                _is_int = self.builder.icmp_unsigned(
-                    "==", _rt_tag, ir.Constant(i32, FPY_TAG_INT))
+                _is_int = self._fv_tag_is_integral(_rt_tag)
                 _int_bb = self._new_block("unkn_int.iarith")
                 _flt_bb = self._new_block("unkn_int.farith")
                 _mrg_bb = self._new_block("unkn_int.merge")
@@ -36451,10 +36489,8 @@ class CodeGen:
             if (_ltag is not None and _rtag is not None
                     and _li64 is not None and _ri64 is not None):
                 _both_int = self.builder.and_(
-                    self.builder.icmp_unsigned(
-                        "==", _ltag, ir.Constant(i32, FPY_TAG_INT)),
-                    self.builder.icmp_unsigned(
-                        "==", _rtag, ir.Constant(i32, FPY_TAG_INT)))
+                    self._fv_tag_is_integral(_ltag),
+                    self._fv_tag_is_integral(_rtag))
                 _uu_int = self._new_block("unkn_uu.iarith")
                 _uu_flt = self._new_block("unkn_uu.farith")
                 _uu_mrg = self._new_block("unkn_uu.merge")
@@ -36500,18 +36536,21 @@ class CodeGen:
                 elif (isinstance(_uires.type, ir.IntType)
                         and _uires.type.width == 64):
                     _uidata = _uires
+                    # INT, or BOOL when `&`/`|`/`^` joined two bools — see
+                    # `_fv_int_result_tag`.
+                    _uu_scalar_tag = self._fv_int_result_tag(op, _ltag, _rtag)
                     if _uu_bigint_flag is not None:
                         _uitag = self.builder.select(
                             _uu_bigint_flag,
                             ir.Constant(i32, FPY_TAG_BIGINT),
-                            ir.Constant(i32, FPY_TAG_INT))
+                            _uu_scalar_tag)
                     else:
-                        _uitag = ir.Constant(i32, FPY_TAG_INT)
+                        _uitag = _uu_scalar_tag
                 else:
                     _uidata = self.builder.sext(_uires, i64) \
                         if isinstance(_uires.type, ir.IntType) \
                         else self.builder.ptrtoint(_uires, i64)
-                    _uitag = ir.Constant(i32, FPY_TAG_INT)
+                    _uitag = self._fv_int_result_tag(op, _ltag, _rtag)
                 self.builder.branch(_uu_mrg)
                 _uu_int_end = self.builder.block
                 # ── float path: tag-aware conversion ──
@@ -37861,7 +37900,22 @@ class CodeGen:
                     result = self.builder.call(
                         self.runtime["obj_call_method0"], [obj, name_ptr])
                     return self._ensure_ptr(result)
-            return self._emit_expr_value(node.operand)
+            _pos = self._emit_expr_value(node.operand)
+            # Unary `+` is the identity on the *value* but not on the type:
+            # `+True` is `1`, not `True`, because bool has no `__pos__` and
+            # inherits int's.  Returning the operand untouched kept the BOOL
+            # tag and printed `True`.  Only the tag changes, and only for
+            # BOOL — every other tag is genuinely unchanged.
+            # BUG-BOOL-PLUS-INT-YIELDS-FLOAT.
+            if isinstance(_pos.type, ir.LiteralStructType) and _pos.type == fpy_val:
+                _pt = self.builder.extract_value(_pos, 0)
+                _pd = self.builder.extract_value(_pos, 1)
+                _pt = self.builder.select(
+                    self.builder.icmp_unsigned(
+                        "==", _pt, ir.Constant(i32, FPY_TAG_BOOL)),
+                    ir.Constant(i32, FPY_TAG_INT), _pt)
+                return self._fv_build_from_slots(_pt, _pd)
+            return _pos
         elif isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Invert):
             # __invert__ on user-class objects
             if self._is_obj_expr(node.operand):

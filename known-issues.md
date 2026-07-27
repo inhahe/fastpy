@@ -3264,6 +3264,24 @@ consumer is wrong. `abs(d[1])` is wrong for the same reason and was originally
 filed under BUG-ABS-OF-TAGGED-VALUE, but it is abs-independent — the repro above
 has no `abs()` in it.
 
+**Sharper repro (2026-07-27) — `print` is wrong too.** When the values being
+stored are themselves *runtime-tagged* (an `FpyValue` variable rather than a
+literal), the tag is dropped on the way in and the load hands back a bare i64
+tagged INT, so even `print` shows the raw payload. Should print
+`3 True 4.5 s None`:
+```python
+m = [3, True, 4.5, "s", None]
+n, t, fl, st, no = m[0], m[1], m[2], m[3], m[4]
+d = {"n": n, "t": t, "f": fl, "s": st, "o": no}
+print(d["n"], d["t"], d["f"], d["s"], d["o"])
+# prints: 3 1 4616752568008179712 140701479720616 0
+```
+`4616752568008179712` is the bit pattern of `4.5` and `140701479720616` is the
+string's address. A *literal*-valued dict (`{"a": True, "b": 3, "c": 4.5}`) is
+fine, and so is the list equivalent — it is specifically an FV-tagged value
+crossing the dict store/load boundary. This is the same missing
+`fastpy_dict_get_fv` as above, seen from the store side.
+
 **Where:** the dict-subscript load path in `CodeGen`. The list equivalent is
 already correct (`fastpy_list_get_fv` returns a tag), so the fix is presumably
 the same shape: a `fastpy_dict_get_fv` and a `_scan_fv_forced_locals` that knows
@@ -4195,11 +4213,23 @@ two ops rather than doing pointer arithmetic.
 
 **Severity:** silently wrong values.
 
-### BUG-BOOL-PLUS-INT-YIELDS-FLOAT. Adding two tagged values takes the float edge unless *both* are INT — 2026-07-27
+### ~~BUG-BOOL-PLUS-INT-YIELDS-FLOAT. Adding two tagged values takes the float edge unless *both* are INT~~ — FIXED 2026-07-27
 
 **What:** `True + 3` on two runtime-tagged values gives `4.0`, not `4`. The value
 is right; only its type is wrong, so it prints with a spurious `.0` and infects
 everything downstream.
+
+**It was worse than "only its type".** Filing it as a cosmetic tag bug
+understated it — the float edge is the wrong edge for a bool, not just a
+badly-labelled one:
+
+- `True % 2` printed **`5e-324`**. `_emit_float_binop` handed back the integer
+  result `1` as an i64, the float edge tagged it FLOAT unconditionally, and the
+  payload `0x1` was read as a denormal double.
+- `True << 2` **raised** `TypeError: unsupported operand type(s) for <<:
+  'float' and 'float'` — a float has no shift, so an operator CPython answers
+  `4` for aborted the program.
+- `True // 1` printed `0.0` where CPython says `1`.
 
 **Reproduce** — should print `4 4.5`:
 ```python
@@ -4217,13 +4247,37 @@ Note this is *not* the same hole as BUG-BIGINT-FV-RESULT-NOT-CONSUMED, which was
 about non-scalar tags reaching the float edge and having a *pointer* bitcast to a
 double. That one is fixed: the float edge is now guarded by a real "both operands
 are plain scalars" check, and BOOL genuinely is a plain scalar, so it still takes
-it. The remaining fix is narrower — widen the integer test from "both INT" to
-"both INT-or-BOOL", and make the result tag INT — but it has to be done in every
-inlined split (the Add-specific `unkn.num_*` path and the general `_uu` path),
-and it must not disturb `True / 2`, which really is a float.
+it.
 
-**Severity:** silently wrong *type*; `print` shows it, and an int-only consumer
-downstream (indexing, `range`, `%` formatting) may reject or mis-handle it.
+**Fixed:** the integer test was widened from "both INT" to "both INT-or-BOOL"
+via a new `_fv_tag_is_integral` helper in `compiler/codegen.py`, applied to
+**three** inlined splits, not the two the original note predicted:
+
+1. `_n_both_int` — the Add-specific `unkn.num_*` split.
+2. `_is_int` — the UNKNOWN-op-static-INT split (`unkn_int.*`). This is the one
+   `True % 2` took, and the one the original note missed.
+3. `_both_int` — the general `_uu` split.
+
+`True / 2` is undisturbed because the *integer* edge already returns a double
+for `Div`: `_emit_int_binop` handles that, and the surrounding code tags the
+result FLOAT when the result type is a double. Nothing had to special-case it.
+
+Two adjacent defects surfaced while testing and are fixed with it:
+
+- **`&`, `|`, `^` of two bools must stay a bool.** `True & False` is `False`
+  in CPython, not `0`, while the shifts and any mixed bool/int pair widen to
+  int (`True << 1` is `2`, `True | 3` is `3`). Both edges needed it: the
+  inlined one via `_fv_int_result_tag` (a `select` on "both tags BOOL at
+  runtime"), and the runtime's `fastpy_fv_binop` bitwise block in
+  `runtime/objects.c`, which tagged every result INT.
+- **`+True` is `1`, not `True`.** Unary `+` was emitted as a pure identity, so
+  it handed the BOOL tag straight back. It now retags BOOL→INT (and only
+  BOOL) when its operand is an `FpyValue`.
+
+**Test:** `tests/regressions/bool_is_an_int_in_tagged_arithmetic.py`.
+
+**Severity:** was silently wrong *type* for `+`/`-`/`*`, a silently wrong
+*value* for `%` and `//`, and a hard `TypeError` for `<<`/`>>`.
 
 ### ~~BUG-BIGINT-RETURNED-FROM-FUNCTION-LOSES-TAG. A BigInt returned through a call comes back as a number~~ — FIXED 2026-07-27
 
