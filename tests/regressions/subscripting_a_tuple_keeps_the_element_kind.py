@@ -120,4 +120,50 @@ for v in nested[1]:
     acc += v
 print(nested[0], acc)
 
+
+# ── The tuple reached through a *return value* rather than a name ────────
+# `_csa_propagate_ret_types`'s direct-return arm chain knew `ast.List`,
+# `ast.Dict`, `ast.Set` and bytes constants but not `ast.Tuple`, so `f()`
+# got no recorded return tag at all and `f()[1]` was read at the INT
+# element default: `len()` answered 0 and iterating it segfaulted.  This
+# was the fifth arm that had to learn the word "tuple"; the list spelling
+# `g()` below was correct the whole time.
+
+def returns_tuple():
+    return ("x", [1, 2, 3])
+
+
+def returns_list():
+    return ["x", [1, 2, 3]]
+
+
+r = returns_tuple()
+print(r[0], len(r[1]))
+for v in returns_tuple()[1]:
+    print(v)
+
+s = returns_list()
+print(s[0], len(s[1]))
+for v in returns_list()[1]:
+    print(v)
+
+
+# The same return, with the other element kinds.
+
+def returns_pair_of_strs():
+    return ("ab", "cde")
+
+
+def returns_pair_of_floats():
+    return (0.5, 1.5)
+
+
+def returns_pair_of_dicts():
+    return ({"a": 1}, {"b": 2, "c": 3})
+
+
+print(len(returns_pair_of_strs()[1]), returns_pair_of_strs()[0])
+print(returns_pair_of_floats()[1] + 1.0)
+print(len(returns_pair_of_dicts()[1]), returns_pair_of_dicts()[1]["c"])
+
 print("end")

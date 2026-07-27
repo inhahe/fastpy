@@ -1060,10 +1060,13 @@ name fell to a bare `"list"`, which its consumer defaults to `VKind.INT`, so a
 BigInt argument compared by address and a float argument was read as its own
 bits. All three now go through `_csa_list_literal_tag`, a thin wrapper over the
 `_csa_list_elem_tag` classifier the return path already used, so a literal is
-typed by the same rules wherever it is written. (A **fourth** copy came to light
-later, inside `_csa_propagate_ret_types`' own `local_types` scan — see the tuple
-paragraph below — so "three" was itself an undercount, which is the usual shape
-of this problem: you find the copies by watching a fix fail to take effect.)
+typed by the same rules wherever it is written. (A **fourth** and then a
+**fifth** copy came to light later, both inside `_csa_propagate_ret_types` —
+its `local_types` scan and its direct-return arm chain, eighty lines apart in
+the same function; see the tuple paragraph below. So "three" was itself an
+undercount, twice, which is the usual shape of this problem: you find the
+copies by watching a fix fail to take effect, which means you only ever find
+the ones some test happens to exercise.)
 `_csa_list_is_mixed` survives as
 a *fallback* rather than being replaced: the classifier declines as soon as any
 element is unclassified and so cannot see the heterogeneity in `[1, some_name]`,
@@ -1153,15 +1156,21 @@ correct, the one-assignment form wrong — and the reason it survives so long is
 that `print` reads the *runtime* tag and therefore keeps printing `(10, 20)`
 throughout.
 
-Closing it took four arms, and only the first stops the crash: the return-type
+Closing it took five arms, and only the first stops the crash: the return-type
 scan (which also decides the ABI, so a tag-only fix would still have had no
-slot for the pointer), `_build_local_vt`, `_csa_build_var_types`, and the
-fourth classifier copy inside `_csa_propagate_ret_types`. The last three carry
-the *element* kind rather than the pointer-ness, and without them
-`(1.5, 2.5)[0]` still read a double's bits as an integer. This is the recurring
-count in this subsystem: one hole is never one hole, because the same question
-is asked at three or four points on a path and each answer tests clean in
-isolation.
+slot for the pointer), `_build_local_vt`, `_csa_build_var_types`, and *two*
+separate classifier copies inside `_csa_propagate_ret_types` — its `local_types`
+scan and, eighty lines below, its direct-return arm chain, which had arms for
+list, dict, set and bytes and none for tuple, so `return ("x", [1, 2, 3])`
+recorded no return tag at all. The last four carry the *element* kind rather
+than the pointer-ness, and without them `(1.5, 2.5)[0]` still read a double's
+bits as an integer. This is the recurring count in this subsystem: one hole is
+never one hole, because the same question is asked at four or five points on a
+path and each answer tests clean in isolation. Five is also the count *found*,
+not the count that exists — the fifth surfaced after the suite was green,
+caught only because a probe happened to spell a returned tuple as a literal
+rather than through a variable, and the honest reading of that is that the
+duplication itself is the bug and the arms are symptoms.
 
 `_csa_list_literal_tag` answers `"tuple:<elem>"` rather than folding tuples
 into `"list"`. `VKind.TUPLE` exists and `ValueType.from_old_tag` already parses

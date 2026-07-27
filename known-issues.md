@@ -201,7 +201,7 @@ was given a bare i64 return. `print` kept working throughout because it reads
 the runtime tag rather than the static one, which is what made the gap easy to
 miss for so long.
 
-**Fixed by** four separate arms plus a widened guard, none of which is
+**Fixed by** five separate arms plus a widened guard, none of which is
 sufficient alone:
 
 - `_duf_detect_ret_type`'s local-assignment scan (codegen.py ~11270) now
@@ -222,6 +222,17 @@ sufficient alone:
   element-refining block just below (~8013) had `VKind.LIST` hard-coded and
   now accepts `VKind.TUPLE` too, carrying the head through so a tuple stays a
   tuple.
+- `_csa_propagate_ret_types`' *direct-return* arm chain (~7987) — a **fifth**
+  copy, in the same function as the fourth and eighty lines below it, found
+  after the other four were in and the suite was green. It has arms for
+  `(ast.List, ast.ListComp)`, `(ast.Dict, ast.DictComp)`, `(ast.Set,
+  ast.SetComp)` and bytes constants, and had none for `ast.Tuple`, so
+  `return ("x", [1, 2, 3])` recorded no `_func_ret_types` entry at all and the
+  caller read `f()[1]` at the INT element default — `len()` answered `0` and
+  iterating it segfaulted. It now calls `_csa_list_literal_tag` rather than the
+  bare `_csa_list_elem_tag` the list arm above it uses, so a heterogeneous
+  tuple reaches the `"mixed"` fallback instead of a bare `"tuple"` that
+  consumers default back to INT.
 
 `_csa_list_elem_tag` and `_csa_list_literal_tag` were generalized from `ast.List`
 to `(ast.List, ast.Tuple)` to serve those call sites. `_csa_list_literal_tag`
@@ -234,10 +245,16 @@ Deliberately **not** done: replacing the refine block at ~8013 with a call to
 `_csa_list_literal_tag`. That block has a `"ptr:list"` special case for a list
 of lists, and unifying would have spelled it `"list:list"`; nothing cheaply
 proves no downstream string comparison depends on the exact spelling. The
-fourth-copy problem is therefore reduced, not closed.
+duplicate-classifier problem is therefore reduced, not closed — five copies is
+the count *found*, not the count that exists, and the fifth was found only
+because a probe happened to spell a returned tuple as a literal rather than
+through a variable.
 
-Regression test:
-`tests/regressions/a_tuple_held_in_a_variable_is_still_a_tuple.py`.
+Regression tests:
+`tests/regressions/a_tuple_held_in_a_variable_is_still_a_tuple.py` (the local
+variable) and the returned-tuple section at the end of
+`tests/regressions/subscripting_a_tuple_keeps_the_element_kind.py` (the fifth
+arm).
 
 **It woke a consumer** — see BUG-TUPLE-SUBSCRIPT-ELEM-KIND-LOST immediately
 below, which the full suite caught as an access violation in
@@ -4419,6 +4436,129 @@ spellings of the same read**: `x = outer[0]; x[0]` correct but `outer[0][0]`
 wrong; `str` arguments correct but `float` ones wrong; `p = pick(...)` correct
 but `pick(...) ==` wrong. Each asymmetry named the exact reader that was
 missing an arm, which guessing would not have.
+
+### BUG-METHOD-RETURN-ELEM-KIND-LOST. A container returned from a *method* has no element kind, though the same body in a plain function does — 2026-07-27
+
+**What** (both lines print `0`; CPython prints `2` and `3`):
+
+```python
+class C:
+    def m(self):
+        return ["b", [4, 5]]
+    def s(self):
+        return ["p", "qrs"]
+
+c = C()
+print(len(c.m()[1]))          # 0, CPython 2
+print(len(c.s()[1]))          # 0, CPython 3
+print(c.s()[1])               # 'qrs' — correct, because print reads the tag
+```
+
+Binding first makes no difference: `r = c.m(); len(r[1])` is `0` too. The
+identical body in a **plain function** is correct — `def g(): return ["x",
+[10, 20, 30]]` gives `len(g()[1]) == 3` — which is the asymmetry that names
+this. Tuples behave the same way; this is not a tuple bug (found while probing
+for one).
+
+**Root cause (suspected, not yet confirmed):** `_csa_propagate_ret_types`
+records element-carrying return tags in `_func_ret_types`, keyed by *function*
+name, and `_infer_type_tag`'s call-subscript arm consults it. A method's return
+value goes through `_find_method_return_type` / `_method_returns_list`, which
+answer the *LLVM* type or a yes/no — "returns a pointer", "returns a list" —
+and carry no element kind at all. So `c.m()[1]` falls to the `VKind.INT`
+element default and `len()` measures a pointer.
+
+**Proper fix:** give methods the same element-carrying return record functions
+have — a `(class, method) -> tag` map populated by the same CSA pass, consulted
+wherever `_func_ret_types` is consulted today. This is the method-shaped half of
+BUG-RETURNED-LIST-ELEM-TAG-LOST and BUG-CALL-SUBSCRIPT-ELEM-KIND-LOST, both of
+which were fixed for functions only.
+
+**Severity:** medium. Silently wrong; no crash in the shapes probed, but the
+same wrong answer routes `for` to the native list loop, so a crash is reachable.
+
+**Pre-existing:** reproduced identically at `5441451^`, before any of the tuple
+work.
+
+### BUG-DICT-VALUE-CONTAINER-ELEM-KIND-LOST-ON-BIND. `d["k"][1]` is right but `e = d["k"]; e[1]` is not — 2026-07-27
+
+**What:**
+
+```python
+d = {"k": ["a", [1, 2, 3]]}
+print(len(d["k"][1]))     # 3 — correct
+e = d["k"]
+print(len(e[1]))          # 0, CPython 3
+
+d2 = {"k": ["a", "bcd"]}
+e2 = d2["k"]
+print(e2[1], len(e2[1]))  # "bcd 0", CPython "bcd 3"
+```
+
+The *direct* subscript chain keeps the element kind and the **one-assignment**
+form loses it — the same diagnostic shape as BUG-TUPLE-RETURN-SEGFAULTS, in a
+different producer. Tuples behave the same; not a tuple bug.
+
+**Root cause (suspected, not yet confirmed):** the assignment `e = d["k"]`
+records `e` as a bare `"list"` — `_dict_var_list_values` is a *set of names*,
+so it can say "this dict's values are lists" and nothing about what the lists
+hold. Reading `d["k"]` inline instead re-derives the value type from the dict
+literal, where the element kind is still visible.
+
+**Proper fix:** the same one as the `elem_type=VKind.INT` conflation generally —
+record a dict's value type as a `ValueType`, not membership in one of the
+`_dict_var_*_values` name-sets. Those sets are the boolean-kind-set pattern
+again (`_dict_var_int_values`, `_dict_var_list_values`, `_dict_var_dict_values`,
+`_dict_var_obj_values`), one level down, and they lose exactly what a
+`ValueType` would keep. See BUG-DICT-VALUE-STATIC-KIND.
+
+**Severity:** medium. Silently wrong.
+
+**Pre-existing:** reproduced identically at `5441451^`.
+
+### BUG-CTOR-PARAM-CONTAINER-ATTR-ELEM-KIND-LOST. `self.t = t` in `__init__` loses the container's element kind, and iterating it segfaults — 2026-07-27
+
+**What** (CPython prints `3` / `1` / `2` / `3`; compiled prints `0` then
+segfaults):
+
+```python
+class C:
+    def __init__(self, t):
+        self.t = t
+
+c = C(["a", [1, 2, 3]])
+print(len(c.t[1]))
+for v in c.t[1]:
+    print(v)
+```
+
+Writing the literal *inside* `__init__` instead — `self.t = ["a", [1, 2, 3]]` —
+is correct. The tuple spelling fails the same way, so this is not a tuple bug.
+
+**Root cause (suspected, not yet confirmed):** `_detect_class_container_attrs`
+(codegen.py ~16756) records `self.attr` as a list attr from the *shape of the
+assigned expression*, with one arm (~16906) for "assigned a parameter whose
+call-site type is LIST or TUPLE". That arm records **membership in a name-set**
+— `list_attrs` — and a name-set cannot carry an element kind, so the attribute
+is a list of unknown, i.e. `VKind.INT`. `len(c.t[1])` therefore measures a
+pointer and `for` picks the native list loop over an FpyValue.
+
+Note the `len()` answers `0` here where the literal-inside-`__init__` case
+answers correctly, so the attribute is being seen as a list at all — it is only
+the *element* kind that is missing. This is the class-attribute instance of the
+same `elem_type=VKind.INT` conflation catalogued elsewhere in this file.
+
+**Proper fix:** replace `_class_container_attrs`' `(set[str], set[str])` with a
+`dict[str, ValueType]` per class, so an attribute records its full type rather
+than which of two buckets it fell into. That is the same refactor
+BUG-RETURN-OF-BYTES-OR-BIGINT-VAR-PRINTS-POINTER wants for `str_vars`/
+`list_vars`/`dict_vars`/`obj_vars`, applied to attributes: **the recurring
+mistake in this compiler is a set of names where a map to a type belongs.**
+
+**Severity:** high — it segfaults, and `self.x = param` in `__init__` is one of
+the most ordinary things a Python program does.
+
+**Pre-existing:** reproduced identically at `5441451^`.
 
 ### BUG-NESTED-LIST-ARG-INNER-ELEM-LOST. A nested list literal argument keeps the outer element kind but not the inner — 2026-07-27
 

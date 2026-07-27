@@ -7984,6 +7984,20 @@ class CodeGen:
                         else:
                             _func_ret_types[fname] = (
                                 f"list:{_elem}" if _elem else "list")
+                    elif isinstance(n.value, ast.Tuple):
+                        # `return ("x", [1, 2, 3])` had no arm, so the function
+                        # got no `_func_ret_types` entry and the caller read
+                        # `f()[1]` at the INT element default: `len()` answered
+                        # 0 and iterating it segfaulted.  The list spelling of
+                        # the same return was correct throughout.  This is the
+                        # *fifth* place that needed to learn the word "tuple";
+                        # see BUG-TUPLE-RETURN-SEGFAULTS for the other four.
+                        # `_csa_list_literal_tag` rather than the bare
+                        # `_csa_list_elem_tag` above, so a heterogeneous tuple
+                        # reaches the "mixed" fallback instead of a bare
+                        # "tuple" that consumers default back to INT.
+                        _func_ret_types[fname] = self._csa_list_literal_tag(
+                            n.value, local_types)
                     elif isinstance(n.value, (ast.Dict, ast.DictComp)):
                         _func_ret_types[fname] = "dict"
                     elif isinstance(n.value, (ast.Set, ast.SetComp)):
