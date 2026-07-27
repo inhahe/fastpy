@@ -4108,30 +4108,54 @@ producer and consumer.
 silent truncation, not an error. Noted here because
 `tests/regressions/repr_quote_choice.py` has to skip the `\x00` case for it.
 
-### BUG-SUITE-DEFAULT-TIMEOUT-FLAKES-UNDER-LOAD. Regression tests spuriously fail on a busy machine — 2026-07-27
+### ~~BUG-SUITE-DEFAULT-TIMEOUT-FLAKES-UNDER-LOAD. Regression tests spuriously fail on a busy machine~~ — FIXED 2026-07-27
 
-**What:** `tests/conftest.py` gives every collected regression/program file a
-fixed `timeout = 10.0` seconds covering compile + run + the CPython reference
-run. On an otherwise-busy machine that is not enough headroom for the slower
-files, and the test reports a failure rather than a timeout.
+**What:** `tests/conftest.py` gave every collected regression/program file a
+fixed `timeout = 10.0` seconds covering the run and the CPython reference
+run. On an otherwise-busy machine that was not enough headroom for the slower
+files, and the test reported a failure rather than a timeout.
 
 **Reproduce:** run `pytest tests/ -q` while a large native build is running.
-Observed once: `list_literal_heap_numeric_elems` failed in a full run that
-took 627 s, then passed standalone in 1.77 s and passed again in a quiet full
-run (1009 passed, 741 s). Nothing in the failure output identified a timeout,
-which is what made it expensive to diagnose.
+Observed twice. First: `list_literal_heap_numeric_elems` failed in a full run
+that took 627 s, then passed standalone in 1.77 s and passed again in a quiet
+full run (1009 passed, 741 s). Then, on the run that prompted this fix,
+`int_float_of_tagged_value` failed in two consecutive full runs
+(1 failed / 1016 passed, 593 s) while passing standalone in 1 s, passing in
+`pytest tests/regressions -q` (334 passed), and finally passing in a third
+full run (1017 passed, 570 s) with nothing changed. Neither failure output
+identified a timeout, which is what made both expensive to diagnose.
 
-**Where:** the `timeout` defaults in the `assert_compiles` / `assert_file_compiles`
-fixtures and the collection hook in `tests/conftest.py`.
+**Where:** the `timeout` defaults in the `assert_compiles` /
+`assert_file_compiles` fixtures in `tests/conftest.py`, and `diff_test` /
+`diff_test_file` / `run_cpython` / `run_executable` in `tests/harness.py`.
 
-**Proper fix:** two parts. Raise the default (the slowest legitimate file is
-~2 s, so 10 s is only a 5× margin — 30 s costs nothing on a green run), and
-make a timeout *report itself as a timeout* instead of as an output mismatch,
-so the next occurrence is one line to diagnose instead of a bisect.
+**Fixed:** both halves of the proper fix.
 
-**Severity:** no product impact, but a suite that fails randomly under load
-trains you to re-run rather than investigate, which is how a real regression
-gets waved through.
+1. The budget is now one shared `DEFAULT_TIMEOUT = 30.0` in
+   `tests/harness.py`, which `conftest.py`'s two fixtures import rather than
+   restating. The slowest legitimate file runs in ~2 s, so this is a 15×
+   margin instead of a 5× one, and it still bounds a genuine hang. The
+   headroom costs nothing on a green run because nothing waits on it.
+2. A timeout reports itself. `diff_test` checks `compiled_result.timed_out`
+   *before* the generic output diff and fails with `compiled program timed
+   out after 30s (CPython finished the same program in 0.04s)`. Previously a
+   killed process fell through to the diff, which described it as `stdout
+   differs; exit code: CPython=0, Compiled=-1` — indistinguishable from a
+   real miscompilation. `DiffResult.detail()` also stops dumping the
+   empty-vs-expected stdout pair in that case, since the summary line is the
+   whole story.
+
+`RunResult` grew a `duration` field for the same reason: on the next
+occurrence it separates "this hung" (normally 0.1 s, burned the whole
+budget) from "this was merely slow" (took 29.9 s of 30 s).
+
+Note the asymmetry that stays: a *CPython* timeout is still a SKIP, not a
+FAIL — a reference run that won't finish means the test can't be judged.
+Only the compiled binary timing out is a failure.
+
+**Severity:** was no product impact, but a suite that fails randomly under
+load trains you to re-run rather than investigate, which is how a real
+regression gets waved through.
 
 ### BUG-DECIMAL-FLOAT-COMPARE-INEXACT. Comparing a Decimal against a float rounds the Decimal — 2026-07-27
 

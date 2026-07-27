@@ -14,7 +14,7 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
-from tests.harness import diff_test, diff_test_file, DiffResult
+from tests.harness import diff_test, diff_test_file, DiffResult, DEFAULT_TIMEOUT
 
 
 @pytest.fixture
@@ -29,7 +29,7 @@ def assert_compiles():
     Skips if the compiler can't handle the program yet.
     Fails if the compiled output differs from CPython.
     """
-    def _assert(source: str, timeout: float = 10.0) -> DiffResult:
+    def _assert(source: str, timeout: float = DEFAULT_TIMEOUT) -> DiffResult:
         result = diff_test(source, timeout)
         if result.skipped:
             pytest.skip(result.reason)
@@ -48,7 +48,7 @@ def assert_file_compiles():
         def test_something(assert_file_compiles):
             assert_file_compiles(Path("tests/programs/test_arith.py"))
     """
-    def _assert(path: Path, timeout: float = 10.0) -> DiffResult:
+    def _assert(path: Path, timeout: float = DEFAULT_TIMEOUT) -> DiffResult:
         result = diff_test_file(path, timeout)
         if result.skipped:
             pytest.skip(result.reason)

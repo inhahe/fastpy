@@ -1302,6 +1302,26 @@ silent, per-call-site, and invisible to a suite written with string paths.
 (`test_differential.py`, `test_full_suite.py`, `test_comprehensive.py`,
 `test_cross_target.py`). Config in `pyproject.toml` (`[tool.pytest.ini_options]`).
 
+Every `.py` in `tests/regressions/` and `tests/programs/` is auto-collected by
+`pytest_collect_file` in `tests/conftest.py` and run through
+`tests/harness.py`'s `diff_test`: run under CPython, compile, run the binary,
+compare stdout and exit code byte-for-byte. The three outcomes are PASS, SKIP
+("the compiler can't build this yet") and FAIL ("it built and then lied").
+
+**The two timeout outcomes are deliberately not the same.** One budget,
+`harness.DEFAULT_TIMEOUT` (30 s), covers the CPython reference run and the
+compiled run; `conftest.py`'s fixtures import it rather than restating it, so
+there is one number to change. A *CPython* timeout is a **SKIP** — a reference
+run that will not finish leaves nothing to judge the binary against. A
+*compiled* timeout is a **FAIL**, and it is checked before the generic output
+diff so that it reports as `compiled program timed out after 30s`; left to the
+diff, a killed process looks exactly like a miscompilation (`stdout differs`,
+`exit code -1`), which cost two bisects before it was fixed. `RunResult`
+carries a `duration` so the next one separates a hang from mere load. The
+budget is deliberately generous — the slowest legitimate file runs in ~2 s,
+and headroom costs nothing on a green run, whereas a suite that fails randomly
+under load trains you to re-run instead of investigate.
+
 ## Git workflow (project rule)
 
 Never `git push` from this working directory. The user pushes by copying files to

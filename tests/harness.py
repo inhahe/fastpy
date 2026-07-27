@@ -27,6 +27,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -36,6 +37,17 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 from compiler.pipeline import compile_source, CompileResult
+
+
+# Wall-clock budget for one differential test: the CPython reference run and
+# the compiled binary each get this long. It bounds a genuine hang (an
+# infinite loop in generated code) without being tight enough to fire on a
+# busy machine — the slowest legitimate file in the suite runs in ~2 s, so
+# this is a 15x margin, and on a green run the headroom costs nothing because
+# nothing waits on it. It used to be 10 s, which was enough for a full run
+# under load to fail a test that passed standalone seconds later.
+# BUG-SUITE-DEFAULT-TIMEOUT-FLAKES-UNDER-LOAD.
+DEFAULT_TIMEOUT = 30.0
 
 
 # Substrings that identify an LLVM *verifier* rejection rather than a fastpy
@@ -74,6 +86,11 @@ class RunResult:
     stderr: str
     exit_code: int
     timed_out: bool = False
+    # Wall-clock seconds the process ran for. Reported on a timeout so the
+    # next occurrence separates "this hung" from "this was merely slow":
+    # a program that normally finishes in 0.1 s and burned the whole budget
+    # is an infinite loop, one that took 29.9 s of a 30 s budget is load.
+    duration: float = 0.0
 
 
 @dataclass
@@ -110,6 +127,11 @@ class DiffResult:
         """Multi-line detail for failure diagnosis."""
         lines = [self.summary()]
         if self.failed:
+            # A killed process has no output to diff, so dumping "(empty)"
+            # against CPython's stdout would bury the one fact that matters
+            # — which the summary line already states.
+            if self.compiled is not None and self.compiled.timed_out:
+                return "\n".join(lines)
             # A failure with no compiled run is an invalid-IR rejection: the
             # compiler errors are the whole story.
             if self.compiled is None and self.compile_result:
@@ -137,12 +159,13 @@ class DiffResult:
         return "\n".join(lines)
 
 
-def run_cpython(source: str, timeout: float = 10.0) -> RunResult:
+def run_cpython(source: str, timeout: float = DEFAULT_TIMEOUT) -> RunResult:
     """
     Run a Python source string under CPython and capture output.
 
     Uses the same Python interpreter that's running the test suite.
     """
+    started = time.monotonic()
     try:
         proc = subprocess.run(
             [sys.executable, "-c", source],
@@ -157,6 +180,7 @@ def run_cpython(source: str, timeout: float = 10.0) -> RunResult:
             stdout=proc.stdout,
             stderr=proc.stderr,
             exit_code=proc.returncode,
+            duration=time.monotonic() - started,
         )
     except subprocess.TimeoutExpired:
         return RunResult(
@@ -164,11 +188,13 @@ def run_cpython(source: str, timeout: float = 10.0) -> RunResult:
             stderr="Timed out",
             exit_code=-1,
             timed_out=True,
+            duration=time.monotonic() - started,
         )
 
 
-def run_executable(exe_path: Path, timeout: float = 10.0) -> RunResult:
+def run_executable(exe_path: Path, timeout: float = DEFAULT_TIMEOUT) -> RunResult:
     """Run a compiled executable and capture output."""
+    started = time.monotonic()
     try:
         # Ensure Python DLLs (python3XX.dll) are on PATH for the compiled
         # executable, which links against the CPython bridge.
@@ -188,6 +214,7 @@ def run_executable(exe_path: Path, timeout: float = 10.0) -> RunResult:
             stdout=proc.stdout,
             stderr=proc.stderr,
             exit_code=proc.returncode,
+            duration=time.monotonic() - started,
         )
     except subprocess.TimeoutExpired:
         return RunResult(
@@ -195,6 +222,7 @@ def run_executable(exe_path: Path, timeout: float = 10.0) -> RunResult:
             stderr="Timed out",
             exit_code=-1,
             timed_out=True,
+            duration=time.monotonic() - started,
         )
 
 
@@ -229,7 +257,7 @@ def _parse_compile_flags(source: str) -> dict:
 
 def diff_test(
     source: str,
-    timeout: float = 10.0,
+    timeout: float = DEFAULT_TIMEOUT,
 ) -> DiffResult:
     """
     Run the full differential test for a Python source string.
@@ -282,7 +310,28 @@ def diff_test(
     except OSError:
         pass
 
-    # Step 4: Compare outputs
+    # Step 4: Compare outputs.
+    #
+    # A timed-out binary is reported as a timeout, before the generic diff
+    # gets to describe it as "stdout differs; exit code: ..." — which is what
+    # a killed process looks like (no output, exit code -1) and is why the
+    # last occurrence cost a bisect to identify. CPython finished, so the
+    # program itself terminates; either codegen produced a loop that does
+    # not, or the machine was too busy to finish it inside the budget.
+    # BUG-SUITE-DEFAULT-TIMEOUT-FLAKES-UNDER-LOAD.
+    if compiled_result.timed_out:
+        return DiffResult(
+            status="fail",
+            reason=(
+                f"compiled program timed out after {timeout:g}s "
+                f"(CPython finished the same program in "
+                f"{cpython_result.duration:.2f}s)"
+            ),
+            cpython=cpython_result,
+            compiled=compiled_result,
+            compile_result=compile_result,
+        )
+
     differences: list[str] = []
 
     if cpython_result.stdout != compiled_result.stdout:
@@ -319,7 +368,7 @@ def diff_test(
     )
 
 
-def diff_test_file(path: Path, timeout: float = 10.0) -> DiffResult:
+def diff_test_file(path: Path, timeout: float = DEFAULT_TIMEOUT) -> DiffResult:
     """Run the differential test on a Python source file."""
     source = path.read_text(encoding="utf-8")
     return diff_test(source, timeout)
