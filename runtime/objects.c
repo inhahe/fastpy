@@ -990,6 +990,60 @@ void fastpy_fv_subscript(int32_t c_tag, int64_t c_data,
     *out_data = 0;
 }
 
+/* FpyValue slice — runtime dispatch for `c[a:b:s]` where the container's kind
+ * is only known at runtime (an untyped parameter, a json.loads result, ...).
+ * The static paths pick fastpy_str_slice or fastpy_list_slice by the compiler's
+ * guess, which silently produced an empty string when a list arrived on the
+ * str path.  Slicing preserves the container's kind, so the tag is echoed back
+ * rather than derived from the elements. */
+FpyList* fastpy_list_slice(FpyList*, int64_t, int64_t, int64_t, int64_t);
+FpyList* fastpy_list_slice_step(FpyList*, int64_t, int64_t, int64_t,
+                                int64_t, int64_t);
+extern const char* fastpy_str_slice(const char*, int64_t, int64_t,
+                                    int64_t, int64_t);
+extern const char* fastpy_str_slice_step(const char*, int64_t, int64_t,
+                                         int64_t, int64_t, int64_t);
+
+void fastpy_fv_slice(int32_t c_tag, int64_t c_data,
+                     int64_t start, int64_t stop, int64_t step,
+                     int64_t has_start, int64_t has_stop, int64_t has_step,
+                     int32_t *out_tag, int64_t *out_data) {
+    switch (c_tag) {
+        case FPY_TAG_LIST: {
+            /* Tuples carry FPY_TAG_LIST at runtime, so this arm covers both. */
+            FpyList *lst = (FpyList*)(intptr_t)c_data;
+            FpyList *res;
+            if (has_step) {
+                res = fastpy_list_slice_step(lst, start, stop, step,
+                                             has_start, has_stop);
+            } else {
+                res = fastpy_list_slice(lst, start, stop,
+                                        has_start, has_stop);
+            }
+            *out_tag = c_tag;
+            *out_data = (int64_t)(intptr_t)res;
+            return;
+        }
+        case FPY_TAG_STR:
+        case FPY_TAG_BYTES: {
+            const char *s = (const char*)(intptr_t)c_data;
+            const char *res;
+            if (has_step) {
+                res = fastpy_str_slice_step(s, start, stop, step,
+                                            has_start, has_stop);
+            } else {
+                res = fastpy_str_slice(s, start, stop, has_start, has_stop);
+            }
+            *out_tag = c_tag;
+            *out_data = (int64_t)(intptr_t)res;
+            return;
+        }
+    }
+    fastpy_raise(FPY_EXC_TYPEERROR, "object is not subscriptable");
+    *out_tag = FPY_TAG_NONE;
+    *out_data = 0;
+}
+
 /* FpyValue containment check — runtime dispatch for `x in container`.
  * Returns 1 if found, 0 if not found. */
 int32_t fastpy_fv_contains(int32_t c_tag, int64_t c_data,

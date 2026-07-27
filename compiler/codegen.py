@@ -1299,6 +1299,13 @@ class CodeGen:
         # AnnAssign handler can skip native alloca creation for them.
         self._unsafe_typed_vars: set[str] = set()
 
+        # Locals that must be given an FpyValue slot from their very first
+        # assignment because they can hold a value whose kind is only known
+        # at runtime.  Pre-scanned per scope by _scan_fv_forced_locals so the
+        # slot never has to be widened mid-body (which would strand loads
+        # already emitted against the narrower one).
+        self._fv_forced_locals: set[str] = set()
+
         # Per-variable integer overflow policy from Annotated markers or
         # constructor calls (unchecked_int / checked_int).
         # Maps variable name → "unchecked" | "checked".
@@ -1423,6 +1430,12 @@ class CodeGen:
         # void fastpy_fv_subscript(i32 c_tag, i64 c_data, i32 k_tag, i64 k_data, i32* out_tag, i64* out_data)
         ft = ir.FunctionType(void, [i32, i64, i32, i64, ir.PointerType(i32), ir.PointerType(i64)])
         self.runtime["fv_subscript"] = ir.Function(self.module, ft, name="fastpy_fv_subscript")
+        # void fastpy_fv_slice(i32 c_tag, i64 c_data, i64 start, i64 stop,
+        #                      i64 step, i64 has_start, i64 has_stop,
+        #                      i64 has_step, i32* out_tag, i64* out_data)
+        ft = ir.FunctionType(void, [i32, i64, i64, i64, i64, i64, i64, i64,
+                                    ir.PointerType(i32), ir.PointerType(i64)])
+        self.runtime["fv_slice"] = ir.Function(self.module, ft, name="fastpy_fv_slice")
         # i32 fastpy_fv_contains(i32 c_tag, i64 c_data, i32 v_tag, i64 v_data)
         ft = ir.FunctionType(i32, [i32, i64, i32, i64])
         self.runtime["fv_contains"] = ir.Function(self.module, ft, name="fastpy_fv_contains")
@@ -10580,6 +10593,14 @@ class CodeGen:
                         elif (self._tag_kind(ct) == VKind.STR
                                 and isinstance(n.value.slice, ast.Slice)):
                             returns_str = True
+                    elif n.value.value.id not in _ann_params:
+                        # An element of an untyped container is itself of
+                        # unknown kind — `s[0]` is a str when the caller passed
+                        # a str and an int when it passed a list of ints.  The
+                        # subscript already lowers to `fv_subscript`, which
+                        # answers with a runtime tag; saying "int" here would
+                        # only make the caller throw that tag away again.
+                        returns_untyped_param = True
                 elif (isinstance(n.value, ast.Name)
                         and n.value.id in param_names):
                     # Param pass-through: inherit type info from call site
@@ -11226,6 +11247,15 @@ class CodeGen:
         else:
             call_types = self._call_site_param_types.get(node.name, [])
 
+        # An annotation is evidence in its own right, independent of any call
+        # site; a parameter that has one is never treated as unknown below.
+        _annotated_params = {a.arg for a in node.args.args
+                             if a.annotation is not None}
+        _annotated_params |= {a.arg for a in node.args.posonlyargs
+                              if a.annotation is not None}
+        _annotated_params |= {a.arg for a in node.args.kwonlyargs
+                              if a.annotation is not None}
+
         for param_idx, param in enumerate(info.func.args):
             if info.uses_bare_abi:
                 # Bare-type ABI: params are already native types (i64/double).
@@ -11386,6 +11416,22 @@ class CodeGen:
                         if len(_sig_types) > 1:
                             tag = "mixed"  # conflicting types → runtime dispatch
                         elif _has_unknown_caller and _sig_types:
+                            tag = "mixed"
+                        elif (_has_unknown_caller
+                                and param.name not in _annotated_params):
+                            # Every caller unresolvable and no annotation:
+                            # nothing at all is known.  `static_type` is only
+                            # i64 because `param_types` falls back to it when
+                            # it has no evidence, so calling that "int" is the
+                            # same silence-as-scalar guess the bare ABI used to
+                            # make.  A str parameter tagged "int" loads as a
+                            # naked pointer-as-integer, which sends `s[i]` past
+                            # the `fv_subscript` runtime-dispatch arm and into
+                            # the CPython `__getitem__` bridge — NULL in pure
+                            # mode, and a fault on the next use.  The pointer
+                            # branch above already answers "mixed" here; this
+                            # is the same answer for the other half of the
+                            # split.  BUG-SUBSCRIPT-UNTYPED-PARAM-BRIDGE.
                             tag = "mixed"
                         elif (not _sigs and node.name in getattr(
                                 self, '_funcs_used_as_values', set())):
@@ -11602,7 +11648,8 @@ class CodeGen:
                  self._obj_var_class, self._native_vars,
                  self._unsafe_typed_vars, self._int_mode_vars,
                  self._current_fn_bare_abi,
-                 self._current_func_explicit_globals)
+                 self._current_func_explicit_globals,
+                 self._fv_forced_locals)
 
         # Set up function state
         self.function = info.func
@@ -11676,6 +11723,12 @@ class CodeGen:
 
         self._efd_store_parameters(node, info, _sig_override,
                                    bool_default_params, string_params, saved)
+
+        # Parameters already have their slots, so they are excluded; every
+        # other local that can hold a runtime-tagged value is given an
+        # FpyValue slot on its first store instead of being widened later.
+        self._fv_forced_locals = self._scan_fv_forced_locals(
+            node.body, set(self.variables) | self._current_func_params)
 
         # --typed mode: parse parameter annotations and create native allocas
         # with entry guards that verify the FpyValue tag matches the annotation.
@@ -11849,7 +11902,8 @@ class CodeGen:
          self._obj_var_class, self._native_vars,
          self._unsafe_typed_vars, self._int_mode_vars,
          self._current_fn_bare_abi,
-         self._current_func_explicit_globals) = saved
+         self._current_func_explicit_globals,
+         self._fv_forced_locals) = saved
 
     # -----------------------------------------------------------------
     # Class support
@@ -22154,7 +22208,19 @@ class CodeGen:
             self.builder.store(value, alloca)
             return
 
-        if not self._USE_FV_LOCALS or self._current_fn_bare_abi:
+        # A local the pre-scan marked as runtime-tagged keeps one FpyValue slot
+        # for the whole body: `t = 0` must not open an i64 slot that a later
+        # `t = t + mixed()` would abandon in favour of a second, wider one.
+        # Its kind is genuinely unknown, so the tag says so from the start —
+        # otherwise a load emitted before the widening would unbox a later
+        # iteration's value against the wrong kind.
+        # BUG-SUBSCRIPT-UNTYPED-PARAM-BRIDGE.
+        _forced_fv = (self._USE_FV_LOCALS and name in self._fv_forced_locals)
+        if _forced_fv:
+            type_tag = ValueType(VKind.MIXED)
+
+        if (not self._USE_FV_LOCALS
+                or (self._current_fn_bare_abi and not _forced_fv)):
             # Bare-type alloca: store native values directly (no FpyValue wrapping).
             # Used in both legacy mode (_USE_FV_LOCALS=False) and bare-ABI functions.
             if name in self.variables:
@@ -22616,6 +22682,91 @@ class CodeGen:
                     if rhs_kind is not None and rhs_kind != annotated[stmt.target.id]:
                         unsafe.add(stmt.target.id)
         return unsafe
+
+    def _scan_fv_forced_locals(self, body: list[ast.stmt],
+                                skip: set[str]) -> set[str]:
+        """Locals that must get an FpyValue slot from their first assignment.
+
+        A local's storage class is decided by its *first* store: `t = 0` in a
+        bare-ABI function gets an `i64` alloca.  If a later store needs an
+        `FpyValue` — because the value's kind is only known at runtime — the
+        store path used to allocate a *second*, wider slot and leave the first
+        one behind.  Straight-line code survives that, because every load after
+        the switch reads the new slot; a loop does not:
+
+            t = 0
+            while i < n:
+                t = t + at(lst, i)   # load reads the dead i64 slot,
+                i = i + 1            # store writes the FpyValue slot
+
+        The load was emitted before the widening, so it is bound to the old
+        alloca forever and the accumulation is thrown away on every iteration.
+        The same split silently drops the initial value when the widening
+        happens inside an `if`.
+
+        The fix is to never widen: decide up front which locals can hold a
+        runtime-tagged value and give those an FpyValue slot from the start,
+        so there is exactly one slot per name.  This scan answers that
+        question conservatively — a name is forced when it is assigned from an
+        expression whose kind is not statically known, which today means a
+        call to a function returning `mixed`, an element or slice of such a
+        value, or arithmetic involving one.  Over-approximating is safe: an
+        FpyValue slot is correct for any value, only wider than it needs to
+        be.  Parameters are excluded because their slots are created by
+        `_efd_store_parameters` before this runs.
+
+        Not descending into nested functions is deliberate: they are separate
+        scopes and get their own scan.  BUG-SUBSCRIPT-UNTYPED-PARAM-BRIDGE.
+        """
+        forced: set[str] = set()
+
+        def yields_mixed(e) -> bool:
+            if isinstance(e, ast.Name):
+                return e.id in forced
+            if isinstance(e, ast.Call):
+                if isinstance(e.func, ast.Name):
+                    if e.func.id in forced:
+                        return True
+                    return self._callee_returns_mixed(e.func.id)
+                return False
+            if isinstance(e, ast.Subscript):
+                # An element or slice of a runtime-tagged container is itself
+                # of unknown kind — that is exactly what fv_subscript and
+                # fv_slice hand back.
+                return yields_mixed(e.value)
+            if isinstance(e, ast.BinOp):
+                return yields_mixed(e.left) or yields_mixed(e.right)
+            if isinstance(e, ast.UnaryOp):
+                return yields_mixed(e.operand)
+            if isinstance(e, ast.IfExp):
+                return yields_mixed(e.body) or yields_mixed(e.orelse)
+            return False
+
+        def note(target, value) -> bool:
+            if not isinstance(target, ast.Name) or target.id in skip:
+                return False
+            if target.id in forced or not yields_mixed(value):
+                return False
+            forced.add(target.id)
+            return True
+
+        # A back edge can make a name mixed only on a later iteration
+        # (`t = t + f(x)` where `f` is mixed), so iterate to a fixpoint.
+        for _ in range(8):
+            changed = False
+            for stmt in self._walk_scope(body):
+                if isinstance(stmt, ast.Assign):
+                    for target in stmt.targets:
+                        changed |= note(target, stmt.value)
+                elif isinstance(stmt, ast.AugAssign):
+                    changed |= note(stmt.target, stmt.value)
+                elif isinstance(stmt, (ast.For, ast.AsyncFor)):
+                    # Iterating a runtime-tagged container yields elements of
+                    # the same unknown kind.
+                    changed |= note(stmt.target, stmt.iter)
+            if not changed:
+                break
+        return forced
 
     @staticmethod
     def _walk_scope(body: list[ast.stmt]):
@@ -46195,14 +46346,19 @@ class CodeGen:
         # Returns a full FpyValue so downstream print/assignment preserves
         # the runtime tag.
         if (isinstance(node.value, ast.Name)
-                and node.value.id in self.variables
-                and not isinstance(node.slice, ast.Slice)):
+                and node.value.id in self.variables):
             _unk_alloca, _unk_tag = self.variables[node.value.id]
             if (self._tag_kind(_unk_tag) in (VKind.UNKNOWN, VKind.FVALUE, VKind.MIXED)
                     and isinstance(_unk_alloca.type, ir.PointerType)
                     and _unk_alloca.type.pointee is fpy_val):
-                # Load the container's runtime tag and data
                 _fv = self._load_fv_raw(node.value.id)
+                if isinstance(node.slice, ast.Slice):
+                    # Slicing preserves the container's kind, so it has to be
+                    # dispatched on the runtime tag too: the static paths below
+                    # pick str_slice or list_slice from the compiler's guess,
+                    # and a list arriving on the str path sliced to the empty
+                    # string.
+                    return self._emit_fv_slice(_fv, node.slice)
                 _c_tag = self._fv_tag(_fv)
                 _c_data = self._fv_data_i64(_fv)
                 # Load the key and convert to tag+data
@@ -46329,6 +46485,31 @@ class CodeGen:
                           [callable_ptr, ir.Constant(i32, tag), data,
                            out_tag, out_data])
         return self.builder.load(out_data)
+
+    def _emit_fv_slice(self, fv: ir.Value, sl: ast.Slice) -> ir.Value:
+        """Slice a container whose kind is only known at runtime.
+
+        `fastpy_fv_slice` picks str/bytes or list/tuple from the tag and echoes
+        that tag back, since a slice has the same kind as what it came from.
+        Without it a slice of an untyped parameter took whichever static path
+        the compiler guessed — `str_slice` on a list quietly produced the empty
+        string.  BUG-SUBSCRIPT-UNTYPED-PARAM-BRIDGE.
+        """
+        _zero = ir.Constant(i64, 0)
+        start = self._emit_expr_value(sl.lower) if sl.lower else _zero
+        stop = self._emit_expr_value(sl.upper) if sl.upper else _zero
+        step = self._emit_expr_value(sl.step) if sl.step else ir.Constant(i64, 1)
+        tag_slot = self._create_entry_alloca(i32, "fvsl.tag")
+        data_slot = self._create_entry_alloca(i64, "fvsl.data")
+        self.builder.call(
+            self.runtime["fv_slice"],
+            [self._fv_tag(fv), self._fv_data_i64(fv), start, stop, step,
+             ir.Constant(i64, 1 if sl.lower else 0),
+             ir.Constant(i64, 1 if sl.upper else 0),
+             ir.Constant(i64, 1 if sl.step else 0),
+             tag_slot, data_slot])
+        return self._fv_build_from_slots(self.builder.load(tag_slot),
+                                         self.builder.load(data_slot))
 
     def _emit_list_slice(self, lst: ir.Value, sl: ast.Slice, node: ast.AST) -> ir.Value:
         """Emit list slicing: lst[start:stop] or lst[start:stop:step]."""

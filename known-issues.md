@@ -1889,7 +1889,7 @@ dispatch that iterates `i in range(fpy_bytes_len(data))` yielding
 
 **Workaround:** index manually — `i = 0; n = len(data); while i < n: c = data[i]; ...`.
 
-### BUG-SUBSCRIPT-UNTYPED-PARAM-BRIDGE. Subscripting an untyped function parameter that holds a `str` falls back to the CPython bridge and returns NULL in pure mode — 2026-07-21
+### ~~BUG-SUBSCRIPT-UNTYPED-PARAM-BRIDGE~~ **FIXED**. Subscripting an untyped function parameter that holds a `str` falls back to the CPython bridge and returns NULL in pure mode — 2026-07-21
 
 **What:** when a user function has an **unannotated** parameter (e.g.
 `def fnv1a(s):`) and the body subscripts it (`s[i]`), codegen doesn't know the
@@ -1943,6 +1943,38 @@ dereferencing a NULL bridge result. Add codegen regression tests for
 (`def fnv1a(s: str)`, `def to_hex8(v: int)`). The `services/fastpy-store`
 SlateOS utility does exactly this so `s[i]` stays on the native
 `fastpy_str_index` fast path.
+
+**Fix:** the value never reached the dispatch helper, which already knew how to
+index a str, list, dict, tuple or bytes from the tag. Four parts:
+
+1. *The parameter was tagged `int`.* `_efd_store_parameters` resolves each
+   parameter's tag from `_function_signatures`. Its **pointer** branch already
+   had an "every caller unresolvable → `mixed`" arm; the **non-pointer** branch
+   did not, and fell through to `"int"` — the same "silence means scalar" guess
+   as BUG-UNTYPED-PARAM-BARE-ABI. So `s` loaded as a naked pointer-as-integer
+   and `s[i]` sailed past the `fastpy_fv_subscript` arm into the CPython
+   `__getitem__` bridge. The non-pointer branch now answers `mixed` too, unless
+   the parameter carries an annotation (which is evidence in its own right).
+2. *`return v[i]` was typed `int`.* An element of an untyped container is
+   itself of unknown kind, so `_duf_determine_ret_tag` now reports `mixed` for
+   it rather than throwing the runtime tag away one frame up.
+3. *Slices had no runtime-dispatch arm at all.* `v[1:3]` took whichever static
+   path the compiler guessed, so a list arriving on `str_slice` sliced to `""`
+   instead of faulting. New runtime helper `fastpy_fv_slice` (`runtime/objects.c`)
+   picks str/bytes or list/tuple from the tag and echoes that tag back, since a
+   slice has the same kind as what it came from; `_emit_fv_slice` calls it.
+4. *One slot per local.* A local's storage class was decided by its first
+   store, and a later store needing an `FpyValue` allocated a **second**, wider
+   slot — stranding every load already emitted against the first. Straight-line
+   code survives that; `t = 0` followed by `t = t + at(lst, i)` in a `while`
+   loop does not, because the load in the loop body is bound to the dead slot
+   forever (`sum` came out 60 instead of 420). New pre-scan
+   `_scan_fv_forced_locals` decides up front which locals can hold a
+   runtime-tagged value and gives them an `FpyValue` slot from their first
+   store, so a slot is never widened.
+
+**Test:** tests/regressions/subscript_untyped_param.py. Verified wrong at
+1f23c9f. Clean under ASan/UBSan/LSan.
 
 ### BUG-FILEREAD-FN-RETTAG. A user function that returns a file-read result is typed `int`, losing the `str` tag — 2026-07-21
 

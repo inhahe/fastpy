@@ -260,6 +260,38 @@ a fixed point, in either definition order; `_csa_propagate_ret_types` does the
 same for the tags it knows, but it runs before the declaration pass and so
 cannot see this one.
 
+**Indexing an untyped parameter dispatches on the tag.** The same "silence
+means scalar" guess ran a second time in `_efd_store_parameters`, which reads
+`static_param_types`' `i64` fallback as a real answer. Its *pointer* branch
+already had an "every caller unresolvable → `mixed`" arm; the non-pointer branch
+did not, and that asymmetry sent `s[i]` on an unannotated parameter past the
+`fastpy_fv_subscript` runtime-dispatch arm and into the generic CPython
+`__getitem__` bridge — NULL in pure mode, an access violation on Windows. Both
+branches now answer `mixed` when nothing is known and the parameter has no
+annotation. Two consequences follow. `return v[i]` is a `mixed` return, because
+an element of an untyped container is itself of unknown kind and saying `int`
+would only throw the runtime tag away again. And **slices** had no dispatch arm
+at all — `v[1:3]` took whichever static path the compiler guessed, so a list
+arriving on `str_slice` quietly sliced to `""` rather than faulting; the new
+`fastpy_fv_slice` picks str/bytes or list/tuple from the tag and echoes that tag
+back, since a slice has the same kind as what it came from.
+
+**One slot per local, decided before the body is emitted.** A local's storage
+class used to be decided by its *first* store — `t = 0` opens an `i64` alloca —
+and a later store that needed an `FpyValue` allocated a **second**, wider slot.
+Straight-line code survives that because every subsequent load reads the new
+slot, but a loop does not: in `t = 0; while …: t = t + at(lst, i)` the load was
+emitted before the widening and stays bound to the dead slot forever, so the
+accumulation is discarded on every iteration (420 came out as 60). The same
+split drops the initial value when the widening happens inside an `if`.
+`_scan_fv_forced_locals` now pre-scans each scope for locals that can hold a
+runtime-tagged value — assigned from a `mixed`-returning call, from an element
+or slice of such a value, or from arithmetic involving one, to a fixed point
+across back edges — and `_store_variable` gives those an `FpyValue` slot and a
+`mixed` tag from their first store. Over-approximating is safe: an `FpyValue`
+slot holds any value, it is merely wider than it needs to be. Parameters are
+excluded, since `_efd_store_parameters` creates their slots first.
+
 **A splat is evidence too, but only about the required slots.** `f(*seq)` had
 no arm in the per-argument classification at all, so a parameter fed only that
 way hit the same silent-zero. `_csa_build_seq_binds` maps each name to the
