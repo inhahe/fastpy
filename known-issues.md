@@ -655,9 +655,9 @@ result, `in` answered False, and iterating yielded a single empty item — all
 from the same stripped tag. `tests/regressions/direct_call_mixed_tag.py` covers
 each, plus the invariant that the direct and via-variable forms agree.
 
-### BUG-MIXED-SCALAR-RETURN-TAG. A function returning an int on one branch and a float on another prints the float's bit pattern — 2026-07-26
+### ~~BUG-MIXED-SCALAR-RETURN-TAG. A function returning an int on one branch and a float on another prints the float's bit pattern~~ — FIXED 2026-07-27
 
-**What:** mixed *scalar* returns are not reconciled at all; the float comes back
+**What:** mixed *scalar* returns were not reconciled at all; the float came back
 reinterpreted as an i64.
 
 **Reproduce** — should print `1 2.5`:
@@ -672,23 +672,145 @@ def int_or_float(f):
 print(int_or_float(True), int_or_float(False))   # 1 4612811918334230528
 ```
 `4612811918334230528` is the IEEE-754 bit pattern of `2.5`. Binding to a
-variable does not help; inside a function it degrades differently
+variable did not help; inside a function it degraded differently
 (`5e-324 2.5` — the int reinterpreted as a double), which is the same confusion
 in the other direction.
 
 **Where:** the LLVM return type is one of i64 / double, chosen once per
-function, and there is no branch-sensitive reconciliation. `_csa_returns_disagree`
-(added for BUG-MODULE-DOCSTRING-UNBOXES-GLOBAL) deliberately does **not** cover
-this: it is scoped to pointer kinds because scalar returns are settled by that
-separate i64-vs-double mechanism, and forcing them to `"mixed"` would change
-the ABI of a great many functions.
+function, and there was no branch-sensitive reconciliation. `_csa_returns_disagree`
+(added for BUG-MODULE-DOCSTRING-UNBOXES-GLOBAL) deliberately did **not** cover
+this: it is scoped to pointer kinds, on the stated grounds that scalar returns
+are "settled by a separate mechanism (the i64 vs double LLVM return type)".
+They are not settled by it — that mechanism is exactly the one that picks one
+of the two and discards the other.
 
-**Proper fix:** a function whose returns mix INT and FLOAT has to return an
-FpyValue (`uses_fv_abi`) rather than a bare scalar, so the tag travels with the
-value. That is an ABI change for the affected functions, hence out of scope for
-the pointer-kind fix.
+**Fix.** `_returns_mix_int_and_float` is the scalar counterpart of
+`_csa_returns_disagree`, backed by `_literal_scalar_kind` (the counterpart of
+`_csa_literal_ptr_kind`) and just as deliberately narrow: constants, unary
+`+`/`-`, comparisons, `not`, uniform `and`/`or`, arithmetic binops, `float()`
+/`int()`/`len()`/`ord()` calls, and `/` (always float in Python, whatever the
+operands). Anything else reads as "no constraint", never as disagreement, so a
+lone `return helper()` cannot push a whole function off the bare ABI. Returns
+inside nested `def`s and lambdas are excluded; `return 1 if c else 2.5` is
+looked through.
 
-**Not a regression:** identical output at the parent commit.
+Three consumers had to agree, the same shape as the splat fix one commit
+earlier:
+
+1. `_duf_select_abi` — `_mixed_scalar_ret` joins the `uses_bare` conjunction
+   (and the `_analyze_mode` blocker list), so the value can carry a tag at all.
+2. `_duf_determine_ret_tag` — records `"mixed"`, so callers do not unwrap the
+   returned FpyValue by a static guess.
+3. `_csa_propagate_ret_types` — records `"mixed"` too, so a module-level
+   `a = f(...)` is not typed from the guess either. This is the one that fixed
+   the `5e-324 2.5` variant.
+
+**Two things the first attempt got wrong:**
+
+* **A bool return is not an int return.** `return True` beside `return -1.5`
+  reached `_emit_return`'s `static_ret_type is double` promote path, whose
+  IntType arm tagged every integer INT — so the program printed `1` where
+  CPython prints `True`. The new bool arm has to run *before* the
+  `_is_float_expr` one, because that answers yes for `x > 5` when `x` is
+  float-typed, and a comparison is a bool whatever it compares.
+* **A `-> float` annotation is not a promise.** Python does not enforce it, so
+  `def a(x) -> float: return 1` really does return the integer 1. Exempting
+  annotated functions left them printing `1 4612811918334230528` — the tag said
+  float, the value was an i64. The `"mixed"` override therefore runs *after*
+  the annotation override in `_duf_determine_ret_tag`, not before it. Note this
+  is a deliberate ruling that a return annotation is **not** coercive for this
+  purpose; CPython's own behaviour is the tie-breaker.
+
+Regression test: `tests/regressions/mixed_scalar_return_tag.py`. Verified wrong
+at `cfc34df`.
+
+**Two adjacent bugs surfaced while testing this** and are *not* covered by the
+fix — both verified pre-existing at `cfc34df`: BUG-IFEXP-INT-FLOAT-PROMOTE and
+BUG-VAR-RETYPED-MIDSCOPE-STALE-SLOT, below.
+
+### BUG-IFEXP-INT-FLOAT-PROMOTE. `1 if c else 2.5` evaluates to `1.0`, not `1` — 2026-07-27
+
+**What:** a conditional expression whose arms are an int and a float unifies to
+`double` and the int arm is `sitofp`'d, so the int-ness is lost. CPython
+evaluates each arm independently and returns whichever one ran, unconverted.
+
+**Reproduce** — should print `1` twice:
+```python
+c = True
+print(1 if c else 2.5)     # 1.0
+x = 1 if c else 2.5
+print(x)                   # 1.0
+```
+No function is involved, so this is independent of
+BUG-MIXED-SCALAR-RETURN-TAG — but it is why
+`tests/regressions/mixed_scalar_return_tag.py` writes its mixed returns as
+`if`/`return` statements rather than one-liners: `return 1 if c else 2.5`
+still prints `1.0`.
+
+**Where:** the `ast.IfExp` emitter, which builds a phi and must give both
+incoming values one LLVM type.
+
+**Proper fix:** when the two arms' static kinds disagree, the phi must be an
+`fpy_val` — tag and data — rather than a promoted scalar, exactly as
+`_returns_mix_int_and_float` now does for returns. The same treatment is needed
+for arms that disagree on *pointer* kind, which today is presumably handled
+only because both are `i8*`.
+
+**Severity:** wrong output (`1.0` for `1`), not memory-unsafe. Silent.
+
+### BUG-VAR-RETYPED-MIDSCOPE-STALE-SLOT. Re-typing a module-level variable allocates a second slot; reads keep using the first — 2026-07-27
+
+**What:** when a variable's static type changes across assignments in the same
+scope, codegen allocates a *new* alloca and rebinds `self.variables[name]` to
+it. Statements already emitted still read the old slot — and so does the same
+statement on the next iteration of a loop, because the loop's back-edge re-runs
+code emitted before the rebind.
+
+**Reproduce** — should print `2.0 / 2.25 / 4.25 / 4.5`:
+```python
+def m(i):
+    if i % 2 == 0:
+        return 2
+    return 0.25
+
+t = 0.0
+i = 0
+while i < 4:
+    t = t + m(i)
+    print(t)
+    i = i + 1
+```
+prints `2.0 / 0.25 / 2.0 / 0.25` — i.e. `t` reads as 0 every iteration. The IR
+shows it plainly:
+
+```llvm
+  %"t.2" = alloca {i32, i64}        ; the FpyValue slot the loop body stores to
+  %"t"   = alloca double            ; the slot `t = 0.0` wrote and the loop reads
+  ...
+  %"t.1" = load double, double* %"t"      ; always 0.0
+  ...
+  store {i32, i64} %".18", {i32, i64}* %"t.2"
+```
+
+Unrolling the loop works (each read follows its own store in emission order);
+so does moving the whole thing inside a `def` (function-local variables are
+pre-typed by a scan the module level does not get). Pre-existing at `cfc34df`,
+where the same program printed a different wrong answer
+(`2.0 / 4.598e+18 / …`) for the same reason.
+
+**Where:** module-level assignment in `CodeGen`, where a store whose value type
+does not match the existing alloca creates a fresh one instead of promoting the
+variable. The function-level equivalent is avoided by the local-type pre-scan.
+
+**Proper fix:** pre-scan module-level statements the way function bodies are
+pre-scanned, and give any variable whose assignments disagree an `fpy_val` slot
+from its first store — never allocate a second slot for a name already bound.
+A second alloca for a live name should arguably be an assertion failure.
+
+**Blast radius:** any module-level accumulator fed by a value whose static kind
+differs from its initialiser. Made easier to hit by the
+BUG-MIXED-SCALAR-RETURN-TAG fix, which gives more functions a `"mixed"` return,
+but not caused by it.
 
 ### ~~BUG-MODULE-DOCSTRING-UNBOXES-GLOBAL. `_load_variable` unboxes an FpyValue local using its (wrong) static tag, so a mixed-kind module-level value loses its runtime tag~~ — FIXED 2026-07-26
 
@@ -800,7 +922,8 @@ functions, rebinding one slot across kinds, and a 30-iteration loop.
 Two adjacent bugs surfaced while testing this and are **not** covered by the
 fix — both verified pre-existing at the parent commit: `len(f(x))` without an
 intermediate variable (BUG-DIRECT-CALL-LEN-STATIC-TAG) and mixed int/float
-returns (BUG-MIXED-SCALAR-RETURN-TAG).
+returns (BUG-MIXED-SCALAR-RETURN-TAG, since fixed by the scalar counterpart
+`_returns_mix_int_and_float`).
 
 Note the `"ptr"` tag is separately overloaded — it means both "definitely
 list/tuple" (annotations at ~10408/~10414) and "a pointer, kind unknown"

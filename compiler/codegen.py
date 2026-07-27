@@ -6854,6 +6854,132 @@ class CodeGen:
                         return True
         return False
 
+    @classmethod
+    def _literal_scalar_kind(cls, expr: ast.expr) -> 'str | None':
+        """The scalar kind of *expr* — "int" or "float" — when the AST says so.
+
+        The companion of `_csa_literal_ptr_kind` for the other half of the
+        type space, and just as deliberately narrow: it is used only to spot
+        returns that *disagree*, so anything not recognised here must read as
+        "no constraint" rather than as a conflict.  A `return helper()` or a
+        `return x` says nothing and must stay silent, or every function with
+        one unclassifiable return would be pushed off the bare ABI.
+
+        `bool` counts as "int" because that is how a bare scalar return
+        encodes it — a function alternating `return True` with `return 2.5`
+        loses the tag exactly as an int/float one does.
+        """
+        if isinstance(expr, ast.Constant):
+            v = expr.value
+            if isinstance(v, bool):
+                return "int"
+            if isinstance(v, float):
+                return "float"
+            if isinstance(v, int):
+                return "int"
+            return None
+        if isinstance(expr, ast.UnaryOp):
+            if isinstance(expr.op, (ast.USub, ast.UAdd)):
+                return cls._literal_scalar_kind(expr.operand)
+            if isinstance(expr.op, ast.Not):
+                return "int"  # bool
+            return None
+        # A comparison is a bool whatever it compares.
+        if isinstance(expr, ast.Compare):
+            return "int"
+        # `a and b` evaluates to one of its operands, so it is only
+        # classifiable when they all agree.
+        if isinstance(expr, ast.BoolOp):
+            _ks = {cls._literal_scalar_kind(v) for v in expr.values}
+            return next(iter(_ks)) if len(_ks) == 1 else None
+        if isinstance(expr, ast.BinOp):
+            # True division is float in Python whatever the operands are, so
+            # `return a / b` is evidence even when a and b are opaque.
+            if isinstance(expr.op, ast.Div):
+                return "float"
+            _l = cls._literal_scalar_kind(expr.left)
+            _r = cls._literal_scalar_kind(expr.right)
+            # One float operand makes an arithmetic result float regardless of
+            # the other side — the only other side that would not raise a
+            # TypeError in CPython is a number.  This is what lets
+            # `return 0.5 + recurse(n - 1)` be read as float even though the
+            # call itself says nothing, which is the shape a recursive
+            # accumulator takes.
+            if (isinstance(expr.op, (ast.Add, ast.Sub, ast.Mult, ast.Mod,
+                                     ast.FloorDiv))
+                    and "float" in (_l, _r)):
+                return "float"
+            if _l is None or _r is None:
+                return None
+            # `2 ** -1` is 0.5, so two int operands do not make an int here
+            # unless the exponent is a literal that can be seen to be >= 0.
+            if isinstance(expr.op, ast.Pow):
+                if "float" in (_l, _r):
+                    return "float"
+                _e = expr.right
+                if (isinstance(_e, ast.UnaryOp)
+                        and isinstance(_e.op, ast.USub)):
+                    return "float"
+                if isinstance(_e, ast.Constant) and isinstance(_e.value, int):
+                    return "float" if _e.value < 0 else "int"
+                return None
+            return "float" if "float" in (_l, _r) else "int"
+        if isinstance(expr, ast.Call) and isinstance(expr.func, ast.Name):
+            if expr.func.id == "float":
+                return "float"
+            if expr.func.id in ("int", "len", "ord"):
+                return "int"
+        return None
+
+    @classmethod
+    def _returns_mix_int_and_float(cls, fnode: ast.AST) -> bool:
+        """True when *fnode* returns an int on one path and a float on another.
+
+        The scalar counterpart of `_csa_returns_disagree`, which explicitly
+        scoped itself away from this case on the grounds that "int/float
+        returns are settled by a separate mechanism (the i64 vs double LLVM
+        return type)".  They are not settled by it — that mechanism picks *one*
+        of the two and the other is then reinterpreted:
+
+            def f(c):
+                if c:
+                    return 1
+                return 2.5
+            print(f(True), f(False))   # 1 2.5 in CPython
+
+        printed `1 4612811918334230528`, the IEEE-754 bits of 2.5 returned
+        through an i64.  The bare ABI has nowhere to put a runtime tag, so
+        such a function must not have it; the callers of this predicate deny
+        it the bare ABI and tag its return "mixed" instead.
+
+        Returns inside nested `def`s and lambdas belong to those functions,
+        not this one, so they are excluded.  A conditional expression is
+        looked through, since `return 1 if c else 2.5` is the same function
+        written on one line.
+        """
+        _nested: set[int] = set()
+        for _item in ast.walk(fnode):
+            if _item is not fnode and isinstance(
+                    _item, (ast.FunctionDef, ast.AsyncFunctionDef,
+                            ast.Lambda)):
+                for _sub in ast.walk(_item):
+                    _nested.add(id(_sub))
+        kinds: set[str] = set()
+        for n in ast.walk(fnode):
+            if id(n) in _nested:
+                continue
+            if not isinstance(n, ast.Return) or n.value is None:
+                continue
+            _exprs = ([n.value.body, n.value.orelse]
+                      if isinstance(n.value, ast.IfExp) else [n.value])
+            for _e in _exprs:
+                k = cls._literal_scalar_kind(_e)
+                if k is not None:
+                    kinds.add(k)
+                    if len(kinds) > 1:
+                        return True
+        return False
+
     def _csa_propagate_ret_types(
         self, tree: ast.Module,
         func_asts: dict[str, ast.FunctionDef],
@@ -7244,6 +7370,12 @@ class CodeGen:
             # already passes through as a whole FpyValue so the runtime tag
             # survives the load.  BUG-MODULE-DOCSTRING-UNBOXES-GLOBAL.
             if self._csa_returns_disagree(fnode):
+                _func_ret_types[fname] = "mixed"
+            # Same lie, other half of the type space.  The loop above happily
+            # records "float" for a function that also returns an int, and
+            # `a = f(...)` at module level then types `a` float and reads the
+            # integer's bits as a double.  BUG-MIXED-SCALAR-RETURN-TAG.
+            elif self._returns_mix_int_and_float(fnode):
                 _func_ret_types[fname] = "mixed"
 
         # Propagate return types back to module-level var_types
@@ -9860,11 +9992,18 @@ class CodeGen:
             or (i < len(call_types) and call_types[i] is not None)
             for i, p in enumerate(param_names)
         )
+        # A function that returns an int on one path and a float on another
+        # has no single scalar return type, and the bare ABI has nowhere to
+        # put a runtime tag — whichever of i64/double it is given, the other
+        # kind's bits travel back reinterpreted.  Deny it the bare ABI so the
+        # tag rides along in the FpyValue.  BUG-MIXED-SCALAR-RETURN-TAG.
+        _mixed_scalar_ret = self._returns_mix_int_and_float(node)
         uses_bare = (
             not _used_as_value
             and not has_vararg
             and not has_kwarg
             and not _may_return_none
+            and not _mixed_scalar_ret
             and _is_scalar_ret
             and _body_is_scalar
             and all(isinstance(t, _SCALAR_TYPES) for t in param_types)
@@ -9884,6 +10023,8 @@ class CodeGen:
                 blockers.append("**kwargs parameter")
             if _may_return_none:
                 blockers.append("may return None")
+            if _mixed_scalar_ret:
+                blockers.append("returns int on one path and float on another")
             if not _is_scalar_ret:
                 blockers.append("non-scalar return type")
             if not _body_is_scalar:
@@ -10903,6 +11044,22 @@ class CodeGen:
                         ret_tag = "set"
                     elif ann.value.id in ("tuple", "Tuple"):
                         ret_tag = "ptr"
+
+        # An int-on-one-path/float-on-another function has no single scalar
+        # tag.  `_duf_select_abi` has already denied it the bare ABI so the
+        # FpyValue carries the real tag; saying "int" (or "float") here would
+        # hand the caller a static answer it would then unwrap by, undoing
+        # that.  BUG-MIXED-SCALAR-RETURN-TAG.
+        #
+        # This runs *after* the annotation override on purpose.  A `-> float`
+        # annotation on a function that also returns an int is simply wrong,
+        # and Python does not enforce it — `def a(x) -> float: return 1`
+        # returns the integer 1.  Letting the annotation win here produced
+        # neither answer: the tag said float, the value was an i64, and the
+        # caller printed 4612811918334230528.
+        if (ret_tag in ("int", "float", "bool")
+                and self._returns_mix_int_and_float(node)):
+            ret_tag = "mixed"
 
         return ret_tag
 
@@ -26494,11 +26651,23 @@ class CodeGen:
                         if isinstance(bare.type, ir.DoubleType):
                             value = self._fv_from_float(bare)
                         elif isinstance(bare.type, ir.IntType):
+                            # `return True` and `return x > 0` are bools, and
+                            # this path used to tag every integer INT — so a
+                            # function returning a bool on one path and a float
+                            # on another printed `1` where CPython prints
+                            # `True`.  BUG-MIXED-SCALAR-RETURN-TAG.
+                            _bool_ret = (bare.type.width == 1
+                                         or self._expr_is_bool_ast(node.value))
                             if bare.type.width == 1 or bare.type.width == 32:
                                 bare = self.builder.zext(bare, i64)
+                            # A bool is checked first: `_is_float_expr` answers
+                            # yes for `x > 5` when x is float-typed, but a
+                            # comparison is a bool whatever it compares.
+                            if _bool_ret:
+                                value = self._wrap_bare_to_fv(bare, "bool")
                             # Check if this expression is KNOWN to be float
                             # (e.g. division, float literal, float binop).
-                            if self._is_float_expr(node.value):
+                            elif self._is_float_expr(node.value):
                                 bare = self.builder.sitofp(bare, double)
                                 value = self._fv_from_float(bare)
                             else:

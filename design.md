@@ -181,11 +181,35 @@ Two limits on that check are deliberate and load-bearing:
   readable straight off the AST count (literals, comprehensions, f-strings).
   If `return helper()` counted as a distinct kind, nearly every function would
   go MIXED and lose its static paths.
-- **Scalars and `None` are out of scope.** `return None` beside `return [...]`
-  is ubiquitous and already tolerated everywhere; int-vs-float returns are
-  settled by a different mechanism (the i64-vs-double LLVM return type), and
-  forcing those to MIXED would change the ABI of many functions. Mixed scalar
-  returns are consequently still broken — see BUG-MIXED-SCALAR-RETURN-TAG.
+- **`None` is out of scope.** `return None` beside `return [...]` is ubiquitous
+  and already tolerated everywhere.
+
+**Scalars needed the same treatment, and the i64-vs-double return type was not
+it.** That check originally excluded int-vs-float returns on the grounds that
+they were "settled by a different mechanism (the i64-vs-double LLVM return
+type)". They were not: that mechanism picks *one* of the two and the other
+comes back reinterpreted, so `def f(c): return 1 if c else 2.5` (written as an
+`if`/`return` pair) printed the IEEE-754 bits of 2.5 as an i64.
+`_returns_mix_int_and_float` is the scalar counterpart, backed by
+`_literal_scalar_kind` as the counterpart of `_csa_literal_ptr_kind`, and it
+obeys the same "unclassifiable is no constraint" rule. It denies the function
+the bare ABI (`_duf_select_abi`), tags its return `"mixed"`
+(`_duf_determine_ret_tag`) and records `"mixed"` in `_func_ret_types`
+(`_csa_propagate_ret_types`) — the same three-consumer hand-off the splat fix
+needed, for the same reason.
+
+Two rulings fall out of it:
+
+- **A bool is not an int here.** `return True` beside `return -1.5` is the same
+  bug, and the FpyValue must carry `bool`, not `int`, or the program prints `1`
+  where CPython prints `True`. Because a comparison is a bool whatever it
+  compares, the bool test in `_emit_return` runs *before* the `_is_float_expr`
+  test, which answers yes for `x > 5` when `x` is float-typed.
+- **A return annotation is not coercive.** Python does not enforce `-> float`,
+  so `def a(x) -> float: return 1` returns the integer 1 and fastpy now agrees.
+  The `"mixed"` override therefore runs *after* the annotation override rather
+  than yielding to it. Where an annotation and the actual returns disagree,
+  CPython's behaviour is the tie-breaker.
 
 **Two call sites must agree on the MIXED tag.** A callee's result type is
 decided in two independent places, and both consult `_func_ret_types`:
