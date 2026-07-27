@@ -8,7 +8,62 @@ how to reproduce it, and what the proper fix looks like.
 
 ## Active Bugs
 
-### BUG-DIRECT-CALL-LEN-STATIC-TAG. `len(f(x))` ignores the callee's `mixed` return tag; only `v = f(x); len(v)` is correct — 2026-07-26
+### BUG-PARAM-TYPE-FROM-USER-CALL-ARG. A parameter whose only call-site evidence is a user call is left untyped, and `len()` on it returns 0 — 2026-07-26
+
+**What:** when every call site passes a *call result* for a given parameter, the
+parameter gets no inferred type and operations on it silently produce wrong
+answers. `len()` returns 0 rather than crashing, so this fails quietly.
+
+**Reproduce** — should print `3 6 4`, prints `0 0 0`:
+```python
+"""Doc."""
+
+def always_list(n):
+    return [n, n, n]
+
+def always_str(n):
+    return "ab" * n
+
+def pick(flag):
+    if flag:
+        return "abcd"
+    return [1, 2, 3]
+
+def sink_l(v): return len(v)
+def sink_s(v): return len(v)
+def sink_m(v): return len(v)
+
+print(sink_l(always_list(5)), sink_s(always_str(3)), sink_m(pick(True)))
+```
+
+**Not mixed-specific.** This is the important part: `sink_l(always_list(5))` is
+just as broken as the mixed case, and `always_list` has one unambiguous return.
+It is also enough for the *slot* to be sole-evidence — adding one call with a
+literal (`sink_l([1, 2])` anywhere) types the parameter and everything starts
+working, which is why this has stayed hidden: almost all real code eventually
+passes a literal somewhere.
+
+**Where:** `_call_site_param_types` (declared ~3693, populated during
+`_analyze_call_sites`). Probing the minimal repro shows `{'sink': [None],
+'pick': ['bool'], ...}` — the argument slot is `None`. Argument types are
+recorded *before* `_csa_propagate_ret_types` runs at 8766, so at the moment an
+argument is classified, no callee's return type is known yet.
+
+**Proper fix:** the ordering is the bug. Either run return-type propagation
+before argument classification, or iterate the two to a fixed point — an
+argument slot left `None` on the first pass should be revisited once
+`_func_ret_types` is populated. A fixed point is the honest answer, since
+`_func_ret_types` itself propagates through `return f()` chains and so has the
+same dependency in the other direction. Do *not* paper over it by
+special-casing `len()` on an untyped param.
+
+**Not a regression:** identical `0 0 0` at the parent commit — verified by
+stashing.
+
+**Where it bites:** `tests/regressions/direct_call_mixed_tag.py` never passes a
+call result straight into another user function, and says so in its docstring.
+
+### ~~BUG-DIRECT-CALL-LEN-STATIC-TAG. `len(f(x))` ignores the callee's `mixed` return tag; only `v = f(x); len(v)` is correct~~ — FIXED 2026-07-26
 
 **What:** with BUG-MODULE-DOCSTRING-UNBOXES-GLOBAL fixed, a mixed-kind return
 bound to a variable is tagged `mixed` and `len()` dispatches on the runtime tag.
@@ -46,8 +101,26 @@ them drift apart.
 **Not a regression:** identical garbage at the parent commit — verified by
 stashing the fix and re-running. The `mixed` work neither caused nor fixed it.
 
-**Where it bites:** `tests/regressions/mixed_return_tag.py` binds every mixed
-call to a name before measuring it, for this reason.
+**Fixed** at the `_emit_user_call` seam: when `_callee_returns_mixed(name)` —
+i.e. `_func_ret_types[name]` is `mixed` — the unwrap is skipped and the whole
+tagged FpyValue is handed back. `_emit_expr` already types any `fpy_val`-shaped
+result as `VKind.FVALUE`, so no consumer needed changing; `len`, subscript,
+slicing, `in`, iteration, `bool()` and `str()` all went correct at once. The
+helper deliberately reads `_func_ret_types` rather than `info.ret_tag`, because
+agreeing with `_assign_fv_fast_path` is the entire point — the two call sites
+drifting apart is what made `v = f(x); len(v)` and `len(f(x))` disagree.
+
+The suggestion above to factor the tag choice into one shared helper was *not*
+taken, and deliberately so: the two sites need different things from the answer
+(one picks an alloca representation, the other picks whether to unwrap), so the
+shared part is only the `_func_ret_types` lookup, which is now one line each.
+Merging them would have meant a larger refactor of `_assign_fv_fast_path` for
+no behavioural gain. Revisit if a third consumer appears.
+
+**Damage was wider than `len()`:** subscripting a returned str gave an empty
+result, `in` answered False, and iterating yielded a single empty item — all
+from the same stripped tag. `tests/regressions/direct_call_mixed_tag.py` covers
+each, plus the invariant that the direct and via-variable forms agree.
 
 ### BUG-MIXED-SCALAR-RETURN-TAG. A function returning an int on one branch and a float on another prints the float's bit pattern — 2026-07-26
 

@@ -44,14 +44,18 @@ ubiquitous beside `return [...]` and already tolerated, and the latter is
 settled by a separate mechanism (the i64-vs-double LLVM return type) that
 "mixed" would disrupt. Both exclusions are exercised below.
 
-Two adjacent bugs are deliberately *not* covered here, because they are
-pre-existing and orthogonal — both were verified to misbehave identically at
-the parent commit, so this change neither caused nor fixed them:
+This file covers only the path where the call result reaches a *variable*.
+There is a second decision site — `_emit_user_call`, for a bare call expression
+with no intermediate name — which was still unwrapping by the coarse static
+type when this file was written, so everything below binds the call to a name
+first. That is BUG-DIRECT-CALL-LEN-STATIC-TAG, since fixed;
+`direct_call_mixed_tag.py` covers it, including the invariant that the two
+forms agree.
 
-* BUG-DIRECT-CALL-LEN-STATIC-TAG — `len(pick(True))` with no intermediate
-  variable still prints garbage. The mixed tag reaches a *variable*, but the
-  call-expression path in `len()` never consults it. Everything below therefore
-  binds the call to a name first.
+One adjacent bug is deliberately *not* covered here, because it is
+pre-existing and orthogonal — it was verified to misbehave identically at the
+parent commit, so this change neither caused nor fixed it:
+
 * BUG-MIXED-SCALAR-RETURN-TAG — a function returning `1` on one branch and
   `2.5` on another prints the float's bit pattern as an int. Scalars are out of
   scope for `_csa_returns_disagree` by design (see above).

@@ -187,10 +187,29 @@ Two limits on that check are deliberate and load-bearing:
   forcing those to MIXED would change the ABI of many functions. Mixed scalar
   returns are consequently still broken — see BUG-MIXED-SCALAR-RETURN-TAG.
 
-Note the tag is consulted when *storing* to a name (`_assign_fv_fast_path`),
-not when emitting a bare call expression, so `v = f(x); len(v)` is correct
-while `len(f(x))` is not — BUG-DIRECT-CALL-LEN-STATIC-TAG. Having two places
-decide a callee's result type is what let them drift apart.
+**Two call sites must agree on the MIXED tag.** A callee's result type is
+decided in two independent places, and both consult `_func_ret_types`:
+
+- `_assign_fv_fast_path` when *storing* the result to a name, to pick the slot
+  representation.
+- `_emit_user_call` when emitting a *bare call expression*, via
+  `_callee_returns_mixed`, to decide whether to unwrap at all. A MIXED callee
+  skips `_unwrap_return_value` and yields the whole tagged FpyValue;
+  `_emit_expr` types any `fpy_val`-shaped result as `VKind.FVALUE`, which is
+  what routes `len`, subscript, slicing, `in`, iteration and truthiness through
+  runtime dispatch.
+
+They must agree, or `v = f(x); len(v)` and `len(f(x))` give different answers —
+they did, which was BUG-DIRECT-CALL-LEN-STATIC-TAG. `_emit_user_call`
+deliberately reads `_func_ret_types` and not `info.ret_tag`: the latter is
+fixed in the declaration pass, before call-site analysis has run, so it holds
+only the coarse first guess.
+
+A separate and much broader gap remains on the *argument* side: a parameter
+whose only call-site evidence is a user call is left untyped, because argument
+types are recorded before `_csa_propagate_ret_types` runs. That is an ordering
+problem, not a MIXED one — a single-kind callee is affected identically. See
+BUG-PARAM-TYPE-FROM-USER-CALL-ARG.
 
 ## Runtime
 

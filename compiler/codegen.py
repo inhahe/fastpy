@@ -30862,11 +30862,35 @@ class CodeGen:
 
         result = self.builder.call(info.func, coerced)
 
-        # Unwrap FV return to the caller's expected bare type
+        # Unwrap FV return to the caller's expected bare type -- unless there
+        # is no single bare type to unwrap to.  A callee whose returns commit
+        # to different pointer kinds is typed "mixed", and _unwrap_return_value
+        # would pick one from info.static_ret_type and drop the runtime tag,
+        # so `len(pick(True))` measured a string as a list.  Hand back the
+        # tagged FpyValue instead; _emit_expr tags any fpy_val-typed result
+        # FVALUE, which routes downstream operations through runtime dispatch.
+        # BUG-DIRECT-CALL-LEN-STATIC-TAG.
         if info.uses_fv_abi and info.ret_tag != "void":
-            result = self._unwrap_return_value(result, info)
+            if not self._callee_returns_mixed(name):
+                result = self._unwrap_return_value(result, info)
 
         return result if info.ret_tag != "void" else None
+
+    def _callee_returns_mixed(self, name: str) -> bool:
+        """True when the CSA pass typed *name*'s return as `mixed`.
+
+        Kept separate from `info.ret_tag` on purpose: `ret_tag` is fixed in the
+        declaration pass, before the call-site analysis has run, so it records
+        only the coarse guess.  `_func_ret_types` is the reconciled answer, and
+        it is what `_assign_fv_fast_path` consults when storing a call result
+        to a name.  Both call sites must agree, or `v = f(x); len(v)` and
+        `len(f(x))` disagree — which is exactly the bug.
+        """
+        frt = getattr(self, "_func_ret_types", None)
+        if not frt:
+            return False
+        tag = frt.get(name)
+        return tag is not None and self._tag_kind(tag) == VKind.MIXED
 
     def _emit_user_call_fv(self, node: ast.Call) -> ir.Value:
         """Emit a user function call and return the raw FpyValue without
