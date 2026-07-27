@@ -690,6 +690,28 @@ subscript needed the same treatment for the plainer reason that it raises:
 `_emit_subscript`'s result was returned to the expression dispatcher with no
 check, so `[1, 2][9] + "s"` reported TypeError rather than IndexError.
 
+**A cleanup is owed to every way out of the block, not just the one the
+lowering happens to fall through.** `_emit_with` builds its `__exit__` call by
+hand into a `with.finally` block, which the fall-through path branches to — and
+which a `return` inside the body branches straight past. The finally stack is
+what `_emit_return` consults, so the `with` pushed something onto it: an
+*empty list*, which emitted nothing. `with T(): return 1` therefore left the
+block without calling `__exit__` at all. The stack now holds either a
+finally-body AST list or a callable, because a `with`'s cleanup is IR that was
+never an AST, and `_emit_with_exit_unwind` emits it again at the return site.
+
+`break` and `continue` had the same hole and a wider one: they consulted the
+finally stack not at all, so they skipped every `with` *and* every
+`try/finally` between them and the loop. The difference from `return` is that
+they leave only part of the stack — the cleanups pushed inside the loop, not
+the ones enclosing it — which is a fact only the loop knows. `_push_loop` /
+`_pop_loop` now replace fifteen hand-written `_loop_stack.append` sites so that
+the finally depth is frozen at loop entry by construction; the alternative,
+remembering to record it at each of the specialized `for`/`while` lowerings, is
+the kind of thing that is right the day it is written and wrong a year later.
+All three exits share `_emit_loop_exit_cleanups`, with `return` passing depth
+zero.
+
 **An exception's stored message is its `str()`, so KeyError has to be repr'd at
 the raise.** fastpy keeps a rendered message and never an args tuple, which
 matches every builtin but one: `KeyError.__str__` is `repr(args[0])`, so a

@@ -1260,12 +1260,17 @@ class CodeGen:
         self.function: ir.Function | None = None
         self.builder: ir.IRBuilder | None = None
         self.variables: dict[str, tuple[ir.AllocaInstr, str]] = {}
-        self._loop_stack: list[tuple[ir.Block, ir.Block]] = []
+        # (break target, continue target, finally depth at loop entry).  The
+        # depth is what tells `break`/`continue` which cleanups they leave —
+        # the ones pushed inside the loop, not the ones enclosing it.
+        self._loop_stack: list[tuple[ir.Block, ir.Block, int]] = []
         self._in_try_block: bool = False
-        # Stack of finally-body AST lists currently enclosing the emitter.
-        # A `return` inside a try-with-finally must emit all pending finally
-        # bodies in LIFO order before actually returning.
-        self._finally_stack: list[list[ast.stmt]] = []
+        # Stack of cleanups currently enclosing the emitter.  A `return`
+        # inside a try-with-finally must emit all pending finally bodies in
+        # LIFO order before actually returning.  An entry is either a
+        # finally-body AST list or — for a `with`, whose cleanup is IR that
+        # was never an AST — a callable that emits it.
+        self._finally_stack: list = []
 
         # Generator functions: set of function names that contain yield
         self._generator_funcs: set[str] = set()
@@ -25126,12 +25131,12 @@ class CodeGen:
 
         # Body
         self.builder.position_at_end(body_block)
-        self._loop_stack.append((end_block, cond_block))
+        self._push_loop(end_block, cond_block)
         _prev_hot = self._in_hot_loop
         self._in_hot_loop = True
         self._emit_stmts(node.body)
         self._in_hot_loop = _prev_hot
-        self._loop_stack.pop()
+        self._pop_loop()
         if not self.builder.block.is_terminated:
             self.builder.branch(cond_block)
 
@@ -25353,12 +25358,12 @@ class CodeGen:
 
         # Body
         self.builder.position_at_end(body_block)
-        self._loop_stack.append((end_block, incr_block))
+        self._push_loop(end_block, incr_block)
         _prev_hot = self._in_hot_loop
         self._in_hot_loop = True
         self._emit_stmts(node.body)
         self._in_hot_loop = _prev_hot
-        self._loop_stack.pop()
+        self._pop_loop()
         if not self.builder.block.is_terminated:
             self.builder.branch(incr_block)
 
@@ -25378,6 +25383,52 @@ class CodeGen:
                 self.builder.branch(end_block)
 
         self.builder.position_at_end(end_block)
+
+    def _emit_with_exit_unwind(self, mgr_alloca, pyobj_flag) -> None:
+        """Emit `mgr.__exit__(None, None, None)` for a `return` out of a `with`.
+
+        `_emit_with` lowers the block by hand, and the `__exit__` it emits
+        lives in a block that a `return` inside the body branches straight
+        past.  The finally stack is what a `return` consults, so this is what
+        goes on it — the same two-way dispatch as the fall-through path, but
+        with none of its exception plumbing, because a `return` reaching here
+        has already been checked for a pending exception and cannot have one.
+        The result is discarded for the same reason: there is nothing left to
+        suppress.  See BUG-RETURN-IN-WITH-SKIPS-EXIT.
+        """
+        saved_mgr = self.builder.load(mgr_alloca, name="with.mgr.ret")
+        flag = self.builder.load(pyobj_flag)
+        is_pyobj = self.builder.icmp_signed(
+            "!=", flag, ir.Constant(i32, 0))
+        b_pyobj = self._new_block("with.ret.exit.pyobj")
+        b_native = self._new_block("with.ret.exit.native")
+        b_done = self._new_block("with.ret.exit.done")
+        self.builder.cbranch(is_pyobj, b_pyobj, b_native)
+
+        self.builder.position_at_end(b_pyobj)
+        none_tag = ir.Constant(i32, FPY_TAG_NONE)
+        none_data = ir.Constant(i64, 0)
+        exit_method = self.builder.call(
+            self.runtime["cpython_getattr"],
+            [saved_mgr, self._make_string_constant("__exit__")])
+        self.builder.call(
+            self.runtime["cpython_call3"],
+            [exit_method, none_tag, none_data, none_tag, none_data,
+             none_tag, none_data,
+             self._create_entry_alloca(i32, "with.ret.exit.tag"),
+             self._create_entry_alloca(i64, "with.ret.exit.data")])
+        # __exit__ may have printed through CPython's sys.stdout.
+        self.builder.call(self.runtime["cpython_flush"], [])
+        self.builder.branch(b_done)
+
+        self.builder.position_at_end(b_native)
+        self.builder.call(
+            self.runtime["obj_call_method3"],
+            [saved_mgr, self._make_string_constant("__exit__"),
+             ir.Constant(i64, 0), ir.Constant(i64, 0), ir.Constant(i64, 0)])
+        self.builder.branch(b_done)
+
+        self.builder.position_at_end(b_done)
 
     def _emit_with(self, node: ast.With) -> None:
         """Emit `with expr as var: body`.
@@ -25527,11 +25578,14 @@ class CodeGen:
             finally_block = self._new_block("with.finally")
             end_block = self._new_block("with.end")
 
-            # Push finally onto stack (for returns inside the with body)
-            # We'll emit the finally body inline, but also need it for
-            # the _finally_stack so `return` inside with-body triggers it.
-            # Create a dummy finalbody list — we'll emit manually.
-            self._finally_stack.append([])  # placeholder
+            # A `return` inside the body branches past the `with.finally`
+            # block below, so the finally stack — which is what `_emit_return`
+            # consults — carries a callback that emits the `__exit__` call
+            # again at the return site.  It used to carry an empty list, which
+            # emitted nothing and skipped the cleanup entirely.
+            self._finally_stack.append(
+                lambda _m=mgr_alloca, _f=_pyobj_mgr_flag:
+                    self._emit_with_exit_unwind(_m, _f))
 
             # Emit with-body in try context
             saved_in_try = self._in_try_block
@@ -27878,14 +27932,10 @@ class CodeGen:
 
         # Emit enclosing finally bodies in LIFO order. Take a snapshot to
         # avoid re-entrance if a finally body itself has a try-finally.
-        if self._finally_stack:
-            for finalbody in reversed(self._finally_stack):
-                saved_stack = self._finally_stack
-                self._finally_stack = []
-                self._emit_stmts(finalbody)
-                self._finally_stack = saved_stack
-                if self.builder.block.is_terminated:
-                    return  # finally block unconditionally terminated
+        # A `return` leaves every one of them, so the bound is zero.  (An
+        # entry is a statement list or, for a `with`, a callback.)
+        if self._emit_loop_exit_cleanups(0):
+            return  # a finally body unconditionally terminated
 
         # Pop shadow stack before returning (skip for bare-ABI — no frame pushed)
         if not self._current_fn_bare_abi:
@@ -28791,12 +28841,12 @@ class CodeGen:
         new_cnt = self.builder.add(cnt, ir.Constant(i64, 1))
         self._store_variable(cnt_name, new_cnt, ValueType(VKind.INT))
 
-        self._loop_stack.append((end_block, cond_block))
+        self._push_loop(end_block, cond_block)
         _prev_hot = self._in_hot_loop
         self._in_hot_loop = True
         self._emit_stmts(node.body)
         self._in_hot_loop = _prev_hot
-        self._loop_stack.pop()
+        self._pop_loop()
         if not self.builder.block.is_terminated:
             self.builder.branch(cond_block)
 
@@ -28909,12 +28959,12 @@ class CodeGen:
             inner_list = self._list_get_as_bare(lst_ptr, idx, "list")
             self._unpack_targets_from_list(val_target.elts, inner_list, node)
 
-        self._loop_stack.append((end_block, incr_block))
+        self._push_loop(end_block, incr_block)
         _prev_hot = self._in_hot_loop
         self._in_hot_loop = True
         self._emit_stmts(node.body)
         self._in_hot_loop = _prev_hot
-        self._loop_stack.pop()
+        self._pop_loop()
         if not self.builder.block.is_terminated:
             self.builder.branch(incr_block)
 
@@ -29061,12 +29111,12 @@ class CodeGen:
                 else:
                     self._bridge_fallback_stmt(node, "unsupported for tuple unpack target")
 
-        self._loop_stack.append((end_block, incr_block))
+        self._push_loop(end_block, incr_block)
         _prev_hot = self._in_hot_loop
         self._in_hot_loop = True
         self._emit_stmts(node.body)
         self._in_hot_loop = _prev_hot
-        self._loop_stack.pop()
+        self._pop_loop()
         if not self.builder.block.is_terminated:
             self.builder.branch(incr_block)
 
@@ -29112,12 +29162,12 @@ class CodeGen:
         ch = self._rt_call("str_index", [str_val, idx])
         self._store_variable(var_name, ch, ValueType(VKind.STR))
 
-        self._loop_stack.append((end_block, incr_block))
+        self._push_loop(end_block, incr_block)
         _prev_hot = self._in_hot_loop
         self._in_hot_loop = True
         self._emit_stmts(node.body)
         self._in_hot_loop = _prev_hot
-        self._loop_stack.pop()
+        self._pop_loop()
         if not self.builder.block.is_terminated:
             self.builder.branch(incr_block)
 
@@ -29169,12 +29219,12 @@ class CodeGen:
         byte_val = self._rt_call("bytes_get", [b_val, idx])
         self._store_variable(var_name, byte_val, ValueType(VKind.INT))
 
-        self._loop_stack.append((end_block, incr_block))
+        self._push_loop(end_block, incr_block)
         _prev_hot = self._in_hot_loop
         self._in_hot_loop = True
         self._emit_stmts(node.body)
         self._in_hot_loop = _prev_hot
-        self._loop_stack.pop()
+        self._pop_loop()
         if not self.builder.block.is_terminated:
             self.builder.branch(incr_block)
 
@@ -29239,12 +29289,12 @@ class CodeGen:
         fv = self._fv_build_from_slots(ret_tag, result)
         self._store_variable(var_name, fv, ValueType(VKind.FVALUE))
 
-        self._loop_stack.append((end_block, cond_block))
+        self._push_loop(end_block, cond_block)
         _prev_hot = self._in_hot_loop
         self._in_hot_loop = True
         self._emit_stmts(node.body)
         self._in_hot_loop = _prev_hot
-        self._loop_stack.pop()
+        self._pop_loop()
         if not self.builder.block.is_terminated:
             self.builder.branch(cond_block)
 
@@ -29307,12 +29357,12 @@ class CodeGen:
         next_idx = self.builder.add(idx, ir.Constant(i64, 1))
         self.builder.store(next_idx, idx_slot)
 
-        self._loop_stack.append((end_block, cond_block))
+        self._push_loop(end_block, cond_block)
         _prev_hot = self._in_hot_loop
         self._in_hot_loop = True
         self._emit_stmts(node.body)
         self._in_hot_loop = _prev_hot
-        self._loop_stack.pop()
+        self._pop_loop()
         if not self.builder.block.is_terminated:
             self.builder.branch(cond_block)
 
@@ -29369,12 +29419,12 @@ class CodeGen:
         # for downstream operations (print, attribute access, method calls).
         self._store_variable(var_name, raw_item, ValueType(VKind.PYOBJ))
 
-        self._loop_stack.append((end_block, cond_block))
+        self._push_loop(end_block, cond_block)
         _prev_hot = self._in_hot_loop
         self._in_hot_loop = True
         self._emit_stmts(node.body)
         self._in_hot_loop = _prev_hot
-        self._loop_stack.pop()
+        self._pop_loop()
         if not self.builder.block.is_terminated:
             self.builder.branch(cond_block)
 
@@ -29415,12 +29465,12 @@ class CodeGen:
         fv_elem = self._fv_build_from_slots(elem_tag, elem_data)
         self._store_variable(var_name, fv_elem, ValueType(VKind.MIXED))
 
-        self._loop_stack.append((end_block, cond_block))
+        self._push_loop(end_block, cond_block)
         _prev_hot = self._in_hot_loop
         self._in_hot_loop = True
         self._emit_stmts(node.body)
         self._in_hot_loop = _prev_hot
-        self._loop_stack.pop()
+        self._pop_loop()
         if not self.builder.block.is_terminated:
             next_idx = self.builder.add(
                 self.builder.load(idx_alloca), ir.Constant(i64, 1))
@@ -29493,12 +29543,12 @@ class CodeGen:
         fv_elem = self._fv_build_from_slots(elem_tag, elem_data)
         self._store_variable(var_name, fv_elem, ValueType(VKind.MIXED))
 
-        self._loop_stack.append((end_block, incr_block))
+        self._push_loop(end_block, incr_block)
         _prev_hot = self._in_hot_loop
         self._in_hot_loop = True
         self._emit_stmts(node.body)
         self._in_hot_loop = _prev_hot
-        self._loop_stack.pop()
+        self._pop_loop()
         if not self.builder.block.is_terminated:
             self.builder.branch(incr_block)
 
@@ -29661,12 +29711,12 @@ class CodeGen:
             if key_types:
                 self._dict_var_key_types[var_name] = key_types
 
-        self._loop_stack.append((end_block, incr_block))
+        self._push_loop(end_block, incr_block)
         _prev_hot = self._in_hot_loop
         self._in_hot_loop = True
         self._emit_stmts(node.body)
         self._in_hot_loop = _prev_hot
-        self._loop_stack.pop()
+        self._pop_loop()
         if not self.builder.block.is_terminated:
             self.builder.branch(incr_block)
 
@@ -29763,12 +29813,12 @@ class CodeGen:
         self._fv_store_from_list(var_name, dict_val, idx, key_type,
                                  get_fn="dict_key_fv")
 
-        self._loop_stack.append((end_block, incr_block))
+        self._push_loop(end_block, incr_block)
         _prev_hot = self._in_hot_loop
         self._in_hot_loop = True
         self._emit_stmts(node.body)
         self._in_hot_loop = _prev_hot
-        self._loop_stack.pop()
+        self._pop_loop()
         if not self.builder.block.is_terminated:
             self.builder.branch(incr_block)
 
@@ -29835,12 +29885,12 @@ class CodeGen:
         self._fv_store_from_list(val_target.id, dict_val, idx, val_type,
                                  get_fn="dict_value_fv")
 
-        self._loop_stack.append((end_block, incr_block))
+        self._push_loop(end_block, incr_block)
         _prev_hot = self._in_hot_loop
         self._in_hot_loop = True
         self._emit_stmts(node.body)
         self._in_hot_loop = _prev_hot
-        self._loop_stack.pop()
+        self._pop_loop()
         if not self.builder.block.is_terminated:
             self.builder.branch(incr_block)
 
@@ -29858,16 +29908,54 @@ class CodeGen:
 
         self.builder.position_at_end(end_block)
 
+    def _push_loop(self, break_block, continue_block) -> None:
+        """Open a loop, freezing the finally depth that bounds break/continue.
+
+        Every loop emitter goes through here rather than appending to
+        `_loop_stack` itself, so that the one fact `break` needs — how much of
+        the finally stack belongs to this loop — cannot be forgotten at one of
+        the dozen-odd specialized `for`/`while` lowerings."""
+        self._loop_stack.append(
+            (break_block, continue_block, len(self._finally_stack)))
+
+    def _pop_loop(self) -> None:
+        self._loop_stack.pop()
+
+    def _emit_loop_exit_cleanups(self, depth: int) -> bool:
+        """Emit the cleanups `break`/`continue` unwind out of, LIFO.
+
+        Returns True if one of them terminated the block, in which case the
+        caller must not emit its branch."""
+        for cleanup in reversed(self._finally_stack[depth:]):
+            saved_stack = self._finally_stack
+            self._finally_stack = []
+            try:
+                if callable(cleanup):
+                    cleanup()
+                else:
+                    self._emit_stmts(cleanup)
+            finally:
+                self._finally_stack = saved_stack
+            if self.builder.block.is_terminated:
+                return True
+        return False
+
     def _emit_break(self, node: ast.Break) -> None:
         if not self._loop_stack:
             raise CodeGenError("'break' outside loop", node)
-        end_block, _ = self._loop_stack[-1]
+        end_block, _, depth = self._loop_stack[-1]
+        # Leaving a `with` or a `try`'s body runs its cleanup, the same as a
+        # `return` does — see BUG-RETURN-IN-WITH-SKIPS-EXIT.
+        if self._emit_loop_exit_cleanups(depth):
+            return
         self.builder.branch(end_block)
 
     def _emit_continue(self, node: ast.Continue) -> None:
         if not self._loop_stack:
             raise CodeGenError("'continue' outside loop", node)
-        _, continue_block = self._loop_stack[-1]
+        _, continue_block, depth = self._loop_stack[-1]
+        if self._emit_loop_exit_cleanups(depth):
+            return
         self.builder.branch(continue_block)
 
     # -----------------------------------------------------------------

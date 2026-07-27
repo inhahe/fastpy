@@ -199,10 +199,31 @@ The same hole let side effects past a raise: in
 
 </details>
 
-### BUG-RETURN-IN-WITH-SKIPS-EXIT. A `return` inside a `with` body never runs `__exit__` — 2026-07-27
+### BUG-RETURN-IN-WITH-SKIPS-EXIT. A `return` inside a `with` body never runs `__exit__` — 2026-07-27 — **FIXED**
 
-**What:** `_emit_with` lowers the block by hand rather than by building a
-synthetic `try/finally`, and to make `return` inside the body work it pushes a
+**Fixed:** the finally stack now carries a *callback* for a `with`, because a
+`with`'s cleanup is IR that was never an AST. `_emit_with` pushes one that
+calls `_emit_with_exit_unwind`, which emits the same pyobj/native dispatch the
+fall-through path does but with `(None, None, None)` and no suppression
+handling — a `return` reaching it has already been checked for a pending
+exception and cannot have one, so there is nothing to suppress.
+
+The same walk was missing entirely from `break` and `continue`, which just
+branched to the loop's exit, skipping every `with` **and** every `try/finally`
+between them and the loop. Those leave only the cleanups pushed *inside* the
+loop, so the loop stack now records the finally depth at loop entry —
+`_push_loop`/`_pop_loop` replace fifteen hand-written `_loop_stack.append`
+sites for exactly that reason, so the one fact `break` needs cannot be
+forgotten at one of the specialized `for`/`while` lowerings — and
+`_emit_break`/`_emit_continue` unwind down to it. `_emit_return` unwinds to
+depth zero through the same helper.
+
+Regression coverage in `tests/regressions/return_out_of_with_runs_exit.py`.
+
+<details><summary>Original report</summary>
+
+`_emit_with` lowers the block by hand rather than by building a synthetic
+`try/finally`, and to make `return` inside the body work it pushed a
 **placeholder** onto the finally stack:
 
 ```python
@@ -210,12 +231,10 @@ self._finally_stack.append([])   # placeholder
 ```
 
 `_emit_return` walks that stack and emits each entry's statements before the
-`ret`. An empty list emits nothing, so a `return` out of a `with` body leaves
-the block without calling `__exit__` at all — no cleanup, no suppression, and
-for a `contextlib.contextmanager` the generator is never resumed past its
-`yield`.
+`ret`. An empty list emits nothing, so a `return` out of a `with` body left the
+block without calling `__exit__` at all — no cleanup, no suppression, and for a
+`contextlib.contextmanager` the generator was never resumed past its `yield`.
 
-**Reproduce** — should print `enter` / `exit` / `r: 1`:
 ```python
 class T:
     def __enter__(self):
@@ -227,31 +246,100 @@ def f():
     with T():
         return 1
 
-print("r:", f())
+print("r:", f())     # printed `enter` then `r: 1` — no `exit`
 ```
-fastpy prints `enter` then `r: 1` — `exit` is missing.
 
-**Where:** `_emit_with` in `compiler/codegen.py` (the
-`self._finally_stack.append([])` placeholder and the `with.finally` block it
-stands in for).
+</details>
 
-**Proper fix:** the `__exit__` call has to be emitted from somewhere
-`_emit_return` can reach. Either give the finally stack a second entry kind —
-an IR callback instead of a statement list, invoked at each `return` — or hoist
-the `with.finally` body into a helper that both the fall-through path and
-`_emit_return` call. The callback form is the better one: it keeps a single
-copy of the `__exit__` sequence and generalises to `break`/`continue` out of a
-`with`, which have the same hole. Note the exception-suppression path already
-exists in `with.finally`; a `return` must take the *drop* side of it (the
-exception, if any, is already gone, so it reduces to calling `__exit__` with
-`(None, None, None)` and ignoring the result).
+### BUG-WITH-OPEN-IN-FUNCTION-SEGFAULTS. `with open(...) as fh:` inside a function segfaults — 2026-07-27
 
-**Severity:** silent skipped cleanup — an unclosed file, an unreleased lock, an
-un-finalised context manager — in the single most common shape of `with` use.
-Discovered while writing
-`tests/regressions/pending_exception_stops_the_statement.py`, whose `with`-in-
-a-function case is written to assign-then-return specifically to route around
-this.
+**What:** the same statement that works at module scope crashes when it is in a
+function body. It is not about the `return` — the assign-then-return form
+crashes identically — and it is not about what is done with the handle.
+
+**Reproduce** — prints `module: line one`, then segfaults:
+```python
+f = open("t.txt", "w"); f.write("line one\n"); f.close()
+
+with open("t.txt", "r") as fh:      # fine
+    s = fh.readline()
+print("module:", s.strip())
+
+def rd(path):
+    with open(path, "r") as g:      # segfault
+        t = g.readline()
+    return t
+
+print("fn:", rd("t.txt").strip())
+```
+
+**Where:** `_emit_with` in `compiler/codegen.py`, most likely the
+`_is_file_expr(ctx_expr)` branch that binds the `as` target as a file var
+(`self._file_vars.add(opt_var.id)`) combined with the `with.finally` block's
+`obj_call_method3(mgr, "__exit__", ...)`. A builtin file object is an
+`FpyFile`, not a user object with a method table, so a method dispatch on it
+would fault exactly this way. Verified pre-existing against a stashed tree, so
+it is not fallout from the `return`/`break` cleanup work.
+
+**Proper fix:** find out which of the two halves faults — build the repro and
+step the `with.finally` block in cdb, or dump the IR for `rd` and look at what
+`with.exit.native` is handed. If it is the `__exit__` dispatch, a file manager
+needs its own arm that calls `fastpy_file_close` directly rather than going
+through `obj_call_method3`; the fall-through path, the `return` path
+(`_emit_with_exit_unwind`) and the `break`/`continue` path all have to take it,
+which is an argument for having exactly one function emit the exit call.
+
+**Severity:** high — a segfault, in the single most idiomatic way to read a
+file, in a function. Worked around in
+`tests/regressions/return_out_of_with_runs_exit.py` by standing a hand-written
+context manager in for the file.
+
+### BUG-CTOR-ARG-BINOP-TYPES-PARAM-INT. A `+` expression passed to a constructor types that parameter as an int, for every call site — 2026-07-27
+
+**What:** passing a BinOp directly as a constructor argument makes `__init__`'s
+parameter be inferred as an integer. The attribute stored from it then reads
+back as an int *everywhere*, including at call sites that passed a plain string
+literal — so the failure is not confined to the call that caused it.
+
+**Reproduce** — should print `['v one', 'v maybe1']`:
+```python
+class T:
+    def __init__(self, n, log):
+        self.n = n
+        self.log = log
+    def show(self):
+        self.log.append("v " + self.n)
+
+def f1(log):
+    T("one", log).show()
+
+def f2(a, log):
+    T("maybe" + str(a), log).show()
+
+lg = []
+f1(lg); f2(1, lg)
+print(lg)
+```
+fastpy raises `TypeError: unsupported operand type(s) for +: 'str' and 'int'`
+inside **f1** — the site that passed a literal. Assigning the expression to a
+local first (`nm = "maybe" + str(a); T(nm, log)`) makes it work, and so does
+passing `str(a)` on its own; the BinOp is the trigger. It also needs the second
+(untyped) parameter and the call to be inside a function: at module scope, or
+with a one-parameter class, the same code is fine.
+
+**Where:** the constructor-argument kind inference in `compiler/codegen.py` —
+whatever answers "what type is this argument expression" for `__init__` treats
+`ast.BinOp` as arithmetic without asking about its operands. Note that a *free*
+function with the same mixed call sites is handled correctly, so the working
+answer already exists elsewhere and this is the method/`__init__` path not
+using it.
+
+**Severity:** wrong type for an attribute, poisoning call sites that are
+themselves correct — and it fails loudly only when the attribute is used in a
+way ints reject. Stored and read back as an int, a string prints as its
+pointer. Worked around in
+`tests/regressions/return_out_of_with_runs_exit.py` by binding each computed
+name to a local first.
 
 ### BUG-PRINT-EMITS-BEFORE-ARGS-RAISE. `print(a, f())` emits `a` before evaluating `f()`, so a raise in the argument leaves partial output — 2026-07-27
 
