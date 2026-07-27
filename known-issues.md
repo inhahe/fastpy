@@ -3002,14 +3002,21 @@ textbook arithmetic. The same flag also drives the slot scan's widening, so
 turning it on everywhere widens every integer local. Both effects are safe only
 once a BIGINT-tagged value is narrowed correctly wherever it is consumed.
 
-BUG-BIGINT-FV-RESULT-NOT-CONSUMED was the first of these and is now fixed
-(comparison and arithmetic). The remaining one that this bug's own repros walk
-straight into is **BUG-BIGINT-RETURNED-FROM-FUNCTION-LOSES-TAG** — note that
-`fact` and `f` above both `return` the accumulator, which is exactly the
-boundary that drops the tag. BUG-LIST-LITERAL-BIGINT-DECIMAL-ELEM and
-BUG-INT-FLOAT-OF-TAGGED-VALUE are the other two known holes; they are narrower
-but would go from "corner case" to "reachable from ordinary code" the moment the
-flag is deleted.
+Two of these are now fixed: BUG-BIGINT-FV-RESULT-NOT-CONSUMED (comparison and
+arithmetic) and BUG-BIGINT-RETURNED-FROM-FUNCTION-LOSES-TAG (the return
+boundary, which this bug's own repros all walk into — `fact` and `f` above both
+`return` the accumulator).
+
+Still open and worth clearing first, because deleting the flag turns each from a
+corner case into something reachable from ordinary code:
+BUG-LIST-LITERAL-BIGINT-DECIMAL-ELEM (a promoted value stored into a list
+literal loses its tag) and BUG-INT-FLOAT-OF-TAGGED-VALUE (`int()`/`float()` of
+one are no-ops). Neither is large.
+
+Note also that `_returns_may_be_bigint` and the slot scan's widening clause are
+both gated on `_program_uses_bigint`. Deleting the flag makes both
+unconditional, which is the intended end state but means the widening they do
+must be measured for cost, not just correctness.
 
 **Severity: high — silently wrong arithmetic on ordinary code,** and it violates
 a core language guarantee rather than an edge case. `fact(25)` and `fib(100)`
@@ -3287,7 +3294,7 @@ and it must not disturb `True / 2`, which really is a float.
 **Severity:** silently wrong *type*; `print` shows it, and an int-only consumer
 downstream (indexing, `range`, `%` formatting) may reject or mis-handle it.
 
-### BUG-BIGINT-RETURNED-FROM-FUNCTION-LOSES-TAG. A BigInt returned through a call comes back as a number — 2026-07-27
+### ~~BUG-BIGINT-RETURNED-FROM-FUNCTION-LOSES-TAG. A BigInt returned through a call comes back as a number~~ — FIXED 2026-07-27
 
 **What:** a function that returns a BigInt hands the caller the *pointer* with a
 plain integer tag. Arithmetic on it then operates on the address.
@@ -3304,18 +3311,198 @@ print(neg(b) + b)          # prints e.g. 1208925819617242555011456
 The number printed is `2**80` plus a heap address, which is exactly what you get
 by adding a pointer to a BigInt. It varies run to run.
 
-**Where:** the return-tag machinery, same family as BUG-MIXED-SCALAR-RETURN-TAG
-and BUG-RETTAG-STR-VIA-LOCAL. `-x` inside `neg` correctly produces a BIGINT-tagged
-`fpy_val` (that is what `fastpy_neg_fv` was added for), but the function's
-inferred return type is a scalar int, so the tag is dropped at the boundary and
-the caller unboxes `data` as a number. Interestingly `eq(neg(b), neg(c))` is
-*correct* — passing a tagged value as an argument preserves it — so the loss is
-specifically on the return path.
+**Where — not the return path, the *bare call expression* path.** The title
+above is how it looked from outside; the actual split is finer, and worth
+recording because it is the same one as BUG-DIRECT-CALL-LEN-STATIC-TAG:
 
-The fix is to have return-type inference recognise that an expression which can
-produce a BigInt is `mixed`, and give the function the FV return ABI. The
-`_program_uses_bigint` flag already knows the program can produce BigInts;
-return inference does not consult it.
+```python
+v = f(b); print(v + 0)     # always correct
+print(f(b) + 0)            # wrong
+```
+
+Storing to a name first consults `_assign_fv_fast_path`, which was right all
+along. Only a call consumed *in place* went through `_emit_user_call`'s
+`_callee_returns_mixed` check and got unwrapped by a static claim. Passing a
+tagged value as an *argument* was likewise fine throughout.
+
+Three holes in how the return is typed, all in `_duf_infer_ret_tag`:
+
+1. **`return <param>` where the param is a BigInt** has an i8_ptr LLVM return
+   type, and that branch's default is `ret_tag = "ptr"` — which
+   `from_old_tag` maps to `VKind.LIST`. Hence the error message
+   `unsupported operand type(s) for +: 'list' and 'int'`. The i64 branch has
+   had a `returns_untyped_param -> "mixed"` arm since
+   BUG-RETURNS-UNTYPED-PARAM-RET-TAG; the pointer branch never grew one.
+   Guessing *list* for an unrecognised pointer is the worst available default
+   because every pointer fits it. The param pass-through chain also had arms
+   for STR/DICT/LIST/BYTES/SET but none for BIGINT/DECIMAL/COMPLEX, so those
+   set no flag at all and fell into that default.
+2. **`return -x` and `return x * 2`** were typed `int`/i64 — the right *width*
+   but the wrong claim, since in a program that can promote, those operators
+   go through `fpy_checked_*` and may yield a BIGINT-tagged FpyValue.
+3. **The ABI has to agree.** Saying `"mixed"` is only half the answer: `acc`
+   below came out `ret_tag=mixed` but `uses_fv_abi=False`, so there was still
+   nowhere to put the tag. `_duf_select_abi` needed the same denial it already
+   applies for BUG-MIXED-SCALAR-RETURN-TAG.
 
 **Severity:** silently wrong values that depend on the heap address, so they are
 nondeterministic across runs. Only reachable in programs that use big integers.
+
+**FIXED 2026-07-27.** Regression test
+`tests/regressions/bigint_returned_from_function.py`, also clean under
+ASan/UBSan/LSan.
+
+New `_returns_may_be_bigint(node)` answers hole 2 and 3. It is the return-side
+counterpart of the widening clause in `_scan_fv_forced_locals` and deliberately
+shares its shape: the same operator set (`_BIGINT_CAPABLE_OPS` — Add, Sub, Mult,
+Pow, LShift, the ones `_emit_int_binop` routes through `fpy_checked_*`), the
+same `_is_constant_arith` exemption, and the same over-approximating bias, since
+a wide return slot is cheap and a pointer read as a number is not. Names are
+resolved by a small fixpoint because `r = r * k` refers to itself. Unary minus
+is treated as "the operand might already be big" rather than recursing, since
+the reported repro is `-x` on a bare parameter. It is wired into both the i64
+ret_tag branch and `_duf_select_abi`'s `uses_bare` conjunction. Hole 1 is
+answered by giving the i8_ptr branch the missing `mixed` arm.
+
+**A false start worth keeping:** naming the kind statically (`ret_tag =
+"bigint"`) only moved the error, from claiming 'list' to claiming 'str'. A bare
+call expression's kind is guessed from `static_ret_type`, and i8* covers BigInt,
+Decimal and str alike. Committing to a static kind would need a matching arm in
+every consumer — which is exactly the fragility that produced this bug family.
+`"mixed"` keeps the runtime tag and rides `fastpy_fv_binop` /
+`fastpy_fv_compare`, which BUG-BIGINT-FV-RESULT-NOT-CONSUMED had just taught to
+read BigInt correctly. That fix is what made `"mixed"` a viable answer here.
+
+### ~~BUG-CALL-ARG-TYPE-GUESSES-FLOAT-FROM-ARGS. A call is typed float because a float literal was passed *into* it~~ — FIXED 2026-07-27
+
+**What:** `_infer_call_arg_type` answers "what kind does this argument
+expression produce", so the right specialization of the receiving function is
+chosen. For a call it consulted the callee's `ret_tag` and named four kinds —
+float, int, bool, str — and then **fell through** to a last-resort heuristic:
+
+```python
+has_float = any(isinstance(sub, ast.Constant) and isinstance(sub.value, float)
+                for sub in ast.walk(node))
+if has_float:
+    return "float"
+```
+
+On a Call node that `ast.walk` reaches the *arguments*. So `bisect_right(a, 1.5)`
+was typed float purely because `1.5` appears inside it, even though the function
+returns an index.
+
+**Repro** (needs a BigInt somewhere in the program, so the callee's `ret_tag`
+becomes `"mixed"` and the fall-through is reached):
+
+```python
+big = 2 ** 80
+def idx(a, x):
+    lo = 0; hi = len(a)
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if x < a[mid]: hi = mid
+        else: lo = mid + 1
+    return lo
+def show(actual, expected):
+    print(actual, type(actual), actual == expected)
+show(idx([1, 2], 1.5), 1)     # printed `1.0 <class 'float'>`
+```
+
+**Where:** `_infer_call_arg_type`, the `ast.Call`/`ast.Name` branch.
+
+**How it stayed hidden:** while every such function returned a bare i64 its
+`ret_tag` was `"int"`, which the line above answers, so the fall-through was
+unreachable. BUG-BIGINT-RETURNED-FROM-FUNCTION-LOSES-TAG made BigInt-capable
+functions return `"mixed"` and opened it — 14 of `test_bisect`'s 2857
+assertions began failing, all of them the float-`x` call sites, each printing
+the memorable `FAIL: got 1 expected 1`.
+
+**Severity:** wrong *type* (and, through the specialization it selects, wrong
+values) on any program mixing int and float arguments to the same function.
+
+**FIXED 2026-07-27.** The callee's own `ret_tag` is authoritative: a kind the
+table has no name for — `"mixed"` above all, but also a container or void —
+returns `None`, which the specialization scorer already treats as "no evidence".
+Regression test `tests/regressions/call_result_arg_kind.py`.
+
+### ~~BUG-RET-TYPE-FLOAT-FROM-CALL-ARGS. A function's return type is float because a float parameter appears inside a call~~ — FIXED 2026-07-27
+
+**What:** the same shape one level up. `_duf_detect_ret_type` decides a
+function's LLVM return type partly by walking each return expression for a float
+constant or a float-typed parameter. That walk also descends into calls:
+
+```python
+def pick(a, x, k):
+    return idx(a, x) + k       # typed `double` in the variant where x is float
+```
+
+`idx` returns an index; `x` merely rides through as an argument. Typing `pick`
+`double` made its FpyValue return unwrapped with a raw `bitcast`, so
+`pick([1, 2, 3], 2.5, 0)` printed `1e-323` — the integer 2 reinterpreted as a
+denormal.
+
+**Where:** `_duf_detect_ret_type`, both the `float_vars` scan and the
+`returns_float` scan.
+
+**Severity:** silently wrong values, and of the worst kind — a bit pattern
+printed as a number.
+
+**FIXED 2026-07-27.** New `_walk_for_float_evidence` replaces `ast.walk` in both
+scans. It skips a call whose callee already commits to a non-float result: an
+always-integer builtin (`int`, `len`, `ord`, `hash`, `id`, `round`), or a user
+function *every* declared specialization of which has a non-float `ret_tag`.
+Checking every variant is what makes it safe — in a chain like
+`A(x) -> B(x) + 1` where `B` has both an int and a float variant, only the
+caller's own float parameter says which is reached, so `A` must keep taking that
+parameter as evidence. That is `tests/regressions/monomorphization_chain.py`,
+which a first cut consulting only the bare-name entry broke.
+
+### ~~BUG-CSA-ARG-TYPE-FLOAT-FROM-CALL-ARGS. Call-site analysis types a call float from its arguments~~ — FIXED 2026-07-27
+
+**What:** the third copy of the same anti-pattern, in call-site analysis, which
+runs *before* codegen and so cannot use `ret_tag` at all. Its `arg_types`
+catch-all ends:
+
+```python
+has_float = any(isinstance(sub, ast.Constant) and isinstance(sub.value, float)
+                for sub in ast.walk(arg))
+arg_types.append("float" if has_float else None)
+```
+
+so `show(pick([1, 2, 3], 2.5, 0), 2)` gave `show` a bare `double` parameter.
+
+**Where:** `_analyze_call_sites`' `arg_types` construction. There *is* a branch
+above it for `arg.func.id in self._user_functions`, but that dict is empty while
+CSA runs.
+
+**FIXED 2026-07-27.** A new branch for calls to names in `_csa_func_asts` reads
+the *callee's own* return expressions for float evidence (a float constant, or a
+`Div`, which is always float) instead of the caller's arguments.
+
+### ~~BUG-INNER-CALL-PICKS-FIRST-SPECIALIZATION. A container argument makes the resolver fall back to specs[0]~~ — FIXED 2026-07-27
+
+**What:** `_resolve_specialization` scores each candidate signature against the
+call site's inferred one, rejecting a candidate outright on any disagreement and
+falling back to `specs[0]` when every candidate is rejected. Container tags come
+in two spellings — the call site infers `"list:int"`, the recorded
+specialization may be a bare `"list"` — and the exact-string comparison called
+that a conflict. With `("list:int", "float")` against `("list", "int")`,
+`("list", "float")` and `("list", "mixed")`, *all three* were rejected and the
+resolver took the first: the **int** variant.
+
+So inside `pick__list_d_i`, `idx(a, x)` called `idx__list_i`, which read the
+double's bits as an index and walked off the end of the binary search:
+`pick([1, 2, 3], 2.5, 1)` answered 4 instead of 3.
+
+**Where:** `_resolve_specialization`, the partial-match scoring loop.
+
+**Severity:** silently wrong values, and arbitrarily so — the fallback is
+"whichever specialization happened to be recorded first".
+
+**FIXED 2026-07-27.** Agreeing on the base kind before the `:` now scores +1
+while an exact match scores +2, so a bare `"list"` candidate is evidence rather
+than a conflict and an exactly-matching candidate still wins. Alongside it,
+`_spec_param_tags` records each variant's parameter tags under its mangled name
+so `_infer_call_arg_type` can forward a parameter's real kind into an inner call
+— an FpyValue-slotted parameter otherwise reads back as MIXED, which is exactly
+the "no evidence" that let every candidate tie.

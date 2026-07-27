@@ -3739,6 +3739,11 @@ class CodeGen:
         # Maps (func_name, signature) -> specialized mangled name when
         # the function is monomorphized. Populated in _declare_user_function.
         self._monomorphized: dict[str, list[tuple]] = {}
+        # Maps a specialization's mangled name -> {param name: call-site tag}
+        # for that variant.  Filled in _emit_function_def; read by
+        # _infer_call_arg_type so a parameter's kind survives being forwarded
+        # to an inner call.  BUG-INNER-CALL-PICKS-FIRST-SPECIALIZATION.
+        self._spec_param_tags: dict[str, dict[str, str]] = {}
         # Maps id(<the call's ast.Starred node>) -> the signature call-site
         # analysis computed for that `f(*seq)` call.  A splat spans an unknown
         # number of parameter slots, so `_resolve_specialization` cannot
@@ -7887,6 +7892,36 @@ class CodeGen:
                                           'list', 'dict')):
                     # Built-in type conversion: float(...) -> "float", etc.
                     arg_types.append(arg.func.id)
+                elif (isinstance(arg, ast.Call)
+                      and isinstance(arg.func, ast.Name)
+                      and arg.func.id in self._csa_func_asts):
+                    # A call's type is its *callee's* return type.  The
+                    # catch-all below walks the argument expression for a
+                    # float constant, and on a call node that walk reaches
+                    # the arguments: `pick(a, 2.5, 0)` was typed float purely
+                    # because 2.5 was passed in, so the receiving parameter
+                    # became a bare double and the returned INT-tagged
+                    # FpyValue was read as a denormal.  The branch above
+                    # answers this from `ret_tag` once codegen has run; call
+                    # -site analysis runs first, so read the callee's own
+                    # return expressions instead.
+                    # BUG-CSA-ARG-TYPE-FLOAT-FROM-CALL-ARGS.
+                    _callee_ast = self._csa_func_asts[arg.func.id]
+                    _ret_float = False
+                    for _r in ast.walk(_callee_ast):
+                        if not (isinstance(_r, ast.Return)
+                                and _r.value is not None):
+                            continue
+                        for _s in ast.walk(_r.value):
+                            if (isinstance(_s, ast.Constant)
+                                    and isinstance(_s.value, float)):
+                                _ret_float = True
+                            elif (isinstance(_s, ast.BinOp)
+                                    and isinstance(_s.op, ast.Div)):
+                                _ret_float = True
+                        if _ret_float:
+                            break
+                    arg_types.append("float" if _ret_float else None)
                 elif (isinstance(arg, ast.Name)
                       and arg.id in var_types
                       and self._tag_kind(var_types[arg.id]) in (VKind.PATH, VKind.PYOBJ)):
@@ -9886,7 +9921,7 @@ class CodeGen:
             if call_sig_t == sig:
                 return f"{func_name}__{self._mangle_sig(sig)}"
         # Partial match — find the best-matching signature by scoring:
-        # concrete type matches count +1, mismatches reject the sig.
+        # concrete type matches count +2, mismatches reject the sig.
         best_sig = None
         best_score = -1
         for sig in specs:
@@ -9896,10 +9931,22 @@ class CodeGen:
                 if ct is None or st is None:
                     continue
                 if ct == st:
-                    score += 1
+                    score += 2
                     continue
                 # bool/int compatible
                 if {ct, st} == {"bool", "int"}:
+                    score += 2
+                    continue
+                # A container tag may or may not carry its element type:
+                # the call site says "list:int" where the specialization was
+                # recorded as bare "list".  Treating that as a *conflict*
+                # rejected every candidate, so the loop fell through to
+                # "take specs[0]" and `idx(a, x)` inside the float variant of
+                # its caller called the *int* variant of `idx`, reading the
+                # double's bits as an index.  Agreeing on the base kind is
+                # real evidence — just weaker than an exact match, hence the
+                # +1 against +2.  BUG-INNER-CALL-PICKS-FIRST-SPECIALIZATION.
+                if (str(ct).split(":", 1)[0] == str(st).split(":", 1)[0]):
                     score += 1
                     continue
                 matches = False
@@ -9950,6 +9997,15 @@ class CodeGen:
                     return tag._to_tag() if isinstance(tag, ValueType) else str(tag)
                 if _tk in _DICT_LIKE_KINDS:
                     return "dict"
+            # A parameter of the specialization currently being emitted.  Its
+            # slot is an FpyValue, so `_var_kind` above only says MIXED, but
+            # the variant's own signature knows exactly what the caller
+            # passed — and forwarding that is the whole point of having the
+            # variant.  BUG-INNER-CALL-PICKS-FIRST-SPECIALIZATION.
+            _spec_tags = self._spec_param_tags.get(
+                getattr(self, "_current_func_name", ""), None)
+            if _spec_tags and node.id in _spec_tags:
+                return _spec_tags[node.id]
         # Attribute access: resolve via the owning class's attr-type sets.
         # This lets `compute(self.val)` monomorphize correctly when val is
         # a known-typed attr (float/bool/string/list/dict/obj).
@@ -10020,6 +10076,18 @@ class CodeGen:
                     return "bool"
                 elif _rtk == VKind.STR:
                     return "str"
+                # The callee's own return tag is authoritative.  A kind this
+                # table has no name for — "mixed" above all, but also a
+                # container or void — means *unknown*, not "guess from the
+                # call's syntax".  Falling through to the `has_float` walk
+                # below would inspect the call's *arguments*: `br(a, 1.5)`
+                # would be typed float purely because a float literal appears
+                # somewhere inside the call, even though `br` returns an
+                # index.  That mis-selects the caller's specialization and
+                # makes it read a "mixed" FpyValue as a double, so
+                # `_assert_eq(bisect_right([1, 2], 1.5), 1)` compared 1.0
+                # against 1.  BUG-CALL-ARG-TYPE-GUESSES-FLOAT-FROM-ARGS.
+                return None
         # Float-containing expression
         has_float = any(
             isinstance(sub, ast.Constant) and isinstance(sub.value, float)
@@ -10134,12 +10202,20 @@ class CodeGen:
         # kind's bits travel back reinterpreted.  Deny it the bare ABI so the
         # tag rides along in the FpyValue.  BUG-MIXED-SCALAR-RETURN-TAG.
         _mixed_scalar_ret = self._returns_mix_int_and_float(node)
+        # Same argument for a return that can promote to BigInt: the bare i64
+        # has room for the pointer but not for the tag saying it is one, so the
+        # caller reads a heap address as a number.  Denying the bare ABI is
+        # only half the fix — the ret_tag inference must also say "mixed", or
+        # the FpyValue is unwrapped by a static `int` claim on arrival.
+        # BUG-BIGINT-RETURNED-FROM-FUNCTION-LOSES-TAG.
+        _bigint_ret = self._returns_may_be_bigint(node)
         uses_bare = (
             not _used_as_value
             and not has_vararg
             and not has_kwarg
             and not _may_return_none
             and not _mixed_scalar_ret
+            and not _bigint_ret
             and _is_scalar_ret
             and _body_is_scalar
             and all(isinstance(t, _SCALAR_TYPES) for t in param_types)
@@ -10384,6 +10460,69 @@ class CodeGen:
 
         return param_names, param_types, call_types, returns_param
 
+    # Builtins whose result is an integer no matter what they are handed, so
+    # a float argument inside the call says nothing about the call's type.
+    _INT_RESULT_BUILTINS = frozenset({
+        "int", "len", "ord", "hash", "id", "round",
+    })
+
+    def _walk_for_float_evidence(self, e: ast.expr):
+        """Yield the sub-nodes of *e* whose kind can make *e* a float.
+
+        Plain `ast.walk` descends into the **argument list** of a call, and
+        the callers below take any float constant or float-typed parameter
+        they find there as proof the whole expression is a float.  A call's
+        result type is the *callee's* return type; its arguments have nothing
+        to do with it.  `return idx(a, x) + k` is an integer even in the
+        specialization where the parameter `x` is a double, and typing it
+        `double` made the caller bitcast a returned INT-tagged FpyValue into
+        a denormal — `pick([1, 2, 3], 2.5, 0)` printed `1e-323` instead
+        of `2`.  BUG-RET-TYPE-FLOAT-FROM-CALL-ARGS.
+
+        So a call is skipped entirely when its callee already commits to a
+        non-float result: one of the always-integer builtins, or a user
+        function *every* declared specialization of which has a non-float
+        `ret_tag`.  Checking every variant matters — in a chain like
+        `A(x) -> B(x) + 1`, `B` has an int variant and a float one, and only
+        the caller's own float parameter says which is reached, so `A` must
+        keep taking the parameter as evidence.  A callee we cannot name is
+        still walked into, which keeps the old, deliberately eager behaviour
+        for `math.sqrt(x)` and friends.
+        """
+        stack = [e]
+        while stack:
+            n = stack.pop()
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Name):
+                if n.func.id in self._INT_RESULT_BUILTINS:
+                    continue
+                if self._callee_never_returns_float(n.func.id):
+                    continue
+            yield n
+            stack.extend(ast.iter_child_nodes(n))
+
+    _NON_FLOAT_RET_KINDS = frozenset({
+        VKind.INT, VKind.BOOL, VKind.STR, VKind.BYTES, VKind.MIXED,
+    })
+
+    def _callee_never_returns_float(self, name: str) -> bool:
+        """Do all known declarations of user function *name* return non-float?
+
+        False when nothing is known about the name, so the caller falls back
+        to its own (eager) inference rather than assuming.
+        """
+        _infos = []
+        _info, _ = self._lookup_user_function(name)
+        if _info is not None:
+            _infos.append(_info)
+        for _sig in self._monomorphized.get(name, ()):
+            _v = self._user_functions.get(f"{name}__{self._mangle_sig(_sig)}")
+            if _v is not None:
+                _infos.append(_v)
+        if not _infos:
+            return False
+        return all(self._tag_kind(i.ret_tag) in self._NON_FLOAT_RET_KINDS
+                   for i in _infos)
+
     def _duf_detect_ret_type(
         self, node: ast.FunctionDef, ret_type,
         param_names: list[str], call_types: list,
@@ -10514,7 +10653,7 @@ class CodeGen:
                                 # and the caller printed a pointer as an integer.
                                 str_vars.add(tgt.id)
                             else:
-                                for sub in ast.walk(n.value):
+                                for sub in self._walk_for_float_evidence(n.value):
                                     if isinstance(sub, ast.Constant) and isinstance(sub.value, float):
                                         float_vars.add(tgt.id)
                                         break
@@ -10776,7 +10915,7 @@ class CodeGen:
                         # Check for float constants in return expression, or
                         # references to float-typed params (monomorphization).
                         returns_float = False
-                        for sub in ast.walk(n.value):
+                        for sub in self._walk_for_float_evidence(n.value):
                             if isinstance(sub, ast.Constant) and isinstance(sub.value, float):
                                 returns_float = True
                                 break
@@ -10900,6 +11039,11 @@ class CodeGen:
         _ann_params |= {a.arg for a in node.args.kwonlyargs
                         if a.annotation is not None}
         returns_untyped_param = False
+        # A returned parameter whose kind is pointer-carrying but is *not* a
+        # container, str, bytes or obj — BigInt, Decimal, complex.  Kept as a
+        # VKind rather than one boolean each, since the i8_ptr branch below
+        # only needs to name it.
+        returns_ptr_kind = None
         # `bytes` and `set` had no arm here either, so a function returning
         # one was typed `int` and the caller read the pointer as an integer.
         # BUG-BYTES-RETURN-TAG-LOST.
@@ -11040,6 +11184,16 @@ class CodeGen:
                             returns_bytes = True
                         elif _ctk == VKind.SET:
                             returns_set = True
+                        elif _ctk in (VKind.BIGINT, VKind.DECIMAL,
+                                      VKind.COMPLEX):
+                            # The other three pointer-carrying numeric kinds.
+                            # With no arm here nothing was set at all, so the
+                            # i8_ptr branch below fell through to its "ptr"
+                            # default — which means *list* — and `f(2 ** 80)`
+                            # consumed as a number raised "unsupported operand
+                            # type(s) for +: 'list' and 'int'".
+                            # BUG-BIGINT-RETURNED-FROM-FUNCTION-LOSES-TAG.
+                            returns_ptr_kind = _ctk
                     else:
                         # Fallback: use local type tracking (from defaults,
                         # assignments, or .append calls) for param variables.
@@ -11080,6 +11234,13 @@ class CodeGen:
                   and not returns_dict and not returns_list
                   and not returns_obj):
                 ret_tag = "mixed"
+            elif self._returns_may_be_bigint(node):
+                # `return -x` / `return r * 2` in a program that can promote to
+                # BigInt.  i64 is the right *width* but the wrong claim: the
+                # callee may hand back a BIGINT-tagged FpyValue, and narrowing
+                # that to its `data` field yields the pointer.
+                # BUG-BIGINT-RETURNED-FROM-FUNCTION-LOSES-TAG.
+                ret_tag = "mixed"
             else:
                 ret_tag = "int"
         elif ret_type == double:
@@ -11101,6 +11262,29 @@ class CodeGen:
                 ret_tag = "str"
             elif returns_obj:
                 ret_tag = "obj"
+            elif returns_ptr_kind is not None or (returns_untyped_param
+                                                  and not returns_list):
+                # BigInt/Decimal/complex pass-through, and the genuinely
+                # unknown case, both answer "mixed" — keep the tagged
+                # FpyValue and let runtime dispatch read it.
+                #
+                # Naming the kind statically instead (`ret_tag = "bigint"`)
+                # was tried and only moved the error: the caller's kind for a
+                # bare call expression is guessed from `static_ret_type`,
+                # which is i8* for all of these, so `f(2 ** 80) + 0` went from
+                # claiming 'list' to claiming 'str'.  Committing to a static
+                # kind would require a matching arm in every consumer, which
+                # is the fragility that produced this whole bug family.  The
+                # FV ABI already carries the real tag; `fastpy_fv_binop` and
+                # `fastpy_fv_compare` handle BigInt and Decimal correctly.
+                #
+                # The i64 branch above has had the untyped-param arm since
+                # BUG-RETURNS-UNTYPED-PARAM-RET-TAG; the pointer branch never
+                # grew one, so a returned parameter of unknown kind was typed
+                # "ptr" — list.  Guessing list for an unrecognised *pointer*
+                # is the worst available default, because every pointer fits
+                # it.  BUG-BIGINT-RETURNED-FROM-FUNCTION-LOSES-TAG.
+                ret_tag = "mixed"
             else:
                 ret_tag = "ptr"  # list/tuple
                 # Try to determine list element type from return statements
@@ -12104,6 +12288,23 @@ class CodeGen:
 
         effective_name = _name_override if _name_override else node.name
         self._current_func_name = effective_name  # Phase 4: for indirect call ABI detection
+
+        # Record which tag each parameter carries *in this specialization*.
+        # `_infer_call_arg_type` needs it to forward a parameter's kind to an
+        # inner call: inside `pick__list_d_i`, `idx(a, x)` must pick
+        # `idx__list_d`, but `x` is stored as an FpyValue so `_var_kind` only
+        # says MIXED, the argument scored as "unknown", every candidate tied
+        # and the resolver took the *first* specialization — the int one,
+        # which read the double's bits as an index.
+        # BUG-INNER-CALL-PICKS-FIRST-SPECIALIZATION.
+        if _sig_override is not None:
+            _spec_pnames = ([a.arg for a in node.args.posonlyargs]
+                            + [a.arg for a in node.args.args]
+                            + [a.arg for a in node.args.kwonlyargs])
+            self._spec_param_tags[effective_name] = {
+                _pn: _pt for _pn, _pt in zip(_spec_pnames, _sig_override)
+                if _pt is not None
+            }
 
         # CPython generators: skip body emission. The function will be
         # compiled and stored via CPython bridge in fastpy_main.
@@ -23256,6 +23457,83 @@ class CodeGen:
                       if isinstance(n, ast.ClassDef)}
             self._program_class_names_cache = cached
         return cached
+
+    # The operators `_emit_int_binop` routes through `fpy_checked_*` when
+    # `_program_uses_bigint` is set, i.e. the ones whose result can be a
+    # BIGINT-tagged FpyValue rather than an i64.
+    _BIGINT_CAPABLE_OPS = (ast.Add, ast.Sub, ast.Mult, ast.Pow, ast.LShift)
+
+    def _returns_may_be_bigint(self, node: ast.FunctionDef) -> bool:
+        """Could any `return` in *node* hand back a BigInt?
+
+        Return-type inference otherwise types `return -x` and `return r * 2`
+        as `int`/i64, so the caller narrows the FpyValue to its `data` field —
+        which for a BIGINT is the *pointer*.  `print(neg(b) + 0)` then printed
+        a heap address, and it varied run to run.
+        BUG-BIGINT-RETURNED-FROM-FUNCTION-LOSES-TAG.
+
+        This is the return-side counterpart of the widening clause in
+        `_scan_fv_forced_locals`, and deliberately shares its shape: the same
+        operator set, the same `_is_constant_arith` exemption (an all-constant
+        expression is folded to a static BigInt, not a tagged one), and the
+        same over-approximating stance — a name is "maybe big" if *any*
+        assignment to it in this function is, resolved by a small fixpoint
+        because `r = r * k` refers to itself.
+
+        Over-approximating costs a wide return slot; under-approximating hands
+        back a pointer as a number, so the bias is deliberate.
+        """
+        if not self._program_uses_bigint:
+            return False
+
+        def arith_may_be_big(e) -> bool:
+            if isinstance(e, ast.BinOp):
+                return (isinstance(e.op, self._BIGINT_CAPABLE_OPS)
+                        and not self._is_constant_arith(e))
+            if isinstance(e, ast.UnaryOp) and isinstance(e.op, ast.USub):
+                # Negation preserves a BigInt rather than creating one, so the
+                # question is whether the *operand* could already be one — and
+                # a bare name usually can be, which is why this does not just
+                # recurse.  `-x` on a parameter is the reported repro; only a
+                # literal (`-5`) and the never-int nodes are ruled out.
+                inner = e.operand
+                if isinstance(inner, ast.Constant):
+                    return False
+                if isinstance(inner, self._NEVER_INT_NODES):
+                    return False
+                return not self._is_constant_arith(inner)
+            return False
+
+        maybe_big: set[str] = set()
+        for _ in range(4):
+            grew = False
+            for stmt in ast.walk(node):
+                if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1:
+                    tgt, val = stmt.targets[0], stmt.value
+                elif isinstance(stmt, (ast.AnnAssign, ast.AugAssign)):
+                    tgt, val = stmt.target, stmt.value
+                else:
+                    continue
+                if not isinstance(tgt, ast.Name) or val is None:
+                    continue
+                if tgt.id in maybe_big:
+                    continue
+                if arith_may_be_big(val) or (isinstance(val, ast.Name)
+                                             and val.id in maybe_big):
+                    maybe_big.add(tgt.id)
+                    grew = True
+            if not grew:
+                break
+
+        for n in ast.walk(node):
+            if not isinstance(n, ast.Return) or n.value is None:
+                continue
+            v = n.value
+            if arith_may_be_big(v):
+                return True
+            if isinstance(v, ast.Name) and v.id in maybe_big:
+                return True
+        return False
 
     # Builtins whose result kind is their argument's kind, so a tagged
     # argument makes the result tagged too.  `round` is included even though

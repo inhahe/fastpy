@@ -362,6 +362,35 @@ which `frexp`/`ldexp` recover as a 53-bit i64 plus a shift. NaN answers
 "unordered", which every operator but `!=` reads as False. The general form: when
 two representations have different precision, convert toward the *wider* one.
 
+**A return that can promote needs both a `mixed` tag and the FV ABI.** These are
+decided in two places and either one alone is useless: `_duf_infer_ret_tag` can
+say `mixed` while `_duf_select_abi` still hands the function a bare i64, which
+has room for a BigInt's pointer but not for the tag saying it is one. So
+`_returns_may_be_bigint` feeds both — the ret_tag branch, and the `uses_bare`
+conjunction alongside the existing `_returns_mix_int_and_float` denial that
+exists for exactly the same reason.
+
+That predicate is the return-side counterpart of the slot scan's widening clause
+and shares its shape on purpose: the same operator set (`_BIGINT_CAPABLE_OPS` —
+the ones `_emit_int_binop` routes through `fpy_checked_*`), the same
+`_is_constant_arith` exemption, the same fixpoint over names because `r = r * k`
+refers to itself, and the same over-approximating bias, since a wide return slot
+is cheap and a pointer read as a number is not.
+
+**Prefer `mixed` over naming a pointer kind statically.** Typing such a return
+`bigint` was tried and only moved the failure. A *bare call expression*'s kind is
+guessed from `static_ret_type`, and i8* covers BigInt, Decimal, str, bytes and
+list alike — so the complaint merely changed from 'list' to 'str'. Any static
+commitment needs a matching arm in every consumer, which is the fragility this
+whole family comes from; `mixed` keeps the runtime tag and routes through
+dispatch that already reads it. Note the ordering dependency: `mixed` only became
+a *correct* answer once `fastpy_fv_binop` and `fastpy_fv_compare` handled BigInt.
+
+The related trap is that `"ptr"` maps to `VKind.LIST`, so the pointer branch's
+default silently claims every unrecognised pointer is a list — the worst
+available guess, since every pointer fits it. Both the pointer branch and the
+param pass-through chain now fail toward `mixed` instead.
+
 **Two call sites must agree on the MIXED tag.** A callee's result type is
 decided in two independent places, and both consult `_func_ret_types`:
 
@@ -400,6 +429,49 @@ directions on purpose:
 Coverage is bounded by what `_func_ret_types` records: list/dict/tuple/float
 and MIXED, but not str/bytes/set, since the propagation chain has no arm for a
 plain `return "abcd"`. Widening that belongs on the callee side.
+
+**A call's type is the callee's return type — never its arguments'.** Three
+independent passes classify an expression's kind, and all three ended a chain of
+specific cases with the same last-resort heuristic: walk the expression, and if
+a float constant turns up anywhere, call it a float. On a *call* node that walk
+descends into the argument list, so `bisect_right(a, 1.5)` was a float because
+`1.5` had been passed into it. The three copies are `_infer_call_arg_type`
+(picking the receiving function's specialization), `_duf_detect_ret_type`
+(picking a function's own LLVM return type), and `_analyze_call_sites`' arg
+classification (picking a parameter's ABI type). They failed at different times
+and produced different symptoms — a `1.0` where a `1` was expected, a returned
+FpyValue `bitcast` to the denormal `1e-323`, a bare `double` parameter — but the
+correction is the same in each: consult the callee.
+
+The three cannot share one implementation, because they run at different points
+and so have different evidence available:
+
+- `_infer_call_arg_type` runs during emission, so `ret_tag` is final and
+  authoritative. A kind it has no name for (`mixed`, a container, void) means
+  *unknown*, which is a `None` the specialization scorer already handles — not
+  a licence to guess.
+- `_duf_detect_ret_type` runs while `ret_tag`s are still being assigned, so it
+  must check *every* declared specialization of the callee, not the bare-name
+  entry. In `A(x) -> B(x) + 1` where `B` has both an int and a float variant,
+  only the caller's own float parameter says which is reached.
+- `_analyze_call_sites` runs before codegen, when `_user_functions` is empty,
+  so it reads the callee's own `return` expressions out of `_csa_func_asts`.
+
+The residual eagerness is deliberate: a callee that cannot be named at all is
+still walked into, which keeps `math.sqrt(x)` typed float.
+
+**A specialization mismatch must not fall back to "the first one".**
+`_resolve_specialization` rejects a candidate signature on any disagreement and,
+when every candidate is rejected, takes `specs[0]`. That fallback is a silent
+wrong answer, so the scoring has to be forgiving where two spellings mean the
+same thing: container tags appear both with and without their element type
+(`list:int` vs `list`), and treating that as a conflict rejected every
+candidate at once. Agreeing on the base kind scores +1, an exact match +2, so
+partial agreement is evidence without ever outranking an exact hit. The other
+half is making sure a real answer is available: an FpyValue-slotted parameter
+reads back as MIXED, so `_spec_param_tags` records each variant's parameter tags
+under its mangled name and `_infer_call_arg_type` forwards them into inner
+calls. Without it every candidate ties at zero and the fallback fires anyway.
 
 **The bare ABI requires positive evidence about every parameter.** `param_types`
 falls back to `i64` when nothing is known, so by the time `_duf_select_abi` runs
