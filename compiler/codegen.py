@@ -7455,6 +7455,221 @@ class CodeGen:
                     return True
         return False
 
+    def _csa_const_elem_tag(self, value) -> str | None:
+        """The tag of a literal constant, or None when it doesn't decide one.
+
+        `bool` is tested before `int` because it is a subclass of it, and an
+        out-of-i64-range int is a BigInt — the whole point of the caller is
+        that a heap element read back as an i64 is a pointer, not a value.
+        """
+        if isinstance(value, bool):
+            return "bool"
+        if isinstance(value, int):
+            return ("bigint" if (value > 2**63 - 1 or value < -(2**63))
+                    else "int")
+        if isinstance(value, str):
+            return "str"
+        if isinstance(value, bytes):
+            return "bytes"
+        if isinstance(value, float):
+            return "float"
+        if isinstance(value, complex):
+            return "complex"
+        return None  # None, Ellipsis — nothing useful to say
+
+    def _csa_elem_tag_of(self, elt: ast.expr,
+                         local_types: dict[str, str]) -> str | None:
+        """The tag of one element *expression*, or None when undecidable.
+
+        Deliberately shallow and total: this runs in the CSA pre-scan, where
+        `self.variables` is empty and `_infer_type_tag` cannot be trusted, so
+        every answer comes from the AST plus the `local_types` the same scan
+        has already built.  Returning None is always safe — the caller then
+        emits a bare "list", which is exactly the behaviour that existed
+        before this helper.
+        """
+        if isinstance(elt, (ast.List, ast.ListComp)):
+            return "list"
+        if isinstance(elt, ast.Tuple):
+            return "tuple"
+        if isinstance(elt, (ast.Dict, ast.DictComp)):
+            return "dict"
+        if isinstance(elt, (ast.Set, ast.SetComp)):
+            return "set"
+        if isinstance(elt, ast.JoinedStr):
+            return "str"
+        if isinstance(elt, ast.Constant):
+            return self._csa_const_elem_tag(elt.value)
+        if isinstance(elt, ast.UnaryOp) and isinstance(elt.op, ast.USub):
+            # `-(2 ** 80)` is as much a BigInt as `2 ** 80`.
+            return self._csa_elem_tag_of(elt.operand, local_types)
+        if (isinstance(elt, ast.BinOp) and isinstance(elt.op, ast.Pow)
+                and isinstance(elt.left, ast.Constant)
+                and isinstance(elt.right, ast.Constant)
+                and isinstance(elt.left.value, int)
+                and isinstance(elt.right.value, int)
+                and not isinstance(elt.left.value, bool)
+                and not isinstance(elt.right.value, bool)
+                and 0 <= elt.right.value <= 4096):
+            # `2 ** 80` is a BinOp of two small constants, so no literal-range
+            # test sees it; fold it.  The exponent bound keeps the fold cheap
+            # — anything larger is a BigInt whatever the base, short of 0/1.
+            return self._csa_const_elem_tag(
+                elt.left.value ** elt.right.value)
+        if isinstance(elt, ast.BinOp):
+            return self._csa_binop_elem_tag(elt, local_types)
+        if isinstance(elt, ast.Compare):
+            return "bool"
+        if isinstance(elt, ast.IfExp):
+            a = self._csa_elem_tag_of(elt.body, local_types)
+            b = self._csa_elem_tag_of(elt.orelse, local_types)
+            return a if a is not None and a == b else None
+        if isinstance(elt, ast.Name):
+            tag = local_types.get(elt.id)
+            # Only hand back tags this helper itself could have produced; a
+            # compound tag like "list:str" describes the *name*, not what an
+            # element of a list of those names would be.
+            if tag in ("int", "float", "bool", "str", "bytes", "dict", "set",
+                       "tuple", "obj", "bigint", "decimal", "complex"):
+                return tag
+            if tag is not None and tag.startswith("list"):
+                return "list"
+            return None
+        if isinstance(elt, ast.Call) and isinstance(elt.func, ast.Name):
+            if elt.func.id in self._user_classes:
+                return "obj"
+            return {"Decimal": "decimal", "complex": "complex",
+                    "str": "str", "bytes": "bytes", "float": "float",
+                    "dict": "dict", "set": "set", "frozenset": "set",
+                    "list": "list", "tuple": "tuple", "len": "int",
+                    "ord": "int", "chr": "str", "repr": "str",
+                    "hex": "str", "oct": "str", "bin": "str",
+                    "bool": "bool"}.get(elt.func.id)
+        return None
+
+    # Numeric tags in Python's own promotion order.  `bool` sits below `int`
+    # because `True + 1` is an `int`; `bigint` below `float` because a BigInt
+    # divided by anything is a float.
+    _CSA_NUM_RANK = {"bool": 0, "int": 1, "bigint": 2,
+                     "float": 3, "decimal": 4, "complex": 5}
+    _CSA_SEQ_TAGS = ("str", "bytes", "list", "tuple")
+
+    def _csa_binop_elem_tag(self, elt: ast.BinOp,
+                            local_types: dict[str, str]) -> str | None:
+        """The tag of an arithmetic element expression, e.g. `i / 2`.
+
+        Without this arm `[i / 2 for i in range(3)]` had no element tag at
+        all, so a function returning it handed back a list whose elements
+        were float bits read as integers.  Declining stays safe, so anything
+        whose result kind depends on a *value* rather than a kind — `**`,
+        `<<`, which can promote int to BigInt on overflow — declines.
+        """
+        lt = self._csa_elem_tag_of(elt.left, local_types)
+        rt = self._csa_elem_tag_of(elt.right, local_types)
+        op = elt.op
+        rank = self._CSA_NUM_RANK
+        seq = self._CSA_SEQ_TAGS
+
+        if isinstance(op, ast.Mult):
+            # Sequence repetition: `[0] * n`, `"-" * width`.  The count is
+            # often a name this pre-scan cannot see, but the repeated side
+            # decides the result on its own.
+            for a, b in ((lt, rt), (rt, lt)):
+                if a in seq and b in ("int", "bool", None):
+                    return a
+        if isinstance(op, ast.Add) and lt in seq and lt == rt:
+            return lt  # "a" + "b", [1] + [2], b"x" + b"y"
+        if isinstance(op, (ast.BitOr, ast.BitAnd, ast.BitXor, ast.Sub)):
+            if lt == "set" and rt == "set":
+                return "set"
+            if isinstance(op, ast.BitOr) and lt == "dict" and rt == "dict":
+                return "dict"
+
+        if lt in rank and rt in rank:
+            if isinstance(op, (ast.Pow, ast.LShift)):
+                # `2 ** n` and `1 << n` overflow into BigInt at a threshold
+                # only the value knows.  Float bases are safe.
+                return ("float" if max(rank[lt], rank[rt]) >= rank["float"]
+                        else None)
+            if isinstance(op, (ast.BitOr, ast.BitAnd, ast.BitXor,
+                               ast.RShift)):
+                return ("int" if max(rank[lt], rank[rt]) <= rank["bigint"]
+                        else None)
+            if not isinstance(op, (ast.Add, ast.Sub, ast.Mult, ast.Div,
+                                   ast.FloorDiv, ast.Mod)):
+                return None  # MatMult and anything future
+            wide = lt if rank[lt] >= rank[rt] else rt
+            if isinstance(op, ast.Div):
+                # True division never yields an integer.
+                return "float" if rank[wide] <= rank["bigint"] else wide
+            return "int" if wide == "bool" else wide
+        return None
+
+    def _csa_iter_elem_tag(self, it: ast.expr,
+                           local_types: dict[str, str]) -> str | None:
+        """The tag of one item yielded by an iterable expression.
+
+        Only used to bind a comprehension's loop variable, so that the
+        element expression that mentions it can be classified at all:
+        without this, the `i` in `[i / 2 for i in range(3)]` is an unknown
+        name and the whole comprehension declines.
+        """
+        if isinstance(it, ast.Constant) and isinstance(it.value, str):
+            return "str"
+        if isinstance(it, (ast.List, ast.Tuple, ast.Set)):
+            tags = {self._csa_elem_tag_of(e, local_types) for e in it.elts}
+            return tags.pop() if len(tags) == 1 else None
+        if isinstance(it, (ast.ListComp, ast.SetComp, ast.GeneratorExp)):
+            return self._csa_list_elem_tag(it, local_types)
+        if isinstance(it, ast.Name):
+            tag = local_types.get(it.id)
+            if tag == "str":
+                return "str"  # iterating a str yields one-character strs
+            if tag is None or ":" not in tag:
+                return None   # a bare "list" is exactly the missing kind
+            head, _, elem = tag.partition(":")
+            if head in ("list", "tuple", "set", "ptr"):
+                return elem if ":" not in elem else None
+            return None
+        if isinstance(it, ast.Call) and isinstance(it.func, ast.Name):
+            if it.func.id == "range":
+                return "int"
+            if (it.func.id in ("sorted", "reversed", "list", "tuple", "set",
+                               "frozenset", "iter") and it.args):
+                return self._csa_iter_elem_tag(it.args[0], local_types)
+        return None
+
+    def _csa_list_elem_tag(self, node: ast.expr,
+                           local_types: dict[str, str]) -> str | None:
+        """The common element tag of a list literal / comprehension.
+
+        All elements must agree; a mixed list declines, because one tag has to
+        describe every read out of the list and a wrong one is worse than no
+        information.  An empty list also declines — there is nothing to read.
+        """
+        if isinstance(node, (ast.ListComp, ast.SetComp, ast.GeneratorExp)):
+            # Bind each loop variable to what its iterable yields, so the
+            # element expression can mention it.  A target this scan cannot
+            # type is *removed* rather than left alone: an outer name that
+            # the comprehension shadows would otherwise answer for it.
+            scope = dict(local_types)
+            for gen in node.generators:
+                yielded = self._csa_iter_elem_tag(gen.iter, scope)
+                if isinstance(gen.target, ast.Name) and yielded:
+                    scope[gen.target.id] = yielded
+                else:
+                    for nm in ast.walk(gen.target):
+                        if isinstance(nm, ast.Name):
+                            scope.pop(nm.id, None)
+            return self._csa_elem_tag_of(node.elt, scope)
+        if not isinstance(node, ast.List) or not node.elts:
+            return None
+        tags = {self._csa_elem_tag_of(e, local_types) for e in node.elts}
+        if len(tags) != 1:
+            return None
+        tag = tags.pop()
+        return tag
+
     def _csa_propagate_ret_types(
         self, tree: ast.Module,
         func_asts: dict[str, ast.FunctionDef],
@@ -7654,31 +7869,24 @@ class CodeGen:
             for n in ast.walk(fnode):
                 if isinstance(n, ast.Return) and n.value is not None:
                     if isinstance(n.value, (ast.List, ast.ListComp)):
-                        # Detect list-of-lists: return [[...], [...]] or
-                        # return [expr for ...] where expr is a list/comp.
-                        _has_list_elems = False
-                        if isinstance(n.value, ast.List) and n.value.elts:
-                            _has_list_elems = all(
-                                isinstance(e, (ast.List, ast.ListComp))
-                                for e in n.value.elts)
-                        elif isinstance(n.value, ast.ListComp):
-                            _has_list_elems = isinstance(
-                                n.value.elt, (ast.List, ast.ListComp,
-                                              ast.BinOp))
-                            # [0]*N, [expr]*N are lists
-                            if (isinstance(n.value.elt, ast.BinOp)
-                                    and isinstance(n.value.elt.op, ast.Mult)):
-                                if isinstance(n.value.elt.left,
-                                              (ast.List, ast.ListComp)):
-                                    _has_list_elems = True
-                                elif isinstance(n.value.elt.right,
-                                                (ast.List, ast.ListComp)):
-                                    _has_list_elems = True
-                                else:
-                                    _has_list_elems = False
-                        _func_ret_types[fname] = ("ptr:list"
-                                                   if _has_list_elems
-                                                   else "list")
+                        # This used to ask a yes/no question — "is it a list
+                        # of lists?" — so every other element kind collapsed
+                        # to a bare "list", whose consumer then defaults the
+                        # element to VKind.INT: a returned `["alpha"]` read
+                        # its elements back as integers.  Worse, the
+                        # comprehension arm answered *yes* for any `BinOp`
+                        # element, so `[i / 2 for i in range(3)]` claimed to
+                        # be a list of lists and `+ 1` on an element raised
+                        # `unsupported operand type(s) for +: 'list' and
+                        # 'int'`.  Both directions are now one classifier
+                        # that names the kind.  BUG-RETURNED-LIST-ELEM-TAG-
+                        # LOST.
+                        _elem = self._csa_list_elem_tag(n.value, local_types)
+                        if _elem == "list":
+                            _func_ret_types[fname] = "ptr:list"
+                        else:
+                            _func_ret_types[fname] = (
+                                f"list:{_elem}" if _elem else "list")
                     elif isinstance(n.value, (ast.Dict, ast.DictComp)):
                         _func_ret_types[fname] = "dict"
                     elif isinstance(n.value, (ast.Set, ast.SetComp)):
@@ -7711,28 +7919,27 @@ class CodeGen:
                             _func_ret_types[fname] = f"list:{elem}"
                         elif ret_var in local_types:
                             _func_ret_types[fname] = local_types[ret_var]
-                            # Refine: if local_types says "list" but the
-                            # variable was assigned from a list-of-lists
-                            # expression, upgrade to "ptr:list".
-                            if _tk(local_types[ret_var]) == VKind.LIST:
+                            # Refine: `local_types` only ever says a bare
+                            # "list", so recover the element kind from the
+                            # expression the variable was assigned.  This used
+                            # to ask the same yes/no question as the literal
+                            # path above — "is it a list of lists" — and so
+                            # lost every other element kind the same way.
+                            # BUG-RETURNED-LIST-ELEM-TAG-LOST.
+                            if (_tk(local_types[ret_var]) == VKind.LIST
+                                    and ":" not in local_types[ret_var]):
                                 for a2 in ast.walk(fnode):
                                     if (isinstance(a2, ast.Assign)
                                             and len(a2.targets) == 1
                                             and isinstance(a2.targets[0], ast.Name)
                                             and a2.targets[0].id == ret_var):
-                                        _rv = a2.value
-                                        if isinstance(_rv, ast.ListComp):
-                                            elt = _rv.elt
-                                            if isinstance(elt, (ast.List, ast.ListComp)):
-                                                _func_ret_types[fname] = "ptr:list"
-                                            elif (isinstance(elt, ast.BinOp)
-                                                    and isinstance(elt.op, ast.Mult)
-                                                    and (isinstance(elt.left, (ast.List, ast.ListComp))
-                                                         or isinstance(elt.right, (ast.List, ast.ListComp)))):
-                                                _func_ret_types[fname] = "ptr:list"
-                                        elif isinstance(_rv, ast.List) and _rv.elts:
-                                            if all(isinstance(e, (ast.List, ast.ListComp)) for e in _rv.elts):
-                                                _func_ret_types[fname] = "ptr:list"
+                                        _elem = self._csa_list_elem_tag(
+                                            a2.value, local_types)
+                                        if _elem == "list":
+                                            _func_ret_types[fname] = "ptr:list"
+                                        elif _elem:
+                                            _func_ret_types[fname] = (
+                                                f"list:{_elem}")
                                         break
                         elif ret_var in var_types:
                             _func_ret_types[fname] = var_types[ret_var]
@@ -35234,8 +35441,17 @@ class CodeGen:
                 info = self._user_functions[node.func.id]
                 frt = getattr(self, '_func_ret_types', {})
                 _actual_ret = frt.get(node.func.id, info.ret_tag)
-                if _actual_ret == "ptr:list":
-                    return ValueType(VKind.LIST)
+                # `ptr:list` used to be the only element type a returned list
+                # could carry, because the CSA pass only ever asked "is it a
+                # list of lists".  Now that it names the element kind, read
+                # whatever it says — otherwise `return ["alpha"]` still hands
+                # the caller a list whose elements default to INT, and the
+                # string pointers read back as integers.
+                # BUG-RETURNED-LIST-ELEM-TAG-LOST.
+                _ret_vt = ValueType.from_old_tag(_actual_ret)
+                if (_ret_vt.kind == VKind.LIST
+                        and _ret_vt.elem_type is not None):
+                    return _ret_vt.elem_type
                 if info.ret_tag == "ptr":
                     rt = frt.get(node.func.id, "")
                     if self._tag_kind(rt) == VKind.TUPLE and ":" in str(rt):

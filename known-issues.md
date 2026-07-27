@@ -305,7 +305,7 @@ cannot be deleted or reopened for writing). Noted in
 `tests/regressions/file_read_returned_from_function_is_str.py`, which avoids
 the shape for this reason.
 
-### BUG-RETURNED-LIST-ELEM-TAG-LOST. A list of strings returned from a function reads its elements back as ints — 2026-07-27
+### BUG-RETURNED-LIST-ELEM-TAG-LOST. A list of strings returned from a function reads its elements back as ints — 2026-07-27 — **FIXED**
 
 **What:** the *same list literal* is typed `list[str]` at module scope and
 `list[int]` once it has been through a `return`. Reading an element back then
@@ -350,14 +350,59 @@ container reads its inner elements through, and the same default to
 elements were. With a heap-numeric element the consequence is not a wrong
 length but a wrong *answer*: `outer[0][0] == inner[0]` compares two pointers
 as integers and says `False`. See BUG-BIGINT-COMPARES-BY-POINTER, which is
-this bug reached from the other direction and is fixed by fixing this one.
+this bug reached from the other direction — but it was **not** fixed by this
+fix, and the two shapes it uses were re-checked after the fix landed and are
+unchanged. They reach the element kind by other routes (a subscript of a
+*parameter*, and a module-level nested literal), neither of which goes through
+`_func_ret_types` at all.
 
-**Proper fix:** infer the returned list's element kind from the same
-information the construction site already has — for `return [<const str>, ...]`
-and for `return <name>` where the name was assigned such a literal, carry the
-element kind into the call site's view of the result. The general case needs
-the element kind to travel with the value at runtime rather than be re-derived
-statically at every consumer, which is the standing theme of this bug family.
+**A second facet, found while fixing the first.** The comprehension arm of the
+same yes/no test answered **yes** for any element that was an `ast.BinOp`, on
+the strength of `[[0] * n for ...]`. So `[i / 2 for i in range(3)]` claimed its
+elements were *lists*, and reading one back gave a value tagged LIST:
+```python
+def mk():
+    return [i / 2 for i in range(3)]
+
+print(mk()[1])       # 0.5      — correct
+print(mk()[2] + 1)   # TypeError: unsupported operand type(s) for +: 'list' and 'int'
+```
+This is why the fix could not be "fill the element kind in when we happen to
+know it": the yes/no guess was not merely uninformative, it was sometimes
+wrong, so it had to go rather than be supplemented.
+
+**Fix (2026-07-27):** three CSA-pre-pass helpers in `compiler/codegen.py`
+replace the yes/no question with a classifier that names the kind:
+
+- `_csa_elem_tag_of` — the tag of one element *expression*, from the AST plus
+  the `local_types` the same scan has already built. Total and shallow;
+  returning `None` is always safe and reproduces the old bare `"list"`.
+- `_csa_binop_elem_tag` — arithmetic. `int / int` is a float, a sequence times
+  a count is that sequence, `str + str` is a str. `**` and `<<` decline,
+  because whether they overflow into a BigInt depends on the *value*.
+- `_csa_iter_elem_tag` — what an iterable yields, used to bind a
+  comprehension's loop variable, so the `i` in `for i in range(3)` is an `int`
+  rather than an unknown name. A target it cannot type is *removed* from the
+  scope rather than left alone, so an outer name the comprehension shadows
+  cannot answer for it.
+
+All three decision sites now call `_csa_list_elem_tag`: the literal path
+(`return [...]`), the refinement for `return <name>`, and — the reader half,
+which had the mirror-image hole — `_get_list_elem_type`'s user-call arm, which
+recognised `"ptr:list"` and nothing else and so would have ignored a
+`"list:str"` even once one was produced. `"ptr:list"` is now just the answer
+you get when the common element tag *is* `"list"`.
+
+Regression test: `tests/regressions/returned_list_keeps_its_element_type.py`
+(str/float/int/list/dict/bool elements, comprehensions, arithmetic elements,
+mixed and empty declining, the tag surviving an assignment/iteration hop, and a
+branchy return). Full suite green.
+
+**Still true, and still the standing theme:** this is static re-derivation at
+the consumer, not the element kind travelling with the value at runtime. It
+declines rather than guesses, so it is sound where it answers, but a list whose
+elements disagree still falls back to the bare `"list"` whose consumer defaults
+to `VKind.INT`.
 
 **Severity:** silently wrong values, plus a hang — high.
 
@@ -3688,12 +3733,46 @@ That is also why printing is correct throughout: `print` takes the runtime
 tag, which was right all along. Only the statically-dispatched operations are
 wrong.
 
-**Proper fix:** fix the element/return tag (BUG-RETURNED-LIST-ELEM-TAG-LOST),
-which removes the cause. Independently, `_emit_compare` should treat a
-*pointer-shaped* operand typed INT as a contradiction rather than comparing
-it — an i64 that came out of a container should go through `fv_compare` — so
-that the next tag-inference hole degrades to slow-but-correct instead of
-silently wrong.
+**Not fixed by the BUG-RETURNED-LIST-ELEM-TAG-LOST fix (re-checked
+2026-07-27).** That fix replaced the yes/no tag in the *return* pre-pass
+(`_func_ret_types`) with a classifier, and both shapes here were re-run against
+it unchanged. Neither goes through that pre-pass:
+
+- `outer[0][0]` is built and read entirely at **module scope**, so no return
+  tag is involved; the loss is in the container element type
+  (codegen.py:18794's `VKind.INT` default), which is a different reader.
+- `pick(vs)` returns `vs[0]` — a subscript of an untyped **parameter**, not a
+  list literal, so the classifier has nothing to classify and correctly
+  declines.
+
+**Proper fix — and an earlier note here was wrong about it.** This entry used
+to propose that `_emit_compare` treat a *pointer-shaped* operand typed INT as a
+contradiction and route it through `fv_compare`. That cannot work as written:
+by the time `_emit_compare` sees the operand it is a bare `i64` whose static
+type says INT, so `_to_tag_data_ir` would hand `fv_compare` the tag `INT` for
+both sides and it would compare them as integers — the same wrong answer, more
+slowly.
+
+The information is not actually lost. `FpyList.items` is an `FpyValue*`
+(`runtime/objects.h:275`), so **every list element carries its own runtime tag
+at all times**, regardless of what the compiler believes. The loss is entirely
+in the static view, and the fix belongs at the *read*, not the compare: an
+element read out of a list whose element kind is not genuinely known should go
+through `list_get_fv` and be typed `VKind.FVALUE`, which already routes `len`,
+subscript, `in`, iteration, truthiness and comparison through runtime dispatch.
+That bounds the whole family — every heap tag reachable through a container —
+rather than one member, and it degrades to slow-but-correct instead of silently
+wrong.
+
+**What blocks it: `elem_type=INT` means two different things.** The read site
+cannot currently tell "known to be a list of ints" from "no idea, defaulted to
+int", because roughly thirty sites in `codegen.py` write
+`ValueType(VKind.LIST, elem_type=ValueType(VKind.INT))` eagerly where they mean
+the latter. `ValueType(VKind.LIST)` with `elem_type=None` is the representation
+that already exists for "unknown" — `from_old_tag` produces exactly that for a
+bare `"list"` — so the work is to stop collapsing the two at those sites, then
+make the read consult the distinction. Until that is done, any narrower fix
+just moves the hole.
 
 **Severity:** high. Silently wrong answers, no crash and no diagnostic. Note
 the failure is not confined to BigInt: any heap tag reachable through a

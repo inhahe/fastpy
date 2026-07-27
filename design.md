@@ -974,6 +974,40 @@ Coverage is bounded by what `_func_ret_types` records: list/dict/tuple/float
 and MIXED, but not str/bytes/set, since the propagation chain has no arm for a
 plain `return "abcd"`. Widening that belongs on the callee side.
 
+**A returned list's element kind is a kind, not a yes/no.** The tag for a
+list-returning function used to be one of exactly two values: `"ptr:list"` when
+every element of the returned literal was itself a list, and a bare `"list"`
+otherwise. A bare `"list"` carries no element type and its consumer fills that
+in with `VKind.INT`, so *every* element kind other than `list` was reported to
+the caller as `int` — a returned `["alpha"]` handed back string pointers read
+as integers. The comprehension arm also answered the yes/no question *wrongly*,
+treating any `ast.BinOp` element as a list, so `[i / 2 for ...]` claimed float
+elements were lists. That is why the guess had to be replaced rather than
+supplemented (BUG-RETURNED-LIST-ELEM-TAG-LOST).
+
+One classifier now answers for all of it, in the CSA pre-pass where
+`self.variables` is empty and `_infer_type_tag` cannot be trusted, so every
+answer comes from the AST plus the `local_types`/`var_types` dicts the same
+scan builds:
+
+- `_csa_elem_tag_of` — the tag of one element expression.
+- `_csa_binop_elem_tag` — arithmetic, following Python's promotion order.
+  `**` and `<<` decline, since whether they overflow into a BigInt depends on
+  the value, not the kinds.
+- `_csa_iter_elem_tag` — what an iterable yields, used to bind a
+  comprehension's loop variable so the element expression can mention it.
+- `_csa_list_elem_tag` — the *common* tag of a literal or comprehension.
+
+**Declining is a first-class answer.** All four return `None` when they cannot
+decide — mixed elements, an empty list, an unknown name — which reproduces the
+old bare `"list"` exactly. This is what makes the pass safe to widen: a new arm
+can only convert a decline into an answer, never one answer into another.
+
+`"ptr:list"` is no longer a special case, just the tag you get when the common
+element kind *is* `"list"`. Producer and reader must be widened together: the
+reader (`_get_list_elem_type`'s user-call arm) recognised only `"ptr:list"`, so
+fixing the pre-pass alone changed nothing observable.
+
 **A call's type is the callee's return type — never its arguments'.** Three
 independent passes classify an expression's kind, and all three ended a chain of
 specific cases with the same last-resort heuristic: walk the expression, and if
