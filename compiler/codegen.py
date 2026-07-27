@@ -30412,10 +30412,18 @@ class CodeGen:
                 result = self.builder.call(
                     self.runtime["dict_has_int_key"], [container, left_val])
             else:
-                if not isinstance(left_val.type, ir.PointerType):
-                    left_val = self._ensure_ptr(left_val)
+                # Anything else — a float, a tagged FpyValue, an object — goes
+                # through the tag-aware lookup.  This used to coerce the value
+                # to a pointer and hand it to `dict_has_key`, which strcmps it:
+                # `2.5 in {"a": 1}` reinterpreted the double's bit pattern as a
+                # `char*` and segfaulted, on a comparison whose answer is just
+                # False.  Every setter stores keys as tagged FpyValues in one
+                # table (`dict_set_fv` included), so `dict_has_kv_key` finds a
+                # str key too and simply misses on a tag that was never stored.
+                # BUG-DICT-IN-COERCES-NON-STR-KEY-TO-CHAR-PTR.
+                kt, kd = self._to_tag_data_ir(left_val, node.left)
                 result = self.builder.call(
-                    self.runtime["dict_has_key"], [container, left_val])
+                    self.runtime["dict_has_kv_key"], [container, kt, kd])
             result_i1 = self.builder.icmp_signed("!=", result, ir.Constant(i32, 0))
             if isinstance(op, ast.NotIn):
                 result_i1 = self.builder.not_(result_i1)
@@ -49135,26 +49143,64 @@ class CodeGen:
                 self.builder.call(self.runtime["dict_set_kv_fv"],
                                   [dict_ptr, ir.Constant(i32, kt), kd,
                                    tag, data])
-            elif isinstance(key.type, ir.IntType):
-                # Int-keyed dict — native int-key storage
-                self.builder.call(self.runtime["dict_set_int_fv"],
-                                  [dict_ptr, key, tag, data])
-            elif isinstance(key.type, ir.PointerType):
-                self.builder.call(self.runtime["dict_set_fv"],
-                                  [dict_ptr, key, tag, data])
-            elif isinstance(key.type, ir.LiteralStructType):
-                # FpyValue key (e.g. a boxed variable used as dict key).
-                # Extract the i64 data field and use it as an int key.
-                # This is correct for int/bool/float keys whose identity
-                # is captured by the data word.
-                key_data = self.builder.extract_value(key, 1)
-                self.builder.call(self.runtime["dict_set_int_fv"],
-                                  [dict_ptr, key_data, tag, data])
-            else:
+            elif not self._emit_dict_store_by_key(dict_ptr, key, tag, data,
+                                                  key_node):
                 # Truly unsupported key type — bridge fallback
                 return self._bridge_fallback_expr(
                     node, f"dict literal with {key.type} key type")
         return dict_ptr
+
+    def _emit_dict_store_by_key(self, dict_ptr: ir.Value, key: ir.Value,
+                                 tag: ir.Value, data: ir.Value,
+                                 key_node: 'ast.expr | None' = None) -> bool:
+        """Store (tag, data) under *key*, picking the setter from key's shape.
+
+        Returns False without emitting anything if the key shape has no
+        setter, so the caller can fall back before it has built a partial
+        store.
+
+        The `fpy_val` arm is the one worth naming: a key can become a tagged
+        struct for reasons that have nothing to do with the key itself — one
+        BigInt anywhere in the function is enough to promote a comprehension's
+        loop variable — and the emitters that dispatched on key shape inline
+        each had their own set of arms.  The one that missed `fpy_val` bailed
+        to the bridge from *inside* an already-emitted loop, stranding its
+        `.incr`/`.end` blocks unterminated and failing the build.  Having a
+        single helper is what stops the arms from drifting apart again.
+        BUG-DICTCOMP-FV-KEY-EMITS-BROKEN-IR.
+        """
+        # A key carries a tag into the table exactly as a value does, and it is
+        # subject to the same trap: an FV-backed variable arrives here as a
+        # bare i64 payload, which would land in the *int*-keyed table under the
+        # string's address.  `{k: 1 for k in ["a", 7, 2.5]}` did that to all
+        # three keys.  BUG-DICT-VALUE-STATIC-KIND.
+        if key_node is not None:
+            _kt, _kd = self._to_tag_data_ir(key, key_node)
+            if not isinstance(_kt, ir.Constant):
+                self.builder.call(self.runtime["dict_set_kv_fv"],
+                                  [dict_ptr, _kt, _kd, tag, data])
+                return True
+        if isinstance(key.type, ir.IntType):
+            # Int-keyed dict — native int-key storage
+            self.builder.call(self.runtime["dict_set_int_fv"],
+                              [dict_ptr, key, tag, data])
+            return True
+        if isinstance(key.type, ir.PointerType):
+            self.builder.call(self.runtime["dict_set_fv"],
+                              [dict_ptr, key, tag, data])
+            return True
+        if isinstance(key.type, ir.LiteralStructType) and key.type == fpy_val:
+            # Hash the key tag-and-all rather than using the data word as an
+            # int: the word alone cannot tell a str's address from an int, so
+            # `{s: 1}` for a tagged `s = "a"` would collide with `{addr: 1}`
+            # and `"a" in d` would miss.
+            self.builder.call(self.runtime["dict_set_kv_fv"],
+                              [dict_ptr,
+                               self.builder.extract_value(key, 0),
+                               self.builder.extract_value(key, 1),
+                               tag, data])
+            return True
+        return False
 
     def _emit_dict_comprehension(self, node: ast.DictComp) -> ir.Value:
         """Emit {key: val for x in range(n)}."""
@@ -49214,13 +49260,8 @@ class CodeGen:
             key_val = self._emit_expr_value(node.key)
             val_val = self._emit_expr_value(node.value)
             v_tag, v_data = self._to_tag_data_ir(val_val, node.value)
-            if isinstance(key_val.type, ir.IntType):
-                self.builder.call(self.runtime["dict_set_int_fv"],
-                                  [result_dict, key_val, v_tag, v_data])
-            elif isinstance(key_val.type, ir.PointerType):
-                self.builder.call(self.runtime["dict_set_fv"],
-                                  [result_dict, key_val, v_tag, v_data])
-            else:
+            if not self._emit_dict_store_by_key(result_dict, key_val,
+                                                v_tag, v_data, node.key):
                 return self._bridge_fallback_expr(
                     node, "dict comprehension key type")
             self._flush_rc_temps_to(_mark)
@@ -49316,16 +49357,12 @@ class CodeGen:
             key = self._emit_expr_value(node.key)
             val = self._emit_expr_value(node.value)
             v_tag, v_data = self._to_tag_data_ir(val, node.value)
-            if isinstance(key.type, ir.PointerType):
+            if not self._emit_dict_store_by_key(dict_ptr, key, v_tag, v_data,
+                                                node.key):
+                # No arm matched: coerce to a pointer key, which is what this
+                # path did for every non-int key before the helper existed.
                 self.builder.call(self.runtime["dict_set_fv"],
-                                  [dict_ptr, key, v_tag, v_data])
-            elif isinstance(key.type, ir.IntType):
-                self.builder.call(self.runtime["dict_set_int_fv"],
-                                  [dict_ptr, key, v_tag, v_data])
-            else:
-                self.builder.call(self.runtime["dict_set_fv"],
-                                  [dict_ptr,
-                                   self._ensure_ptr(key),
+                                  [dict_ptr, self._ensure_ptr(key),
                                    v_tag, v_data])
             self._flush_rc_temps_to(_mark)
             self.builder.branch(incr_block)
@@ -49380,13 +49417,7 @@ class CodeGen:
         key = self._emit_expr_value(node.key)
         val = self._emit_expr_value(node.value)
         tag, data = self._to_tag_data_ir(val, node.value)
-        if isinstance(key.type, ir.IntType):
-            self.builder.call(self.runtime["dict_set_int_fv"],
-                              [dict_ptr, key, tag, data])
-        elif isinstance(key.type, ir.PointerType):
-            self.builder.call(self.runtime["dict_set_fv"],
-                              [dict_ptr, key, tag, data])
-        else:
+        if not self._emit_dict_store_by_key(dict_ptr, key, tag, data, node.key):
             return self._bridge_fallback_expr(node, "dict comprehension key/value types")
         self._flush_rc_temps_to(_mark)
         self.builder.branch(incr_block)
@@ -49493,14 +49524,8 @@ class CodeGen:
                 key = self._emit_expr_value(node.key)
                 val = self._emit_expr_value(node.value)
                 tag, data = self._to_tag_data_ir(val, node.value)
-                if isinstance(key.type, ir.IntType):
-                    self.builder.call(
-                        self.runtime["dict_set_int_fv"],
-                        [result_dict, key, tag, data])
-                elif isinstance(key.type, ir.PointerType):
-                    self.builder.call(
-                        self.runtime["dict_set_fv"],
-                        [result_dict, key, tag, data])
+                self._emit_dict_store_by_key(result_dict, key, tag, data,
+                                             node.key)
 
             self._flush_rc_temps_to(_mark)
             if not self.builder.block.is_terminated:

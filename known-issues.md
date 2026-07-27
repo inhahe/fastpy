@@ -8,7 +8,50 @@ how to reproduce it, and what the proper fix looks like.
 
 ## Active Bugs
 
-### BUG-DICTCOMP-FV-KEY-EMITS-BROKEN-IR. A dict comprehension whose key becomes FV-typed leaves a block unterminated and the build fails — 2026-07-27
+### BUG-FLOAT-KEY-DICT-LITERAL-SEGFAULTS. A dict literal with a float key produces something `len()` crashes on — 2026-07-27
+
+**What:** `_emit_dict_literal` dispatches on the key's LLVM type and has no arm
+for `DoubleType`, so it returns `_bridge_fallback_expr` for the whole literal.
+Whatever that hands back is then consumed as a native `FpyDict*` — `len(d)`
+faults before any lookup happens.
+
+**Reproduce** — the crash is at `len`, not at the subscript:
+```python
+d = {2.5: "a", 7: "b"}
+print("built")     # prints
+print(len(d))      # segfault
+```
+
+**Where:** `_emit_dict_store_by_key` in `compiler/codegen.py` (the shared setter
+dispatch) returns False for a `double` key, and every caller's fallback assumes
+the bridge result is interchangeable with a native dict. Both halves are wrong:
+the missing arm and the unchecked fallback.
+
+**Proper fix:** add a float arm that bitcasts the double to i64 and stores via
+`dict_set_kv_fv` with `FPY_TAG_FLOAT` — the table is uniform and hashes floats
+already (`fpy_hash_value`), so this is a missing case rather than missing
+machinery. The read side needs the matching arm in the dict-subscript getter,
+which today falls to `_bridge_fallback_expr(node, "dict access with non-string
+key")` for the same reason; `d[2.5]` on a *mixed* dict built the working way
+returns `0` rather than crashing, which is the same gap seen without the
+fallback. Audit the bridge-fallback-returns-a-PyObject assumption while there.
+
+**Severity:** segfault on valid Python.
+
+### BUG-DICTCOMP-FV-KEY-EMITS-BROKEN-IR. A dict comprehension whose key becomes FV-typed leaves a block unterminated and the build fails — 2026-07-27 — **FIXED**
+
+**Fixed:** the four comprehension setters and the dict literal now share
+`_emit_dict_store_by_key`, which has the `fpy_val` arm they were each missing
+and — the structural half — returns False *without emitting anything* so a
+caller can fall back before it has built a partial store. The new arm hashes
+the key tag-and-all through `dict_set_kv_fv` rather than using the data word as
+an int key, which the dict literal had been doing: the word alone cannot tell a
+str's address from an int, so `{s: 1}` for a tagged `s = "a"` filed the entry
+under the address and `d["a"]` raised KeyError. Passing the key's AST node in
+closed the matching hole for comprehension *keys* — an FV-backed variable
+arrives as a bare i64 payload, so `{k: 1 for k in ["a", 7, 2.5]}` filed all
+three under raw payloads. Covered by
+`tests/regressions/dict_key_shapes_that_are_not_strings.py`.
 
 **What:** `_emit_dict_comprehension`'s range path dispatches on the key's LLVM
 type — `IntType` → `dict_set_int_fv`, `PointerType` → `dict_set_fv`, and
@@ -44,7 +87,29 @@ fall back to the bridge *before* emitting any of the loop, so an unsupported key
 type can never strand half-built blocks; a mid-loop `return` out of an emitter
 is structurally unsafe regardless of which types reach it.
 
-**Severity:** loud (the build fails), but it fails on valid Python.
+**Severity:** was loud (the build failed), but it failed on valid Python.
+
+### BUG-DICT-IN-COERCES-NON-STR-KEY-TO-CHAR-PTR. `2.5 in {"a": 1}` segfaults — 2026-07-27 — **FIXED**
+
+**Fixed:** the non-str, non-native-int arm of the dict branch of
+`_emit_in_compare` now converts the probe with `_to_tag_data_ir` and calls
+`fastpy_dict_has_kv_key`, the same uniform tagged lookup the tuple-key arm
+already used. Every setter — `dict_set_fv` included — stores keys as tagged
+`FpyValue`s in one table, so this finds a str key too and simply misses on a
+tag that was never stored. Covered by
+`tests/regressions/dict_key_shapes_that_are_not_strings.py`.
+
+**What:** the arm coerced the value to a pointer (`_ensure_ptr`) and handed it
+to `fastpy_dict_has_key`, which `strcmp`s it. A `double` operand had its bit
+pattern reinterpreted as a `char*`.
+
+**Reproduce** — the answer is just False in CPython:
+```python
+d = {"a": 1, "b": 2}
+print(2.5 in d)    # segfault
+```
+
+**Severity:** was a segfault on valid Python.
 
 ### BUG-SORTED-KEY-DROPS-TAG. `sorted(xs, key=f)` over a heterogeneous list calls `f` on the raw payload — 2026-07-27
 

@@ -436,6 +436,31 @@ behind a line that rewrote every honest `"unknown"` into `"int"`. The statement
 one — when a helper exists that preserves the tag, a second hand-rolled copy of
 the same fetch is where the tag gets lost.
 
+**A dict key is a tagged value too, and dispatching on its LLVM type inline is
+how the arms drift apart.** Five emitters each decided between the int-keyed,
+str-keyed and generic setters with their own chain of `isinstance(key.type,
+...)` tests, and each was missing a different arm. The dict *literal* had an
+`fpy_val` arm but used the data word as an int key — which cannot tell a str's
+address from an int, so `{s: 1}` for a tagged `s` filed the entry under the
+address and `d["a"]` raised KeyError. The *comprehensions* had no `fpy_val` arm
+at all and fell through to `_bridge_fallback_expr` — from *inside* an
+already-emitted loop, so the `.incr`/`.end` blocks it had created were left
+unterminated and the module failed to parse. That failure mode is the important
+one: **an emitter must decide to fall back before it emits, not after**, which
+is why the shared `_emit_dict_store_by_key` returns False without emitting
+rather than bailing out itself. The trigger was incidental — one BigInt anywhere
+in the function promotes a comprehension's loop variable to a tagged struct — so
+`{i: m[i] for i in range(1)}` compiled or not depending on an unrelated literal.
+
+The **read** side has the same shape and the same hazard. `in` against a dict
+coerced any non-str key to a `char*` and `strcmp`'d it, so `2.5 in {"a": 1}`
+reinterpreted a double's bit pattern as a pointer and segfaulted — on a
+comparison whose answer is just False. The runtime never needed the special
+cases: every setter stores keys as tagged `FpyValue`s in one table, so
+`fastpy_dict_has_kv_key` finds a str key as readily as an int one and simply
+misses on a tag that was never stored. The typed entry points are a fast path,
+and a fast path that is *also* the only path is where these bugs live.
+
 The predicates that remain are for *syntactic* evidence and must answer for
 every expression form that can carry the kind — notably `ast.Subscript`, which
 both `_is_complex_expr` and `_is_decimal_expr` were missing. That gap is subtle
