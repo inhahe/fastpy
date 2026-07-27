@@ -848,51 +848,67 @@ whose static kind differs from its initialiser. Made easier to hit by the
 BUG-MIXED-SCALAR-RETURN-TAG fix, which gives more functions a `"mixed"` return,
 but not caused by it.
 
-### BUG-ABS-OF-TAGGED-VALUE. `abs()` of a runtime-tagged value returns 0 — 2026-07-27
+### ~~BUG-ABS-OF-TAGGED-VALUE. `abs()` of a runtime-tagged value returns 0~~ — FIXED 2026-07-27
 
-**What:** `_emit_builtin_abs` (`compiler/codegen.py:38620`) handles exactly two
-LLVM types — `ir.IntType` and `ir.DoubleType`. When its argument is an
-`fpy_val` `{i32, i64}` it matches neither, falls off the end of the `if`, and
-returns `self._bridge_fallback_expr(node, "abs() with wrong args")`, which in
-native/pure mode yields 0.
+**What:** `_emit_builtin_abs` handled exactly two LLVM types — `ir.IntType` and
+`ir.DoubleType`. Anything else matched neither, fell off the end of the `if`,
+and returned `self._bridge_fallback_expr(node, "abs() with wrong args")`, which
+in native/pure mode yields 0. Three separate kinds of argument did:
 
-**Reproduce** — should print `1 2.5`:
+* an `fpy_val` `{i32, i64}` — a heterogeneous list element, or a call to a
+  function whose returns disagree;
+* a **BigInt**, which is a pointer;
+* a **Decimal**, likewise — and `decimal_abs` had been declared in codegen's
+  runtime table all along without a single caller, which is a fair summary of
+  the bug.
+
+**Reproduced** — should print `1 2.5`:
 ```python
 v = [1, -2.5]
-print(abs(v[0]), abs(v[1]))        # prints 0 0
+print(abs(v[0]), abs(v[1]))        # printed 0 0
+b = 2 ** 80
+print(abs(b))                       # printed 0
+from decimal import Decimal
+print(abs(Decimal("-2.5")))         # printed 0
 ```
-Nothing here is new: a heterogeneous list element has been a tagged value all
-along. Two more shapes, both also wrong:
-```python
-def f(x):
-    if x:
-        return 1
-    return -2.5
-print(abs(f(1)), abs(f(0)))        # prints 0 0
+Nothing here was new: a heterogeneous list element has been a tagged value all
+along. The silent `_bridge_fallback_expr` is why it survived — a `CodeGenError`
+would have surfaced it immediately.
 
-d = {}
-d[0] = 1
-d[1] = -2.5
-print(abs(d[0]), abs(d[1]))        # prints 1 4610560118520545280
-```
-The dict case is a different failure — a static kind guessed from the first
-store — and may or may not be the same fix.
+**Fix,** in three parts:
 
-**Where:** `_emit_builtin_abs`. The silent `_bridge_fallback_expr` is the reason
-this is invisible: a `raise CodeGenError` would have surfaced it years ago.
+1. **`fastpy_abs_fv(int32_t tag, int64_t data, int32_t *out_tag,
+   int64_t *out_data)`** in `runtime/objects.c` (declared `extern` and
+   `SYM()`-registered in `runtime/runtime.c`), switching on the tag. It lives in
+   the runtime rather than being open-coded as IR because *six* tags are numeric
+   rather than two — INT, BOOL, FLOAT, BIGINT, DECIMAL and COMPLEX. An
+   i64/double select in codegen would have left the other three silently wrong
+   instead of visibly wrong. Two details it has to get right: `abs(-2**63)` does
+   not fit an i64, so the INT case widens to a BigInt rather than wrapping (and
+   negating in place to detect it would itself be UB); and `abs(a+bj)` is a real
+   magnitude, so COMPLEX returns FLOAT. A non-numeric tag raises `TypeError`
+   with CPython's own wording rather than returning a quiet zero.
+2. **`_emit_builtin_abs`** gained an `fpy_val` branch calling it, plus a
+   bigint/Decimal dispatch loop (`fpy_bigint_abs` / `fpy_decimal_abs`) ahead of
+   the scalar branches. The pointer results are returned *tagged*, following
+   `bigint_neg`'s convention.
+3. **`_scan_fv_forced_locals`** learned `_KIND_FORWARDING_BUILTINS =
+   {abs, min, max, sum, round}`: a builtin whose result kind is its argument's
+   kind is mixed exactly when the argument is. Without this,
+   `t = t + abs(f(i % 2))` in a loop gave the accumulator a narrow slot on its
+   first store and then a second, stale one — the same shape as
+   BUG-VAR-RETYPED-MIDSCOPE-STALE-SLOT.
 
-**Proper fix:** a runtime `FpyValue fpy_abs_fv(FpyValue)` that switches on the
-tag — INT/BOOL to an integer abs, FLOAT to `fabs`, BIGINT to
-`fpy_bigint_abs`, DECIMAL to `fpy_decimal_abs`, COMPLEX to `fpy_complex_abs`,
-anything else to a `TypeError` — with `_emit_builtin_abs` calling it whenever
-the argument's type is `fpy_val`. Doing it inline in codegen would only cover
-INT and FLOAT and would silently mis-handle the other four tags.
+**Test:** `tests/regressions/abs_of_tagged_value.py`, also clean under
+ASan/UBSan/LSan.
 
-**Also audit the neighbours.** `_emit_builtin_abs` is unlikely to be the only
-builtin whose type dispatch predates `FpyValue`; `divmod`, `pow` and `round`
-are in the same block and take the same naked-scalar shape.
+**Not fixed, and split out:** the dict shape below is a *different* failure —
+the value is loaded with a static kind guessed from the first store, and is
+wrong with no `abs()` in sight. See BUG-DICT-VALUE-STATIC-KIND.
 
-**Severity:** silently wrong output. Not memory-unsafe.
+**Still worth auditing:** `_emit_builtin_abs` is unlikely to be the only builtin
+whose type dispatch predates `FpyValue`; `divmod`, `pow` and `round` are in the
+same block and take the same naked-scalar shape.
 
 ### ~~BUG-MODULE-DOCSTRING-UNBOXES-GLOBAL. `_load_variable` unboxes an FpyValue local using its (wrong) static tag, so a mixed-kind module-level value loses its runtime tag~~ — FIXED 2026-07-26
 
@@ -2793,3 +2809,207 @@ rather than done.
 
 **Where:** the assignment/store path in `CodeGen`, and
 `_scan_fv_forced_locals` (`compiler/codegen.py:~23157`).
+
+### BUG-BIGINT-PROGRAM-HANGS-WHILE-COUNTER. Any big-integer constant makes every `while` loop counter spin forever — 2026-07-27
+
+**What:** the compiled binary produces *no output at all* and never exits.
+
+**Reproduce** — should print `1`, instead hangs forever with empty stdout:
+```python
+def f():
+    x = 4611686018427387904      # any constant >= 1 << 62
+    i = 0
+    while i < 1:
+        i = i + 1
+    print(i)
+
+f()
+```
+
+**Root cause — this is BUG-SECOND-ALLOCA-NOT-DIAGNOSED firing.** Pass 0.9
+(`compiler/codegen.py:~3830`) sets a **whole-program** flag
+`_program_uses_bigint` when the AST contains an integer literal `>= 1 << 62`,
+a `**` with a constant exponent `> 30`, or a `<<` with a constant shift `>= 40`.
+With that flag set, `_emit_int_binop` (`~36683`) stops emitting a plain
+`builder.add` and routes *every* integer `+`/`-`/`*`/`**`/`<<` through
+`fpy_checked_add` and friends, whose result is a **tagged** `{i32, i64}` that
+carries `FPY_TAG_BIGINT` on overflow.
+
+`_scan_fv_forced_locals.yields_mixed` does not know this. Its `ast.BinOp` case
+is `yields_mixed(e.left) or yields_mixed(e.right)`, and for `i + 1` neither
+operand is mixed — so `i` is not forced wide, gets an `i64` alloca from `i = 0`,
+and the widening then happens *mid-loop* via the silent second alloca. The
+emitted IR says it plainly:
+
+```llvm
+  %"i.3" = alloca {i32, i64}          ; the wide slot the body writes
+  %"i"   = alloca i64                 ; the abandoned slot the condition reads
+while.cond.1:
+  %"i.1" = load i64, i64* %"i"        ; always 0  ->  i < 1 forever
+while.body.2:
+  ... call i64 @"fpy_checked_add"(i64 %"i.2", i64 1, i8** %"big_out") ...
+  store {i32, i64} %".14", {i32, i64}* %"i.3"   ; writes the *other* slot
+  br label %"while.cond.1"
+```
+
+The condition reads a slot nobody ever stores to again, so the counter is
+permanently 0 and the loop never terminates. There is no output because stdout
+is still buffered.
+
+**Why it looked narrower than it is.** Originally filed as
+"module-level int > INT32_MAX + a `while` inside a function". All three
+qualifiers are wrong: the constant may live anywhere including inside the same
+function; the threshold is not `INT32_MAX` but Pass 0.9's rules (which is why
+`2 ** 31` tripped it and `2 ** 30` did not — exponent `> 30` — while the bare
+literal `2147483648` does *not*, being below `1 << 62`); and the *constant's*
+scope is irrelevant.
+
+What does matter is the scope of the **loop**. A `while` at module scope is
+unaffected, because a module-level name is backed by a real LLVM global whose
+storage is one fixed location — there is no second alloca to strand the loads
+on. A `for` loop is unaffected in either scope, because its induction
+variable's slot is created by the loop emitter rather than by a first plain
+store. So the bug needs a `while` *inside a function*, with a counter
+introduced by an ordinary assignment.
+
+**Not a regression.** Verified failing identically at HEAD, `622b214` and
+`cfc34df`. It predates the whole IfExp/tagged-value line of work.
+
+**Proper fix:** `yields_mixed`'s `BinOp` case must return `True` for an
+overflow-capable operator whenever `self._program_uses_bigint` is set,
+regardless of the operands' kinds — because that is precisely what the emitter
+will do. Pass 0.9 runs long before the scan, so the flag is available. This
+over-approximates (every int accumulator in a bigint-using program gets a wide
+slot), which is the documented and safe direction for this scan.
+
+**Severity: high — an infinite hang with no output, on entirely ordinary code.**
+Worse than a wrong answer: no assertion, no message, no exit. The harness does
+report it, as a `fail` with `Timed out` in stderr.
+
+**Worked around** in `tests/regressions/abs_of_tagged_value.py`, whose `while`
+accumulator lives at module scope (the file binds `2 ** 80`); the comment there
+points here.
+
+### BUG-DICT-VALUE-STATIC-KIND. A dict value is loaded with the static kind of the first store — 2026-07-27
+
+**What:** subscripting a dict whose values have differing kinds yields a *bare*
+scalar typed from whatever was stored first, rather than a tagged `FpyValue`.
+The bit pattern is then reinterpreted as that kind.
+
+**Reproduce** — should print `1 -2.5` then `-2.5`:
+```python
+d = {}
+d[0] = 1
+d[1] = -2.5
+print(d[0], d[1])     # prints 1 -2.5   (print has a tagged path)
+x = d[1] + 0.0
+print(x)              # prints -4.6105601185205453e+18
+```
+`print` happens to be right, which makes this easy to miss; any *arithmetic*
+consumer is wrong. `abs(d[1])` is wrong for the same reason and was originally
+filed under BUG-ABS-OF-TAGGED-VALUE, but it is abs-independent — the repro above
+has no `abs()` in it.
+
+**Where:** the dict-subscript load path in `CodeGen`. The list equivalent is
+already correct (`fastpy_list_get_fv` returns a tag), so the fix is presumably
+the same shape: a `fastpy_dict_get_fv` and a `_scan_fv_forced_locals` that knows
+a heterogeneous dict's element is mixed.
+
+**Severity:** silently wrong arithmetic.
+
+### BUG-MINMAX-OF-TAGGED-VALUE. `max`/`min` of two tagged values emits an `icmp` on a struct and fails the IR verifier — 2026-07-27
+
+**What:** `max(a, b)` where both operands are `fpy_val` `{i32, i64}` emits an
+`icmp` directly on the struct. LLVM rejects it with *"icmp requires integer
+operands"*, so the build fails outright.
+
+**Reproduce:**
+```python
+v = [1, -2.5]
+print(max(v[0], v[1]))
+```
+
+**Where:** the `max`/`min` emitter in `CodeGen`, which — exactly like
+`_emit_builtin_abs` before its fix — assumes naked scalars. The fix has the same
+shape: a runtime `fastpy_max_fv`/`fastpy_min_fv` dispatching on the tag pair,
+because comparing INT against FLOAT against BIGINT against DECIMAL is not an
+`icmp`.
+
+**Note this is reported by the harness as `skip`, not `fail`** — see
+BUG-SKIP-MASKS-VERIFIER-ERRORS. Excluded with a comment in
+`tests/regressions/abs_of_tagged_value.py`.
+
+**Severity:** compile failure (loud), but invisible in the suite.
+
+### BUG-BIGINT-FV-RESULT-NOT-CONSUMED. A BIGINT-tagged FpyValue is not narrowed back to a pointer by comparison or arithmetic — 2026-07-27
+
+**What:** runtime helpers that return a BigInt do so as a *tagged* `FpyValue`
+carrying the pointer in `data`. Consumers that expect a bare BigInt pointer —
+`==`, `-`, and friends — never narrow it, so they operate on the two pointers
+instead of the two numbers.
+
+**Reproduce** — `-b == -c` is False and the subtraction is garbage:
+```python
+b = 2 ** 80
+c = 2 ** 80
+print(-b == -c)      # False; should be True
+print(-b - -c)       # nonzero garbage
+```
+`abs()` inherits this exactly, because its BigInt path follows the same
+`bigint_neg` convention: `abs(b) == abs(-b)` is False.
+
+**Where:** wherever a comparison/binop operand is classified. It needs the
+"operand is an `fpy_val` whose tag is BIGINT → extract `data`, inttoptr, take
+the BigInt path" case that currently does not exist.
+
+**Not caused by the abs fix** — the `bigint_neg` repro above has no `abs()` in
+it. Excluded with a comment in `tests/regressions/abs_of_tagged_value.py`.
+
+**Severity:** silently wrong comparisons and arithmetic on big integers.
+
+### BUG-INT-FLOAT-OF-TAGGED-VALUE. `int()` and `float()` of a tagged value are no-ops — 2026-07-27
+
+**What:** `int(x)` and `float(x)` where `x` is an `fpy_val` pass the value
+straight through, tag and all, instead of converting it.
+
+**Reproduce** — should print `-2` then `1.0`:
+```python
+v = [1, -2.5]
+print(int(v[1]))      # prints -2.5
+print(float(v[0]))    # prints 1
+```
+
+**Where:** `_emit_builtin_int` / `_emit_builtin_float` in `CodeGen` — the same
+"knows only naked scalars" shape as BUG-ABS-OF-TAGGED-VALUE, but failing open
+(pass-through) rather than closed (fallback zero). The fix is the same: a
+tag-dispatching runtime entry point, which additionally has to get
+truncation-toward-zero right for FLOAT→INT and raise for the non-numeric tags.
+
+**Severity:** silently wrong values, and wrong *types* downstream.
+
+### BUG-LIST-LITERAL-BIGINT-DECIMAL-ELEM. A BigInt or Decimal stored into a list literal loses its tag — 2026-07-27
+
+**What:** a list literal containing a BigInt element stores the raw pointer with
+an INT tag, so reading it back prints the address. A Decimal element is worse —
+it prints nothing at all.
+
+**Reproduce:**
+```python
+v = [2 ** 80, 1]
+print(v[0])                    # prints 1715270543088 (a pointer)
+
+from decimal import Decimal
+w = [Decimal("1.5"), 1]
+print(w[0])                    # prints an empty line
+```
+
+**Where:** the list-literal element store path. It classifies each element by
+static kind and evidently has no BIGINT/DECIMAL case, so the pointer is stored
+with the default INT tag (and the Decimal one presumably reaches a printer that
+formats a mis-tagged value as empty). This is the sibling of
+BUG-LIST-ELEM-STR-TAG-LOST and probably wants fixing alongside it.
+
+**Note the asymmetry:** a *dict* holds these correctly, so the two container
+element-store paths disagree — which is itself worth collapsing.
+
+**Severity:** silently wrong output; the Decimal case loses the value entirely.

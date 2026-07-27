@@ -1498,6 +1498,13 @@ class CodeGen:
         self.runtime["list_get_fv"] = ir.Function(self.module, ft, name="fastpy_list_get_fv")
         ft = ir.FunctionType(void, [i8_ptr, i64, i32, i64])
         self.runtime["list_set_fv"] = ir.Function(self.module, ft, name="fastpy_list_set_fv")
+        # abs() of a tagged value.  Six tags are numeric, not two, so this
+        # cannot be open-coded as an i64/double select in codegen without
+        # silently mis-handling bigint/Decimal/complex.
+        # BUG-ABS-OF-TAGGED-VALUE.
+        ft = ir.FunctionType(void, [i32, i64, ir.PointerType(i32),
+                                    ir.PointerType(i64)])
+        self.runtime["abs_fv"] = ir.Function(self.module, ft, name="fastpy_abs_fv")
         ft = ir.FunctionType(void, [i8_ptr, i8_ptr, i32, i64])
         self.runtime["dict_set_fv"] = ir.Function(self.module, ft, name="fastpy_dict_set_fv")
         ft = ir.FunctionType(void, [i8_ptr, i8_ptr, ir.PointerType(i32), ir.PointerType(i64)])
@@ -2639,6 +2646,7 @@ class CodeGen:
         self.runtime["bigint_to_str"] = ir.Function(self.module, ft, name="fpy_bigint_to_str")
         self.runtime["bigint_from_str"] = ir.Function(self.module, ft, name="fpy_bigint_from_str")
         self.runtime["bigint_neg"] = ir.Function(self.module, ft, name="fpy_bigint_neg")
+        self.runtime["bigint_abs"] = ir.Function(self.module, ft, name="fpy_bigint_abs")
         # BigInt arithmetic (two FpyBigInt* → FpyBigInt*)
         ft = ir.FunctionType(i8_ptr, [i8_ptr, i8_ptr])
         self.runtime["bigint_add"] = ir.Function(self.module, ft, name="fpy_bigint_add")
@@ -23167,6 +23175,13 @@ class CodeGen:
                         unsafe.add(stmt.target.id)
         return unsafe
 
+    # Builtins whose result kind is their argument's kind, so a tagged
+    # argument makes the result tagged too.  `round` is included even though
+    # one-argument `round` is always an int in CPython: this scan is allowed
+    # to over-approximate (a wide slot is correct for any value, merely
+    # wider than needed) and is not allowed to under-approximate.
+    _KIND_FORWARDING_BUILTINS = frozenset({"abs", "min", "max", "sum", "round"})
+
     def _scan_fv_forced_locals(self, body: list[ast.stmt],
                                 skip: set[str]) -> set[str]:
         """Locals that must get an FpyValue slot from their first assignment.
@@ -23211,6 +23226,13 @@ class CodeGen:
                 if isinstance(e.func, ast.Name):
                     if e.func.id in forced:
                         return True
+                    # A builtin that hands back one of its arguments, or a
+                    # value of the same kind, is mixed exactly when that
+                    # argument is: `abs(f(x))` for a "mixed"-returning `f`
+                    # yields a tagged FpyValue, and an accumulator fed from
+                    # it needs its wide slot from the first store.
+                    if e.func.id in self._KIND_FORWARDING_BUILTINS:
+                        return any(yields_mixed(a) for a in e.args)
                     return self._callee_returns_mixed(e.func.id)
                 return False
             if isinstance(e, ast.Subscript):
@@ -35186,6 +35208,21 @@ class CodeGen:
             return self._is_bigint_expr(node.operand)
         return False
 
+    def _is_decimal_expr(self, node: ast.expr) -> bool:
+        """Check if an expression evaluates to a Decimal value.
+
+        Deliberately narrower than `_is_bigint_expr`: a BinOp is not walked,
+        because `Decimal("1") + 2` is a Decimal but `2 + 2` is not, and the
+        operand kinds are what decide it.  A name and a `Decimal(...)` call
+        are enough for the callers that exist.
+        """
+        if isinstance(node, ast.Name) and node.id in self.variables:
+            return self._var_kind(node.id) == VKind.DECIMAL
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id == "Decimal"):
+            return True
+        return False
+
     def _is_complex_expr(self, node: ast.expr) -> bool:
         """Check if an expression evaluates to a complex number."""
         if isinstance(node, ast.Constant) and isinstance(node.value, complex):
@@ -38633,6 +38670,25 @@ class CodeGen:
                 ptr = self._ensure_ptr(val)
                 return self.builder.call(
                     self.runtime["complex_abs"], [ptr])
+            # BigInt and Decimal are pointers, so they matched neither the
+            # IntType nor the DoubleType branch below and fell through to the
+            # silent bridge fallback: `b = 2 ** 80; print(abs(b))` printed 0,
+            # as did `abs(Decimal("-2.5"))`.  `decimal_abs` had in fact been
+            # declared in the runtime table all along and never called.
+            # The result is returned tagged, the way `bigint_neg`'s is, so
+            # print and assignment see a BigInt rather than a raw pointer.
+            # BUG-ABS-OF-TAGGED-VALUE.
+            for _pred, _rt, _tag in (
+                    (self._is_bigint_expr, "bigint_abs", FPY_TAG_BIGINT),
+                    (self._is_decimal_expr, "decimal_abs", FPY_TAG_DECIMAL)):
+                if _pred(arg_node):
+                    _ptr = self._ensure_ptr(self._emit_expr_value(arg_node))
+                    _res = self.builder.call(self.runtime[_rt], [_ptr])
+                    _fv = ir.Constant(fpy_val, ir.Undefined)
+                    _fv = self.builder.insert_value(
+                        _fv, ir.Constant(i32, _tag), 0)
+                    return self.builder.insert_value(
+                        _fv, self.builder.ptrtoint(_res, i64), 1)
             # Object __abs__: dispatch to dunder (returns object)
             if self._is_obj_expr(arg_node):
                 obj = self._emit_expr_value(arg_node)
@@ -38650,6 +38706,23 @@ class CodeGen:
             elif isinstance(val.type, ir.DoubleType):
                 fabs_fn = self.module.declare_intrinsic("llvm.fabs", [double])
                 return self.builder.call(fabs_fn, [val])
+            elif val.type == fpy_val:
+                # A tagged argument — a heterogeneous list element, a call to
+                # a "mixed"-returning function — matched neither branch above
+                # and fell out of the `if` entirely, reaching the bridge
+                # fallback below, which yields 0 in native mode.  So
+                # `abs(v[0])` on `[1, -2.5]` printed `0 0`.  Dispatch on the
+                # tag at runtime instead.  BUG-ABS-OF-TAGGED-VALUE.
+                _tag_slot = self._create_entry_alloca(i32, "abs.tag")
+                _data_slot = self._create_entry_alloca(i64, "abs.data")
+                self.builder.call(
+                    self.runtime["abs_fv"],
+                    [self.builder.extract_value(val, 0),
+                     self.builder.extract_value(val, 1),
+                     _tag_slot, _data_slot])
+                return self._fv_build_from_slots(
+                    self.builder.load(_tag_slot),
+                    self.builder.load(_data_slot))
         return self._bridge_fallback_expr(node, "abs() with wrong args")
 
     def _emit_builtin_divmod(self, node):

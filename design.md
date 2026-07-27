@@ -246,6 +246,32 @@ storage is not an alloca). Any widening this scan fails to foresee still falls
 through to a silent second alloca; making that an assertion is filed as
 BUG-SECOND-ALLOCA-NOT-DIAGNOSED.
 
+Some builtins forward their argument's kind to their result, so the scan has to
+look *through* them: `_KIND_FORWARDING_BUILTINS` (`abs`, `min`, `max`, `sum`,
+`round`) is mixed exactly when an argument is. `round` is in the set even though
+one-argument `round` is always an int, because the scan is allowed to
+over-approximate — a wide slot is merely wider than needed — and is not allowed
+to under-approximate.
+
+**A builtin's type dispatch belongs in the runtime once more than two types are
+numeric.** `_emit_builtin_abs` knew exactly two LLVM types, `IntType` and
+`DoubleType`; a tagged `FpyValue`, a BigInt pointer and a Decimal pointer all
+matched neither and fell through to `_bridge_fallback_expr`, which yields 0 in
+native mode. The tagged case is answered by a runtime `fastpy_abs_fv` rather
+than by inlined IR, because *six* tags are numeric rather than two — INT, BOOL,
+FLOAT, BIGINT, DECIMAL and COMPLEX. An i64/double select in codegen would have
+left the other three silently wrong instead of visibly wrong. The runtime side
+owns the cases IR cannot express anyway: `abs(-2**63)` does not fit an i64, so
+INT widens to a BigInt rather than wrapping (negating in place to detect it
+would itself be UB), and `abs(a+bj)` is a real magnitude, so COMPLEX returns
+FLOAT. A non-numeric tag raises `TypeError` rather than returning a quiet zero.
+
+The general lesson is that **a silent fallback is what let this live**: a
+`CodeGenError` on an unhandled argument type would have surfaced it at the first
+compile. `divmod`, `pow`, `round`, `int`, `float`, `min` and `max` share the
+naked-scalar shape and are known or suspected to have the same hole — see
+BUG-MINMAX-OF-TAGGED-VALUE and BUG-INT-FLOAT-OF-TAGGED-VALUE.
+
 **Two call sites must agree on the MIXED tag.** A callee's result type is
 decided in two independent places, and both consult `_func_ret_types`:
 

@@ -8397,6 +8397,79 @@ FpyDecimal* fpy_decimal_abs(FpyDecimal *a) {
                             a->sign < 0 ? 1 : a->sign);
 }
 
+/* abs() of a runtime-tagged value.
+ *
+ * `_emit_builtin_abs` in codegen only ever knew two LLVM types, i64 and
+ * double.  An argument that arrives as a tagged FpyValue — a heterogeneous
+ * list element, a "mixed"-returning call — matched neither and fell through
+ * to the silent bridge fallback, which yields 0 in native mode, so
+ * `abs(v[0])` on `[1, -2.5]` printed `0 0`.  BUG-ABS-OF-TAGGED-VALUE.
+ *
+ * This lives in the runtime rather than being open-coded in codegen because
+ * six tags are numeric, not two: inlining an i64/double select would have
+ * left bigint, Decimal and complex silently wrong instead of visibly wrong. */
+void fastpy_abs_fv(int32_t tag, int64_t data,
+                   int32_t *out_tag, int64_t *out_data) {
+    switch (tag) {
+    case FPY_TAG_BOOL:
+        *out_tag = FPY_TAG_INT;
+        *out_data = (data != 0) ? 1 : 0;
+        return;
+    case FPY_TAG_INT:
+        if (data == INT64_MIN) {
+            /* abs(-2**63) does not fit an i64.  CPython has no such limit,
+             * so widen rather than wrap — negating in place would be UB. */
+            FpyBigInt *b = fpy_bigint_from_i64(data);
+            FpyBigInt *r = fpy_bigint_abs(b);
+            fpy_bigint_free(b);
+            *out_tag = FPY_TAG_BIGINT;
+            *out_data = (int64_t)(intptr_t)r;
+            return;
+        }
+        *out_tag = FPY_TAG_INT;
+        *out_data = (data < 0) ? -data : data;
+        return;
+    case FPY_TAG_FLOAT: {
+        double d;
+        memcpy(&d, &data, sizeof(double));
+        d = fabs(d);
+        *out_tag = FPY_TAG_FLOAT;
+        memcpy(out_data, &d, sizeof(double));
+        return;
+    }
+    case FPY_TAG_BIGINT:
+        *out_tag = FPY_TAG_BIGINT;
+        *out_data = (int64_t)(intptr_t)
+            fpy_bigint_abs((FpyBigInt*)(intptr_t)data);
+        return;
+    case FPY_TAG_DECIMAL:
+        *out_tag = FPY_TAG_DECIMAL;
+        *out_data = (int64_t)(intptr_t)
+            fpy_decimal_abs((FpyDecimal*)(intptr_t)data);
+        return;
+    case FPY_TAG_COMPLEX: {
+        /* abs(a+bj) is a real magnitude, so the result is a float. */
+        double m = fpy_complex_abs((FpyComplex*)(intptr_t)data);
+        *out_tag = FPY_TAG_FLOAT;
+        memcpy(out_data, &m, sizeof(double));
+        return;
+    }
+    default: {
+        static const char *_tnames[] = {
+            "int", "float", "str", "bool", "NoneType",
+            "list", "object", "dict", "bytes", "set",
+            "bigint", "complex", "Decimal"};
+        const char *tn = (tag >= 0 && tag <= 12) ? _tnames[tag] : "object";
+        snprintf(_err_buf, sizeof(_err_buf),
+                 "bad operand type for abs(): '%.40s'", tn);
+        fastpy_raise(FPY_EXC_TYPEERROR, _err_buf);
+        *out_tag = FPY_TAG_NONE;
+        *out_data = 0;
+        return;
+    }
+    }
+}
+
 char* fpy_decimal_to_str(FpyDecimal *d) {
     if (d->sign == 0) return fpy_strdup("0");
 
