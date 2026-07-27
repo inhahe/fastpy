@@ -3730,6 +3730,12 @@ class CodeGen:
         # Maps (func_name, signature) -> specialized mangled name when
         # the function is monomorphized. Populated in _declare_user_function.
         self._monomorphized: dict[str, list[tuple]] = {}
+        # Maps id(<the call's ast.Starred node>) -> the signature call-site
+        # analysis computed for that `f(*seq)` call.  A splat spans an unknown
+        # number of parameter slots, so `_resolve_specialization` cannot
+        # rebuild the signature from the argument nodes on its own.
+        # BUG-SPLAT-CALL-PICKS-FIRST-SPECIALIZATION.
+        self._csa_splat_call_sigs: dict[int, tuple] = {}
         # Maps class_name -> list of constructor signatures when the class
         # is monomorphized (same class name used with scalar-conflicting
         # constructor arg types). Populated in _declare_class.
@@ -7848,22 +7854,46 @@ class CodeGen:
                 # which silently made len() answer 0 rather than fault.
                 # BUG-SPLAT-ARG-PARAM-UNTYPED.
                 #
-                # Only the *required* slots are claimed.  A slot at or past
-                # `off` may take the element or the default depending on the
-                # sequence's runtime length, and neither answer is safe to
-                # assume: typing it from the element reinterprets the
-                # default's bits when the sequence stops short, and typing it
-                # from the default does the reverse.  That ambiguity is left
-                # exactly as it was — see BUG-SPLAT-DEFAULTED-SLOT-TYPE.
+                # Only the *required* slots can be claimed outright.  A slot at
+                # or past `off` may take the element or the default depending
+                # on the sequence's runtime length, and neither answer is safe
+                # to assume on its own: typing it from the element
+                # reinterprets the default's bits when the sequence stops
+                # short, and typing it from the default does the reverse.
+                # Unless the two are positively known to agree, such a slot is
+                # therefore recorded as "mixed" — which is exactly what it is,
+                # a slot with no single static type — and that denies the
+                # function the bare ABI, so the value arrives carrying its own
+                # runtime tag.  Claiming the default's type there used to
+                # silently reinterpret a double as an i64: `def g(a, b=0)`
+                # called `g(*[1.5, 2.5])` printed 3.5 rather than 4.0.
+                # BUG-SPLAT-DEFAULTED-SLOT-TYPE.
+                #
+                # Note this arm runs even when the element tag is unknown.  An
+                # unreadable sequence is not evidence that the default wins;
+                # `mix(*[1, 2.5])` has no common element tag at all and still
+                # supplies 2.5 to a slot defaulted to `0`.
                 #
                 # This must run *before* the default-type fill below, which
                 # only writes into slots that are still None.
-                if _sp_elem is not None:
-                    for pi in range(_sp_at, min(off, n_regular)):
+                if _sp_at is not None:
+                    if _sp_elem is not None:
+                        for pi in range(_sp_at, min(off, n_regular)):
+                            if pi >= len(sig_arg_types):
+                                break
+                            if sig_arg_types[pi] is None:
+                                sig_arg_types[pi] = _sp_elem
+                    for pi in range(max(_sp_at, off), n_regular):
                         if pi >= len(sig_arg_types):
                             break
-                        if sig_arg_types[pi] is None:
-                            sig_arg_types[pi] = _sp_elem
+                        if sig_arg_types[pi] is not None:
+                            continue  # caller named it explicitly
+                        _dt = _const_type(defaults[pi - off])
+                        # Agreement is not ambiguity: both candidates have the
+                        # same type, so the slot does have a single answer.
+                        sig_arg_types[pi] = (
+                            _dt if _dt is not None and _dt == _sp_elem
+                            else "mixed")
                 for di, d in enumerate(defaults):
                     pi = off + di
                     if pi < len(sig_arg_types) and sig_arg_types[pi] is None:
@@ -7907,6 +7937,18 @@ class CodeGen:
                     if kw_type is not None:
                         sig_arg_types[pi] = kw_type
             sig = tuple(sig_arg_types)
+            if _sp_at is not None:
+                # A `Starred` argument spans an unknown number of parameter
+                # slots, so the codegen-time `_resolve_specialization` cannot
+                # rebuild this signature from the argument nodes — it saw one
+                # arg it could not classify, scored every specialization zero
+                # and took the first.  `h(*[3])` therefore called the
+                # `(float, ...)` variant and read the integer 3 as a double.
+                # The signature is already computed here; record it against
+                # the splat node so the resolver can use the same answer
+                # rather than a worse re-derivation.
+                # BUG-SPLAT-CALL-PICKS-FIRST-SPECIALIZATION.
+                self._csa_splat_call_sigs[id(node.args[_sp_at])] = sig
             for name in names_to_register:
                 sigs = self._function_signatures.setdefault(name, [])
                 if sig not in sigs:
@@ -9542,6 +9584,18 @@ class CodeGen:
             return func_name
         # Infer types at the call site for positional args
         call_sig = list(self._infer_call_arg_type(a) for a in arg_nodes)
+        # A `f(*seq)` call has one argument node standing for several
+        # parameter slots, so the list above is both too short and unusable —
+        # every entry is None, every specialization scores zero, and the loops
+        # below fall through to "take the first one".  Call-site analysis
+        # already worked the signature out for exactly this call; use it.
+        # BUG-SPLAT-CALL-PICKS-FIRST-SPECIALIZATION.
+        for _a in arg_nodes:
+            if isinstance(_a, ast.Starred):
+                _rec = self._csa_splat_call_sigs.get(id(_a))
+                if _rec is not None:
+                    call_sig = list(_rec)
+                break
         # Map keyword args to positional slots using the function's AST so
         # the call sig reflects all arguments the callee will see.
         if keyword_nodes:
@@ -11471,7 +11525,18 @@ class CodeGen:
                                     _sig_types.add(sig[param_idx])
                                 else:
                                     _has_unknown_caller = True
-                        if len(_sig_types) > 1:
+                        _has_mixed_caller = any(
+                            self._tag_kind(t) == VKind.MIXED
+                            for t in _sig_types)
+                        if _has_mixed_caller:
+                            # A single call site can be ambiguous all by
+                            # itself — `f(*seq)` where `seq` may or may not
+                            # reach a defaulted slot records "mixed" there.
+                            # Without this arm one such signature looked like
+                            # one *known* type and the slot was tagged
+                            # statically.  BUG-SPLAT-DEFAULTED-SLOT-TYPE.
+                            tag = "mixed"
+                        elif len(_sig_types) > 1:
                             tag = "mixed"  # conflicting types → runtime dispatch
                         elif _has_unknown_caller and _sig_types:
                             # Some callers have known pointer types, others
@@ -11520,7 +11585,15 @@ class CodeGen:
                                     _sig_types.add(sig[param_idx])
                                 else:
                                     _has_unknown_caller = True
-                        if len(_sig_types) > 1:
+                        _has_mixed_caller = any(
+                            self._tag_kind(t) == VKind.MIXED
+                            for t in _sig_types)
+                        if _has_mixed_caller:
+                            # See the pointer branch above: one call site can
+                            # be ambiguous on its own, and "ambiguous" is not
+                            # "known".  BUG-SPLAT-DEFAULTED-SLOT-TYPE.
+                            tag = "mixed"
+                        elif len(_sig_types) > 1:
                             tag = "mixed"  # conflicting types → runtime dispatch
                         elif _has_unknown_caller and _sig_types:
                             tag = "mixed"
@@ -31769,6 +31842,14 @@ class CodeGen:
         of this loop, so the bug had to be fixed twice and one copy was missed.
         They share this one instead; the FV variant only has to pad its
         parallel `arg_source_nodes` list afterwards.
+
+        Every element is read as a tagged `FpyValue` and only then narrowed to
+        what the parameter wants.  The required slots used to take the shortcut
+        of `_list_get_as_bare`, which unwraps by the sequence's *static*
+        element type — and that type is a single answer even for a sequence
+        that has no single answer, so `two(*[1, 2.5])` reinterpreted the
+        double's bits and printed 4612811918334230528.
+        BUG-SPLAT-HETEROGENEOUS-ELEM.
         """
         remaining = info.param_count - len(args)
         elem_type = self._get_list_elem_type(seq_node)
@@ -31776,8 +31857,11 @@ class CodeGen:
         for i in range(remaining):
             pos = len(args)
             if pos < info.min_args:
-                args.append(self._list_get_as_bare(
-                    list_val, ir.Constant(i64, i), elem_type))
+                _tag, _data = self._fv_list_get(list_val, ir.Constant(i64, i),
+                                                "splat.req")
+                args.append(self._splat_fv_to_param(
+                    self._fv_build_from_slots(_tag, _data),
+                    info, pos, elem_type))
                 continue
             if splat_len is None:
                 splat_len = self.builder.sext(
@@ -31848,32 +31932,45 @@ class CodeGen:
         phi.add_incoming(_take_fv, _blk_take_end)
         phi.add_incoming(_def_fv, _blk_def_end)
 
+        return self._splat_fv_to_param(phi, info, pos, elem_type)
+
+    def _splat_fv_to_param(self, fv: ir.Value, info: "FuncInfo", pos: int,
+                            elem_type) -> ir.Value:
+        """Narrow a splatted element (an `FpyValue`) to what slot *pos* wants.
+
+        An FV-ABI callee wants the tagged value exactly as it is — that ABI
+        exists so the tag survives the call.  A bare-ABI one wants a naked
+        value, and the type to unwrap to is the *parameter's*, not the
+        splatted sequence's element type: a defaulted slot holds a default as
+        often as an element, and `def f(v, n=1)` splatted from a list of lists
+        would otherwise read the integer 1 back as a pointer.
+
+        The narrowing consults the runtime tag (`_splat_fv_as_double` /
+        `_splat_fv_as_i64`) rather than reinterpreting the bits, because
+        neither a heterogeneous sequence nor an element-or-default slot has a
+        single static kind to reinterpret from.
+        """
         if info.uses_fv_abi:
-            return phi
-        # Bare ABI wants a naked value.  The type to unwrap to is the
-        # *parameter's*, not the splatted sequence's element type: this slot
-        # holds a default as often as an element, and `def f(v, n=1)` splatted
-        # from a list of lists would otherwise read the integer 1 back as a
-        # pointer.
+            return fv
         _pt = None
         if info.static_param_types and pos < len(info.static_param_types):
             _pt = info.static_param_types[pos]
         if _pt is None:
             _pt = elem_type
         if isinstance(_pt, ir.DoubleType):
-            return self._splat_fv_as_double(phi)
+            return self._splat_fv_as_double(fv)
         if isinstance(_pt, ir.IntType):
-            _iv = self._splat_fv_as_i64(phi)
+            _iv = self._splat_fv_as_i64(fv)
             return (self.builder.trunc(_iv, i32)
                     if _pt.width == 32 else _iv)
         if isinstance(_pt, ir.PointerType):
-            return self._fv_as_ptr(phi)
+            return self._fv_as_ptr(fv)
         _ek = _pt.kind if isinstance(_pt, ValueType) else self._tag_kind(_pt)
         if _ek == VKind.FLOAT:
-            return self._splat_fv_as_double(phi)
+            return self._splat_fv_as_double(fv)
         if _ek in (VKind.INT, VKind.BOOL):
-            return self._splat_fv_as_i64(phi)
-        return self._fv_as_ptr(phi)
+            return self._splat_fv_as_i64(fv)
+        return self._fv_as_ptr(fv)
 
     def _splat_fv_is_float(self, fv: ir.Value) -> ir.Value:
         """i1: does *fv* carry the FLOAT tag?"""

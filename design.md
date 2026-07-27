@@ -346,16 +346,29 @@ access violation — the `binascii`/`gzip`/`zlib` stdlib tests caught it. The se
 is the authoritative list of "builtins whose result is a native value"; a new
 native lowering has to appear in both places or the two disagree.
 
-**A splat is evidence too, but only about the required slots.** `f(*seq)` had
-no arm in the per-argument classification at all, so a parameter fed only that
-way hit the same silent-zero. `_csa_build_seq_binds` maps each name to the
-sequence literal it was bound to — `_csa_var_types` records only the coarse
-kind `"list"`, never the element type — and `_csa_splat_elem_tag` resolves that
-to an element tag, poisoning any name that is rebound anywhere. The tag is
-given to every slot from the splat's position up to `min_args`, and no further:
-a slot with a default may take the element or the default depending on the
-sequence's runtime length, and committing to either reinterprets the other's
-bits (BUG-SPLAT-DEFAULTED-SLOT-TYPE).
+**A splat is evidence about the required slots, and an admission of ignorance
+about the rest.** `f(*seq)` had no arm in the per-argument classification at
+all, so a parameter fed only that way hit the same silent-zero.
+`_csa_build_seq_binds` maps each name to the sequence literal it was bound to —
+`_csa_var_types` records only the coarse kind `"list"`, never the element type
+— and `_csa_splat_elem_tag` resolves that to an element tag, poisoning any name
+that is rebound anywhere. The element tag is given to every slot from the
+splat's position up to `min_args`. Past `min_args` the slot may take the
+element *or* the default depending on the sequence's runtime length, so unless
+the two types are positively known to agree the slot is recorded as `"mixed"`
+— which is what it is, a slot with no single static type — and that denies the
+function the bare ABI so the value arrives carrying its own runtime tag. This
+arm runs even when the element tag is unreadable: an unreadable sequence is not
+evidence that the default wins (BUG-SPLAT-DEFAULTED-SLOT-TYPE).
+
+**"Mixed" only helps if every consumer agrees it is not a type.** `"mixed"` is
+cleared to `None` in `_call_site_param_types` — the merge cannot refine it —
+but `_function_signatures` keeps it, and the FV-ABI prologue reads those
+signatures to decide each parameter's tag. It used to treat one `"mixed"`
+signature as `len(_sig_types) == 1`, i.e. as a single *known* type, and tag the
+parameter statically anyway; both halves of that branch now test for MIXED
+first. A tag that says "no static type" has to be recognised by everything
+downstream, or recording it changes nothing.
 
 **Splat expansion lives in one place.** `_splat_positional_args` is shared by
 `_emit_user_call` and `_emit_user_call_fv`, which previously each had a copy —
@@ -364,10 +377,22 @@ missed. A splatted sequence supplies as many arguments as it *has*, so required
 parameters are extracted unconditionally (a short sequence is a TypeError, and
 the `min_args` check reports it) while each defaulted slot is resolved at
 runtime by `_splat_elem_or_default` as `seq[i] if i < len(seq) else <default>`.
-That value is built as an `FpyValue` because the two arms need a common LLVM
-type; unwrapping it back for a bare-ABI callee goes through
-`_splat_fv_as_double` / `_splat_fv_as_i64`, which consult the runtime tag
-rather than reinterpreting the bits.
+Every element — required or defaulted — is read as a tagged `FpyValue` and
+narrowed by the shared `_splat_fv_to_param`: passed straight through for an
+FV-ABI callee, and converted through the runtime tag
+(`_splat_fv_as_double` / `_splat_fv_as_i64`) for a bare-ABI one. The required
+slots used to take the shortcut of unwrapping by the sequence's *static*
+element type, which `_get_list_elem_type` reports even for a sequence that has
+no single element type (BUG-SPLAT-HETEROGENEOUS-ELEM).
+
+**A splat call cannot re-derive its own signature at codegen time.**
+`_resolve_specialization` rebuilds a call's signature from its argument nodes,
+and a `Starred` node classifies as `None` while standing for an unknown number
+of parameter slots — so every specialization scored zero and the first one was
+taken (BUG-SPLAT-CALL-PICKS-FIRST-SPECIALIZATION). Call-site analysis has
+already computed the right answer, having both the callee's parameter list and
+the sequence-binding map, so it records it against `id()` of the `Starred` node
+in `_csa_splat_call_sigs` and the resolver consults that.
 
 ## Runtime
 

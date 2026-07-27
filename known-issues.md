@@ -320,13 +320,13 @@ runtime type rather than a patch, which is why it was not folded into the
 silently answer with a list, but changing that is a user-visible behaviour
 decision.
 
-### BUG-SPLAT-DEFAULTED-SLOT-TYPE. A defaulted parameter reached by `f(*seq)` is typed from the default even when the sequence supplies it — 2026-07-26
+### ~~BUG-SPLAT-DEFAULTED-SLOT-TYPE. A defaulted parameter reached by `f(*seq)` is typed from the default even when the sequence supplies it~~ — FIXED 2026-07-26
 
-**What:** when a splat can reach a slot that *also* has a default, the slot's
-static type is taken from the default, so an element of a different kind
-landing there is converted to the wrong type.
+**What:** when a splat could reach a slot that *also* had a default, the slot's
+static type was taken from the default, so an element of a different kind
+landing there was converted to the wrong type.
 
-**Reproduce** — should print `4.0`, prints `3.5`:
+**Reproduce** — should print `4.0`, printed `3.5`:
 ```python
 """Doc."""
 
@@ -336,39 +336,122 @@ def g(a, b=0):
 xs = [1.5, 2.5]
 print(g(*xs))
 ```
-`a` is correctly `float` (a required slot, see BUG-STARARG-SPLAT-DEFAULT-PARAM
-below), but `b` is typed `int` from `b=0`, so the 2.5 the sequence actually
-supplies is truncated to 2.
+`a` was correctly `float` (a required slot, see BUG-STARARG-SPLAT-DEFAULT-PARAM),
+but `b` was typed `int` from `b=0`, so the 2.5 the sequence actually supplies
+was truncated to 2.
 
-**Why it is not simply "let the element win":** whether the slot receives the
+**Why "let the element win" was not the answer:** whether the slot receives the
 element or the default depends on the sequence's *runtime* length, so neither
 static answer is safe. Element-wins breaks the mirror case — `d_list(v, n=1)`
 splatted from a one-element list of lists would declare `n` a pointer and then
 read the integer default `1` as one. Both directions were tried and measured;
 each fixes one case and breaks the other.
 
-**What the correct fix is:** such a slot has to carry its own runtime tag, i.e.
-take the FV ABI. `_splat_elem_or_default` already builds the value as a
-correctly tagged `FpyValue`, so the caller side is ready. The blocker is on the
-callee side: tagging the slot `"mixed"` gets cleared to `None` by the
-pre-cleanup in `_analyze_call_sites` (~line 7880, "Clear to None so the param
-uses generic FV-ABI runtime dispatch"), and that comment does not hold — a
-`None` slot still lands on a bare `i64` parameter, which is why the `"mixed"`
-variant printed a float's bit pattern rather than dispatching. Making a `None`
-/ `"mixed"` parameter genuinely force FV-ABI for that parameter is the real
-fix, and it would also settle the wider "untyped parameter answers 0 for
-`len()`" class of silent wrongness (see the note under
-BUG-PARAM-TYPE-FROM-USER-CALL-ARG).
+**Fix — three parts, because the ambiguity had to survive three hand-offs.**
 
-**Where:** the splat block in `_analyze_call_sites` guarded by `_sp_elem`
-(~line 7770) deliberately fills only slots below `off` (= `min_args`); the
-`else` arm that would decide the ambiguous slots is the thing that cannot be
-written soundly today.
+1. **Record it.** The splat block in `_analyze_call_sites` now runs for every
+   splat call, not only ones whose element tag it could read, and writes
+   `"mixed"` into each splat-reachable defaulted slot unless the element tag
+   and the default's type are positively known to agree. An *unreadable*
+   sequence is not evidence that the default wins: `mix(*[1, 2.5])` has no
+   common element tag at all and still supplies 2.5 to a slot defaulted to `0`.
 
-**Partly mitigated:** `_splat_fv_as_double` / `_splat_fv_as_i64` make the
-bare-ABI unwrap in `_splat_elem_or_default` tag-aware, so the value is at least
-*converted* rather than bit-reinterpreted. Before that this case printed
-`4.6e18`.
+2. **Let it reach the callee.** `"mixed"` is cleared to `None` in
+   `_call_site_param_types` (the merge cannot refine it further), but
+   `_function_signatures` keeps it — and the FV-ABI prologue in
+   `_efd_store_parameters` read a lone `"mixed"` signature entry as
+   `len(_sig_types) == 1`, i.e. as one *known* type, and tagged the parameter
+   `"int"` anyway. Both halves of that branch (the pointer one and the scalar
+   one) now test for a MIXED entry first. This is why the earlier attempt at
+   this fix printed a float's bit pattern rather than dispatching, and it is
+   what the old entry meant by "a `None` slot still lands on a bare `i64`".
+
+3. **Narrow it correctly at the call.** `_splat_elem_or_default`'s unwrap tail
+   became `_splat_fv_to_param`, shared with the required-slot path (see
+   BUG-SPLAT-HETEROGENEOUS-ELEM below).
+
+**Blast radius:** a function with a splat-reachable defaulted slot now loses
+the bare ABI unless the element and default types are known to agree. That is
+the intended trade — the slot genuinely has no single static type — and the
+required-slot fast path is untouched, so `f(*seq)` into an all-required
+signature is as cheap as before.
+
+**Test:** `tests/regressions/splat_defaulted_slot_type.py`. Verified wrong at
+`157c863`.
+
+### ~~BUG-SPLAT-HETEROGENEOUS-ELEM. A required slot filled by `f(*seq)` is unwrapped by the sequence's static element type, which a heterogeneous sequence does not have~~ — FIXED 2026-07-26
+
+**What:** `_splat_positional_args` filled required slots with
+`_list_get_as_bare(list_val, i, elem_type)`, which unwraps the element by the
+*static* element type `_get_list_elem_type` reports. That function answers with
+a single type even for a sequence that has no single type, so the bits were
+reinterpreted.
+
+**Reproduce** — should print `2.5`, printed `4612811918334230528` (the IEEE-754
+bits of 2.5 read as an i64):
+```python
+"""Doc."""
+
+def two(a, b):
+    return b
+
+print(two(*[1, 2.5]))
+```
+
+**Root cause:** the same one as BUG-SPLAT-DEFAULTED-SLOT-TYPE — a static answer
+given where there is no single static answer — reached from the *element* side
+rather than the parameter side. The defaulted-slot path had already been made
+tag-aware (`_splat_fv_as_double` / `_splat_fv_as_i64`); the required-slot path
+had not, because it looked like the case where the type was known.
+
+**Fix:** every splatted element is now read as a tagged `FpyValue` and narrowed
+through the shared `_splat_fv_to_param`, which passes it straight through for
+an FV-ABI callee and converts it via the runtime tag for a bare-ABI one. The
+`list_get_fv` call is the same one `_list_get_as_bare` was already making, so
+the FV path costs nothing extra; the bare path adds one tag compare.
+
+**Test:** `tests/regressions/splat_defaulted_slot_type.py`. Verified wrong at
+`157c863`.
+
+### ~~BUG-SPLAT-CALL-PICKS-FIRST-SPECIALIZATION. `f(*seq)` against a monomorphized function always calls the first specialization~~ — FIXED 2026-07-26
+
+**What:** `_resolve_specialization` rebuilds a call's signature from its
+argument nodes via `_infer_call_arg_type`. A `Starred` node classifies as
+`None` and stands for an unknown number of parameter slots, so the rebuilt
+signature was `(None,)` — too short, and uninformative. The exact-match loop
+missed, the scoring loop gave every specialization zero, and the fallback took
+`specs[0]`.
+
+**Reproduce** — should print `3.0` then `4`, printed `3.0` then `1.0`:
+```python
+"""Doc."""
+
+def h(a, n=1):
+    return a + n
+
+print(h(*[1.0, 2.0]))
+print(h(*[3]))
+```
+Two signatures — `('float', 'mixed')` and `('int', 'int')` — so `h` is
+monomorphized, and both calls went to the float variant. The integer 3 arrived
+in a parameter tagged `float` and was unwrapped by bitcast into a denormal, so
+`a + n` came out as `0.0 + 1`.
+
+**Hidden before, because it was only half-wrong:** with the pre-`"mixed"`
+signatures the first variant was `('float', 'int')`, whose bare-ABI `double`
+parameter made the caller `sitofp` the integer, so the value survived and only
+the *type* was wrong (`4.0` instead of `4`). Giving the slot its honest
+`"mixed"` tag turned that silent type error into a visible value error.
+
+**Fix:** `_analyze_call_sites` records the signature it computes for a splat
+call against `id()` of the call's `Starred` node
+(`self._csa_splat_call_sigs`), and `_resolve_specialization` uses that instead
+of re-deriving a worse one. One computation, two consumers — the resolver was
+never in a position to reproduce it, since it has neither the callee's
+parameter list nor the sequence-binding map.
+
+**Test:** `tests/regressions/splat_defaulted_slot_type.py`. Verified wrong at
+`157c863`.
 
 ### ~~BUG-STARARG-SPLAT-DEFAULT-PARAM. `f(*xs)` raises IndexError when `f` has a default parameter~~ — FIXED 2026-07-26
 
