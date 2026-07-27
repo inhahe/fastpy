@@ -29671,7 +29671,15 @@ class CodeGen:
         # twice — `val() is val()` bumped a global three times instead of twice.
         # Skip the eager emission when every operator is an identity test; `in`
         # and the ordering/equality operators still need the value.
-        if all(isinstance(o, (ast.Is, ast.IsNot)) for o in node.ops):
+        # `== None` joins them: it is identity against a singleton, and the
+        # value-based path folds it to a constant.  Only take the AST route
+        # when *every* operator wants it, so `left` is either emitted once for
+        # the value path or not at all — a mixed chain would otherwise emit
+        # node.left twice.  BUG-IS-NONE-ON-TAGGED-VALUE.
+        _all_identity_like = all(
+            self._is_identity_like_op(o, c, node.left)
+            for o, c in zip(node.ops, node.comparators))
+        if _all_identity_like:
             tv_left = None
             left = None
         else:
@@ -29683,6 +29691,11 @@ class CodeGen:
             # Handle `is`/`is not` specially (identity comparison)
             if isinstance(op, (ast.Is, ast.IsNot)):
                 cmp = self._emit_is_compare(op, node.left, comparator_node, node)
+            elif _all_identity_like and isinstance(op, (ast.Eq, ast.NotEq)):
+                # `x == None` must agree with `x is None`.
+                cmp = self._emit_is_compare(
+                    ast.IsNot() if isinstance(op, ast.NotEq) else ast.Is(),
+                    node.left, comparator_node, node)
             # Handle `in`/`not in` specially
             elif isinstance(op, (ast.In, ast.NotIn)):
                 cmp = self._emit_in_compare(op, left, comparator_node, node,
@@ -30098,12 +30111,32 @@ class CodeGen:
 
         return result
 
+    @staticmethod
+    def _is_none_literal(n: 'ast.expr | None') -> bool:
+        """True for the literal `None` as written in the source."""
+        return isinstance(n, ast.Constant) and n.value is None
+
+    def _is_identity_like_op(self, op, comparator_node, left_node) -> bool:
+        """True when an operator must be emitted from the AST, not from a value.
+
+        `is`/`is not` always are.  So is `== None` / `!= None`: `None` is a
+        singleton, so equality against it *is* identity, and the value-based
+        path can only see that one side inferred to VKind.NONE and the other
+        didn't — which folds `x == None` to False for every `x` whose noneness
+        is a runtime tag.  BUG-IS-NONE-ON-TAGGED-VALUE.
+        """
+        if isinstance(op, (ast.Is, ast.IsNot)):
+            return True
+        if isinstance(op, (ast.Eq, ast.NotEq)):
+            return (self._is_none_literal(comparator_node)
+                    or self._is_none_literal(left_node))
+        return False
+
     def _emit_is_compare(self, op, left_node, right_node, node) -> ir.Value:
         """Emit `is` / `is not` comparison. Supports None and Ellipsis."""
         # Check if comparing to None
         is_none_check = (
-            (isinstance(left_node, ast.Constant) and left_node.value is None) or
-            (isinstance(right_node, ast.Constant) and right_node.value is None)
+            self._is_none_literal(left_node) or self._is_none_literal(right_node)
         )
         # Check if comparing to Ellipsis
         is_ellipsis = (
@@ -30207,6 +30240,27 @@ class CodeGen:
                         "!=", tag, ir.Constant(i32, FPY_TAG_NONE))
                 return self.builder.icmp_signed(
                     "==", tag, ir.Constant(i32, FPY_TAG_NONE))
+
+        # A container element carries its noneness in its runtime tag and
+        # nowhere else: `_emit_expr_value` hands a subscript back as the bare
+        # payload, and None's payload is 0 — indistinguishable from the int 0
+        # or a null pointer.  Without this arm the test fell all the way to the
+        # AST fold below, which can only say "the inferred kind isn't NONE" and
+        # answered False, so `if m[1] is None:` never fired.
+        # BUG-IS-NONE-ON-TAGGED-VALUE.
+        if (self._USE_FV_LOCALS
+                and isinstance(other, ast.Subscript)
+                and not isinstance(other.slice, ast.Slice)
+                and (self._is_dict_expr(other.value)
+                     or self._is_list_expr(other.value)
+                     or self._is_tuple_expr(other.value))):
+            fv = self._load_or_wrap_fv(other)
+            if (isinstance(fv.type, ir.LiteralStructType)
+                    and fv.type == fpy_val):
+                tag = self.builder.extract_value(fv, 0, name="is_none.tag")
+                return self.builder.icmp_signed(
+                    "!=" if isinstance(op, ast.IsNot) else "==",
+                    tag, ir.Constant(i32, FPY_TAG_NONE))
 
         # Class variable attribute access: cls.attr is None / ClassName.attr is None
         # Load the pointer from the class var global and compare to null.

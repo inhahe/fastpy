@@ -427,6 +427,35 @@ store, where the tag is not just recorded but *decides the code path*: a heap
 tag must go through the refcounting setter rather than the inline fast path, so
 a runtime tag there would mean a runtime branch, not a different constant.
 
+**`None` is the value with no payload, so only its tag says it is None.** Its
+data word is `0`, which is also the int `0` and also a null pointer, so a test
+against `None` is a *tag* test and nothing else. `_emit_is_compare` had arms for
+the operand shapes where a tag was reachable — an FV-backed local, an object
+attribute, a call to a function that may return None — and for everything else
+fell through to an AST fold that could only ask whether compile-time inference
+had said NONE. For a container element it never has, so `if m[1] is None:`
+folded to a constant False and the guard silently never fired. That shape has
+an arm now, via `_load_or_wrap_fv`.
+
+`== None` was wrong in strictly *more* cases than `is None`, and for a
+different reason: it took the value-comparison path, which folds to a constant
+the moment either side infers to NONE — so `no == None` was False even where
+`no is None` had an arm and was True. Equality against a singleton *is*
+identity, so `== None` and `!= None` are routed through the identity emitter
+now. The routing is gated on every operator in the comparison being
+identity-like, because the identity emitter takes AST nodes and emits the left
+operand itself: taking that route for one operator in a chain whose others
+took the value route would emit the left operand twice, which is exactly how
+`val() is val()` once bumped a counter three times.
+
+Two operand shapes are still wrong, and neither is this emitter's fault — the
+tag it would read was never written. A polymorphic object field collapses to
+one static type across construction sites, so `P(None).a` *stores* `0`
+(BUG-ATTR-STORE-DROPS-TAG); and a global is allocated as `i8*`/`double`/`i64`
+by static kind and never as `fpy_val`, so a module-level `None` has no tag to
+read from inside a function (BUG-GLOBAL-NONE-LOSES-TAG). Both are the store
+rule above, applied to two stores that have not adopted it yet.
+
 The same "guess replaces the truth" shape appeared one level up, in **binding**
 rather than storing. The comprehension tuple-unpack paths hand-rolled the
 element fetch and stored only the payload under a positionally-inferred kind,

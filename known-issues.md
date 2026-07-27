@@ -210,7 +210,90 @@ assumes naked scalars.
 
 **Severity:** silently wrong order.
 
-### BUG-IS-NONE-ON-TAGGED-VALUE. `is None` and `== None` against a runtime-tagged expression are always False — 2026-07-27
+### BUG-ATTR-STORE-DROPS-TAG. A polymorphic object field loses its runtime tag at the *store*, so `None` in it reads back as `0` — 2026-07-27
+
+**What:** an object field's type is decided statically per class, so a class
+constructed with different field types at different sites gets one type for
+all of them and the tag is thrown away on write. It is the object-field
+sibling of BUG-DICT-VALUE-STATIC-KIND, and it fails one step earlier than
+that one did: the value is already wrong when *printed*, not just when tested.
+
+**Reproduce** — should print `None 3` then `True False`:
+```python
+class P:
+    def __init__(self, a):
+        self.a = a
+p = P(None)
+q = P(3)          # this line is what breaks the line above
+print(p.a, q.a)          # prints 0 3
+print(p.a is None, q.a is None)   # prints False False
+```
+With only `P(None)` in the program, both lines are correct — the second
+constructor call is what collapses the field to `int`.
+
+**Where:** the attribute store in `compiler/codegen.py` and the per-class field
+type inference feeding it. `_emit_is_compare` already has an Attribute arm
+that reads the tag via `_load_or_wrap_fv`; it returns the wrong answer because
+the tag it reads is the one the store wrote, and the store wrote INT.
+
+**Proper fix:** the same rule the container stores now follow — a field store
+must carry the value's *runtime* tag (`_to_tag_data_ir`) rather than a
+statically inferred one, and a field written with more than one kind across
+construction sites must be FV-backed rather than collapsed to one type.
+
+**Severity:** silently wrong value, visible in plain `print`.
+
+### BUG-GLOBAL-NONE-LOSES-TAG. A module-level `None` is stored as `i64 0`, so `g is None` inside a function is False — 2026-07-27
+
+**What:** globals are allocated as `i8*`, `double` or `i64` by static kind
+(`compiler/codegen.py`, the `_global_vars` construction) — never as `fpy_val`.
+A global whose value is `None` falls to the `i64` case with
+`ValueType(VKind.INT)`, so its noneness is gone before any test runs. At
+module level the test is answered from the local variable table and is right;
+read from inside a function it goes through the global and is wrong.
+
+**Reproduce** — should print `True`:
+```python
+g = None
+def check():
+    return g is None
+print(check())     # prints False
+print(g is None)   # prints True — module level is fine
+```
+
+**Where:** `_global_vars` population in `compiler/codegen.py` (~line 3597 and
+the two sibling passes that follow), and the FV-backed arm of
+`_emit_is_compare`, which excludes globals (`other.id not in
+self._global_vars`) precisely because there is no FV to load.
+
+**Proper fix:** globals need the same FV backing locals have under
+`_USE_FV_LOCALS` — a global whose assignments are not all one kind (or that is
+ever assigned `None`) should be an `fpy_val` global, after which the existing
+tag-comparison arm covers it with the `_global_vars` exclusion removed.
+Patching only the `is None` test would leave `print(g)` still showing `0`.
+
+**Severity:** silently wrong branch, and a wrong value from `print`.
+
+### BUG-IS-NONE-ON-TAGGED-VALUE. `is None` and `== None` against a runtime-tagged expression are always False — 2026-07-27 — **FIXED** (for container elements and every `== None`; two operand shapes remain, tracked separately above)
+
+**Fixed:** `_emit_is_compare` gained a Subscript arm that reads the runtime tag
+through `_load_or_wrap_fv` for list/tuple/dict elements, including nested ones,
+so `if m[1] is None:` fires. And `== None` / `!= None` now route through the
+identity emitter rather than the value-comparison path: `None` is a singleton,
+so equality against it *is* identity, whereas the value path folded to a
+constant as soon as either side inferred to NONE — which is why `no == None`
+was False even where `no is None` was already True. The routing is gated on
+*every* operator in the comparison being identity-like, so the left operand is
+emitted exactly once (a mixed chain would otherwise emit it twice — the same
+double-side-effect hazard that `val() is val()` hit before).
+
+Still wrong, for reasons that are not in this emitter: a polymorphic object
+field (BUG-ATTR-STORE-DROPS-TAG — the tag is lost at the store) and a
+module-level `None` read inside a function (BUG-GLOBAL-NONE-LOSES-TAG — there
+is no tag to read). Regression coverage in
+`tests/regressions/is_none_against_a_runtime_tag.py`.
+
+<details><summary>Original report</summary>
 
 **What:** `_emit_is_compare` decides `is None` from *AST-level* inference — a
 `None` literal, or a `Name` whose `VKind` is `NONE`. A subscript or any other
@@ -238,6 +321,8 @@ equality path needs the same treatment, since `x == None` must agree with
 
 **Severity:** silently wrong branch — a `None` guard on a value read out of a
 container simply never fires.
+
+</details>
 
 ### ~~BUG-BIGINT-TRUEDIV-UNIMPLEMENTED. `/` on a big int reaches the CPython bridge with a raw `FpyBigInt*` and segfaults~~ — FIXED 2026-07-27
 
