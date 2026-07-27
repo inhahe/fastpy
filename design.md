@@ -593,7 +593,11 @@ raised.** The boundary flush is emitted in the no-exception continuation block,
 which a `raise` never reaches, so `raise ValueError("m" * n)` leaked its whole
 message every iteration. `_emit_raise` now flushes to its own watermark
 immediately after the raise call — safe precisely because `fastpy_raise` copies
-the message rather than borrowing it. The same audit found `str_repeat` to be
+the message rather than borrowing it. `_emit_assert` had the same shape for the
+same reason, and its flush sat *below* the `ret`/branch-to-handler, where
+`_flush_rc_temps_to` can only pop temps without emitting decrefs; the rule is
+that a release must be emitted while its block is still open, so the flush
+moved above the terminator. The same audit found `str_repeat` to be
 the one statically-typed string producer whose owned result nobody registered
 (`_owned_str_repeat` now does), which alone cost 187 MB over 500k iterations of
 `s = "m" * 350`. Both are invisible to an output-diffing test suite; peak

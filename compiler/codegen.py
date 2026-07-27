@@ -18068,6 +18068,16 @@ class CodeGen:
         exc_id = self.builder.call(self.runtime["exc_name_to_id"], [name_ptr])
         self.builder.call(self.runtime["raise"], [exc_id, msg_ptr])
         self.builder.call(self.runtime["exc_set_class_name"], [name_ptr])
+        # Release the message expression's temps *here*, while `fail_block` is
+        # still open. Below this point every path terminates it, and a flush
+        # after that can only pop the temps without emitting decrefs — which is
+        # how `assert i < 0, "m" * 350` in a loop leaked its message every
+        # iteration (500k iterations reached a 186 MB working set). Releasing
+        # is safe because fastpy_raise has already copied the message into the
+        # exception slot's own refcounted string, so what the handler reads
+        # through `fastpy_exc_get_msg()` does not depend on these temps.
+        # BUG-EXC-MSG-NOT-OWNED.
+        self._flush_rc_temps_to(_rc_mark_msg)
         # If not in try block, return early (exception will propagate to main)
         if not self._in_try_block:
             ret_type = self.function.return_value.type
@@ -18091,12 +18101,10 @@ class CodeGen:
             else:
                 self.builder.branch(pass_block)
 
-        # Drop the arm's temps. The block is terminated by now, so this pops
-        # them *without* emitting decrefs — there is nowhere to emit them. That
-        # leaks the assert's message expression, which is a leak and nothing
-        # worse: `fastpy_raise` copies the message into the exception slot's
-        # own refcounted string, so what the handler later reads through
-        # `fastpy_exc_get_msg()` does not depend on this temp at all.
+        # Belt and braces: the flush above already emptied the arm's temps
+        # while its block was open. This catches anything a future edit adds
+        # after the terminator, and pops it without emitting a decref that
+        # `pass_block` could not dominate (BUG-DECREF-DOES-NOT-DOMINATE).
         self._flush_rc_temps_to(_rc_mark_msg)
         self.builder.position_at_end(pass_block)
 

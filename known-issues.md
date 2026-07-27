@@ -1548,7 +1548,7 @@ the alpha-renaming pass existed. Called out in the docstring of
 `tests/regressions/nested_def_name_collision.py`, whose `collide_in_branch`
 case is written to stay inside the cross-scope collision this pass does fix.
 
-### BUG-EXC-MSG-NOT-OWNED. A raised exception borrows its message string, so every dynamic message must leak — 2026-07-26
+### ~~BUG-EXC-MSG-NOT-OWNED. A raised exception borrows its message string, so every dynamic message must leak~~ — FIXED 2026-07-27
 
 **What:** `fastpy_raise` (runtime/runtime.c:818) stores the message pointer
 rather than copying it:
@@ -1616,6 +1616,33 @@ Whichever is chosen, it also removes the special-case temp-dropping in
 **Discovered** while fixing BUG-DECREF-DOES-NOT-DOMINATE facet (c) — the
 try-body flush made the previously invisible leak visible as an invalid-IR
 failure in `assert_fstring_msg.py`.
+
+**Fixed:** option 2, in two steps. The runtime side landed first —
+`fastpy_raise` copies through `fpy_exc_msg_store` into storage the exception
+slot owns (originally for the header probe, then made refcounted by
+BUG-EXC-MSG-BUFFER-ALIASES-ACROSS-RAISES) — which is what makes releasing the
+caller's temp legal at all. The codegen side is the release itself, and the
+reason it was not simply "delete the special case" is that both raise sites
+evaluate their message in a block that *always* terminates:
+
+- `_emit_raise` (BUG-RAISE-MESSAGE-TEMP-LEAKS): the statement-boundary flush
+  is emitted in the no-exception continuation block, which a raise never
+  reaches. It now takes an `_rc_mark` before the message and flushes right
+  after the raise call, while the block is still open.
+- `_emit_assert`: same shape, and the one the original note called out. The
+  arm's flush ran *after* the `ret`/branch to the handler, where
+  `_flush_rc_temps_to` can only pop temps without emitting decrefs. Moved
+  above the terminator; a second flush stays below it as a guard for anything
+  a future edit adds there (it pops nothing today).
+
+Measured on 500k iterations: `raise ValueError("m" * 350)` went 189 → 12.95 MB,
+`assert i < 0, "m" * 350` went 186 → 14.25 MB. Covered by
+`tests/regressions/assert_msg_survives_later_asserts.py`, whose cases hold a
+message across later failing asserts and across a handler's clear — the
+property that proves the copy is independent of the released temp.
+
+**Severity:** was medium — unbounded growth in any loop that raises or asserts
+with a computed message, invisible to output-diffing tests.
 
 ### ~~BUG-INDIRECT-CALL-RET-TAG-INT. A nested `def`'s return value is tagged INT at the call site, so a returned str prints as a pointer~~ — FIXED 2026-07-26
 
