@@ -6601,6 +6601,80 @@ class CodeGen:
     # _analyze_call_sites helper methods (D2 extraction)
     # ------------------------------------------------------------------
 
+    def _csa_refine_params_from_call_returns(
+        self, tree: ast.AST, func_asts: dict, func_ret_types: dict,
+    ) -> None:
+        """Type parameters whose only call-site evidence is a user call.
+
+        `_infer_call_arg_type` cannot resolve `f(helper())` during the main
+        scan, for two independent reasons: `_user_functions` is still empty at
+        that point (so its user-call branch is dead code there), and
+        `_func_ret_types` has not been built yet.  Such an argument therefore
+        reads as "unknown", and a parameter passed *only* that way stays
+        untyped — which silently makes `len(v)` on it return 0 rather than
+        crashing.  See BUG-PARAM-TYPE-FROM-USER-CALL-ARG.
+
+        This is a fixed-point step, not a new source of truth.  It runs after
+        `_csa_propagate_ret_types` has populated *func_ret_types*, and it only
+        fills slots that are still `None`; it never overrides a type the main
+        merge already decided.  A slot is filled only when *every* call site
+        agrees on it, so one unclassifiable caller still forces the
+        conservative untyped ABI — the same "unknown doesn't override known"
+        rule the merge at the top of this pass relies on.
+
+        Note the coverage is bounded by what `_func_ret_types` records, which
+        is list/dict/tuple/float/mixed but *not* str/bytes/set: a plain
+        `return "abcd"` has no arm in that chain, so `f(returns_a_str())` is
+        still not refined.  That gap is the callee-side one and is tracked
+        separately rather than worked around here.
+        """
+        # Calls that would misalign positional slots disable refinement for
+        # the whole callee: we cannot tell which parameter a keyword or a
+        # `*args` splat lands on, and guessing could type the wrong one.
+        blocked: set[str] = set()
+        # (fname, arg index) -> set of candidate tags, or None once any call
+        # site at that position is unresolvable.
+        seen: dict[tuple[str, int], set | None] = {}
+
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name)):
+                continue
+            fname = node.func.id
+            if fname not in func_asts:
+                continue
+            if node.keywords or any(isinstance(a, ast.Starred)
+                                    for a in node.args):
+                blocked.add(fname)
+                continue
+            for i, arg in enumerate(node.args):
+                key = (fname, i)
+                if key in seen and seen[key] is None:
+                    continue  # already poisoned by an unresolvable caller
+                tag = None
+                if (isinstance(arg, ast.Call)
+                        and isinstance(arg.func, ast.Name)):
+                    tag = func_ret_types.get(arg.func.id)
+                if tag is None:
+                    seen[key] = None
+                else:
+                    seen.setdefault(key, set()).add(tag)
+
+        for (fname, i), tags in seen.items():
+            if fname in blocked or not tags:
+                continue
+            existing = self._call_site_param_types.get(fname)
+            if existing is None or i >= len(existing):
+                continue
+            if existing[i] is not None:
+                continue  # the main merge already decided; do not override
+            # Callers that resolve but disagree are the definition of MIXED,
+            # which the merge above already accepts as a parameter tag.  This
+            # is not a guess: every caller is known, they just are not the
+            # same kind.  Leaving it None instead would keep the untyped ABI
+            # and silently answer 0 for len(), which is how this bug hid.
+            existing[i] = next(iter(tags)) if len(tags) == 1 else "mixed"
+
     # Return expressions whose *pointer* kind is readable straight off the
     # AST.  Used only to detect returns that disagree with each other — see
     # _csa_returns_disagree — so it is deliberately narrow: anything not
@@ -8900,6 +8974,9 @@ class CodeGen:
 
         self._csa_post_scan_propagation(
             tree, class_parents, obj_classes, var_types, func_asts)
+
+        self._csa_refine_params_from_call_returns(
+            tree, func_asts, _func_ret_types)
 
         # ── Analysis: report functions with unresolved parameter types ──
         if self._analyze_mode:

@@ -8,7 +8,48 @@ how to reproduce it, and what the proper fix looks like.
 
 ## Active Bugs
 
-### BUG-PARAM-TYPE-FROM-USER-CALL-ARG. A parameter whose only call-site evidence is a user call is left untyped, and `len()` on it returns 0 — 2026-07-26
+### BUG-STARARG-SPLAT-DEFAULT-PARAM. `f(*xs)` raises IndexError when `f` has a default parameter — 2026-07-26
+
+**What:** splatting into a function that has *any* default parameter fails at
+runtime. Nothing to do with the element type — a list of plain ints fails the
+same way.
+
+**Reproduce** — should print `6`, raises:
+```python
+"""Doc."""
+
+def d_int(a, n=1):
+    return a + n
+
+ints = [5]
+print(d_int(*ints))
+```
+```
+Traceback (most recent call last):
+  File "<module>", line 7, in <module>
+IndexError: list index out of range
+```
+
+**Narrowing already done:** `two_pos(*[3, 4])` into `def two_pos(a, b)` works,
+and `d_int(5)` works, so neither splatting nor defaults is broken alone — it is
+the combination. The IndexError is raised by the compiled program itself, so
+the splat is being expanded against the *call site's* argument count rather
+than the callee's parameter count, and the defaulted slot is then read off the
+end of the splatted sequence.
+
+**Where:** the star-args expansion in the call-emission path (`_emit_user_call`
+and the `_expand_starargs` handling ahead of it). The fix is to expand only as
+many positions as the sequence actually has and let the normal default-filling
+supply the rest, rather than expanding to the callee's arity.
+
+**Not a regression:** identical IndexError at `9ba4c3c` and its parent —
+verified by stashing.
+
+**Where it bites:** `tests/regressions/param_type_from_call_arg.py` wanted a
+star-args call site to prove refinement is disabled for one; it has to use a
+no-default callee instead, and says so.
+
+### ~~BUG-PARAM-TYPE-FROM-USER-CALL-ARG. A parameter whose only call-site evidence is a user call is left untyped, and `len()` on it returns 0~~ — FIXED 2026-07-26
 
 **What:** when every call site passes a *call result* for a given parameter, the
 parameter gets no inferred type and operations on it silently produce wrong
@@ -60,8 +101,36 @@ special-casing `len()` on an untyped param.
 **Not a regression:** identical `0 0 0` at the parent commit — verified by
 stashing.
 
-**Where it bites:** `tests/regressions/direct_call_mixed_tag.py` never passes a
-call result straight into another user function, and says so in its docstring.
+**Worse than "returns 0":** the regression test showed the untyped parameter
+also *crashes* once it is genuinely used. At baseline the test prints `0 0 0`
+and then dies with `0xC0000005` (access violation) in `uses_fully`, which
+iterates and subscripts the parameter. `len()` answering 0 is just the quietest
+symptom.
+
+**Fixed** by `_csa_refine_params_from_call_returns`, a fixed-point step run
+after `_csa_post_scan_propagation` (so `_func_ret_types` exists). It fills only
+slots that are still `None` and never overrides the main merge. Two rules, in
+opposite directions:
+
+* An **unresolvable** caller at a position poisons that position — the slot
+  stays untyped, preserving the "unknown doesn't override known" rule.
+  Call sites with keywords or `*args` disable refinement for the whole callee,
+  since positional slots cannot be aligned through them.
+* Callers that all resolve but **disagree** get `mixed`, not `None`. This is
+  not a guess: every caller is known, they simply are not the same kind, and
+  the merge at the top of the pass already accepts `mixed` as a parameter tag
+  (it has an "already mixed, can't refine further" arm). The first draft left
+  these `None` and consequently still printed 0 — caught by the `two_kinds`
+  case in the test.
+
+**Residual, deliberately not fixed here:** coverage is bounded by what
+`_func_ret_types` records, which is list/dict/tuple/float/mixed but **not**
+str/bytes/set. There is no arm in `_csa_propagate_ret_types` for a plain
+`return "abcd"` — the only place it records `"str"` is for a parameter
+forwarded straight through (`return v` where a call site passed a str literal).
+So a parameter fed only by a str-returning function is still untyped. That is
+the same callee-side absence that caused BUG-MODULE-DOCSTRING-UNBOXES-GLOBAL,
+and it should be fixed there rather than papered over on the argument side.
 
 ### ~~BUG-DIRECT-CALL-LEN-STATIC-TAG. `len(f(x))` ignores the callee's `mixed` return tag; only `v = f(x); len(v)` is correct~~ — FIXED 2026-07-26
 

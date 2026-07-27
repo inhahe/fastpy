@@ -205,11 +205,26 @@ deliberately reads `_func_ret_types` and not `info.ret_tag`: the latter is
 fixed in the declaration pass, before call-site analysis has run, so it holds
 only the coarse first guess.
 
-A separate and much broader gap remains on the *argument* side: a parameter
-whose only call-site evidence is a user call is left untyped, because argument
-types are recorded before `_csa_propagate_ret_types` runs. That is an ordering
-problem, not a MIXED one — a single-kind callee is affected identically. See
-BUG-PARAM-TYPE-FROM-USER-CALL-ARG.
+**The argument side is an ordering problem, solved by a fixed-point step.**
+Call-argument types are classified early in `_analyze_call_sites`, before
+`_csa_propagate_ret_types` has run and while `_user_functions` is still empty,
+so `f(helper())` contributes nothing and a parameter passed *only* that way
+stays untyped. An untyped parameter does not fail loudly — `len()` on it
+answers 0, and using it properly faults. `_csa_refine_params_from_call_returns`
+runs after the propagation and fills slots that are still unknown, never
+overriding what the main merge decided. Its two rules point in opposite
+directions on purpose:
+
+- An *unresolvable* caller poisons that position, keeping the conservative
+  untyped ABI. Keyword and `*args` call sites disable refinement for the whole
+  callee, since positional slots cannot be aligned through them.
+- Callers that all *resolve but disagree* yield MIXED rather than unknown —
+  every caller is known there, they are simply different kinds, which is what
+  MIXED means.
+
+Coverage is bounded by what `_func_ret_types` records: list/dict/tuple/float
+and MIXED, but not str/bytes/set, since the propagation chain has no arm for a
+plain `return "abcd"`. Widening that belongs on the callee side.
 
 ## Runtime
 
