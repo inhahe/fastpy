@@ -251,48 +251,32 @@ print("r:", f())     # printed `enter` then `r: 1` — no `exit`
 
 </details>
 
-### BUG-WITH-OPEN-IN-FUNCTION-SEGFAULTS. `with open(...) as fh:` inside a function segfaults — 2026-07-27
+### BUG-FILEREAD-FN-RETTAG is a segfault, not just a wrong type — 2026-07-27
 
-**What:** the same statement that works at module scope crashes when it is in a
-function body. It is not about the `return` — the assign-then-return form
-crashes identically — and it is not about what is done with the handle.
+Recorded here because the symptom is nothing like the entry's title and cost an
+hour of chasing the wrong subsystem. `def rd(p): ... return f.readline()`
+followed by `rd(p).strip()` **segfaults** — the caller re-tags the returned
+string as `FPY_TAG_INT` (that is the known bug, logged below as
+BUG-FILEREAD-FN-RETTAG) and `.strip()` then dispatches a str method on what it
+believes is an integer.
 
-**Reproduce** — prints `module: line one`, then segfaults:
+The reason it is worth a note of its own: the crash looks exactly like a broken
+`with`. It reproduces as
+
 ```python
-f = open("t.txt", "w"); f.write("line one\n"); f.close()
-
-with open("t.txt", "r") as fh:      # fine
-    s = fh.readline()
-print("module:", s.strip())
-
 def rd(path):
-    with open(path, "r") as g:      # segfault
+    with open(path, "r") as g:
         t = g.readline()
     return t
-
-print("fn:", rd("t.txt").strip())
+print(rd("t.txt").strip())      # segfault
 ```
 
-**Where:** `_emit_with` in `compiler/codegen.py`, most likely the
-`_is_file_expr(ctx_expr)` branch that binds the `as` target as a file var
-(`self._file_vars.add(opt_var.id)`) combined with the `with.finally` block's
-`obj_call_method3(mgr, "__exit__", ...)`. A builtin file object is an
-`FpyFile`, not a user object with a method table, so a method dispatch on it
-would fault exactly this way. Verified pre-existing against a stashed tree, so
-it is not fallout from the `return`/`break` cleanup work.
-
-**Proper fix:** find out which of the two halves faults — build the repro and
-step the `with.finally` block in cdb, or dump the IR for `rd` and look at what
-`with.exit.native` is handed. If it is the `__exit__` dispatch, a file manager
-needs its own arm that calls `fastpy_file_close` directly rather than going
-through `obj_call_method3`; the fall-through path, the `return` path
-(`_emit_with_exit_unwind`) and the `break`/`continue` path all have to take it,
-which is an argument for having exactly one function emit the exit call.
-
-**Severity:** high — a segfault, in the single most idiomatic way to read a
-file, in a function. Worked around in
-`tests/regressions/return_out_of_with_runs_exit.py` by standing a hand-written
-context manager in for the file.
+which reads as "`with open(...)` inside a function is broken" — and the same
+statement at module scope is fine, which seems to confirm it. It isn't: the
+`with` is correct, including a `return` out of the body, and
+`print(rd("t.txt"))` or `len(rd("t.txt"))` both work. Only the method call on
+the result crashes. Anything that consumes the value as a string is a
+segfault-shaped report of the same root cause.
 
 ### BUG-CTOR-ARG-BINOP-TYPES-PARAM-INT. A `+` expression passed to a constructor types that parameter as an int, for every call site — 2026-07-27
 
@@ -3482,12 +3466,20 @@ result through a user function). The `services/fastpy-cat` and
 `services/fastpy-sysinfo` SlateOS utilities use the inline pattern for this
 reason.
 
-### DEBT-REGRESSION-SUITE-FLAKE. `int_float_of_tagged_value` failed once in a full run and passed alone and on re-run — 2026-07-27
+### DEBT-REGRESSION-SUITE-FLAKE. Two different regression tests have each failed once in a full run and passed alone and on re-run — 2026-07-27
 
 **What:** one run of `python -m pytest tests/regressions -q` reported
 `FAILED tests/regressions/int_float_of_tagged_value.py`. Re-running that file
 alone passed, and the very next full run of the whole directory was 341/341.
 Nothing in the compiler or runtime changed between the two runs.
+
+Later the same day a second full run reported
+`FAILED tests/regressions/list_literal_heap_numeric_elems.py` — a *different*
+test, with only documentation text and one regression file's contents changed
+since the previous green run. That file too passed alone, and the following
+full run was 342/342. Two unrelated tests each failing exactly once and never
+again is the signature of the environment, not of either test: whatever it is,
+it is not specific to the code under test.
 
 **Suspected cause:** not the test. The harness compiles into a temp directory
 and shells out to `link`/`clang` for every file, so a transient file lock — an
@@ -3496,11 +3488,13 @@ handle from the previous test's process — would surface as exactly this: a
 one-off failure with no reproduction. `DEFAULT_TIMEOUT` expiring under load is
 the other candidate; `RunResult.timed_out` would distinguish them.
 
-**What to do:** don't chase it until it recurs, but *do* capture it when it
-does — the failure detail (which of stdout / exit code / stderr differed, and
-whether `timed_out` was set) is the whole diagnosis and is lost as soon as the
-run scrolls past. If it turns out to be a lock, the fix is a bounded retry
-around the link step in `compile_source`, not a retry of the test.
+**What to do:** the failure detail — which of stdout / exit code / stderr
+differed, and whether `timed_out` was set — is the whole diagnosis, and `-q`
+throws it away as soon as the run scrolls past. Both occurrences so far were
+lost that way. Run the suite with `-q --tb=short` (or re-run failing files with
+`-vv`) so the next one is captured rather than merely counted. If it turns out
+to be a lock, the fix is a bounded retry around the link step in
+`compile_source`, not a retry of the test.
 
 **Severity:** low on its own, corrosive if it becomes normal — a suite with a
 known flaky test is a suite whose failures stop being read.

@@ -260,11 +260,6 @@ print("many:", many(200, lgF), len(lgF))
 
 
 # --- a cleanup that really is a resource release ---
-# The motivating case — `with open(p) as fh: return fh.readline()` — cannot be
-# written here: `with open(...)` inside *any* function segfaults, with or
-# without a return in the body, which is BUG-WITH-OPEN-IN-FUNCTION-SEGFAULTS.
-# A hand-written manager standing in for one is what is left, and it is what
-# actually exercises the emitted cleanup.
 class Handle:
     def __init__(self, log):
         self.log = log
@@ -289,3 +284,33 @@ def use_handle(log):
 lgG = []
 inside = use_handle(lgG)
 print("handle:", inside, lgG)
+
+
+# --- the motivating case: a real file, closed by the return ---
+# (The line is printed as-is rather than `.strip()`ed.  A str returned out of a
+# function that read it from a file arrives re-tagged as an int, so calling a
+# str method on it segfaults — BUG-FILEREAD-FN-RETTAG, nothing to do with the
+# `with`.  `len()` and printing both work, and are enough to show the read
+# happened.)
+def read_first_line(path):
+    with open(path, "r") as fh:
+        return fh.readline()
+
+
+_w = open("with_exit_tmp.txt", "w")
+_w.write("line one\nline two\n")
+_w.close()
+_first = read_first_line("with_exit_tmp.txt")
+print("file:", len(_first), _first)
+
+# A skipped __exit__ leaves the handle open.  Reopening the same path for
+# writing, and then removing it, is what that would break.
+_w = open("with_exit_tmp.txt", "w")
+_w.write("rewritten\n")
+_w.close()
+_again = read_first_line("with_exit_tmp.txt")
+print("reopened:", len(_again), _again)
+
+import os
+os.remove("with_exit_tmp.txt")
+print("removed:", os.path.exists("with_exit_tmp.txt"))
