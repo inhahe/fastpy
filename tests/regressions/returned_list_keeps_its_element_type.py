@@ -204,6 +204,44 @@ print(mk_empty(), len(mk_empty()))
 print(mk_empty_local(), len(mk_empty_local()))
 
 
+# ── Disagreeing is knowledge; not knowing is not ──────────────────────────
+# Elements that are all classified but *differ* say so, as "mixed", which
+# routes the read through the per-element runtime tag `FpyList.items` has
+# carried all along.  A bare "list" would default the element to int and
+# read a heap element back as its own address.  The identical literal at
+# module scope was correct all along, which is the tell.
+
+def mk_het():
+    return [2 ** 85, "s"]
+
+
+big85 = 2 ** 85
+mod_het = [2 ** 85, "s"]
+print(mod_het[0], mod_het[1], len(mod_het[1]), mod_het[0] == big85)
+print(mk_het()[0], mk_het()[1], len(mk_het()[1]), mk_het()[0] == big85)
+het = mk_het()
+print(het[0], het[1], len(het[1]), het[0] == big85)
+
+
+# ── `f()[i]` — a subscript of a *call*, not of a name ─────────────────────
+# This had no inference arm at all, so it took the LLVM type of the loaded
+# i64 (int) whatever the callee returned, and a returned BigInt compared by
+# address.  BUG-CALL-SUBSCRIPT-ELEM-KIND-LOST.
+
+def mk_bigs():
+    return [2 ** 85, 2 ** 86]
+
+
+def mk_strs():
+    return ["alpha", "beta"]
+
+
+print(mk_bigs()[0] == big85, mk_bigs()[1] == 2 ** 86)
+print(mk_bigs()[0], mk_bigs()[1])
+print(len(mk_strs()[0]), mk_strs()[0] == "alpha")
+print(mk_floats()[0] == 1.5, mk_ints()[1] == 2)
+
+
 # ── The tag survives one more hop: assigned, iterated, re-indexed ────────
 
 def mk_words():

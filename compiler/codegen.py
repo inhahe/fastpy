@@ -7665,10 +7665,20 @@ class CodeGen:
         if not isinstance(node, ast.List) or not node.elts:
             return None
         tags = {self._csa_elem_tag_of(e, local_types) for e in node.elts}
-        if len(tags) != 1:
-            return None
-        tag = tags.pop()
-        return tag
+        if len(tags) == 1:
+            return tags.pop()
+        if None not in tags:
+            # Every element was classified and they genuinely *disagree*.
+            # That is knowledge, not ignorance, and it is worth saying: a
+            # bare "list" defaults its element to INT, which reads a heap
+            # element back as its own address, whereas "mixed" routes the
+            # read through `list_get_fv` and keeps the per-element runtime
+            # tag that `FpyList.items` has carried all along.  The same
+            # literal written at module scope already behaves this way,
+            # which is why `[2 ** 85, "s"]` is correct there and was wrong
+            # through a `return`.
+            return "mixed"
+        return None  # at least one element is unclassified — say nothing
 
     def _csa_propagate_ret_types(
         self, tree: ast.Module,
@@ -22114,6 +22124,17 @@ class CodeGen:
                 _vt = _vt if isinstance(_vt, ValueType) else ValueType.from_old_tag(_vt)
                 if _vt.kind == VKind.LIST and _vt.elem_type is not None:
                     return _vt.elem_type  # element type is already ValueType
+            elif isinstance(node.value, ast.Call):
+                # `f()[0]` had no arm here at all, so it fell through to the
+                # LLVM type of the loaded i64 — INT — no matter what `f`
+                # returned.  A returned list of BigInts therefore compared by
+                # address (`mk()[0] == big` was False) while the identical
+                # literal at module scope was fine.  BUG-CALL-SUBSCRIPT-ELEM-
+                # KIND-LOST.
+                if self._is_list_expr(node.value):
+                    _et = self._get_list_elem_type(node.value)
+                    if _et.kind != VKind.UNKNOWN:
+                        return _et
         # Set operations (|, &, -, ^) produce sets
         if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.BitOr, ast.BitAnd, ast.BitXor, ast.Sub)):
             if self._is_set_expr(node.left) or self._is_set_expr(node.right):

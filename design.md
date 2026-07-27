@@ -998,15 +998,34 @@ scan builds:
   comprehension's loop variable so the element expression can mention it.
 - `_csa_list_elem_tag` — the *common* tag of a literal or comprehension.
 
-**Declining is a first-class answer.** All four return `None` when they cannot
-decide — mixed elements, an empty list, an unknown name — which reproduces the
-old bare `"list"` exactly. This is what makes the pass safe to widen: a new arm
-can only convert a decline into an answer, never one answer into another.
+**Declining is a first-class answer, but disagreement is not a decline.** The
+helpers return `None` when they cannot decide — an empty list, an unclassified
+element — which reproduces the old bare `"list"` exactly. This is what makes
+the pass safe to widen: a new arm can only convert a decline into an answer,
+never one answer into another. But when every element *is* classified and they
+simply differ, that is knowledge, and the tag is `"mixed"`. A bare `"list"`
+would default the element to INT and read a heap element back as its own
+address; `"mixed"` is not inlineable, so the read goes through `list_get_fv`
+and keeps the per-element tag that `FpyList.items` (an `FpyValue*`) has carried
+all along. The same literal at module scope was always correct for exactly this
+reason — `_infer_list_elem_type` takes the first element, and a non-scalar
+first element already forces the tag-preserving path.
 
 `"ptr:list"` is no longer a special case, just the tag you get when the common
 element kind *is* `"list"`. Producer and reader must be widened together: the
 reader (`_get_list_elem_type`'s user-call arm) recognised only `"ptr:list"`, so
 fixing the pre-pass alone changed nothing observable.
+
+**A subscript of a call is a different expression shape from a subscript of a
+name.** The `ast.Subscript` arm of the type-inference chain resolved
+`node.value` through `self.variables`, so it only ever fired for an
+`ast.Name`. `f()[0]` matched no arm at all and fell through to
+`_llvm_type_tag`, taking the element kind from the loaded `i64` — INT —
+whatever `f` returned, while `xs = f(); xs[0]` was correct. It now consults
+`_get_list_elem_type(node.value)`, which already knows how to read a callee's
+return tag (BUG-CALL-SUBSCRIPT-ELEM-KIND-LOST). This hole was *unobservable*
+until the return tag above was fixed, because there was previously nothing
+worth consulting — two holes on one path can each test clean in isolation.
 
 **A call's type is the callee's return type — never its arguments'.** Three
 independent passes classify an expression's kind, and all three ended a chain of

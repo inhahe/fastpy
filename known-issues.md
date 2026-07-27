@@ -371,6 +371,33 @@ This is why the fix could not be "fill the element kind in when we happen to
 know it": the yes/no guess was not merely uninformative, it was sometimes
 wrong, so it had to go rather than be supplemented.
 
+**A third facet: disagreeing is knowledge, not ignorance.** The classifier's
+first form *declined* whenever the elements differed, falling back to the bare
+`"list"` — and a bare `"list"` defaults its element to INT, which reads a heap
+element back as its own address. The tell was that the identical literal at
+module scope had always been right:
+
+```python
+m = [2 ** 85, "s"]                  # module scope
+print(len(m[1]), m[0] == 2 ** 85)   # 1 True  — correct
+
+def mk():
+    return [2 ** 85, "s"]
+print(len(mk()[1]), mk()[0] == 2 ** 85)   # was 0 False
+```
+
+Module scope works because `_infer_list_elem_type` takes the *first* element,
+gets BIGINT, and BIGINT is not inlineable — so the read goes through
+`list_get_fv` and each element's own runtime tag survives. The machinery was
+there all along; only the return path discarded it. When every element is
+classified and they simply *differ*, the pre-pass now says so with `"mixed"`
+rather than declining. (`"fvalue"` was tried first and changed the tag but
+nothing observable; `"mixed"` is the vocabulary the rest of codegen already
+dispatches on. Only the demonstrable version was kept.)
+
+Declining is still right when at least one element is *unclassified* — that is
+genuine ignorance, and the bare `"list"` is the honest answer for it.
+
 **Fix (2026-07-27):** three CSA-pre-pass helpers in `compiler/codegen.py`
 replace the yes/no question with a classifier that names the kind:
 
@@ -400,11 +427,49 @@ branchy return). Full suite green.
 
 **Still true, and still the standing theme:** this is static re-derivation at
 the consumer, not the element kind travelling with the value at runtime. It
-declines rather than guesses, so it is sound where it answers, but a list whose
-elements disagree still falls back to the bare `"list"` whose consumer defaults
-to `VKind.INT`.
+declines rather than guesses, so it is sound where it answers, but a list with
+even one unclassified element still falls back to the bare `"list"` whose
+consumer defaults to `VKind.INT`.
 
 **Severity:** silently wrong values, plus a hang — high.
+
+### BUG-CALL-SUBSCRIPT-ELEM-KIND-LOST. `f()[0]` takes the element kind from the loaded i64, not from `f` — 2026-07-27 — **FIXED**
+
+**What:** subscripting a *call* had no type-inference arm at all, so the result
+took the LLVM type of the loaded `i64` — INT — no matter what the callee
+returned. Binding the call to a name first was fine, which is what disguised it
+as a container bug:
+
+```python
+def mk_bigs():
+    return [2 ** 85, 2 ** 86]
+
+big = 2 ** 85
+print(mk_bigs()[0] == big)      # CPython True, compiled False
+xs = mk_bigs()
+print(xs[0] == big)             # True — the same read through a name
+```
+
+Printing is correct throughout (print uses the runtime tag), so only
+statically-dispatched operations — `==`, arithmetic, `len` — are wrong.
+
+**Where:** `compiler/codegen.py`, the `ast.Subscript` arm of the type-inference
+chain (~22121). It read `self.variables[node.value.id]` and therefore only ever
+fired when `node.value` was an `ast.Name`; `ast.Call` fell through every
+remaining arm to `_llvm_type_tag(value)`.
+
+**Fix (2026-07-27):** an `elif isinstance(node.value, ast.Call)` arm that
+consults `_get_list_elem_type(node.value)` — which already knows how to read a
+callee's return tag — and uses it when it is not UNKNOWN.
+
+**Note this was invisible until the return tag was fixed.** While
+`_func_ret_types` reduced every returned list to `ptr:list` or a bare `"list"`,
+there was nothing for this arm to consult, so adding it would have changed
+nothing. Two independent holes on the same path can each look like "not the
+bug" when tested alone — see BUG-RETURNED-LIST-ELEM-TAG-LOST, whose producer
+and reader had exactly this relationship.
+
+**Severity:** silently wrong answers, no crash and no diagnostic — high.
 
 ### BUG-FILEREAD-FN-RETTAG is a segfault, not just a wrong type — 2026-07-27
 
