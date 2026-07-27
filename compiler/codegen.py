@@ -1299,6 +1299,13 @@ class CodeGen:
         # AnnAssign handler can skip native alloca creation for them.
         self._unsafe_typed_vars: set[str] = set()
 
+        # Locals of the scope being emitted that a read can reach before any
+        # binding does.  They must live in an FpyValue slot, because only
+        # that carries FPY_TAG_UNDEF — the tag that makes the premature read
+        # raise instead of returning the stack word that happened to be
+        # there.  See `_names_maybe_unbound`.
+        self._scope_maybe_unbound: set[str] = set()
+
         # Locals that must be given an FpyValue slot from their very first
         # assignment because they can hold a value whose kind is only known
         # at runtime.  Pre-scanned per scope by _scan_fv_forced_locals so the
@@ -3156,13 +3163,22 @@ class CodeGen:
     def _load_fv_raw(self, name: str) -> 'ir.Value | None':
         """Load an FpyValue variable without unwrapping — preserves the
         runtime tag. Returns the fpy_val struct, or None if the variable
-        is not stored as an FpyValue alloca."""
+        is not stored as an FpyValue alloca.
+
+        UNDEF is a runtime tag like any other, so preserving the tag means
+        checking for it too: this is the load `return c` uses, and without
+        the check a function whose only binding of `c` is in a branch that
+        did not run returned the sentinel to its caller as if it were a
+        value.  BUG-UNBOUND-NATIVE-LOCAL-READS-STACK."""
         if name not in self.variables:
             return None
         alloca, _ = self.variables[name]
         if (isinstance(alloca.type, ir.PointerType)
                 and alloca.type.pointee is fpy_val):
-            return self.builder.load(alloca, name=f"{name}.fv_raw")
+            fv = self.builder.load(alloca, name=f"{name}.fv_raw")
+            if self._needs_undef_check(name):
+                self._check_fv_undef(fv, name)
+            return fv
         return None
 
     def _expr_to_tag_data(self, node: ast.expr) -> tuple:
@@ -4072,6 +4088,279 @@ class CodeGen:
                     self.runtime["cpython_exec_get"], [source_ptr, name_ptr])
                 self._store_variable(base_name, func_ptr, ValueType(VKind.PYOBJ))
 
+    # ------------------------------------------------------------------
+    # Definite assignment: which locals can be read before they are bound
+    # ------------------------------------------------------------------
+    #
+    # "Not bound yet" is a *state of the variable*, and a native slot has
+    # room for a value but not for the fact that there isn't one.  An FV
+    # local is initialized to FPY_TAG_UNDEF and `_check_fv_undef` turns a
+    # premature read into the NameError CPython raises; a bare `alloca
+    # i64` just hands back whatever the stack happened to hold — `0` on a
+    # fresh page, a stale pointer otherwise.
+    #
+    # So the rule is the one the bare ABI already applies to a BigInt
+    # result and to a mixed scalar return: if the value needs a tag the
+    # slot cannot hold, the slot is wrong.  The pass below finds the names
+    # that need the UNDEF tag, and they disqualify the scope from the
+    # bare ABI (and from a `--typed` native alloca).
+    #
+    # Precision here only buys performance — a name wrongly called
+    # possibly-unbound costs a scope its native slots, never correctness —
+    # so every construct whose control flow is not obvious (`try`, `match`,
+    # a loop body that may run zero times) contributes no bindings.
+
+    # A nested scope: its body does not execute here, so nothing it binds
+    # is bound in *this* scope, and nothing it reads is read here either.
+    _MU_NESTED = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+
+    @classmethod
+    def _mu_target_names(cls, target: ast.expr, out: set) -> None:
+        """The names an assignment target binds.  An attribute or a
+        subscript target binds nothing — `a.b = 1` does not bind `a`."""
+        if isinstance(target, ast.Name):
+            out.add(target.id)
+        elif isinstance(target, (ast.Tuple, ast.List)):
+            for elt in target.elts:
+                cls._mu_target_names(elt, out)
+        elif isinstance(target, ast.Starred):
+            cls._mu_target_names(target.value, out)
+
+    @classmethod
+    def _mu_locals(cls, stmts: list) -> set:
+        """Every name this scope binds anywhere — i.e. its locals.
+
+        A read of anything outside this set is a global or a builtin,
+        resolved by a different path entirely, so it is not our business.
+        `global`/`nonlocal` names are excluded for the same reason."""
+        names: set = set()
+        declared_elsewhere: set = set()
+        for stmt in stmts:
+            for n in ast.walk(stmt):
+                if isinstance(n, (ast.Global, ast.Nonlocal)):
+                    declared_elsewhere.update(n.names)
+                elif isinstance(n, ast.Assign):
+                    for t in n.targets:
+                        cls._mu_target_names(t, names)
+                elif isinstance(n, (ast.AugAssign, ast.AnnAssign)):
+                    cls._mu_target_names(n.target, names)
+                elif isinstance(n, ast.NamedExpr):
+                    cls._mu_target_names(n.target, names)
+                elif isinstance(n, (ast.For, ast.AsyncFor)):
+                    cls._mu_target_names(n.target, names)
+                elif isinstance(n, (ast.With, ast.AsyncWith)):
+                    for item in n.items:
+                        if item.optional_vars is not None:
+                            cls._mu_target_names(item.optional_vars, names)
+                elif isinstance(n, cls._MU_NESTED):
+                    names.add(n.name)
+                elif isinstance(n, ast.ExceptHandler) and n.name:
+                    names.add(n.name)
+                elif isinstance(n, (ast.Import, ast.ImportFrom)):
+                    for alias in n.names:
+                        names.add(alias.asname or alias.name.split(".")[0])
+                elif isinstance(n, ast.MatchAs) and n.name:
+                    names.add(n.name)
+                elif isinstance(n, ast.MatchStar) and n.name:
+                    names.add(n.name)
+                elif isinstance(n, ast.MatchMapping) and n.rest:
+                    names.add(n.rest)
+        return names - declared_elsewhere
+
+    @classmethod
+    def _mu_reads(cls, node: 'ast.AST | None') -> set:
+        """The names an expression reads when it is evaluated.
+
+        A comprehension's own loop targets are its locals, not this
+        scope's, so they are subtracted; a lambda's parameters likewise.
+        A lambda *body* is not evaluated here at all, but walking into it
+        only over-reports, which is harmless."""
+        if node is None:
+            return set()
+        out: set = set()
+        shadowed: set = set()
+        for n in ast.walk(node):
+            if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load):
+                out.add(n.id)
+            elif isinstance(n, (ast.ListComp, ast.SetComp,
+                                ast.DictComp, ast.GeneratorExp)):
+                for gen in n.generators:
+                    cls._mu_target_names(gen.target, shadowed)
+            elif isinstance(n, ast.Lambda):
+                shadowed.update(a.arg for a in n.args.args)
+                shadowed.update(a.arg for a in n.args.posonlyargs)
+                shadowed.update(a.arg for a in n.args.kwonlyargs)
+        return out - shadowed
+
+    @classmethod
+    def _mu_use(cls, node, bound: set, local_names: set, maybe: set) -> None:
+        """Record every read that no binding dominates."""
+        for name in cls._mu_reads(node):
+            if name in local_names and name not in bound:
+                maybe.add(name)
+
+    @classmethod
+    def _mu_scan(cls, stmts: list, bound: set,
+                 local_names: set, maybe: set) -> set:
+        """Walk `stmts` in order and return what is definitely bound on
+        normal exit, given `bound` on entry."""
+        bound = set(bound)
+        for st in stmts:
+            bound = cls._mu_stmt(st, bound, local_names, maybe)
+        return bound
+
+    @classmethod
+    def _mu_stmt(cls, st, bound: set, local_names: set, maybe: set) -> set:
+        use = cls._mu_use
+
+        if isinstance(st, cls._MU_NESTED):
+            # The decorators, defaults and bases *are* evaluated here; the
+            # body is not.  The `def` itself binds the name.
+            for dec in st.decorator_list:
+                use(dec, bound, local_names, maybe)
+            if isinstance(st, ast.ClassDef):
+                for b in st.bases:
+                    use(b, bound, local_names, maybe)
+            else:
+                for d in st.args.defaults:
+                    use(d, bound, local_names, maybe)
+                for d in st.args.kw_defaults:
+                    use(d, bound, local_names, maybe)
+            return bound | {st.name}
+
+        if isinstance(st, ast.Assign):
+            use(st.value, bound, local_names, maybe)
+            names: set = set()
+            for t in st.targets:
+                # A subscript or attribute target *reads* its base.
+                if not isinstance(t, ast.Name):
+                    use(t, bound, local_names, maybe)
+                cls._mu_target_names(t, names)
+            return bound | names
+
+        if isinstance(st, ast.AugAssign):
+            # `x += 1` reads x before it writes it.
+            if isinstance(st.target, ast.Name):
+                if (st.target.id in local_names
+                        and st.target.id not in bound):
+                    maybe.add(st.target.id)
+            else:
+                use(st.target, bound, local_names, maybe)
+            use(st.value, bound, local_names, maybe)
+            names = set()
+            cls._mu_target_names(st.target, names)
+            return bound | names
+
+        if isinstance(st, ast.AnnAssign):
+            use(st.value, bound, local_names, maybe)
+            if st.value is None:
+                # A bare `x: int` declares but does not bind.
+                return bound
+            names = set()
+            cls._mu_target_names(st.target, names)
+            return bound | names
+
+        if isinstance(st, ast.Delete):
+            for t in st.targets:
+                use(t, bound, local_names, maybe)
+            gone: set = set()
+            for t in st.targets:
+                cls._mu_target_names(t, gone)
+            return bound - gone
+
+        if isinstance(st, (ast.Import, ast.ImportFrom)):
+            return bound | {a.asname or a.name.split(".")[0]
+                            for a in st.names}
+
+        if isinstance(st, ast.If):
+            use(st.test, bound, local_names, maybe)
+            # `if False:` still binds in CPython's eyes — the name is a
+            # local either way, it just never gets a value — so a dead
+            # branch is scanned like any other and contributes nothing to
+            # the intersection.
+            b1 = cls._mu_scan(st.body, bound, local_names, maybe)
+            b2 = cls._mu_scan(st.orelse, bound, local_names, maybe)
+            return b1 & b2
+
+        if isinstance(st, (ast.While, ast.For, ast.AsyncFor)):
+            if isinstance(st, ast.While):
+                use(st.test, bound, local_names, maybe)
+                body_entry = bound
+            else:
+                use(st.iter, bound, local_names, maybe)
+                names = set()
+                cls._mu_target_names(st.target, names)
+                body_entry = bound | names
+            # One pass, with only what was bound *before* the loop.  A
+            # second pass carrying the first pass's bindings would model
+            # "this may not be the first iteration" — but the first
+            # iteration is a path too, and it is the one on which a name
+            # bound at the bottom of the body and read at the top is
+            # unbound.  Definitely-bound at body entry is the intersection
+            # over incoming edges (before-loop, and body-end), and
+            # `bound ∩ (bound | body_binds)` is just `bound`.
+            cls._mu_scan(st.body, body_entry, local_names, maybe)
+            cls._mu_scan(st.orelse, bound, local_names, maybe)
+            # The body may run zero times, so it binds nothing for good.
+            return bound
+
+        if isinstance(st, (ast.With, ast.AsyncWith)):
+            names = set()
+            for item in st.items:
+                use(item.context_expr, bound, local_names, maybe)
+                if item.optional_vars is not None:
+                    cls._mu_target_names(item.optional_vars, names)
+            return cls._mu_scan(st.body, bound | names, local_names, maybe)
+
+        if isinstance(st, ast.Try) or type(st).__name__ == "TryStar":
+            # An exception can cut the body off between any two
+            # statements, so nothing the body binds survives into a
+            # handler, and nothing it binds is guaranteed after.
+            cls._mu_scan(st.body, bound, local_names, maybe)
+            for h in st.handlers:
+                cls._mu_scan(h.body, bound, local_names, maybe)
+            cls._mu_scan(st.orelse, bound, local_names, maybe)
+            # `finally` does run, whichever way the block ends.
+            return cls._mu_scan(st.finalbody, bound, local_names, maybe)
+
+        if isinstance(st, ast.Match):
+            use(st.subject, bound, local_names, maybe)
+            for case in st.cases:
+                names = set()
+                for n in ast.walk(case.pattern):
+                    if isinstance(n, ast.MatchAs) and n.name:
+                        names.add(n.name)
+                    elif isinstance(n, ast.MatchStar) and n.name:
+                        names.add(n.name)
+                    elif isinstance(n, ast.MatchMapping) and n.rest:
+                        names.add(n.rest)
+                entry = bound | names
+                if case.guard is not None:
+                    use(case.guard, entry, local_names, maybe)
+                cls._mu_scan(case.body, entry, local_names, maybe)
+            # No case is guaranteed to match.
+            return bound
+
+        # Return / Expr / Assert / Raise / Pass / Break / Continue /
+        # Global / Nonlocal: reads only.
+        for field in ("value", "test", "msg", "exc", "cause"):
+            if hasattr(st, field):
+                use(getattr(st, field), bound, local_names, maybe)
+        return bound
+
+    @classmethod
+    def _names_maybe_unbound(cls, body: list, params=()) -> set:
+        """The locals of `body` that at least one read does not find bound.
+
+        Reading one of these must raise NameError/UnboundLocalError, which
+        only an FV slot can represent — see the note above `_MU_NESTED`."""
+        local_names = cls._mu_locals(body)
+        if not local_names:
+            return set()
+        maybe: set = set()
+        cls._mu_scan(body, set(params), local_names, maybe)
+        return maybe
+
     def _gen_detect_bare_abi(self, tree: ast.Module) -> None:
         """Determine if module-level code can use bare-ABI mode.
 
@@ -4098,8 +4387,15 @@ class CodeGen:
         # the i64 data in the alloca — the tag is lost, so subsequent loads
         # misinterpret the BigInt pointer as a plain integer.  Disable
         # bare-ABI to force fpy_val allocas that preserve the runtime tag.
+        # "Never assigned" is a tag too — FPY_TAG_UNDEF — and a bare i64
+        # slot has no room for it, so `for _ in range(0): z = 0` followed
+        # by `print(z)` printed the uninitialized stack slot instead of
+        # raising NameError.  BUG-UNBOUND-NATIVE-LOCAL-READS-STACK.
+        _maybe_unbound = self._names_maybe_unbound(tree.body)
+        self._scope_maybe_unbound = _maybe_unbound
         self._current_fn_bare_abi = (not _main_has_complex
-                                     and not self._program_uses_bigint)
+                                     and not self._program_uses_bigint
+                                     and not _maybe_unbound)
 
         if _main_has_complex and self._analyze_mode:
             from compiler.analysis import HIGH, IMPACT_BARE_ABI_MODULE
@@ -10216,8 +10512,16 @@ class CodeGen:
         # the FpyValue is unwrapped by a static `int` claim on arrival.
         # BUG-BIGINT-RETURNED-FROM-FUNCTION-LOSES-TAG.
         _bigint_ret = self._returns_may_be_bigint(node)
+        # A local that a read can reach before any binding does needs the
+        # UNDEF tag, and a bare scalar slot has nowhere to put it: the
+        # premature read hands back the uninitialized stack word instead
+        # of raising UnboundLocalError.  Same argument as the two above —
+        # the value needs a tag the ABI cannot carry.
+        # BUG-UNBOUND-NATIVE-LOCAL-READS-STACK.
+        _maybe_unbound = self._names_maybe_unbound(node.body, param_names)
         uses_bare = (
             not _used_as_value
+            and not _maybe_unbound
             and not has_vararg
             and not has_kwarg
             and not _may_return_none
@@ -10242,6 +10546,10 @@ class CodeGen:
                 blockers.append("**kwargs parameter")
             if _may_return_none:
                 blockers.append("may return None")
+            if _maybe_unbound:
+                blockers.append(
+                    "local(s) readable before assignment: "
+                    + ", ".join(sorted(_maybe_unbound)))
             if _mixed_scalar_ret:
                 blockers.append("returns int on one path and float on another")
             if not _is_scalar_ret:
@@ -12330,7 +12638,8 @@ class CodeGen:
                  self._unsafe_typed_vars, self._int_mode_vars,
                  self._current_fn_bare_abi,
                  self._current_func_explicit_globals,
-                 self._fv_forced_locals)
+                 self._fv_forced_locals,
+                 self._scope_maybe_unbound)
 
         # Set up function state
         self.function = info.func
@@ -12350,6 +12659,10 @@ class CodeGen:
         self._obj_var_class = {}
         self._obj_var_pinned = set()
         self._int_mode_vars = {}
+        self._scope_maybe_unbound = self._names_maybe_unbound(
+            node.body, [a.arg for a in node.args.args]
+            + [a.arg for a in node.args.kwonlyargs]
+            + [a.arg for a in node.args.posonlyargs])
         # Pre-scan for typed annotations contradicted by later assignments
         if self._typed_mode:
             self._unsafe_typed_vars = self._scan_unsafe_typed_vars(node.body)
@@ -12616,7 +12929,8 @@ class CodeGen:
          self._unsafe_typed_vars, self._int_mode_vars,
          self._current_fn_bare_abi,
          self._current_func_explicit_globals,
-         self._fv_forced_locals) = saved
+         self._fv_forced_locals,
+         self._scope_maybe_unbound) = saved
 
     # -----------------------------------------------------------------
     # Class support
@@ -17893,6 +18207,12 @@ class CodeGen:
                         print(f"fastpy: warning: ignoring type annotation for "
                               f"'{varname}' (contradicted by assignment in scope)",
                               file=sys.stderr)
+                    elif varname in self._scope_maybe_unbound:
+                        # `x: int` declares without binding, so a read can
+                        # still arrive first.  A native slot cannot say
+                        # "no value yet"; the FV slot's UNDEF tag can.
+                        # BUG-UNBOUND-NATIVE-LOCAL-READS-STACK.
+                        pass
                     elif varname not in self._native_vars:
                         native_type = self._VKIND_TO_LLVM[kind]
                         native_alloca = self._create_entry_alloca(
@@ -23906,15 +24226,45 @@ class CodeGen:
         else:
             return data
 
+    def _needs_undef_check(self, name: str) -> bool:
+        """Whether a load of `name` has to test for the UNDEF sentinel.
+
+        The check is an icmp plus a predicted-not-taken branch per load,
+        which blocks LLVM's loop optimizations, so it is skipped wherever a
+        read cannot find the variable unbound.
+
+        `_definitely_assigned` alone is not that test: it records that a
+        store has been *emitted*, and a store in a loop body that runs zero
+        times — or in a dead `if` branch — is emitted just the same.
+        `for _ in range(0): z = 0` followed by `0 + z` skipped the check and
+        added the UNDEF sentinel's data word as if it were a number.  The
+        dominance answer comes from `_names_maybe_unbound`.
+
+        Every site that loads an FV local has to ask *this* question, not its
+        own version of it: `return x` for a float-returning function had its
+        own raw-FV load that skipped the check entirely, so the one shape
+        where a float local is read is the one shape that did not raise.
+        BUG-UNBOUND-NATIVE-LOCAL-READS-STACK.
+        """
+        return (name in self._scope_maybe_unbound
+                or not (name in self._definitely_assigned
+                        and not self._in_try_block))
+
     def _check_fv_undef(self, fv: ir.Value, name: str) -> ir.Value:
         """Check if a loaded FpyValue has the UNDEF tag (never assigned).
 
-        Emits a runtime NameError if so, matching CPython semantics for
-        accessing a variable that was never defined (or whose assignment
-        was interrupted by an exception in a try block).  Returns the
-        original fpy_val struct unchanged — the caller proceeds only if
-        the ok-block is reached.  The cost is one icmp + one predicted-
-        not-taken branch per load.
+        Emits the exception CPython raises for reading a variable that was
+        never given a value (or whose assignment an exception in a try
+        block interrupted).  Returns the original fpy_val struct unchanged
+        — the caller proceeds only if the ok-block is reached.  The cost is
+        one icmp + one predicted-not-taken branch per load.
+
+        Which exception depends on the scope: a *local* gets
+        UnboundLocalError, a module-level name gets NameError.  They are
+        not interchangeable — the messages differ, and while
+        UnboundLocalError is a subclass of NameError (so `except
+        NameError:` catches both), only the subclass is caught by `except
+        UnboundLocalError:`.
         """
         rt_tag = self.builder.extract_value(fv, 0, name=f"{name}.rtag")
         is_undef = self.builder.icmp_signed(
@@ -23924,19 +24274,32 @@ class CodeGen:
         self.builder.cbranch(is_undef, undef_block, ok_block)
 
         self.builder.position_at_end(undef_block)
-        ne_name_ptr = self._make_string_constant("NameError")
+        _at_module_scope = (
+            getattr(self, "_current_func_name", "fastpy_main")
+            == "fastpy_main")
+        if _at_module_scope:
+            _exc, _msg = "NameError", f"name '{name}' is not defined"
+        else:
+            _exc = "UnboundLocalError"
+            _msg = (f"cannot access local variable '{name}' where it is "
+                    f"not associated with a value")
+        ne_name_ptr = self._make_string_constant(_exc)
         ne_exc_id = self.builder.call(
             self.runtime["exc_name_to_id"], [ne_name_ptr])
-        ne_msg_ptr = self._make_string_constant(
-            f"name '{name}' is not defined")
+        ne_msg_ptr = self._make_string_constant(_msg)
         self.builder.call(self.runtime["raise"],
                           [ne_exc_id, ne_msg_ptr])
-        if not self._in_try_block:
+        # Only module-level code may declare the exception unhandled here.
+        # Inside a function the *caller* can be in a try block, and calling
+        # exc_unhandled exits the process before its handler ever runs:
+        # `try: f() except NameError:` did not catch the unbound local that
+        # `f` read.  Leaving the exception merely pending lets the ordinary
+        # bail-out checks carry it out of the function.
+        if _at_module_scope and not self._in_try_block:
             self.builder.call(self.runtime["exc_unhandled"], [])
-        # Must terminate the block — branch to ok_block.  In the
-        # non-try case exc_unhandled already exited, so this is
-        # dead code.  In the try case the exception is pending and
-        # the next exc_pending check will catch it.
+        # Must terminate the block — branch to ok_block.  Where
+        # exc_unhandled was emitted this is dead code; otherwise the
+        # exception is pending and the next exc_pending check finds it.
         self.builder.branch(ok_block)
 
         self.builder.position_at_end(ok_block)
@@ -23950,9 +24313,25 @@ class CodeGen:
             alloca, _kind = self._native_vars[name]
             return self.builder.load(alloca, name=name)
         if name not in self.variables:
-            # Fallback: check module-level globals (Python allows reading
-            # globals without explicit `global` declaration).
-            if name in self._global_vars:
+            # A local whose slot the *store* creates, read before that store
+            # was emitted, has no slot yet — so `y = y + 1` inside a function
+            # fell all the way through to the "truly undefined" arm below and
+            # answered NameError, where CPython says UnboundLocalError, and
+            # then called exc_unhandled from inside the callee (killing the
+            # process before the caller's handler could run).  A local shadows
+            # a global of the same name for the *whole* scope, so this has to
+            # come before the _global_vars fallback: a name assigned anywhere
+            # in the function is local even where it is read first.  Give it
+            # the FV slot the analysis already says it needs; the UNDEF
+            # sentinel then reaches _check_fv_undef, which picks the exception
+            # by scope.  BUG-UNBOUND-NATIVE-LOCAL-READS-STACK.
+            if (name in self._scope_maybe_unbound
+                    and self._USE_FV_LOCALS
+                    and not self._current_fn_bare_abi):
+                alloca = self._create_entry_alloca(fpy_val, name)
+                self._entry_store_fv_none(alloca)
+                self.variables[name] = (alloca, ValueType(VKind.MIXED))
+            elif name in self._global_vars:
                 self.variables[name] = self._global_vars[name]
             elif name in self._user_functions:
                 # User function used as a value (e.g., callback = add, or
@@ -24071,12 +24450,7 @@ class CodeGen:
         # (determined by the variable's current type_tag)
         if isinstance(alloca.type, ir.PointerType) and alloca.type.pointee is fpy_val:
             fv = self.builder.load(alloca, name=f"{name}.fv")
-            # Skip the UNDEF tag check for variables that have been
-            # assigned at least once (outside try blocks).  The check
-            # is an icmp + predicted-not-taken branch per load which
-            # prevents LLVM from optimizing hot loops.
-            if not (name in self._definitely_assigned
-                    and not self._in_try_block):
+            if self._needs_undef_check(name):
                 self._check_fv_undef(fv, name)
             # Unchecked/checked int-mode variables (from unchecked_int() /
             # checked_int() constructors): always unwrap to bare i64.
@@ -27343,6 +27717,8 @@ class CodeGen:
                         if (isinstance(alloca.type, ir.PointerType)
                                 and alloca.type.pointee is fpy_val):
                             value = self.builder.load(alloca, name=f"{node.value.id}.retfv")
+                            if self._needs_undef_check(node.value.id):
+                                self._check_fv_undef(value, node.value.id)
                         else:
                             bare = self._emit_expr_value(node.value)
                             if isinstance(bare.type, ir.IntType):

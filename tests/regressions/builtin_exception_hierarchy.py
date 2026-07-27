@@ -175,6 +175,29 @@ except LookupError as e:
     print("user under abstract base:", type(e).__name__)
 
 
+# --- NameError and its subclass ---
+def unbound(t):
+    if t:
+        v = 1
+    return v
+
+
+try:
+    unbound(0)
+except NameError as e:
+    print("unbound via NameError:", type(e).__name__)
+
+try:
+    unbound(0)
+except UnboundLocalError as e:
+    print("unbound exact:", type(e).__name__)
+
+try:
+    unbound(0)
+except (TypeError, NameError) as e:
+    print("unbound in tuple:", type(e).__name__)
+
+
 # --- every builtin is an Exception, and every Exception a BaseException ---
 for thunk in ("zero", "key", "index", "value", "user"):
     try:

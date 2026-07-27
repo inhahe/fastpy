@@ -8,6 +8,77 @@ how to reproduce it, and what the proper fix looks like.
 
 ## Active Bugs
 
+### BUG-UNBOUND-NATIVE-LOCAL-READS-STACK. A local read before anything bound it returns stack garbage instead of raising — 2026-07-27 — **FIXED**
+
+**Fixed:** "never assigned" is a value a local can have, and it needs somewhere
+to live. An FV slot has room for it — `FPY_TAG_UNDEF` in the tag word, written
+on entry and checked on load — but a *native* slot (a bare `i64`, a `double`,
+an `i8*`) is all payload and no tag. Two things put a local in a native slot:
+bare-ABI mode and a `--typed` annotation, and both did it to locals a read could
+reach before any store did.
+
+Four layers, all now fixed:
+
+* `_names_maybe_unbound` answers "which locals can be read before they are
+  bound?" for real — intersecting `if` branches, treating a `try` as
+  contributing only its `finally`, treating a bare `x: int` as a declaration
+  that binds nothing, and scanning a loop body with only the bindings that were
+  live *before* the loop (the first iteration is a path too, and it is the one
+  on which a name bound at the bottom of the body and read at the top is
+  unbound; definite-assignment at body entry is the intersection over incoming
+  edges, and `bound ∩ (bound ∪ body_binds)` is just `bound`).
+* A scope with any such local is disqualified from the bare ABI and from
+  `--typed` native allocas, exactly the way a scope that touches a BigInt is.
+  Same argument in both cases: the value needs a tag the slot cannot carry.
+* The load has to actually *do* the check. It was skipping it whenever
+  `_definitely_assigned` held the name — but that set records that a store was
+  **emitted**, and a store inside a loop that runs zero times is emitted just
+  the same. The gate is now the shared `_needs_undef_check`, which defers to
+  the analysis.
+* Every load site has to ask that same question. `_load_fv_raw` — the choke
+  point for ~15 tag-preserving loads (`return c`, method receivers, subscript
+  bases, call arguments, `for` iterables) — did not check at all, so a function
+  returned the sentinel to its caller as if it were a value; and the
+  float-return path had its own private raw-FV load that skipped it too. Both
+  now go through `_needs_undef_check`.
+
+A fifth, smaller hole: a local whose slot the *store* creates, read before that
+store was emitted (`y = y + 1` inside a function), had no slot at all and fell
+through to the "truly undefined" arm, answering NameError. `_load_variable`
+now creates the sentinel-initialised slot for a maybe-unbound name before the
+globals fallback — which also fixes the shadowing order, since a name that is
+global *and* assigned later in the function is local.
+
+The exception differs by scope: a module-level read raises NameError, a
+function-level one UnboundLocalError — which is a subclass, so
+`except NameError:` catches it (see BUG-BUILTIN-EXC-HIERARCHY-NOT-MATCHED,
+fixed in the same chain). `_check_fv_undef` must not call
+`fastpy_exc_unhandled` from inside a callee, or a caller's handler never gets
+the chance to fire.
+
+Regression coverage in
+`tests/regressions/unbound_local_read_before_assignment.py`.
+
+<details><summary>Original report</summary>
+
+```python
+def loop_zero(n):
+    for _ in range(n):
+        z = 0
+    return z
+print(loop_zero(0))      # printed 0, should raise UnboundLocalError
+
+def branch(t):
+    if t:
+        w = 1
+    return w
+print(branch(0))         # printed 2458834108416, then 1988293820416, ...
+```
+The second one printing a different number per run is the diagnosis: it is
+whatever the stack happened to hold.
+
+</details>
+
 ### BUG-BUILTIN-EXC-HIERARCHY-NOT-MATCHED. `except ArithmeticError:` did not catch `1 / 0` — 2026-07-27 — **FIXED**
 
 **Fixed:** an `except` clause matched by comparing the raised exception's *type
@@ -54,6 +125,155 @@ except ArithmeticError:      # never fired
 Same for `except LookupError:` over a missing dict key or a list index.
 
 </details>
+
+### BUG-PENDING-EXC-CLOBBERED-IN-FUNCTION. A raise mid-statement inside a function does not stop the statement, so a later raise overwrites it — 2026-07-27
+
+**What:** `_emit_try_bail_if_exc` has two arms — bail to the handler when
+`_in_try_block`, bail to `exc_unhandled` at module scope — and **does nothing
+at all** inside a non-`fastpy_main` function that is not itself in a `try`. So
+the raise sets the pending exception and codegen carries straight on emitting
+the rest of the statement. The next operation runs on whatever garbage the
+failed one left, raises its own exception, and that one wins.
+
+**Reproduce** — should report ZeroDivisionError:
+```python
+def f(a):
+    return (1 // a) + "s"
+try:
+    f(0)
+except Exception as e:
+    print(type(e).__name__)     # prints TypeError
+```
+The `//` raises ZeroDivisionError, the `+` then runs anyway on the garbage
+result and its TypeError replaces it.
+
+**Where:** `_emit_try_bail_if_exc` in `compiler/codegen.py` (~37798).
+
+**Proper fix:** give each function a lazily-created exception-exit block —
+allocated on first need, placed before the normal epilogue, returning a
+zero/`None` value — and give `_emit_try_bail_if_exc` a third arm that branches
+there when the current function is not `fastpy_main` and not inside a `try`.
+Rejected alternative: making `fastpy_raise` a no-op while an exception is
+pending. That looks like it fixes the symptom but changes `finally`-re-raise
+semantics, where a *deliberate* second raise must replace the first.
+
+This is also half of BUG-PRINT-EMITS-BEFORE-ARGS-RAISE.
+
+**Severity:** wrong exception class reported; a handler selected on class picks
+the wrong arm.
+
+### BUG-PRINT-EMITS-BEFORE-ARGS-RAISE. `print(a, f())` emits `a` before evaluating `f()`, so a raise in the argument leaves partial output — 2026-07-27
+
+**What:** the `print` emitter writes each argument as it goes rather than
+evaluating all of them first. If a later argument raises, the earlier ones have
+already reached stdout, and the text is on the stream ahead of the traceback.
+CPython evaluates every argument before writing anything.
+
+**Reproduce** — should print nothing before the handler runs:
+```python
+def raises():
+    return 1 // 0
+try:
+    print("x", raises())
+except ZeroDivisionError:
+    print("caught")
+```
+fastpy prints `x ` first.
+
+**Where:** the `print` emitter in `compiler/codegen.py`.
+
+**Proper fix:** evaluate all arguments into temporaries, then emit. Note that
+even with that, the statement only actually stops if
+BUG-PENDING-EXC-CLOBBERED-IN-FUNCTION is fixed too — inside a function with no
+enclosing `try`, nothing currently bails.
+
+**Severity:** stray output on an exception path; makes exception tests in a
+regression corpus need contorting around it (see the in-file notes in
+`tests/regressions/unbound_local_read_before_assignment.py`).
+
+### BUG-MIXED-POSITIONAL-VARARG-KWARG-DROPPED. `def f(p, q=2, *args, **kwargs)` fails to compile — the `**kwargs` name is never bound — 2026-07-27
+
+**What:** `_duf_resolve_params`'s `has_vararg and node.args.args` branch builds
+the parameter list without ever appending the `**kwargs` name, so the
+definition is short one parameter and the call is rejected with
+`f() missing 1 required argument(s)`. When it does compile the runtime output
+is silently `0`.
+
+**Reproduce:**
+```python
+def f(p, q=2, *args, **kwargs):
+    return p, q, args, kwargs
+print(f(1))
+```
+
+**Where:** `_duf_resolve_params` in `compiler/codegen.py`.
+
+**Proper fix:** append the vararg *and* kwarg names in that branch the way the
+other branches do; the shapes should share one parameter-list builder rather
+than each assembling its own.
+
+**Severity:** compile failure on a legal signature.
+
+### BUG-DEFAULT-PLUS-VARARG-CALL-BROKEN. A parameter with a default alongside `*args` or `**kwargs` produces empty or wrong output — 2026-07-27
+
+**What:** distinct from the above (which fails to compile) — these compile and
+then behave wrongly.
+
+**Reproduce:**
+```python
+def p(a, q=2, *args):
+    return a, q, args
+print(p(1))            # prints nothing at all
+
+def k(a, q=2, **kw):
+    return a, q, kw
+print(k(1))            # NameError on `kw`
+print(k(1, 3, m=5))    # prints 0
+```
+
+**Where:** the same `_duf_resolve_params` family plus the call-site argument
+packing in `compiler/codegen.py`.
+
+**Severity:** silently wrong or missing output on a legal signature. Verified
+pre-existing (`git stash`), not introduced by the unbound-local work.
+
+### BUG-EMPTY-KWARGS-CALL-SEGFAULTS. Calling a `**kwargs`-only function with no arguments segfaults — 2026-07-27
+
+**Reproduce:**
+```python
+def kw(**kwargs):
+    return kwargs
+print(kw())            # segfault
+```
+
+**Where:** the `**kwargs` dict construction at the callee prologue in
+`compiler/codegen.py` — an empty kwargs almost certainly yields a null pointer
+where an empty `FpyDict*` is expected.
+
+**Proper fix:** always materialise an empty dict for the kwargs parameter,
+never a null.
+
+**Severity:** crash. Verified pre-existing (`git stash -- compiler runtime`).
+
+### BUG-CALL-VIA-CONTAINER-ELEM-DROPS-RETTAG. Calling a function fetched out of a container loses the return tag — 2026-07-27
+
+**What:** `h = g; h(1)` is correct, but `for fn in (g,): fn(1)` is not — the
+call through the container element uses a statically-assumed return kind rather
+than the tag the callee produced, so a float comes back as its bit pattern.
+
+**Reproduce** — should print `1.5`:
+```python
+def g(t):
+    return 1.5
+for fn in (g,):
+    print(fn(1))       # prints 4609434218613702656
+```
+
+**Where:** the indirect-call emitter in `compiler/codegen.py`. Same family as
+BUG-DECORATOR-WRAPPER-STATIC-RET-TAG and BUG-SORTED-KEY-DROPS-TAG: a consumer
+that trusts a static kind where a runtime tag is available.
+
+**Severity:** silently wrong value.
 
 ### BUG-FLOAT-KEY-DICT-LITERAL-SEGFAULTS. A dict literal with a float key produces something `len()` crashes on — 2026-07-27 — **FIXED**
 

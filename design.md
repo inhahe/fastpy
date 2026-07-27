@@ -934,6 +934,60 @@ parameter falling to the CPython bridge), which is why it is fixed at the ABI
 rather than at each use. In the regression corpus 11 of 641 functions changed
 ABI, all of them nested or closure functions.
 
+**"Never assigned" is a tag, so a scope that can read one needs tagged slots.**
+An FpyValue slot is initialised in the entry block to `{FPY_TAG_UNDEF, 0}` and
+every load tests for it; a native slot is all payload and has nowhere to put
+that fact. Nothing checked whether a scope actually contained such a read, so
+`for _ in range(0): z = 0` followed by `print(z)` printed the uninitialised
+stack word, and `if False: w = 1; print(w)` printed a different address every
+run. `_names_maybe_unbound` answers the question for real, and a scope with any
+maybe-unbound local is denied the bare ABI (`_gen_detect_bare_abi`,
+`_duf_select_abi`) and denied a `--typed` native alloca for that name — the same
+argument that already disqualifies BigInt and mixed scalar returns: *the value
+needs a tag the slot cannot carry.* Precision here only buys performance, so
+the analysis is allowed to over-report and never to under-report.
+
+Three rulings in it are load-bearing:
+
+- **A loop body is analysed with only what was bound before the loop.** An
+  earlier cut scanned the body twice and let the second pass see the first
+  pass's bindings, to model "this may not be the first iteration". But the
+  first iteration *is* a path, and it is precisely the path on which a name
+  bound at the bottom of the body and read at the top is unbound.
+  Definitely-bound at body entry is the intersection over the incoming edges,
+  and `bound ∩ (bound ∪ body_binds)` is just `bound`.
+- **`if` intersects its branches; `try` contributes only its `finally`.** An
+  exception can cut the body short anywhere, so nothing the body binds is
+  guaranteed; the `finally` runs on every path out.
+- **A bare `x: int` declares without binding.** It is exactly the annotation
+  that would otherwise win a native slot, so it has to be excluded by name.
+
+The check the analysis enables is `_needs_undef_check`, and it exists as a
+shared predicate rather than as a condition spelled at each load because
+`_definitely_assigned` is *not* that test: it records that a store has been
+**emitted**, and a store inside a zero-iteration loop or a dead `if` branch is
+emitted just the same. Every FV load must ask the shared question —
+`_load_variable`, `_load_fv_raw` (the tag-preserving load that `return c` and a
+dozen other sites use), and the float-return raw load in `_emit_return` each
+had their own answer, so the one shape that reads a float local was the one
+shape that did not raise.
+
+The exception depends on the scope: module level gets `NameError`, a function
+local gets `UnboundLocalError`. They are not interchangeable — the messages
+differ, and while `UnboundLocalError` is a subclass of `NameError` (so `except
+NameError:` catches both), only the subclass answers `except UnboundLocalError:`.
+`_check_fv_undef` also may **not** call `fastpy_exc_unhandled` from inside a
+callee: the caller can be in a `try`, and exiting the process there runs before
+its handler ever does. Leaving the exception merely pending lets the ordinary
+bail-out checks carry it out. Only module-level code, outside a `try`, may
+declare an exception unhandled at the raise site.
+
+A local also shadows a global of the same name for the *whole* scope, so when
+`_load_variable` finds no slot yet it must consult the analysis **before** the
+module-globals fallback. Otherwise `y = y + 1` inside a function read a global
+`y`, or — with no global of that name — reported `NameError` from the
+"truly undefined variable" arm.
+
 **Returning an untyped parameter is a `mixed` return.** `_duf_determine_ret_tag`
 inherits a `return <param>` from the call site's classification, but when no
 call site classified the parameter there was nothing to inherit and the tag
