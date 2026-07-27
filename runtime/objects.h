@@ -57,6 +57,12 @@ FpyComplex* fpy_complex_pow(FpyComplex *a, FpyComplex *b);
 FpyComplex* fpy_complex_neg(FpyComplex *a);
 double fpy_complex_abs(FpyComplex *a);
 void fpy_complex_print(FpyComplex *c);
+/* Returns a *header-backed* string (see fpy_str_buf below): the char* points
+ * 8 bytes into its malloc block, so the caller must release it with
+ * fpy_rc_decref(FPY_TAG_STR, …) — never free().  This differs from
+ * fpy_bigint_to_str / fpy_decimal_to_str, which hand back a bare malloc, and
+ * confusing the two corrupts the heap.
+ * BUG-COMPLEX-REPR-FREES-HEADERED-STRING. */
 char* fpy_complex_to_str(FpyComplex *c);
 
 /* Decimal number (fixed-precision: 18 digits via int64 coefficient) */

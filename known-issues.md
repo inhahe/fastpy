@@ -3237,7 +3237,7 @@ truncation-toward-zero right for FLOAT→INT and raise for the non-numeric tags.
 
 **Severity:** silently wrong values, and wrong *types* downstream.
 
-### BUG-LIST-LITERAL-BIGINT-DECIMAL-ELEM. A BigInt or Decimal stored into a list literal loses its tag — 2026-07-27
+### ~~BUG-LIST-LITERAL-BIGINT-DECIMAL-ELEM. A BigInt or Decimal stored into a list literal loses its tag~~ — FIXED 2026-07-27
 
 **What:** a list literal containing a BigInt element stores the raw pointer with
 an INT tag, so reading it back prints the address. A Decimal element is worse —
@@ -3263,6 +3263,349 @@ BUG-LIST-ELEM-STR-TAG-LOST and probably wants fixing alongside it.
 element-store paths disagree — which is itself worth collapsing.
 
 **Severity:** silently wrong output; the Decimal case loses the value entirely.
+
+**FIXED 2026-07-27.** Collapsing the two container element-store paths is
+exactly the fix. `_emit_list_append_expr` now asks `_infer_type_tag` for the
+element's kind — the same analysis `_bare_to_tag_data` consults, which is
+precisely *why* a dict was right all along — instead of the narrow `_is_*_expr`
+predicates. (`_is_bigint_expr` knows only an integer literal too wide for an
+i64 and a BIGINT-kinded name, so it answered False for `2 ** 80`, a BinOp of
+two small constants; `_is_decimal_expr` was right about `Decimal("1.5")` and
+simply had no branch calling it.) The old predicates are kept as extra
+evidence, OR-ed in, since they were already trusted and can only widen what is
+tagged correctly.
+
+Storing the tag correctly then made the *read* side reachable, and it turned
+out to be broken in seven further ways — each found and fixed in the same
+change, each listed below: BUG-LIST-ELEM-TYPE-MISSES-HEAP-NUMERICS,
+BUG-COMPLEX-SUBSCRIPT-NOT-COMPLEX-EXPR, BUG-DECIMAL-SUBSCRIPT-NOT-DECIMAL-EXPR,
+BUG-UNKNOWN-INT-BINOP-FLOAT-EDGE, BUG-FV-BINOP-NO-DECIMAL-COMPLEX,
+BUG-SUM-BARE-I64-OVER-HEAP-ELEMENTS and the comparison pair
+BUG-DECIMAL-COMPLEX-COMPARE-BY-POINTER / BUG-FV-COMPARE-NO-DECIMAL-COMPLEX.
+Plus one memory-safety bug, BUG-COMPLEX-REPR-FREES-HEADERED-STRING, which
+`print([1 + 2j])` hit as soon as the element carried its real tag.
+
+Pinned by `tests/regressions/list_literal_heap_numeric_elems.py`.
+
+### ~~BUG-LIST-ELEM-TYPE-MISSES-HEAP-NUMERICS. A complex/Decimal/BigInt list element is read as a bare i64~~ — FIXED 2026-07-27
+
+**What:** with the store side fixed, `c = [1 + 2j, 1j]; print(c[0])` still read
+the element's *pointer* as an integer.
+
+**Where:** `_infer_list_elem_type` (`compiler/codegen.py`) had arms for str,
+float, bytes and so on but none for COMPLEX/DECIMAL/BIGINT, so all three fell
+through to the INT default at the bottom. `_can_inline_list_access` then
+answered "int" and the subscript became an inline i64 load, bypassing
+`list_get_fv` and the tag it carries.
+
+**FIXED 2026-07-27.** An arm consulting `_infer_type_tag(first)` for the three
+kinds. None of them is inlineable, so merely *naming* the kind is what routes
+the access through `list_get_fv` and preserves the tag — the same collapse onto
+one inference that fixed the store side.
+
+### ~~BUG-COMPLEX-SUBSCRIPT-NOT-COMPLEX-EXPR. `c[0] + c[1]` on a complex list prints a pointer~~ — FIXED 2026-07-27
+
+**What:** `c = [1 + 2j, complex(0, 1)]; print(c[0] + c[1])` printed
+`2716821164608`. Each element read on its own was correct; only the sum was
+wrong.
+
+**Where:** `_infer_type_tag` typed the Subscript COMPLEX and the binop
+correctly dispatched to `_emit_complex_binop` — but the *BinOp* arm of
+`_infer_type_tag` asks `_is_complex_expr`, not itself, and `_is_complex_expr`
+had no `ast.Subscript` case. So the BinOp was typed INT and `print` rendered
+the resulting `FpyComplex*` as an integer.
+
+**FIXED 2026-07-27.** A non-Slice Subscript arm deferring to
+`_infer_type_tag(node).kind == VKind.COMPLEX`, so there is one definition of
+"what kind does this subscript yield". The recursion terminates because
+`_infer_type_tag`'s Subscript arm only descends into `node.value`.
+
+### ~~BUG-DECIMAL-SUBSCRIPT-NOT-DECIMAL-EXPR. `d < z[1]` compares a Decimal against a pointer~~ — FIXED 2026-07-27
+
+**What:** the same hole one predicate over. `d = Decimal("1.5"); z =
+[Decimal("1.5"), Decimal("2.5")]; print(d < z[1])` printed `False`.
+
+**Where:** `_is_decimal_expr` recognised only a DECIMAL-kinded name and a
+`Decimal(...)` call, so a container read was not a Decimal and the comparison
+saw a Decimal on one side only.
+
+**FIXED 2026-07-27.** The same non-Slice Subscript arm as `_is_complex_expr`.
+
+### ~~BUG-UNKNOWN-INT-BINOP-FLOAT-EDGE. The third copy of the two-way binop split misreads a pointer as a double~~ — FIXED 2026-07-27
+
+**What:** `[Decimal("1.5"), 1][0] + 1` printed `1.0`, and `* 2` printed
+`2.1355557234974e-311`.
+
+**Where:** the UNKNOWN⊗INT block of `_emit_binop_unknown` split on "both tags
+== INT → integer, else → float via `bitcast(i64, double)`". That is correct
+only for plain scalars: BIGINT, DECIMAL, COMPLEX, STR and LIST all keep a
+*pointer* in the data slot, so the float edge read an address as a denormal
+double. This is the third instance of the anti-pattern — see
+BUG-BIGINT-FV-RESULT-NOT-CONSUMED for the other two.
+
+The block did carry a BIGINT-only special case, but it was both narrower (one
+tag out of the five that break the float edge) and gated on
+`_program_uses_bigint` — a condition the *runtime* tag does not respect, since
+a value can arrive BIGINT-tagged through a list or a call without the program
+mentioning a big literal at all.
+
+**FIXED 2026-07-27.** Same answer as the other two copies: guard the float edge
+with `_fv_tag_is_plain_scalar` and give everything else a third edge to
+`fastpy_fv_binop`, which subsumes the `_program_uses_bigint` special case.
+
+### ~~BUG-FV-BINOP-NO-DECIMAL-COMPLEX. `fastpy_fv_binop` did arithmetic on Decimal and complex *pointers*~~ — FIXED 2026-07-27
+
+**What:** exposed immediately by the fix above — the new generic edge landed in
+`fastpy_fv_binop`, which had no Decimal or complex case at all and fell through
+to the integer arithmetic at the bottom, returning the sum of two addresses.
+
+**Where:** `fastpy_fv_binop` in `runtime/objects.c`.
+
+**FIXED 2026-07-27.** Decimal and complex arms ahead of the "promote to float"
+block, promoting INT/BOOL (and FLOAT, for complex) to the heap type, plus the
+TypeError guard extended so a DECIMAL/COMPLEX operand that neither arm could
+handle *stops* instead of falling into integer arithmetic on its pointer.
+
+**Still open, deliberately:** only `+ - * /` are covered. `Decimal // int` and
+`Decimal % int` now raise TypeError here rather than silently doing pointer
+arithmetic — see BUG-DECIMAL-FLOORDIV-IS-TRUEDIV below for the related static
+path, which is separately wrong.
+
+### ~~BUG-COMPLEX-REPR-FREES-HEADERED-STRING. `print([1 + 2j])` aborts with heap corruption~~ — FIXED 2026-07-27
+
+**What:** `print([1 + 2j])` died with STATUS_HEAP_CORRUPTION (0xc0000374)
+before printing anything. `print(c[0])` was fine, because it never reached this
+repr.
+
+**Where:** the `FPY_TAG_COMPLEX` case of `fpy_value_repr` (`runtime/objects.c`)
+called `free()` on `fpy_complex_to_str`'s result. Unlike its siblings
+`fpy_bigint_to_str` / `fpy_decimal_to_str`, which hand back a bare `malloc`,
+`fpy_complex_to_str` returns `fpy_str_buf`'s *header-backed* buffer, whose
+`char*` points 8 bytes into the malloc block. Root-caused with `cdb`
+(`RtlFreeHeap` ← `ucrtbase!free_base`) and A/B'd against HEAD to confirm it was
+pre-existing.
+
+**FIXED 2026-07-27.** `fpy_rc_decref(FPY_TAG_STR, …)` instead of `free()`, and
+the ownership contract is now documented on the declaration in
+`runtime/objects.h` so the next caller cannot make the same mistake.
+
+**Severity:** memory corruption — the worst class in the tracker, and reachable
+from a one-line program.
+
+### ~~BUG-SUM-BARE-I64-OVER-HEAP-ELEMENTS. `sum()` adds pointers~~ — FIXED 2026-07-27
+
+**What:** `print(sum([2 ** 80, 2 ** 80]))` printed `4413044692288` instead of
+`2417851639229258349412352`.
+
+**Where:** `_emit_builtin_sum` has exactly two accumulators, i64 and double,
+and both read the element with `_list_get_as_bare(..., "int")`, which throws
+the runtime tag away and keeps the raw i64. For a BigInt, Decimal or complex
+that i64 is the value's address. FVALUE/MIXED elements had the same problem for
+a different reason: nothing is statically known about them, so the bare read is
+a guess that is wrong for every float element too.
+
+**FIXED 2026-07-27.** A third accumulator keeping `(tag, data)` and folding
+with `fastpy_fv_binop` — the one place that knows how to add every tag
+combination, and which also raises the right TypeError for `sum(["a"])` instead
+of silently adding two string pointers. It is selected only for element kinds
+the bare read misreads (BIGINT, DECIMAL, COMPLEX, FVALUE, MIXED), so the plain
+scalar loops are untouched.
+
+### ~~BUG-DECIMAL-COMPLEX-COMPARE-BY-POINTER. `Decimal("1.5") < Decimal("2.5")` answers on heap address order~~ — FIXED 2026-07-27
+
+**What:** non-deterministic comparison. The same binary printed `True False`
+on one run and `False True` on the next:
+
+```python
+from decimal import Decimal
+a = Decimal("1.5")
+b = Decimal("2.5")
+print(a < b, a > b)      # flips between runs
+```
+
+**Where:** `_emit_compare` has a BIGINT arm but none for DECIMAL or COMPLEX.
+Two Decimals share a *kind*, so they also missed the cross-type `fv_compare`
+branch — which requires the two kinds to *differ* — and fell all the way
+through to the generic pointer/integer comparison at the bottom of the chain.
+The answer was therefore whatever the allocator happened to do, which ASLR
+varies per run.
+
+**FIXED 2026-07-27.** A DECIMAL/COMPLEX arm routing to `fastpy_fv_compare` via
+`_to_tag_data_ir`. It deliberately does not open-code the promotion the way the
+BIGINT arm does: the runtime helper covers every partner tag (INT, BOOL, FLOAT)
+in one place, and `_to_tag_data_ir` reaches the same `_infer_type_tag` the
+container element paths use, so the tag stamped here and the tag a list stores
+agree by construction.
+
+**Severity:** non-deterministic wrong answers — the hardest kind to notice,
+since a passing test proves nothing.
+
+### ~~BUG-FV-COMPARE-NO-DECIMAL-COMPLEX. `fastpy_fv_compare` compared Decimal and complex pointers~~ — FIXED 2026-07-27
+
+**What:** the runtime half of the bug above. `fastpy_fv_compare` had STR and
+BIGINT arms but nothing for DECIMAL or COMPLEX, so both fell into the
+"integer/bool comparison (default)" at the bottom and compared addresses.
+
+**Where:** `fastpy_fv_compare` and `_fpy_tags_order_compatible` in
+`runtime/objects.c`.
+
+**FIXED 2026-07-27.** Decimal and complex arms ahead of the FLOAT and default
+branches, plus `_fpy_tags_order_compatible` taught that DECIMAL and COMPLEX are
+comparable with INT/BOOL/FLOAT. Complex is equality-only: ordering raises
+TypeError exactly as CPython does — including *complex vs complex*, which the
+`tag1 == tag2` shortcut at the top of the function used to wave straight
+through.
+
+### ~~BUG-CALL-ON-CALL-STALE-ARG-TAG. `C()(x)` let the callee read the *previous* call's argument tag~~ — FIXED 2026-07-27
+
+**What:** a callee whose parameter is UNKNOWN gets only a bare `i64` and
+recovers the type from the `fastpy_{set,get}_arg_tag` side-channel. That
+channel is global and sticky — it keeps whatever the last call site wrote.
+`_emit_call_on_call` wrote nothing, so `__call__`'s parameter inherited the tag
+of some unrelated earlier argument.
+
+**Reproduce:** `tests/regressions/call_on_call_arg_tag.py`. Minimal form — a
+str argument anywhere earlier poisons slot 0, then `Doubler()(7)` runs `x * 2`
+with `x` tagged STR:
+
+```python
+class Greeter:
+    def __init__(self, name): self.name = name
+    def __call__(self): return "Hello " + self.name
+print(Greeter("World")())
+
+class Doubler:
+    def __call__(self, x): return x * 2
+print(Doubler()(7))          # → strlen((char *)7) → segfault
+```
+
+**Where:** `_emit_call_on_call` in `compiler/codegen.py`; every arm
+(`call_ptr1`, `call_ptr2`, `obj_call_method1`) had the same hole.
+
+**FIXED 2026-07-27.** One shared `_emit_set_arg_tags` helper, used by all of
+them and by the direct-dispatch `__call__` path that previously open-coded it.
+
+**History:** latent until the UNKNOWN⊗INT binop grew its generic
+`fastpy_fv_binop` edge (BUG-UNKNOWN-INT-BINOP-FLOAT-EDGE). Before that a STR
+tag fell down the float edge and produced a *silently wrong number*; afterwards
+it reached the runtime's genuine string arms and dereferenced the integer. The
+crash was the fix doing its job — the wrong tag was always there.
+
+### ~~BUG-CALL-ON-CALL-IGNORES-RET-TAG. `Echo()("xyz")` printed the string's address~~ — FIXED 2026-07-27
+
+**What:** `fastpy_obj_call_methodN` and `fastpy_call_ptrN` return a bare `i64`;
+`_emit_call_on_call` wrapped it with a hard-coded INT tag. Any `__call__` (or
+call-on-call closure) returning a str / float / bool / list / tuple therefore
+printed as an integer.
+
+**Where:** `_emit_call_on_call` in `compiler/codegen.py`.
+
+**FIXED 2026-07-27.** `_wrap_with_ret_tag` reads `fastpy_get_ret_tag()` and
+rebuilds the FpyValue. Applied only where the callee provably publishes a tag —
+`fastpy.class.*` methods (every `return <expr>` path calls `set_ret_tag`, see
+`_needs_ret_tag` in `_emit_return`) and `fastpy.closure.*` bodies — because the
+ret-tag channel is as sticky as the arg-tag one; see
+`_recover_closure_ret_tag`'s doctrine.
+
+### ~~BUG-CALL-ON-CALL-2ARG-OBJ-RETURNS-ZERO. `Pair()(3, 4)` silently produced 0~~ — FIXED 2026-07-27
+
+**What:** the object arm of `_emit_call_on_call` handled 0 and 1 arguments and
+fell off the end returning `None` for 2+, so `C()(a, b)` produced `0` with no
+diagnostic.
+
+**Where:** `_emit_call_on_call` in `compiler/codegen.py`.
+
+**FIXED 2026-07-27.** When the inner call is a constructor of a known user
+class the callee is statically resolvable, so the new
+`_emit_direct_dunder_call` calls `__call__` directly instead of going through
+the runtime's name-based dispatcher. That removes the arity ceiling, coerces
+arguments to the callee's real signature, and recovers the return tag — the
+same helper the `f = F(); f(x)` path now uses, so the two shapes can no longer
+drift apart. The dispatcher path remains as the fallback for objects whose
+class is not known at the call site, and still tops out at two arguments.
+
+### BUG-STR-HEADER-PROBES-BEFORE-RUNTIME-STATIC-BUFFERS. Increfing an exception message reads out of bounds — 2026-07-27
+
+**What:** `fpy_str_header(s)` decides whether a `char*` is refcounted by reading
+the magic at `s - offsetof(FpyString, data)`. That probe is only *defined* when
+`s` really points into an `FpyString`. Compiler-emitted literals are fine — the
+`.str.N` globals are laid out as `{i32 magic, i32 refcount, [N x i8]}` with an
+immortal refcount, precisely so the probe lands inside them. The C runtime's
+static message buffers are not: `_err_buf`, `fastpy_fv_compare`'s `_cmp_err`
+and `_cx_err`, and their siblings are bare `char[256]` globals, so the probe
+reads the 8 bytes *before* the array.
+
+**Reproduce:** any runtime-raised exception bound with `as e`, under
+`tools/pure_harness.py`:
+
+```python
+try:
+    x = 1 / 0
+except ZeroDivisionError as e:
+    print("caught:", e)
+```
+
+ASan: `global-buffer-overflow ... READ of size 4 ... in fpy_str_header`, from
+`fpy_rc_incref` on the message string. Present at HEAD, so it long predates the
+Decimal/complex work that surfaced it.
+
+**Where:** `fpy_str_header` in `runtime/objects.h`; `fastpy_raise` in
+`runtime/runtime.c`, which stores the caller's `const char *msg` into
+`fpy_exc_msg` verbatim.
+
+**Proper fix:** copy the message inside `fastpy_raise` into a single
+thread-local *header-backed* buffer (`FpyString`-shaped, `magic =
+FPY_STR_MAGIC`, `refcount = FPY_RC_IMMORTAL`) and point `fpy_exc_msg` at its
+`.data`. That preserves today's semantics exactly — the message already lives
+only until the next raise, since most producers share `_err_buf` — while making
+the header probe well-defined for every producer at once. Fixing the producers
+instead does not scale: of the ~89 `fastpy_raise` call sites only three use a
+static buffer; the rest pass plain C string literals, which are just as
+headerless. Do **not** "fix" it by weakening `fpy_str_header` — the probe is
+load-bearing and a laxer test would misclassify real strings.
+
+**Severity:** benign on real hardware (an in-bounds-of-the-image read that
+almost never matches the magic), but it is genuine UB and it aborts every
+ASan run that raises an exception, which blocks the harness from vetting
+anything downstream of a `raise`.
+
+### BUG-DECIMAL-FLOAT-COMPARE-INEXACT. Comparing a Decimal against a float rounds the Decimal — 2026-07-27
+
+**What:** `fastpy_fv_compare`'s new Decimal arm converts the Decimal to a
+double when the other operand is a FLOAT. CPython does the opposite — it
+converts the *float* to a Decimal, so the comparison is exact.
+
+**Reproduce:** needs a Decimal past 2^53 or a decimal fraction no double
+represents; e.g. `Decimal("0.1") == 0.1` is False in CPython (0.1 is not
+exactly one tenth) and may come out True here.
+
+**Where:** `_fpy_decimal_to_double` in `runtime/objects.c`, used by the DECIMAL
+arm of `fastpy_fv_compare`.
+
+**Proper fix:** a float→Decimal constructor in the runtime — exact, since every
+finite double *is* a terminating decimal — then compare with
+`fpy_decimal_compare` like every other partner tag. The same helper would let
+`fastpy_fv_binop`'s Decimal arm accept a float operand, which it currently
+rejects.
+
+**Severity:** wrong answers only at the edges; the common `Decimal("1.5") ==
+1.5` shape is right.
+
+### BUG-DECIMAL-FLOORDIV-IS-TRUEDIV. `Decimal(...) // n` does true division — 2026-07-27
+
+**What:** `Decimal("2.5") // 2` gives `1.25`, not `1`.
+
+**Where:** the Decimal fast path in the static binop emitter
+(`compiler/codegen.py`) maps `ast.FloorDiv` to the `decimal_div` runtime entry
+point — the same one `ast.Div` maps to. `ast.Mod` has no mapping at all.
+
+**Proper fix:** `fpy_decimal_floordiv` and `fpy_decimal_mod` in the runtime
+(floor semantics, matching CPython's `Decimal.__floordiv__`, which truncates
+toward zero — note that differs from `int //`), wired into both the static path
+and `fastpy_fv_binop`'s Decimal arm, which currently raises TypeError for these
+two ops rather than doing pointer arithmetic.
+
+**Severity:** silently wrong values.
 
 ### BUG-BOOL-PLUS-INT-YIELDS-FLOAT. Adding two tagged values takes the float edge unless *both* are INT — 2026-07-27
 

@@ -21845,6 +21845,17 @@ class CodeGen:
             # integer.  BUG-BYTES-IN-LIST-TAG-LOST.
             if self._is_bytes_expr(first):
                 return ValueType(VKind.BYTES)
+            # Complex / Decimal / BigInt elements.  With no arm for them here
+            # `[1 + 2j]` fell through to the INT default at the bottom,
+            # `_can_inline_list_access` answered "int", and `c[0]` became an
+            # inline i64 load of the complex's *pointer* — so `c[0] + c[0]`
+            # added two addresses.  The store side has tagged these correctly
+            # since BUG-LIST-LITERAL-BIGINT-DECIMAL-ELEM; this is the matching
+            # read.  None of the three is inlineable, so naming the kind is
+            # what routes the access through `list_get_fv` and keeps the tag.
+            _first_kind = self._infer_type_tag(first, None).kind
+            if _first_kind in (VKind.COMPLEX, VKind.DECIMAL, VKind.BIGINT):
+                return ValueType(_first_kind)
             # Handle negative float literals: -1.0 is parsed as
             # UnaryOp(USub, Constant(1.0)), not Constant(-1.0).
             if (isinstance(first, ast.UnaryOp)
@@ -29744,6 +29755,41 @@ class CodeGen:
                     else:
                         cmp = self.builder.icmp_signed(">=", cmp_result, zero)
 
+                # DECIMAL / COMPLEX comparison.  Both are heap numbers behind
+                # a pointer, and neither had an arm here — so two Decimals,
+                # having the *same* kind, also missed the cross-type
+                # fv_compare branch above and fell all the way to the generic
+                # pointer/integer compare at the bottom.  `Decimal("1.5") <
+                # Decimal("2.5")` was therefore answered on heap *address*
+                # order and flipped from run to run.
+                # BUG-DECIMAL-COMPLEX-COMPARE-BY-POINTER.
+                #
+                # Unlike the BIGINT arm above this does not open-code the
+                # promotion: `fastpy_fv_compare` gained proper Decimal and
+                # complex arms (BUG-FV-COMPARE-NO-DECIMAL-COMPLEX), and it
+                # covers every partner tag — INT, BOOL and FLOAT included —
+                # plus the TypeError that complex ordering has to raise.
+                # `_to_tag_data_ir` reaches the same `_infer_type_tag` the
+                # container element paths use, so the tag it stamps here and
+                # the tag a list stores agree by construction.
+                elif (isinstance(op, (ast.Eq, ast.NotEq, ast.Lt, ast.LtE,
+                                      ast.Gt, ast.GtE))
+                        and (left_kind in (VKind.DECIMAL, VKind.COMPLEX)
+                             or tv_right.vtype.kind in (VKind.DECIMAL,
+                                                        VKind.COMPLEX))):
+                    _cmp_ops = {ast.Eq: 0, ast.NotEq: 1, ast.Lt: 2,
+                                ast.LtE: 3, ast.Gt: 4, ast.GtE: 5}
+                    l_tag, l_data = self._to_tag_data_ir(cmp_left, node.left)
+                    r_tag, r_data = self._to_tag_data_ir(cmp_right,
+                                                         comparator_node)
+                    cmp_result = self.builder.call(
+                        self.runtime["fv_compare"],
+                        [l_tag, l_data, r_tag, r_data,
+                         ir.Constant(i32, _cmp_ops[type(op)])])
+                    self._emit_try_bail_if_exc()
+                    cmp = self.builder.icmp_signed(
+                        "!=", cmp_result, ir.Constant(i32, 0))
+
                 # STR comparison (only when we KNOW it's a string, not a generic ptr)
                 elif (left_kind == VKind.STR
                         and isinstance(op, (ast.Eq, ast.NotEq, ast.Lt, ast.LtE,
@@ -35695,6 +35741,16 @@ class CodeGen:
         if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
                 and node.func.id == "Decimal"):
             return True
+        if isinstance(node, ast.Subscript) and not isinstance(node.slice,
+                                                              ast.Slice):
+            # An element read out of a Decimal-element container is a Decimal,
+            # exactly as the name it was read into would be.  Without this arm
+            # `d = Decimal("1.5"); z = [...]; d < z[1]` saw a Decimal on one
+            # side only and compared it against the element's *pointer* as an
+            # integer, answering False.  Same hole and same fix as
+            # `_is_complex_expr`'s Subscript arm below.
+            # BUG-DECIMAL-SUBSCRIPT-NOT-DECIMAL-EXPR.
+            return self._infer_type_tag(node, None).kind == VKind.DECIMAL
         return False
 
     def _is_complex_expr(self, node: ast.expr) -> bool:
@@ -35711,6 +35767,23 @@ class CodeGen:
                     or self._is_complex_expr(node.right))
         if isinstance(node, ast.UnaryOp):
             return self._is_complex_expr(node.operand)
+        if isinstance(node, ast.Subscript) and not isinstance(node.slice,
+                                                              ast.Slice):
+            # An element read out of a complex-element container is complex,
+            # exactly as the name it was read into would be.  Without this arm
+            # `c = [1 + 2j, 1j]; c[0] + c[1]` typed the *BinOp* INT — the
+            # subscript itself was already typed COMPLEX by `_infer_type_tag`,
+            # but the BinOp arm above asks this predicate, not that one — so
+            # print() rendered the resulting FpyComplex* as an integer
+            # (`2716821164608`).  BUG-COMPLEX-SUBSCRIPT-NOT-COMPLEX-EXPR.
+            #
+            # Deferring to `_infer_type_tag` rather than re-deriving the
+            # element kind here keeps the one definition of "what kind does
+            # this subscript yield", the same way `_emit_list_append_expr` and
+            # `_infer_list_elem_type` were collapsed onto it.  The recursion
+            # terminates: the Subscript arm of `_infer_type_tag` only ever
+            # descends into `node.value`, a strictly smaller node.
+            return self._infer_type_tag(node, None).kind == VKind.COMPLEX
         return False
 
     def _is_bytes_expr(self, node: ast.expr, env: dict | None = None) -> bool:
@@ -36096,41 +36169,39 @@ class CodeGen:
                 _int_bb = self._new_block("unkn_int.iarith")
                 _flt_bb = self._new_block("unkn_int.farith")
                 _mrg_bb = self._new_block("unkn_int.merge")
-                # When BigInt promotion is possible, the UNKNOWN operand
-                # might be BIGINT at runtime (e.g., after overflow in a
-                # loop).  Add a BIGINT branch that routes through fv_binop
-                # which handles all BigInt operations correctly.
-                _big_bb = None
-                if self._program_uses_bigint:
-                    _is_big = self.builder.icmp_unsigned(
-                        "==", _rt_tag, ir.Constant(i32, FPY_TAG_BIGINT))
-                    _big_bb = self._new_block("unkn_int.bigint")
-                    _notbig_bb = self._new_block("unkn_int.notbig")
-                    self.builder.cbranch(_is_big, _big_bb, _notbig_bb)
-                    # ── BIGINT path: dispatch through fv_binop ──
-                    self.builder.position_at_end(_big_bb)
-                    _fv_ops = {ast.Add: 0, ast.Sub: 1, ast.Mult: 2,
-                               ast.Div: 3, ast.FloorDiv: 4, ast.Mod: 5,
-                               ast.BitAnd: 6, ast.BitOr: 7, ast.BitXor: 8,
-                               ast.LShift: 9, ast.RShift: 10}
-                    _opc = _fv_ops.get(op, 0)
-                    _big_ot = self._create_entry_alloca(i32, "ubig.tag")
-                    _big_od = self._create_entry_alloca(i64, "ubig.data")
-                    _int_tag_c = ir.Constant(i32, FPY_TAG_INT)
-                    if unkn_left:
-                        self.builder.call(self.runtime["fv_binop"],
-                            [_rt_tag, _unkn_i64, _int_tag_c, int_val,
-                             ir.Constant(i32, _opc), _big_ot, _big_od])
-                    else:
-                        self.builder.call(self.runtime["fv_binop"],
-                            [_int_tag_c, int_val, _rt_tag, _unkn_i64,
-                             ir.Constant(i32, _opc), _big_ot, _big_od])
-                    _big_tag = self.builder.load(_big_ot)
-                    _big_data = self.builder.load(_big_od)
-                    self.builder.branch(_mrg_bb)
-                    _big_end = self.builder.block
-                    self.builder.position_at_end(_notbig_bb)
-                self.builder.cbranch(_is_int, _int_bb, _flt_bb)
+                # The FLOAT edge below bitcasts `_unkn_i64` to a double, which
+                # is only meaningful when the runtime tag says that i64 really
+                # holds a number.  BIGINT, DECIMAL, COMPLEX, STR and LIST all
+                # keep a *pointer* there, so `[Decimal("1.5"), 1][0] + 1` read
+                # the Decimal's address as a denormal double and printed
+                # `1.0`.  BUG-UNKNOWN-INT-BINOP-FLOAT-EDGE.
+                #
+                # This is the third copy of the same two-way split — see
+                # BUG-BIGINT-FV-RESULT-NOT-CONSUMED for the other two — and it
+                # takes the same answer: guard the float edge with a real
+                # "the tag is a plain scalar" test and give everything else a
+                # third edge to `fastpy_fv_binop`, which handles every tag
+                # combination (BigInt, Decimal, str concat, and the TypeErrors)
+                # correctly.
+                #
+                # That generic edge subsumes the BIGINT-only branch this block
+                # used to carry, which was both narrower — one tag out of the
+                # five that break the float edge — and gated on
+                # `_program_uses_bigint`, a condition the runtime tag does not
+                # respect: a value can arrive BIGINT-tagged through a list or a
+                # call without the program mentioning a big literal at all.
+                _gen_opc = self._FV_BINOP_OPCODES.get(op)
+                _gen_bb = (self._new_block("unkn_int.gen")
+                           if _gen_opc is not None else None)
+                if _gen_bb is not None:
+                    _pick_bb = self._new_block("unkn_int.pick")
+                    self.builder.cbranch(_is_int, _int_bb, _pick_bb)
+                    self.builder.position_at_end(_pick_bb)
+                    self.builder.cbranch(
+                        self._fv_tag_is_plain_scalar(_rt_tag),
+                        _flt_bb, _gen_bb)
+                else:
+                    self.builder.cbranch(_is_int, _int_bb, _flt_bb)
                 # ── INT path: integer arithmetic ──
                 self.builder.position_at_end(_int_bb)
                 if unkn_left:
@@ -36183,6 +36254,26 @@ class CodeGen:
                         else self.builder.ptrtoint(_fres, i64)
                 self.builder.branch(_mrg_bb)
                 _flt_end = self.builder.block
+                # ── GENERIC path: every tag the two edges above misread ──
+                _gen_end = _gen_tag = _gen_data = None
+                if _gen_bb is not None:
+                    self.builder.position_at_end(_gen_bb)
+                    _gen_ot = self._create_entry_alloca(i32, "ugen.tag")
+                    _gen_od = self._create_entry_alloca(i64, "ugen.data")
+                    _int_tag_c = ir.Constant(i32, FPY_TAG_INT)
+                    if unkn_left:
+                        _gen_args = [_rt_tag, _unkn_i64, _int_tag_c, int_val]
+                    else:
+                        _gen_args = [_int_tag_c, int_val, _rt_tag, _unkn_i64]
+                    self.builder.call(
+                        self.runtime["fv_binop"],
+                        _gen_args + [ir.Constant(i32, _gen_opc),
+                                     _gen_ot, _gen_od])
+                    self._emit_try_bail_if_exc()
+                    _gen_tag = self.builder.load(_gen_ot)
+                    _gen_data = self.builder.load(_gen_od)
+                    self.builder.branch(_mrg_bb)
+                    _gen_end = self.builder.block
                 # ── Merge: FpyValue with runtime-correct tag ──
                 self.builder.position_at_end(_mrg_bb)
                 _tag_phi = self.builder.phi(i32, "unkn_int.tag")
@@ -36192,10 +36283,9 @@ class CodeGen:
                 _data_phi = self.builder.phi(i64, "unkn_int.data")
                 _data_phi.add_incoming(_idata, _int_end)
                 _data_phi.add_incoming(_fdata, _flt_end)
-                # Add BIGINT incoming edge if the branch exists
-                if _big_bb is not None:
-                    _tag_phi.add_incoming(_big_tag, _big_end)
-                    _data_phi.add_incoming(_big_data, _big_end)
+                if _gen_end is not None:
+                    _tag_phi.add_incoming(_gen_tag, _gen_end)
+                    _data_phi.add_incoming(_gen_data, _gen_end)
                 return self._fv_build_from_slots(_tag_phi, _data_phi)
 
         # ── UNKNOWN + UNKNOWN: runtime branch preserving int-ness ──
@@ -39514,6 +39604,71 @@ class CodeGen:
                     and isinstance(node.args[1].value, float)):
                 _sum_float = True
 
+            # Heap-numeric elements need an FpyValue accumulator.  Both loops
+            # below read the element with `_list_get_as_bare(..., "int")`,
+            # which throws the runtime tag away and keeps the raw i64 — for a
+            # BigInt, Decimal or complex that i64 is the value's *address*, so
+            # `sum([2 ** 80, 2 ** 80])` added two pointers and printed
+            # `4413044692288`.  BUG-SUM-BARE-I64-OVER-HEAP-ELEMENTS.
+            #
+            # FVALUE/MIXED elements have the same problem for a different
+            # reason: nothing is statically known about them, so the bare read
+            # is a guess that is wrong for every float element too.
+            #
+            # The third accumulator keeps (tag, data) and folds with
+            # `fastpy_fv_binop`, which is the one place that knows how to add
+            # every tag combination — and, being the same helper the binop
+            # paths use, it also raises the right TypeError for `sum(["a"])`
+            # instead of silently adding two string pointers.
+            _sum_fv = False
+            if not _sum_float and len(node.args) >= 1:
+                _fv_kinds = (VKind.BIGINT, VKind.DECIMAL, VKind.COMPLEX,
+                             VKind.FVALUE, VKind.MIXED)
+                if self._get_list_elem_type(node.args[0]).kind in _fv_kinds:
+                    _sum_fv = True
+
+            if _sum_fv:
+                _acc_tag = self._create_entry_alloca(i32, "sumfv.tag")
+                _acc_data = self._create_entry_alloca(i64, "sumfv.data")
+                if len(node.args) >= 2:
+                    _st = self._emit_expr(node.args[1])
+                    _stag, _sdata = self._fv_unpack(_st.as_fv(self.builder))
+                    self.builder.store(_stag, _acc_tag)
+                    self.builder.store(_sdata, _acc_data)
+                else:
+                    self.builder.store(ir.Constant(i32, FPY_TAG_INT), _acc_tag)
+                    self.builder.store(ir.Constant(i64, 0), _acc_data)
+
+                idx_alloca = self._create_entry_alloca(i64, "sum.idx")
+                self.builder.store(ir.Constant(i64, 0), idx_alloca)
+                cond_block = self._new_block("sumfv.cond")
+                body_block = self._new_block("sumfv.body")
+                end_block = self._new_block("sumfv.end")
+                self.builder.branch(cond_block)
+                self.builder.position_at_end(cond_block)
+                idx = self.builder.load(idx_alloca)
+                self.builder.cbranch(
+                    self.builder.icmp_signed("<", idx, length),
+                    body_block, end_block)
+
+                self.builder.position_at_end(body_block)
+                idx = self.builder.load(idx_alloca)
+                _etag, _edata = self._fv_list_get(lst, idx, "sumfv.elem")
+                self._rt_call(
+                    "fv_binop",
+                    [self.builder.load(_acc_tag),
+                     self.builder.load(_acc_data), _etag, _edata,
+                     ir.Constant(i32, self._FV_BINOP_OPCODES[ast.Add]),
+                     _acc_tag, _acc_data])
+                self._emit_try_bail_if_exc()
+                self.builder.store(
+                    self.builder.add(idx, ir.Constant(i64, 1)), idx_alloca)
+                self.builder.branch(cond_block)
+
+                self.builder.position_at_end(end_block)
+                return self._fv_build_from_slots(self.builder.load(_acc_tag),
+                                                 self.builder.load(_acc_data))
+
             if _sum_float:
                 sum_alloca = self._create_entry_alloca(double, "sum.acc")
                 if len(node.args) >= 2:
@@ -39904,6 +40059,135 @@ class CodeGen:
         ret_data = self.builder.load(out_data)
         return self._fv_build_from_slots(ret_tag, ret_data)
 
+    def _emit_set_arg_tags(self, pairs):
+        """Publish the runtime tag of each positional argument.
+
+        A callee whose parameter is UNKNOWN receives only a bare i64 and
+        recovers the tag from the `fastpy_{set,get}_arg_tag` side-channel.
+        That channel is *global and sticky*: a call site that forgets to
+        write it leaves the previous call's tags in place, so the callee
+        reads a stale tag and misinterprets its own argument.  Every site
+        that reaches a Python-level function through a bare-i64 signature
+        must therefore call this, even when the tag looks statically
+        obvious — "obvious" only describes what the caller passes, not
+        what the callee will read if we stay silent.
+
+        `pairs` is a sequence of `(value, arg_node)`; `value` should be the
+        argument *before* any ptrtoint/zext coercion, so `_bare_to_tag_data`
+        still sees its real LLVM type.
+        """
+        for _ati, (_atv, _at_node) in enumerate(pairs):
+            _rt_tag_val = None
+            if (isinstance(_at_node, ast.Name)
+                    and _at_node.id in self.variables):
+                _v_alloca, _ = self.variables[_at_node.id]
+                if (isinstance(_v_alloca.type, ir.PointerType)
+                        and _v_alloca.type.pointee is fpy_val):
+                    _fv_load = self.builder.load(
+                        _v_alloca, name=f"fv.{_at_node.id}")
+                    _rt_tag_val = self.builder.extract_value(
+                        _fv_load, 0, name=f"fv.{_at_node.id}.tag")
+            if (_rt_tag_val is None
+                    and isinstance(_atv.type, ir.LiteralStructType)
+                    and _atv.type == fpy_val):
+                _rt_tag_val = self.builder.extract_value(_atv, 0)
+            if _rt_tag_val is not None:
+                self.builder.call(self.runtime["set_arg_tag"],
+                                  [ir.Constant(i32, _ati), _rt_tag_val])
+            else:
+                _at_tag, _ = self._bare_to_tag_data(_atv,
+                                                    value_node=_at_node)
+                self.builder.call(self.runtime["set_arg_tag"],
+                                  [ir.Constant(i32, _ati),
+                                   ir.Constant(i32, _at_tag)])
+
+    def _resolve_dunder_call_func(self, cls_name):
+        """Find the `__call__` LLVM function a class inherits, or None."""
+        cn = cls_name
+        while cn and cn in self._user_classes:
+            ci = self._user_classes[cn]
+            if "__call__" in ci.methods:
+                return ci.methods["__call__"]
+            cn = ci.parent_name
+        return None
+
+    def _emit_direct_dunder_call(self, obj_ptr, call_func, node: ast.Call):
+        """Call a statically-resolved `__call__` with `node`'s arguments.
+
+        Used by every `obj(...)` shape whose class is known at compile time,
+        whether the object comes from a variable (`f = F(); f(x)`) or straight
+        out of a constructor (`F()(x)`).  Going direct rather than through the
+        runtime's name-based `fastpy_obj_call_methodN` matters for three
+        reasons: the dispatcher only has 0-, 1- and 2-argument shapes, it
+        flattens every return type to a bare `i64`, and it forces the caller
+        to guess the result's tag.  Here the callee's real LLVM signature is
+        in hand, so arguments are coerced to it and the return tag is read
+        back from the side-channel the method itself published.
+        """
+        direct_args = [obj_ptr]
+        call_vals = []
+        for i, arg_node in enumerate(node.args):
+            val = self._emit_expr_value(arg_node)
+            call_vals.append((val, arg_node))
+            if 1 + i < len(call_func.args):
+                expected = call_func.args[1 + i].type
+                if val.type != expected:
+                    if (isinstance(expected, ir.IntType)
+                            and isinstance(val.type, ir.IntType)
+                            and expected.width != val.type.width):
+                        if expected.width > val.type.width:
+                            val = self.builder.zext(val, expected)
+                        else:
+                            val = self.builder.trunc(val, expected)
+                    elif (isinstance(expected, ir.IntType)
+                            and isinstance(val.type, ir.PointerType)):
+                        val = self.builder.ptrtoint(val, expected)
+                    elif (isinstance(expected, ir.PointerType)
+                            and isinstance(val.type, ir.IntType)):
+                        val = self.builder.inttoptr(val, expected)
+                    elif (isinstance(expected, ir.DoubleType)
+                            and isinstance(val.type, ir.IntType)):
+                        val = self.builder.bitcast(val, expected)
+                    elif (isinstance(expected, ir.IntType)
+                            and isinstance(val.type, ir.DoubleType)):
+                        val = self.builder.bitcast(val, expected)
+            direct_args.append(val)
+        # Set arg tags so the callee knows runtime types
+        self._emit_set_arg_tags(call_vals)
+        result = self.builder.call(call_func, direct_args)
+        ret_type = call_func.return_value.type
+        if isinstance(ret_type, ir.VoidType):
+            return ir.Constant(i64, 0)
+        return self._wrap_with_ret_tag(result)
+
+    def _wrap_with_ret_tag(self, result):
+        """Rebuild an FpyValue from a bare scalar return using `get_ret_tag`.
+
+        Only call this once the callee is known to *publish* a tag, since the
+        channel is sticky and otherwise hands back some earlier call's value —
+        the same trap `_recover_closure_ret_tag` documents.  Two lowerings
+        qualify: `fastpy.class.*` methods, whose every `return <expr>` path
+        calls `set_ret_tag` (see `_needs_ret_tag` in `_emit_return`), and
+        `fastpy.closure.*` bodies, which do the same.
+
+        Without it the caller assumes INT, so `Echo()("xyz")` prints the
+        string's address.  BUG-CALL-ON-CALL-IGNORES-RET-TAG.
+        """
+        if (isinstance(result.type, ir.LiteralStructType)
+                and result.type == fpy_val):
+            return result
+        ret_tag = self.builder.call(self.runtime["get_ret_tag"], [])
+        if isinstance(result.type, ir.PointerType):
+            data = self.builder.ptrtoint(result, i64)
+        elif isinstance(result.type, ir.DoubleType):
+            data = self.builder.bitcast(result, i64)
+        elif isinstance(result.type, ir.IntType):
+            data = (result if result.type.width == 64
+                    else self.builder.sext(result, i64))
+        else:
+            return result
+        return self._fv_build_from_slots(ret_tag, data)
+
     def _emit_call_on_call(self, node: ast.Call):
         """Handle Call-on-Call patterns: f(3)(5), C()(5), etc.
         The inner call might return a closure or an object with __call__.
@@ -39914,41 +40198,66 @@ class CodeGen:
             return None
         # Check if the inner call returns a closure
         inner_returns_closure = False
+        # The callee's LLVM body, when the inner call resolves to a nested
+        # def we generated.  Only then is `fpy_ret_tag` guaranteed fresh
+        # after the indirect call — see `_wrap_with_ret_tag`.
+        _closure_fn = None
         if isinstance(node.func.func, ast.Name):
             inner_name = node.func.func.id
             for full_name in self._closure_info:
                 if full_name.startswith(f"{inner_name}."):
                     inner_returns_closure = True
+                    _closure_fn = self.module.globals.get(
+                        f"fastpy.closure.{full_name}")
                     break
             if (inner_name in self.variables
                     and self._var_kind(inner_name) == VKind.CLOSURE):
                 inner_returns_closure = True
 
+        def _tagged(res):
+            return (self._wrap_with_ret_tag(res)
+                    if _closure_fn is not None else res)
+
         if inner_returns_closure:
             # Use call_ptr dispatch (handles closures and raw func ptrs)
             n_args = len(node.args)
             if n_args == 0:
-                return self.builder.call(
-                    self.runtime["call_ptr0"], [callee])
+                return _tagged(self.builder.call(
+                    self.runtime["call_ptr0"], [callee]))
             elif n_args == 1:
                 a = self._emit_expr_value(node.args[0])
+                self._emit_set_arg_tags([(a, node.args[0])])
                 if isinstance(a.type, ir.PointerType):
                     a = self.builder.ptrtoint(a, i64)
                 elif isinstance(a.type, ir.IntType) and a.type.width != 64:
                     a = self.builder.zext(a, i64)
-                return self.builder.call(
-                    self.runtime["call_ptr1"], [callee, a])
+                return _tagged(self.builder.call(
+                    self.runtime["call_ptr1"], [callee, a]))
             elif n_args == 2:
                 a1 = self._emit_expr_value(node.args[0])
                 a2 = self._emit_expr_value(node.args[1])
+                self._emit_set_arg_tags(
+                    [(a1, node.args[0]), (a2, node.args[1])])
                 if isinstance(a1.type, ir.PointerType):
                     a1 = self.builder.ptrtoint(a1, i64)
                 if isinstance(a2.type, ir.PointerType):
                     a2 = self.builder.ptrtoint(a2, i64)
-                return self.builder.call(
-                    self.runtime["call_ptr2"], [callee, a1, a2])
+                return _tagged(self.builder.call(
+                    self.runtime["call_ptr2"], [callee, a1, a2]))
         else:
-            # Object with __call__
+            # Object with __call__.  When the inner call is a constructor of
+            # a known user class the callee is statically resolvable, so go
+            # direct — the runtime dispatcher below only has 0/1/2-argument
+            # shapes and loses the return type.
+            _ctor_cls = None
+            if (isinstance(node.func, ast.Call)
+                    and isinstance(node.func.func, ast.Name)
+                    and node.func.func.id in self._user_classes):
+                _ctor_cls = node.func.func.id
+            if _ctor_cls is not None:
+                _cf = self._resolve_dunder_call_func(_ctor_cls)
+                if _cf is not None:
+                    return self._emit_direct_dunder_call(callee, _cf, node)
             name_ptr = self._make_string_constant("__call__")
             if len(node.args) == 0:
                 return self.builder.call(
@@ -39956,6 +40265,12 @@ class CodeGen:
                     [callee, name_ptr])
             elif len(node.args) == 1:
                 a = self._emit_expr_value(node.args[0])
+                # `C()(7)` reaches `__call__` through the runtime's
+                # name-based dispatcher, which passes a bare i64 — so the
+                # tag has to travel through the arg-tag channel or the
+                # callee reads whatever the *previous* call left there.
+                # BUG-CALL-ON-CALL-STALE-ARG-TAG.
+                self._emit_set_arg_tags([(a, node.args[0])])
                 if isinstance(a.type, ir.PointerType):
                     a = self.builder.ptrtoint(a, i64)
                 elif isinstance(a.type, ir.IntType) and a.type.width != 64:
@@ -40047,70 +40362,10 @@ class CodeGen:
                     if _call_cls and self._class_has_method(_call_cls, "__call__"):
                         obj = self._load_variable(name, node)
                         obj = self._ensure_ptr(obj)
-                        call_func = None
-                        cn = _call_cls
-                        while cn and cn in self._user_classes:
-                            ci = self._user_classes[cn]
-                            if "__call__" in ci.methods:
-                                call_func = ci.methods["__call__"]
-                                break
-                            cn = ci.parent_name
+                        call_func = self._resolve_dunder_call_func(_call_cls)
                         if call_func is not None:
-                            direct_args = [obj]
-                            call_vals = []
-                            for i, arg_node in enumerate(node.args):
-                                val = self._emit_expr_value(arg_node)
-                                call_vals.append((val, arg_node))
-                                # Coerce arg types to match __call__ signature
-                                if 1 + i < len(call_func.args):
-                                    expected = call_func.args[1 + i].type
-                                    if val.type != expected:
-                                        if (isinstance(expected, ir.IntType)
-                                                and isinstance(val.type, ir.IntType)
-                                                and expected.width != val.type.width):
-                                            if expected.width > val.type.width:
-                                                val = self.builder.zext(val, expected)
-                                            else:
-                                                val = self.builder.trunc(val, expected)
-                                        elif (isinstance(expected, ir.IntType)
-                                                and isinstance(val.type, ir.PointerType)):
-                                            val = self.builder.ptrtoint(val, expected)
-                                        elif (isinstance(expected, ir.PointerType)
-                                                and isinstance(val.type, ir.IntType)):
-                                            val = self.builder.inttoptr(val, expected)
-                                        elif (isinstance(expected, ir.DoubleType)
-                                                and isinstance(val.type, ir.IntType)):
-                                            val = self.builder.bitcast(val, expected)
-                                        elif (isinstance(expected, ir.IntType)
-                                                and isinstance(val.type, ir.DoubleType)):
-                                            val = self.builder.bitcast(val, expected)
-                                direct_args.append(val)
-                            # Set arg tags so callee knows runtime types
-                            for _ati, (_atv, _at_node) in enumerate(call_vals):
-                                _rt_tag_val = None
-                                if (isinstance(_at_node, ast.Name)
-                                        and _at_node.id in self.variables):
-                                    _v_alloca, _v_vtag = self.variables[_at_node.id]
-                                    if (isinstance(_v_alloca.type, ir.PointerType)
-                                            and _v_alloca.type.pointee is fpy_val):
-                                        _fv_load = self.builder.load(
-                                            _v_alloca, name=f"fv.{_at_node.id}")
-                                        _rt_tag_val = self.builder.extract_value(
-                                            _fv_load, 0, name=f"fv.{_at_node.id}.tag")
-                                if _rt_tag_val is not None:
-                                    self.builder.call(self.runtime["set_arg_tag"],
-                                                      [ir.Constant(i32, _ati), _rt_tag_val])
-                                else:
-                                    _at_tag, _ = self._bare_to_tag_data(
-                                        _atv, value_node=_at_node)
-                                    self.builder.call(self.runtime["set_arg_tag"],
-                                                      [ir.Constant(i32, _ati),
-                                                       ir.Constant(i32, _at_tag)])
-                            result = self.builder.call(call_func, direct_args)
-                            ret_type = call_func.return_value.type
-                            if isinstance(ret_type, ir.VoidType):
-                                return ir.Constant(i64, 0)
-                            return result
+                            return self._emit_direct_dunder_call(
+                                obj, call_func, node)
                 # FVALUE/MIXED/OBJ variables that might hold a function pointer:
                 # dispatch through closure call path which uses call_ptr to
                 # auto-detect closures vs raw function pointers at runtime.
@@ -47968,30 +48223,53 @@ class CodeGen:
                                   [list_ptr, tag, data])
                 return
 
-        # BigInt constants / expressions — tag as BIGINT, not INT
-        if self._is_bigint_expr(node):
+        # BigInt / Decimal / Complex elements.  All three are heap values
+        # reached through a pointer, and the generic fall-through below tags
+        # every i64 INT and every pointer STR — so `[2 ** 80]` printed the
+        # element's *address* and `[Decimal("1.5")]` printed an empty line.
+        # BUG-LIST-LITERAL-BIGINT-DECIMAL-ELEM.
+        #
+        # The narrow `_is_*_expr` predicates are not enough on their own.
+        # `_is_bigint_expr` knows only an integer literal too wide for an i64
+        # and a BIGINT-kinded name, so it answers False for `2 ** 80` — a
+        # BinOp of two small constants.  `_is_decimal_expr` was right about
+        # `Decimal("1.5")` and simply had no branch calling it.
+        #
+        # `_infer_type_tag` gets all three right, and it is the same analysis
+        # `_bare_to_tag_data` consults — which is precisely why a *dict* held
+        # these correctly all along while a list did not.  Asking it here is
+        # what makes the two container element-store paths agree.  The old
+        # predicates stay as extra evidence: they were already trusted, and
+        # OR-ing them can only widen what is tagged correctly.
+        _elem_kind = self._infer_type_tag(node, None).kind
+        _heap_num_tag = None
+        if _elem_kind == VKind.BIGINT or self._is_bigint_expr(node):
+            _heap_num_tag = FPY_TAG_BIGINT
+        elif _elem_kind == VKind.DECIMAL or self._is_decimal_expr(node):
+            _heap_num_tag = FPY_TAG_DECIMAL
+        elif _elem_kind == VKind.COMPLEX or self._is_complex_expr(node):
+            _heap_num_tag = FPY_TAG_COMPLEX
+        if _heap_num_tag is not None:
             value = self._emit_expr_value(node)
+            if (isinstance(value.type, ir.LiteralStructType)
+                    and value.type == fpy_val):
+                # Already carries its own runtime tag, which beats the static
+                # guess — a BIGINT-kinded expression may well be holding a
+                # value small enough to have stayed a plain int.
+                self.builder.call(
+                    self.runtime["list_append_fv"],
+                    [list_ptr, self.builder.extract_value(value, 0),
+                     self.builder.extract_value(value, 1)])
+                return
             if isinstance(value.type, ir.PointerType):
                 data = self.builder.ptrtoint(value, i64)
             elif isinstance(value.type, ir.IntType) and value.type.width == 64:
                 data = value
             else:
-                data = self.builder.zext(value, i64) if isinstance(value.type, ir.IntType) else value
+                data = (self.builder.zext(value, i64)
+                        if isinstance(value.type, ir.IntType) else value)
             self.builder.call(self.runtime["list_append_fv"],
-                              [list_ptr, ir.Constant(i32, FPY_TAG_BIGINT), data])
-            return
-
-        # Complex constants / expressions — tag as COMPLEX
-        if self._is_complex_expr(node):
-            value = self._emit_expr_value(node)
-            if isinstance(value.type, ir.PointerType):
-                data = self.builder.ptrtoint(value, i64)
-            elif isinstance(value.type, ir.IntType) and value.type.width == 64:
-                data = value
-            else:
-                data = self.builder.zext(value, i64) if isinstance(value.type, ir.IntType) else value
-            self.builder.call(self.runtime["list_append_fv"],
-                              [list_ptr, ir.Constant(i32, FPY_TAG_COMPLEX), data])
+                              [list_ptr, ir.Constant(i32, _heap_num_tag), data])
             return
 
         # For all other expressions, evaluate and dispatch by LLVM type

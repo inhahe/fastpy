@@ -532,7 +532,14 @@ void fpy_value_repr(FpyValue val, char *buf, int bufsize) {
         case FPY_TAG_COMPLEX: {
             char *s = fpy_complex_to_str((FpyComplex*)(intptr_t)val.data.i);
             snprintf(buf, bufsize, "%s", s);
-            free(s);
+            /* NOT free(): unlike its siblings above, fpy_complex_to_str
+             * returns fpy_str_buf's *header-backed* buffer, whose char*
+             * points 8 bytes into the malloc block.  Handing that to free()
+             * aborted the process with STATUS_HEAP_CORRUPTION (0xc0000374) —
+             * `print([1 + 2j])` died before printing anything, while
+             * `print(c[0])` was fine because it never reached this repr.
+             * BUG-COMPLEX-REPR-FREES-HEADERED-STRING. */
+            fpy_rc_decref(FPY_TAG_STR, (int64_t)(intptr_t)s);
             break;
         }
         case FPY_TAG_DECIMAL: {
@@ -687,7 +694,40 @@ static int _fpy_tags_order_compatible(int32_t tag1, int32_t tag2) {
     if (tag2 == FPY_TAG_BIGINT &&
         (tag1 == FPY_TAG_INT || tag1 == FPY_TAG_BOOL
          || tag1 == FPY_TAG_FLOAT)) return 1;
+    /* DECIMAL with INT/BOOL/FLOAT — CPython orders a Decimal against any of
+     * them.  COMPLEX with them too, but only for *equality*: `(1+0j) == 1` is
+     * True while `(1+0j) < 1` is a TypeError.  This predicate cannot express
+     * "equality only", and answering 0 here would make the equality silently
+     * False instead, so the ordering rejection lives in the COMPLEX arm of
+     * fastpy_fv_compare (which also has to reject complex-vs-complex ordering,
+     * something the tag1 == tag2 shortcut above lets through).
+     * BUG-FV-COMPARE-NO-DECIMAL-COMPLEX. */
+    if (tag1 == FPY_TAG_DECIMAL &&
+        (tag2 == FPY_TAG_INT || tag2 == FPY_TAG_BOOL
+         || tag2 == FPY_TAG_FLOAT)) return 1;
+    if (tag2 == FPY_TAG_DECIMAL &&
+        (tag1 == FPY_TAG_INT || tag1 == FPY_TAG_BOOL
+         || tag1 == FPY_TAG_FLOAT)) return 1;
+    if (tag1 == FPY_TAG_COMPLEX &&
+        (tag2 == FPY_TAG_INT || tag2 == FPY_TAG_BOOL
+         || tag2 == FPY_TAG_FLOAT)) return 1;
+    if (tag2 == FPY_TAG_COMPLEX &&
+        (tag1 == FPY_TAG_INT || tag1 == FPY_TAG_BOOL
+         || tag1 == FPY_TAG_FLOAT)) return 1;
     return 0;
+}
+
+/* A Decimal as a double, for comparison against a FLOAT operand.
+ *
+ * Inexact in the same way `float(Decimal(...))` is, and CPython's own
+ * Decimal-vs-float comparison is *exact* — it converts the float to a Decimal
+ * rather than the other way round.  The difference only shows up past 2^53 or
+ * for a decimal fraction no double represents, and doing it exactly needs a
+ * float→Decimal constructor the runtime does not have yet.
+ * Logged as BUG-DECIMAL-FLOAT-COMPARE-INEXACT. */
+static double _fpy_decimal_to_double(const FpyDecimal *d) {
+    double v = (double)d->coefficient * pow(10.0, (double)d->exponent);
+    return d->sign < 0 ? -v : v;
 }
 
 /* A finite double whose magnitude is at least 2^63, as an exact BigInt.
@@ -819,6 +859,79 @@ int32_t fastpy_fv_compare(int32_t tag1, int64_t data1,
             case 5: return cmp >= 0;
         }
         return 0;
+    }
+    /* Decimal comparison: at least one is DECIMAL.  Like the BigInt block
+     * above, this has to precede the FLOAT and default-integer branches, both
+     * of which read the Decimal *pointer* as a number — the default one
+     * compared the two addresses, so `[Decimal("1.5"), 1][0] == Decimal("1.5")`
+     * was False and `w[0] < w[1]` answered on allocation order.
+     * BUG-FV-COMPARE-NO-DECIMAL-COMPLEX. */
+    if (tag1 == FPY_TAG_DECIMAL || tag2 == FPY_TAG_DECIMAL) {
+        int cmp;
+        if (tag1 == FPY_TAG_FLOAT || tag2 == FPY_TAG_FLOAT) {
+            double dv;
+            int64_t fdata = (tag1 == FPY_TAG_FLOAT) ? data1 : data2;
+            memcpy(&dv, &fdata, sizeof(dv));
+            double dd = _fpy_decimal_to_double((FpyDecimal*)(intptr_t)
+                ((tag1 == FPY_TAG_DECIMAL) ? data1 : data2));
+            if (isnan(dv)) return (op == 1);   /* NaN: only != is true */
+            double lhs = (tag1 == FPY_TAG_DECIMAL) ? dd : dv;
+            double rhs = (tag1 == FPY_TAG_DECIMAL) ? dv : dd;
+            cmp = (lhs < rhs) ? -1 : (lhs > rhs) ? 1 : 0;
+        } else {
+            /* The other side is DECIMAL, INT or BOOL.  Only the promoted one
+             * is owned here; the caller's Decimal is not ours to free. */
+            FpyDecimal *la = (tag1 == FPY_TAG_DECIMAL)
+                ? (FpyDecimal*)(intptr_t)data1 : fpy_decimal_from_int(data1);
+            FpyDecimal *ra = (tag2 == FPY_TAG_DECIMAL)
+                ? (FpyDecimal*)(intptr_t)data2 : fpy_decimal_from_int(data2);
+            cmp = fpy_decimal_compare(la, ra);
+            if (tag1 != FPY_TAG_DECIMAL) free(la);
+            if (tag2 != FPY_TAG_DECIMAL) free(ra);
+        }
+        switch (op) {
+            case 0: return cmp == 0;
+            case 1: return cmp != 0;
+            case 2: return cmp < 0;
+            case 3: return cmp <= 0;
+            case 4: return cmp > 0;
+            case 5: return cmp >= 0;
+        }
+        return 0;
+    }
+    /* Complex comparison: equality only, exactly as CPython.  Ordering is a
+     * TypeError even between two complexes — which the tag1 == tag2 shortcut
+     * in the cross-type check above lets through, so it has to be rejected
+     * here.  BUG-FV-COMPARE-NO-DECIMAL-COMPLEX. */
+    if (tag1 == FPY_TAG_COMPLEX || tag2 == FPY_TAG_COMPLEX) {
+        if (op >= 2) {
+            static char _cx_err[256];
+            const char *ops[] = {"==","!=","<","<=",">",">="};
+            snprintf(_cx_err, sizeof(_cx_err),
+                     "'%s' not supported between instances of '%s' and '%s'",
+                     ops[op], _fpy_tag_typename(tag1), _fpy_tag_typename(tag2));
+            fastpy_raise(FPY_EXC_TYPEERROR, _cx_err);
+            return 0;
+        }
+        double r1, i1, r2, i2;
+        if (tag1 == FPY_TAG_COMPLEX) {
+            FpyComplex *c = (FpyComplex*)(intptr_t)data1;
+            r1 = c->real; i1 = c->imag;
+        } else if (tag1 == FPY_TAG_FLOAT) {
+            memcpy(&r1, &data1, sizeof(r1)); i1 = 0.0;
+        } else {
+            r1 = (double)data1; i1 = 0.0;
+        }
+        if (tag2 == FPY_TAG_COMPLEX) {
+            FpyComplex *c = (FpyComplex*)(intptr_t)data2;
+            r2 = c->real; i2 = c->imag;
+        } else if (tag2 == FPY_TAG_FLOAT) {
+            memcpy(&r2, &data2, sizeof(r2)); i2 = 0.0;
+        } else {
+            r2 = (double)data2; i2 = 0.0;
+        }
+        int eq = (r1 == r2 && i1 == i2);
+        return (op == 0) ? eq : !eq;
     }
     /* Float comparison: at least one is FLOAT */
     if (tag1 == FPY_TAG_FLOAT || tag2 == FPY_TAG_FLOAT) {
@@ -1404,6 +1517,84 @@ void fastpy_fv_binop(int32_t lt, int64_t ld, int32_t rt, int64_t rd,
         }
         /* truediv falls through (BigInt / BigInt → float not implemented yet) */
     }
+    /* Decimal arithmetic — promote INT/BOOL to Decimal.
+     *
+     * Without this a DECIMAL-tagged operand fell all the way through to the
+     * int/bool arithmetic at the bottom of this function, which added the
+     * Decimal's *pointer*: `[Decimal("1.5"), 1][0] + 1` printed a heap
+     * address, and `* 2` printed twice that address.
+     * BUG-FV-BINOP-NO-DECIMAL-COMPLEX.
+     *
+     * Only +, -, * and / are covered, matching the helpers that exist (and
+     * the statically-typed Decimal path in codegen, which maps the same four).
+     * Anything else — Decimal + float, which CPython rejects, and //, % and
+     * the bitwise ops, which it accepts but no helper implements — falls
+     * through to the TypeError guard below.  That is loud rather than silently
+     * wrong, which is the right failure while the helpers are missing. */
+    if (lt == FPY_TAG_DECIMAL || rt == FPY_TAG_DECIMAL) {
+        if ((lt == FPY_TAG_DECIMAL || lt == FPY_TAG_INT || lt == FPY_TAG_BOOL)
+            && (rt == FPY_TAG_DECIMAL || rt == FPY_TAG_INT || rt == FPY_TAG_BOOL)
+            && op >= 0 && op <= 3) {
+            FpyDecimal *la = (lt == FPY_TAG_DECIMAL)
+                ? (FpyDecimal*)(intptr_t)ld : fpy_decimal_from_int(ld);
+            FpyDecimal *ra = (rt == FPY_TAG_DECIMAL)
+                ? (FpyDecimal*)(intptr_t)rd : fpy_decimal_from_int(rd);
+            FpyDecimal *dres = NULL;
+            switch (op) {
+                case 0: dres = fpy_decimal_add(la, ra); break;
+                case 1: dres = fpy_decimal_sub(la, ra); break;
+                case 2: dres = fpy_decimal_mul(la, ra); break;
+                case 3: dres = fpy_decimal_div(la, ra); break;
+                default: break;
+            }
+            /* Only the operands promoted here are owned; a caller-provided
+             * Decimal still belongs to whoever holds the tagged value. */
+            if (lt != FPY_TAG_DECIMAL) free(la);
+            if (rt != FPY_TAG_DECIMAL) free(ra);
+            if (dres) {
+                *out_tag = FPY_TAG_DECIMAL;
+                *out_data = (int64_t)(intptr_t)dres;
+                return;
+            }
+        }
+    }
+    /* Complex arithmetic — promote INT/BOOL/FLOAT to complex.  Same hole and
+     * same fix as Decimal above: `[1 + 2j][0] + [1 + 2j][0]` added two
+     * pointers.  BUG-FV-BINOP-NO-DECIMAL-COMPLEX. */
+    if (lt == FPY_TAG_COMPLEX || rt == FPY_TAG_COMPLEX) {
+        int _lc_ok = (lt == FPY_TAG_COMPLEX || lt == FPY_TAG_INT
+                      || lt == FPY_TAG_BOOL || lt == FPY_TAG_FLOAT);
+        int _rc_ok = (rt == FPY_TAG_COMPLEX || rt == FPY_TAG_INT
+                      || rt == FPY_TAG_BOOL || rt == FPY_TAG_FLOAT);
+        if (_lc_ok && _rc_ok && op >= 0 && op <= 3) {
+            FpyComplex *lc, *rc;
+            if (lt == FPY_TAG_COMPLEX) lc = (FpyComplex*)(intptr_t)ld;
+            else if (lt == FPY_TAG_FLOAT) {
+                double _lv; memcpy(&_lv, &ld, sizeof(double));
+                lc = fpy_complex_new(_lv, 0.0);
+            } else lc = fpy_complex_new((double)ld, 0.0);
+            if (rt == FPY_TAG_COMPLEX) rc = (FpyComplex*)(intptr_t)rd;
+            else if (rt == FPY_TAG_FLOAT) {
+                double _rv; memcpy(&_rv, &rd, sizeof(double));
+                rc = fpy_complex_new(_rv, 0.0);
+            } else rc = fpy_complex_new((double)rd, 0.0);
+            FpyComplex *cres = NULL;
+            switch (op) {
+                case 0: cres = fpy_complex_add(lc, rc); break;
+                case 1: cres = fpy_complex_sub(lc, rc); break;
+                case 2: cres = fpy_complex_mul(lc, rc); break;
+                case 3: cres = fpy_complex_div(lc, rc); break;
+                default: break;
+            }
+            if (lt != FPY_TAG_COMPLEX) free(lc);
+            if (rt != FPY_TAG_COMPLEX) free(rc);
+            if (cres) {
+                *out_tag = FPY_TAG_COMPLEX;
+                *out_data = (int64_t)(intptr_t)cres;
+                return;
+            }
+        }
+    }
     /* Promote to float if either operand is float AND the other is numeric.
      * Guard: float + container (str, list, dict, set, etc.) is TypeError,
      * not float promotion. */
@@ -1437,7 +1628,13 @@ void fastpy_fv_binop(int32_t lt, int64_t ld, int32_t rt, int64_t rd,
     if (lt == FPY_TAG_LIST || lt == FPY_TAG_DICT || lt == FPY_TAG_SET ||
         rt == FPY_TAG_LIST || rt == FPY_TAG_DICT || rt == FPY_TAG_SET ||
         lt == FPY_TAG_STR  || rt == FPY_TAG_STR ||
-        lt == FPY_TAG_BYTES || rt == FPY_TAG_BYTES) {
+        lt == FPY_TAG_BYTES || rt == FPY_TAG_BYTES ||
+        /* A DECIMAL or COMPLEX operand that survived the two blocks above is
+         * one they could not handle.  It must stop here: the int/bool
+         * arithmetic below would otherwise do the sum on its pointer.
+         * BUG-FV-BINOP-NO-DECIMAL-COMPLEX. */
+        lt == FPY_TAG_DECIMAL || rt == FPY_TAG_DECIMAL ||
+        lt == FPY_TAG_COMPLEX || rt == FPY_TAG_COMPLEX) {
         /* If we reach here, no valid handler matched (e.g. list+int, dict-int,
          * str+list, etc.) — raise TypeError like CPython does. */
         static const char *_op_syms[] = {"+", "-", "*", "/", "//", "%",

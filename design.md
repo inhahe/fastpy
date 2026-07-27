@@ -289,8 +289,11 @@ and mode-pinned names are both exempt, as is anything `maybe_int` rules out
 (which incidentally also stopped floats being widened: `t + 1.5` has a float
 constant operand). The rule to carry forward: *a wide slot is correct for any
 value the FV paths handle correctly.* BigInt has since become one of them for
-comparison and arithmetic (below), but not yet at a return boundary or inside a
-list literal, so both exemptions stand.
+comparison, arithmetic, the return boundary and container literals (all below).
+The two exemptions still stand, but for their own reasons rather than for lack
+of FV coverage: a `x = 2 ** 63` slot is *unconditionally* a pointer that every
+consumer reads directly, and a mode-pinned name has an overflow policy the
+tagged paths do not implement.
 
 Because `_int_mode_vars` is only filled during emission, the scan recognises
 `unchecked_int`/`checked_int` and the `Unchecked`/`Checked` markers
@@ -361,6 +364,73 @@ observation that a finite double that large *is* an exact `mantissa * 2^k`,
 which `frexp`/`ldexp` recover as a 53-bit i64 plus a shift. NaN answers
 "unordered", which every operator but `!=` reads as False. The general form: when
 two representations have different precision, convert toward the *wider* one.
+
+**Decimal and complex are the same shape as BigInt, and every place that
+special-cased BigInt had to learn all three.** All three are heap numbers: the
+`FpyValue`'s `data` holds a pointer and only the tag says so. Wherever a path
+knew about BigInt and stopped there, Decimal and complex read as addresses —
+`fastpy_fv_binop` and `fastpy_fv_compare` both had a BIGINT arm and no other,
+so `[Decimal("1.5"), 1][0] + 1` summed pointers and `Decimal("1.5") <
+Decimal("2.5")` answered on *heap address order*, flipping from run to run
+under ASLR. The comparison case is the more instructive failure, because
+`_emit_compare`'s cross-type `fv_compare` branch requires the two kinds to
+*differ*: two Decimals share a kind, so they sailed past it and landed in the
+generic pointer compare at the bottom of the chain. **A "same kind → simple
+compare" shortcut is only valid for kinds whose `data` is a value.**
+
+Complex additionally needs the *asymmetry* between equality and ordering that
+CPython has: `(1+0j) == 1` is True while `(1+0j) < 1` is a TypeError, and
+`complex < complex` is a TypeError too. `_fpy_tags_order_compatible` cannot
+express "equality only" — answering 0 there would silently make the equality
+False rather than raising — so it reports compatible and the ordering rejection
+lives in the COMPLEX arm of `fastpy_fv_compare`, which also has to override the
+`tag1 == tag2` shortcut at the top of that function.
+
+**One inference decides a container element's kind, on both the store and the
+read side.** A list literal used to classify each element with the narrow
+`_is_bigint_expr` / `_is_decimal_expr` / `_is_complex_expr` predicates, while a
+*dict* went through `_bare_to_tag_data`, which consults `_infer_type_tag`. The
+two disagreed, and the weaker one lost: `[2 ** 80]` printed the element's
+address (`_is_bigint_expr` knows a too-wide literal and a BIGINT-kinded name,
+but `2 ** 80` is a BinOp of two small constants) and `[Decimal("1.5")]` printed
+an empty line. Both container paths now ask `_infer_type_tag`.
+
+Naming the kind is not decoration — it is what selects the *representation*.
+`_can_inline_list_access` inlines only INT and FLOAT elements, so a subscript
+whose element kind is COMPLEX/DECIMAL/BIGINT is routed through `list_get_fv`
+and keeps its tag; leaving `_infer_list_elem_type` with no arm for them made
+them fall through to the INT default and become an inline i64 load of the
+pointer. The corollary is that **the store side and the read side must derive
+the kind the same way**, or the tag written and the tag expected diverge.
+
+The predicates that remain are for *syntactic* evidence and must answer for
+every expression form that can carry the kind — notably `ast.Subscript`, which
+both `_is_complex_expr` and `_is_decimal_expr` were missing. That gap is subtle
+because `_infer_type_tag` typed the subscript itself correctly; it is the
+*BinOp* arm of `_infer_type_tag` that asks the predicate rather than recursing
+into itself, so `c[0] + c[1]` came back INT and printed an `FpyComplex*` as an
+integer. Where a predicate can defer to `_infer_type_tag` it now does, keeping
+one definition of "what kind does this expression yield".
+
+**An accumulator loop is a tag-dispatch site too.** `sum()` had exactly two
+accumulators, i64 and double, and read every element with
+`_list_get_as_bare(..., "int")` — the same "throw the tag away" shape, so
+`sum([2 ** 80, 2 ** 80])` added two addresses. It now has a third accumulator
+holding `(tag, data)` and folding through `fastpy_fv_binop`, selected for the
+element kinds the bare read misreads (BIGINT, DECIMAL, COMPLEX, FVALUE, MIXED)
+so the plain-scalar loops keep their speed. Reusing the binop helper rather
+than open-coding the addition also inherits its TypeErrors — `sum(["a"])`
+raises instead of adding two string pointers.
+
+**Two string-returning conventions in one runtime is a memory-safety trap.**
+`fpy_bigint_to_str` and `fpy_decimal_to_str` return a bare `malloc`;
+`fpy_complex_to_str` returns `fpy_str_buf`'s *header-backed* buffer, whose
+`char*` points 8 bytes into its malloc block. `fpy_value_repr` treated all
+three alike and `free()`d the third, so `print([1 + 2j])` aborted with
+STATUS_HEAP_CORRUPTION as soon as a complex element carried its real tag. The
+header-backed one must be released with `fpy_rc_decref(FPY_TAG_STR, …)`, and
+the contract is now stated on the declaration in `runtime/objects.h` — the only
+place a caller reliably looks.
 
 **A return that can promote needs both a `mixed` tag and the FV ABI.** These are
 decided in two places and either one alone is useless: `_duf_infer_ret_tag` can
@@ -702,6 +772,34 @@ A *static* return tag is not an alternative here. `FuncInfo.ret_tag` stays
 `"int"` for FpyValue-ABI functions by design — their real tag rides inside the
 returned `{i32, i64}` struct, which only a direct call can see — and a function
 may return different kinds on different branches regardless.
+
+**The argument tags are the same protocol running the other way, with the same
+"silence is not a default" rule.** A parameter the compiler could not type
+compiles to a bare `i64`; the callee recovers its Python type from
+`fastpy_get_arg_tag(i)`, which the caller is expected to have filled in with
+`fastpy_set_arg_tag`. Like `fpy_ret_tag` this is one global array, sticky
+across calls, so a call site that stays silent does not leave the callee
+guessing "int" — it leaves it reading *the previous call's* argument. The
+failure is invisible while nothing consults the tag and then arbitrarily far
+away when something does: a leftover STR tag turned `x * 2` inside a
+`__call__` into a string-repeat on the integer 7
+(BUG-CALL-ON-CALL-STALE-ARG-TAG). Every emitter that reaches a Python-level
+body through a bare-i64 signature must therefore go through
+`_emit_set_arg_tags`, even where the tag looks statically obvious — "obvious"
+describes what the caller passes, not what the callee reads if we say nothing.
+
+**Prefer resolving the callee statically over the runtime's name-based
+dispatcher.** `fastpy_obj_call_methodN` looks a method up by name at runtime,
+which costs three things beyond the lookup: it exists only in 0-, 1- and
+2-argument shapes (a third argument used to fall off the end of
+`_emit_call_on_call` and silently yield `0`), it flattens every return type to
+`i64`, and it forces both tag channels above to carry what a direct call would
+have known from the signature. So when the receiver's class is known — a
+variable of OBJ kind with a recorded class, or a constructor call like
+`C()(x)` — codegen resolves `__call__` up the MRO and calls the LLVM function
+directly (`_emit_direct_dunder_call`). Both shapes share that one emitter
+precisely so they cannot drift apart; the dispatcher remains the fallback for
+receivers whose class the call site genuinely cannot name.
 
 **Function names are made unique before analysis, because the analysis maps are
 flat.** Nearly every map the compiler builds about a function —
