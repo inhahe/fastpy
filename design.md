@@ -241,6 +241,25 @@ parameter falling to the CPython bridge), which is why it is fixed at the ABI
 rather than at each use. In the regression corpus 11 of 641 functions changed
 ABI, all of them nested or closure functions.
 
+**Returning an untyped parameter is a `mixed` return.** `_duf_determine_ret_tag`
+inherits a `return <param>` from the call site's classification, but when no
+call site classified the parameter there was nothing to inherit and the tag
+fell through to the `int` default. The value itself was fine — an FV-ABI callee
+really does return a tagged `{i32, i64}` — but the caller believed the tag and
+unwrapped it away, so `len(echo(opaque_str()))` measured a string pointer as an
+integer while `r = echo(...); len(r)` was right, the same two-forms-disagree
+split as BUG-DIRECT-CALL-LEN-STATIC-TAG. The honest tag is `mixed`, since the
+kind is whatever the caller passed, and `_callee_returns_mixed` now consults
+`info.ret_tag` when `_func_ret_types` has no entry: the declaration pass is the
+only pass that can see "returns a parameter", so the two answers are combined
+rather than one deferring to the other. Annotated parameters are excluded —
+the annotation is evidence enough for the bare ABI, whose `i64` return has
+nowhere to carry a `mixed` tag. `_duf_propagate_mixed_ret_tags` then spreads
+that tag through plain forwarding wrappers (`def wrap(v): return inner(v)`) to
+a fixed point, in either definition order; `_csa_propagate_ret_types` does the
+same for the tags it knows, but it runs before the declaration pass and so
+cannot see this one.
+
 **A splat is evidence too, but only about the required slots.** `f(*seq)` had
 no arm in the per-argument classification at all, so a parameter fed only that
 way hit the same silent-zero. `_csa_build_seq_binds` maps each name to the

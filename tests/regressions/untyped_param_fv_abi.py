@@ -48,16 +48,16 @@ for a plain `return "abcd"`; a list- or dict-returning callee gets its
 parameter typed by `_csa_refine_params_from_call_returns` and so never reached
 the bare ABI in the first place.
 
-Two neighbours are deliberately absent, both verified to behave identically
-before and after this change:
+One neighbour is deliberately absent, verified to behave identically before and
+after this change: `bytes` flowing through an untyped parameter loses its tag,
+so `len()` on it answers 0 and `print()` shows a pointer.
+BUG-BYTES-RETURN-TAG-LOST.
 
-* `len(echo(opaque_str()))`, where `echo` just returns its own untyped
-  parameter, answers 0 — the declaration pass guesses `ret_tag="int"` for such
-  a function and the call site unwraps to that. Binding the result to a name
-  first is correct, so `echo` appears below only in that form.
-  BUG-RETURNS-UNTYPED-PARAM-RET-TAG.
-* `bytes` flowing through an untyped parameter loses its tag, so `len()` on it
-  answers 0 and `print()` shows a pointer. BUG-BYTES-RETURN-TAG-LOST.
+`len(echo(opaque_str()))`, where `echo` just returns its own untyped parameter,
+was also wrong here at the time — the declaration pass guessed `ret_tag="int"`
+for such a function and the call site unwrapped to that, so only the
+bound-to-a-name form appears below. That is BUG-RETURNS-UNTYPED-PARAM-RET-TAG,
+since fixed; `returns_untyped_param_ret_tag.py` covers it directly.
 """
 
 

@@ -4278,6 +4278,11 @@ class CodeGen:
             if inner.name not in self._user_functions:
                 self._declare_user_function(inner)
 
+        # Every function that can be declared ahead of body emission now is,
+        # so a forwarding wrapper's return tag can be resolved against its
+        # callee regardless of the order the two were defined in.
+        self._duf_propagate_mixed_ret_tags()
+
         # Pass 1.5: generate code for module-level lambda functions.
         # Only process lambdas at the top level (tree.body), NOT inside
         # function/class definitions. Function-local lambdas are compiled
@@ -10471,6 +10476,23 @@ class CodeGen:
         returns_str = False
         returns_dict = False
         returns_list = False
+        # `return <param>` where nothing at all is known about that parameter.
+        # The honest tag is "mixed": the kind is whatever the caller passed, and
+        # only the runtime tag can say.  Falling through to the "int" default
+        # instead made the caller unwrap the returned FpyValue to a naked i64,
+        # so `len(echo(opaque_str()))` measured a string pointer as an integer
+        # and answered 0.  BUG-RETURNS-UNTYPED-PARAM-RET-TAG.
+        #
+        # An *annotated* parameter is excluded even when no call site classified
+        # it: the annotation is evidence, `_duf_select_abi` accepts it as such
+        # and may hand the function the bare ABI, and a bare i64 return has
+        # nowhere to carry a "mixed" tag.
+        _ann_params = {a.arg for a in node.args.args if a.annotation is not None}
+        _ann_params |= {a.arg for a in node.args.posonlyargs
+                        if a.annotation is not None}
+        _ann_params |= {a.arg for a in node.args.kwonlyargs
+                        if a.annotation is not None}
+        returns_untyped_param = False
         for n in ast.walk(node):
             if isinstance(n, ast.Return) and n.value is not None:
                 if isinstance(n.value, ast.JoinedStr):
@@ -10581,6 +10603,8 @@ class CodeGen:
                             returns_dict = True
                         elif _vid in str_vars:
                             returns_str = True
+                        elif _vid not in _ann_params:
+                            returns_untyped_param = True
 
         # Detect obj-valued returns (variable tracked in obj_vars from the
         # local type-tracking scan above) so ret_tag is "obj" rather than
@@ -10599,7 +10623,14 @@ class CodeGen:
                     break
 
         if ret_type == i64:
-            ret_tag = "str" if returns_str else "int"
+            if returns_str:
+                ret_tag = "str"
+            elif (returns_untyped_param
+                  and not returns_dict and not returns_list
+                  and not returns_obj):
+                ret_tag = "mixed"
+            else:
+                ret_tag = "int"
         elif ret_type == double:
             ret_tag = "float"
         elif ret_type == i32:
@@ -10692,6 +10723,61 @@ class CodeGen:
                         ret_tag = "ptr"
 
         return ret_tag
+
+    def _duf_propagate_mixed_ret_tags(self) -> None:
+        """Spread a `mixed` return tag through plain forwarding wrappers.
+
+        `def wrap(v): return inner(v)` is declared before anything knows what
+        `inner` returns when `inner` is defined later in the file, and even in
+        source order `_duf_determine_ret_tag` has no arm for "returns a user
+        call" — so the wrapper fell through to the `"int"` default and its
+        callers unwrapped the tagged FpyValue away, exactly the way
+        BUG-RETURNS-UNTYPED-PARAM-RET-TAG does one level down.
+
+        The equivalent propagation already exists for the call-site analysis
+        (`_csa_propagate_ret_types` copies a callee's entry to the wrapper), so
+        a wrapper around a `pick()`-style mixed function was already correct.
+        This covers the tags only the declaration pass can see — chiefly
+        `return <untyped param>` — which reach `_user_functions` but never
+        `_func_ret_types`.
+
+        Run to a fixed point so chains of any length converge, and confined to
+        functions still carrying the bare `"int"` default: an annotation, a
+        `_func_ret_types` entry or any more specific tag is a real answer and
+        outranks this one.  Bare-ABI functions are skipped because their `i64`
+        return has nowhere to carry a tag.
+        """
+        nodes = getattr(self, "_function_def_nodes", None)
+        if not nodes:
+            return
+        frt = getattr(self, "_func_ret_types", None) or {}
+        for _ in range(8):
+            changed = False
+            for name, fnode in list(nodes.items()):
+                info = self._user_functions.get(name)
+                if (info is None or info.ret_tag != "int"
+                        or not info.uses_fv_abi
+                        or fnode.returns is not None
+                        or frt.get(name) is not None):
+                    continue
+                for n in ast.walk(fnode):
+                    if not (isinstance(n, ast.Return)
+                            and isinstance(n.value, ast.Call)
+                            and isinstance(n.value.func, ast.Name)):
+                        continue
+                    callee = n.value.func.id
+                    if callee == name:
+                        continue  # self-recursion says nothing new
+                    _ct = frt.get(callee)
+                    if _ct is None:
+                        _ci = self._user_functions.get(callee)
+                        _ct = _ci.ret_tag if _ci is not None else None
+                    if _ct is not None and self._tag_kind(_ct) == VKind.MIXED:
+                        info.ret_tag = "mixed"
+                        changed = True
+                        break
+            if not changed:
+                return
 
     def _declare_user_function(self, node: ast.FunctionDef,
                                _sig_override: list | None = None,
@@ -31084,20 +31170,29 @@ class CodeGen:
         return result if info.ret_tag != "void" else None
 
     def _callee_returns_mixed(self, name: str) -> bool:
-        """True when the CSA pass typed *name*'s return as `mixed`.
+        """True when either analysis typed *name*'s return as `mixed`.
 
-        Kept separate from `info.ret_tag` on purpose: `ret_tag` is fixed in the
-        declaration pass, before the call-site analysis has run, so it records
-        only the coarse guess.  `_func_ret_types` is the reconciled answer, and
-        it is what `_assign_fv_fast_path` consults when storing a call result
-        to a name.  Both call sites must agree, or `v = f(x); len(v)` and
-        `len(f(x))` disagree — which is exactly the bug.
+        `_func_ret_types` is the reconciled answer of the call-site analysis,
+        and it is what `_assign_fv_fast_path` consults when storing a call
+        result to a name.  Both call sites must agree, or `v = f(x); len(v)`
+        and `len(f(x))` disagree — which is exactly BUG-DIRECT-CALL-LEN-
+        STATIC-TAG.
+
+        `info.ret_tag` is normally the *coarser* of the two — it is fixed in
+        the declaration pass, before the call-site analysis has run — so it is
+        consulted only for the one thing it alone can see: `return <param>`
+        where the parameter has no known type.  The CSA chain has no arm for
+        that shape and leaves `_func_ret_types` empty, so without this the
+        declaration pass's "mixed" would be ignored and the tag unwrapped away.
+        BUG-RETURNS-UNTYPED-PARAM-RET-TAG.
         """
-        frt = getattr(self, "_func_ret_types", None)
-        if not frt:
-            return False
+        frt = getattr(self, "_func_ret_types", None) or {}
         tag = frt.get(name)
-        return tag is not None and self._tag_kind(tag) == VKind.MIXED
+        if tag is not None:
+            return self._tag_kind(tag) == VKind.MIXED
+        info = self._user_functions.get(name)
+        return (info is not None
+                and self._tag_kind(info.ret_tag) == VKind.MIXED)
 
     def _emit_user_call_fv(self, node: ast.Call) -> ir.Value:
         """Emit a user function call and return the raw FpyValue without

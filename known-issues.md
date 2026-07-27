@@ -54,11 +54,11 @@ survives the call, which is the prerequisite.
 `b1a665d` (pointers printed as integers, lengths 0). Clean under
 ASan/UBSan/LSan.
 
-### BUG-RETURNS-UNTYPED-PARAM-RET-TAG. A function that returns its own untyped parameter is typed `int`, so `len(f(x))` answers 0 — 2026-07-26
+### ~~BUG-RETURNS-UNTYPED-PARAM-RET-TAG~~ **FIXED**. A function that returns its own untyped parameter was typed `int`, so `len(f(x))` answered 0 — 2026-07-26
 
-**What:** `_duf_determine_ret_tag` has no arm for "returns a parameter whose
-type is unknown", so it falls through to the `int` default. The call site then
-unwraps the callee's tagged `FpyValue` to that guess and the tag is gone.
+**What:** `_duf_determine_ret_tag` had no arm for "returns a parameter whose
+type is unknown", so it fell through to the `int` default. The call site then
+unwrapped the callee's tagged `FpyValue` to that guess and the tag was gone.
 
 **Reproduce** — should print `abcd 4` / `4`, prints `abcd 4` / `0`:
 ```python
@@ -82,15 +82,30 @@ BUG-DIRECT-CALL-LEN-STATIC-TAG. `_assign_fv_fast_path` keeps the whole
 helper reads `_func_ret_types`, which has no entry here. Meanwhile
 `info.ret_tag` is a confident, wrong `"int"`.
 
-**Proper fix:** `_duf_determine_ret_tag` (~line 10465) should report `"mixed"`
-when every `return` yields a parameter with no known type — the honest answer,
-since the kind is whatever the caller passed. `_callee_returns_mixed` should
-then also accept `info.ret_tag == "mixed"`, not only `_func_ret_types`; the
-declaration pass is the authority for this particular case because it is the
-pass that can see "returns a parameter".
+**Fix:** `_duf_determine_ret_tag` now reports `"mixed"` when a `return` yields
+a parameter with no known type — the honest answer, since the kind is whatever
+the caller passed — and `_callee_returns_mixed` falls back to `info.ret_tag`
+when `_func_ret_types` has no entry. The declaration pass is the authority for
+this one shape because it is the only pass that can see "returns a parameter";
+the CSA chain has no arm for it, so the two answers are combined rather than
+one deferring to the other.
 
-**Where it bites:** `tests/regressions/untyped_param_fv_abi.py` has to bind
-`echo`'s result to a name before measuring it, and says so.
+An *annotated* parameter is excluded even with no call site: the annotation is
+evidence, `_duf_select_abi` accepts it as such and may hand the function the
+bare ABI, and a bare `i64` return has nowhere to carry a `mixed` tag.
+
+A second gap fell out while testing and is fixed with it: a plain forwarding
+wrapper, `def wrap(v): return inner(v)`, has no "returns a user call" arm
+either and fell through to the same `int` default. `_csa_propagate_ret_types`
+already does this propagation for tags it knows, but it runs *before* the
+declaration pass and so cannot see this one. `_duf_propagate_mixed_ret_tags`
+is a fixed-point step after Pass 1.1 that spreads `mixed` through such
+wrappers, in either definition order. It only touches functions still carrying
+the bare `"int"` default, skips bare-ABI ones, and is confined to a direct
+`return <user call>`.
+
+**Test:** `tests/regressions/returns_untyped_param_ret_tag.py`. Verified wrong
+at `24bfaa4`. Clean under ASan/UBSan/LSan.
 
 ### BUG-BYTES-RETURN-TAG-LOST. A `bytes`-returning function loses its tag, so `len()` answers 0 and `print()` shows a pointer — 2026-07-26
 
