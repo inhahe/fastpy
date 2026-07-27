@@ -1299,6 +1299,14 @@ class CodeGen:
         # AnnAssign handler can skip native alloca creation for them.
         self._unsafe_typed_vars: set[str] = set()
 
+        # How many `finally` bodies (or `with` __exit__ calls) enclose the
+        # statement being emitted, each of which has moved a pending
+        # exception aside with fastpy_exc_save.  A `return` from inside one
+        # never reaches the matching restore, so it has to drop the saved
+        # frames itself — which is also the right semantics: in Python a
+        # `return` in a `finally` discards the exception it interrupted.
+        self._finally_exc_depth = 0
+
         # Locals of the scope being emitted that a read can reach before any
         # binding does.  They must live in an FpyValue slot, because only
         # that carries FPY_TAG_UNDEF — the tag that makes the premature read
@@ -2593,6 +2601,20 @@ class CodeGen:
         # void fastpy_exc_clear(void)
         ft = ir.FunctionType(void, [])
         self.runtime["exc_clear"] = ir.Function(self.module, ft, name="fastpy_exc_clear")
+        # Moving the pending exception aside while a `finally` body or a
+        # `with` block's __exit__ runs — see fastpy_exc_save in runtime.c.
+        ft = ir.FunctionType(void, [])
+        self.runtime["exc_save"] = ir.Function(
+            self.module, ft, name="fastpy_exc_save")
+        ft = ir.FunctionType(void, [])
+        self.runtime["exc_restore"] = ir.Function(
+            self.module, ft, name="fastpy_exc_restore")
+        ft = ir.FunctionType(void, [])
+        self.runtime["exc_drop"] = ir.Function(
+            self.module, ft, name="fastpy_exc_drop")
+        ft = ir.FunctionType(i32, [])
+        self.runtime["exc_saved_pending"] = ir.Function(
+            self.module, ft, name="fastpy_exc_saved_pending")
         # int fastpy_exc_name_to_id(const char *name)
         ft = ir.FunctionType(i32, [i8_ptr])
         self.runtime["exc_name_to_id"] = ir.Function(self.module, ft, name="fastpy_exc_name_to_id")
@@ -12639,7 +12661,8 @@ class CodeGen:
                  self._current_fn_bare_abi,
                  self._current_func_explicit_globals,
                  self._fv_forced_locals,
-                 self._scope_maybe_unbound)
+                 self._scope_maybe_unbound,
+                 self._finally_exc_depth)
 
         # Set up function state
         self.function = info.func
@@ -12659,6 +12682,9 @@ class CodeGen:
         self._obj_var_class = {}
         self._obj_var_pinned = set()
         self._int_mode_vars = {}
+        # A nested def emitted while inside a finally body is its own scope:
+        # its returns leave *it*, not the enclosing cleanup.
+        self._finally_exc_depth = 0
         self._scope_maybe_unbound = self._names_maybe_unbound(
             node.body, [a.arg for a in node.args.args]
             + [a.arg for a in node.args.kwonlyargs]
@@ -12930,7 +12956,8 @@ class CodeGen:
          self._current_fn_bare_abi,
          self._current_func_explicit_globals,
          self._fv_forced_locals,
-         self._scope_maybe_unbound) = saved
+         self._scope_maybe_unbound,
+         self._finally_exc_depth) = saved
 
     # -----------------------------------------------------------------
     # Class support
@@ -25603,8 +25630,14 @@ class CodeGen:
             self.builder.store(none_tag, _arg2_tag)
             self.builder.store(none_data, _arg2_data)
             self.builder.branch(_call_exit_block)
-            # Call __exit__(arg1, arg2, None)  — tb is always None
+            # Call __exit__(arg1, arg2, None)  — tb is always None.
+            # The exception (if any) has to be moved aside first: __exit__ is
+            # an ordinary function, and every call in it is followed by a
+            # pending-exception check that would unwind the frame before the
+            # body ran.  The arguments above were read while it was still
+            # pending, which is why the save lands here and not earlier.
             self.builder.position_at_end(_call_exit_block)
+            self.builder.call(self.runtime["exc_save"], [])
             self.builder.call(
                 self.runtime["cpython_call3"],
                 [exit_method,
@@ -25624,45 +25657,52 @@ class CodeGen:
                 self.runtime["fv_truthy"], [_exit_tag_v, _exit_data_v])
             _is_truthy_py = self.builder.icmp_signed(
                 "!=", _exit_truthy_py, ir.Constant(i32, 0))
+            # Truthy → the saved exception is suppressed and discarded;
+            # falsy → it goes back.  Either way the save is balanced here,
+            # and either way anything __exit__ itself raised survives.
             _pyobj_suppress = self._new_block("with.suppress.pyobj")
-            self.builder.cbranch(_is_truthy_py, _pyobj_suppress, after_exit_block)
+            _pyobj_keep = self._new_block("with.keep.pyobj")
+            self.builder.cbranch(_is_truthy_py, _pyobj_suppress, _pyobj_keep)
             self.builder.position_at_end(_pyobj_suppress)
-            _pend_py = self.builder.call(self.runtime["exc_pending"], [])
-            _has_exc_py = self.builder.icmp_signed(
-                "!=", _pend_py, ir.Constant(i32, 0))
-            _do_clear_py = self._new_block("with.clear.pyobj")
-            self.builder.cbranch(_has_exc_py, _do_clear_py, after_exit_block)
-            self.builder.position_at_end(_do_clear_py)
-            self.builder.call(self.runtime["exc_clear"], [])
+            self.builder.call(self.runtime["exc_drop"], [])
+            self.builder.branch(after_exit_block)
+            self.builder.position_at_end(_pyobj_keep)
+            self.builder.call(self.runtime["exc_restore"], [])
             self.builder.branch(after_exit_block)
 
             # Native FpyObj* path: use obj_call_method3
             self.builder.position_at_end(native_exit_block)
             exit_name = self._make_string_constant("__exit__")
             zero = ir.Constant(i64, 0)
+            self.builder.call(self.runtime["exc_save"], [])
             exit_ret = self.builder.call(
                 self.runtime["obj_call_method3"],
                 [saved_mgr, exit_name, zero, zero, zero])
-            # If __exit__ returned truthy and there's a pending exception,
-            # suppress it (clear the exception state).
+            # Truthy __exit__ suppresses the saved exception; otherwise it
+            # goes back.  See the PyObject path above.
             exit_truthy = self.builder.icmp_signed(
                 "!=", exit_ret, ir.Constant(i64, 0))
             _native_suppress = self._new_block("with.suppress.native")
-            self.builder.cbranch(exit_truthy, _native_suppress, after_exit_block)
+            _native_keep = self._new_block("with.keep.native")
+            self.builder.cbranch(exit_truthy, _native_suppress, _native_keep)
             self.builder.position_at_end(_native_suppress)
-            _pend = self.builder.call(self.runtime["exc_pending"], [])
-            _has_exc = self.builder.icmp_signed(
-                "!=", _pend, ir.Constant(i32, 0))
-            _do_clear = self._new_block("with.clear.native")
-            self.builder.cbranch(_has_exc, _do_clear, after_exit_block)
-            self.builder.position_at_end(_do_clear)
-            self.builder.call(self.runtime["exc_clear"], [])
+            self.builder.call(self.runtime["exc_drop"], [])
+            self.builder.branch(after_exit_block)
+            self.builder.position_at_end(_native_keep)
+            self.builder.call(self.runtime["exc_restore"], [])
             self.builder.branch(after_exit_block)
 
             self.builder.position_at_end(after_exit_block)
             self.builder.branch(end_block)
 
             self.builder.position_at_end(end_block)
+            # `end_block` is reached on both paths: the body ran to the end,
+            # or it was cut short and __exit__ declined to suppress and the
+            # exception was put back.  On the second the statement after the
+            # `with` must not run — this is the same check every raising
+            # operation gets, just at the one place where the exception was
+            # invisible while the cleanup was in progress.
+            self._emit_try_bail_if_exc()
 
     def _emit_match(self, node: ast.Match) -> None:
         """Emit match/case statement (Python 3.10+ structural pattern matching).
@@ -26676,12 +26716,20 @@ class CodeGen:
 
         if has_finally:
             self.builder.position_at_end(finally_block)
+            # Same reasoning as the `try` finally — see _emit_try.
+            self.builder.call(self.runtime["exc_save"], [])
+            self._finally_exc_depth += 1
             self._emit_stmts(node.finalbody)
+            self._finally_exc_depth -= 1
             if not self.builder.block.is_terminated:
+                self.builder.call(self.runtime["exc_restore"], [])
                 self.builder.branch(end_block)
 
         self._pop_saved_exc_slots(_outer_saved_exc)
         self.builder.position_at_end(end_block)
+        if has_finally:
+            # See _emit_try: the restore makes the exception visible again.
+            self._emit_try_bail_if_exc()
 
     # ── Optimization analysis recording ─────────────────────────────────
 
@@ -27462,15 +27510,31 @@ class CodeGen:
         if has_finally:
             self._finally_stack.pop()
 
-        # Finally block
+        # Finally block.  The body runs on the exception path too, so the
+        # exception is moved aside for its duration — otherwise the first
+        # call in it unwinds the frame instead of doing the cleanup.  A
+        # `return` inside the body never reaches the restore, which is
+        # right: in Python a `return` in `finally` discards the exception,
+        # and `_emit_return` drops the saved frame for exactly that reason.
         if has_finally:
             self.builder.position_at_end(finally_block)
+            self.builder.call(self.runtime["exc_save"], [])
+            self._finally_exc_depth += 1
             self._emit_stmts(node.finalbody)
+            self._finally_exc_depth -= 1
             if not self.builder.block.is_terminated:
+                self.builder.call(self.runtime["exc_restore"], [])
                 self.builder.branch(end_block)
 
         self._pop_saved_exc_slots(_outer_saved_exc)
         self.builder.position_at_end(end_block)
+        if has_finally:
+            # The finally body put the exception back (or a handler re-raised
+            # through it).  Whatever follows the `try` must not run on that
+            # path — while the cleanup was in progress the exception was
+            # deliberately invisible, so this is where it becomes visible
+            # again and has to be acted on.
+            self._emit_try_bail_if_exc()
 
     def _emit_raise(self, node: ast.Raise) -> None:
         """Emit raise ExcType('msg'). Sets the exception flag; caller checks it."""
@@ -27688,6 +27752,15 @@ class CodeGen:
         try-with-finally blocks), emit them in LIFO order before the
         actual return.
         """
+        # A `return` written *inside* a finally body leaves without passing
+        # the restore that body's exit would have run, so the frames that
+        # `fastpy_exc_save` pushed have to be dropped here.  Dropping is also
+        # the semantics: `return` in a `finally` discards the exception it
+        # interrupted.  Emitted before the return expression, so a raise in
+        # that expression is the exception that propagates.
+        for _ in range(self._finally_exc_depth):
+            self.builder.call(self.runtime["exc_drop"], [])
+
         # Evaluate the return value first (side effects happen before finally).
         # When the function returns FpyValue, use _load_or_wrap_fv so that
         # dict subscripts, list subscripts, and FV-backed variables preserve
@@ -37820,6 +37893,62 @@ class CodeGen:
         else:
             return self._bridge_fallback_expr(node, f"unsupported int operator: {type(op).__name__}")
 
+    def _fn_exc_exit_block(self) -> 'ir.Block':
+        """The block a raise in the middle of a statement branches to when the
+        current function has no enclosing `try`.
+
+        Every function needs somewhere to go on the exception path, and until
+        this existed there was nowhere: `_emit_try_bail_if_exc` had an arm for
+        "inside a try" and an arm for "module level", and inside a function
+        that was neither it emitted *nothing* — so codegen carried on emitting
+        the rest of the statement, the next operation ran on whatever the
+        failed one left behind, and its exception replaced the real one.
+        `def f(a): return (1 // a) + "s"` reported TypeError rather than
+        ZeroDivisionError, because the `+` ran anyway.
+        BUG-PENDING-EXC-CLOBBERED-IN-FUNCTION.
+
+        The block is what a `return` would be on that path: pop the shadow
+        stack, release the scope's owned locals, hand back a zero of the
+        return type.  The value is never read — every caller checks
+        `exc_pending` before using a result — but the *shadow pop* is not
+        optional, or the traceback of the exception this is propagating grows
+        a frame per unwound call.
+
+        Created on demand and hung off the `ir.Function`, so each of the
+        several function-emitting paths gets its own without threading another
+        field through the save/restore tuples.  It is emitted at the first
+        bail site, which means it decrefs the locals that exist *then* — the
+        same window an early `return` inside a loop already has, since
+        `_emit_return` calls `_emit_scope_decref` at its own emission point
+        too.
+        """
+        blk = getattr(self.function, "_fpy_exc_exit", None)
+        if blk is not None:
+            return blk
+        blk = self.function.append_basic_block("fn.exc_exit")
+        # Attach before emitting: _emit_scope_decref can reach code that
+        # asks for the block again, and a second append would leave the
+        # first one unterminated.
+        self.function._fpy_exc_exit = blk
+        saved_builder = self.builder
+        self.builder = _SafeIRBuilder(blk)
+        try:
+            if not self._current_fn_bare_abi:
+                self.builder.call(self.runtime["shadow_pop"], [])
+            self._emit_scope_decref()
+            ret_ty = self.function.return_value.type
+            if isinstance(ret_ty, ir.VoidType):
+                self.builder.ret_void()
+            elif isinstance(ret_ty, ir.LiteralStructType):
+                self.builder.ret(self._fv_none())
+            elif isinstance(ret_ty, ir.PointerType):
+                self.builder.ret(ir.Constant(ret_ty, None))
+            else:
+                self.builder.ret(ir.Constant(ret_ty, 0))
+        finally:
+            self.builder = saved_builder
+        return blk
+
     def _emit_try_bail_if_exc(self) -> None:
         """If inside a try block, check exc_pending() and bail to the except
         handler immediately.  This prevents side-effectful code from executing
@@ -37829,7 +37958,14 @@ class CodeGen:
         At module level (fastpy_main, not in a try block), check exc_pending()
         and call exc_unhandled() (print traceback + exit) — uncaught exceptions
         must halt execution immediately, not let subsequent code run with
-        garbage values."""
+        garbage values.
+
+        Inside a function that is in neither situation, bail to the function's
+        exception-exit block: the exception is real and pending, and the rest
+        of the statement must not run.  The caller's own bail check is what
+        picks it up, so this arm is what makes an exception raised three calls
+        deep arrive at the handler that named it, rather than whatever the
+        unwound frames raised on their way out."""
         if self._in_try_block:
             target = getattr(self, '_try_except_target', None)
             if target is None:
@@ -37854,6 +37990,18 @@ class CodeGen:
             self.builder.call(self.runtime["exc_unhandled"], [])
             self.builder.unreachable()
             self.builder.position_at_end(cont)
+            return
+        # Inside a function, outside any try: stop the statement and unwind.
+        # Not for a bare-ABI function — it has no shadow frame to pop and no
+        # FV locals to release, and more to the point it was chosen for
+        # scopes whose operations cannot raise.
+        if self._current_fn_bare_abi or self.function.name == "fastpy_main":
+            return
+        pending = self.builder.call(self.runtime["exc_pending"], [])
+        is_exc = self.builder.icmp_signed("!=", pending, ir.Constant(i32, 0))
+        cont = self._new_block("fn.bail_cont")
+        self.builder.cbranch(is_exc, self._fn_exc_exit_block(), cont)
+        self.builder.position_at_end(cont)
 
     def _emit_python_floordiv(self, left: ir.Value, right: ir.Value) -> ir.Value:
         """
@@ -38358,7 +38506,15 @@ class CodeGen:
             result = self.builder.not_(cmp)
             return self.builder.zext(result, i32)
         elif isinstance(node, ast.Subscript):
-            return self._emit_subscript(node)
+            value = self._emit_subscript(node)
+            # A subscript is a raising operation — IndexError, KeyError — and
+            # nothing checked afterwards, so `xs[9] + "s"` ran the `+` on the
+            # miss value and reported the `+`'s TypeError instead.  The check
+            # goes here rather than inside `_emit_subscript`, which has two
+            # dozen return paths that would each need their own.
+            # BUG-PENDING-EXC-CLOBBERED-IN-FUNCTION.
+            self._emit_try_bail_if_exc()
+            return value
         elif isinstance(node, ast.JoinedStr):
             return self._emit_fstring(node)
         elif isinstance(node, ast.List):

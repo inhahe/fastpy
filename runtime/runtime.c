@@ -1057,6 +1057,145 @@ void fastpy_exc_clear(void) {
     fpy_traceback_depth = 0;
 }
 
+/* --- Moving the pending exception aside while cleanup code runs ------------
+ *
+ * A `finally` body, and the `__exit__` call a `with` block ends in, run *while*
+ * an exception is propagating — and they run ordinary code: calls, divisions,
+ * subscripts. Every one of those is followed by a pending-exception check that
+ * unwinds the frame it is in, so with the exception still flagged the first
+ * statement of the cleanup bails before doing anything and a `__exit__` that
+ * prints, or that returns True to suppress, never runs at all.
+ *
+ * So the exception is moved aside for the duration and put back after. This
+ * only became load-bearing when a function outside any `try` gained an
+ * unwind path of its own (BUG-PENDING-EXC-CLOBBERED-IN-FUNCTION); before that
+ * a callee simply ignored the pending flag, which is why `__exit__` used to
+ * work by accident.
+ *
+ * `fastpy_exc_restore` deliberately keeps whatever the cleanup body raised in
+ * preference to the saved exception: in Python a raise inside `finally`
+ * replaces the exception it interrupted.
+ *
+ * The message needs more than a pointer copy. It is a refcounted FpyString
+ * that `fpy_exc_msg_store` reuses in place while the exception slot is its
+ * sole owner, so a raise during the cleanup would otherwise memcpy over the
+ * saved text. Saving therefore *transfers* the slot's reference into the
+ * saved frame and leaves `fpy_exc_msg_cur` empty, which forces the next raise
+ * to allocate.
+ *
+ * The traceback is deliberately not saved: it is only rewritten by a raise,
+ * and a raise during the cleanup is a raise whose exception wins anyway. */
+#define FPY_EXC_SAVE_DEPTH 64
+typedef struct {
+    int type;
+    const char *msg;
+    FpyString *msg_str;      /* owns one reference while saved */
+    size_t msg_cap;
+    void *obj;
+    const char *class_name;
+    int group_inner;
+    int group_inner_count;
+    int group_inner_types[FPY_MAX_GROUP_INNERS];
+} FpyExcSaved;
+static FPY_THREAD_LOCAL FpyExcSaved fpy_exc_saved[FPY_EXC_SAVE_DEPTH];
+/* Counts every save, including ones past the array. Overflowing levels save
+ * nothing *and clear nothing*, so the exception stays pending and the cleanup
+ * behaves the way it did before this existed — degraded, never lost. */
+static FPY_THREAD_LOCAL int fpy_exc_saved_depth = 0;
+
+/* Release a saved frame's reference to its message. */
+static void fpy_exc_saved_release(FpyExcSaved *f) {
+    FpyString *s = f->msg_str;
+    f->msg_str = NULL;
+    f->msg = "";
+    f->msg_cap = 0;
+    if (s && fpy_str_decref(s->data)) free(s);
+}
+
+/* Stash the pending exception (if any) and clear it. */
+void fastpy_exc_save(void) {
+    int d = fpy_exc_saved_depth++;
+    if (d >= FPY_EXC_SAVE_DEPTH) return;
+    FpyExcSaved *f = &fpy_exc_saved[d];
+    f->type = fpy_exc_type;
+    f->msg = fpy_exc_msg;
+    f->msg_str = fpy_exc_msg_cur;
+    f->msg_cap = fpy_exc_msg_cur_cap;
+    f->obj = fpy_exc_obj;
+    f->class_name = fpy_exc_class_name;
+    f->group_inner = fpy_exc_group_inner;
+    f->group_inner_count = fpy_exc_group_inner_count;
+    if (f->group_inner_count > 0) {
+        int n = f->group_inner_count;
+        if (n > FPY_MAX_GROUP_INNERS) n = FPY_MAX_GROUP_INNERS;
+        memcpy(f->group_inner_types, fpy_exc_group_inner_types,
+               sizeof(int) * (size_t)n);
+    }
+    /* The reference moved into the frame; leave the slot owning nothing. */
+    fpy_exc_msg_cur = NULL;
+    fpy_exc_msg_cur_cap = 0;
+    fpy_exc_type = FPY_EXC_NONE;
+    fpy_exc_msg = "";
+    fpy_exc_obj = NULL;
+    fpy_exc_class_name = "";
+    fpy_exc_group_inner = FPY_EXC_NONE;
+    fpy_exc_group_inner_count = 0;
+}
+
+/* Put the stashed exception back, unless the cleanup raised its own. */
+void fastpy_exc_restore(void) {
+    if (fpy_exc_saved_depth <= 0) return;
+    int d = --fpy_exc_saved_depth;
+    if (d >= FPY_EXC_SAVE_DEPTH) return;
+    FpyExcSaved *f = &fpy_exc_saved[d];
+    if (fpy_exc_type != FPY_EXC_NONE) {
+        /* A raise inside the cleanup replaces the one it interrupted. */
+        fpy_exc_saved_release(f);
+        return;
+    }
+    fpy_exc_msg_drop();          /* nothing pending, but the slot may hold "" */
+    fpy_exc_type = f->type;
+    fpy_exc_msg = f->msg;
+    fpy_exc_msg_cur = f->msg_str;   /* reference moves back out of the frame */
+    fpy_exc_msg_cur_cap = f->msg_cap;
+    fpy_exc_obj = f->obj;
+    fpy_exc_class_name = f->class_name;
+    fpy_exc_group_inner = f->group_inner;
+    fpy_exc_group_inner_count = f->group_inner_count;
+    if (f->group_inner_count > 0) {
+        int n = f->group_inner_count;
+        if (n > FPY_MAX_GROUP_INNERS) n = FPY_MAX_GROUP_INNERS;
+        memcpy(fpy_exc_group_inner_types, f->group_inner_types,
+               sizeof(int) * (size_t)n);
+    }
+    f->msg_str = NULL;
+    f->msg = "";
+    f->msg_cap = 0;
+}
+
+/* Discard the stashed exception — `__exit__` returned truthy and suppressed
+ * it. Whatever the cleanup itself raised is left alone. */
+void fastpy_exc_drop(void) {
+    if (fpy_exc_saved_depth <= 0) return;
+    int d = --fpy_exc_saved_depth;
+    if (d >= FPY_EXC_SAVE_DEPTH) {
+        /* This level never saved, so the exception is still pending and
+         * "discard it" means clearing it for real. */
+        fastpy_exc_clear();
+        return;
+    }
+    fpy_exc_saved_release(&fpy_exc_saved[d]);
+}
+
+/* Was an exception stashed by the innermost fastpy_exc_save? `__exit__`
+ * needs to know whether it is being called for an exception or a normal
+ * exit, and by then the flag it would have read has been moved aside. */
+int fastpy_exc_saved_pending(void) {
+    int d = fpy_exc_saved_depth - 1;
+    if (d < 0 || d >= FPY_EXC_SAVE_DEPTH) return 0;
+    return fpy_exc_saved[d].type != FPY_EXC_NONE;
+}
+
 /* Set the actual exception class name (for type(e).__name__) */
 void fastpy_exc_set_class_name(const char *name) {
     fpy_exc_class_name = name;
@@ -1539,6 +1678,8 @@ static FpySymEntry fpy_jit_symbols[] = {
     SYM(fastpy_fv_len), SYM(fastpy_fv_iter_get), SYM(fastpy_fv_subscript), SYM(fastpy_fv_contains), SYM(fastpy_fv_binop),
     SYM(fastpy_raise), SYM(fastpy_raise_with_obj),
     SYM(fastpy_exc_pending), SYM(fastpy_exc_clear),
+    SYM(fastpy_exc_save), SYM(fastpy_exc_restore), SYM(fastpy_exc_drop),
+    SYM(fastpy_exc_saved_pending),
     SYM(fastpy_exc_get_type), SYM(fastpy_exc_get_msg), SYM(fastpy_exc_get_obj),
     SYM(fastpy_exc_name_to_id), SYM(fastpy_exc_set_class_name), SYM(fastpy_exc_get_class_name),
     SYM(fastpy_exc_register_class), SYM(fastpy_exc_class_matches),

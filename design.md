@@ -638,6 +638,58 @@ to be newer than the newest `.h` in the runtime directory. That over-rebuilds �
 any header change rebuilds every `.obj` — and that is the right trade against
 maintaining a per-file dependency list by hand for a build that takes seconds.
 
+**A raise sets a flag, so every path that could carry on has to look at it —
+including the one out of a frame.** The check is emitted by
+`_emit_try_bail_if_exc`, and it had two arms: inside a `try` it branched to the
+handler, at module level it called `fastpy_exc_unhandled`. Inside a function
+that was neither, it emitted *nothing*. So codegen carried straight on with the
+rest of the statement: `return (1 // a) + "s"` did the add on whatever the
+failed divide left in the register, and the add's TypeError overwrote the real
+ZeroDivisionError; `xs.append(1 // a); xs.append(99)` appended both. Functions
+now have a third arm — a lazily created `fn.exc_exit` block, hung off the
+`ir.Function` so one is shared by every check in the body, which pops the
+shadow stack, releases the scope's locals and returns a zero of whatever the
+return type is. A frame unwinds the way a `return` does and the caller's own
+check picks the exception up, which is why the fix needs nothing new at the
+call site.
+
+**Cleanup code runs while an exception is propagating, so for its duration the
+exception must not exist.** This is the other half, and it only became a
+problem once callees started honouring the flag: a `finally` body and the
+`__exit__` a `with` ends in are *ordinary code*, so the first call in them saw
+the pending exception and unwound the frame instead of doing the cleanup —
+`__exit__` never ran at all. The exception is therefore moved aside for the
+duration (`fastpy_exc_save`) and put back after (`fastpy_exc_restore`). Three
+rules fall out and are encoded in the runtime, not in codegen:
+
+- **The save takes the message reference with it.** `fpy_exc_msg_cur` is
+  refcounted and reused in place at refcount 1; if a save left it behind, a
+  raise inside the cleanup would overwrite the saved exception's own text. Save
+  transfers ownership out, so a raise during cleanup has to allocate.
+- **A raise inside the cleanup wins.** `fastpy_exc_restore` keeps whatever is
+  pending in preference to what it saved, because in Python a raise in a
+  `finally` replaces the exception it interrupted. Same for `__exit__`.
+- **Suppression is a drop, not a restore.** A truthy `__exit__` discards the
+  saved exception (`fastpy_exc_drop`), and so does a `return` inside a
+  `finally` — which never reaches the restore at the bottom of the block, so
+  `_emit_return` emits one `exc_drop` per enclosing `finally` it is returning
+  out of (`_finally_exc_depth`). That is not a workaround for the missing
+  restore; it is Python's rule that a `return` in `finally` swallows.
+
+The save stack is fixed-depth (64) and a level past the top saves nothing *and
+clears nothing*, so overflow degrades to the old behaviour rather than to a
+lost exception. The traceback is deliberately not saved: it is diagnostic, and
+the frames it names are still on the shadow stack.
+
+The mirror of the save is a check where the exception becomes visible again.
+The statement after a `try/finally`, and the statement after a `with`, are
+reached on both the normal and the unwinding path, so both ends emit a bail —
+without it a `with` whose body raised would run the rest of the function with a
+pending exception, and the first thing to fail there would replace it. A
+subscript needed the same treatment for the plainer reason that it raises:
+`_emit_subscript`'s result was returned to the expression dispatcher with no
+check, so `[1, 2][9] + "s"` reported TypeError rather than IndexError.
+
 **An exception's stored message is its `str()`, so KeyError has to be repr'd at
 the raise.** fastpy keeps a rendered message and never an args tuple, which
 matches every builtin but one: `KeyError.__str__` is `repr(args[0])`, so a

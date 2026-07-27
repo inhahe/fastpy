@@ -126,41 +126,132 @@ Same for `except LookupError:` over a missing dict key or a list index.
 
 </details>
 
-### BUG-PENDING-EXC-CLOBBERED-IN-FUNCTION. A raise mid-statement inside a function does not stop the statement, so a later raise overwrites it — 2026-07-27
+### BUG-PENDING-EXC-CLOBBERED-IN-FUNCTION. A raise mid-statement inside a function does not stop the statement, so a later raise overwrites it — 2026-07-27 — **FIXED**
 
-**What:** `_emit_try_bail_if_exc` has two arms — bail to the handler when
-`_in_try_block`, bail to `exc_unhandled` at module scope — and **does nothing
-at all** inside a non-`fastpy_main` function that is not itself in a `try`. So
-the raise sets the pending exception and codegen carries straight on emitting
-the rest of the statement. The next operation runs on whatever garbage the
-failed one left, raises its own exception, and that one wins.
+**Fixed:** `_emit_try_bail_if_exc` has a third arm. Inside a function that is
+neither `fastpy_main` nor in a `try`, it now branches to `fn.exc_exit` — a
+block created on first need and cached on the `ir.Function`, so every check in
+the body shares one — which pops the shadow stack, runs `_emit_scope_decref`
+and returns a zero of whatever the return type is. The frame unwinds the way a
+`return` does and the caller's own check picks the exception up, so nothing had
+to change at the call site.
 
-**Reproduce** — should report ZeroDivisionError:
+That exposed the other half. A `finally` body and the `__exit__` a `with` ends
+in run *while* an exception is propagating, and they are ordinary code: once
+callees honoured the pending flag, the first call in the cleanup unwound the
+frame instead of cleaning up, and `__exit__` never ran. The exception is now
+moved aside for the duration and put back after — `fastpy_exc_save` /
+`fastpy_exc_restore` / `fastpy_exc_drop` / `fastpy_exc_saved_pending` in
+`runtime/runtime.c`, over a fixed 64-deep thread-local stack. Three rules live
+in the runtime rather than in codegen:
+
+* the save **transfers the message reference** out of `fpy_exc_msg_cur`, which
+  is reused in place at refcount 1 — otherwise a raise inside the cleanup would
+  overwrite the saved exception's own text;
+* `fastpy_exc_restore` keeps whatever the cleanup raised in preference to what
+  it saved, because a raise in a `finally` replaces the exception it
+  interrupted;
+* a level past the top of the stack saves nothing **and clears nothing**, so
+  overflow degrades to the old behaviour rather than to a lost exception.
+
+Suppression is a drop, not a restore: a truthy `__exit__` discards the saved
+exception, and so does a `return` inside a `finally`, which never reaches the
+restore at the bottom of the block — `_emit_return` emits one `exc_drop` per
+enclosing `finally` it is returning out of (`_finally_exc_depth`). That is
+Python's own rule, not a workaround.
+
+The mirror of the save is a check where the exception becomes visible again:
+the statement after a `try/finally` and the statement after a `with` both emit
+a bail, since both are reached on the normal and the unwinding path. A
+subscript needed one too, for the plainer reason that it raises —
+`_emit_subscript`'s result went back to the expression dispatcher unchecked, so
+`[1, 2][9] + "s"` inside a function reported TypeError instead of IndexError.
+
+Rejected alternative: making `fastpy_raise` a no-op while an exception is
+pending. It looks like it fixes the symptom but breaks `finally`-re-raise,
+where a *deliberate* second raise must replace the first.
+
+Regression coverage in
+`tests/regressions/pending_exception_stops_the_statement.py`.
+
+This was also half of BUG-PRINT-EMITS-BEFORE-ARGS-RAISE; the argument-ordering
+half of that one is still open.
+
+<details><summary>Original report</summary>
+
+`_emit_try_bail_if_exc` had two arms — bail to the handler when
+`_in_try_block`, bail to `exc_unhandled` at module scope — and did nothing at
+all inside a non-`fastpy_main` function that was not itself in a `try`. The
+raise set the pending exception and codegen carried straight on emitting the
+rest of the statement; the next operation ran on whatever the failed one left
+in the register and its exception won.
+
 ```python
 def f(a):
     return (1 // a) + "s"
 try:
     f(0)
 except Exception as e:
-    print(type(e).__name__)     # prints TypeError
+    print(type(e).__name__)     # printed TypeError
 ```
-The `//` raises ZeroDivisionError, the `+` then runs anyway on the garbage
-result and its TypeError replaces it.
+The same hole let side effects past a raise: in
+`xs.append(1 // a); xs.append(99)` both appends ran.
 
-**Where:** `_emit_try_bail_if_exc` in `compiler/codegen.py` (~37798).
+</details>
 
-**Proper fix:** give each function a lazily-created exception-exit block —
-allocated on first need, placed before the normal epilogue, returning a
-zero/`None` value — and give `_emit_try_bail_if_exc` a third arm that branches
-there when the current function is not `fastpy_main` and not inside a `try`.
-Rejected alternative: making `fastpy_raise` a no-op while an exception is
-pending. That looks like it fixes the symptom but changes `finally`-re-raise
-semantics, where a *deliberate* second raise must replace the first.
+### BUG-RETURN-IN-WITH-SKIPS-EXIT. A `return` inside a `with` body never runs `__exit__` — 2026-07-27
 
-This is also half of BUG-PRINT-EMITS-BEFORE-ARGS-RAISE.
+**What:** `_emit_with` lowers the block by hand rather than by building a
+synthetic `try/finally`, and to make `return` inside the body work it pushes a
+**placeholder** onto the finally stack:
 
-**Severity:** wrong exception class reported; a handler selected on class picks
-the wrong arm.
+```python
+self._finally_stack.append([])   # placeholder
+```
+
+`_emit_return` walks that stack and emits each entry's statements before the
+`ret`. An empty list emits nothing, so a `return` out of a `with` body leaves
+the block without calling `__exit__` at all — no cleanup, no suppression, and
+for a `contextlib.contextmanager` the generator is never resumed past its
+`yield`.
+
+**Reproduce** — should print `enter` / `exit` / `r: 1`:
+```python
+class T:
+    def __enter__(self):
+        print("enter"); return self
+    def __exit__(self, a, b, c):
+        print("exit")
+
+def f():
+    with T():
+        return 1
+
+print("r:", f())
+```
+fastpy prints `enter` then `r: 1` — `exit` is missing.
+
+**Where:** `_emit_with` in `compiler/codegen.py` (the
+`self._finally_stack.append([])` placeholder and the `with.finally` block it
+stands in for).
+
+**Proper fix:** the `__exit__` call has to be emitted from somewhere
+`_emit_return` can reach. Either give the finally stack a second entry kind —
+an IR callback instead of a statement list, invoked at each `return` — or hoist
+the `with.finally` body into a helper that both the fall-through path and
+`_emit_return` call. The callback form is the better one: it keeps a single
+copy of the `__exit__` sequence and generalises to `break`/`continue` out of a
+`with`, which have the same hole. Note the exception-suppression path already
+exists in `with.finally`; a `return` must take the *drop* side of it (the
+exception, if any, is already gone, so it reduces to calling `__exit__` with
+`(None, None, None)` and ignoring the result).
+
+**Severity:** silent skipped cleanup — an unclosed file, an unreleased lock, an
+un-finalised context manager — in the single most common shape of `with` use.
+Discovered while writing
+`tests/regressions/pending_exception_stops_the_statement.py`, whose `with`-in-
+a-function case is written to assign-then-return specifically to route around
+this.
 
 ### BUG-PRINT-EMITS-BEFORE-ARGS-RAISE. `print(a, f())` emits `a` before evaluating `f()`, so a raise in the argument leaves partial output — 2026-07-27
 
@@ -3302,6 +3393,29 @@ and the call site keeps the STR tag.
 result through a user function). The `services/fastpy-cat` and
 `services/fastpy-sysinfo` SlateOS utilities use the inline pattern for this
 reason.
+
+### DEBT-REGRESSION-SUITE-FLAKE. `int_float_of_tagged_value` failed once in a full run and passed alone and on re-run — 2026-07-27
+
+**What:** one run of `python -m pytest tests/regressions -q` reported
+`FAILED tests/regressions/int_float_of_tagged_value.py`. Re-running that file
+alone passed, and the very next full run of the whole directory was 341/341.
+Nothing in the compiler or runtime changed between the two runs.
+
+**Suspected cause:** not the test. The harness compiles into a temp directory
+and shells out to `link`/`clang` for every file, so a transient file lock — an
+on-access virus scanner holding the freshly written `.exe`, or a leftover
+handle from the previous test's process — would surface as exactly this: a
+one-off failure with no reproduction. `DEFAULT_TIMEOUT` expiring under load is
+the other candidate; `RunResult.timed_out` would distinguish them.
+
+**What to do:** don't chase it until it recurs, but *do* capture it when it
+does — the failure detail (which of stdout / exit code / stderr differed, and
+whether `timed_out` was set) is the whole diagnosis and is lost as soon as the
+run scrolls past. If it turns out to be a lock, the fix is a bounded retry
+around the link step in `compile_source`, not a retry of the test.
+
+**Severity:** low on its own, corrosive if it becomes normal — a suite with a
+known flaky test is a suite whose failures stop being read.
 
 ---
 

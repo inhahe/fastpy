@@ -226,6 +226,35 @@ def run_executable(exe_path: Path, timeout: float = DEFAULT_TIMEOUT) -> RunResul
         )
 
 
+def _runtime_stderr(stderr: str) -> str:
+    """Drop CPython's *compile-time* warnings from a stderr capture.
+
+    The reference interpreter emits SyntaxWarning while compiling the source
+    — `'return' in a 'finally' block`, an invalid escape sequence, `is` with
+    a literal.  Those say something about the source text under one
+    particular CPython version, not about what the program does, and fastpy
+    is a different compiler with its own diagnostics.  A test that exercises
+    a warned-about-but-legal construct would otherwise be permanently
+    unrunnable, so the warning and the source line it echoes are removed
+    before the presence check.  Anything the program itself writes to stderr
+    — including warnings raised at *run* time — is left alone.
+    """
+    out: list[str] = []
+    skip_echo = False
+    for line in stderr.splitlines(True):
+        if "SyntaxWarning:" in line:
+            # `file:line: SyntaxWarning: msg` is followed by the offending
+            # source line, indented.
+            skip_echo = True
+            continue
+        if skip_echo:
+            skip_echo = False
+            if line[:1].isspace():
+                continue
+        out.append(line)
+    return "".join(out)
+
+
 def _parse_compile_flags(source: str) -> dict:
     """Extract compile flags from a `# compile_flags: ...` comment.
 
@@ -345,8 +374,8 @@ def diff_test(
 
     # We compare stderr loosely — only flag it if one has stderr and the
     # other doesn't, because exact error messages may differ
-    cpython_has_err = bool(cpython_result.stderr.strip())
-    compiled_has_err = bool(compiled_result.stderr.strip())
+    cpython_has_err = bool(_runtime_stderr(cpython_result.stderr).strip())
+    compiled_has_err = bool(_runtime_stderr(compiled_result.stderr).strip())
     if cpython_has_err != compiled_has_err:
         differences.append("stderr presence differs")
 
