@@ -1027,6 +1027,30 @@ return tag (BUG-CALL-SUBSCRIPT-ELEM-KIND-LOST). This hole was *unobservable*
 until the return tag above was fixed, because there was previously nothing
 worth consulting — two holes on one path can each test clean in isolation.
 
+**An inner list's elements have a kind too.** `outer[0][0]` read a heap element
+back as its own address while `x = outer[0]; x[0]` was correct, because binding
+to a name goes through `self.variables` — which records the full nested element
+type — and the double subscript never touches a variable, so it had nowhere to
+ask. Two adjacent holes produced this, and both are the same mistake as above at
+one more level of nesting (BUG-BIGINT-COMPARES-BY-POINTER, nested half):
+
+- `_get_list_elem_type` had an arm for a *slice* subscript (`words[1:]`
+  propagates the source's element type) but none for an *index* subscript, so
+  `outer[0]`'s element type fell to the INT default. The index arm returns the
+  outer element type's own `elem_type`, which is exactly what the slice arm
+  already did one level up.
+- `_infer_list_elem_type` returned a **bare** `ValueType(VKind.LIST)` for a
+  nested list *literal*, recording that the elements were lists but not what
+  *their* elements were. The `[a, b]` name form had propagated the inner type
+  all along; only the literal form threw it away. So `[["one", "two"]]` lost the
+  str kind, and three levels deep (`[[["x", "yy"]]]`) segfaulted — the inner
+  read defaulted to INT and dereferenced an integer as a pointer.
+
+Printing was right in every one of these cases, because `print` uses the runtime
+tag. Only the statically-dispatched operations — `==`, arithmetic, `len` — were
+wrong, which is why it hid: nothing crashed and nothing printed oddly, the
+answers were just false.
+
 **A call's type is the callee's return type — never its arguments'.** Three
 independent passes classify an expression's kind, and all three ended a chain of
 specific cases with the same last-resort heuristic: walk the expression, and if

@@ -22124,13 +22124,19 @@ class CodeGen:
                 _vt = _vt if isinstance(_vt, ValueType) else ValueType.from_old_tag(_vt)
                 if _vt.kind == VKind.LIST and _vt.elem_type is not None:
                     return _vt.elem_type  # element type is already ValueType
-            elif isinstance(node.value, ast.Call):
-                # `f()[0]` had no arm here at all, so it fell through to the
-                # LLVM type of the loaded i64 — INT — no matter what `f`
-                # returned.  A returned list of BigInts therefore compared by
-                # address (`mk()[0] == big` was False) while the identical
-                # literal at module scope was fine.  BUG-CALL-SUBSCRIPT-ELEM-
-                # KIND-LOST.
+            elif isinstance(node.value, (ast.Call, ast.Subscript,
+                                        ast.Attribute)):
+                # Only a *name* had an arm here, so every other way of
+                # naming a list took the LLVM type of the loaded i64 — INT
+                # — whatever it actually held.  `f()[0]` compared a returned
+                # BigInt by address while `xs = f(); xs[0]` was fine
+                # (BUG-CALL-SUBSCRIPT-ELEM-KIND-LOST), and `outer[0][0]` did
+                # the same one level down even though `outer`'s element type
+                # records the inner element kind perfectly well
+                # (BUG-BIGINT-COMPARES-BY-POINTER).  `_get_list_elem_type`
+                # already knows how to answer for all three shapes; it was
+                # simply never asked.  The recursion is well-founded — it
+                # always descends to a strictly smaller node.
                 if self._is_list_expr(node.value):
                     _et = self._get_list_elem_type(node.value)
                     if _et.kind != VKind.UNKNOWN:
@@ -22589,6 +22595,16 @@ class CodeGen:
                     return ValueType(VKind.FLOAT)
             # Check if elements are nested lists or tuples (both stored as list pointers)
             if isinstance(first, (ast.List, ast.ListComp, ast.Tuple)):
+                # Recurse so the *inner* element kind survives too.  This
+                # returned a bare LIST, so `[["one", "two"]]` knew its
+                # elements were lists but not that theirs were strs, and
+                # `lit[0][1]` fell to the INT default — `len()` answered 0
+                # and `==` compared addresses.  The `[a, b]` arm below has
+                # propagated the inner type all along; the literal form
+                # simply never did.  BUG-BIGINT-COMPARES-BY-POINTER.
+                _inner = self._infer_list_elem_type(first)
+                if _inner.kind != VKind.INT:
+                    return ValueType(VKind.LIST, elem_type=_inner)
                 return ValueType(VKind.LIST)
             # Check if elements are dicts
             if isinstance(first, (ast.Dict, ast.DictComp)):
@@ -35513,6 +35529,21 @@ class CodeGen:
         if (isinstance(node, ast.Subscript)
                 and isinstance(node.slice, ast.Slice)):
             return self._get_list_elem_type(node.value)
+        # Index subscript: `outer[0]` where `outer` is a list of lists.  The
+        # element type of that inner list is the *outer* element's own
+        # element type, which `outer` already records.  Only the slice case
+        # above had an arm, so this fell through to the INT default and
+        # `outer[0][0]` read a heap element back as its own address —
+        # `outer[0][0] == inner[0]` answered False while the identical read
+        # through a temporary (`x = outer[0]; x[0]`) was correct.
+        # BUG-BIGINT-COMPARES-BY-POINTER.
+        if (isinstance(node, ast.Subscript)
+                and not isinstance(node.slice, ast.Slice)
+                and self._is_list_expr(node.value)):
+            _outer_elem = self._get_list_elem_type(node.value)
+            if (_outer_elem.kind == VKind.LIST
+                    and _outer_elem.elem_type is not None):
+                return _outer_elem.elem_type
         # Infer from AST
         return self._infer_list_elem_type(node)
 

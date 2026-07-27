@@ -3754,7 +3754,7 @@ carry a file read through one more local.
 
 **Test:** `tests/regressions/aliased_local_keeps_its_kind.py`.
 
-### BUG-BIGINT-COMPARES-BY-POINTER. A BigInt compares by address unless an operand is statically BIGINT — 2026-07-27
+### BUG-BIGINT-COMPARES-BY-POINTER. A BigInt compares by address unless an operand is statically BIGINT — 2026-07-27 — **PARTLY FIXED** (nested-container half fixed; the parameter half remains)
 
 **What:** a BigInt-tagged value that reaches `==` without the compiler
 *statically* knowing one side is a BigInt is compared as a raw pointer, so
@@ -3797,6 +3797,40 @@ BIGINT-kinded `Name` is one of the few shapes the inference does keep.
 That is also why printing is correct throughout: `print` takes the runtime
 tag, which was right all along. Only the statically-dispatched operations are
 wrong.
+
+**Nested-container half FIXED 2026-07-27.** `outer[0][0] == inner[0]` now
+answers True. Two adjacent holes, both in element-kind inference:
+
+- `_get_list_elem_type` had an arm for a *slice* subscript (`words[1:]`
+  propagates the source's element type) but **none for an index subscript**, so
+  `outer[0]`'s element type fell to the INT default. The tell was that the same
+  read through a temporary was correct all along — `x = outer[0]; x[0]` — since
+  binding to a name goes through `self.variables`, which records the full
+  nested element type. Only the double subscript, which never touches a
+  variable, had nowhere to ask.
+- `_infer_list_elem_type` returned a **bare** `ValueType(VKind.LIST)` for a
+  literal nested list, so `[["one", "two"]]` knew its elements were lists but
+  not that theirs were strs. The `[a, b]` (Name elements) arm right below it
+  had propagated the inner type all along; the literal form simply never did.
+  Three levels deep (`[[["x", "yy"]]]`) **segfaulted** on this, not merely
+  answered wrongly.
+
+Also added an `ast.Subscript`/`ast.Attribute` case to the `_infer_type_tag`
+subscript arm alongside the `ast.Call` one, so the recovered type is actually
+consulted.
+
+Regression test: `tests/regressions/nested_list_element_keeps_its_kind.py`
+(BigInt/str/float/int elements, literal nesting with no intermediate name,
+three levels deep, and iteration — each paired with the through-a-temporary
+form that already worked, so a regression in either is visible).
+
+**The parameter half is still open.** `pick(vs): return vs[0]` called as
+`pick([big])` still compares by address. `_func_ret_types` and
+`_call_site_param_types` are both *empty* for that program: the return
+propagation has no arm for `return <subscript>`, and the call-site pass records
+nothing for a list-literal argument, so the parameter never acquires an element
+type. That is a separate piece of work — parameter element-type propagation —
+not a variation of what was just fixed.
 
 **Not fixed by the BUG-RETURNED-LIST-ELEM-TAG-LOST fix (re-checked
 2026-07-27).** That fix replaced the yes/no tag in the *return* pre-pass
