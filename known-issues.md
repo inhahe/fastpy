@@ -8,7 +8,7 @@ how to reproduce it, and what the proper fix looks like.
 
 ## Active Bugs
 
-### BUG-RETURN-OF-GLOBAL-LOSES-ITS-KIND. `return <module-level name>` is typed int, so a returned str prints as a pointer and a returned float as its bit pattern — 2026-07-27
+### BUG-RETURN-OF-GLOBAL-LOSES-ITS-KIND. `return <module-level name>` is typed int, so a returned str prints as a pointer and a returned float as its bit pattern — 2026-07-27 — **FIXED**
 
 **Reproduce:**
 
@@ -72,6 +72,196 @@ against the enclosing scope's `local_vt` first and then the module `var_types`,
 the way `_csa_list_literal_tag`'s callers already thread both dicts. This is
 the last-resort float-evidence walk's fault only for `eq_f`; the primary hole
 is the missing name lookup.
+
+**Fixed** by `_scope_global_tags(node)` (codegen.py, beside `_scope_file_names`,
+which answers the structurally identical question for `open()` locals). It
+returns the module-level names the scope only *reads* — every name the scope
+binds is dropped, whether by a parameter (its own or a nested function's), an
+assignment including one under `global`, a loop / `with` / `except` /
+comprehension target, an import, or a nested `def`/`class` — paired with the
+tag `_csa_var_types` already recorded for it. Deliberately flow-insensitive; it
+declines rather than guesses.
+
+It also drops any name the *module* binds more than once, or that any `global`
+statement names. `_csa_var_types` is last-writer-wins and has no arm for a
+plain int, so `x = 10` followed later by `x = "global"` records `str`; reading
+that as a return type compiled `return x` to a str return and printed the
+integer 10 through it, an access violation.
+`tests/cpython_adapted/test_scope.py` is that program and caught it in the full
+suite. The trustworthy set is built beside the tags themselves, as
+`_csa_global_single_bind`. Declining even when two bindings agree is
+deliberate — knowing they agree means classifying each assignment separately,
+and a second copy of that classifier is worse to own than a missed refinement.
+See BUG-GLOBAL-KIND-CHANGING-REBIND-USES-STALE-TAG for the half of that hole
+which is still open (the body-level read).
+
+Both passes call it, the way both already call `_scope_file_names`:
+
+* `_duf_detect_ret_type` **seeds the kind sets** (`str_vars`, `list_vars`,
+  `dict_vars`, `obj_vars`, `float_vars`) from it, rather than adding one
+  `return <global>` arm. Seeding is what makes the aliased form `t = s;
+  return t` work too — the alias fixpoint further down already propagates set
+  membership, it just had nothing to propagate. The kinds with no set of their
+  own (bytes, BigInt, Decimal, complex) get an explicit `is_ptr → i8_ptr` arm.
+* `_duf_determine_ret_tag` gets a matching `return <global>` arm placed after
+  the `str_vars`/`dict_vars` ones, so a global tuple, set, bytes or BigInt is
+  named rather than left to the `i8_ptr` branch's `"ptr"` default — which
+  means *list*, the worst available guess because every pointer fits it.
+
+Widening the *tag* alone would not have been enough: `_duf_select_abi` reads
+the same inference, and the pre-fix function was given the bare i64 ABI, whose
+return slot has nowhere to put a pointer. The type and the tag had to move
+together. Regression test:
+`tests/regressions/returning_a_module_global_keeps_its_kind.py` (pre-fix it
+segfaults on the first line; post-fix it matches CPython exactly).
+
+**Two neighbours this uncovered but did not fix** — both pre-existing and
+independent of globals, verified by compiling the same programs with the
+committed compiler: `BUG-TUPLE-RETURN-SEGFAULTS` and
+`BUG-RETURN-OF-BYTES-OR-BIGINT-VAR-PRINTS-POINTER`, below.
+
+### BUG-GLOBAL-KIND-CHANGING-REBIND-USES-STALE-TAG. A module-level name reassigned to a different kind keeps the first kind's tag forever — 2026-07-27
+
+**Reproduce** (CPython prints `43`):
+
+```python
+v = "hello"
+v = 42
+
+def peek_v():
+    return v
+
+print(peek_v() + 1)   # TypeError: unsupported operand type(s) for +: 'str' and 'int'
+```
+
+and without the function at all, where the wrong tag is silent rather than
+loud:
+
+```python
+x = 10
+x = "global"
+print(x)              # correct, "global" — module scope reads the real value
+```
+
+**Where:** `_csa_build_var_types` (codegen.py ~9722) is last-writer-wins *and*
+has no arm for a plain `int` constant, so the second assignment writes nothing
+and the tag stays `"str"` from the first. Two independent faults compound: the
+missing int arm means "reassigned to an int" is indistinguishable from "not
+reassigned", and last-writer-wins means even a recorded second kind would be
+wrong for every use before it.
+
+**Impact today is bounded but real.** `_scope_global_tags` declines for any
+multiply-bound name (see BUG-RETURN-OF-GLOBAL-LOSES-ITS-KIND), so the *return*
+path is safe; what remains wrong is the body-level read, which is what raises
+above. `tests/cpython_adapted/test_scope.py` contains this exact shape
+(`x = 10` at line 5, `x = "global"` at line 95) and passes only because
+`read_global()` is called before the rebind and nothing tests `x`'s kind after.
+
+**Proper fix:** `_csa_var_types` needs to be a *flow-sensitive* answer, or
+honestly admit it is not one. The cheap and correct version is to record a
+name whose module-level bindings disagree as `"mixed"` rather than as the last
+one seen — every consumer already knows what `"mixed"` means, and it routes the
+read through the runtime tag, which is exactly right for a name whose kind
+genuinely varies. That needs the per-assignment tag, i.e. the arm chain in
+`_csa_build_var_types` refactored into a function returning a tag for one
+`ast.expr` instead of writing straight into the dict — worth doing anyway,
+since `_csa_list_literal_tag` was already split out of it for the same reason.
+Once that exists, `_csa_global_single_bind` can be replaced by "the bindings
+all agree", which is strictly more precise than "there is only one".
+
+### BUG-TUPLE-RETURN-SEGFAULTS. A function that returns a tuple crashes on any use of the result — 2026-07-27
+
+**Reproduce** (compiles clean; CPython prints `(10, 20) 2 10` twice):
+
+```python
+def loc_t():
+    q = (10, 20)
+    return q
+
+def lit_t():
+    return (10, 20)
+
+print(loc_t(), len(loc_t()), loc_t()[0])   # segfault, no output at all
+```
+
+Not about globals: the *literal* form `lit_t` crashes too, so nothing in the
+scope-resolution path is involved. Found while checking whether
+`_scope_global_tags` should seed `list_vars` for a global tuple — it does, and
+a global tuple then behaves exactly like these two, i.e. still broken.
+
+**Also missing, and probably the first thing to fix:** `_csa_build_var_types`
+(codegen.py ~9722) has arms for `ast.List`/`ast.ListComp`, `ast.Dict`,
+`ast.Set` and the scalar `ast.Constant`s, but **no `ast.Tuple` arm**, so a
+module-level `t = (10, 20)` gets no entry in `_csa_var_types` at all. Adding
+one is a producer-side change that every consumer of `_csa_var_types` sees, so
+it wants the full suite behind it — and it is pointless until the segfault
+above is fixed, since the tag would only route the crash differently.
+
+**Where to look:** `returns_list = True` is set for `ast.Tuple` returns at
+`_duf_determine_ret_tag` (codegen.py ~11738, the
+`isinstance(n.value, (ast.List, ast.ListComp, ast.Tuple))` arm), so a returned
+tuple is *tagged* as a list. If the callee actually builds an `FpyTuple` and
+the caller unpacks it as an `FpyList`, that is the crash — the same
+"guessing list for an unrecognised pointer" failure named in
+BUG-BIGINT-COMPARES-BY-POINTER, here in the producer rather than the consumer.
+
+### BUG-RETURN-OF-BYTES-OR-BIGINT-VAR-PRINTS-POINTER. A bytes or BigInt held in a variable and then returned comes back as its address — 2026-07-27
+
+**Reproduce** (compiles clean, no crash; only `lit_bs` is right):
+
+```python
+def lit_bs():
+    return b"abc"
+
+def loc_bs():
+    q = b"abc"
+    return q
+
+def lit_big():
+    return 2 ** 80
+
+def loc_big():
+    q = 2 ** 80
+    return q
+
+print(lit_bs(), len(lit_bs()))     # b'abc' 3        — correct
+print(loc_bs(), len(loc_bs()))     # 140698536040096 0
+print(lit_big(), lit_big() + 1)    # 2089960906288 2089960907505
+print(loc_big(), loc_big() + 1)    # 2089960906960 2089960905969
+```
+
+CPython prints `b'abc' 3` / `b'abc' 3` /
+`1208925819614629174706176 1208925819614629174706177` twice.
+
+Note `lit_big()` is wrong too, so this is not only about the variable: only a
+*bytes literal* returned directly survives. The arithmetic is wrong in a
+telling way — `lit_big() + 1` differs from `lit_big()` by 1217, i.e. the
+addition happened on the address, so the caller is reading the returned pointer
+as a naked i64 rather than an FpyValue. `len(loc_bs())` answering 0 is the same
+pointer measured as a length.
+
+**Where:** the same two passes as BUG-RETURN-OF-GLOBAL-LOSES-ITS-KIND, but the
+*local-variable* side of them. `_duf_detect_ret_type`'s assignment scan
+(codegen.py ~11198) has arms that add a target to `str_vars`, `list_vars`,
+`dict_vars` and `obj_vars`, but there is no set for bytes, BigInt, Decimal or
+complex, so `q = b"abc"` records nothing and `return q` matches no arm. The
+proper fix is the one this family keeps pointing at: stop expressing "which
+kind is this local" as four ad-hoc boolean sets and carry a `dict[str,
+ValueType]` instead, which has a slot for every `VKind` by construction. Doing
+that would subsume this entry, most of BUG-RETURN-OF-GLOBAL-LOSES-ITS-KIND's
+machinery, and the `elem_type=VKind.INT` conflation below.
+
+**The refactor is bounded.** `str_vars`, `list_vars`, `dict_vars`, `obj_vars`
+and `float_vars` are mentioned at 66 lines, all of them inside
+`_duf_detect_ret_type` (codegen.py 11106–11705), `_duf_determine_ret_tag`
+(11708–11970) and the single call site at 12290/12424 — the sets are created,
+consumed and discarded there and escape nowhere else. Replacing them with one
+`kinds: dict[str, ValueType]` is therefore a self-contained change: every
+`x.add(name)` becomes `kinds[name] = ValueType(...)`, every `name in x_vars`
+becomes a kind test, the alias fixpoint at 11313 becomes a plain dict copy, and
+`_duf_detect_ret_type`'s six-tuple return collapses to three values. It also
+removes the standing hazard that `list_vars` currently means "list *or* dict
+*or* set *or* tuple", which is why a returned tuple is tagged as a list.
 
 ### BUG-UNCALLED-FN-PARAM-NAME-POISONS-A-CALLED-ONE. An *uncalled* function whose parameter happens to share a name with another function's parameter makes that other function segfault — 2026-07-27
 

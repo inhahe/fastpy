@@ -1098,6 +1098,44 @@ The copies were observably identical for as long as no list argument carried
 an element kind, and diverged the day the classifier above learned to supply
 one.
 
+**A scope's names come from three places, and the return inference used to
+know only two.** A function's LLVM return type and its return tag are both
+inferred from four sets of names — `str_vars`, `list_vars`, `dict_vars`,
+`obj_vars` — assembled by `_duf_detect_ret_type` from the function's own
+assignments and from its parameters as the call sites described them. A
+module-level global that the function merely *reads* is neither, so it was in
+no set, matched no `return <Name>` arm, and fell through to the `int` default:
+`s = "hello"` with `def direct(): return s` handed the caller a live string
+pointer typed as an integer. `_scope_global_tags(node)` supplies the third
+place — the module-level names the scope never binds, paired with the tag the
+CSA pre-pass already recorded for them — and is used exactly the way
+`_scope_file_names` is, by both passes independently. It is seeded *into* the
+kind sets rather than consulted by one new arm, because that is what makes the
+aliased form `t = s; return t` work: the alias fixpoint already propagates set
+membership and only lacked something to propagate. Widening the tag alone would
+not have sufficed, since `_duf_select_abi` reads the same inference and had
+given the function a bare i64 whose return slot cannot hold a pointer — the
+type and the tag move together.
+
+Which names it may claim is the interesting half. `_csa_var_types` is
+last-writer-wins and has no arm for a plain int, so a module saying `x = 10`
+and later `x = "global"` records `str` — a tag wrong for every call before the
+second line. That is tolerable for the call-site analysis, which treats the map
+as a hint and can only lose precision by being wrong; it is not tolerable for a
+consumer that picks a *return type*, and the first full-suite run turned the
+old wrong answer into a crash. So the map is paired with
+`_csa_global_single_bind`, the names the module binds exactly once and that no
+`global` statement mentions, and everything else is declined. The same
+discipline `_scope_file_names` uses: claim a name only when nothing else in
+range ever binds it, and decline rather than guess.
+
+The four sets are themselves the next thing to go. They can express str, list,
+dict and obj and nothing else, so a local holding bytes, a BigInt, a Decimal or
+a complex records nothing at all and `q = b"abc"; return q` returns an address.
+The replacement is a single `dict[str, ValueType]`, which has a slot for every
+`VKind` by construction; it would subsume this hole, most of the machinery
+above, and the `elem_type=VKind.INT` conflation described earlier.
+
 **A call's type is the callee's return type — never its arguments'.** Three
 independent passes classify an expression's kind, and all three ended a chain of
 specific cases with the same last-resort heuristic: walk the expression, and if

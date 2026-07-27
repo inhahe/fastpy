@@ -9849,6 +9849,51 @@ class CodeGen:
                             # Unknown function on imported module —
                             # assume bridge result (pyobj).
                             var_types[tgt.id] = "pyobj"
+
+        # Which of these names a single static tag can actually describe.
+        #
+        # `var_types` is last-writer-wins and, worse, has no arm at all for a
+        # plain int, so a module that says `x = 10` and later `x = "global"`
+        # leaves the tag `str` — a tag that is wrong for every call made
+        # before line 95.  That is harmless for the call-site analysis, which
+        # reads `var_types` as a hint and can only lose precision by being
+        # wrong; it is not harmless for `_scope_global_tags`, whose answer
+        # picks a function's *return type*, and `return x` compiled to a str
+        # return crashed printing the integer 10 through it.
+        #
+        # Rebinding is exactly the case where one static tag cannot be right,
+        # so the trustworthy set is the names bound once and only once.
+        # Declining even when two bindings agree is deliberate: knowing they
+        # agree means classifying each assignment separately, and a second
+        # copy of the classifier above is a worse thing to own than a missed
+        # refinement.  Same discipline as `_scope_file_names`, which claims a
+        # name only when nothing else in the scope ever binds it.
+        # BUG-RETURN-OF-GLOBAL-LOSES-ITS-KIND.
+        _bound_once: set[str] = set()
+        _rebound: set[str] = set()
+        for node in _walk_skip_funcs(tree):
+            _targets: list = []
+            if isinstance(node, ast.Assign):
+                _targets = list(node.targets)
+            elif isinstance(node, (ast.AugAssign, ast.AnnAssign,
+                                   ast.NamedExpr)):
+                _targets = [node.target]
+            elif isinstance(node, (ast.For, ast.AsyncFor, ast.comprehension)):
+                _targets = [node.target]
+            elif isinstance(node, (ast.With, ast.AsyncWith)):
+                _targets = [i.optional_vars for i in node.items
+                            if i.optional_vars is not None]
+            for tgt in _targets:
+                for nm in ast.walk(tgt):
+                    if isinstance(nm, ast.Name):
+                        (_rebound if nm.id in _bound_once
+                         else _bound_once).add(nm.id)
+        # A `global` declaration means a *function body* may rebind the name,
+        # and the walk above deliberately never enters one.
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Global):
+                _rebound.update(node.names)
+        self._csa_global_single_bind = _bound_once - _rebound
         return var_types
 
     def _analyze_call_sites(self, tree: ast.Module) -> None:
@@ -11195,6 +11240,29 @@ class CodeGen:
                         dict_vars.add(_pname)
                     elif isinstance(_def, ast.Constant) and isinstance(_def.value, str):
                         str_vars.add(_pname)
+            # Module-level globals this function only reads.  Their kind was
+            # known all along — the CSA pre-pass recorded it — but nothing
+            # carried it into these sets, so `return s` for a global string
+            # matched no arm, fell through to the i64 default, and handed the
+            # caller a pointer typed as an integer.  Seeding the sets rather
+            # than adding one `return <global>` arm is what makes the aliased
+            # form `t = s; return t` work too: the alias fixpoint below already
+            # propagates membership, it just had nothing to propagate.
+            # BUG-RETURN-OF-GLOBAL-LOSES-ITS-KIND.
+            _global_tags = self._scope_global_tags(node)
+            for _gname, _gtag in _global_tags.items():
+                _gk = self._tag_kind(_gtag)
+                if _gk == VKind.STR:
+                    str_vars.add(_gname)
+                elif _gk == VKind.DICT:
+                    list_vars.add(_gname)
+                    dict_vars.add(_gname)
+                elif _gk in (VKind.LIST, VKind.SET, VKind.TUPLE):
+                    list_vars.add(_gname)
+                elif _gk == VKind.OBJ:
+                    obj_vars.add(_gname)
+                elif _gk == VKind.FLOAT:
+                    float_vars.add(_gname)
             for n in ast.walk(node):
                 if isinstance(n, ast.Assign):
                     for tgt in n.targets:
@@ -11352,6 +11420,17 @@ class CodeGen:
                         ret_type = i8_ptr
                         break
                     if isinstance(n.value, ast.Name) and n.value.id in obj_vars:
+                        ret_type = i8_ptr
+                        break
+                    # `return <module-level global>` whose kind carries a
+                    # pointer but has no set of its own to live in — bytes,
+                    # BigInt, Decimal, complex.  The seeding above covers the
+                    # four kinds that do have one.
+                    # BUG-RETURN-OF-GLOBAL-LOSES-ITS-KIND.
+                    if (isinstance(n.value, ast.Name)
+                            and (_gt := _global_tags.get(n.value.id))
+                            is not None
+                            and self._tag_kind(_gt).is_ptr):
                         ret_type = i8_ptr
                         break
                     # Check if returning a JoinedStr (f-string)
@@ -11711,6 +11790,12 @@ class CodeGen:
         # See _duf_detect_ret_type: which locals hold an open() file has to be
         # read off the AST here too.  BUG-FILEREAD-FN-RETTAG.
         file_names = self._scope_file_names(node)
+        # And which module-level globals this scope only reads, for the same
+        # reason: the sets handed to us cover str/dict/obj, but the kinds with
+        # no set of their own reached no arm at all and the i8_ptr branch
+        # below then fell through to its "ptr" default — which means *list*.
+        # BUG-RETURN-OF-GLOBAL-LOSES-ITS-KIND.
+        _global_tags = self._scope_global_tags(node)
         for n in ast.walk(node):
             if isinstance(n, ast.Return) and n.value is not None:
                 if (_fk := self._file_method_kind(
@@ -11741,6 +11826,26 @@ class CodeGen:
                         and has_return_value
                         and n.value.id in dict_vars):
                     returns_dict = True
+                elif (isinstance(n.value, ast.Name)
+                        and (_gt := _global_tags.get(n.value.id)) is not None
+                        and (_gk := self._tag_kind(_gt)) is not None
+                        and (_gk.is_ptr or _gk == VKind.FLOAT)):
+                    # `return <module-level global>`, named explicitly rather
+                    # than left to the i8_ptr branch's "ptr" default, so a
+                    # global tuple, set, bytes or BigInt is not reported as a
+                    # list.  BUG-RETURN-OF-GLOBAL-LOSES-ITS-KIND.
+                    if _gk == VKind.STR:
+                        returns_str = True
+                    elif _gk == VKind.DICT:
+                        returns_dict = True
+                    elif _gk in (VKind.LIST, VKind.TUPLE):
+                        returns_list = True
+                    elif _gk == VKind.SET:
+                        returns_set = True
+                    elif _gk == VKind.BYTES:
+                        returns_bytes = True
+                    elif _gk in (VKind.BIGINT, VKind.DECIMAL, VKind.COMPLEX):
+                        returns_ptr_kind = _gk
                 elif (isinstance(n.value, ast.Call)
                         and isinstance(n.value.func, ast.Attribute)
                         and n.value.func.attr in (
@@ -48329,6 +48434,78 @@ class CodeGen:
                 if isinstance(n.target, ast.Name):
                     others.add(n.target.id)
         return files - others
+
+    def _scope_global_tags(self, node) -> dict[str, str]:
+        """Module-level names a function only *reads*, with their tags.
+
+        A function's return type and return tag are inferred from sets —
+        `str_vars`, `list_vars`, `dict_vars`, `obj_vars` — built from the
+        function's own assignments and from its parameters.  A module-level
+        global that the function merely reads is in none of them, so
+
+            s = "hello"
+            def direct():
+                return s
+
+        fell through every arm to the `int` default and handed the caller a
+        live string pointer typed as an integer, which printed as
+        140697798825664.  BUG-RETURN-OF-GLOBAL-LOSES-ITS-KIND.
+
+        Nothing here has to be inferred: the CSA pre-pass already recorded
+        every module-level name's tag in `_csa_var_types`, and its own
+        `_func_ret_types` gets these functions right.  The only question is
+        which of those names still mean the module's binding once inside this
+        scope, and the honest answer is "the ones this scope never binds".
+        Any name bound here — a parameter (this function's or a nested one's),
+        an assignment including one under `global`, a loop, `with` or `except`
+        target, an import, a nested def or class — is dropped, because after
+        the rebinding the module's tag is no longer evidence about it.
+        Deliberately flow-insensitive: it declines rather than guesses.
+
+        A name the *module* binds more than once is dropped as well, since
+        `_csa_var_types` is last-writer-wins and cannot describe a name whose
+        kind changes over the module's lifetime; see
+        `_csa_global_single_bind`, built beside the tags themselves.
+        """
+        _tags = getattr(self, '_csa_var_types', None)
+        _single = getattr(self, '_csa_global_single_bind', None)
+        if not _tags or _single is None:
+            return {}
+        shadowed: set[str] = set()
+        for sub in ast.walk(node):
+            if isinstance(sub, ast.arg):
+                shadowed.add(sub.arg)
+            elif isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                  ast.ClassDef)):
+                if sub is not node:
+                    shadowed.add(sub.name)
+            elif isinstance(sub, ast.Assign):
+                for tgt in sub.targets:
+                    for nm in ast.walk(tgt):
+                        if isinstance(nm, ast.Name):
+                            shadowed.add(nm.id)
+            elif isinstance(sub, (ast.AugAssign, ast.AnnAssign, ast.NamedExpr)):
+                for nm in ast.walk(sub.target):
+                    if isinstance(nm, ast.Name):
+                        shadowed.add(nm.id)
+            elif isinstance(sub, (ast.For, ast.AsyncFor, ast.comprehension)):
+                for nm in ast.walk(sub.target):
+                    if isinstance(nm, ast.Name):
+                        shadowed.add(nm.id)
+            elif isinstance(sub, (ast.With, ast.AsyncWith)):
+                for item in sub.items:
+                    if item.optional_vars is not None:
+                        for nm in ast.walk(item.optional_vars):
+                            if isinstance(nm, ast.Name):
+                                shadowed.add(nm.id)
+            elif isinstance(sub, ast.ExceptHandler):
+                if sub.name:
+                    shadowed.add(sub.name)
+            elif isinstance(sub, (ast.Import, ast.ImportFrom)):
+                for alias in sub.names:
+                    shadowed.add((alias.asname or alias.name).split('.')[0])
+        return {k: v for k, v in _tags.items()
+                if v is not None and k in _single and k not in shadowed}
 
     def _file_method_kind(self, node: ast.expr, file_names: set[str]):
         """VKind of a `<file>.read()`-style call, or None if it is not one.
