@@ -4429,6 +4429,19 @@ class CodeGen:
             self.variables[gname] = (gvar, gtag)
         self._loop_stack = []
 
+        # Module scope needs the same one-slot-per-name guarantee a function
+        # body gets.  Without this scan `t = 0.0` opened a `double` alloca and
+        # a later `t = t + mixed()` opened a second `{i32, i64}` one; the load
+        # inside a loop stayed bound to the first, so the accumulator read 0
+        # on every iteration.  Names backed by an actual LLVM global are
+        # excluded — their storage is not an alloca and cannot be widened.
+        # BUG-VAR-RETYPED-MIDSCOPE-STALE-SLOT.
+        self._fv_forced_locals = self._scan_fv_forced_locals(
+            [s for s in tree.body
+             if not isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                   ast.ClassDef))],
+            set(self._global_vars))
+
         # Register classes with the runtime.
         # Deduplicate by identity: monomorphized aliases (e.g. "Counter"
         # → same ClassInfo as "Counter__i") must not be registered twice.
@@ -6854,82 +6867,202 @@ class CodeGen:
                         return True
         return False
 
+    # Arithmetic operators for which one float operand forces a float result.
+    # `/` is handled separately (always float) and `**` too (`2 ** -1` is a
+    # float from two ints).  Bitwise and shift operators are absent because
+    # CPython rejects a float operand outright.
+    _SCALAR_ARITH_OPS = (ast.Add, ast.Sub, ast.Mult, ast.Mod, ast.FloorDiv)
+
+    @staticmethod
+    def _scalar_kinds_join(a: 'set[str] | None',
+                           b: 'set[str] | None') -> 'set[str] | None':
+        """Union of two kind sets, with None ("no constraint") absorbing."""
+        return None if a is None or b is None else a | b
+
     @classmethod
-    def _literal_scalar_kind(cls, expr: ast.expr) -> 'str | None':
-        """The scalar kind of *expr* — "int" or "float" — when the AST says so.
+    def _scalar_kinds_of(cls, expr: ast.expr,
+                         local_kinds: 'dict[str, set[str] | None]',
+                         ) -> 'set[str] | None':
+        """The scalar kinds — "int" and/or "float" — *expr* can evaluate to.
 
         The companion of `_csa_literal_ptr_kind` for the other half of the
-        type space, and just as deliberately narrow: it is used only to spot
-        returns that *disagree*, so anything not recognised here must read as
-        "no constraint" rather than as a conflict.  A `return helper()` or a
-        `return x` says nothing and must stay silent, or every function with
-        one unclassifiable return would be pushed off the bare ABI.
+        type space, and just as deliberately narrow: it exists only to spot
+        values that have *more than one* kind, so anything unrecognised must
+        answer `None` — "no constraint" — rather than guess.  A bare `None`
+        answer for `helper()` is what keeps one unclassifiable return from
+        pushing a whole function off the bare ABI.
 
-        `bool` counts as "int" because that is how a bare scalar return
-        encodes it — a function alternating `return True` with `return 2.5`
-        loses the tag exactly as an int/float one does.
+        An empty set is not the same as `None`: it means "nothing has been
+        classified yet", the starting point of the `_local_scalar_kinds`
+        fixpoint below, and it must not read as a constraint either.
+
+        `bool` counts as "int" because that is how a bare scalar encodes it —
+        a value alternating `True` with `2.5` loses its tag exactly as an
+        int/float one does.
         """
         if isinstance(expr, ast.Constant):
             v = expr.value
             if isinstance(v, bool):
-                return "int"
+                return {"int"}
             if isinstance(v, float):
-                return "float"
+                return {"float"}
             if isinstance(v, int):
-                return "int"
+                return {"int"}
             return None
+        if isinstance(expr, ast.Name):
+            return local_kinds.get(expr.id)
+        # A conditional expression evaluates to whichever arm ran, so it has
+        # both arms' kinds.  This is why `1 if c else 2.5` is a two-kind value
+        # rather than the promoted double it used to compile to.
+        if isinstance(expr, ast.IfExp):
+            return cls._scalar_kinds_join(
+                cls._scalar_kinds_of(expr.body, local_kinds),
+                cls._scalar_kinds_of(expr.orelse, local_kinds))
         if isinstance(expr, ast.UnaryOp):
             if isinstance(expr.op, (ast.USub, ast.UAdd)):
-                return cls._literal_scalar_kind(expr.operand)
+                return cls._scalar_kinds_of(expr.operand, local_kinds)
             if isinstance(expr.op, ast.Not):
-                return "int"  # bool
+                return {"int"}  # bool
             return None
         # A comparison is a bool whatever it compares.
         if isinstance(expr, ast.Compare):
-            return "int"
-        # `a and b` evaluates to one of its operands, so it is only
-        # classifiable when they all agree.
+            return {"int"}
+        # `a and b` evaluates to one of its operands, so it has all of them.
         if isinstance(expr, ast.BoolOp):
-            _ks = {cls._literal_scalar_kind(v) for v in expr.values}
-            return next(iter(_ks)) if len(_ks) == 1 else None
+            acc: 'set[str] | None' = set()
+            for v in expr.values:
+                acc = cls._scalar_kinds_join(
+                    acc, cls._scalar_kinds_of(v, local_kinds))
+            return acc
         if isinstance(expr, ast.BinOp):
-            # True division is float in Python whatever the operands are, so
-            # `return a / b` is evidence even when a and b are opaque.
-            if isinstance(expr.op, ast.Div):
-                return "float"
-            _l = cls._literal_scalar_kind(expr.left)
-            _r = cls._literal_scalar_kind(expr.right)
-            # One float operand makes an arithmetic result float regardless of
-            # the other side — the only other side that would not raise a
-            # TypeError in CPython is a number.  This is what lets
-            # `return 0.5 + recurse(n - 1)` be read as float even though the
-            # call itself says nothing, which is the shape a recursive
-            # accumulator takes.
-            if (isinstance(expr.op, (ast.Add, ast.Sub, ast.Mult, ast.Mod,
-                                     ast.FloorDiv))
-                    and "float" in (_l, _r)):
-                return "float"
-            if _l is None or _r is None:
-                return None
-            # `2 ** -1` is 0.5, so two int operands do not make an int here
-            # unless the exponent is a literal that can be seen to be >= 0.
-            if isinstance(expr.op, ast.Pow):
-                if "float" in (_l, _r):
-                    return "float"
-                _e = expr.right
-                if (isinstance(_e, ast.UnaryOp)
-                        and isinstance(_e.op, ast.USub)):
-                    return "float"
-                if isinstance(_e, ast.Constant) and isinstance(_e.value, int):
-                    return "float" if _e.value < 0 else "int"
-                return None
-            return "float" if "float" in (_l, _r) else "int"
+            return cls._scalar_kinds_binop(expr, local_kinds)
         if isinstance(expr, ast.Call) and isinstance(expr.func, ast.Name):
             if expr.func.id == "float":
-                return "float"
+                return {"float"}
             if expr.func.id in ("int", "len", "ord"):
-                return "int"
+                return {"int"}
         return None
+
+    @classmethod
+    def _scalar_kinds_binop(cls, expr: ast.BinOp,
+                            local_kinds: 'dict[str, set[str] | None]',
+                            ) -> 'set[str] | None':
+        """`_scalar_kinds_of` for a binary operator."""
+        # True division is float in Python whatever the operands are, so
+        # `a / b` is evidence even when a and b are both opaque.
+        if isinstance(expr.op, ast.Div):
+            return {"float"}
+        _l = cls._scalar_kinds_of(expr.left, local_kinds)
+        _r = cls._scalar_kinds_of(expr.right, local_kinds)
+        if isinstance(expr.op, cls._SCALAR_ARITH_OPS):
+            # A definitely-float operand makes the result float regardless of
+            # the other side — the only other side CPython would not reject
+            # with a TypeError is a number.  This is what lets
+            # `0.5 + recurse(n - 1)` be read as float even though the call
+            # itself says nothing, the shape a recursive accumulator takes.
+            if _l == {"float"} or _r == {"float"}:
+                return {"float"}
+        if _l is None or _r is None:
+            return None
+        # `2 ** -1` is 0.5, so two int operands do not make an int here
+        # unless the exponent is a literal that can be seen to be >= 0.
+        if isinstance(expr.op, ast.Pow):
+            if "float" in _l or "float" in _r:
+                return {"float"}
+            _e = expr.right
+            if isinstance(_e, ast.UnaryOp) and isinstance(_e.op, ast.USub):
+                return {"float"}
+            if isinstance(_e, ast.Constant) and isinstance(_e.value, int):
+                return {"float"} if _e.value < 0 else {"int"}
+            return None
+        return {"float" if "float" in (_a, _b) else "int"
+                for _a in _l for _b in _r}
+
+    @classmethod
+    def _nested_func_node_ids(cls, fnode: ast.AST) -> 'set[int]':
+        """ids of every node belonging to a `def`/`lambda` inside *fnode*."""
+        out: set[int] = set()
+        for _item in ast.walk(fnode):
+            if _item is not fnode and isinstance(
+                    _item, (ast.FunctionDef, ast.AsyncFunctionDef,
+                            ast.Lambda)):
+                for _sub in ast.walk(_item):
+                    out.add(id(_sub))
+        return out
+
+    @classmethod
+    def _local_scalar_kinds(cls, fnode: ast.AST, nested_ids: 'set[int]',
+                            ) -> 'dict[str, set[str] | None]':
+        """Which scalar kinds each local name in *fnode* can hold.
+
+        A small monotone fixpoint rather than a single pass, because an
+        accumulator refers to itself: `t = 0` then `t = t + (1 if c else 0.5)`
+        needs `t`'s own kinds on the right-hand side, and they grow from
+        `{"int"}` to `{"int", "float"}` on the second round.
+
+        The lattice is ∅ ⊑ {one kind} ⊑ {both} ⊑ None, where None is "no
+        constraint" — the top, reached by any assignment this analysis cannot
+        read, and never left.  Names bound by anything other than a plain
+        assignment (parameters, `for` targets, `with ... as`, walrus, imports,
+        unpacking) start at None: they are not evidence of anything.
+        """
+        assigns: list[tuple[str, ast.expr | None]] = []
+        for a in ast.walk(fnode):
+            if isinstance(a, ast.arg):
+                assigns.append((a.arg, None))
+        for n in ast.walk(fnode):
+            if id(n) in nested_ids:
+                continue
+            if (isinstance(n, ast.Assign) and len(n.targets) == 1
+                    and isinstance(n.targets[0], ast.Name)):
+                assigns.append((n.targets[0].id, n.value))
+            elif (isinstance(n, ast.AnnAssign)
+                    and isinstance(n.target, ast.Name) and n.value is not None):
+                assigns.append((n.target.id, n.value))
+            elif isinstance(n, ast.AugAssign) and isinstance(n.target,
+                                                             ast.Name):
+                assigns.append((n.target.id, ast.BinOp(
+                    left=n.target, op=n.op, right=n.value)))
+            elif isinstance(n, ast.NamedExpr) and isinstance(n.target,
+                                                             ast.Name):
+                assigns.append((n.target.id, n.value))
+            else:
+                # Every other binding form is unreadable here.
+                _tgts = []
+                if isinstance(n, (ast.For, ast.AsyncFor, ast.comprehension)):
+                    _tgts = [n.target]
+                elif isinstance(n, ast.withitem):
+                    _tgts = [n.optional_vars] if n.optional_vars else []
+                elif isinstance(n, ast.Assign):
+                    _tgts = n.targets
+                for _t in _tgts:
+                    for _s in ast.walk(_t):
+                        if isinstance(_s, ast.Name):
+                            assigns.append((_s.id, None))
+        kinds: dict[str, set[str] | None] = {}
+        for name, value in assigns:
+            if value is None:
+                kinds[name] = None
+            else:
+                kinds.setdefault(name, set())
+        # Each name can only rise ∅ → one → both → None, so three rounds
+        # suffice for a self-referential chain; the loop stops earlier when
+        # nothing moved.  The cap is a guard, not the expected exit.
+        for _ in range(8):
+            changed = False
+            for name, value in assigns:
+                if value is None or kinds.get(name) is None:
+                    continue
+                ks = cls._scalar_kinds_of(value, kinds)
+                if ks is None:
+                    kinds[name] = None
+                    changed = True
+                elif not ks <= kinds[name]:
+                    kinds[name] = kinds[name] | ks
+                    changed = True
+            if not changed:
+                break
+        return kinds
 
     @classmethod
     def _returns_mix_int_and_float(cls, fnode: ast.AST) -> bool:
@@ -6953,31 +7086,25 @@ class CodeGen:
         it the bare ABI and tag its return "mixed" instead.
 
         Returns inside nested `def`s and lambdas belong to those functions,
-        not this one, so they are excluded.  A conditional expression is
-        looked through, since `return 1 if c else 2.5` is the same function
-        written on one line.
+        not this one, so they are excluded.  The disagreement need not be
+        between two `return` statements: `return 1 if c else 2.5` is one
+        return with two kinds, and `v = 1 if c else 2.5; return v` is the same
+        thing again with a local in the way — which is why the local kinds are
+        worked out first rather than only literals being read.
         """
-        _nested: set[int] = set()
-        for _item in ast.walk(fnode):
-            if _item is not fnode and isinstance(
-                    _item, (ast.FunctionDef, ast.AsyncFunctionDef,
-                            ast.Lambda)):
-                for _sub in ast.walk(_item):
-                    _nested.add(id(_sub))
+        _nested = cls._nested_func_node_ids(fnode)
+        _locals = cls._local_scalar_kinds(fnode, _nested)
         kinds: set[str] = set()
         for n in ast.walk(fnode):
             if id(n) in _nested:
                 continue
             if not isinstance(n, ast.Return) or n.value is None:
                 continue
-            _exprs = ([n.value.body, n.value.orelse]
-                      if isinstance(n.value, ast.IfExp) else [n.value])
-            for _e in _exprs:
-                k = cls._literal_scalar_kind(_e)
-                if k is not None:
-                    kinds.add(k)
-                    if len(kinds) > 1:
-                        return True
+            ks = cls._scalar_kinds_of(n.value, _locals)
+            if ks:
+                kinds |= ks
+                if len(kinds) > 1:
+                    return True
         return False
 
     def _csa_propagate_ret_types(
@@ -23096,7 +23223,15 @@ class CodeGen:
             if isinstance(e, ast.UnaryOp):
                 return yields_mixed(e.operand)
             if isinstance(e, ast.IfExp):
-                return yields_mixed(e.body) or yields_mixed(e.orelse)
+                if yields_mixed(e.body) or yields_mixed(e.orelse):
+                    return True
+                # Arms of different scalar kinds make the value's kind a
+                # runtime question too — `1 if c else 2.5` is an int on one
+                # path and a float on the other, and used to be forced to
+                # double so that one LLVM type could hold both.
+                # BUG-IFEXP-INT-FLOAT-PROMOTE.
+                _ks = self._scalar_kinds_of(e, {})
+                return _ks is not None and len(_ks) > 1
             return False
 
         def note(target, value) -> bool:
@@ -48246,6 +48381,14 @@ class CodeGen:
 
         Returns the VKind if the branch has a clearly determinable type,
         or None if the type is dynamic/unknown at compile time.
+
+        `VKind.MIXED` is a third answer, and it is a *determination*, not an
+        absence of one: the branch is known to evaluate to a runtime-tagged
+        `FpyValue`.  Folding that case into `None` cost the caller the one
+        thing it needed, because `None` on both sides reads as "the two arms
+        might yet agree" and skips the tagged phi — so `(1 if x else 2.5) if y
+        else (3 if x else 4.5)` merged two `FpyValue`s as naked i64 and
+        printed a float's bit pattern.  BUG-IFEXP-INT-FLOAT-PROMOTE.
         """
         if isinstance(node, ast.Constant):
             v = node.value
@@ -48264,14 +48407,18 @@ class CodeGen:
         elif isinstance(node, ast.Name):
             if node.id in self.variables:
                 k = self._var_kind(node.id)
-                if k in (VKind.MIXED, VKind.FVALUE, VKind.UNKNOWN):
+                if k in (VKind.MIXED, VKind.FVALUE):
+                    return VKind.MIXED
+                if k is VKind.UNKNOWN:
                     return None
                 return k
             if node.id in self._global_vars:
                 _, vt = self._global_vars[node.id]
                 if not isinstance(vt, ValueType):
                     vt = ValueType.from_old_tag(vt)
-                if vt.kind in (VKind.MIXED, VKind.FVALUE, VKind.UNKNOWN):
+                if vt.kind in (VKind.MIXED, VKind.FVALUE):
+                    return VKind.MIXED
+                if vt.kind is VKind.UNKNOWN:
                     return None
                 return vt.kind
         elif isinstance(node, (ast.List, ast.ListComp, ast.GeneratorExp)):
@@ -48285,12 +48432,24 @@ class CodeGen:
         elif isinstance(node, ast.JoinedStr):
             return VKind.STR
         elif isinstance(node, ast.IfExp):
-            # Nested ternary: check both sub-branches
+            # Nested ternary: the answer has to mirror exactly what
+            # `_emit_ifexp` will do with the same two sub-branches, because
+            # that is what decides whether this arm arrives tagged.
+            if ((isinstance(node.body, ast.Constant) and node.body.value is None)
+                    or (isinstance(node.orelse, ast.Constant)
+                        and node.orelse.value is None)):
+                return VKind.MIXED
             bk = self._ifexp_branch_kind(node.body)
             ek = self._ifexp_branch_kind(node.orelse)
-            if bk == ek:
-                return bk
-            return None
+            if bk is VKind.MIXED or ek is VKind.MIXED:
+                return VKind.MIXED
+            if bk is None and ek is None:
+                # Neither sub-branch is pinned down, so the inner ternary does
+                # not wrap either, and this arm is as unknown as they are.
+                return None
+            if bk != ek:
+                return VKind.MIXED
+            return bk
         return None
 
     def _emit_ifexp(self, node: ast.IfExp) -> ir.Value:
@@ -48312,11 +48471,22 @@ class CodeGen:
         if not needs_fv_output:
             _body_k = self._ifexp_branch_kind(node.body)
             _else_k = self._ifexp_branch_kind(node.orelse)
-            if _body_k is not None and _else_k is not None:
+            if _body_k is VKind.MIXED or _else_k is VKind.MIXED:
+                # An arm that already carries a runtime tag has to be merged
+                # as one.  Two such arms agree on being MIXED, which is not
+                # the kind of agreement that lets the tag be dropped.
+                needs_fv_output = True
+            elif _body_k is not None and _else_k is not None:
                 if _body_k != _else_k:
-                    # int/float can be promoted to double without fpy_val
-                    if not ({_body_k, _else_k} <= {VKind.INT, VKind.FLOAT}):
-                        needs_fv_output = True
+                    # An int arm beside a float arm used to be exempted here
+                    # and promoted to double, on the reasoning that no tag is
+                    # needed if both fit one LLVM type.  They do fit, but the
+                    # int-ness does not survive: `1 if c else 2.5` printed
+                    # `1.0` where CPython prints `1`, because a conditional
+                    # expression yields whichever arm ran, unconverted.  The
+                    # arms disagree, so the result carries a tag like any
+                    # other disagreeing pair.  BUG-IFEXP-INT-FLOAT-PROMOTE.
+                    needs_fv_output = True
             elif _body_k is not None or _else_k is not None:
                 # One known, one unknown/dynamic → could differ at runtime
                 needs_fv_output = True

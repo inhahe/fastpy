@@ -724,45 +724,78 @@ earlier:
 Regression test: `tests/regressions/mixed_scalar_return_tag.py`. Verified wrong
 at `cfc34df`.
 
-**Two adjacent bugs surfaced while testing this** and are *not* covered by the
-fix — both verified pre-existing at `cfc34df`: BUG-IFEXP-INT-FLOAT-PROMOTE and
-BUG-VAR-RETYPED-MIDSCOPE-STALE-SLOT, below.
+**Two adjacent bugs surfaced while testing this** — both verified pre-existing
+at `cfc34df`, both since fixed together (they had to be: the first is
+unobservable without the second):
+~~BUG-IFEXP-INT-FLOAT-PROMOTE~~ and ~~BUG-VAR-RETYPED-MIDSCOPE-STALE-SLOT~~,
+below.
 
-### BUG-IFEXP-INT-FLOAT-PROMOTE. `1 if c else 2.5` evaluates to `1.0`, not `1` — 2026-07-27
+### ~~BUG-IFEXP-INT-FLOAT-PROMOTE. `1 if c else 2.5` evaluates to `1.0`, not `1`~~ — FIXED 2026-07-27
 
-**What:** a conditional expression whose arms are an int and a float unifies to
-`double` and the int arm is `sitofp`'d, so the int-ness is lost. CPython
+**What:** a conditional expression whose arms were an int and a float unified to
+`double` and the int arm was `sitofp`'d, so the int-ness was lost. CPython
 evaluates each arm independently and returns whichever one ran, unconverted.
 
 **Reproduce** — should print `1` twice:
 ```python
 c = True
-print(1 if c else 2.5)     # 1.0
+print(1 if c else 2.5)     # printed 1.0
 x = 1 if c else 2.5
-print(x)                   # 1.0
+print(x)                   # printed 1.0
 ```
-No function is involved, so this is independent of
+No function is involved, so this was independent of
 BUG-MIXED-SCALAR-RETURN-TAG — but it is why
 `tests/regressions/mixed_scalar_return_tag.py` writes its mixed returns as
-`if`/`return` statements rather than one-liners: `return 1 if c else 2.5`
-still prints `1.0`.
+`if`/`return` statements rather than one-liners.
 
-**Where:** the `ast.IfExp` emitter, which builds a phi and must give both
-incoming values one LLVM type.
+**Where:** `_emit_ifexp`, which builds a phi and must give both incoming values
+one LLVM type. It carried an explicit exemption:
 
-**Proper fix:** when the two arms' static kinds disagree, the phi must be an
-`fpy_val` — tag and data — rather than a promoted scalar, exactly as
-`_returns_mix_int_and_float` now does for returns. The same treatment is needed
-for arms that disagree on *pointer* kind, which today is presumably handled
-only because both are `i8*`.
+```python
+# int/float can be promoted to double without fpy_val
+if not ({_body_k, _else_k} <= {VKind.INT, VKind.FLOAT}):
+    needs_fv_output = True
+```
 
-**Severity:** wrong output (`1.0` for `1`), not memory-unsafe. Silent.
+The premise is true and the conclusion does not follow. A `double` really does
+hold both, which is why this never produced a bit-reinterpretation — but the
+value is *whichever arm ran*, and promoting erases that.
 
-### BUG-VAR-RETYPED-MIDSCOPE-STALE-SLOT. Re-typing a module-level variable allocates a second slot; reads keep using the first — 2026-07-27
+**Fix:** three parts.
 
-**What:** when a variable's static type changes across assignments in the same
-scope, codegen allocates a *new* alloca and rebinds `self.variables[name]` to
-it. Statements already emitted still read the old slot — and so does the same
+* The exemption is gone: arms of disagreeing kinds get an `fpy_val` phi like
+  every other disagreeing pair.
+* `_returns_mix_int_and_float` no longer reads return kinds one expression at a
+  time. `return 1 if c else 2.5` is one return with two kinds, and
+  `v = 1 if c else 2.5; return v` moves the disagreement into a local, so the
+  old `_literal_scalar_kind` was replaced by `_scalar_kinds_of` /
+  `_scalar_kinds_binop` over expressions plus `_local_scalar_kinds`, a small
+  monotone fixpoint over the function's plain assignments. A fixpoint rather
+  than one pass because an accumulator needs its own kinds on the right-hand
+  side: `t = 0` then `t = t + (1 if c else 0.5)` grows `t` from `{"int"}` to
+  `{"int", "float"}` on the second round. Anything unclassifiable stays `None`,
+  "no constraint" — never a conflict.
+* `_ifexp_branch_kind` gained a third answer. It used to fold "this arm is a
+  runtime-tagged value" into `None`, "unknown" — and `None` on *both* sides
+  reads as "they might yet agree", so the tagged phi was skipped and two
+  `FpyValue`s were merged as naked i64:
+
+  ```python
+  (1 if x else 2.5) if y else (3 if x else 4.5)   # printed 1 4612811918334230528
+  ```
+
+  It now returns `VKind.MIXED` for a nested ternary that will itself be wrapped,
+  and for a name of MIXED/FVALUE kind, mirroring exactly what `_emit_ifexp`
+  decides for the same sub-branches. `VKind.UNKNOWN` still maps to `None` —
+  that one really is an absence of information.
+
+Regression test: `tests/regressions/ifexp_int_float_promote.py`.
+
+### ~~BUG-VAR-RETYPED-MIDSCOPE-STALE-SLOT. Re-typing a module-level variable allocates a second slot; reads keep using the first~~ — FIXED 2026-07-27
+
+**What:** when a variable's static type changed across assignments in the same
+scope, codegen allocated a *new* alloca and rebound `self.variables[name]` to
+it. Statements already emitted still read the old slot — and so did the same
 statement on the next iteration of a loop, because the loop's back-edge re-runs
 code emitted before the rebind.
 
@@ -780,8 +813,8 @@ while i < 4:
     print(t)
     i = i + 1
 ```
-prints `2.0 / 0.25 / 2.0 / 0.25` — i.e. `t` reads as 0 every iteration. The IR
-shows it plainly:
+printed `2.0 / 0.25 / 2.0 / 0.25` — i.e. `t` read as 0 every iteration. The IR
+showed it plainly:
 
 ```llvm
   %"t.2" = alloca {i32, i64}        ; the FpyValue slot the loop body stores to
@@ -792,25 +825,74 @@ shows it plainly:
   store {i32, i64} %".18", {i32, i64}* %"t.2"
 ```
 
-Unrolling the loop works (each read follows its own store in emission order);
-so does moving the whole thing inside a `def` (function-local variables are
-pre-typed by a scan the module level does not get). Pre-existing at `cfc34df`,
-where the same program printed a different wrong answer
-(`2.0 / 4.598e+18 / …`) for the same reason.
+Unrolling the loop worked (each read follows its own store in emission order);
+so did moving the whole thing inside a `def`. Pre-existing at `cfc34df`, where
+the same program printed a different wrong answer (`2.0 / 4.598e+18 / …`) for
+the same reason.
 
-**Where:** module-level assignment in `CodeGen`, where a store whose value type
-does not match the existing alloca creates a fresh one instead of promoting the
-variable. The function-level equivalent is avoided by the local-type pre-scan.
+**Fix:** the machinery to prevent this already existed and was simply not
+reaching module scope. `_scan_fv_forced_locals` decides up front which names
+must get an `fpy_val` slot from their *first* store — its own docstring
+describes this exact failure — but it was run only over function bodies. Pass 3
+now runs it over the module's top-level statements too, excluding names backed
+by a real LLVM global (their storage is not an alloca and cannot be widened).
+Its inner `yields_mixed` also did not know that a ternary with disagreeing arms
+yields a mixed value, so the function-scope case was broken too once
+BUG-IFEXP-INT-FLOAT-PROMOTE was fixed; it does now.
 
-**Proper fix:** pre-scan module-level statements the way function bodies are
-pre-scanned, and give any variable whose assignments disagree an `fpy_val` slot
-from its first store — never allocate a second slot for a name already bound.
-A second alloca for a live name should arguably be an assertion failure.
+There is still no assertion that a name never gets a second alloca. Adding one
+would be the durable guard — see BUG-SECOND-ALLOCA-NOT-DIAGNOSED below.
 
-**Blast radius:** any module-level accumulator fed by a value whose static kind
-differs from its initialiser. Made easier to hit by the
+**Blast radius (before the fix):** any module-level accumulator fed by a value
+whose static kind differs from its initialiser. Made easier to hit by the
 BUG-MIXED-SCALAR-RETURN-TAG fix, which gives more functions a `"mixed"` return,
 but not caused by it.
+
+### BUG-ABS-OF-TAGGED-VALUE. `abs()` of a runtime-tagged value returns 0 — 2026-07-27
+
+**What:** `_emit_builtin_abs` (`compiler/codegen.py:38620`) handles exactly two
+LLVM types — `ir.IntType` and `ir.DoubleType`. When its argument is an
+`fpy_val` `{i32, i64}` it matches neither, falls off the end of the `if`, and
+returns `self._bridge_fallback_expr(node, "abs() with wrong args")`, which in
+native/pure mode yields 0.
+
+**Reproduce** — should print `1 2.5`:
+```python
+v = [1, -2.5]
+print(abs(v[0]), abs(v[1]))        # prints 0 0
+```
+Nothing here is new: a heterogeneous list element has been a tagged value all
+along. Two more shapes, both also wrong:
+```python
+def f(x):
+    if x:
+        return 1
+    return -2.5
+print(abs(f(1)), abs(f(0)))        # prints 0 0
+
+d = {}
+d[0] = 1
+d[1] = -2.5
+print(abs(d[0]), abs(d[1]))        # prints 1 4610560118520545280
+```
+The dict case is a different failure — a static kind guessed from the first
+store — and may or may not be the same fix.
+
+**Where:** `_emit_builtin_abs`. The silent `_bridge_fallback_expr` is the reason
+this is invisible: a `raise CodeGenError` would have surfaced it years ago.
+
+**Proper fix:** a runtime `FpyValue fpy_abs_fv(FpyValue)` that switches on the
+tag — INT/BOOL to an integer abs, FLOAT to `fabs`, BIGINT to
+`fpy_bigint_abs`, DECIMAL to `fpy_decimal_abs`, COMPLEX to `fpy_complex_abs`,
+anything else to a `TypeError` — with `_emit_builtin_abs` calling it whenever
+the argument's type is `fpy_val`. Doing it inline in codegen would only cover
+INT and FLOAT and would silently mis-handle the other four tags.
+
+**Also audit the neighbours.** `_emit_builtin_abs` is unlikely to be the only
+builtin whose type dispatch predates `FpyValue`; `divmod`, `pow` and `round`
+are in the same block and take the same naked-scalar shape.
+
+**Severity:** silently wrong output. Not memory-unsafe.
 
 ### ~~BUG-MODULE-DOCSTRING-UNBOXES-GLOBAL. `_load_variable` unboxes an FpyValue local using its (wrong) static tag, so a mixed-kind module-level value loses its runtime tag~~ — FIXED 2026-07-26
 
@@ -2688,3 +2770,26 @@ exists/isfile/isdir→BOOL), mirroring the `_os_path_fns` emit map. Verified
 bridge-free via `llvm-nm` on the intermediate-var form, and exercised on
 SlateOS: `services/fastpy-getmtime` now uses `back = os.path.getmtime(path);
 got = int(back)` as an on-target regression test.
+
+### BUG-SECOND-ALLOCA-NOT-DIAGNOSED. A name can silently acquire a second stack slot — 2026-07-27
+
+**What (tech debt):** when a store's value type does not match the alloca
+already bound to a name, the store path allocates a *fresh* alloca and rebinds
+`self.variables[name]` to it. Every load already emitted — including the ones a
+loop's back-edge will re-run — stays bound to the abandoned slot. This is the
+mechanism behind BUG-VAR-RETYPED-MIDSCOPE-STALE-SLOT, and the fix for that bug
+addressed the *cause* (pre-scan the scope, widen the slot up front) without
+closing off the *mechanism*.
+
+`_scan_fv_forced_locals` is a conservative approximation. Anything it fails to
+foresee still falls through to the silent second alloca, and the resulting
+wrong answer looks like a miscompile with no diagnostic anywhere.
+
+**Proper fix:** make the second alloca an assertion failure — a `CodeGenError`
+naming the variable, the two types and the statement. Every case it catches is
+a bug in the pre-scan; none should reach a user. Landing this needs the whole
+suite run once to enumerate what currently trips it, which is why it is filed
+rather than done.
+
+**Where:** the assignment/store path in `CodeGen`, and
+`_scan_fv_forced_locals` (`compiler/codegen.py:~23157`).

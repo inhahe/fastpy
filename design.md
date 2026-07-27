@@ -190,9 +190,8 @@ they were "settled by a different mechanism (the i64-vs-double LLVM return
 type)". They were not: that mechanism picks *one* of the two and the other
 comes back reinterpreted, so `def f(c): return 1 if c else 2.5` (written as an
 `if`/`return` pair) printed the IEEE-754 bits of 2.5 as an i64.
-`_returns_mix_int_and_float` is the scalar counterpart, backed by
-`_literal_scalar_kind` as the counterpart of `_csa_literal_ptr_kind`, and it
-obeys the same "unclassifiable is no constraint" rule. It denies the function
+`_returns_mix_int_and_float` is the scalar counterpart, and it obeys the same
+"unclassifiable is no constraint" rule. It denies the function
 the bare ABI (`_duf_select_abi`), tags its return `"mixed"`
 (`_duf_determine_ret_tag`) and records `"mixed"` in `_func_ret_types`
 (`_csa_propagate_ret_types`) — the same three-consumer hand-off the splat fix
@@ -210,6 +209,42 @@ Two rulings fall out of it:
   The `"mixed"` override therefore runs *after* the annotation override rather
   than yielding to it. Where an annotation and the actual returns disagree,
   CPython's behaviour is the tie-breaker.
+
+**Scalar kinds are a dataflow property, not a syntactic one.** The first cut
+read each `return`'s kind straight off its own expression, which cannot see
+`return 1 if c else 2.5` (one return, two kinds) or
+`v = 1 if c else 2.5; return v` (the disagreement lives in a local). The
+analysis is now `_scalar_kinds_of` / `_scalar_kinds_binop` over expressions,
+plus `_local_scalar_kinds`, a small monotone fixpoint over a scope's plain
+assignments. The lattice is ∅ ⊑ {one kind} ⊑ {both} ⊑ `None`, where `None`
+absorbs and means "no constraint" — so the empty set (nothing classified yet)
+and `None` (unclassifiable) are deliberately different values. It is a fixpoint
+because accumulators are self-referential: `t = 0` followed by
+`t = t + (1 if c else 0.5)` only reaches `{"int", "float"}` on the second
+round. Names bound by anything other than a plain assignment — parameters,
+`for` targets, `with ... as`, walrus, unpacking — start at `None`, and nested
+`def`/`lambda` bodies are excluded by node identity rather than by scope
+tracking.
+
+**A conditional expression yields whichever arm ran, unconverted.**
+`_emit_ifexp` used to exempt an int arm beside a float arm from the tagged phi,
+reasoning that a `double` holds both. It does, which is why this never
+corrupted bits — but `1 if c else 2.5` then printed `1.0`. The exemption is
+gone. `_ifexp_branch_kind` correspondingly has three answers, not two: a
+concrete `VKind`, `None` for genuinely unknown, and `VKind.MIXED` for "this arm
+is known to arrive runtime-tagged". Collapsing MIXED into `None` was itself a
+bug — two `None`s read as possible agreement, so a nested ternary merged two
+`FpyValue`s as naked i64. `VKind.UNKNOWN` still maps to `None`.
+
+**One slot per name, in every scope.** A local's storage class is fixed by its
+first store; a later store needing a wider `fpy_val` used to allocate a second
+alloca and abandon the first, stranding every load already emitted — fatal
+inside a loop, whose back-edge re-runs them. `_scan_fv_forced_locals` exists to
+decide this up front, and Pass 3 now runs it over module-level statements as
+well as function bodies (excluding names backed by a real LLVM global, whose
+storage is not an alloca). Any widening this scan fails to foresee still falls
+through to a silent second alloca; making that an assertion is filed as
+BUG-SECOND-ALLOCA-NOT-DIAGNOSED.
 
 **Two call sites must agree on the MIXED tag.** A callee's result type is
 decided in two independent places, and both consult `_func_ret_types`:
