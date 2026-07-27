@@ -43,7 +43,7 @@ retain**, and the registered `+1` is released by a **watermark flush**
 classifying an owned value as borrowed only leaks; classifying a borrowed value
 as owned is a use-after-free — so *retain* is always the safe direction.
 
-Four structural rules follow, and all have been the source of real bugs:
+Five structural rules follow, and all have been the source of real bugs:
 
 - **A temp must be released in a block that its definition dominates.** An owned
   temp created inside one arm of a conditional *expression* — an if-expression
@@ -130,6 +130,30 @@ Four structural rules follow, and all have been the source of real bugs:
   holding an undefined value, and decref'ing that is a UAF, whereas leaking it is
   the safe direction. Dominance holds at either site. If a new construct emits a
   statement list, it must do the same.
+- **The runtime's two tag switches must agree, arm for arm.** All of the above
+  bottoms out in `fpy_rc_incref` / `fpy_rc_decref` (runtime/objects.c), a pair
+  of `switch (tag)` statements that each end in `default: break`. Codegen emits
+  matched pairs of calls; the *runtime* is what decides whether a given tag is
+  actually refcounted. A tag present in one switch and absent from the other is
+  therefore not a local mistake — it silently converts every balanced pair of
+  calls in the whole program into an unbalanced one. Which direction it breaks
+  matters:
+  - **decref-only** (the arm exists in decref, not in incref) is a
+    **use-after-free**: increfs are no-ops, so a value with two owners is freed
+    by the first release. This was BUG-BIGINT-INCREF-MISSING — a ~15–25% random
+    `STATUS_HEAP_CORRUPTION` that was twice mis-filed as a test-suite flake,
+    because the two owners have to be dropped in the right order for anything
+    to be noticed.
+  - **incref-only** merely leaks, and is the safe direction, consistent with
+    the Model-2 rule above.
+  - **absent from both** is consistent but leaks, and is a trap for whoever
+    later adds one half: `FPY_TAG_COMPLEX` and `FPY_TAG_DECIMAL` are in this
+    state (DEBT-COMPLEX-DECIMAL-NOT-REFCOUNTED).
+
+  Because the failure mode is invisible at the call site, both `default: break`
+  arms carry a comment naming the tags that fall through them deliberately
+  (INT/FLOAT/BOOL/NONE, which are unboxed) and the ones that fall through by
+  omission. Adding a heap tag means adding *both* arms in the same change.
 
 ### Two local representations, and how one is chosen
 
@@ -980,6 +1004,30 @@ and so have different evidence available:
 The residual eagerness is deliberate: a callee that cannot be named at all is
 still walked into, which keeps `math.sqrt(x)` typed float.
 
+**A local's kind is read off the shape of what is assigned to it, and a bare
+name has no shape.** `_duf_detect_ret_type` builds `str_vars` / `list_vars` /
+`dict_vars` / `obj_vars` by pattern-matching each assignment's right-hand side,
+then answers `return x` from those sets. An alias — `out = raw` — matches
+nothing, so a single extra copy before the `return` erased everything already
+worked out and the caller read the pointer as an int (`raw = "abcdef"; out =
+raw; return out` measured 0). The sets are therefore closed over plain
+name-to-name assignments as a **fixpoint**, not a single pass: `ast.walk` does
+not visit in source order, and an alias chain can be any length.
+
+Two structural hazards live in that scan and both have bitten:
+
+- **A narrow arm placed before a general one silently swallows its cases.**
+  The `elif` for the string-building pattern `result = result + ch` tested "is
+  the left operand a known str" *inside* the arm rather than in its guard, so
+  every other `+` was claimed by it and then dropped — the general
+  `_expr_is_str` test after it never ran, and `str(n) + "x"` was typed int.
+  Conditions that decide whether an arm applies belong in the guard; anything
+  else turns the chain into a chain of one.
+- **The scan runs before the body is emitted, so emit-time state is empty.**
+  Anything the scan needs must be derivable from the AST alone — this is what
+  `_scope_file_names` exists for (see the file-object section), and the same
+  applies to any future fact the pre-pass wants to consult.
+
 **A specialization mismatch must not fall back to "the first one".**
 `_resolve_specialization` rejects a candidate signature on any disagreement and,
 when every candidate is rejected, takes `specs[0]`. That fallback is a silent
@@ -1484,6 +1532,17 @@ the CPython bridge for SlateOS later as a superset once CPython is ported.
   variables (`_file_vars`) from `f = open(...)` assignments and `with open(...)
   as f:` bindings; the `with`/`for line in f` paths bind `f` as `VKind.OBJ` so
   the context-manager and iterator-protocol dispatch drive the runtime methods.
+  `_file_vars` is filled in **while emitting**, which is too late for anything
+  that has to answer before a body exists — a function's return type is
+  inferred in a pre-pass, so `return f.read()` looked like a call on an object
+  of unknown type and the function was typed `int`, re-tagging a live string
+  pointer at every call site. The pre-pass therefore reads the same fact off
+  the AST instead (`_scope_file_names`), flow-insensitively and declining when
+  a name is bound to both `open(...)` and something else. Whether `open` itself
+  is rebound is settled once from the module AST (`_open_is_shadowed`) rather
+  than from `_user_functions`, which is still being filled at that point —
+  otherwise the pre-pass and the emitter could disagree about the same call,
+  which is worse than either answer alone.
   **Design
   decision (Claude, autonomous):** native file objects are used in **both** host
   and pure mode (uniform behaviour, and it removes the bridge dependency

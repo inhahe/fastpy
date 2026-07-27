@@ -1377,6 +1377,10 @@ class CodeGen:
         # method calls route through _emit_method_call_file (obj_call_methodN
         # + get_ret_tag recovery) instead of the user-class dispatch paths.
         self._file_vars: set[str] = set()
+        # Whether the program rebinds `open`; computed once from the module
+        # AST, since the return-type pre-pass cannot ask `_user_functions`
+        # while that set is still being filled.  See `_open_is_shadowed`.
+        self._open_shadowed: bool | None = None
 
         # Track dict variables whose values are all lists (so d[k] returns a list)
         self._dict_var_list_values: set[str] = set()
@@ -10884,6 +10888,10 @@ class CodeGen:
             for n in ast.walk(node)
             if id(n) not in _nested_ids
         )
+        # Which locals hold an open() file, computed from the AST because
+        # `_file_vars` is not filled in until the body is emitted — which is
+        # after this.  BUG-FILEREAD-FN-RETTAG.
+        file_names = self._scope_file_names(node)
         # Pre-collect string variables for return type detection
         str_vars = set()
         obj_vars: set[str] = set()
@@ -10975,10 +10983,22 @@ class CodeGen:
                                   and n.value.id in obj_vars):
                                 # `x = y` where y is known obj
                                 obj_vars.add(tgt.id)
-                            elif isinstance(n.value, ast.BinOp) and isinstance(n.value.op, ast.Add):
-                                # result = result + ch (string concat pattern)
-                                if isinstance(n.value.left, ast.Name) and n.value.left.id in str_vars:
-                                    str_vars.add(tgt.id)
+                            elif (isinstance(n.value, ast.BinOp)
+                                  and isinstance(n.value.op, ast.Add)
+                                  and ((isinstance(n.value.left, ast.Name)
+                                        and n.value.left.id in str_vars)
+                                       or (isinstance(n.value.right, ast.Name)
+                                           and n.value.right.id in str_vars))):
+                                # result = result + ch (string concat pattern),
+                                # and the mirrored ch + result.
+                                #
+                                # The str-var test used to live *inside* this
+                                # arm rather than in its guard, so any other
+                                # `+` was claimed by the arm and did nothing —
+                                # shadowing the general `_expr_is_str` test
+                                # below.  `raw = str(n) + "x"` is unambiguously
+                                # a str and was typed int for that reason.
+                                str_vars.add(tgt.id)
                             elif (isinstance(n.value, ast.Call)
                                   and isinstance(n.value.func, ast.Name)
                                   and n.value.func.id in (
@@ -10987,6 +11007,19 @@ class CodeGen:
                                 # n = int(x) — always produces an integer,
                                 # even when the argument is a float param.
                                 pass
+                            elif (_fk := self._file_method_kind(
+                                    n.value, file_names)) is not None:
+                                # `data = f.read()`.  The read produces a str,
+                                # but through a method on an object codegen
+                                # only recognises once it is emitting — which
+                                # is after this.  Without an arm here `return
+                                # data` inferred int and the caller re-tagged a
+                                # live string pointer as one.
+                                # BUG-FILEREAD-FN-RETTAG.
+                                if _fk == VKind.STR:
+                                    str_vars.add(tgt.id)
+                                elif _fk == VKind.LIST:
+                                    list_vars.add(tgt.id)
                             elif self._expr_is_str(n.value):
                                 # `s = str(n)`, `s = x.upper()`, `s = ",".join(...)`
                                 # — the return-type inference below already knew
@@ -11004,6 +11037,32 @@ class CodeGen:
                                             and sub.id in float_params):
                                         float_vars.add(tgt.id)
                                         break
+
+            # `out = raw` — a plain alias.  The scan above types a local from
+            # the *shape* of the expression assigned to it, and a bare Name has
+            # no shape, so one extra copy before the `return` dropped the kind
+            # and the caller read the pointer as an int:
+            # `raw = "abcdef"; out = raw; return out` measured 0.
+            # A fixpoint rather than one pass because `ast.walk` does not visit
+            # in source order and an alias chain can be any length.
+            # BUG-ALIASED-LOCAL-RETURN-KIND-LOST.
+            _aliases = []
+            for n in ast.walk(node):
+                if id(n) in _nested_ids:
+                    continue
+                if isinstance(n, ast.Assign) and isinstance(n.value, ast.Name):
+                    for tgt in n.targets:
+                        if isinstance(tgt, ast.Name):
+                            _aliases.append((tgt.id, n.value.id))
+            _changed = bool(_aliases)
+            while _changed:
+                _changed = False
+                for _dst, _src in _aliases:
+                    for _set in (str_vars, list_vars, dict_vars, obj_vars,
+                                 float_vars):
+                        if _src in _set and _dst not in _set:
+                            _set.add(_dst)
+                            _changed = True
 
             # Check return expression type (skip nested function returns)
             for n in ast.walk(node):
@@ -11043,6 +11102,12 @@ class CodeGen:
                             and isinstance(n.value.func, ast.Name)
                             and n.value.func.id in (
                                 "bytes", "set", "frozenset")):
+                        ret_type = i8_ptr
+                        break
+                    # `return f.read()` / `return f.readlines()` — both hand
+                    # back a pointer.  BUG-FILEREAD-FN-RETTAG.
+                    if self._file_method_kind(n.value, file_names) in (
+                            VKind.STR, VKind.LIST):
                         ret_type = i8_ptr
                         break
                     # Check if returning a list/dict/string/obj variable
@@ -11391,9 +11456,21 @@ class CodeGen:
         # BUG-BYTES-RETURN-TAG-LOST.
         returns_bytes = False
         returns_set = False
+        # See _duf_detect_ret_type: which locals hold an open() file has to be
+        # read off the AST here too.  BUG-FILEREAD-FN-RETTAG.
+        file_names = self._scope_file_names(node)
         for n in ast.walk(node):
             if isinstance(n, ast.Return) and n.value is not None:
-                if isinstance(n.value, ast.JoinedStr):
+                if (_fk := self._file_method_kind(
+                        n.value, file_names)) is not None:
+                    # `return f.readline()` direct.  The i8_ptr type alone is
+                    # not enough — the tag is what tells the caller whether the
+                    # pointer is a string or a list.
+                    if _fk == VKind.STR:
+                        returns_str = True
+                    elif _fk == VKind.LIST:
+                        returns_list = True
+                elif isinstance(n.value, ast.JoinedStr):
                     returns_str = True
                 elif (isinstance(n.value, ast.Constant)
                         and isinstance(n.value.value, bytes)):
@@ -47839,6 +47916,112 @@ class CodeGen:
         if isinstance(node, ast.Name):
             return node.id in self._file_vars
         return self._is_open_call(node)
+
+    # What each built-in file method hands back.  At emit time the runtime
+    # reports this through the ret-tag side channel, so codegen never had to
+    # know it statically; the same table written out is what lets the
+    # *pre-pass* answer, which has to happen before any of that code exists.
+    # Only the kinds that carry a pointer are listed — a method not named here
+    # falls through to the ordinary integer default, which is already right for
+    # `write`/`tell`/`seek` and harmless for `close`.
+    _FILE_METHOD_KINDS = {
+        "read": VKind.STR,
+        "readline": VKind.STR,
+        "readlines": VKind.LIST,
+    }
+
+    def _open_is_shadowed(self) -> bool:
+        """True if the program rebinds the name `open` anywhere.
+
+        `_is_open_call` decides this by asking `_user_functions`, which is only
+        complete once every top-level `def` has been declared.  The return-type
+        pre-pass runs *while* that set is being filled, so a `def open` further
+        down the file would be invisible to it and visible at emit time — the
+        two would disagree about the same call, which is worse than either
+        answer.  Reading the module AST gives one answer at any point in the
+        compile.
+        """
+        if self._open_shadowed is None:
+            tree = getattr(self, "_module_tree", None)
+            shadowed = False
+            for n in ast.walk(tree) if tree is not None else ():
+                if (isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                   ast.ClassDef))
+                        and n.name == "open"):
+                    shadowed = True
+                elif isinstance(n, ast.arg) and n.arg == "open":
+                    shadowed = True
+                elif isinstance(n, ast.Name) and n.id == "open" and isinstance(
+                        n.ctx, (ast.Store, ast.Del)):
+                    shadowed = True
+                elif isinstance(n, ast.alias) and (
+                        n.asname or n.name.split(".")[0]) == "open":
+                    shadowed = True
+                if shadowed:
+                    break
+            self._open_shadowed = shadowed
+        return self._open_shadowed
+
+    def _scope_file_names(self, node) -> set[str]:
+        """Names bound to a built-in file object within one function's scope.
+
+        `_file_vars` answers the same question during emission, but a
+        function's return type is inferred *before* its body is emitted, so at
+        that moment the set is empty and `f.read()` looks like a call on an
+        unknown object.  That is how a `str` read from a file came back tagged
+        as an int — BUG-FILEREAD-FN-RETTAG.
+
+        Deliberately flow-insensitive: a name assigned from `open(...)`
+        anywhere in the scope counts, *unless* it is also bound to something
+        else somewhere, in which case nothing is claimed.  A wrong answer here
+        misroutes a method call, so the ambiguous case declines.
+        """
+        if self._open_is_shadowed():
+            return set()
+        _nested = set()
+        for _item in ast.walk(node):
+            if _item is not node and isinstance(
+                    _item, (ast.FunctionDef, ast.AsyncFunctionDef,
+                            ast.ClassDef, ast.Lambda)):
+                for _sub in ast.walk(_item):
+                    _nested.add(id(_sub))
+        files: set[str] = set()
+        others: set[str] = set()
+        for n in ast.walk(node):
+            if id(n) in _nested:
+                continue
+            if isinstance(n, (ast.With, ast.AsyncWith)):
+                for item in n.items:
+                    if isinstance(item.optional_vars, ast.Name):
+                        (files if self._is_open_call(item.context_expr)
+                         else others).add(item.optional_vars.id)
+            elif isinstance(n, ast.Assign):
+                for tgt in n.targets:
+                    if isinstance(tgt, ast.Name):
+                        (files if self._is_open_call(n.value)
+                         else others).add(tgt.id)
+            elif isinstance(n, (ast.AugAssign, ast.AnnAssign, ast.NamedExpr)):
+                if isinstance(n.target, ast.Name):
+                    others.add(n.target.id)
+            elif isinstance(n, (ast.For, ast.AsyncFor)):
+                if isinstance(n.target, ast.Name):
+                    others.add(n.target.id)
+        return files - others
+
+    def _file_method_kind(self, node: ast.expr, file_names: set[str]):
+        """VKind of a `<file>.read()`-style call, or None if it is not one.
+
+        `file_names` comes from `_scope_file_names`; a direct
+        `open(p).read()` is recognised without it.
+        """
+        if not (isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)):
+            return None
+        recv = node.func.value
+        if not ((isinstance(recv, ast.Name) and recv.id in file_names)
+                or self._is_open_call(recv)):
+            return None
+        return self._FILE_METHOD_KINDS.get(node.func.attr)
 
     def _emit_method_call_file(self, node: ast.Call) -> ir.Value:
         """Emit a method call on a built-in file object (open() result).

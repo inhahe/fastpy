@@ -251,6 +251,116 @@ print("r:", f())     # printed `enter` then `r: 1` — no `exit`
 
 </details>
 
+### BUG-OS-REMOVE-IGNORES-FAILURE. `os.remove` reports success when the delete did not happen — 2026-07-27
+
+**What:** `os.remove(p)` returns normally even when the OS refused the delete.
+CPython raises `PermissionError`/`FileNotFoundError`; fastpy raises nothing and
+the file is still there afterwards. Every removal error is invisible, so a
+program that cleans up after itself silently doesn't.
+
+**Reproduce** — CPython prints `gone: True`, fastpy prints `gone: False` with
+no error in between:
+```python
+import os
+P = "t.txt"
+w = open(P, "w"); w.write("x\n"); w.close()
+def direct(path):
+    return open(path, "r").read()   # handle leaked, so P stays open
+print("n:", len(direct(P)))
+os.remove(P)
+print("gone:", not os.path.exists(P))
+```
+
+**Where:** the `os.remove` emitter / runtime shim. The return value of the
+underlying `remove`/`DeleteFile` is discarded instead of being turned into an
+exception.
+
+**Proper fix:** check the result and raise the matching `OSError` subclass —
+this is the same "a failure that produces no value produces no error either"
+shape as the pending-exception family, one layer down.
+
+**Severity:** silent data-integrity failure; also masks
+BUG-TEMP-FILE-OBJECT-HANDLE-LEAKED below, which is how it was found.
+
+### BUG-TEMP-FILE-OBJECT-HANDLE-LEAKED. A file object with no name is never closed — 2026-07-27
+
+**What:** `open(p, "r").read()` leaves the handle open for the rest of the
+process. CPython drops the last reference when the expression ends and closes
+it there; fastpy has no such release for a file object that was never bound to
+a name. On Windows the still-open handle blocks deletion of the file.
+
+**Reproduce:** see BUG-OS-REMOVE-IGNORES-FAILURE above — the file survives
+`os.remove` precisely because the read leaked its handle.
+
+**Where:** the temporary-lifetime handling for file objects in
+`compiler/codegen.py`. Named file vars are closed by an explicit `.close()` or
+by a `with`; an unnamed one is on no release path at all.
+
+**Proper fix:** register an unnamed `open(...)` result as an owned temporary so
+the statement-boundary release closes it, the same treatment other owned
+pointer temporaries get.
+
+**Severity:** resource leak, and on Windows a functional failure (the file
+cannot be deleted or reopened for writing). Noted in
+`tests/regressions/file_read_returned_from_function_is_str.py`, which avoids
+the shape for this reason.
+
+### BUG-RETURNED-LIST-ELEM-TAG-LOST. A list of strings returned from a function reads its elements back as ints — 2026-07-27
+
+**What:** the *same list literal* is typed `list[str]` at module scope and
+`list[int]` once it has been through a `return`. Reading an element back then
+reinterprets the string pointer as an integer, so `len(x[1])` is `0`, and a str
+method on it either hangs or crashes.
+
+**Reproduce** — CPython prints `4 4 4`, fastpy prints `4 0 0`:
+```python
+def mk_const():
+    return ["alpha", "beta"]
+
+def mk_local():
+    ls = ["alpha", "beta"]
+    return ls
+
+lit = ["alpha", "beta"]
+print(len(lit[1]), len(mk_const()[1]), len(mk_local()[1]))
+```
+Iteration loses it too — `for e in mk_const(): print(len(e))` gives `0 0`. And
+the failure is not confined to `len`: `mk_const()[1].strip()` **hangs** (an
+infinite loop inside the runtime, not a segfault), while the same element
+reached through a file read reports `AttributeError: 'file' object has no
+method 'strip'` — the mis-tagged pointer is dispatched against whatever class
+the stale tag names, so the symptom depends on the caller.
+
+**Where:** the function return path in `compiler/codegen.py`. `ret_tag` for a
+list-returning function is `"ptr"`, and the loop just after it
+(`_duf_determine_ret_tag`, the `ret_tag == "ptr"` arm) tries to recover an
+element type but only recognises lists built by appending *lists*. The element
+kind of the list actually being returned is never consulted, so the caller's
+view of the result defaults to `list[int]`.
+
+**Relation to BUG-LIST-ELEM-STR-TAG-LOST:** that entry is about element types
+that are not statically visible *at construction* (`[a+b]`, `.append(c)`).
+This one is different and arguably worse: the elements here are plain string
+**constants**, correctly typed where they are written, and the type is
+discarded by the return.
+
+**Not only `str`, and not only `return`.** The same tag is what a *nested*
+container reads its inner elements through, and the same default to
+`VKind.INT` applies, so `outer = [inner, inner]` loses whatever `inner`'s
+elements were. With a heap-numeric element the consequence is not a wrong
+length but a wrong *answer*: `outer[0][0] == inner[0]` compares two pointers
+as integers and says `False`. See BUG-BIGINT-COMPARES-BY-POINTER, which is
+this bug reached from the other direction and is fixed by fixing this one.
+
+**Proper fix:** infer the returned list's element kind from the same
+information the construction site already has — for `return [<const str>, ...]`
+and for `return <name>` where the name was assigned such a literal, carry the
+element kind into the call site's view of the result. The general case needs
+the element kind to travel with the value at runtime rather than be re-derived
+statically at every consumer, which is the standing theme of this bug family.
+
+**Severity:** silently wrong values, plus a hang — high.
+
 ### BUG-FILEREAD-FN-RETTAG is a segfault, not just a wrong type — 2026-07-27
 
 Recorded here because the symptom is nothing like the entry's title and cost an
@@ -3413,7 +3523,32 @@ index a str, list, dict, tuple or bytes from the tag. Four parts:
 **Test:** tests/regressions/subscript_untyped_param.py. Verified wrong at
 1f23c9f. Clean under ASan/UBSan/LSan.
 
-### BUG-FILEREAD-FN-RETTAG. A user function that returns a file-read result is typed `int`, losing the `str` tag — 2026-07-21
+### BUG-FILEREAD-FN-RETTAG. A user function that returns a file-read result is typed `int`, losing the `str` tag — 2026-07-21 — **FIXED 2026-07-27**
+
+**Fixed:** option 2 from the plan below. `_scope_file_names` reads which locals
+hold an `open(...)` file straight off the AST, so the pre-pass can answer
+before any body has been emitted and `_file_vars` exists; `_file_method_kind`
+maps `<file>.read`/`readline` → STR and `readlines` → LIST on top of it. Three
+consumers use it: the assignment scan in `_duf_detect_ret_type` (so `data =
+f.read()` types `data`), that function's return-expression scan (so `return
+f.readline()` picks the pointer LLVM type), and `_duf_determine_ret_tag` (so
+the tag says *which* pointer).
+
+The scan is deliberately flow-insensitive and declines when a name is bound to
+both `open(...)` and something else — a wrong answer here misroutes a method
+call, so the ambiguous case answers "not a file". Whether `open` itself is
+shadowed is settled once from the module AST (`_open_is_shadowed`) rather than
+from `_user_functions`: that set is still being filled while the pre-pass runs,
+so a `def open` further down the file would be invisible here and visible at
+emit time, and the two disagreeing about one call is worse than either answer.
+
+Fixing this exposed, and required, a second fix — see
+BUG-ALIASED-LOCAL-RETURN-KIND-LOST: the read had to survive one more local
+(`out = raw`) before the `return`.
+
+**Test:** `tests/regressions/file_read_returned_from_function_is_str.py`.
+
+<details><summary>Original report</summary>
 
 **What:** codegen's return-type inference for a user-defined function does not
 recognize that the function returns a `str` when the returned value came from a
@@ -3466,42 +3601,204 @@ result through a user function). The `services/fastpy-cat` and
 `services/fastpy-sysinfo` SlateOS utilities use the inline pattern for this
 reason.
 
-### DEBT-REGRESSION-SUITE-FLAKE. Two different regression tests have each failed once in a full run and passed alone and on re-run — 2026-07-27
+</details>
 
-**What:** one run of `python -m pytest tests/regressions -q` reported
-`FAILED tests/regressions/int_float_of_tagged_value.py`. Re-running that file
-alone passed, and the very next full run of the whole directory was 341/341.
-Nothing in the compiler or runtime changed between the two runs.
+### BUG-ALIASED-LOCAL-RETURN-KIND-LOST. One extra copy before a `return` erases the local's inferred kind — 2026-07-27 — **FIXED 2026-07-27**
 
-Later the same day a second full run reported
-`FAILED tests/regressions/list_literal_heap_numeric_elems.py` — a *different*
-test, with only documentation text and one regression file's contents changed
-since the previous green run. That file too passed alone, and the following
-full run was 342/342. Two unrelated tests each failing exactly once and never
-again is the signature of the environment, not of either test: whatever it is,
-it is not specific to the code under test.
+**What:** `_duf_detect_ret_type` types each local from the *shape* of what is
+assigned to it. A bare Name has no shape, so `out = raw` matched nothing and
+the function's return type fell back to `int` — the caller then read a live
+string pointer as an integer.
 
-**Suspected cause:** not the test. The harness compiles into a temp directory
-and shells out to `link`/`clang` for every file, so a transient file lock — an
-on-access virus scanner holding the freshly written `.exe`, or a leftover
-handle from the previous test's process — would surface as exactly this: a
-one-off failure with no reproduction. `DEFAULT_TIMEOUT` expiring under load is
-the other candidate; `RunResult.timed_out` would distinguish them.
+**Reproduced** — CPython printed `6 3`, fastpy printed `0 0`:
+```python
+def f():
+    raw = "abcdef"
+    out = raw
+    return out
 
-**What to do:** the failure detail — which of stdout / exit code / stderr
-differed, and whether `timed_out` was set — is the whole diagnosis, and `-q`
-throws it away as soon as the run scrolls past. Both occurrences so far were
-lost that way. Run the suite with `-q --tb=short` (or re-run failing files with
-`-vv`) so the next one is captured rather than merely counted. If it turns out
-to be a lock, the fix is a bounded retry around the link step in
-`compile_source`, not a retry of the test.
+def g(n):
+    raw = str(n) + "x"
+    out = raw
+    return out
 
-**Severity:** low on its own, corrosive if it becomes normal — a suite with a
-known flaky test is a suite whose failures stop being read.
+print(len(f()), len(g(12)))
+```
+
+**Fixed:** two independent faults, one per line of that repro.
+
+1. The kind sets (`str_vars`, `list_vars`, `dict_vars`, `obj_vars`,
+   `float_vars`) are now closed over plain name-to-name assignments as a
+   **fixpoint** rather than left to the single walk. A fixpoint and not one
+   pass because `ast.walk` does not visit in source order and an alias chain
+   can be any length.
+2. The arm for the string-building pattern `result = result + ch` tested "is
+   the left operand a known str" from *inside* the arm instead of in its
+   guard. Every other `+` was therefore claimed by that arm and then dropped,
+   shadowing the general `_expr_is_str` test that came after it — which is why
+   `str(n) + "x"`, unambiguously a str, was typed int. The test moved into the
+   guard, and the mirrored `ch + result` was added while there.
+
+Found while fixing BUG-FILEREAD-FN-RETTAG, which needs the same propagation to
+carry a file read through one more local.
+
+**Test:** `tests/regressions/aliased_local_keeps_its_kind.py`.
+
+### BUG-BIGINT-COMPARES-BY-POINTER. A BigInt compares by address unless an operand is statically BIGINT — 2026-07-27
+
+**What:** a BigInt-tagged value that reaches `==` without the compiler
+*statically* knowing one side is a BigInt is compared as a raw pointer, so
+equal values answer `False`:
+
+```python
+inner = [2 ** 85]
+outer = [inner, inner]
+print(outer[0][0] == inner[0])   # CPython True, compiled False
+
+def pick(vs):
+    return vs[0]
+big = 2 ** 120
+print(pick([big]) == big)        # CPython True, compiled False
+print(big == big)                # True — the statically-known case works
+```
+
+Printing the same expressions is correct in every case, so the value and its
+tag survive; only the *comparison* is wrong.
+
+**Root cause:** not the compare path — the *kind*. `_emit_compare` dispatches
+on `left_kind` / `tv_right.vtype.kind`, and neither of these expressions has
+kind BIGINT:
+
+- `outer[0][0]` — `outer` is a list-of-lists whose element tag is the bare
+  `"list"`, with no element type, so the second subscript falls to the
+  `VKind.INT` default (codegen.py:18794). This is
+  **BUG-RETURNED-LIST-ELEM-TAG-LOST** seen through a container instead of a
+  return: the same "is it a list of lists, yes or no" tag at codegen.py:7679
+  that throws the inner element type away.
+- `pick([big])` — a function returning `vs[0]` gets its return tag from the
+  same inference, so the call is typed INT.
+
+With *both* sides confidently typed INT, the chain never reaches the BIGINT
+arm (30482) and never reaches the UNKNOWN-operand `fv_compare` arm (30378),
+which requires the two kinds to *differ*. Two i64 pointers are compared, and
+two distinct allocations are never equal. `big == big` works only because a
+BIGINT-kinded `Name` is one of the few shapes the inference does keep.
+
+That is also why printing is correct throughout: `print` takes the runtime
+tag, which was right all along. Only the statically-dispatched operations are
+wrong.
+
+**Proper fix:** fix the element/return tag (BUG-RETURNED-LIST-ELEM-TAG-LOST),
+which removes the cause. Independently, `_emit_compare` should treat a
+*pointer-shaped* operand typed INT as a contradiction rather than comparing
+it — an i64 that came out of a container should go through `fv_compare` — so
+that the next tag-inference hole degrades to slow-but-correct instead of
+silently wrong.
+
+**Severity:** high. Silently wrong answers, no crash and no diagnostic. Note
+the failure is not confined to BigInt: any heap tag reachable through a
+nested container or a returned element has the same hole.
+
+### BUG-HASH-BY-POINTER-FOR-HEAP-VALUES. BigInt, bytes, Decimal and complex hash by address, so they cannot be dict keys or set members — 2026-07-27
+
+**What:**
+
+```python
+st = {2 ** 96}
+print(2 ** 96 in st)     # CPython True, compiled False
+d = {2 ** 96: "k"}
+print(d[2 ** 96])        # CPython 'k', compiled KeyError: 2850994955104
+```
+
+The `KeyError` prints the *address*, which names the bug outright.
+
+**Root cause:** *both* halves of key identity fall through to the pointer.
+`fpy_hash_value` (runtime/objects.c:2418) handles STR, INT, BOOL, NONE, FLOAT
+and LIST, then ends with `return (uint64_t)v.data.i;  /* fallback for other
+types */`; `fpy_key_equal` (~2517) handles the numeric tower, STR and LIST and
+then ends with `return a.data.i == b.data.i;  /* fallback */`. So two
+structurally equal heap values land in different buckets *and* would compare
+unequal even if they collided. BYTES is caught by the same two fallbacks and
+is hashable in CPython, so `{b"a": 1}[b"a"]` has the same hole.
+
+**Proper fix:** give each heap tag a value-based hash — BIGINT over its limbs
+and sign (matching the int hash for values that fit in i64, since
+`hash(2**96) == hash(2**96)` must hold and a BigInt that fits an i64 should
+hash like the i64), BYTES over its bytes, DECIMAL over its numeric value so it
+agrees with the int/float hash it compares equal to, COMPLEX over its two
+components — with the matching arms added to `fpy_key_equal` in the same
+change, since a hash without an equality is only half a key. Only genuinely
+identity-hashed tags (OBJ without `__hash__`) should keep the pointer, and
+that case should be explicit rather than a fall-through in either function.
+
+**Severity:** high, and quiet — a missing key looks like a program bug.
+
+### DEBT-COMPLEX-DECIMAL-NOT-REFCOUNTED. FPY_TAG_COMPLEX and FPY_TAG_DECIMAL are heap-allocated but appear in neither incref nor decref — 2026-07-27
+
+**What:** `fpy_rc_incref` and `fpy_rc_decref` (runtime/objects.c) both fall
+through to `default: break` for `FPY_TAG_COMPLEX` (11) and `FPY_TAG_DECIMAL`
+(12), which are heap pointers. Because *both* sides are missing they are
+consistent, so this leaks rather than dangles — which is why it has never
+crashed.
+
+**Why it matters anyway:** the asymmetric version of exactly this omission was
+BUG-BIGINT-INCREF-MISSING, a heap use-after-free that masqueraded as a suite
+flake for weeks. The safety here rests on nobody ever adding the decref arm
+alone. Add both arms together, or add an explicit comment at each
+`default: break` naming the tags that deliberately fall through.
+
+**Proper fix:** give FpyComplex and FpyDecimal a leading `int32_t refcount`
+like FpyBigInt and add matching arms to both functions.
 
 ---
 
 ## Recently Fixed
+
+### BUG-BIGINT-INCREF-MISSING (fixed 2026-07-27) — *this was the "regression suite flake"*
+
+`fpy_rc_decref` (runtime/objects.c:295) has a `case FPY_TAG_BIGINT` that
+decrements the BigInt's refcount and frees it at zero. `fpy_rc_incref`, forty
+lines above it, did **not** — BIGINT fell into `default: break` alongside
+INT/FLOAT/BOOL/NONE, the genuinely unboxed tags. So every incref of a BigInt
+was a silent no-op while every decref really counted down. A BigInt with one
+owner survived; a BigInt with **two** owners was freed by the first release,
+and the second one read freed memory.
+
+**The narrowest reproducer is two loops sharing a loop variable:**
+
+```python
+for x in [2 ** 80]:   # x borrows the element and "increfs" it — no-op
+    print(int(x))
+#                     # the temp list is released here, freeing the BigInt
+for x in [1]:         # rebinding x decrefs the old value → use-after-free
+    print(int(x))
+```
+
+It needs *two* loops because with one, nothing touches the variable after the
+list dies. Dropping either loop, or renaming the second loop's variable, makes
+it clean.
+
+**Why it looked like a flake.** Natively this is a ~15–25% abort with exit
+`0xC0000374` (`STATUS_HEAP_CORRUPTION`) or `0xC0000005` — intermittent because
+whether the freed block has been reused yet is allocator-state dependent. It
+had been filed twice as `DEBT-REGRESSION-SUITE-FLAKE`, once against
+`int_float_of_tagged_value.py` and once against
+`list_literal_heap_numeric_elems.py`, on the reasoning that two unrelated tests
+each failing once and passing on re-run is the signature of the environment
+rather than of the code. That reasoning was wrong: the two tests are not
+unrelated — they are the only two in the suite that iterate a list literal of
+BigInts twice over the same name. The entry itself warned that `-q` was
+discarding the one fact that mattered; capturing the exit code is what turned
+it from folklore into a bug, and `tools/pure_harness.py` then made it
+deterministic and pointed straight at `fpy_decref`.
+
+**Fix:** add the mirroring arm to `fpy_rc_incref`, and label the remaining
+`default: break` with the tags that fall through it on purpose (and with the
+two, COMPLEX and DECIMAL, that fall through it by omission — see
+DEBT-COMPLEX-DECIMAL-NOT-REFCOUNTED).
+
+**Test:** `tests/regressions/bigint_shared_ownership.py` — 7/30 native aborts
+and a deterministic ASan report before the fix, 0/30 and ASan-clean after.
 
 ### BUG-CONTAINER-STORE-STR-TEMP-UAF (fixed 2026-07-24)
 
