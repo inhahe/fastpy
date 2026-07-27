@@ -12202,6 +12202,38 @@ class CodeGen:
         self._fv_forced_locals = self._scan_fv_forced_locals(
             node.body, set(self.variables) | self._current_func_params)
 
+        # Excluding parameters is right for the *scan* — their slots are made
+        # by `_efd_store_parameters` above, not by a first store — but it left
+        # them without the one-slot guarantee, and a parameter is the most
+        # natural loop counter there is: `def f(i): while i < n: i = i + 1`
+        # widened `i` mid-loop into a second alloca, so the condition kept
+        # reading the abandoned one and the loop never terminated.
+        # BUG-BIGINT-PROGRAM-HANGS-WHILE-COUNTER.
+        #
+        # Re-running the scan with the parameters visible is safe to act on at
+        # exactly this point: only the parameter stores have been emitted, so
+        # rebuilding a slot now strands no loads.  Names already in
+        # `self.variables` that are *not* parameters stay skipped — a closure
+        # cell or a global is not ours to widen.
+        if self._USE_FV_LOCALS and self._current_func_params:
+            _forced_params = self._scan_fv_forced_locals(
+                node.body,
+                set(self.variables) - self._current_func_params,
+            ) & self._current_func_params
+            for _pname in sorted(_forced_params):
+                _entry = self.variables.get(_pname)
+                if _entry is None:
+                    continue
+                _palloca, _ptag = _entry
+                if _palloca.type.pointee == fpy_val:
+                    continue
+                _pcur = self.builder.load(_palloca)
+                self._fv_forced_locals.add(_pname)
+                # Drop the binding so `_store_variable` builds a fresh slot
+                # rather than reusing (or re-widening) the narrow one.
+                del self.variables[_pname]
+                self._store_variable(_pname, _pcur, _ptag)
+
         # --typed mode: parse parameter annotations and create native allocas
         # with entry guards that verify the FpyValue tag matches the annotation.
         if self._typed_mode and info.uses_fv_abi:
@@ -18221,10 +18253,7 @@ class CodeGen:
 
     def _assign_try_int_constructor(self, node: ast.Assign) -> bool:
         """Handle unchecked_int/checked_int/int32 constructor calls. Returns True if handled."""
-        _INT_CONSTRUCTORS = {
-            'unchecked_int': 'unchecked', 'checked_int': 'checked',
-            'unchecked_int32': 'unchecked32', 'checked_int32': 'checked32',
-        }
+        _INT_CONSTRUCTORS = self._INT_CONSTRUCTORS
         if not (len(node.targets) == 1
                 and isinstance(node.targets[0], ast.Name)
                 and isinstance(node.value, ast.Call)
@@ -23175,6 +23204,58 @@ class CodeGen:
                         unsafe.add(stmt.target.id)
         return unsafe
 
+    # Constructors that pin a variable to an explicit i64 overflow policy.
+    # Shared with `_scan_fv_forced_locals`, which has to recognise them
+    # syntactically: `_int_mode_vars` is not filled until emission.
+    _INT_CONSTRUCTORS = {
+        'unchecked_int': 'unchecked', 'checked_int': 'checked',
+        'unchecked_int32': 'unchecked32', 'checked_int32': 'checked32',
+    }
+
+    _INT_MODE_MARKERS = frozenset({'Unchecked', 'Checked',
+                                   'Unchecked32', 'Checked32'})
+
+    @staticmethod
+    def _is_constant_arith(e: ast.expr) -> bool:
+        """Is *e* arithmetic over literals alone, with no names or calls?
+
+        Such an expression is folded to a single constant whose kind codegen
+        knows exactly — `2 ** 63` is a BigInt, always — so it is never the
+        "might be narrow, might promote" shape that forces a wide slot.
+        """
+        if isinstance(e, ast.Constant):
+            return isinstance(e.value, (int, float)) and not isinstance(e.value, bool)
+        if isinstance(e, ast.BinOp):
+            return (CodeGen._is_constant_arith(e.left)
+                    and CodeGen._is_constant_arith(e.right))
+        if isinstance(e, ast.UnaryOp) and isinstance(e.op, (ast.USub, ast.UAdd)):
+            return CodeGen._is_constant_arith(e.operand)
+        return False
+
+    # Expression nodes that can never be an integer, so `_emit_int_binop` is
+    # never reached for them and the `_program_uses_bigint` widening below
+    # must not fire.  Containers, comprehensions and f-strings are obvious;
+    # `Compare`/`BoolOp` yield bools, which take the bool path.
+    _NEVER_INT_NODES = (ast.List, ast.Tuple, ast.Dict, ast.Set, ast.ListComp,
+                        ast.SetComp, ast.DictComp, ast.GeneratorExp,
+                        ast.JoinedStr, ast.Compare, ast.BoolOp, ast.Lambda)
+
+    @property
+    def _program_class_names(self) -> set[str]:
+        """Every `class` name in the program, for spotting constructor calls.
+
+        `_scan_fv_forced_locals` needs this to tell `v1 + v2` on two `Vector`s
+        from `i + 1` on two ints, and it runs before any class is emitted, so
+        it reads the module AST saved in Pass 0 rather than a codegen-side
+        registry that does not exist yet.
+        """
+        cached = getattr(self, '_program_class_names_cache', None)
+        if cached is None:
+            cached = {n.name for n in ast.walk(self._module_tree)
+                      if isinstance(n, ast.ClassDef)}
+            self._program_class_names_cache = cached
+        return cached
+
     # Builtins whose result kind is their argument's kind, so a tagged
     # argument makes the result tagged too.  `round` is included even though
     # one-argument `round` is always an int in CPython: this scan is allowed
@@ -23219,6 +23300,80 @@ class CodeGen:
         """
         forced: set[str] = set()
 
+        # A variable with an explicit per-variable overflow policy never
+        # promotes: `unchecked_int` wraps and `checked_int` raises, and
+        # neither ever yields a tagged value.  Widening one anyway breaks the
+        # policy — it crashed `annotated_overflow_behavior` outright.  The
+        # markers have to be read syntactically here because `_int_mode_vars`
+        # is not filled until emission, long after this scan.
+        _mode_pinned: set[str] = set()
+        for _stmt in self._walk_scope(body):
+            if isinstance(_stmt, ast.Assign) and len(_stmt.targets) == 1:
+                _tgt, _val = _stmt.targets[0], _stmt.value
+            elif isinstance(_stmt, ast.AnnAssign):
+                _tgt, _val = _stmt.target, _stmt.value
+            else:
+                continue
+            if not isinstance(_tgt, ast.Name):
+                continue
+            if (isinstance(_val, ast.Call) and isinstance(_val.func, ast.Name)
+                    and _val.func.id in self._INT_CONSTRUCTORS):
+                _mode_pinned.add(_tgt.id)
+            elif (isinstance(_stmt, ast.AnnAssign)
+                    and _stmt.annotation is not None):
+                _markers = self._unwrap_annotated(_stmt.annotation)[1]
+                if any(_m in self._INT_MODE_MARKERS for _m in _markers):
+                    _mode_pinned.add(_tgt.id)
+        if _mode_pinned:
+            skip = set(skip) | _mode_pinned
+
+        # `_program_uses_bigint` only changes how *integer* arithmetic is
+        # emitted, so the widening below has to be able to tell `i + 1` from
+        # `v1 + v2` on two `Vector`s.  Getting that wrong printed an empty
+        # string for `f"{v1 + v2}"`: the object went into a tagged slot and
+        # its `__str__` was never found.  Names are classified by what they
+        # are assigned syntactically — a container, an f-string, a string
+        # literal or a constructor call for a class in this program all mean
+        # "never an int".  This deliberately answers "maybe" for anything it
+        # cannot see through (a plain call, an attribute, a subscript), since
+        # under-approximating here brings the hang back.
+        _never_int: set[str] = set()
+
+        def maybe_int(e) -> bool:
+            if isinstance(e, ast.Constant):
+                return isinstance(e.value, int) and not isinstance(e.value, bool)
+            if isinstance(e, self._NEVER_INT_NODES):
+                return False
+            if isinstance(e, ast.Name):
+                return e.id not in _never_int
+            if isinstance(e, ast.BinOp):
+                return maybe_int(e.left) and maybe_int(e.right)
+            if isinstance(e, ast.UnaryOp):
+                return (isinstance(e.op, (ast.USub, ast.UAdd, ast.Invert))
+                        and maybe_int(e.operand))
+            if isinstance(e, ast.IfExp):
+                return maybe_int(e.body) or maybe_int(e.orelse)
+            if isinstance(e, ast.Call):
+                return not (isinstance(e.func, ast.Name)
+                            and e.func.id in self._program_class_names)
+            return True
+
+        for _ in range(4):
+            _grew = False
+            for _stmt in self._walk_scope(body):
+                if isinstance(_stmt, ast.Assign) and len(_stmt.targets) == 1:
+                    _tgt, _val = _stmt.targets[0], _stmt.value
+                elif isinstance(_stmt, (ast.AnnAssign, ast.AugAssign)):
+                    _tgt, _val = _stmt.target, _stmt.value
+                else:
+                    continue
+                if (isinstance(_tgt, ast.Name) and _val is not None
+                        and _tgt.id not in _never_int and not maybe_int(_val)):
+                    _never_int.add(_tgt.id)
+                    _grew = True
+            if not _grew:
+                break
+
         def yields_mixed(e) -> bool:
             if isinstance(e, ast.Name):
                 return e.id in forced
@@ -23241,7 +23396,47 @@ class CodeGen:
                 # fv_slice hand back.
                 return yields_mixed(e.value)
             if isinstance(e, ast.BinOp):
-                return yields_mixed(e.left) or yields_mixed(e.right)
+                if yields_mixed(e.left) or yields_mixed(e.right):
+                    return True
+                # Both operands can be plain ints and the result still be
+                # tagged.  Pass 0.9 sets `_program_uses_bigint` for the *whole
+                # program* when any constant reaches BigInt range, and
+                # `_emit_int_binop` then routes every integer +/-/*/**/<<
+                # through `fpy_checked_*`, which hands back an FpyValue
+                # carrying FPY_TAG_BIGINT on overflow.  So the operator alone
+                # decides this, not the operands — and missing it meant
+                # `i = 0` / `while i < n: i = i + 1` gave `i` an i64 slot and
+                # then widened mid-loop into a second one, leaving the
+                # condition reading a slot nobody stores to again.  The
+                # counter stayed 0 and the loop never terminated.
+                # BUG-BIGINT-PROGRAM-HANGS-WHILE-COUNTER.
+                #
+                # An all-constant expression is exempt, and that exemption is
+                # load-bearing rather than an optimisation.  `x = 2 ** 63` is
+                # *unconditionally* a BigInt, not a value that might promote,
+                # and codegen already gives it a static BIGINT slot holding a
+                # pointer.  Widening it to a tagged slot instead breaks every
+                # consumer that expects the pointer — `print(add_big(x, y))`
+                # printed an address — because a BIGINT-tagged FpyValue is not
+                # narrowed back at a call boundary.  That is
+                # BUG-BIGINT-FV-RESULT-NOT-CONSUMED, and until it is fixed,
+                # over-approximating here is *not* free: a wide slot is only
+                # harmless for values the tagged paths handle correctly.
+                #
+                # `maybe_int` keeps this to arithmetic that could actually
+                # reach `_emit_int_binop`.  Without it the clause fired on
+                # `v3 = v1 + v2` for a user class with `__add__`, put the
+                # object in a tagged slot and lost its `__str__`, so
+                # `f"v1 + v2 = {v3}"` printed nothing after the `=`.  A float
+                # operand is excluded the same way and for the same reason:
+                # `t + 1.5` is a double, never a tagged value.
+                if (self._program_uses_bigint
+                        and isinstance(e.op, (ast.Add, ast.Sub, ast.Mult,
+                                              ast.Pow, ast.LShift))
+                        and maybe_int(e)
+                        and not self._is_constant_arith(e)):
+                    return True
+                return False
             if isinstance(e, ast.UnaryOp):
                 return yields_mixed(e.operand)
             if isinstance(e, ast.IfExp):

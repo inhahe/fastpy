@@ -2875,20 +2875,177 @@ introduced by an ordinary assignment.
 **Not a regression.** Verified failing identically at HEAD, `622b214` and
 `cfc34df`. It predates the whole IfExp/tagged-value line of work.
 
-**Proper fix:** `yields_mixed`'s `BinOp` case must return `True` for an
-overflow-capable operator whenever `self._program_uses_bigint` is set,
-regardless of the operands' kinds — because that is precisely what the emitter
-will do. Pass 0.9 runs long before the scan, so the flag is available. This
-over-approximates (every int accumulator in a bigint-using program gets a wide
-slot), which is the documented and safe direction for this scan.
-
 **Severity: high — an infinite hang with no output, on entirely ordinary code.**
 Worse than a wrong answer: no assertion, no message, no exit. The harness does
 report it, as a `fail` with `Timed out` in stderr.
 
-**Worked around** in `tests/regressions/abs_of_tagged_value.py`, whose `while`
-accumulator lives at module scope (the file binds `2 ** 80`); the comment there
-points here.
+**Fix,** in five parts:
+
+1. `yields_mixed`'s `BinOp` case now returns `True` for an overflow-capable
+   operator (`+ - * ** <<`) whenever `self._program_uses_bigint` is set,
+   without asking whether either operand is *already* mixed — because that is
+   precisely what the emitter will do. Pass 0.9 runs long before the scan, so
+   the flag is available.
+2. **All-constant arithmetic is exempt, and that exemption is load-bearing.**
+   `x = 2 ** 63` is *unconditionally* a BigInt, not a value that might promote,
+   and codegen gives it a static BIGINT slot holding a pointer. Widening it to
+   a tagged slot instead broke every consumer expecting that pointer —
+   `print(add_big(x, y))` printed an address — because a BIGINT-tagged
+   `FpyValue` is never narrowed back at a call boundary. **This is the
+   correction to the assumption that over-approximating is free:** a wide slot
+   is only harmless for values the tagged paths actually handle, and BigInt is
+   not one of them until BUG-BIGINT-FV-RESULT-NOT-CONSUMED is fixed. New
+   helper `_is_constant_arith`. Float arithmetic *is* still over-approximated,
+   which is fine because a float round-trips through a wide slot correctly.
+3. **Variables with an explicit overflow policy are exempt.** `unchecked_int`
+   wraps and `checked_int` raises; neither ever produces a tagged value, and
+   widening one broke the policy badly enough to crash
+   `annotated_overflow_behavior` with an access violation. The scan now reads
+   the `unchecked_int`/`checked_int` constructors and the
+   `Unchecked`/`Checked` `Annotated` markers *syntactically*, because
+   `_int_mode_vars` is not populated until emission — long after this scan.
+   The constructor table moved to a shared `_INT_CONSTRUCTORS` class constant
+   rather than being duplicated.
+4. **Parameters needed the same guarantee.** Excluding them from the scan is
+   right — their slots are made by `_efd_store_parameters`, not by a first
+   store — but a parameter is the most natural loop counter there is, and
+   `def f(i): while i < n: i = i + 1` hung for exactly the same reason. The
+   scan is now re-run with parameters visible, and any parameter it forces has
+   its slot rebuilt as an `fpy_val` immediately after `_efd_store_parameters`.
+   That point is the only safe one: just the parameter stores have been
+   emitted, so rebuilding a slot strands no loads. Non-parameter names already
+   in `self.variables` stay skipped — a closure cell or a global is not ours to
+   widen.
+5. **The operator decides, but only for operands that could be integers.**
+   Part 1 keyed off `+` alone, and `+` is also object concatenation: it widened
+   `v3` in `v3 = v1 + v2` for a user class with `__add__`, so `f"{v3}"` printed
+   the empty string — the object sat in a tagged slot where its `__str__` was
+   never found. `tests/programs/advanced.py` caught this and nothing else did.
+   The scan now carries a `maybe_int` predicate: container/comprehension/
+   f-string/comparison nodes, non-int constants, and calls to a class defined
+   in this program are never ints, and names assigned from any of those are
+   propagated to a `_never_int` set by a small fixpoint. Anything it cannot see
+   through — a plain call, an attribute, a subscript — answers "maybe", since
+   under-approximating brings the hang back. Class names come from a new
+   `_program_class_names` property reading `self._module_tree` (saved in
+   Pass 0), because no codegen-side class registry exists this early.
+
+   This also removes the float over-approximation part 2 had accepted:
+   `t + 1.5` has a float constant operand, so it is no longer widened.
+
+**Test:** `tests/regressions/bigint_program_while_counter.py`, also clean under
+ASan/UBSan/LSan.
+
+**Was worked around** in `tests/regressions/abs_of_tagged_value.py`, whose
+`while` accumulator was moved to module scope (the file binds `2 ** 80`). The
+workaround is now unnecessary but harmless, and the comment there points here.
+
+### BUG-INT-OVERFLOW-WRAPS-WITHOUT-BIG-LITERAL. Integer arithmetic silently wraps unless the program *mentions* a big constant — 2026-07-27
+
+**What:** Pass 0.9 decides whether a program needs BigInt by looking for a big
+integer *constant* in the AST (`>= 1 << 62`, `**` with exponent `> 30`, `<<`
+with shift `>= 40`). If it finds none, `_emit_int_binop` emits a plain
+`builder.add`/`mul` with no overflow check at all. But a program can overflow at
+runtime without containing any big constant — that is what repeated
+multiplication *is*. Python integers are arbitrary precision; fastpy silently
+produces a wrapped i64.
+
+**Reproduce** — every one of these is ordinary, big-literal-free code:
+```python
+def fact(n):
+    r = 1
+    i = 2
+    while i <= n:
+        r = r * i
+        i = i + 1
+    return r
+print(fact(25))     # 7034535277573963776, not 15511210043330985984000000
+
+a = 0
+b = 1
+i = 0
+while i < 100:
+    a, b = b, a + b
+    i = i + 1
+print(a)            # 3736710778780434371, not 354224848179261915075
+
+def f():
+    t = 1
+    for i in range(70):
+        t = t * 2
+    return t
+print(f())          # 0, not 1180591620717411303424
+```
+Adding any big constant anywhere in the file — even an unused `z = 2 ** 80` —
+makes the first and third correct, which is a good way to confirm the trigger.
+
+**Where:** Pass 0.9 (`compiler/codegen.py:~3830`) and the
+`if not self._program_uses_bigint` early-out in `_emit_int_binop` (`~36683`).
+
+**Why it is the way it is:** the flag exists purely for speed — it lets the
+majority of programs use plain LLVM arithmetic instead of paying an
+`fpy_checked_add` call per operation. The heuristic is sound for *constants* and
+unsound for *computed* values, which is most of them.
+
+**Proper fix:** the fast path has to be justified by something other than "no
+big literals appear". The right shape is the one already used for
+`--typed --int64`: `llvm.sadd.with.overflow.i64` and friends, which cost
+essentially nothing (no call, still vectorisable) and branch to a promotion slow
+path only on actual overflow. That gets correctness *and* keeps the speed, and
+would let Pass 0.9's whole-program flag be deleted rather than patched.
+
+**Blocked on BUG-BIGINT-FV-RESULT-NOT-CONSUMED.** Deleting the flag means every
+program's integer arithmetic can promote, so BIGINT-tagged `FpyValue`s stop
+being confined to programs that mention a big literal and start flowing through
+ordinary code — and every consumer that fails to narrow one back to a pointer
+becomes wrong on textbook arithmetic. The same flag also drives the slot scan's
+widening, so turning it on everywhere widens every integer local. Both effects
+are safe only once a BIGINT-tagged value is narrowed correctly wherever it is
+consumed. Fix that first.
+
+**Severity: high — silently wrong arithmetic on ordinary code,** and it violates
+a core language guarantee rather than an edge case. `fact(25)` and `fib(100)`
+are not exotic inputs.
+
+### BUG-BIGINT-MUL-BY-VAR-MISTAGS-FLOAT. A promoted BigInt times a *variable* comes back tagged FLOAT — 2026-07-27
+
+**What:** in a program where `_program_uses_bigint` is set, an accumulator that
+promotes to BigInt and is then multiplied by a **variable** produces a value
+tagged `FPY_TAG_FLOAT`, so it prints as a float. Multiplying by a **constant**
+is correct.
+
+**Reproduce** — the only difference between these is `2` vs `i`:
+```python
+z = 2 ** 80                      # switches on checked arithmetic
+
+def ok():
+    t = 1
+    i = 0
+    while i < 70:
+        t = t * 2                # correct: 1180591620717411303424
+        i = i + 1
+    print(t)
+
+def bad():
+    t = 1
+    i = 2
+    while i <= 25:
+        t = t * i                # 6.746447057102016e+17
+        i = i + 1
+    print(t)
+```
+
+**Where:** the tagged-operand path of `_emit_int_binop` / `fpy_checked_mul`'s
+result handling. The FLOAT tag suggests a branch that treats "tag is not INT" as
+"tag is FLOAT" and reinterprets the BigInt pointer's bits as a double.
+
+**Independent of the slot scan.** It fails identically at module scope and in a
+`for` loop, neither of which goes through `_scan_fv_forced_locals`, and it
+failed at HEAD before BUG-BIGINT-PROGRAM-HANGS-WHILE-COUNTER was fixed.
+
+**Severity:** silently wrong values, with a visibly wrong *type* as the tell.
+Excluded with a comment in
+`tests/regressions/bigint_program_while_counter.py`.
 
 ### BUG-DICT-VALUE-STATIC-KIND. A dict value is loaded with the static kind of the first store — 2026-07-27
 
@@ -2958,14 +3115,47 @@ print(-b - -c)       # nonzero garbage
 `abs()` inherits this exactly, because its BigInt path follows the same
 `bigint_neg` convention: `abs(b) == abs(-b)` is False.
 
-**Where:** wherever a comparison/binop operand is classified. It needs the
-"operand is an `fpy_val` whose tag is BIGINT → extract `data`, inttoptr, take
-the BigInt path" case that currently does not exist.
+**Where — two separate holes, both downstream of correct codegen.** Reading the
+IR for the repro settles it: codegen builds *exactly the right thing*. `-b`
+emits `fpy_bigint_neg` and wraps the result in an `{i32 10, i64 ptr}`, so both
+operands reach the consumer properly tagged BIGINT. Neither consumer knows the
+tag.
+
+1. **`fastpy_fv_compare` (`runtime/objects.c:689`) has no BIGINT case.** It
+   handles STR, then "at least one is FLOAT", then falls through to a default
+   integer compare — which compares the two *pointers*. So `-b == -c` is
+   pointer equality. The FLOAT branch is wrong for BigInt too: it does
+   `(double)data` on a pointer. Note `fpy_value_compare` (the qsort helper at
+   `:1596`) already gets this right with `fpy_bigint_cmp`, so the knowledge
+   exists in the file — just not on this path. Needs a BIGINT case that
+   promotes an INT/BOOL operand with `fpy_bigint_from_i64`, calls
+   `fpy_bigint_cmp`, and frees the temporary; plus a real conversion for
+   FLOAT ⊕ BIGINT.
+2. **`_emit_binop_unknown` inlines a two-way INT-vs-FLOAT tag test.** The IR is
+   `and(tag_l == 0, tag_r == 0)` branching to `unkn_uu.iarith` or
+   `unkn_uu.farith` — so BIGINT (tag 10) takes the *float* branch and the
+   pointer is bitcast to a double. That is where `-b - -c` gets `1024.0`.
+   **This is BUG-ABS-OF-TAGGED-VALUE's shape exactly**: an inlined binary
+   dispatch where six tags are numeric. And as with `abs`, the runtime already
+   has the correct answer — `fastpy_fv_binop` (`runtime/objects.c:1119`)
+   handles BIGINT and Decimal properly and simply is not called. The fix is to
+   keep the inlined int/float fast path for speed but give it a third edge to
+   `fastpy_fv_binop` for anything else, rather than assuming float.
 
 **Not caused by the abs fix** — the `bigint_neg` repro above has no `abs()` in
 it. Excluded with a comment in `tests/regressions/abs_of_tagged_value.py`.
 
 **Severity:** silently wrong comparisons and arithmetic on big integers.
+
+**This blocks BUG-INT-OVERFLOW-WRAPS-WITHOUT-BIG-LITERAL, and should be fixed
+first.** Fixing the wrap means checking every integer operation, which means
+`_program_uses_bigint` is effectively on for every program, which means
+BIGINT-tagged `FpyValue`s flow through *ordinary* code rather than only through
+programs that mention a big literal. Every consumer that fails to narrow one
+would then be wrong on textbook arithmetic instead of on a corner. It is also
+the same limit that forced `_is_constant_arith` in
+BUG-BIGINT-PROGRAM-HANGS-WHILE-COUNTER — a wide slot is only safe for kinds the
+tagged paths handle, so making BigInt one of them unblocks both.
 
 ### BUG-INT-FLOAT-OF-TAGGED-VALUE. `int()` and `float()` of a tagged value are no-ops — 2026-07-27
 

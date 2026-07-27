@@ -253,6 +253,57 @@ one-argument `round` is always an int, because the scan is allowed to
 over-approximate — a wide slot is merely wider than needed — and is not allowed
 to under-approximate.
 
+**The operator can make a value mixed even when both operands are plain.** Pass
+0.9 sets a *whole-program* `_program_uses_bigint` flag from any constant in
+BigInt range, and `_emit_int_binop` then routes every integer `+ - * ** <<`
+through `fpy_checked_*`, whose result is tagged BIGINT on overflow. So in such a
+program `i + 1` is a mixed value however ordinary its operands look, and the
+scan's `BinOp` case has to key off the operator, not the operands. Missing this
+was a *hang*, not a wrong answer: `i = 0` followed by `while i < n: i = i + 1`
+widened `i` mid-loop into a second alloca, leaving the condition reading a slot
+nobody stores to again, so the counter stayed 0 forever.
+
+**…but only where that operator could reach the integer emitter.** `+` is also
+object and string concatenation, and keying off the operator alone widened `v3`
+in `v3 = v1 + v2` for a class with `__add__`, so `f"{v3}"` printed the empty
+string — the object sat in a tagged slot where its `__str__` was never found.
+The scan therefore carries a `maybe_int` predicate: containers, comprehensions,
+f-strings, comparisons, non-int constants and calls to a class defined in this
+program are never ints, and names assigned from any of those propagate into a
+`_never_int` set by a small fixpoint. Anything it cannot see through — a plain
+call, an attribute, a subscript — answers "maybe", because under-approximating
+brings the hang back while over-approximating only costs a wide slot. Class
+names come from `_program_class_names`, which reads the module AST saved in
+Pass 0; there is no codegen-side class registry this early.
+
+**Over-approximating is only safe for kinds the tagged paths handle.** The
+scan's standing licence to widen anything it is unsure about has a limit, found
+the hard way by widening two things that must not be. `x = 2 ** 63` is
+*unconditionally* a BigInt rather than a value that might promote, and gets a
+static BIGINT slot holding a pointer; giving it a tagged slot instead broke
+every consumer expecting that pointer, because a BIGINT-tagged `FpyValue` is
+not narrowed back at a call boundary. And a variable pinned by `unchecked_int`
+or `checked_int` has an overflow policy — wrap, or raise — that a tagged slot
+does not implement at all. So all-constant arithmetic (`_is_constant_arith`)
+and mode-pinned names are both exempt, as is anything `maybe_int` rules out
+(which incidentally also stopped floats being widened: `t + 1.5` has a float
+constant operand). The rule to carry forward: *a wide slot is correct for any
+value the FV paths handle correctly, and BigInt is not yet one of them.*
+
+Because `_int_mode_vars` is only filled during emission, the scan recognises
+`unchecked_int`/`checked_int` and the `Unchecked`/`Checked` markers
+syntactically, off the shared `_INT_CONSTRUCTORS` table.
+
+**Parameters need the one-slot guarantee too, and get it at a specific moment.**
+The scan excludes parameters because their slots are made by
+`_efd_store_parameters` rather than by a first store — but a parameter is the
+most natural loop counter there is. So the scan is re-run with parameters
+visible and any parameter it forces has its slot rebuilt as an `fpy_val`
+*immediately* after `_efd_store_parameters`, which is the only safe point: just
+the parameter stores have been emitted, so rebuilding strands no loads. Names
+already bound that are not parameters stay skipped — a closure cell or a global
+is not the function's to widen.
+
 **A builtin's type dispatch belongs in the runtime once more than two types are
 numeric.** `_emit_builtin_abs` knew exactly two LLVM types, `IntType` and
 `DoubleType`; a tagged `FpyValue`, a BigInt pointer and a Decimal pointer all
