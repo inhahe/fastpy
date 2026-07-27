@@ -1051,6 +1051,53 @@ tag. Only the statically-dispatched operations — `==`, arithmetic, `len` — w
 wrong, which is why it hid: nothing crashed and nothing printed oddly, the
 answers were just false.
 
+**One classifier for a list literal, wherever it appears.** Three CSA scans
+independently answered "what is the tag of this list literal?" — `_build_local_vt`
+for function locals, `_csa_build_var_types` for module globals, and the
+call-argument loop for arguments — each with its own first-element guess
+recognising a *different* subset of element kinds. Whatever a given copy did not
+name fell to a bare `"list"`, which its consumer defaults to `VKind.INT`, so a
+BigInt argument compared by address and a float argument was read as its own
+bits. All three now go through `_csa_list_literal_tag`, a thin wrapper over the
+`_csa_list_elem_tag` classifier the return path already used, so a literal is
+typed by the same rules wherever it is written. `_csa_list_is_mixed` survives as
+a *fallback* rather than being replaced: the classifier declines as soon as any
+element is unclassified and so cannot see the heterogeneity in `[1, some_name]`,
+where the coarser test still can, and "mixed" beats the INT default.
+
+**Knowing an element's kind is not knowing it is a pointer.** Teaching the
+producers to say more immediately broke a consumer that had been reading the
+weaker fact as the stronger one: the return-type analysis widened
+`return <param>[i]` to `i8_ptr` whenever the parameter's element kind was merely
+*not None*. That held only while the element kind was almost never known — once
+the classifier above started saying `"list:float"`, a double came back through an
+`i8*` and `second([1.5, 2.5]) * 2` segfaulted. It had been silently wrong before
+that (it printed a NaN bit pattern as an i64), so the fix woke a latent bug
+rather than creating one. The test is now `elem_kind.is_ptr`, with an explicit
+FLOAT arm because a float element is the one non-pointer kind the i64 default
+gets wrong — the float-evidence walk looks for float *constants* and float-typed
+*names*, and `fs[1]` is neither. The general lesson is that a defaulted field
+read as knowledge will hold until the default stops being universal, which makes
+every such read a hazard that only fires once something upstream improves.
+
+**One merge rule for a parameter's tag.** A parameter's tag is the merge of
+every call site's, and two copies of that merge existed: the direct call-site
+loop in `_analyze_call_sites`, and the interprocedural propagation in
+`_csa_propagate_ret_types` that runs when a callee is reached through a
+*caller's* parameter. The direct copy knew that a bare `"list"` and a
+`"list:int"` are the same type described with different precision; the
+propagation copy knew only bool-vs-int and called everything else a conflict.
+Both now call `_csa_merge_param_tag`, which keeps the more precise container
+tag, widens bool ⊂ int ⊂ bigint, and answers `"mixed"` only when nothing
+narrower is true. Two copies of a *lattice* is a worse duplication than two
+copies of an optimisation: the coarse one does not merely miss a refinement,
+it reports a conflict that is not one — and `"mixed"` for a parameter means
+"an FpyValue of unknown kind", not "a list whose elements vary", so the callee
+stops treating the parameter as a list at all and `len(xs[1:])` answers 0.
+The copies were observably identical for as long as no list argument carried
+an element kind, and diverged the day the classifier above learned to supply
+one.
+
 **A call's type is the callee's return type — never its arguments'.** Three
 independent passes classify an expression's kind, and all three ended a chain of
 specific cases with the same last-resort heuristic: walk the expression, and if

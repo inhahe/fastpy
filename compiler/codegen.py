@@ -7680,6 +7680,78 @@ class CodeGen:
             return "mixed"
         return None  # at least one element is unclassified — say nothing
 
+    def _csa_list_literal_tag(self, node: ast.expr,
+                              local_types: dict[str, str]) -> str:
+        """The `"list:<elem>"` tag of a list literal / comprehension.
+
+        Three separate scans used to answer this question with their own
+        hand-rolled first-element guess, each recognising a *different* subset
+        of element kinds — `_build_local_vt` knew str and float,
+        `_csa_build_var_types` knew those plus list and tuple, and the
+        call-argument loop knew list, tuple and str.  Every kind a given copy
+        did not name fell to a bare `"list"`, which carries no element type and
+        whose consumer fills that in with `VKind.INT`.  So a BigInt argument
+        was compared by address and a float argument read as its own bit
+        pattern — `add_one([1.5, 2.5])` answered 4609434218613702657, which is
+        the IEEE-754 bits of 1.5 loaded as an i64.  `str` elements were right
+        all along, purely because every copy happened to name that one.
+        BUG-BIGINT-COMPARES-BY-POINTER (parameter half).
+
+        `_csa_list_is_mixed` stays as a fallback rather than being replaced.
+        The classifier declines as soon as *any* element is unclassified, so it
+        cannot see the heterogeneity in `[1, some_name]`; the coarser test
+        still can, and "mixed" beats the INT default.
+        """
+        elem = self._csa_list_elem_tag(node, local_types)
+        if elem:
+            return f"list:{elem}"
+        if isinstance(node, ast.List) and node.elts and \
+                self._csa_list_is_mixed(node.elts):
+            return "list:mixed"
+        return "list"
+
+    def _csa_merge_param_tag(self, existing: str, incoming: str) -> str:
+        """The single tag that describes two callers of one parameter.
+
+        Both arguments are known (non-``None``) tags; the caller decides what
+        an unknown one means, because that differs between the two places this
+        is used.  The answer is ``"mixed"`` — an FpyValue carrying its kind at
+        runtime — only when nothing narrower is true.
+
+        There used to be two copies of this rule: the direct call-site merge
+        knew about list refinement and bigint widening, and the
+        interprocedural propagation in `_csa_propagate_ret_types` knew only
+        bool/int.  Two copies of a *lattice* is a worse duplication than most,
+        because the coarser one does not merely miss an optimisation — it
+        answers "conflict" where the finer one answers "the same type, said
+        twice with different precision", and a spurious conflict downgrades a
+        list parameter to an untyped value.  They agreed for as long as the
+        call-site scan never produced an element kind; the moment it did, the
+        copy left behind started corrupting programs.
+        BUG-PARAM-TAG-PROPAGATION-MERGES-COARSELY.
+        """
+        if existing == incoming:
+            return existing
+        _ek = self._tag_kind(existing)
+        _ik = self._tag_kind(incoming)
+        if _ek == VKind.MIXED or _ik == VKind.MIXED:
+            return "mixed"
+        if _ek == _ik and _ek in (VKind.LIST, VKind.DICT):
+            # A container tag without an element kind is not a *different*
+            # type from one that has it — it is the same type described less
+            # precisely.  Keep whichever caller knows more.
+            if self._tag_elem_kind(existing) is None:
+                return incoming
+            if self._tag_elem_kind(incoming) is None:
+                return existing
+            # Both know, and they disagree.  That is a real conflict.
+            return "mixed"
+        # bool ⊂ int ⊂ bigint: widen to the largest of the two.
+        _numeric = (VKind.BOOL, VKind.INT, VKind.BIGINT)
+        if _ek in _numeric and _ik in _numeric:
+            return "bigint" if VKind.BIGINT in (_ek, _ik) else "int"
+        return "mixed"
+
     def _csa_propagate_ret_types(
         self, tree: ast.Module,
         func_asts: dict[str, ast.FunctionDef],
@@ -8153,18 +8225,8 @@ class CodeGen:
                     tgt = stmt.targets[0]
                     if isinstance(tgt, ast.Name):
                         if isinstance(stmt.value, (ast.List, ast.ListComp)):
-                            if (isinstance(stmt.value, ast.List)
-                                    and stmt.value.elts
-                                    and all(isinstance(e, ast.Constant) and isinstance(e.value, str)
-                                            for e in stmt.value.elts)):
-                                local_vt[tgt.id] = "list:str"
-                            elif (isinstance(stmt.value, ast.List)
-                                    and stmt.value.elts
-                                    and all(isinstance(e, ast.Constant) and isinstance(e.value, float)
-                                            for e in stmt.value.elts)):
-                                local_vt[tgt.id] = "list:float"
-                            else:
-                                local_vt[tgt.id] = "list"
+                            local_vt[tgt.id] = self._csa_list_literal_tag(
+                                stmt.value, local_vt)
                         elif isinstance(stmt.value, (ast.Dict, ast.DictComp)):
                             local_vt[tgt.id] = "dict"
                         elif isinstance(stmt.value, ast.Constant):
@@ -8344,17 +8406,10 @@ class CodeGen:
                 elif isinstance(arg, ast.JoinedStr):
                     arg_types.append("str")
                 elif isinstance(arg, ast.List):
-                    # Detect nested lists (list of lists) and list of tuples
-                    if arg.elts and isinstance(arg.elts[0], (ast.List, ast.ListComp)):
-                        arg_types.append("list:list")
-                    elif arg.elts and isinstance(arg.elts[0], ast.Tuple):
-                        arg_types.append("list:tuple")
-                    elif arg.elts and isinstance(arg.elts[0], ast.Constant) and isinstance(arg.elts[0].value, str):
-                        arg_types.append("list:str")
-                    elif arg.elts and self._csa_list_is_mixed(arg.elts):
-                        arg_types.append("list:mixed")
-                    else:
-                        arg_types.append("list")
+                    # One classifier for every element kind, rather than a
+                    # first-element guess that named three of them.
+                    arg_types.append(self._csa_list_literal_tag(
+                        arg, {**var_types, **_local_vt}))
                 elif isinstance(arg, ast.Dict):
                     # Refine the dict tag with its value type when the literal
                     # has uniform values — propagates so callee's d[k] can
@@ -8819,7 +8874,6 @@ class CodeGen:
                         existing.append(sig_arg_types[i])
                     for i in range(min(len(existing), len(sig_arg_types))):
                         _ek = self._tag_kind(existing[i]) if existing[i] else None
-                        _sk = self._tag_kind(sig_arg_types[i]) if sig_arg_types[i] else None
                         if _ek == VKind.MIXED:
                             continue  # already mixed, can't refine further
                         if sig_arg_types[i] is None:
@@ -8834,33 +8888,8 @@ class CodeGen:
                         if existing[i] is None:
                             existing[i] = sig_arg_types[i]  # first known type
                             continue
-                        if sig_arg_types[i] == existing[i]:
-                            continue  # same type, no conflict
-                        # Types conflict — check if it's a safe refinement
-                        # or a genuine conflict requiring "mixed"
-                        if (_sk == VKind.LIST
-                                and _ek == VKind.LIST
-                                and self._tag_elem_kind(existing[i]) is None):
-                            existing[i] = sig_arg_types[i]  # refine list element type
-                        elif (_ek == VKind.LIST
-                              and _sk == VKind.LIST
-                              and self._tag_elem_kind(sig_arg_types[i]) is None):
-                            pass  # keep the more specific type
-                        elif (_sk == VKind.BOOL and _ek == VKind.INT):
-                            pass  # bool is a subtype of int, keep int
-                        elif (_ek == VKind.BOOL and _sk == VKind.INT):
-                            existing[i] = "int"  # widen to int
-                        elif (_sk == VKind.BIGINT and _ek == VKind.INT):
-                            existing[i] = "bigint"  # widen to bigint
-                        elif (_ek == VKind.BIGINT and _sk == VKind.INT):
-                            pass  # keep bigint (int is a subset)
-                        elif (_sk == VKind.BIGINT and _ek == VKind.BOOL):
-                            existing[i] = "bigint"  # widen to bigint
-                        elif (_ek == VKind.BIGINT and _sk == VKind.BOOL):
-                            pass  # keep bigint
-                        else:
-                            # Genuine type conflict (e.g. int vs str)
-                            existing[i] = "mixed"
+                        existing[i] = self._csa_merge_param_tag(
+                            existing[i], sig_arg_types[i])
 
         # Pre-cleanup: "mixed" means incompatible types within the same
         # category (e.g. str vs list vs dict — all pointers but not
@@ -9610,17 +9639,24 @@ class CodeGen:
                                 existing[i] = t
                                 changed = True
                             elif existing[i] != t:
-                                # Compatible bool/int? leave as int.
-                                _e_k = self._tag_kind(existing[i])
-                                _t_k = self._tag_kind(t)
-                                if {_e_k, _t_k} == {VKind.INT, VKind.BOOL}:
-                                    existing[i] = "int"
-                                elif _e_k == VKind.MIXED:
-                                    pass  # keep mixed
-                                else:
-                                    # Genuine conflict → "mixed" (will be
-                                    # handled by monomorphization pass).
-                                    existing[i] = "mixed"
+                                # The same rule the direct call-site merge
+                                # uses.  This arm used to have its own,
+                                # coarser copy that knew only bool/int, so a
+                                # container tag met a *less precise* container
+                                # tag — `list:int` from `mean([1, 2, 3])` and
+                                # `list` from `mean(list(range(10)))` — and
+                                # called that a genuine conflict.  "mixed" for
+                                # a parameter means "an FpyValue of unknown
+                                # kind", not "a list of unknown elements", so
+                                # the callee stopped treating `data` as a list
+                                # at all and `len(data)` read a tag as a
+                                # pointer.  The two tags were equal before the
+                                # call-site classifier learned element kinds,
+                                # which is why one copy could stay behind the
+                                # other for so long.
+                                # BUG-PARAM-TAG-PROPAGATION-MERGES-COARSELY.
+                                existing[i] = self._csa_merge_param_tag(
+                                    existing[i], t)
 
     @staticmethod
     def _csa_list_is_mixed(elts: list[ast.expr]) -> bool:
@@ -9687,28 +9723,9 @@ class CodeGen:
             if isinstance(node, ast.Assign) and len(node.targets) == 1:
                 tgt = node.targets[0]
                 if isinstance(tgt, ast.Name):
-                    if isinstance(node.value, ast.List):
-                        if node.value.elts and isinstance(node.value.elts[0], (ast.List, ast.ListComp)):
-                            var_types[tgt.id] = "list:list"
-                        elif node.value.elts and isinstance(node.value.elts[0], ast.Tuple):
-                            var_types[tgt.id] = "list:tuple"
-                        elif (node.value.elts
-                              and all(isinstance(e, ast.Constant)
-                                      and isinstance(e.value, str)
-                                      for e in node.value.elts)):
-                            var_types[tgt.id] = "list:str"
-                        elif (node.value.elts
-                              and all(isinstance(e, ast.Constant)
-                                      and isinstance(e.value, float)
-                                      for e in node.value.elts)):
-                            var_types[tgt.id] = "list:float"
-                        elif node.value.elts and self._csa_list_is_mixed(
-                                node.value.elts):
-                            var_types[tgt.id] = "list:mixed"
-                        else:
-                            var_types[tgt.id] = "list"
-                    elif isinstance(node.value, ast.ListComp):
-                        var_types[tgt.id] = "list"
+                    if isinstance(node.value, (ast.List, ast.ListComp)):
+                        var_types[tgt.id] = self._csa_list_literal_tag(
+                            node.value, var_types)
                     elif isinstance(node.value, (ast.Dict, ast.DictComp)):
                         # Refine dict tag with value type when literal
                         # has uniform values.
@@ -11453,9 +11470,27 @@ class CodeGen:
                         if pidx < len(call_types) and call_types[pidx] is not None:
                             ct = call_types[pidx]
                             _ctk = self._tag_kind(ct)
+                            _ek = self._tag_elem_kind(ct)
+                            # The test is whether the *element* is a pointer,
+                            # not merely whether its kind is known.  This used
+                            # to accept any known element kind, which was safe
+                            # only because the element was so rarely known:
+                            # once the call-site classifier learned to say
+                            # "list:float", `return fs[1]` started returning a
+                            # double through an i8* and `second([1.5, 2.5]) * 2`
+                            # segfaulted (it read a NaN bit pattern as an i64
+                            # before that, so it was already wrong).
                             if (_ctk in (VKind.LIST, VKind.DICT)
-                                    and self._tag_elem_kind(ct) is not None):
+                                    and _ek is not None and _ek.is_ptr):
                                 ret_type = i8_ptr
+                                break
+                            if (_ctk in (VKind.LIST, VKind.DICT)
+                                    and _ek == VKind.FLOAT):
+                                # A float element is the one non-pointer kind
+                                # the i64 default gets wrong: the float-evidence
+                                # walk below looks for float *constants* and
+                                # float-typed names, and `fs[1]` is neither.
+                                ret_type = double
                                 break
                             if (_ctk == VKind.STR
                                     and isinstance(n.value.slice, ast.Slice)):
@@ -11786,6 +11821,25 @@ class CodeGen:
                             returns_dict = True
                         elif _ek == VKind.LIST:
                             returns_list = True
+                        elif _ek == VKind.BYTES:
+                            returns_bytes = True
+                        elif _ek == VKind.SET:
+                            returns_set = True
+                        elif _ek in (VKind.BIGINT, VKind.DECIMAL,
+                                     VKind.COMPLEX):
+                            # The mirror of the `return <param>` arm below,
+                            # which grew these three under
+                            # BUG-BIGINT-RETURNED-FROM-FUNCTION-LOSES-TAG while
+                            # this one — an *element* of a param rather than the
+                            # param itself — never did.  With no arm here
+                            # nothing was set at all, so the i8_ptr branch fell
+                            # through to its "ptr" default, which means *list*,
+                            # and `pick([2 ** 85]) == big` compared a BigInt
+                            # against a list by address.  Guessing list for an
+                            # unrecognised pointer is the worst available
+                            # default, because every pointer fits it.
+                            # BUG-BIGINT-COMPARES-BY-POINTER (parameter half).
+                            returns_ptr_kind = _ek
                         elif (self._tag_kind(ct) == VKind.STR
                                 and isinstance(n.value.slice, ast.Slice)):
                             returns_str = True

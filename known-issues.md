@@ -8,6 +8,174 @@ how to reproduce it, and what the proper fix looks like.
 
 ## Active Bugs
 
+### BUG-RETURN-OF-GLOBAL-LOSES-ITS-KIND. `return <module-level name>` is typed int, so a returned str prints as a pointer and a returned float as its bit pattern — 2026-07-27
+
+**Reproduce:**
+
+```python
+s = "hello"
+f = 1.5
+big = 2 ** 85
+
+def direct():
+    return s
+
+def via_local():
+    t = s
+    return t
+
+def use_it():
+    return len(s)
+
+def concat():
+    return s + "!"
+
+print(direct())     # 140697798825664   — CPython "hello"
+print(via_local())  # 140697798825664   — CPython "hello"
+print(use_it())     # 5                 — correct
+print(concat())     # hello!            — correct
+```
+
+and the same for every heap kind:
+
+```python
+def sh_f():
+    return f
+def eq_f():
+    return f == 1.5
+
+print(sh_f())   # 4609434218613702656 — the IEEE-754 bits of 1.5 as an i64
+print(eq_f())   # 1.0                 — a bool printed through a float ret tag
+print(big == 2 ** 85)          # True  — module scope is fine
+def check():
+    local = 2 ** 85
+    return big == local
+print(check())                 # False — CPython True
+```
+
+**The tell is that the global's kind is known inside the function and lost only
+at the boundary.** `len(s)` answers 5 and `s + "!"` answers `hello!`, so the
+body reads `s` as a str; it is the *return-tag* inference that does not consult
+module-level variable types and falls to its int default. `eq_f` is the same
+hole seen from the other side: the inference walked the return expression,
+found the float constant `1.5`, and typed the whole function float — so the
+boolean `True` came back as `1.0`.
+
+**Where:** the return-tag pre-pass in `_analyze_call_sites` builds
+`var_types` for module globals already (`_csa_build_var_types`); the return
+classifier is not asking it about a bare `ast.Name`. Compare with
+BUG-RETTAG-STR-VIA-LOCAL, which fixed the same shape for a *local* assigned
+from `str(n)` — the module-global case was never added.
+
+**Proper fix:** in the return-tag inference, resolve a bare `ast.Name` return
+against the enclosing scope's `local_vt` first and then the module `var_types`,
+the way `_csa_list_literal_tag`'s callers already thread both dicts. This is
+the last-resort float-evidence walk's fault only for `eq_f`; the primary hole
+is the missing name lookup.
+
+### BUG-UNCALLED-FN-PARAM-NAME-POISONS-A-CALLED-ONE. An *uncalled* function whose parameter happens to share a name with another function's parameter makes that other function segfault — 2026-07-27
+
+**Reproduce** (compiles clean, then segfaults with no output; CPython prints
+`5`):
+
+```python
+def unused(data):        # never called anywhere
+    return 1
+
+def mode(data):
+    freq = {}
+    for x in data:       # `data` iterated
+        freq[x] = 1
+    max_val = data[0]    # `data` subscripted
+    for val in freq:
+        max_val = val
+    return max_val
+
+print(mode([5]))
+```
+
+**The tell is the parameter *name*.** Rename `unused`'s parameter to anything
+else — `q`, `x`, `freq`, `val` — and the program is correct. Delete `unused`
+entirely: correct. *Call* `unused` once (`print(unused([1]))`): correct. Only
+the combination "another function has an identically-named parameter, and that
+function is never called" reproduces it. So some map is keyed by bare parameter
+name rather than by (function, parameter), and the uncalled function's entry —
+which has no call-site evidence, so no type — wins over the called one's.
+
+**Narrowing so far:** `mode`'s body needs all three of the iteration
+(`for x in data`), the subscript (`data[0]`), and the dict iteration
+(`for val in freq`). Returning `len(freq)` instead of `max_val` does not
+crash; dropping the `for x in data` loop does not crash. `_call_site_param_types`
+is correctly keyed by function name, so the leak is elsewhere — the candidates
+are the several `self.variables[pname] = ...` parameter-binding sites
+(`compiler/codegen.py` around 5854-6072, 10266-10291, 12896-12943) and any
+`_func_*` map that stores per-parameter facts without a scope prefix.
+
+**Pre-existing, not a regression:** reproduces identically on the compiler as
+of commit `3000210`, before any of the element-kind work. It was found while
+minimising an unrelated crash and the minimisation walked into it.
+
+**Proper fix:** key every per-parameter fact by `(function, parameter)`, the
+way `_func_local_vt` already does, rather than by the parameter's bare name.
+
+### BUG-PARAM-TAG-PROPAGATION-MERGES-COARSELY. A second copy of the parameter-tag merge called `list` and `list:int` a conflict, downgrading the parameter to an untyped value — 2026-07-27 — **FIXED**
+
+**Fixed:** there is one merge rule now, `_csa_merge_param_tag`
+(`compiler/codegen.py`), used by both the direct call-site merge in
+`_analyze_call_sites` and the interprocedural propagation in
+`_csa_propagate_ret_types`.
+
+A parameter's tag is merged across every call site. Two copies of that merge
+existed. The direct one knew that a bare `"list"` and a `"list:int"` are the
+same type described with different precision, and kept the precise one. The
+propagation copy — which runs when a *callee* is reached through a caller's
+parameter — knew only bool-vs-int, and answered `"mixed"` for everything else.
+
+The two agreed for as long as the call-site scan never produced an element
+kind: every list argument was a bare `"list"`, so the tags being merged were
+equal and the coarse copy never had to decide. Fixing
+BUG-BIGINT-COMPARES-BY-POINTER's parameter half made the classifier say
+`"list:int"`, and the copy left behind immediately started reporting a
+conflict that was not one.
+
+The consequence is worse than losing an optimisation, because `"mixed"` for a
+*parameter* means "an FpyValue of unknown kind", not "a list whose elements
+vary". The callee stopped treating the parameter as a list at all:
+
+    def rest(xs):
+        return xs[1:]
+
+    def rest_len_via(xs):
+        return len(rest(xs))         # <- propagates the tag to `rest`
+
+    print(rest_len_via([1, 2, 3]))   # answered 0, CPython says 2
+
+and in `tests/cpython_adapted/test_statistics.py` — where `mean` is called
+both with list literals and with `list(range(1, 11))`, and again from inside
+`variance` — the program segfaulted in `len(data)`, which read a type tag as
+a pointer.
+
+**How it was found:** the full suite went from 1030 passed to 2 failed
+(`test_statistics`, twice). Truncating the file bisected the crash to the
+first `variance(list(range(1, 11)))` call, and dumping
+`_call_site_param_types` under the old and new compilers showed one line of
+difference that mattered: `mean: ['list'] → mean: ['mixed']`, while its
+sibling `variance` merged correctly to `'list:int'`. The asymmetry named the
+path — `mean` is the only one of the two reached through another function's
+parameter.
+
+**Why two copies of a lattice is a worse duplication than most:** a coarser
+copy of an *optimisation* costs speed. A coarser copy of a *type lattice*
+answers "conflict" where the finer one answers "the same type, said twice
+with different precision" — and a spurious conflict is not a conservative
+answer here, it is a different and wrong type. The two copies were observably
+identical until the day something upstream got more precise, which is the
+same latent-wrong-default shape as the `_ek is not None` test recorded under
+BUG-BIGINT-COMPARES-BY-POINTER.
+
+Regression test:
+`tests/regressions/param_tag_merge_keeps_the_less_precise_container.py`.
+
 ### BUG-UNBOUND-NATIVE-LOCAL-READS-STACK. A local read before anything bound it returns stack garbage instead of raising — 2026-07-27 — **FIXED**
 
 **Fixed:** "never assigned" is a value a local can have, and it needs somewhere
@@ -3754,7 +3922,7 @@ carry a file read through one more local.
 
 **Test:** `tests/regressions/aliased_local_keeps_its_kind.py`.
 
-### BUG-BIGINT-COMPARES-BY-POINTER. A BigInt compares by address unless an operand is statically BIGINT — 2026-07-27 — **PARTLY FIXED** (nested-container half fixed; the parameter half remains)
+### BUG-BIGINT-COMPARES-BY-POINTER. A BigInt compares by address unless an operand is statically BIGINT — 2026-07-27 — **FIXED**
 
 **What:** a BigInt-tagged value that reaches `==` without the compiler
 *statically* knowing one side is a BigInt is compared as a raw pointer, so
@@ -3824,13 +3992,58 @@ Regression test: `tests/regressions/nested_list_element_keeps_its_kind.py`
 three levels deep, and iteration — each paired with the through-a-temporary
 form that already worked, so a regression in either is visible).
 
-**The parameter half is still open.** `pick(vs): return vs[0]` called as
-`pick([big])` still compares by address. `_func_ret_types` and
-`_call_site_param_types` are both *empty* for that program: the return
-propagation has no arm for `return <subscript>`, and the call-site pass records
-nothing for a list-literal argument, so the parameter never acquires an element
-type. That is a separate piece of work — parameter element-type propagation —
-not a variation of what was just fixed.
+**Parameter half FIXED 2026-07-27.** `pick([2 ** 85]) == big` now answers True.
+An earlier note here said the call-site pass "records nothing" for a list-literal
+argument; that was wrong, and the truth was more actionable — it recorded a bare
+`"list"`. Three holes, in a row along the same path:
+
+- **Three hand-rolled copies of one classifier.** `_build_local_vt`,
+  `_csa_build_var_types` and the call-argument loop each answered "what is the
+  tag of this list literal?" with their own first-element guess, and each
+  recognised a *different* subset of kinds — str and float; those plus list and
+  tuple; list, tuple and str. Every kind a given copy did not name fell to a
+  bare `"list"`, whose consumer defaults the element to `VKind.INT`. So a BigInt
+  argument compared by address and a float argument was read as its own bits:
+  `add_one([1.5, 2.5])` answered **4609434218613702657**, which is
+  `0x3FF8000000000000 + 1` — the IEEE-754 bits of 1.5 loaded as an i64. `str`
+  elements were right all along purely because every copy happened to name that
+  one, and that asymmetry was the tell. All three now call
+  `_csa_list_literal_tag`, which wraps the `_csa_list_elem_tag` classifier the
+  return path already used. `_csa_list_is_mixed` is kept as a *fallback*, not
+  replaced: the classifier declines as soon as any element is unclassified, so
+  it cannot see the heterogeneity in `[1, some_name]`, and dropping to bare
+  `"list"` there would have been a regression.
+- **The `return <param>[i]` arm never mirrored `return <param>`.** The
+  pass-through arm grew BIGINT/DECIMAL/COMPLEX under
+  BUG-BIGINT-RETURNED-FROM-FUNCTION-LOSES-TAG; the element arm one level down
+  did not, so nothing was set at all and the i8_ptr branch fell through to its
+  `"ptr"` default — which means *list*. `pick(...) == big` then compared a
+  BigInt against a "list" by address. It now sets `returns_ptr_kind`, which
+  routes to `ret_tag = "mixed"` and keeps the tagged FpyValue, exactly as the
+  sibling arm does.
+- **"Element kind is known" was being read as "element is a pointer."** The
+  return-type analysis widened `return <param>[i]` to `i8_ptr` whenever the
+  parameter's element kind was merely *not None*. That was safe only because
+  the element was so rarely known; once the classifier above learned to say
+  `"list:float"`, `return fs[1]` started returning a double through an `i8*` and
+  `second([1.5, 2.5]) * 2` **segfaulted**. It was already wrong before that —
+  it printed `-9221120237041090560`, a NaN bit pattern read as an i64 — so this
+  was a latent bug the fix merely woke up. The test is now `_ek.is_ptr`, plus an
+  explicit FLOAT arm, since a float element is the one non-pointer kind the i64
+  default gets wrong (the float-evidence walk looks for float *constants* and
+  float-typed *names*, and `fs[1]` is neither).
+
+A fourth hole surfaced only after the three above were closed, and only in a
+whole-program build: the interprocedural copy of the parameter-tag merge
+called the new `"list:int"` a conflict with a plain `"list"` and downgraded
+the parameter to an untyped value, which segfaulted
+`tests/cpython_adapted/test_statistics.py`. Tracked and fixed as
+BUG-PARAM-TAG-PROPAGATION-MERGES-COARSELY. It belongs to the same shape as the
+`_ek is not None` hole above — a consumer whose assumption held only while the
+producer was imprecise.
+
+Regression test:
+`tests/regressions/list_literal_argument_keeps_its_element_kind.py`.
 
 **Not fixed by the BUG-RETURNED-LIST-ELEM-TAG-LOST fix (re-checked
 2026-07-27).** That fix replaced the yes/no tag in the *return* pre-pass
@@ -3840,11 +4053,13 @@ it unchanged. Neither goes through that pre-pass:
 - `outer[0][0]` is built and read entirely at **module scope**, so no return
   tag is involved; the loss is in the container element type
   (codegen.py:18794's `VKind.INT` default), which is a different reader.
-- `pick(vs)` returns `vs[0]` — a subscript of an untyped **parameter**, not a
-  list literal, so the classifier has nothing to classify and correctly
-  declines.
+- `pick(vs)` returns `vs[0]` — a subscript of a **parameter**, not a list
+  literal, so the classifier had nothing to classify and correctly declined.
+  (The parameter is no longer untyped; teaching the *call site* to type it is
+  what the parameter-half fix above did.)
 
-**Proper fix — and an earlier note here was wrong about it.** This entry used
+**A proposed fix that was wrong, kept because the reasoning still applies.**
+This entry used
 to propose that `_emit_compare` treat a *pointer-shaped* operand typed INT as a
 contradiction and route it through `fv_compare`. That cannot work as written:
 by the time `_emit_compare` sees the operand it is a bare `i64` whose static
@@ -3863,19 +4078,144 @@ That bounds the whole family — every heap tag reachable through a container �
 rather than one member, and it degrades to slow-but-correct instead of silently
 wrong.
 
-**What blocks it: `elem_type=INT` means two different things.** The read site
-cannot currently tell "known to be a list of ints" from "no idea, defaulted to
-int", because roughly thirty sites in `codegen.py` write
-`ValueType(VKind.LIST, elem_type=ValueType(VKind.INT))` eagerly where they mean
-the latter. `ValueType(VKind.LIST)` with `elem_type=None` is the representation
-that already exists for "unknown" — `from_old_tag` produces exactly that for a
-bare `"list"` — so the work is to stop collapsing the two at those sites, then
-make the read consult the distinction. Until that is done, any narrower fix
-just moves the hole.
+**Still worth doing: `elem_type=INT` means two different things.** Both halves
+of this bug were fixed by teaching the *producers* to say what they know, which
+is the narrower move. The read site still cannot tell "known to be a list of
+ints" from "no idea, defaulted to int", because roughly thirty sites in
+`codegen.py` write `ValueType(VKind.LIST, elem_type=ValueType(VKind.INT))`
+eagerly where they mean the latter. `ValueType(VKind.LIST)` with
+`elem_type=None` is the representation that already exists for "unknown" —
+`from_old_tag` produces exactly that for a bare `"list"` — so the work is to
+stop collapsing the two at those sites, then make the read fall back to
+`list_get_fv`/`VKind.FVALUE` when the element kind is not genuinely known. That
+would bound the whole family at the *reader* rather than requiring every
+producer to be taught separately, and the four spin-off bugs logged below are
+each an instance of a producer that has not been.
 
-**Severity:** high. Silently wrong answers, no crash and no diagnostic. Note
-the failure is not confined to BigInt: any heap tag reachable through a
-nested container or a returned element has the same hole.
+**Severity when open:** high. Silently wrong answers, no crash and no
+diagnostic. Note the failure was never confined to BigInt: any heap tag
+reachable through a nested container or a returned element had the same hole.
+
+**A note on method.** Each half of this bug turned out to be *two or three*
+holes on one path, and each hole tested clean on its own — fixing the argument
+classifier alone changed nothing for BigInt, because the return tag then threw
+the answer away. The reliable tell throughout was an **asymmetry between two
+spellings of the same read**: `x = outer[0]; x[0]` correct but `outer[0][0]`
+wrong; `str` arguments correct but `float` ones wrong; `p = pick(...)` correct
+but `pick(...) ==` wrong. Each asymmetry named the exact reader that was
+missing an arm, which guessing would not have.
+
+### BUG-NESTED-LIST-ARG-INNER-ELEM-LOST. A nested list literal argument keeps the outer element kind but not the inner — 2026-07-27
+
+**What:**
+
+```python
+def inner_first(rows):
+    return rows[0][0]
+
+print(inner_first([["a", "bb"]]))        # 'a' — correct
+print(len(inner_first([["a", "bb"]])))   # CPython 1, compiled 0
+```
+
+**Root cause:** `_csa_elem_tag_of` answers a flat `"list"` for a nested list
+element, so the argument is tagged `"list:list"` — the elements are known to be
+lists, but not that *theirs* are strs. The reader then defaults the inner
+element to `VKind.INT` and reads a str pointer as an integer, so `len()`
+answers 0.
+
+This is the exact shape of the `_infer_list_elem_type` hole fixed for the
+module-scope case (see the nested-container half above), one representation
+over: there it was a bare `ValueType(VKind.LIST)`, here it is a bare `"list"`
+tag string.
+
+**Proper fix:** have `_csa_elem_tag_of` return the compound tag for a nested
+list element (`"list:str"`), so `_csa_list_elem_tag` yields `"list:list:str"`.
+`from_old_tag` already parses arbitrarily nested `list:` chains, so the reader
+needs no change. Check `_csa_iter_elem_tag`, which currently declines any tag
+containing a second `:` — it would need to hand back the compound tag rather
+than `None`.
+
+**Severity:** medium. Silently wrong, no crash. Covered (as a documented
+non-assertion) in `tests/regressions/list_literal_argument_keeps_its_element_kind.py`.
+
+### BUG-LIST-OF-DICTS-PARAM-VALUE-KIND-LOST. A list-of-dicts parameter carries no dict value type — 2026-07-27
+
+**What:**
+
+```python
+def get_a(ds):
+    return ds[0]["a"]
+
+print(get_a([{"a": 1}, {"a": 2}]))          # 1 — correct
+print(len(get_a([{"a": "x"}])))             # CPython 1, compiled 0
+```
+
+Before the parameter-half fix above this **segfaulted**; it now merely answers
+wrongly, because the return type is no longer widened to `i8_ptr` on the
+strength of a known-but-not-pointer element kind.
+
+**Root cause:** the argument is tagged `"list:dict"`, which records that the
+elements are dicts but not what their *values* are. `_tag_elem_kind` gives
+DICT, and the dict-value type — which `_dict_var_int_values` and friends track
+for a plain dict parameter — has nowhere to live for a dict *inside* a list.
+Same missing level of nesting as BUG-NESTED-LIST-ARG-INNER-ELEM-LOST, on the
+dict side.
+
+**Proper fix:** the same compound-tag widening (`"list:dict:str"`), or the
+reader-side fix in the parent entry, which subsumes both.
+
+**Severity:** medium.
+
+### BUG-LOOP-CARRIED-BIGINT-KIND-LOST. A BigInt loses its kind across a loop-carried rebinding — 2026-07-27
+
+**What:**
+
+```python
+def biggest(vs):
+    m = vs[0]
+    for v in vs:
+        if v > m:
+            m = v
+    return m
+
+print(biggest([1.5, 3.25, 2.0]))              # 3.25 — correct
+print(biggest(["a", "c", "b"]))               # 'c' — correct
+print(biggest([2 ** 85, 2 ** 86]) == 2 ** 86) # CPython True, compiled False
+```
+
+**Root cause:** not yet traced. The parameter's element kind is now correctly
+`bigint` (verified by probe), and `vs[0]` reads with kind BIGINT, so the loss is
+in `m` — either the initial binding, the rebinding inside the `if`, or the phi
+that merges them. Note float and str survive the identical shape, which
+localises it to the BigInt path rather than to loop-carried bindings in general.
+
+**Reproduce:** the snippet above; the two working kinds are the control.
+
+**Severity:** medium. Silently wrong.
+
+### BUG-CALL-ARG-RET-TAG-LOSES-ELEM-KIND. Passing a returned list straight into another call drops its element kind — 2026-07-27
+
+**What:** `_RET_TAG_TO_ARG` (codegen.py, in the CSA call-site argument loop)
+maps a callee's return kind to an argument tag through a plain dict:
+
+```python
+_RET_TAG_TO_ARG = {
+    VKind.LIST: "list", VKind.DICT: "dict", VKind.STR: "str",
+    VKind.FLOAT: "float", VKind.BOOL: "bool", VKind.OBJ: "obj",
+}
+```
+
+`VKind.LIST → "list"` is a bare tag, so `g(mk_strs())` tells `g` only that it
+gets a list — the element kind that `mk_strs`' own return tag records
+(`"list:str"`, since BUG-RETURNED-LIST-ELEM-TAG-LOST was fixed) is thrown away
+at the hand-off. The same value bound to a name first (`xs = mk_strs(); g(xs)`)
+keeps it, which is the usual asymmetry tell.
+
+**Proper fix:** pass the callee's `ret_tag` through when it is already a
+compound tag, falling back to the bare kind name only when it is not. The map
+is the wrong shape for this — it discards the suffix by construction.
+
+**Severity:** medium. Not yet given a regression test.
 
 ### BUG-HASH-BY-POINTER-FOR-HEAP-VALUES. BigInt, bytes, Decimal and complex hash by address, so they cannot be dict keys or set members — 2026-07-27
 
