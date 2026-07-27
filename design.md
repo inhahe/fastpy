@@ -432,6 +432,28 @@ header-backed one must be released with `fpy_rc_decref(FPY_TAG_STR, …)`, and
 the contract is now stated on the declaration in `runtime/objects.h` — the only
 place a caller reliably looks.
 
+**A `char*` that can become a STR value must carry the header, because
+refcounting *probes* for it.** `fpy_str_header` decides ownership by reading
+the magic 8 bytes below the char data, so the probe is only defined for
+strings laid out that way. Compiler literals are — codegen emits `.str.N` as
+`{i32 magic, i32 refcount, [N x i8]}` with an immortal refcount for exactly
+this reason — but a bare C literal or a static `char[256]` scratch buffer in
+the runtime is not, and increfing one reads out of bounds. The exception
+message was the worst case of this, since `except … as e` increfs it and the
+message arrives from ~89 raise sites of every kind.
+
+The fix has to go where the producers *converge*, not at the producers. Only
+three of those sites even used a static buffer; the rest pass plain C literals,
+which are equally headerless, so patching them one at a time would have been
+both endless and permanently one new call site away from regressing.
+`fastpy_raise` instead copies whatever it is given into a single immortal,
+header-backed thread-local buffer and publishes that — one choke point makes
+the probe well-defined for every producer at once, and keeps the lifetime
+callers already depended on (valid until the next raise). The tempting
+alternative — making `fpy_str_header` more suspicious so it rejects junk — is
+wrong in the other direction: the probe is load-bearing for ordinary strings,
+and any laxer test would start misclassifying real ones.
+
 **A return that can promote needs both a `mixed` tag and the FV ABI.** These are
 decided in two places and either one alone is useless: `_duf_infer_ret_tag` can
 say `mixed` while `_duf_select_abi` still hands the function a bare i64, which

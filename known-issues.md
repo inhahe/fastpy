@@ -3524,7 +3524,7 @@ same helper the `f = F(); f(x)` path now uses, so the two shapes can no longer
 drift apart. The dispatcher path remains as the fallback for objects whose
 class is not known at the call site, and still tops out at two arguments.
 
-### BUG-STR-HEADER-PROBES-BEFORE-RUNTIME-STATIC-BUFFERS. Increfing an exception message reads out of bounds — 2026-07-27
+### ~~BUG-STR-HEADER-PROBES-BEFORE-RUNTIME-STATIC-BUFFERS. Increfing an exception message reads out of bounds~~ — FIXED 2026-07-27
 
 **What:** `fpy_str_header(s)` decides whether a `char*` is refcounted by reading
 the magic at `s - offsetof(FpyString, data)`. That probe is only *defined* when
@@ -3568,6 +3568,92 @@ load-bearing and a laxer test would misclassify real strings.
 almost never matches the magic), but it is genuine UB and it aborts every
 ASan run that raises an exception, which blocks the harness from vetting
 anything downstream of a `raise`.
+
+**Fixed** by `fpy_exc_msg_store` in `runtime/runtime.c`: `fastpy_raise` and
+`fastpy_raise_with_obj` now copy the message into one immortal, header-backed
+thread-local buffer (with a heap overflow buffer for messages past 512 bytes)
+and publish *that* as `fpy_exc_msg`. Lifetime is unchanged — valid until the
+next raise on the thread, exactly what the shared `_err_buf` already gave. The
+`__exc_msg__` attribute set by `raise_with_obj` deliberately keeps the
+caller's pointer instead, since it has to outlive the next raise and codegen
+only reaches it with a compiler-emitted (header-backed, immortal) literal.
+Regression test `tests/regressions/exc_msg_header_backed.py`; verified by A/B
+under `tools/pure_harness.py` (ASan aborts without the change, clean with it).
+This also unblocked `list_literal_heap_numeric_elems.py` under the harness.
+
+### BUG-MODULO-BY-ZERO-MESSAGE-WORDING. `1 % 0` reports a different message than CPython — 2026-07-27
+
+**What:** fastpy raises `ZeroDivisionError: integer modulo by zero`; CPython
+3.14 says `division by zero` for `%` just as it does for `/` and `//`. (The
+older wording matches CPython ≤3.11, so this is a version drift, not a typo.)
+
+**Reproduce:**
+
+```python
+try:
+    1 % 0
+except ZeroDivisionError as e:
+    print(e)      # fastpy: integer modulo by zero;  CPython 3.14: division by zero
+```
+
+**Where:** the `fastpy_raise(FPY_EXC_ZERODIVISION, "integer modulo by zero")`
+call in `runtime/runtime.c` (around the int-modulo helper).
+
+**Proper fix:** change the literal to `"division by zero"`, then check the
+sibling messages for the same drift against 3.14 rather than fixing this one
+in isolation. Cheap, but it needs the message audit to be worth doing once.
+
+**Severity:** cosmetic, but it makes any test that prints a caught modulo
+message diverge from CPython — `tests/regressions/exc_msg_header_backed.py`
+has to compare only the length because of it.
+
+### BUG-KEYERROR-STR-NOT-REPR. `str(KeyError)` doesn't quote the key — 2026-07-27
+
+**What:** CPython's `KeyError.__str__` is the *repr* of the missing key, so a
+string key prints quoted. fastpy stores the bare key text as the message.
+
+**Reproduce:**
+
+```python
+try:
+    {"a": 1}["missing"]
+except KeyError as e:
+    print(e)      # fastpy: missing;  CPython: 'missing'
+```
+
+**Proper fix:** the dict-lookup raise site should format the key with the
+runtime's repr routine rather than its str routine — the same distinction
+already exists for printing a string inside a container, so it is a matter of
+calling the existing repr path. Note this is only `KeyError`; every other
+builtin exception's `str` really is the plain message.
+
+**Severity:** cosmetic, same caveat as above — the regression test can't
+compare the text.
+
+### BUG-SUITE-DEFAULT-TIMEOUT-FLAKES-UNDER-LOAD. Regression tests spuriously fail on a busy machine — 2026-07-27
+
+**What:** `tests/conftest.py` gives every collected regression/program file a
+fixed `timeout = 10.0` seconds covering compile + run + the CPython reference
+run. On an otherwise-busy machine that is not enough headroom for the slower
+files, and the test reports a failure rather than a timeout.
+
+**Reproduce:** run `pytest tests/ -q` while a large native build is running.
+Observed once: `list_literal_heap_numeric_elems` failed in a full run that
+took 627 s, then passed standalone in 1.77 s and passed again in a quiet full
+run (1009 passed, 741 s). Nothing in the failure output identified a timeout,
+which is what made it expensive to diagnose.
+
+**Where:** the `timeout` defaults in the `assert_compiles` / `assert_file_compiles`
+fixtures and the collection hook in `tests/conftest.py`.
+
+**Proper fix:** two parts. Raise the default (the slowest legitimate file is
+~2 s, so 10 s is only a 5× margin — 30 s costs nothing on a green run), and
+make a timeout *report itself as a timeout* instead of as an output mismatch,
+so the next occurrence is one line to diagnose instead of a bisect.
+
+**Severity:** no product impact, but a suite that fails randomly under load
+trains you to re-run rather than investigate, which is how a real regression
+gets waved through.
 
 ### BUG-DECIMAL-FLOAT-COMPARE-INEXACT. Comparing a Decimal against a float rounds the Decimal — 2026-07-27
 

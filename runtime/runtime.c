@@ -686,6 +686,79 @@ FPY_THREAD_LOCAL int fpy_exc_group_inner_count = 0;
 FPY_THREAD_LOCAL void *fpy_exc_obj = NULL;  /* exception object for user-defined exceptions */
 FPY_THREAD_LOCAL const char *fpy_exc_class_name = "";  /* actual class name for type(e).__name__ */
 
+/* --- Header-backed storage for the pending exception message ---------------
+ *
+ * Binding an exception with `as e` makes the message an ordinary STR value,
+ * and increfing a STR probes for an FpyString header 8 bytes below the char
+ * data (see `fpy_str_header`). Only strings that actually carry that header
+ * may be probed: compiler-emitted literals do, because codegen lays them out
+ * as {magic, refcount, chars}, but the message producers inside the runtime
+ * do not — plain C string literals and the static `char[256]` scratch buffers
+ * (`_cmp_err`, `_cx_err`, ...) have whatever happens to precede them in
+ * .rodata/.bss. The probe therefore read out of bounds on every runtime-raised
+ * exception that a program actually caught by name.
+ *
+ * Copying the message here, once, at the single point where it is published
+ * makes the probe well-defined for every producer at the same time. Fixing the
+ * producers instead does not scale: of the ~89 `fastpy_raise` call sites only
+ * three use a static buffer and the rest pass bare C literals, which are just
+ * as headerless. Weakening `fpy_str_header` is not an option either — the
+ * probe is load-bearing, and a laxer test would misclassify real strings.
+ *
+ * The copy is immortal, so incref/decref on it are no-ops and it can never be
+ * freed out from under a caught exception. Its lifetime matches what callers
+ * already relied on: valid until the next raise on this thread, exactly like
+ * the shared `_err_buf` most producers already used.
+ * BUG-STR-HEADER-PROBES-BEFORE-RUNTIME-STATIC-BUFFERS. */
+#define FPY_EXC_MSG_INLINE_CAP 512
+typedef struct {
+    int32_t magic;
+    int32_t refcount;
+    char data[FPY_EXC_MSG_INLINE_CAP];
+} FpyExcMsgBuf;
+/* The probe subtracts offsetof(FpyString, data), so the two layouts must agree.
+ * Spelled as a negative-size typedef rather than _Static_assert because MSVC
+ * does not accept the C11 keyword in the C mode this runtime is built with. */
+typedef char fpy_exc_msg_layout_check[
+    (offsetof(FpyExcMsgBuf, data) == offsetof(FpyString, data)) ? 1 : -1];
+static FPY_THREAD_LOCAL FpyExcMsgBuf fpy_exc_msg_inline = {
+    FPY_STR_MAGIC, FPY_RC_IMMORTAL, { 0 }
+};
+/* Overflow buffer for a message too long to inline. Reused and grown in place,
+ * never handed to refcounting, so a thread can hold at most one of these. */
+static FPY_THREAD_LOCAL FpyString *fpy_exc_msg_big = NULL;
+static FPY_THREAD_LOCAL size_t fpy_exc_msg_big_cap = 0;
+
+/* Copy `msg` into header-backed storage and return a pointer to the chars. */
+static const char *fpy_exc_msg_store(const char *msg) {
+    if (!msg) return "";
+    /* Re-publishing the current message must not memcpy a buffer onto itself. */
+    if (msg == fpy_exc_msg_inline.data ||
+        (fpy_exc_msg_big && msg == fpy_exc_msg_big->data))
+        return msg;
+    size_t n = strlen(msg);
+    if (n < FPY_EXC_MSG_INLINE_CAP) {
+        memcpy(fpy_exc_msg_inline.data, msg, n + 1);
+        return fpy_exc_msg_inline.data;
+    }
+    if (n + 1 > fpy_exc_msg_big_cap) {
+        FpyString *nb = (FpyString *)realloc(fpy_exc_msg_big,
+                                             sizeof(FpyString) + n + 1);
+        if (!nb) {
+            /* Out of memory: a truncated message beats losing the raise. */
+            memcpy(fpy_exc_msg_inline.data, msg, FPY_EXC_MSG_INLINE_CAP - 1);
+            fpy_exc_msg_inline.data[FPY_EXC_MSG_INLINE_CAP - 1] = '\0';
+            return fpy_exc_msg_inline.data;
+        }
+        fpy_exc_msg_big = nb;
+        fpy_exc_msg_big_cap = n + 1;
+    }
+    fpy_exc_msg_big->magic = FPY_STR_MAGIC;
+    fpy_exc_msg_big->refcount = FPY_RC_IMMORTAL;
+    memcpy(fpy_exc_msg_big->data, msg, n + 1);
+    return fpy_exc_msg_big->data;
+}
+
 /* Per-thread return tag for closure calls. The closure body stores
  * the value's runtime tag here before returning the i64 data. The
  * caller reads it after the call to reconstruct the full FpyValue.
@@ -875,7 +948,7 @@ static void fpy_shadow_print_traceback(void) {
  * Also snapshots the shadow call stack for traceback display. */
 void fastpy_raise(int exc_type, const char *msg) {
     fpy_exc_type = exc_type;
-    fpy_exc_msg = msg;
+    fpy_exc_msg = fpy_exc_msg_store(msg);
     /* Auto-set the class name for builtin exception types so that
      * type(e).__name__ works even for runtime-raised exceptions (1/0,
      * d["missing"], lst[999], etc.) where the compiler doesn't emit
@@ -916,10 +989,13 @@ void fastpy_raise(int exc_type, const char *msg) {
 extern void fastpy_obj_set_fv(void*, const char*, int32_t, int64_t);
 void fastpy_raise_with_obj(int exc_type, const char *msg, void *obj) {
     fpy_exc_type = exc_type;
-    fpy_exc_msg = msg;
+    fpy_exc_msg = fpy_exc_msg_store(msg);
     fpy_exc_obj = obj;
     /* Store the message on the object so str(e) works after exc_clear().
-     * Uses a dynamic attribute "__exc_msg__" that obj_to_str checks. */
+     * The *caller's* pointer goes on the object, not the copy above: this
+     * attribute has to outlive the next raise, and codegen only reaches here
+     * with a compiler-emitted literal, which is both header-backed and
+     * immortal. */
     if (obj) {
         fastpy_obj_set_fv(obj, "__exc_msg__", 2 /*FPY_TAG_STR*/,
                           (int64_t)(intptr_t)msg);
