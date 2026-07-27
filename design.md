@@ -226,6 +226,21 @@ Coverage is bounded by what `_func_ret_types` records: list/dict/tuple/float
 and MIXED, but not str/bytes/set, since the propagation chain has no arm for a
 plain `return "abcd"`. Widening that belongs on the callee side.
 
+**The bare ABI requires positive evidence about every parameter.** `param_types`
+falls back to `i64` when nothing is known, so by the time `_duf_select_abi` runs
+an untyped parameter is indistinguishable from a known `int` one and used to
+qualify the function for the bare ABI. Bare ABI has nowhere to put a runtime
+tag: the caller unwrapped the tagged `FpyValue` down to a naked `i64` and the
+body read a string pointer as an integer, so `len()` answered 0 instead of
+faulting. Bare ABI now additionally requires every parameter to carry an
+annotation or to have been classified at some call site — silence is not
+evidence of scalarity. This is the shared root cause behind several separately
+observed symptoms (`len()` on a parameter fed only by a call, a `"mixed"`
+parameter tag still landing on a bare `i64`, and subscripting an untyped
+parameter falling to the CPython bridge), which is why it is fixed at the ABI
+rather than at each use. In the regression corpus 11 of 641 functions changed
+ABI, all of them nested or closure functions.
+
 **A splat is evidence too, but only about the required slots.** `f(*seq)` had
 no arm in the per-argument classification at all, so a parameter fed only that
 way hit the same silent-zero. `_csa_build_seq_binds` maps each name to the

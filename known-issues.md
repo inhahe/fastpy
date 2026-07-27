@@ -8,6 +8,131 @@ how to reproduce it, and what the proper fix looks like.
 
 ## Active Bugs
 
+### ~~BUG-UNTYPED-PARAM-BARE-ABI. A parameter with no known type is given the bare ABI, so its runtime tag is dropped and `len()` answers 0~~ — FIXED 2026-07-26
+
+**What:** `_duf_select_abi` granted the bare-type ABI whenever every
+parameter's LLVM type was scalar. `param_types` falls back to `i64` when
+nothing is known about a parameter, so "no evidence at all" and "known to be an
+int" were indistinguishable by the time the ABI was chosen, and an untyped
+parameter counted as a scalar one.
+
+**Reproduce** — should print `4`, printed `0`:
+```python
+"""Doc."""
+
+def sink(v):
+    return len(v)
+
+def opaque():
+    return "abcd"
+
+print(sink(opaque()))
+```
+`sink` was emitted as `define internal i64 @fastpy.user.sink(i64 %v)`.
+
+**Root cause:** bare ABI has nowhere to put a runtime tag. The caller unwrapped
+the callee's tagged `FpyValue` down to a naked `i64`, and the body then read a
+string pointer as an integer.
+
+**Fix:** bare ABI now also requires `_all_params_typed` — every parameter must
+carry an annotation or have been classified at some call site. Inferring
+"scalar" from silence is what produced the wrong answer. `sink` is now
+`define internal {i32, i64} @fastpy.user.sink({i32, i64} %v)`.
+
+**Blast radius, measured:** across the 312-file regression corpus, 11 of 641
+functions changed ABI (169 were bare before), all of them nested or closure
+functions. Full suite green at 994.
+
+**This is the shared root cause** behind BUG-PARAM-TYPE-FROM-USER-CALL-ARG's
+residual, BUG-SPLAT-DEFAULTED-SLOT-TYPE (whose `"mixed"` tag still landed on a
+bare `i64` rather than dispatching), and BUG-SUBSCRIPT-UNTYPED-PARAM-BRIDGE.
+The last is **not** fixed by this — `s[0]` on an FV-ABI parameter still faults,
+because the subscript path has no runtime-tag dispatch arm — but the tag now
+survives the call, which is the prerequisite.
+
+**Test:** `tests/regressions/untyped_param_fv_abi.py`. Verified badly wrong at
+`b1a665d` (pointers printed as integers, lengths 0). Clean under
+ASan/UBSan/LSan.
+
+### BUG-RETURNS-UNTYPED-PARAM-RET-TAG. A function that returns its own untyped parameter is typed `int`, so `len(f(x))` answers 0 — 2026-07-26
+
+**What:** `_duf_determine_ret_tag` has no arm for "returns a parameter whose
+type is unknown", so it falls through to the `int` default. The call site then
+unwraps the callee's tagged `FpyValue` to that guess and the tag is gone.
+
+**Reproduce** — should print `abcd 4` / `4`, prints `abcd 4` / `0`:
+```python
+"""Doc."""
+
+def opaque():
+    return "abcd"
+
+def echo(v):
+    return v
+
+r = echo(opaque())
+print(r, len(r))          # correct — the name-binding path keeps the tag
+print(len(echo(opaque())))  # 0
+```
+
+**Why the two forms disagree:** exactly the split that was
+BUG-DIRECT-CALL-LEN-STATIC-TAG. `_assign_fv_fast_path` keeps the whole
+`FpyValue` when storing to a name, while `_emit_user_call` calls
+`_unwrap_return_value` unless `_callee_returns_mixed` says otherwise — and that
+helper reads `_func_ret_types`, which has no entry here. Meanwhile
+`info.ret_tag` is a confident, wrong `"int"`.
+
+**Proper fix:** `_duf_determine_ret_tag` (~line 10465) should report `"mixed"`
+when every `return` yields a parameter with no known type — the honest answer,
+since the kind is whatever the caller passed. `_callee_returns_mixed` should
+then also accept `info.ret_tag == "mixed"`, not only `_func_ret_types`; the
+declaration pass is the authority for this particular case because it is the
+pass that can see "returns a parameter".
+
+**Where it bites:** `tests/regressions/untyped_param_fv_abi.py` has to bind
+`echo`'s result to a name before measuring it, and says so.
+
+### BUG-BYTES-RETURN-TAG-LOST. A `bytes`-returning function loses its tag, so `len()` answers 0 and `print()` shows a pointer — 2026-07-26
+
+**What:** `_csa_propagate_ret_types` records list/dict/tuple/float/mixed but has
+no arm for `return b"abc"` (nor for a plain `return "abcd"` — the str half of
+the same gap). A `bytes` value crossing a function return therefore arrives
+untagged.
+
+**Reproduce** — should print `3` / `4` / `3` / `b'abc'`:
+```python
+"""Doc."""
+
+def opaque_bytes():
+    return b"abc"
+
+def blen(v):
+    return len(v)
+
+def bshow(v):
+    print(v)
+
+x = opaque_bytes()
+print(len(x))                 # 0
+print(blen(b"abcd"))          # 4  — a literal call site types the param
+print(blen(opaque_bytes()))   # 3  — correct once the param is typed
+bshow(opaque_bytes())         # prints a pointer, not b'abc'
+```
+
+Note the third line is *right*: one classifiable call site (`blen(b"abcd")`)
+types the parameter and every other site starts working. Remove it and the
+answer goes to 0. That is the same "one good call site hides it" property as
+BUG-PARAM-TYPE-FROM-USER-CALL-ARG.
+
+**Where:** the return-type propagation chain in `_analyze_call_sites`
+(`_csa_propagate_ret_types`, ~line 8900) and `_duf_determine_ret_tag`. Adding
+`str`/`bytes`/`set` arms is the fix; it was deliberately deferred once already
+because the blast radius is wide — a great deal of code depends on the current
+(silent) behaviour of an unrecorded return.
+
+**Where it bites:** `tests/regressions/untyped_param_fv_abi.py` covers `str`
+only, and says why.
+
 ### BUG-SPLAT-DEFAULTED-SLOT-TYPE. A defaulted parameter reached by `f(*seq)` is typed from the default even when the sequence supplies it — 2026-07-26
 
 **What:** when a splat can reach a slot that *also* has a default, the slot's

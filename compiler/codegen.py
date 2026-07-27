@@ -9729,6 +9729,24 @@ class CodeGen:
         # through indirect dispatch with any argument types.
         _fn_name = _name_override if _name_override else node.name
         _used_as_value = _fn_name in getattr(self, '_funcs_used_as_values', set())
+        # An *untyped* parameter is not a scalar parameter.  It only looks
+        # like one because `param_types` falls back to i64 when nothing is
+        # known, so "no evidence" and "known to be an int" are indistinguishable
+        # by the time we get here.  Bare ABI has nowhere to put a runtime tag,
+        # so a caller handing such a parameter a str or a list drops the tag on
+        # the floor and the body reads the pointer as an integer: `len(s)`
+        # answers 0 instead of faulting, and `s[i]` falls through to the
+        # CPython bridge, which is NULL in pure mode.  Require positive
+        # evidence — an annotation or a call site — rather than inferring
+        # "scalar" from silence.
+        _annotated = {a.arg for a in node.args.args if a.annotation is not None}
+        _annotated |= {a.arg for a in node.args.kwonlyargs
+                       if a.annotation is not None}
+        _all_params_typed = all(
+            p in _annotated
+            or (i < len(call_types) and call_types[i] is not None)
+            for i, p in enumerate(param_names)
+        )
         uses_bare = (
             not _used_as_value
             and not has_vararg
@@ -9737,6 +9755,7 @@ class CodeGen:
             and _is_scalar_ret
             and _body_is_scalar
             and all(isinstance(t, _SCALAR_TYPES) for t in param_types)
+            and _all_params_typed
             and not node.decorator_list
             and not _has_mixed_call_types
             and not _has_ptr_in_sigs
@@ -9759,6 +9778,9 @@ class CodeGen:
                                 "attrs, or exceptions)")
             if not all(isinstance(t, _SCALAR_TYPES) for t in param_types):
                 blockers.append("non-scalar parameter types")
+            if not _all_params_typed:
+                blockers.append("parameter with no annotation and no "
+                                "classifiable call site")
             if node.decorator_list:
                 blockers.append("has decorator(s)")
             if _has_mixed_call_types:
