@@ -558,6 +558,47 @@ printed `0` instead of raising TypeError. The operand kinds are only still known
 at the *call site*, so that is where the raise is emitted, with
 `_emit_runtime_type_error` as the backstop inside.
 
+**A borrowed pointer into a buffer the next event overwrites is a wrong answer,
+not a fast one.** The exception message lived in one reused *immortal*
+thread-local buffer, so `str(e)` handed back a pointer into storage the next
+raise rewrote, and because the buffer was immortal, storing it increfed
+nothing: collecting messages in a list gave N copies of the last one, while
+concatenating (`"" + str(e)`) copied and looked fine — which is why the tests
+missed it. Each raise now publishes a fresh refcounted string and releases the
+previous one, reusing the buffer in place only while the exception slot is its
+sole owner (`refcount == 1`), so the no-holder case still costs no allocation.
+
+That fix is not expressible in the runtime alone, and the reason generalises:
+**making a shared buffer mortal converts every un-increfed holder from a wrong
+value into a use-after-free.** The holders are compiler-emitted, so the two
+halves had to land together — the `as e` binding already increfs through
+`_store_variable`, and `_retain_exc_msg_slot` now gives the `saved.exc.msg`
+slot behind a bare `raise` the same ownership by routing it through
+`_retain_native_store`, which also brings the entry-block zero-init, the
+release of the previous iteration's message when a `try` sits in a loop, and
+the release at function exit.
+
+**Which exception a bare `raise` re-raises is emission state, and emission state
+nests.** `_saved_exc_type/_msg/_class` name the allocas a bare `raise` reads;
+each try statement overwrote them while emitting its handlers and never put
+them back, so a nested try *inside* a handler left its own exception in place
+and the outer `raise` re-raised the inner one. `_push_saved_exc_slots` /
+`_pop_saved_exc_slots` restore them. Emission order makes the nested try's
+*body* correct for free: the body is emitted before the handlers, so a bare
+`raise` there still sees the enclosing handler's slots — which is what Python
+does, since that body is still running inside the outer handler.
+
+**A temp released at the statement boundary is not released on the path that
+raised.** The boundary flush is emitted in the no-exception continuation block,
+which a `raise` never reaches, so `raise ValueError("m" * n)` leaked its whole
+message every iteration. `_emit_raise` now flushes to its own watermark
+immediately after the raise call — safe precisely because `fastpy_raise` copies
+the message rather than borrowing it. The same audit found `str_repeat` to be
+the one statically-typed string producer whose owned result nobody registered
+(`_owned_str_repeat` now does), which alone cost 187 MB over 500k iterations of
+`s = "m" * 350`. Both are invisible to an output-diffing test suite; peak
+working set is the only thing that shows them.
+
 **A return that can promote needs both a `mixed` tag and the FV ABI.** These are
 decided in two places and either one alone is useless: `_duf_infer_ret_tag` can
 say `mixed` while `_duf_select_abi` still hands the function a bare i64, which

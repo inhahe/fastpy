@@ -694,58 +694,80 @@ FPY_THREAD_LOCAL const char *fpy_exc_class_name = "";  /* actual class name for 
  * as headerless. Weakening `fpy_str_header` is not an option either — the
  * probe is load-bearing, and a laxer test would misclassify real strings.
  *
- * The copy is immortal, so incref/decref on it are no-ops and it can never be
- * freed out from under a caught exception. Its lifetime matches what callers
- * already relied on: valid until the next raise on this thread, exactly like
- * the shared `_err_buf` most producers already used.
- * BUG-STR-HEADER-PROBES-BEFORE-RUNTIME-STATIC-BUFFERS. */
-#define FPY_EXC_MSG_INLINE_CAP 512
-typedef struct {
-    int32_t magic;
-    int32_t refcount;
-    char data[FPY_EXC_MSG_INLINE_CAP];
-} FpyExcMsgBuf;
-/* The probe subtracts offsetof(FpyString, data), so the two layouts must agree.
- * Spelled as a negative-size typedef rather than _Static_assert because MSVC
- * does not accept the C11 keyword in the C mode this runtime is built with. */
-typedef char fpy_exc_msg_layout_check[
-    (offsetof(FpyExcMsgBuf, data) == offsetof(FpyString, data)) ? 1 : -1];
-static FPY_THREAD_LOCAL FpyExcMsgBuf fpy_exc_msg_inline = {
-    FPY_STR_MAGIC, FPY_RC_IMMORTAL, { 0 }
-};
-/* Overflow buffer for a message too long to inline. Reused and grown in place,
- * never handed to refcounting, so a thread can hold at most one of these. */
-static FPY_THREAD_LOCAL FpyString *fpy_exc_msg_big = NULL;
-static FPY_THREAD_LOCAL size_t fpy_exc_msg_big_cap = 0;
+ * The copy is an ordinary refcounted string, not an immortal one. It used to
+ * be immortal — a single buffer rewritten by every raise — which made incref a
+ * no-op and so made `str(e)` a *borrowed* pointer into storage the next raise
+ * overwrote: collecting messages in a list gave N copies of the last one.
+ *
+ *     seen = []
+ *     for d in [0, 1, 2]:
+ *         try: raise ValueError("v%d" % d)
+ *         except ValueError as e: seen.append(str(e))
+ *     # ['v2', 'v2', 'v2'] instead of ['v0', 'v1', 'v2']
+ *
+ * Now each publish owns one reference and releases the previous one, so a
+ * holder that increfs — which is every holder codegen emits: an `as e` binding
+ * and the `saved.exc.msg` slot behind a bare `raise` — really does extend the
+ * message's life. The buffer is reused in place only while the exception slot
+ * is its *sole* owner (refcount 1), which is the common case of one raise
+ * after another with nobody holding on, and costs no allocation there.
+ *
+ * This half cannot stand alone: a mortal buffer with no incref at the holders
+ * would trade a wrong value for a use-after-free. See the matching
+ * `_retain_exc_msg_slot` in compiler/codegen.py.
+ * BUG-STR-HEADER-PROBES-BEFORE-RUNTIME-STATIC-BUFFERS,
+ * BUG-EXC-MSG-BUFFER-ALIASES-ACROSS-RAISES. */
+#define FPY_EXC_MSG_MIN_CAP 256
+static FPY_THREAD_LOCAL FpyString *fpy_exc_msg_cur = NULL;
+static FPY_THREAD_LOCAL size_t fpy_exc_msg_cur_cap = 0;  /* chars incl. NUL */
+
+/* Drop this thread's reference to the published message. */
+static void fpy_exc_msg_drop(void) {
+    FpyString *s = fpy_exc_msg_cur;
+    fpy_exc_msg_cur = NULL;
+    fpy_exc_msg_cur_cap = 0;
+    if (s && fpy_str_decref(s->data)) free(s);
+}
 
 /* Copy `msg` into header-backed storage and return a pointer to the chars. */
 static const char *fpy_exc_msg_store(const char *msg) {
-    if (!msg) return "";
+    /* A NULL message still gets a header-backed empty string: a handler that
+     * binds it will incref, and increfing a bare "" literal probes 8 bytes of
+     * whatever precedes it in .rodata. */
+    if (!msg) msg = "";
     /* Re-publishing the current message must not memcpy a buffer onto itself. */
-    if (msg == fpy_exc_msg_inline.data ||
-        (fpy_exc_msg_big && msg == fpy_exc_msg_big->data))
-        return msg;
+    if (fpy_exc_msg_cur && msg == fpy_exc_msg_cur->data) return msg;
     size_t n = strlen(msg);
-    if (n < FPY_EXC_MSG_INLINE_CAP) {
-        memcpy(fpy_exc_msg_inline.data, msg, n + 1);
-        return fpy_exc_msg_inline.data;
+    if (fpy_exc_msg_cur && fpy_exc_msg_cur->refcount == 1
+            && n + 1 <= fpy_exc_msg_cur_cap) {
+        memcpy(fpy_exc_msg_cur->data, msg, n + 1);
+        return fpy_exc_msg_cur->data;
     }
-    if (n + 1 > fpy_exc_msg_big_cap) {
-        FpyString *nb = (FpyString *)realloc(fpy_exc_msg_big,
-                                             sizeof(FpyString) + n + 1);
-        if (!nb) {
-            /* Out of memory: a truncated message beats losing the raise. */
-            memcpy(fpy_exc_msg_inline.data, msg, FPY_EXC_MSG_INLINE_CAP - 1);
-            fpy_exc_msg_inline.data[FPY_EXC_MSG_INLINE_CAP - 1] = '\0';
-            return fpy_exc_msg_inline.data;
+    size_t cap = (n + 1 < FPY_EXC_MSG_MIN_CAP) ? FPY_EXC_MSG_MIN_CAP : n + 1;
+    /* malloc directly rather than fpy_str_alloc: that one does not check for
+     * OOM, and losing a raise to a failed allocation is worse than truncating
+     * the message into whatever buffer is already here. */
+    FpyString *s = (FpyString *)malloc(sizeof(FpyString) + cap);
+    if (!s) {
+        if (fpy_exc_msg_cur && fpy_exc_msg_cur->refcount == 1
+                && fpy_exc_msg_cur_cap > 1) {
+            size_t k = fpy_exc_msg_cur_cap - 1;
+            if (k > n) k = n;
+            memcpy(fpy_exc_msg_cur->data, msg, k);
+            fpy_exc_msg_cur->data[k] = '\0';
+            return fpy_exc_msg_cur->data;
         }
-        fpy_exc_msg_big = nb;
-        fpy_exc_msg_big_cap = n + 1;
+        return "";
     }
-    fpy_exc_msg_big->magic = FPY_STR_MAGIC;
-    fpy_exc_msg_big->refcount = FPY_RC_IMMORTAL;
-    memcpy(fpy_exc_msg_big->data, msg, n + 1);
-    return fpy_exc_msg_big->data;
+    s->magic = FPY_STR_MAGIC;
+    s->refcount = 1;
+    memcpy(s->data, msg, n + 1);
+    /* Copy first, release after: `msg` may point into the buffer being dropped
+     * (a raise whose message was built from the pending one). */
+    fpy_exc_msg_drop();
+    fpy_exc_msg_cur = s;
+    fpy_exc_msg_cur_cap = cap;
+    return s->data;
 }
 
 /* Per-thread return tag for closure calls. The closure body stores
@@ -981,13 +1003,14 @@ void fastpy_raise_with_obj(int exc_type, const char *msg, void *obj) {
     fpy_exc_msg = fpy_exc_msg_store(msg);
     fpy_exc_obj = obj;
     /* Store the message on the object so str(e) works after exc_clear().
-     * The *caller's* pointer goes on the object, not the copy above: this
-     * attribute has to outlive the next raise, and codegen only reaches here
-     * with a compiler-emitted literal, which is both header-backed and
-     * immortal. */
+     * The published *copy* goes on the object, not the caller's pointer: the
+     * copy is refcounted and fastpy_obj_set_fv increfs, so the attribute keeps
+     * it alive on its own for as long as the object lives. The caller's
+     * pointer has no such guarantee — a message built at the raise site is a
+     * temporary the statement boundary releases. */
     if (obj) {
         fastpy_obj_set_fv(obj, "__exc_msg__", 2 /*FPY_TAG_STR*/,
-                          (int64_t)(intptr_t)msg);
+                          (int64_t)(intptr_t)fpy_exc_msg);
     }
     if (fpy_shadow_depth > 0)
         fpy_shadow_stack[fpy_shadow_depth - 1].lineno = fpy_current_line;
@@ -1020,6 +1043,11 @@ const char* fastpy_exc_get_msg(void) {
 /* Clear current exception. */
 void fastpy_exc_clear(void) {
     fpy_exc_type = FPY_EXC_NONE;
+    /* Hand back the exception slot's reference. Whoever caught the exception
+     * has already taken one of their own — codegen increfs at the `as e`
+     * binding and at the saved-message slot — so this frees the message only
+     * when nothing is holding it. */
+    fpy_exc_msg_drop();
     fpy_exc_msg = "";
     fpy_exc_group_inner = FPY_EXC_NONE;
     fpy_exc_group_inner_count = 0;

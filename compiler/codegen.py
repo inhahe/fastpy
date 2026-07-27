@@ -18092,11 +18092,11 @@ class CodeGen:
                 self.builder.branch(pass_block)
 
         # Drop the arm's temps. The block is terminated by now, so this pops
-        # them *without* emitting decrefs — which is not merely convenient but
-        # required: `fastpy_raise` stores the message pointer (`fpy_exc_msg =
-        # msg`) rather than copying it, so the handler reads it later via
-        # `fastpy_exc_get_msg()`. Releasing here would be a use-after-free.
-        # The message therefore leaks by design, exactly as it did before.
+        # them *without* emitting decrefs — there is nowhere to emit them. That
+        # leaks the assert's message expression, which is a leak and nothing
+        # worse: `fastpy_raise` copies the message into the exception slot's
+        # own refcounted string, so what the handler later reads through
+        # `fastpy_exc_get_msg()` does not depend on this temp at all.
         self._flush_rc_temps_to(_rc_mark_msg)
         self.builder.position_at_end(pass_block)
 
@@ -22472,8 +22472,8 @@ class CodeGen:
 
         # STR *= n (string repetition)
         if left_kind == VKind.STR and isinstance(node.op, ast.Mult):
-            result = self._rt_call("str_repeat",
-                                   [tv_current.as_ptr(self.builder), rhs])
+            result = self._owned_str_repeat(
+                [tv_current.as_ptr(self.builder), rhs])
             self._store_variable(target_name, result, ValueType(VKind.STR))
             return
 
@@ -26075,6 +26075,7 @@ class CodeGen:
         For the common case of single-type groups, this is semantically
         equivalent to CPython's behavior."""
         # TryStar has the same structure as Try: body, handlers, orelse, finalbody
+        _outer_saved_exc = self._push_saved_exc_slots()
         has_except = bool(node.handlers)
         has_finally = bool(node.finalbody)
 
@@ -26127,6 +26128,7 @@ class CodeGen:
             saved_exc_msg_alloca = self._create_entry_alloca(i8_ptr, "saved.exc.msg")
             self.builder.store(exc_type, saved_exc_type_alloca)
             saved_msg = self.builder.call(self.runtime["exc_get_msg"], [])
+            self._retain_exc_msg_slot(saved_exc_msg_alloca, saved_msg)
             self.builder.store(saved_msg, saved_exc_msg_alloca)
             self._saved_exc_type = saved_exc_type_alloca
             self._saved_exc_msg = saved_exc_msg_alloca
@@ -26236,6 +26238,7 @@ class CodeGen:
             if not self.builder.block.is_terminated:
                 self.builder.branch(end_block)
 
+        self._pop_saved_exc_slots(_outer_saved_exc)
         self.builder.position_at_end(end_block)
 
     # ── Optimization analysis recording ─────────────────────────────────
@@ -26822,6 +26825,7 @@ class CodeGen:
 
     def _emit_try(self, node: ast.Try) -> None:
         """Emit try/except/finally using flag-based exception checking."""
+        _outer_saved_exc = self._push_saved_exc_slots()
         has_except = bool(node.handlers)
         has_finally = bool(node.finalbody)
 
@@ -26892,6 +26896,7 @@ class CodeGen:
             saved_exc_class_alloca = self._create_entry_alloca(i8_ptr, "saved.exc.class")
             self.builder.store(exc_type, saved_exc_type_alloca)
             saved_msg = self.builder.call(self.runtime["exc_get_msg"], [])
+            self._retain_exc_msg_slot(saved_exc_msg_alloca, saved_msg)
             self.builder.store(saved_msg, saved_exc_msg_alloca)
             saved_class = self.builder.call(self.runtime["exc_get_class_name"], [])
             self.builder.store(saved_class, saved_exc_class_alloca)
@@ -27058,6 +27063,7 @@ class CodeGen:
             if not self.builder.block.is_terminated:
                 self.builder.branch(end_block)
 
+        self._pop_saved_exc_slots(_outer_saved_exc)
         self.builder.position_at_end(end_block)
 
     def _emit_raise(self, node: ast.Raise) -> None:
@@ -27083,6 +27089,14 @@ class CodeGen:
             exc_name = node.exc.func.id
             name_ptr = self._make_string_constant(exc_name)
             exc_id = self.builder.call(self.runtime["exc_name_to_id"], [name_ptr])
+            # Temps built for the message have to be released *here*, right
+            # after the raise, not at the statement boundary: that flush is
+            # emitted in the no-exception continuation block, which a raise
+            # never reaches, so `raise ValueError("m" * n)` in a loop leaked
+            # the whole message every iteration.  Releasing is safe because
+            # fastpy_raise copies the message into the exception slot's own
+            # refcounted string.  BUG-RAISE-MESSAGE-TEMP-LEAKS.
+            _rc_mark = len(self._rc_temps)
 
             # ExceptionGroup("g", [ValueError("a"), ...]) — store inner types
             if exc_name == "ExceptionGroup" and len(node.exc.args) >= 2:
@@ -27190,6 +27204,7 @@ class CodeGen:
                 # to the exception struct. This avoids silently ignoring it.
                 if node.cause is not None:
                     self._emit_expr_value(node.cause)
+            self._flush_rc_temps_to(_rc_mark)
             # If we're inside a try block, the exception check after this
             # statement will catch it. If not, early-return so the caller
             # can check the exception flag.
@@ -27694,6 +27709,61 @@ class CodeGen:
                                           [ir.Constant(i32, tag)])
                 self.builder.ret(value)
 
+    def _push_saved_exc_slots(self) -> tuple:
+        """Remember which try statement a bare `raise` currently belongs to.
+
+        `_saved_exc_type` / `_saved_exc_msg` / `_saved_exc_class` name the
+        allocas holding the exception a bare `raise` re-raises. Each try
+        statement overwrites them while emitting its handlers, and they were
+        never put back — so a nested try *inside* a handler left its own
+        exception in place and the outer handler's `raise` re-raised the inner
+        one:
+
+            try: raise ValueError("outer")
+            except ValueError:
+                try: raise KeyError("inner")
+                except KeyError: pass
+                raise            # re-raised KeyError('inner')
+
+        The pair of calls restores the enclosing statement's slots when a
+        nested try finishes emitting. Emission order makes the `try` body
+        itself correct for free: the body is emitted before the handlers, so a
+        bare `raise` there still sees the enclosing handler's slots — which is
+        what Python does, since the body of a nested try is still running
+        inside the outer handler. BUG-BARE-RAISE-TAKES-INNERMOST-HANDLER.
+        """
+        return (getattr(self, '_saved_exc_type', None),
+                getattr(self, '_saved_exc_msg', None),
+                getattr(self, '_saved_exc_class', None))
+
+    def _pop_saved_exc_slots(self, saved: tuple) -> None:
+        """Restore the slots a nested try statement displaced."""
+        (self._saved_exc_type, self._saved_exc_msg,
+         self._saved_exc_class) = saved
+
+    def _retain_exc_msg_slot(self, alloca: ir.AllocaInstr,
+                             msg: ir.Value) -> None:
+        """Make a `saved.exc.msg` slot own the message it is about to hold.
+
+        The runtime publishes each exception message as a refcounted string and
+        releases it on the *next* raise (and on exc_clear), so a slot that
+        outlives either — this one does: it backs a bare `raise` and the
+        except* binding, both of which run after the handler's exc_clear and
+        possibly after a nested raise — has to take a reference of its own.
+        Without it the message a re-raise reads is freed memory.
+
+        Going through _retain_native_store rather than emitting a bare incref
+        gets the rest of the bookkeeping for free: the entry-block zero-init,
+        the release of the previous iteration's message when a try runs inside
+        a loop, and the release at every function exit. The slot gets a
+        synthetic, per-statement name because that registry is keyed by name
+        and two try statements in one function must not share an entry.
+        BUG-EXC-MSG-BUFFER-ALIASES-ACROSS-RAISES.
+        """
+        self._exc_msg_slot_n = getattr(self, "_exc_msg_slot_n", 0) + 1
+        self._retain_native_store(f"__exc.saved.msg.{self._exc_msg_slot_n}",
+                                  alloca, msg, ValueType(VKind.STR))
+
     def _register_owned_temp(self, tag_val, data_val) -> None:
         """Register an owned (+1) temporary produced during expression
         evaluation so it can be released at the next statement/expression
@@ -27779,6 +27849,18 @@ class CodeGen:
             data = self.builder.ptrtoint(rp, i64)
             self._register_owned_temp(ir.Constant(i32, FPY_TAG_STR), data)
         return r
+
+    def _owned_str_repeat(self, args) -> ir.Value:
+        """Emit a str_repeat call and register its (+1) result as an owned temp.
+
+        fastpy_str_repeat always allocates — even `s * 0` returns a fresh empty
+        buffer — so like str_concat its result is unconditionally owned. It was
+        the one statically-typed str producer nobody registered, which made
+        `s = "m" * 350` in a loop leak the whole 350 bytes every iteration
+        (500k iterations reached a 187 MB working set).
+        BUG-STR-REPEAT-RESULT-LEAKS."""
+        return self._register_owned_str_ptr(
+            self._ensure_ptr(self._rt_call("str_repeat", args)))
 
     def _owned_bytes_result(self, fn_name, args) -> ir.Value:
         """Emit a bytes-producing runtime call (bytes_concat/bytes_repeat) and
@@ -36690,9 +36772,9 @@ class CodeGen:
         if lk == VKind.STR and rk == VKind.STR and op == ast.Add:
             return self._owned_str_concat([ltv, rtv])
         if lk == VKind.STR and rk in (VKind.INT, VKind.BOOL) and op == ast.Mult:
-            return self._rt_call("str_repeat", [ltv, rtv])
+            return self._owned_str_repeat([ltv, rtv])
         if lk in (VKind.INT, VKind.BOOL) and rk == VKind.STR and op == ast.Mult:
-            return self._rt_call("str_repeat", [rtv, ltv])
+            return self._owned_str_repeat([rtv, ltv])
         # bytes + bytes → concat, bytes * int → repetition. Use dedicated
         # FpyBytes-aware runtime funcs (length-preserving for embedded nulls,
         # header-backed so incref/decref work), NOT the str_* funcs (which

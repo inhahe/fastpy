@@ -96,6 +96,45 @@ Covered by `tests/regressions/numeric_guard_falls_through.py`.
 **Severity:** was high — silently wrong arithmetic, and a crash in the BigInt
 true-division case.
 
+### DEBT-FV-BINOP-HAS-NO-POW-OPCODE. `**` cannot be routed through the dynamic binop, so the `_container_kinds` guard has no fallback for it — 2026-07-27
+
+**What:** noticed while making the three arithmetic guards positive (above).
+The guards work by *falling through* to `fastpy_fv_binop` whenever the static
+emitter can't prove both operands are machine integers. That fallback exists
+for every operator except `**`: the op codes are a dense `0..10` —
+`+ - * / // % & | ^ << >>`, see `_FV_BINOP_OPCODES` in `compiler/codegen.py`
+and the matching switch in `fastpy_fv_binop` — and `ast.Pow` was never
+assigned one. So the `_container_kinds` guard in `compiler/codegen.py`,
+which is supposed to stop a native pointer from reaching `cpython_binop`,
+cannot redirect a `**` anywhere — there is no op code to redirect it *to*.
+
+Today nothing is visibly broken: `(2 ** 80) ** 2` works because codegen has a
+*static* BigInt fast path that maps `ast.Pow: "bigint_pow"` and never consults
+`fv_binop`. The hole is only reachable when both operands are runtime-tagged
+(FVALUE/UNKNOWN) and at least one is a non-int pointer kind — e.g. a BigInt
+that arrived through an untyped parameter, or a dict value read back with a
+dynamic tag, raised to a power.
+
+**Reproduce:** not yet reproduced end-to-end; the shapes that would reach it
+(untyped-parameter BigInt with `**`) currently take other paths. Treat this as
+debt found by reading, not an observed failure.
+
+**Where:** `compiler/codegen.py`, `_FV_BINOP_OPCODES` (~line 36002) and
+`_container_kinds`; `runtime/objects.c`, the op-code switch in
+`fastpy_fv_binop`; the `ast.Pow: "bigint_pow"` entry in codegen's static
+BigInt fast-path table is what covers the reachable cases today.
+
+**Proper fix:** give `**` an op code (11) in `fastpy_fv_binop` with arms for
+int/float/BigInt — including the CPython rules the static path already knows
+(negative integer exponent promotes to float; `0 ** -1` raises
+ZeroDivisionError) — then let `_container_kinds` route `ast.Pow` through it
+like every other operator.
+
+**Severity:** low today (unreachable in practice), but it is exactly the shape
+of the guard bugs above: a kind the emitter doesn't handle continuing into an
+emitter that assumes a machine integer, instead of falling through to a path
+that handles it.
+
 ### ~~BUG-ARITH-SILENT-ZERO-AND-C-SIGN-RULES. Zero divisors answer 0 or nan instead of raising, and `//`/`%` follow C's sign rules rather than Python's~~ — FIXED 2026-07-27
 
 **What:** found alongside the guard bugs above, same theme — an error or a
@@ -3821,7 +3860,25 @@ print and stays `\xNN`. `fastpy_str_repr`'s buffer also had to grow from
 needs. Regression test `tests/regressions/repr_quote_choice.py` covers str,
 bytes, and the container path for each.
 
-### BUG-EXC-MSG-BUFFER-ALIASES-ACROSS-RAISES. `str(e)` returns a borrowed pointer into a buffer the next raise overwrites — 2026-07-27
+### ~~BUG-EXC-MSG-BUFFER-ALIASES-ACROSS-RAISES. `str(e)` returns a borrowed pointer into a buffer the next raise overwrites~~ — FIXED 2026-07-27
+
+**Fixed:** as the entry required, in one change across both halves.
+`fpy_exc_msg_store` in `runtime/runtime.c` now publishes a fresh refcounted
+`FpyString` per raise and drops the previous one (also on `fastpy_exc_clear`),
+reusing the buffer in place only while the exception slot is its sole owner
+(`refcount == 1`), so back-to-back raises with nobody holding on still cost no
+allocation. The compiler half is `_retain_exc_msg_slot`, which gives the
+`saved.exc.msg` slot behind a bare `raise` a real reference by routing it
+through `_retain_native_store` — that brings the entry-block zero-init, the
+release of the previous iteration's message when a `try` runs in a loop, and
+the release at function exit. The `as e` binding already increfed through
+`_store_variable`. `fastpy_raise_with_obj` also switched to storing the
+published copy on `__exc_msg__` rather than the caller's pointer, since the
+copy is refcounted and `fastpy_obj_set_fv` increfs, so the attribute keeps
+itself alive. Two neighbouring bugs surfaced while testing it —
+BUG-BARE-RAISE-TAKES-INNERMOST-HANDLER and BUG-RAISE-MESSAGE-TEMP-LEAKS —
+both fixed in the same change. Covered by
+`tests/regressions/exc_msg_alias_across_raises.py`.
 
 **What:** the exception message lives in one reused, thread-local,
 *immortal* header-backed buffer (see BUG-STR-HEADER-PROBES-BEFORE-RUNTIME-
@@ -3865,6 +3922,102 @@ go in as one change.
 
 **Severity:** silent wrong output. Any program that collects exception
 messages in a list or dict gets N copies of the last one.
+
+### ~~BUG-BARE-RAISE-TAKES-INNERMOST-HANDLER. A nested `try` inside a handler steals the enclosing handler's bare `raise`~~ — FIXED 2026-07-27
+
+**Fixed:** `_push_saved_exc_slots` / `_pop_saved_exc_slots` in
+`compiler/codegen.py` save and restore `_saved_exc_type/_msg/_class` around
+`_emit_try` and `_emit_try_star`.
+
+**What:** those three attributes name the allocas a bare `raise` re-raises
+from. Every try statement overwrote them while emitting its handlers and never
+restored them, so after a nested try finished emitting, the outer handler's
+`raise` read the *inner* try's saved exception.
+
+**Reproduce:**
+
+```python
+try:
+    raise ValueError("outer message")
+except ValueError:
+    try:
+        raise KeyError("inner")
+    except KeyError:
+        pass
+    raise            # fastpy re-raised KeyError('inner')
+```
+
+**Where:** `_emit_try` (~line 26830) and `_emit_try_star` (~line 26071) in
+`compiler/codegen.py`; read by `_emit_raise`'s `node.exc is None` branch.
+
+Emission order makes the nested try's *body* correct without further work: the
+body is emitted before the handlers, so a bare `raise` there still sees the
+enclosing handler's slots — which is also what Python does, since that body
+runs inside the outer handler.
+
+**Severity:** was wrong control flow — the wrong exception type propagated out
+of a handler, so an outer `except` could catch a class that was never raised
+there.
+
+### ~~BUG-RAISE-MESSAGE-TEMP-LEAKS. A computed exception message is never released~~ — FIXED 2026-07-27
+
+**Fixed:** `_emit_raise` takes an `_rc_temps` watermark before evaluating the
+exception's arguments and calls `_flush_rc_temps_to` immediately after the
+`fastpy_raise` call, while the block is still unterminated.
+
+**What:** the statement-boundary flush is emitted in the *no-exception*
+continuation block (see `_emit_try`'s body loop and `_emit_stmts`), which a
+`raise` never reaches, so every temp built for the message leaked. Releasing at
+the raise is safe only because `fastpy_raise` copies the message into the
+exception slot's own refcounted string — which was not true before
+BUG-STR-HEADER-PROBES-BEFORE-RUNTIME-STATIC-BUFFERS, and is the reason the old
+comment in `_emit_assert` claimed the leak was *required*.
+
+**Reproduce** — peak working set, not output:
+
+```python
+total = 0
+for i in range(500000):
+    try:
+        raise ValueError("m" * (i % 700))
+    except ValueError as e:
+        total += len(str(e))
+```
+
+189 MB before, 13 MB after.
+
+**Where:** `_emit_raise` in `compiler/codegen.py`.
+
+**Severity:** unbounded memory growth in any loop that raises with a computed
+message. Invisible to the test suite, which compares output only.
+
+### ~~BUG-STR-REPEAT-RESULT-LEAKS. `s * n` never releases the string it allocates~~ — FIXED 2026-07-27
+
+**Fixed:** `_owned_str_repeat` in `compiler/codegen.py` registers the result as
+a Model-2 owned temp, mirroring `_owned_str_concat`; the three `str_repeat`
+call sites (both `_emit_binop` orders and the `*=` augmented assignment) go
+through it.
+
+**What:** `fastpy_str_repeat` always allocates — even `s * 0` returns a fresh
+empty buffer — but its result was the one statically-typed string producer
+nobody registered, so the `+1` was never released. A consumer that stored it
+increfed to 2 and dropped back to 1, never 0.
+
+**Reproduce** — peak working set, not output:
+
+```python
+for i in range(500000):
+    s = "m" * 350
+```
+
+187 MB before, 13 MB after.
+
+**Where:** `compiler/codegen.py`, `_emit_binop`'s STR×INT fast paths and
+`_emit_augassign`'s `STR *=` branch.
+
+**Severity:** unbounded memory growth for any repeated string built in a loop —
+padding, separators, test fixtures. Found while measuring
+BUG-RAISE-MESSAGE-TEMP-LEAKS; the two are independent.
 
 ### BUG-STR-EMBEDDED-NUL-TRUNCATES. A `str` containing `\x00` is cut at the null — 2026-07-27
 
