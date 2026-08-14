@@ -44,6 +44,57 @@ than documenting the trap — either have `test_comprehensive.py` /
 put the directories in `testpaths` in the pytest config so a bare `pytest`
 covers everything. Until then the canonical command is `python -m pytest tests/`.
 
+### BUG-LATER-FLOAT-REBIND-RETYPES-EARLIER-INT-CALLS. A module name rebound to a float at the *end* of the module makes every earlier call passing it take a `double` parameter, so ints print as `0.0` — 2026-08-14
+
+**Reproduce:**
+
+```python
+def sink(v):
+    return v
+
+for i in range(3):
+    print(sink(i))
+i = 2.5
+print(i)
+```
+
+```
+CPython:  0    1    2    2.5
+fastpy:   0.0  1.0  2.0  2.5
+```
+
+`_csa_build_var_types` is last-writer-wins over the whole module, and it has
+no arm for a `for`-target. `i = 2.5` is therefore the only binding of `i` it
+sees, so `i` is tagged `float` for the entire module — including the three
+loop iterations that precede the rebind and bind an int. `_call_site_param_types`
+reads that tag for `sink(i)` and picks the `double` ABI:
+
+```llvm
+define internal double @"fastpy.user.sink"(double %"v") alwaysinline
+```
+
+The loop's `i64` counter is then widened at the call and comes back as a
+float. Confirmed pre-existing at `096babe`, so it long predates the ABI /
+call-site-analysis work of 2026-08-14.
+
+This is the mirror image of BUG-GLOBAL-KIND-CHANGING-REBIND-USES-STALE-TAG
+below: that one pins the *first* kind forever, this one lets the *last* kind
+retroactively retype earlier uses. Both are the same root defect — a single
+whole-module tag per name where the name genuinely holds two kinds.
+
+`_csa_provably_int_names` correctly declines here (two bindings, one of them
+not an int) and is gap-fill only, so it neither causes nor worsens this; but
+it also cannot fix it, because the repair is not "which single kind is it"
+but "stop asking for a single kind".
+
+**Proper fix:** make the module-level tag flow-sensitive — bind kinds per
+assignment region rather than per name, so `sink(i)` inside the loop resolves
+against the `for`-target binding and the trailing `print(i)` resolves against
+the float one. Where that is not yet possible, a name with two disagreeing
+bindings must fall back to the tagged FpyValue ABI (correct, slower) instead
+of committing to either kind, which is what the decline-on-disagreement rule
+in `_csa_provably_int_names` already does for the int case.
+
 ### BUG-RETURN-OF-GLOBAL-LOSES-ITS-KIND. `return <module-level name>` is typed int, so a returned str prints as a pointer and a returned float as its bit pattern — 2026-07-27 — **FIXED**
 
 **Reproduce:**
