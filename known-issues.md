@@ -44,6 +44,49 @@ than documenting the trap — either have `test_comprehensive.py` /
 put the directories in `testpaths` in the pytest config so a bare `pytest`
 covers everything. Until then the canonical command is `python -m pytest tests/`.
 
+### BUG-STARRED-UNPACK-LOSES-KIND. Every non-starred name in a `a, *b = ...` unpack is typed int, so a str comes back as a pointer and a float as its bit pattern — 2026-08-14
+
+**Reproduce:**
+
+```python
+r, *rest = "ab", 2, 3
+print(r, len(rest))
+```
+
+```
+CPython:  ab 2
+fastpy:   140694976321120 2
+```
+
+Not an ABI or call-site issue — it reproduces with no function call in the
+program at all. The kind is lost at the unpack itself. Every kind is
+affected, so it is a missing tag rather than a wrong one:
+
+| program | CPython | fastpy |
+|---|---|---|
+| `r, *rest = "ab", 2, 3` | `ab` | `140694976321120` (pointer) |
+| `r, *rest = 2.5, 2, 3` | `2.5` | `4612811918334230528` (bit pattern) |
+| `r, *rest = [9], 2, 3` → `len(r)` | `1` | `0` |
+| `*rest, r = 1, 2, "ab"` | `ab` | `140700417185376` |
+| `r, *rest = ["ab", 2, 3]` | `ab` | `140700223329888` |
+
+Position relative to the star does not matter. Two shapes are unaffected and
+bound the defect: `*rest, = "ab", 2` (no plain target at all) and
+`r, q = "ab", 2` (no star) both print correctly — so the plain-unpack path
+propagates kinds fine and only the starred path drops them.
+
+Confirmed pre-existing at `096babe`.
+
+**Proper fix:** the starred-unpack lowering needs to carry each fixed
+position's element kind the way the plain-tuple path already does, instead
+of defaulting the non-starred targets to `i64`. The plain path is the
+working reference implementation.
+
+`_csa_provably_int_names` refuses starred unpacks outright, so it neither
+causes this nor can it mask it; that refusal is pinned by
+`tests/test_abi_selection.py::test_declines_on_starred_unpack`, asserted
+against the IR because output cannot distinguish the decline from this bug.
+
 ### BUG-LATER-FLOAT-REBIND-RETYPES-EARLIER-INT-CALLS. A module name rebound to a float at the *end* of the module makes every earlier call passing it take a `double` parameter, so ints print as `0.0` — 2026-08-14
 
 **Reproduce:**

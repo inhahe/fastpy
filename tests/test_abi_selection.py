@@ -63,7 +63,13 @@ class TestBareABIForCounterLoops:
         "L = [1, 2, 3]\nn = len(L)\nt = add(n, 1)\n",
         # int derived through arithmetic on another proven int
         "i = 0\nj = i * 2 + 1\nt = add(j, 1)\n",
-    ], ids=["while", "for_range", "augassign", "nested_range", "len", "derived"])
+        # literal-to-literal tuple unpack
+        "i, j = 0, 1\nt = add(i, j)\n",
+        # mutual reference: needs the agreement phase, since neither name is
+        # provable on its own, and both are grounded by their first binding
+        "i = 0\nj = 1\ni, j = j, i\nt = add(i, j)\n",
+    ], ids=["while", "for_range", "augassign", "nested_range", "len",
+            "derived", "tuple_unpack", "swap"])
     def test_uses_bare_abi(self, body):
         assert _param_abi(_ADD + body) == "bare"
 
@@ -96,8 +102,19 @@ class TestDeclinesWithoutEvidence:
                "print(big)\n")
         assert _param_abi(src) == "fv"
 
-    def test_declines_on_tuple_unpack(self):
-        src = _ADD + "i, j = 0, 1\nt = add(i, j)\n"
+    def test_declines_on_starred_unpack(self):
+        # A `*b` makes the pairing depend on a length this pass cannot see.
+        src = _ADD + "a, *b = 1, 2, 3\nt = add(a, 1)\n"
+        assert _param_abi(src) == "fv"
+
+    def test_declines_on_unpack_from_call(self):
+        # The right-hand side is not a literal sequence, so which element
+        # reaches which name is not visible in the AST.
+        src = _ADD + "def f():\n    return (1, 2)\na, b = f()\nt = add(a, b)\n"
+        assert _param_abi(src) == "fv"
+
+    def test_declines_when_unpacked_name_is_rebound_to_str(self):
+        src = _ADD + 'i, j = 0, 1\nt = add(i, j)\ni = "s"\nprint(i)\n'
         assert _param_abi(src) == "fv"
 
     def test_declines_on_base_less_cycle(self):

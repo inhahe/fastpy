@@ -87,3 +87,15 @@ m = 0
 while m < 3:
     m = m + 1
 print(m, big)
+
+# ── literal-to-literal unpack, and a mutual reference through a swap ──
+p, q = 3, 4
+print(add(p, q))
+p, q = q, p
+print(add(p, q), p, q)
+
+# A starred unpack must prove nothing either, but that cannot be pinned by
+# output here: every non-starred name in one already loses its kind
+# regardless of this pass (BUG-STARRED-UNPACK-LOSES-KIND). The decline is
+# asserted directly against the IR instead, in
+# `test_abi_selection.py::test_declines_on_starred_unpack`.

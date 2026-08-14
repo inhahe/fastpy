@@ -9806,13 +9806,42 @@ class CodeGen:
             else:
                 bindings.setdefault(name, []).append(expr)
 
+        def _unpack_pairs(tgt, value):
+            """`(a, b) = (x, y)` -> [(a, x), (b, y)], else None.
+
+            Only the shape where both sides are literal sequences of equal
+            length and every target is a plain `Name` is accepted; anything
+            with a `Starred`, a nested target or a non-literal right-hand
+            side is refused, since the pairing would then depend on a
+            runtime length this pass cannot see.
+            """
+            if not isinstance(tgt, (ast.Tuple, ast.List)):
+                return None
+            if not isinstance(value, (ast.Tuple, ast.List)):
+                return None
+            if len(tgt.elts) != len(value.elts):
+                return None
+            if not all(isinstance(e, ast.Name) for e in tgt.elts):
+                return None
+            if any(isinstance(e, ast.Starred) for e in value.elts):
+                return None
+            return [(e.id, v) for e, v in zip(tgt.elts, value.elts)]
+
         for node in mod_nodes:
             if isinstance(node, ast.Assign):
                 for tgt in node.targets:
                     if isinstance(tgt, ast.Name):
                         _bind(tgt.id, node.value)
+                    elif _unpack_pairs(tgt, node.value) is not None:
+                        # `i, j = 0, 1` is a literal-to-literal unpack: each
+                        # name gets exactly one element and the pairing is
+                        # visible in the AST, so it is no more of a guess
+                        # than `i = 0` written twice.
+                        for _nm, _val in _unpack_pairs(tgt, node.value):
+                            _bind(_nm, _val)
                     else:
-                        # Tuple/starred/subscript targets are not tracked.
+                        # Starred, subscript and non-literal RHS unpacks are
+                        # not tracked.
                         for sub in ast.walk(tgt):
                             if isinstance(sub, ast.Name):
                                 disqualified.add(sub.id)
@@ -9880,17 +9909,33 @@ class CodeGen:
         for nm in disqualified:
             bindings.pop(nm, None)
 
+        # Two obligations, and they need opposite fixpoints -- computing both
+        # in one loop is what limited an earlier version to *self*-reference,
+        # so `i, j = j, i` after `i = 0; j = 1` was refused even though both
+        # names are plainly ints.
+        #
+        # Agreement (greatest fixpoint): assume every name is an int, then
+        # repeatedly drop any name with a binding that is not.  Optimism is
+        # safe here only because it is paired with the second phase.
+        cand = set(bindings)
+        while True:
+            drop = {nm for nm in cand
+                    if not all(_is_int(e, cand) for e in bindings[nm])}
+            if not drop:
+                break
+            cand -= drop
+
+        # Groundedness (least fixpoint): agreement alone would also "prove"
+        # `x = y; y = x`, which never binds an int at all -- the assumption
+        # would be justifying itself.  So a name must additionally be
+        # reachable from some binding that is an int *without* assuming the
+        # names still under question.
         proven: set[str] = set()
         changed = True
         while changed:
             changed = False
-            for nm, exprs in bindings.items():
-                if nm in proven:
-                    continue
-                # Base case must hold without leaning on the name itself.
-                if not any(_is_int(e, proven) for e in exprs):
-                    continue
-                if all(_is_int(e, proven | {nm}) for e in exprs):
+            for nm in cand - proven:
+                if any(_is_int(e, proven) for e in bindings[nm]):
                     proven.add(nm)
                     changed = True
         return proven
