@@ -19,3 +19,10 @@ runtime/_msvc_env_cache.json
 
 # Benchmark snapshots written by benchmarks/bench_fastpy_only.py
 benchmarks/_bench_*.json
+
+# Idle-probe artifacts (machine-local benchmark runs)
+benchmarks/_probe.log
+benchmarks/_probe_status.json
+benchmarks/_probe_report.md
+benchmarks/_probe_stdout.log
+benchmarks/_probe_pid.txt
