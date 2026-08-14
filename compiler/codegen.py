@@ -9734,6 +9734,130 @@ class CodeGen:
                     _has_container, _has_name])
         return cats > 1
 
+    # Integer-valued binary operators.  `/` is excluded because it yields a
+    # float, and `**` because it is the one arithmetic op that reaches BigInt
+    # from small operands (`2 ** 64`).
+    _CSA_INT_BINOPS = (ast.Add, ast.Sub, ast.Mult, ast.FloorDiv, ast.Mod,
+                       ast.LShift, ast.RShift, ast.BitAnd, ast.BitOr,
+                       ast.BitXor)
+
+    def _csa_provably_int_names(
+        self, tree: ast.Module, mod_nodes: list,
+    ) -> set[str]:
+        """Module-level names whose *every* binding is a machine int.
+
+        Deliberately a predicate, not a second copy of the `var_types`
+        classifier above: it answers only "is this always an int?" and
+        declines on anything it does not recognise, so it can never
+        contradict a tag that classifier produced.  It exists because
+        `var_types` has no arm for a plain int, which used to be harmless
+        (`int` was also the fallback for "no evidence") but stopped being so
+        once `_duf_select_abi` began requiring *positive* evidence: a
+        parameter fed only by an unrecorded int counted as untyped and took
+        the whole function off the bare ABI.  `add(i, 1)` in a `while` loop
+        is the canonical case, and it cost ~9x.
+
+        Multiple bindings are accepted here — unlike `_csa_global_single_bind`
+        — because "all of them are ints" is a sound claim where "the last one
+        wins" is not.  Self-reference is allowed inductively: a name needs one
+        binding that is an int *without* referring to itself (the base case)
+        before `i = i + 1` may extend it, so a cycle with no base
+        (`x = y; y = x`) is refused rather than assumed.
+        """
+        # Overflow promotion is only emitted when the program mentions a
+        # BigInt (see `_program_uses_bigint`); where it is, an int-tagged
+        # name can hold a heap pointer instead, so claim nothing at all.
+        for n in ast.walk(tree):
+            if (isinstance(n, ast.Constant) and isinstance(n.value, int)
+                    and not isinstance(n.value, bool)
+                    and not -(2 ** 63) <= n.value <= 2 ** 63 - 1):
+                return set()
+
+        bindings: dict[str, list] = {}
+        disqualified: set[str] = set()
+
+        def _bind(name: str, expr) -> None:
+            if expr is None:
+                disqualified.add(name)
+            else:
+                bindings.setdefault(name, []).append(expr)
+
+        for node in mod_nodes:
+            if isinstance(node, ast.Assign):
+                for tgt in node.targets:
+                    if isinstance(tgt, ast.Name):
+                        _bind(tgt.id, node.value)
+                    else:
+                        # Tuple/starred/subscript targets are not tracked.
+                        for sub in ast.walk(tgt):
+                            if isinstance(sub, ast.Name):
+                                disqualified.add(sub.id)
+            elif isinstance(node, ast.AugAssign):
+                if isinstance(node.target, ast.Name):
+                    if isinstance(node.op, self._CSA_INT_BINOPS):
+                        _bind(node.target.id,
+                              ast.BinOp(left=ast.Name(id=node.target.id,
+                                                      ctx=ast.Load()),
+                                        op=node.op, right=node.value))
+                    else:
+                        disqualified.add(node.target.id)
+            elif isinstance(node, (ast.AnnAssign, ast.NamedExpr, ast.For,
+                                   ast.AsyncFor, ast.comprehension,
+                                   ast.With, ast.AsyncWith)):
+                _tgts = []
+                if isinstance(node, (ast.With, ast.AsyncWith)):
+                    _tgts = [i.optional_vars for i in node.items
+                             if i.optional_vars is not None]
+                elif node.target is not None:
+                    _tgts = [node.target]
+                for tgt in _tgts:
+                    for sub in ast.walk(tgt):
+                        if isinstance(sub, ast.Name):
+                            disqualified.add(sub.id)
+        # A `global` declaration means a function body may rebind the name,
+        # and `mod_nodes` deliberately never entered one.
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Global):
+                disqualified.update(node.names)
+
+        def _is_int(expr, cand: set) -> bool:
+            if isinstance(expr, ast.Constant):
+                return (isinstance(expr.value, int)
+                        and not isinstance(expr.value, bool))
+            if isinstance(expr, ast.Name):
+                return expr.id in cand
+            if isinstance(expr, ast.UnaryOp) and isinstance(
+                    expr.op, (ast.USub, ast.UAdd, ast.Invert)):
+                return _is_int(expr.operand, cand)
+            if isinstance(expr, ast.BinOp) and isinstance(
+                    expr.op, self._CSA_INT_BINOPS):
+                return (_is_int(expr.left, cand)
+                        and _is_int(expr.right, cand))
+            if (isinstance(expr, ast.Call)
+                    and isinstance(expr.func, ast.Name)
+                    and expr.func.id == "len"
+                    and expr.func.id not in self._user_functions):
+                return True
+            return False
+
+        for nm in disqualified:
+            bindings.pop(nm, None)
+
+        proven: set[str] = set()
+        changed = True
+        while changed:
+            changed = False
+            for nm, exprs in bindings.items():
+                if nm in proven:
+                    continue
+                # Base case must hold without leaning on the name itself.
+                if not any(_is_int(e, proven) for e in exprs):
+                    continue
+                if all(_is_int(e, proven | {nm}) for e in exprs):
+                    proven.add(nm)
+                    changed = True
+        return proven
+
     def _csa_build_var_types(self, tree: ast.Module) -> dict[str, str]:
         """Build static variable type map from module-level assignments."""
         var_types: dict[str, str] = {}
@@ -9946,6 +10070,17 @@ class CodeGen:
             if isinstance(node, ast.Global):
                 _rebound.update(node.names)
         self._csa_global_single_bind = _bound_once - _rebound
+        # Record the plain-int names the classifier above has no arm for.
+        # Gap-fill only: a name it already tagged keeps that tag, so this
+        # can add evidence but never contradict any.  Names proven here are
+        # frequently rebound (`i = i + 1`) and so are absent from
+        # `_csa_global_single_bind`, which keeps them out of
+        # `_scope_global_tags` — the consumer for which a wrong tag is fatal
+        # rather than merely imprecise.
+        for _nm in self._csa_provably_int_names(tree,
+                                                list(_walk_skip_funcs(tree))):
+            if _nm not in var_types:
+                var_types[_nm] = "int"
         return var_types
 
     def _analyze_call_sites(self, tree: ast.Module) -> None:
