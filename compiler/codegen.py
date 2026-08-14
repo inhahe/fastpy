@@ -9773,6 +9773,30 @@ class CodeGen:
                     and not -(2 ** 63) <= n.value <= 2 ** 63 - 1):
                 return set()
 
+        # Builtins this program rebinds.  `self._user_functions` is still
+        # empty this early -- consulting it silently answered "not shadowed"
+        # for every program -- so read the shadowing off the tree instead.
+        # Deliberately whole-tree and every binding form: a nested `def len`
+        # cannot shadow the module-level one, but declining costs a
+        # refinement while trusting it costs a pointer read as an integer.
+        _shadowed: set[str] = set()
+        for n in ast.walk(tree):
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef,
+                              ast.ClassDef)):
+                _shadowed.add(n.name)
+            elif isinstance(n, (ast.Import, ast.ImportFrom)):
+                for a in n.names:
+                    _shadowed.add((a.asname or a.name).split(".")[0])
+            elif isinstance(n, ast.Assign):
+                for t in n.targets:
+                    for s in ast.walk(t):
+                        if isinstance(s, ast.Name):
+                            _shadowed.add(s.id)
+            elif isinstance(n, (ast.AugAssign, ast.AnnAssign, ast.NamedExpr)):
+                for s in ast.walk(n.target):
+                    if isinstance(s, ast.Name):
+                        _shadowed.add(s.id)
+
         bindings: dict[str, list] = {}
         disqualified: set[str] = set()
 
@@ -9801,6 +9825,19 @@ class CodeGen:
                                         op=node.op, right=node.value))
                     else:
                         disqualified.add(node.target.id)
+            elif (isinstance(node, (ast.For, ast.AsyncFor))
+                  and isinstance(node.target, ast.Name)
+                  and isinstance(node.iter, ast.Call)
+                  and isinstance(node.iter.func, ast.Name)
+                  and node.iter.func.id == "range"
+                  and "range" not in _shadowed):
+                # `for i in range(...)` is the common counter loop, and it
+                # binds an int for any argument that does not raise — range
+                # rejects a float rather than yielding one — so the claim
+                # needs no evidence about the arguments.  Recorded as a
+                # binding rather than an exemption so that a later
+                # `i = "s"` still withdraws it.
+                _bind(node.target.id, ast.Constant(value=0))
             elif isinstance(node, (ast.AnnAssign, ast.NamedExpr, ast.For,
                                    ast.AsyncFor, ast.comprehension,
                                    ast.With, ast.AsyncWith)):
@@ -9836,7 +9873,7 @@ class CodeGen:
             if (isinstance(expr, ast.Call)
                     and isinstance(expr.func, ast.Name)
                     and expr.func.id == "len"
-                    and expr.func.id not in self._user_functions):
+                    and "len" not in _shadowed):
                 return True
             return False
 
