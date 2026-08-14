@@ -8,6 +8,42 @@ how to reproduce it, and what the proper fix looks like.
 
 ## Active Bugs
 
+### DEBT-NAMED-SUITES-SKIP-THE-REGRESSION-CORPUS. Invoking pytest with explicit test-file names silently runs 57% of the suite — 2026-08-14
+
+**Reproduce:**
+
+```bash
+python -m pytest tests/test_differential.py tests/test_comprehensive.py \
+                 tests/test_full_suite.py tests/test_cpython_adapted.py -q
+# 593 passed
+
+python -m pytest tests/ -q
+# 1036 passed
+```
+
+The 353 files in `tests/regressions/` are collected by `pytest_collect_file` in
+`tests/conftest.py:79` — a *discovery* hook. It only fires for files pytest
+walks into, so naming test files explicitly on the command line means the hook
+never sees `regressions/` and the whole corpus is skipped. Nothing reports
+this: the run is green, just 443 tests smaller. `tests/test_shim.py` (32),
+`tests/test_cross_target.py` (9) and `tests/test_generated.py` (7) are lost the
+same way.
+
+This is dangerous precisely because the regression corpus is the record of
+every bug already fixed — the tests most worth running before calling a change
+safe. The docstrings compound it: `test_comprehensive.py:6` says "**Regression
+tests** — existing tests/regressions/ and tests/programs/" and
+`test_full_suite.py:5` says it "Extends the base test suite
+(test_differential.py + regressions/)", so both claim coverage the named-file
+invocation does not deliver.
+
+**Proper fix:** make the full-suite invocation impossible to get wrong rather
+than documenting the trap — either have `test_comprehensive.py` /
+`test_full_suite.py` genuinely parametrise over
+`_collect_python_files(_REGRESSIONS_DIR)` so their docstrings become true, or
+put the directories in `testpaths` in the pytest config so a bare `pytest`
+covers everything. Until then the canonical command is `python -m pytest tests/`.
+
 ### BUG-RETURN-OF-GLOBAL-LOSES-ITS-KIND. `return <module-level name>` is typed int, so a returned str prints as a pointer and a returned float as its bit pattern — 2026-07-27 — **FIXED**
 
 **Reproduce:**

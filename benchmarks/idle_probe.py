@@ -62,9 +62,30 @@ def wait_for_quiet(threshold, quiet_secs, poll=5.0):
     time.sleep(1.0)
     quiet_since = None
     last_report = 0.0
+    last_busy_report = time.monotonic()
+    busy_min = 100.0
+    busy_samples = 0
+    busy_sum = 0.0
     while True:
         cpu = psutil.cpu_percent(interval=None)
         now = time.monotonic()
+        # Heartbeat while busy. Without it the log goes silent for hours and
+        # there is no way to tell a waiting probe from a dead one, nor whether
+        # the threshold is merely strict or hopelessly so.
+        if cpu >= threshold:
+            busy_min = min(busy_min, cpu)
+            busy_sum += cpu
+            busy_samples += 1
+            if now - last_busy_report >= 600:
+                avg = busy_sum / max(busy_samples, 1)
+                log(f"  still busy: cpu now {cpu:.1f}%, "
+                    f"10-min avg {avg:.1f}%, min seen {busy_min:.1f}% "
+                    f"(need < {threshold}%)")
+                write_status(state="waiting_busy", cpu=cpu,
+                             busy_min=round(busy_min, 1),
+                             busy_avg=round(avg, 1), threshold=threshold)
+                last_busy_report = now
+                busy_min, busy_sum, busy_samples = 100.0, 0.0, 0
         if cpu < threshold:
             if quiet_since is None:
                 quiet_since = now
