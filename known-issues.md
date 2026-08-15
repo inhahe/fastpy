@@ -66,6 +66,58 @@ and on the full `pytest tests` (1055 collected). The two misleading docstrings
 now state the consequence rather than only the mechanism. The canonical
 command remains `python -m pytest tests`.
 
+### BUG-SET-UPDATE-NON-SET-ITERABLE-SEGFAULTS. `s.update(<anything but a set>)` reads a list as a dict and dies — 2026-08-15
+
+**Reproduce:**
+
+```python
+s = set()
+s.add(1)
+s.update([2, 3])       # 0xC0000005, no output
+print(sorted(s))
+```
+
+`s.update({2, 3})` — a *set* argument — works. Every other iterable crashes:
+list, tuple, str, bytes. Present on `20a5304` too, so it predates the
+key-kind work; found while writing `tests/regressions/set_elem_kind_proof.py`.
+
+**Why.** The runtime entry point is
+
+```c
+void fastpy_set_update(FpyDict *a, FpyDict *b);          /* objects.c:3302 */
+```
+
+and `_emit_set_method_update` (codegen.py ~46886) hands it whatever the
+argument evaluates to, `_ensure_ptr`'d. Python's `set.update` accepts any
+iterable, so passing a list gives that signature an `FpyList*` — and its body
+immediately reads `b->length` and `b->keys[i]`, which land on an `FpyList`'s
+`items`/`length`/`capacity` instead. The pointer it then dereferences is
+whatever those bytes happen to be.
+
+This is the same shape as BUG-EMPTY-KWARGS-CALL-SEGFAULTS: not a null pointer,
+but a live object of one type read as another, because one signature was made
+to serve two container kinds.
+
+**Proper fix.** The argument's kind is frequently not statically provable, so
+it must come from the runtime tag — the same conclusion as
+BUG-FOR-DICT-KEY-KIND-GUESSED. Replace the call with
+
+```c
+void fastpy_set_update_fv(FpyDict *a, int32_t tag, int64_t data);
+```
+
+switching on `tag`: `SET`/`DICT` iterate `keys` (a dict contributes its keys,
+which is what CPython does), `LIST` iterates `items`, `STR` iterates
+characters via `fastpy_str_index`, `BYTES` iterates ints, anything else raises
+`TypeError` instead of corrupting memory. `_emit_set_method_update` then emits
+`_to_tag_data_ir` on the argument, exactly as `_emit_set_method_add` already
+does.
+
+**Check the siblings while fixing it.** `fastpy_set_intersection_update`,
+`fastpy_set_difference_update` and `fastpy_set_symmetric_difference_update`
+all take `FpyDict *b` with the same assumption, and CPython accepts any
+iterable for all three.
+
 ### PERF-INT-KEYED-DICT-UNPROVABLE-IN-A-WHILE-LOOP. `_is_int_keyed_dict` only recognises a loop-variable key in a `for` loop, so the commonest int-dict idiom of all is not provable — 2026-08-15
 
 **Reproduce** — this is not exotic code, it is the shape half the benchmarks use:

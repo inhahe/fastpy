@@ -36877,6 +36877,335 @@ class CodeGen:
                 return True
         return False
 
+    # ── Proving an expression is an int ────────────────────────────────
+    #
+    # Removing the two key-kind guesses in `_emit_for_dict` cost 1.69x on
+    # `set iterate 100K x 20`: "most sets are int sets" happened to be right
+    # for that workload, and dynamic dispatch is correct but slower.  A guess
+    # cannot come back, so the speed is won back by proving the same fact.
+    #
+    # Everything below is conservative in one direction on purpose.  A False
+    # is a slower loop; a wrong True is a miscompile of exactly the kind
+    # BUG-FOR-DICT-KEY-KIND-GUESSED was.  So a construct that isn't recognised
+    # makes the binding collector return None -- "something happened to this
+    # name I can't read" -- rather than being skipped, because a binding that
+    # goes unread is precisely how a name acquires a kind it doesn't have.
+
+    # Calls whose result is an int whatever the argument is.
+    _INT_CALLS = frozenset(("len", "int", "abs", "ord", "hash", "id"))
+
+    # Operators that keep two ints an int.  `/` is deliberately absent: it is
+    # true division and yields a float.
+    _INT_BINOPS = (ast.Add, ast.Sub, ast.Mult, ast.FloorDiv, ast.Mod,
+                   ast.Pow, ast.LShift, ast.RShift, ast.BitAnd, ast.BitOr,
+                   ast.BitXor)
+    _INT_UNARYOPS = (ast.UAdd, ast.USub, ast.Invert)
+
+    _SCOPE_NODES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
+
+    @staticmethod
+    def _is_int_const(node: ast.AST) -> bool:
+        """An int literal.  `bool` is excluded: `isinstance(True, int)` is
+        true, and a set of bools is not a set of ints to the tag machinery."""
+        return (isinstance(node, ast.Constant)
+                and isinstance(node.value, int)
+                and not isinstance(node.value, bool))
+
+    def _scope_map(self) -> dict:
+        """{id(node): enclosing function node, or None at module level}.
+
+        Built once per module and cached against the tree's identity; the
+        callers below ask it per name lookup, and rebuilding it each time
+        showed up as compile time.
+
+        A `ClassDef` is deliberately not a scope here: a statement in a class
+        body is not a separate variable environment for the names this cares
+        about, and treating it as one would only lose facts.
+        """
+        tree = getattr(self, "_csa_root_tree", None)
+        if tree is None:
+            return {}
+        cached = getattr(self, "_scope_map_cache", None)
+        if cached is not None and cached[0] is tree:
+            return cached[1]
+
+        smap = {id(tree): None}
+
+        def _walk(node, scope):
+            for child in ast.iter_child_nodes(node):
+                if isinstance(child, self._SCOPE_NODES):
+                    smap[id(child)] = scope
+                    _walk(child, child)
+                else:
+                    smap[id(child)] = scope
+                    _walk(child, scope)
+
+        _walk(tree, None)
+        self._scope_map_cache = (tree, smap)
+        self._scoped_binding_cache = {}
+        return smap
+
+    def _scope_of(self, node: ast.AST):
+        """The function node enclosing `node`, or None for module level."""
+        return self._scope_map().get(id(node))
+
+    def _scoped_bindings_of(self, name: str, scope):
+        """Every expression bound to `name` within `scope`, or None.
+
+        None means "give up": the name is a parameter, is declared `global` or
+        `nonlocal`, or is bound by a form not modelled here.  `scope` is
+        matched by identity, so a binding inside a nested `def` is not a
+        binding of this variable -- the scoping that
+        BUG-UNCALLED-FN-PARAM-NAME-POISONS-A-CALLED-ONE was about.
+        """
+        self._scope_map()                       # ensure the caches exist
+        cache = getattr(self, "_scoped_binding_cache", None)
+        if cache is None:
+            cache = self._scoped_binding_cache = {}
+        ckey = (name, id(scope))
+        if ckey in cache:
+            return cache[ckey]
+
+        result = self._collect_scoped_bindings(name, scope)
+        cache[ckey] = result
+        return result
+
+    def _collect_scoped_bindings(self, name: str, scope):
+        tree = getattr(self, "_csa_root_tree", None)
+        if tree is None:
+            return None
+        root = scope if scope is not None else tree
+
+        if isinstance(scope, self._SCOPE_NODES):
+            a = scope.args
+            params = [x.arg for x in (list(getattr(a, "posonlyargs", []))
+                                      + list(a.args) + list(a.kwonlyargs))]
+            if a.vararg:
+                params.append(a.vararg.arg)
+            if a.kwarg:
+                params.append(a.kwarg.arg)
+            if name in params:
+                # A parameter's kind comes from call sites, not from this
+                # walk.  Answering from the walk is the uncalled-function bug.
+                return None
+
+        out = []
+        for n in ast.walk(root):
+            if self._scope_of(n) is not scope:
+                continue
+
+            if isinstance(n, (ast.Global, ast.Nonlocal)):
+                if name in n.names:
+                    return None
+                continue
+
+            if isinstance(n, ast.Assign):
+                for tgt in n.targets:
+                    if isinstance(tgt, ast.Name) and tgt.id == name:
+                        out.append(n.value)
+                    elif self._target_binds_name(tgt, name):
+                        return None         # tuple / starred unpack: unread
+                continue
+
+            if isinstance(n, ast.AnnAssign):
+                if isinstance(n.target, ast.Name) and n.target.id == name:
+                    if n.value is not None:
+                        out.append(n.value)  # a bare annotation binds nothing
+                continue
+
+            if isinstance(n, ast.AugAssign):
+                if isinstance(n.target, ast.Name) and n.target.id == name:
+                    # `i += 1` is `i = i + 1`; modelling it as exactly that
+                    # lets the self-referential case use one code path.
+                    out.append(ast.BinOp(
+                        left=ast.Name(id=name, ctx=ast.Load()),
+                        op=n.op, right=n.value))
+                continue
+
+            if isinstance(n, ast.NamedExpr):
+                if isinstance(n.target, ast.Name) and n.target.id == name:
+                    out.append(n.value)
+                continue
+
+            if isinstance(n, (ast.For, ast.AsyncFor)):
+                if isinstance(n.target, ast.Name) and n.target.id == name:
+                    _it = n.iter
+                    if (isinstance(_it, ast.Call)
+                            and isinstance(_it.func, ast.Name)
+                            and _it.func.id == "range"):
+                        out.append(ast.Constant(value=0))   # range yields ints
+                    elif (isinstance(_it, (ast.List, ast.Tuple)) and _it.elts
+                            and all(self._is_int_const(e) for e in _it.elts)):
+                        out.append(ast.Constant(value=0))
+                    else:
+                        return None
+                elif self._target_binds_name(n.target, name):
+                    return None
+                continue
+
+            if isinstance(n, ast.comprehension):
+                if self._target_binds_name(n.target, name):
+                    return None
+                continue
+
+            if isinstance(n, (ast.With, ast.AsyncWith)):
+                for item in n.items:
+                    if (item.optional_vars is not None
+                            and self._target_binds_name(
+                                item.optional_vars, name)):
+                        return None
+                continue
+
+            if isinstance(n, ast.ExceptHandler):
+                if n.name == name:
+                    return None
+                continue
+
+            if isinstance(n, (ast.Import, ast.ImportFrom)):
+                for al in n.names:
+                    if (al.asname or al.name.split(".")[0]) == name:
+                        return None
+                continue
+
+            if isinstance(n, ast.Delete):
+                for t in n.targets:
+                    if isinstance(t, ast.Name) and t.id == name:
+                        return None
+                continue
+
+            if (isinstance(n, (ast.ClassDef,) + self._SCOPE_NODES)
+                    and getattr(n, "name", None) == name):
+                return None
+
+        return out
+
+    @staticmethod
+    def _target_binds_name(target: ast.AST, name: str) -> bool:
+        """Whether an assignment target binds `name` anywhere inside it."""
+        for t in ast.walk(target):
+            if isinstance(t, ast.Name) and t.id == name:
+                return True
+        return False
+
+    @staticmethod
+    def _expr_mentions_name(expr: ast.AST, name: str) -> bool:
+        for n in ast.walk(expr):
+            if isinstance(n, ast.Name) and n.id == name:
+                return True
+        return False
+
+    def _expr_is_provably_int(self, expr: ast.expr, scope,
+                              _seen=frozenset()) -> bool:
+        """Whether `expr`, evaluated in `scope`, is certainly an int."""
+        if self._is_int_const(expr):
+            return True
+
+        if (isinstance(expr, ast.Call) and isinstance(expr.func, ast.Name)
+                and expr.func.id in self._INT_CALLS):
+            return True
+
+        if (isinstance(expr, ast.UnaryOp)
+                and isinstance(expr.op, self._INT_UNARYOPS)):
+            return self._expr_is_provably_int(expr.operand, scope, _seen)
+
+        if (isinstance(expr, ast.BinOp)
+                and isinstance(expr.op, self._INT_BINOPS)):
+            return (self._expr_is_provably_int(expr.left, scope, _seen)
+                    and self._expr_is_provably_int(expr.right, scope, _seen))
+
+        if isinstance(expr, ast.Name):
+            key = (expr.id, id(scope))
+            if key in _seen:
+                # Reached this name while already proving it: the `i` in
+                # `i = i + 1`.  Assume int here, and require below that some
+                # *other* binding proves it without the assumption -- so a
+                # name defined only in terms of itself stays unproven.
+                return True
+            binds = self._scoped_bindings_of(expr.id, scope)
+            if not binds:
+                return False        # None (unreadable) or [] (never bound)
+            inner = _seen | {key}
+            grounded = False
+            for b in binds:
+                if not self._expr_is_provably_int(b, scope, inner):
+                    return False
+                if not self._expr_mentions_name(b, expr.id):
+                    grounded = True
+            return grounded
+
+        return False
+
+    def _set_elem_tag(self, node: ast.expr) -> 'str | None':
+        """"int" if a set provably holds only ints, else None.
+
+        Only `.add()` grows a set with a value that can be read here.
+        Anything else that could introduce an element -- `update`, `|=`,
+        `symmetric_difference_update` -- makes the answer None, because the
+        element came from a container whose kind is not being proven.
+
+        The search is confined to the scope `node` lives in, for the same
+        reason the counter lookup is: two functions may each have a local `s`
+        and they are not the same variable.  Walking the whole module would
+        not be *unsound* -- every `.add()` found anywhere would still have to
+        prove int, so a foreign str set could only turn the answer into None
+        -- but it would discard facts for nothing, and it is the habit that
+        caused the bug this is recovering the speed from.
+        """
+        if isinstance(node, ast.Set):
+            if not node.elts:
+                return None
+            return ("int" if all(self._is_int_const(e) for e in node.elts)
+                    else None)
+
+        if not isinstance(node, ast.Name):
+            return None
+        tree = getattr(self, "_csa_root_tree", None)
+        if tree is None:
+            return None
+
+        scope = self._scope_of(node)
+        root = scope if scope is not None else tree
+
+        _saw_int_evidence = False
+        for n in ast.walk(root):
+            if self._scope_of(n) is not scope:
+                continue
+
+            if (isinstance(n, ast.Assign) and len(n.targets) == 1
+                    and isinstance(n.targets[0], ast.Name)
+                    and n.targets[0].id == node.id):
+                _v = n.value
+                if (isinstance(_v, ast.Call) and isinstance(_v.func, ast.Name)
+                        and _v.func.id == "set" and not _v.args):
+                    continue                  # `s = set()` says nothing
+                if isinstance(_v, ast.Set) and _v.elts:
+                    if all(self._is_int_const(e) for e in _v.elts):
+                        _saw_int_evidence = True
+                        continue
+                return None
+
+            if (isinstance(n, ast.Call)
+                    and isinstance(n.func, ast.Attribute)
+                    and isinstance(n.func.value, ast.Name)
+                    and n.func.value.id == node.id):
+                _meth = n.func.attr
+                if _meth == "add" and len(n.args) == 1:
+                    if self._expr_is_provably_int(n.args[0], scope):
+                        _saw_int_evidence = True
+                        continue
+                    return None
+                if _meth in ("discard", "remove", "clear", "pop", "copy",
+                             "issubset", "issuperset", "isdisjoint"):
+                    continue                  # cannot introduce an element
+                return None
+
+            if (isinstance(n, ast.AugAssign)
+                    and isinstance(n.target, ast.Name)
+                    and n.target.id == node.id):
+                return None                   # `s |= other`
+
+        return "int" if _saw_int_evidence else None
+
     def _dict_key_type_tag(self, node: ast.expr,
                            vtype: 'ValueType') -> str:
         """Static tag for the keys/elements produced by iterating `node`.
@@ -36905,10 +37234,16 @@ class CodeGen:
                 _only = self._sole_elem_tag(_lit.elts)
                 if _only is not None:
                     return _only
+            # A set grown by `.add()` proves its element kind when every value
+            # added is provably an int.  This is what recovers the 1.69x that
+            # dropping the "most sets are int sets" guess cost -- by proof
+            # this time, so `set()` + `.add(<str>)` still answers "mixed".
+            if self._set_elem_tag(node) == "int":
+                return "int"
             # A set whose ValueType carries a proven element type.  It has to
             # be asked through `_proven_tag`, not `_to_tag()`: an elem_type of
             # VKind.UNKNOWN converts to the *string* "int", which would sneak
-            # "most sets are int sets" back in through a second door.
+            # the same guess back in through a second door.
             _et = self._proven_tag(vtype.elem_type)
             return _et if _et is not None else "mixed"
 
