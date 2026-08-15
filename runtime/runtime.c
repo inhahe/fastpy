@@ -1582,6 +1582,19 @@ extern void fastpy_set_update(FpyDict*, FpyDict*);
 extern void fastpy_set_intersection_update(FpyDict*, FpyDict*);
 extern void fastpy_set_difference_update(FpyDict*, FpyDict*);
 extern void fastpy_set_symmetric_difference_update(FpyDict*, FpyDict*);
+/* The (tag, data) forms codegen calls for the set *methods* — any iterable. */
+extern void fastpy_set_update_fv(FpyDict*, int32_t, int64_t);
+extern void fastpy_set_intersection_update_fv(FpyDict*, int32_t, int64_t);
+extern void fastpy_set_difference_update_fv(FpyDict*, int32_t, int64_t);
+extern void fastpy_set_symmetric_difference_update_fv(FpyDict*, int32_t, int64_t);
+extern FpyDict* fastpy_set_union_fv(FpyDict*, int32_t, int64_t);
+extern FpyDict* fastpy_set_intersection_fv(FpyDict*, int32_t, int64_t);
+extern FpyDict* fastpy_set_difference_fv(FpyDict*, int32_t, int64_t);
+extern FpyDict* fastpy_set_symmetric_diff_fv(FpyDict*, int32_t, int64_t);
+extern int32_t fastpy_set_issubset_fv(FpyDict*, int32_t, int64_t);
+extern int32_t fastpy_set_issuperset_fv(FpyDict*, int32_t, int64_t);
+extern int32_t fastpy_set_isdisjoint_fv(FpyDict*, int32_t, int64_t);
+extern FpyDict* fastpy_set_from_iterable_fv(int32_t, int64_t);
 extern FpyList* fastpy_zip1(FpyList*);
 extern void fastpy_dict_popitem(FpyDict*, int32_t*, int64_t*, int32_t*, int64_t*);
 extern FpyDict* fastpy_dict_copy(FpyDict*);
@@ -1722,6 +1735,13 @@ static FpySymEntry fpy_jit_symbols[] = {
     SYM(fastpy_set_clear), SYM(fastpy_set_pop_fv),
     SYM(fastpy_set_update), SYM(fastpy_set_intersection_update),
     SYM(fastpy_set_difference_update), SYM(fastpy_set_symmetric_difference_update),
+    SYM(fastpy_set_update_fv), SYM(fastpy_set_intersection_update_fv),
+    SYM(fastpy_set_difference_update_fv),
+    SYM(fastpy_set_symmetric_difference_update_fv),
+    SYM(fastpy_set_union_fv), SYM(fastpy_set_intersection_fv),
+    SYM(fastpy_set_difference_fv), SYM(fastpy_set_symmetric_diff_fv),
+    SYM(fastpy_set_issubset_fv), SYM(fastpy_set_issuperset_fv),
+    SYM(fastpy_set_isdisjoint_fv), SYM(fastpy_set_from_iterable_fv),
     SYM(fastpy_zip1), SYM(fastpy_dict_popitem),
     SYM(fastpy_dict_copy), SYM(fastpy_str_index_sub), SYM(fastpy_str_rindex_sub),
     SYM(fastpy_str_replace_count),

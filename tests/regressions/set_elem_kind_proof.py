@@ -190,11 +190,12 @@ print(show(add_one("seven")))
 
 
 # ── `update` and `|=` bring in elements of an unproven kind ──
-# `update` is exercised with a *set* argument only: passing any other iterable
-# segfaults, which is BUG-SET-UPDATE-NON-SET-ITERABLE-SEGFAULTS and predates
-# this change.  What matters here is that a set touched by `update` at all
-# stops being provably int, so `via_update` must print its str element rather
-# than that element's address.
+# What matters here is that a set touched by `update` at all stops being
+# provably int, so `via_update` must print its str element rather than that
+# element's address.  The list and str arguments are the ones that used to
+# segfault before BUG-SET-UPDATE-NON-SET-ITERABLE-SEGFAULTS was fixed; they
+# are also the cases where "the elements came from somewhere the prover never
+# looked" is most obviously true.
 
 
 def via_update(other):
@@ -209,6 +210,9 @@ def via_update(other):
 
 print(via_update({"x", "y"}))
 print(via_update({2, 3}))
+print(via_update(["x", "y"]))
+print(via_update([2, 3]))
+print(via_update("xy"))
 
 
 # ── Same variable names in different functions are different variables ──

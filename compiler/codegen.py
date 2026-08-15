@@ -1634,11 +1634,26 @@ class CodeGen:
         self.runtime["set_clear"] = ir.Function(self.module, ft, name="fastpy_set_clear")
         ft = ir.FunctionType(void, [i8_ptr, i32.as_pointer(), i64.as_pointer()])
         self.runtime["set_pop_fv"] = ir.Function(self.module, ft, name="fastpy_set_pop_fv")
-        ft = ir.FunctionType(void, [i8_ptr, i8_ptr])
-        self.runtime["set_update"] = ir.Function(self.module, ft, name="fastpy_set_update")
-        self.runtime["set_intersection_update"] = ir.Function(self.module, ft, name="fastpy_set_intersection_update")
-        self.runtime["set_difference_update"] = ir.Function(self.module, ft, name="fastpy_set_difference_update")
-        self.runtime["set_symmetric_difference_update"] = ir.Function(self.module, ft, name="fastpy_set_symmetric_difference_update")
+        # The (tag, data) forms.  Every set method that takes an "other" takes
+        # any iterable in CPython, and the argument's kind is a runtime fact --
+        # it is a parameter as often as not -- so the tag has to survive to the
+        # runtime rather than being assumed to be SET.  Assuming it segfaulted
+        # on `s.update([1])`: BUG-SET-UPDATE-NON-SET-ITERABLE-SEGFAULTS.  The
+        # FpyDict* forms above stay, because the *operators* (`|`, `&`, `-`,
+        # `^`, `|=`) really do require a set on both sides.
+        ft = ir.FunctionType(void, [i8_ptr, i32, i64])
+        for _n in ("update", "intersection_update", "difference_update",
+                   "symmetric_difference_update"):
+            self.runtime["set_%s_fv" % _n] = ir.Function(
+                self.module, ft, name="fastpy_set_%s_fv" % _n)
+        ft = ir.FunctionType(i8_ptr, [i8_ptr, i32, i64])
+        for _n in ("union", "intersection", "difference", "symmetric_diff"):
+            self.runtime["set_%s_fv" % _n] = ir.Function(
+                self.module, ft, name="fastpy_set_%s_fv" % _n)
+        ft = ir.FunctionType(i32, [i8_ptr, i32, i64])
+        for _n in ("issubset", "issuperset", "isdisjoint"):
+            self.runtime["set_%s_fv" % _n] = ir.Function(
+                self.module, ft, name="fastpy_set_%s_fv" % _n)
         ft = ir.FunctionType(i8_ptr, [i8_ptr])  # str_split(s) -> list
         self.runtime["str_split"] = ir.Function(self.module, ft, name="fastpy_str_split")
         ft = ir.FunctionType(i64, [i8_ptr, i8_ptr])
@@ -1771,6 +1786,9 @@ class CodeGen:
         # Dict-backed set operations
         ft = ir.FunctionType(i8_ptr, [i8_ptr])  # set_from_list(list) -> set(dict)
         self.runtime["set_from_list"] = ir.Function(self.module, ft, name="fastpy_set_from_list")
+        ft = ir.FunctionType(i8_ptr, [i32, i64])  # set(x) over any iterable
+        self.runtime["set_from_iterable_fv"] = ir.Function(
+            self.module, ft, name="fastpy_set_from_iterable_fv")
         ft = ir.FunctionType(i8_ptr, [i8_ptr])  # set_to_list(set) -> list
         self.runtime["set_to_list"] = ir.Function(self.module, ft, name="fastpy_set_to_list")
         ft = ir.FunctionType(void, [i8_ptr, i32, i64])  # set_add_fv(set, tag, data)
@@ -40549,6 +40567,17 @@ class CodeGen:
 
         "set": "_emit_builtin_set",
 
+        # `frozenset` builds a set, because that is what the rest of the
+        # compiler already says it does: `_infer_type_tag` answers
+        # ValueType(VKind.SET) for a `frozenset(...)` call and `isinstance(x,
+        # frozenset)` tests for FPY_TAG_SET.  Only the emitter disagreed --
+        # it fell through to the CPython bridge and returned a PyObject*
+        # carrying a SET tag, so `sorted(frozenset([2, 1]))` handed that
+        # pointer to `fastpy_set_to_list` and died.  Agreeing with the type
+        # table is the fix; the cost is that a frozenset is not actually
+        # immutable here, which is DEBT-FROZENSET-IS-A-MUTABLE-SET.
+        "frozenset": "_emit_builtin_set",
+
         "setattr": "_emit_builtin_setattr",
 
         "sorted": "_emit_builtin_sorted",
@@ -42256,12 +42285,29 @@ class CodeGen:
                 obj = self._ensure_ptr(obj)
                 lst = self._rt_call("list_from_obj_iter", [obj])
                 return self._rt_call("set_from_list", [lst])
+            # Everything else goes through the runtime on its tag.  This used
+            # to hand the argument's bare pointer to `set_from_list`, which
+            # reads it as an FpyList -- so `set({"k": 1})`, `set(b"AB")` and
+            # `set({7, 8})` each read one container type through another's
+            # field offsets and died, the constructor half of
+            # BUG-SET-UPDATE-NON-SET-ITERABLE-SEGFAULTS.  Only the FpyValue
+            # case was routed by tag, which is why the bug was invisible
+            # wherever the compiler had *failed* to pin the kind down and
+            # visible wherever it had succeeded.
             arg = self._emit_expr_value(arg_node)
-            if isinstance(arg.type, ir.LiteralStructType) and arg.type == fpy_val:
-                tag = self.builder.extract_value(arg, 0)
-                data = self.builder.extract_value(arg, 1)
-                arg = self.builder.call(self.runtime["fv_to_list"], [tag, data])
-            return self._rt_call("set_from_list", [arg])
+            tag, data = self._to_tag_data_ir(arg, arg_node)
+            # `_to_tag_data_ir` answers STR for a pointer whose kind it could
+            # not infer -- a default, not a fact.  This call site's default has
+            # always been LIST, and `set(<a list>)` is what an un-inferred
+            # pointer overwhelmingly is, so keep it: the point of this change
+            # is to stop guessing where the kind is *known*, not to give the
+            # unknown case a new way to be wrong.
+            if (isinstance(tag, ir.Constant)
+                    and int(tag.constant) == FPY_TAG_STR
+                    and self._infer_type_tag(arg_node, arg).kind != VKind.STR):
+                tag = ir.Constant(i32, FPY_TAG_LIST)
+            return self.builder.call(
+                self.runtime["set_from_iterable_fv"], [tag, data])
         if len(node.args) == 0:
             return self.builder.call(self.runtime["dict_new"], [])
         raise CodeGenError("set() takes 0 or 1 arguments", node)
@@ -46813,54 +46859,48 @@ class CodeGen:
         self.builder.call(self.runtime["set_discard_fv"], [obj, tag, data])
         return obj
 
-    def _emit_set_method_union(self, node, obj):
+    # The eleven methods that take an "other" all take *any* iterable, not
+    # just a set — `s.update([1, 2])`, `s.issubset("ab")`, and so on are all
+    # legal Python.  They used to pass the argument as a bare pointer to a
+    # runtime signature declared `FpyDict *`, so a list arrived as an FpyList
+    # whose items/length/capacity were read as a dict's keys/values/length and
+    # the resulting garbage FpyValue was dereferenced: no output, 0xC0000005.
+    # BUG-SET-UPDATE-NON-SET-ITERABLE-SEGFAULTS.
+    #
+    # A static kind cannot fix that — half these arguments are parameters —
+    # so the tag rides along to the runtime, which coerces once in
+    # fpy_iterable_as_set and raises TypeError for a non-iterable instead of
+    # walking off the object.  Passing (tag, data) is the same conclusion
+    # `.add()` reached for its element, one argument position over.
+
+    def _emit_set_iterable_method(self, node, obj, rt_name):
+        """Call `rt_name`(set, tag, data) with the argument's runtime tag."""
         if len(node.args) != 1:
             return None
         other = self._emit_expr_value(node.args[0])
-        other = self._ensure_ptr(other)
-        return self._rt_call("set_union", [obj, other])
+        tag, data = self._to_tag_data_ir(other, node.args[0])
+        return self.builder.call(self.runtime[rt_name], [obj, tag, data])
+
+    def _emit_set_method_union(self, node, obj):
+        return self._emit_set_iterable_method(node, obj, "set_union_fv")
 
     def _emit_set_method_intersection(self, node, obj):
-        if len(node.args) != 1:
-            return None
-        other = self._emit_expr_value(node.args[0])
-        other = self._ensure_ptr(other)
-        return self._rt_call("set_intersection", [obj, other])
+        return self._emit_set_iterable_method(node, obj, "set_intersection_fv")
 
     def _emit_set_method_difference(self, node, obj):
-        if len(node.args) != 1:
-            return None
-        other = self._emit_expr_value(node.args[0])
-        other = self._ensure_ptr(other)
-        return self._rt_call("set_difference", [obj, other])
+        return self._emit_set_iterable_method(node, obj, "set_difference_fv")
 
     def _emit_set_method_symmdiff(self, node, obj):
-        if len(node.args) != 1:
-            return None
-        other = self._emit_expr_value(node.args[0])
-        other = self._ensure_ptr(other)
-        return self._rt_call("set_symmetric_diff", [obj, other])
+        return self._emit_set_iterable_method(node, obj, "set_symmetric_diff_fv")
 
     def _emit_set_method_issubset(self, node, obj):
-        if len(node.args) != 1:
-            return None
-        other = self._emit_expr_value(node.args[0])
-        other = self._ensure_ptr(other)
-        return self._rt_call("set_issubset", [obj, other])
+        return self._emit_set_iterable_method(node, obj, "set_issubset_fv")
 
     def _emit_set_method_issuperset(self, node, obj):
-        if len(node.args) != 1:
-            return None
-        other = self._emit_expr_value(node.args[0])
-        other = self._ensure_ptr(other)
-        return self._rt_call("set_issuperset", [obj, other])
+        return self._emit_set_iterable_method(node, obj, "set_issuperset_fv")
 
     def _emit_set_method_isdisjoint(self, node, obj):
-        if len(node.args) != 1:
-            return None
-        other = self._emit_expr_value(node.args[0])
-        other = self._ensure_ptr(other)
-        return self._rt_call("set_isdisjoint", [obj, other])
+        return self._emit_set_iterable_method(node, obj, "set_isdisjoint_fv")
 
     def _emit_set_method_copy(self, node, obj):
         if len(node.args) != 0:
@@ -46883,36 +46923,29 @@ class CodeGen:
         return self._fv_build_from_slots(
             self.builder.load(tag_slot), self.builder.load(data_slot))
 
+    # The mutators return the set itself rather than the call's void result.
+
     def _emit_set_method_update(self, node, obj):
-        if len(node.args) != 1:
+        if self._emit_set_iterable_method(node, obj, "set_update_fv") is None:
             return None
-        other = self._emit_expr_value(node.args[0])
-        other = self._ensure_ptr(other)
-        self._rt_call("set_update", [obj, other])
         return obj
 
     def _emit_set_method_intersection_update(self, node, obj):
-        if len(node.args) != 1:
+        if self._emit_set_iterable_method(
+                node, obj, "set_intersection_update_fv") is None:
             return None
-        other = self._emit_expr_value(node.args[0])
-        other = self._ensure_ptr(other)
-        self._rt_call("set_intersection_update", [obj, other])
         return obj
 
     def _emit_set_method_difference_update(self, node, obj):
-        if len(node.args) != 1:
+        if self._emit_set_iterable_method(
+                node, obj, "set_difference_update_fv") is None:
             return None
-        other = self._emit_expr_value(node.args[0])
-        other = self._ensure_ptr(other)
-        self._rt_call("set_difference_update", [obj, other])
         return obj
 
     def _emit_set_method_symmetric_difference_update(self, node, obj):
-        if len(node.args) != 1:
+        if self._emit_set_iterable_method(
+                node, obj, "set_symmetric_difference_update_fv") is None:
             return None
-        other = self._emit_expr_value(node.args[0])
-        other = self._ensure_ptr(other)
-        self._rt_call("set_symmetric_difference_update", [obj, other])
         return obj
 
     # ---- Dict method dispatch table (B3) ----

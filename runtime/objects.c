@@ -3339,6 +3339,185 @@ void fastpy_set_symmetric_difference_update(FpyDict *a, FpyDict *b) {
     }
 }
 
+/* --- Any iterable, as a set the set algorithms can consume ---
+ *
+ * Every set method above that takes an "other" is written against an FpyDict
+ * and reads `b->keys[i]`, but CPython accepts *any* iterable for all eleven of
+ * them.  Handing one an FpyList reinterprets that list's `items`/`length`/
+ * `capacity` as a dict's `keys`/`values`/`length`, so `b->keys[i]` comes back
+ * as an FpyValue assembled from a pointer and a capacity, and the runtime
+ * dereferences it.  That is BUG-SET-UPDATE-NON-SET-ITERABLE-SEGFAULTS: not a
+ * null pointer but a live object of one type read as another, the same shape
+ * as BUG-EMPTY-KWARGS-CALL-SEGFAULTS.
+ *
+ * The kind is a runtime fact, not a static one -- the argument is a parameter
+ * as often as not -- so the answer has to come from the tag, exactly as it
+ * does for BUG-FOR-DICT-KEY-KIND-GUESSED.  Giving each of the eleven its own
+ * tag switch would be eleven chances for them to disagree about what
+ * `s.update("ab")` means, so the coercion happens once, here, and the eleven
+ * algorithms stay untouched.
+ *
+ * A value that is already a set is returned as itself, so the overwhelmingly
+ * common case costs one comparison and no allocation.  Anything else is
+ * materialised into a temporary and `*owned` is set, meaning the caller must
+ * release it.  A non-iterable raises TypeError and returns NULL -- loud,
+ * rather than corrupting memory, which was the whole failure here.
+ *
+ * The elements themselves come from `fastpy_fv_to_list`, which already had to
+ * answer "what does iterating this value yield?" for `list()`/`tuple()`.
+ * Writing a second tag switch here would have been a second, quietly
+ * divergent answer -- and a worse one: it would have rejected the OBJ tag,
+ * losing every CPython-backed iterable that the bridge makes work.  The
+ * intermediate list costs one allocation on a path that is cold by
+ * construction, since the hot argument is a set and never reaches it.
+ */
+extern FpyList* fastpy_fv_to_list(int32_t tag, int64_t data);
+static const char *_fpy_tag_name(int32_t tag);   /* defined further down */
+
+/* Iterating one of these is a TypeError, so they must not reach
+ * fastpy_fv_to_list -- its `default` arm wraps a scalar into a one-element
+ * list, which is the right answer for its own callers and the wrong one here
+ * (`s.update(5)` would quietly add 5 rather than raising). */
+static int fpy_tag_is_iterable(int32_t tag) {
+    switch (tag) {
+    case FPY_TAG_STR: case FPY_TAG_LIST: case FPY_TAG_OBJ:
+    case FPY_TAG_DICT: case FPY_TAG_BYTES: case FPY_TAG_SET:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+static FpyDict *fpy_iterable_as_set(int32_t tag, int64_t data, int *owned) {
+    *owned = 0;
+    if (data != 0 && tag == FPY_TAG_SET)
+        return (FpyDict*)(intptr_t)data;
+    if (data == 0 || !fpy_tag_is_iterable(tag)) {
+        char buf[128];
+        snprintf(buf, sizeof(buf), "'%.40s' object is not iterable",
+                 data == 0 ? "NoneType" : _fpy_tag_name(tag));
+        fastpy_raise(FPY_EXC_TYPEERROR, buf);
+        return NULL;
+    }
+    *owned = 1;
+    /* A list is already the element sequence, so take it directly.  Going
+     * through fastpy_fv_to_list would be correct but would copy it first
+     * (`list()` owes its caller a new list; this does not), doubling the
+     * allocation for `set(xs)` and `s.update(xs)` on the commonest argument
+     * there is.  Tuples are FpyLists too, so this covers them. */
+    if (tag == FPY_TAG_LIST)
+        return fastpy_set_from_list((FpyList*)(intptr_t)data);
+    FpyList *elems = fastpy_fv_to_list(tag, data);
+    if (!elems) { *owned = 0; return NULL; }
+    FpyDict *out = fastpy_set_from_list(elems);
+    fpy_rc_decref(FPY_TAG_LIST, (int64_t)(intptr_t)elems);
+    return out;
+}
+
+static void fpy_release_iterable_set(FpyDict *b, int owned) {
+    if (owned) fpy_rc_decref(FPY_TAG_SET, (int64_t)(intptr_t)b);
+}
+
+/* `set(x)` / `frozenset(x)`: the same coercion, but the result is the
+ * program's own set, so it is always fresh -- `set(s)` must not alias `s`. */
+FpyDict* fastpy_set_from_iterable_fv(int32_t tag, int64_t data) {
+    int owned; FpyDict *b = fpy_iterable_as_set(tag, data, &owned);
+    if (!b) return fpy_dict_new(4);
+    return owned ? b : fastpy_set_copy(b);
+}
+
+/* The eleven entry points codegen actually calls.  They take the argument as
+ * (tag, data) so the kind survives to run time, coerce once, and delegate.
+ *
+ * fastpy_raise only sets a pending-exception flag, so an error path still has
+ * to return something the caller can hold until it checks: an empty set for
+ * the set-returning ones (never NULL, which the next call would dereference)
+ * and 0 for the predicates. */
+void fastpy_set_update_fv(FpyDict *a, int32_t tag, int64_t data) {
+    int owned; FpyDict *b = fpy_iterable_as_set(tag, data, &owned);
+    if (!b) return;
+    fastpy_set_update(a, b);
+    fpy_release_iterable_set(b, owned);
+}
+
+void fastpy_set_intersection_update_fv(FpyDict *a, int32_t tag, int64_t data) {
+    int owned; FpyDict *b = fpy_iterable_as_set(tag, data, &owned);
+    if (!b) return;
+    fastpy_set_intersection_update(a, b);
+    fpy_release_iterable_set(b, owned);
+}
+
+void fastpy_set_difference_update_fv(FpyDict *a, int32_t tag, int64_t data) {
+    int owned; FpyDict *b = fpy_iterable_as_set(tag, data, &owned);
+    if (!b) return;
+    fastpy_set_difference_update(a, b);
+    fpy_release_iterable_set(b, owned);
+}
+
+void fastpy_set_symmetric_difference_update_fv(FpyDict *a, int32_t tag,
+                                               int64_t data) {
+    int owned; FpyDict *b = fpy_iterable_as_set(tag, data, &owned);
+    if (!b) return;
+    fastpy_set_symmetric_difference_update(a, b);
+    fpy_release_iterable_set(b, owned);
+}
+
+FpyDict* fastpy_set_union_fv(FpyDict *a, int32_t tag, int64_t data) {
+    int owned; FpyDict *b = fpy_iterable_as_set(tag, data, &owned);
+    if (!b) return fpy_dict_new(4);
+    FpyDict *r = fastpy_set_union(a, b);
+    fpy_release_iterable_set(b, owned);
+    return r;
+}
+
+FpyDict* fastpy_set_intersection_fv(FpyDict *a, int32_t tag, int64_t data) {
+    int owned; FpyDict *b = fpy_iterable_as_set(tag, data, &owned);
+    if (!b) return fpy_dict_new(4);
+    FpyDict *r = fastpy_set_intersection(a, b);
+    fpy_release_iterable_set(b, owned);
+    return r;
+}
+
+FpyDict* fastpy_set_difference_fv(FpyDict *a, int32_t tag, int64_t data) {
+    int owned; FpyDict *b = fpy_iterable_as_set(tag, data, &owned);
+    if (!b) return fpy_dict_new(4);
+    FpyDict *r = fastpy_set_difference(a, b);
+    fpy_release_iterable_set(b, owned);
+    return r;
+}
+
+FpyDict* fastpy_set_symmetric_diff_fv(FpyDict *a, int32_t tag, int64_t data) {
+    int owned; FpyDict *b = fpy_iterable_as_set(tag, data, &owned);
+    if (!b) return fpy_dict_new(4);
+    FpyDict *r = fastpy_set_symmetric_diff(a, b);
+    fpy_release_iterable_set(b, owned);
+    return r;
+}
+
+int32_t fastpy_set_issubset_fv(FpyDict *a, int32_t tag, int64_t data) {
+    int owned; FpyDict *b = fpy_iterable_as_set(tag, data, &owned);
+    if (!b) return 0;
+    int32_t r = fastpy_set_issubset(a, b);
+    fpy_release_iterable_set(b, owned);
+    return r;
+}
+
+int32_t fastpy_set_issuperset_fv(FpyDict *a, int32_t tag, int64_t data) {
+    int owned; FpyDict *b = fpy_iterable_as_set(tag, data, &owned);
+    if (!b) return 0;
+    int32_t r = fastpy_set_issuperset(a, b);
+    fpy_release_iterable_set(b, owned);
+    return r;
+}
+
+int32_t fastpy_set_isdisjoint_fv(FpyDict *a, int32_t tag, int64_t data) {
+    int owned; FpyDict *b = fpy_iterable_as_set(tag, data, &owned);
+    if (!b) return 0;
+    int32_t r = fastpy_set_isdisjoint(a, b);
+    fpy_release_iterable_set(b, owned);
+    return r;
+}
+
 /* Print a set in {a, b, c} format. */
 void fastpy_set_print(FpyDict *set) {
     printf("{");

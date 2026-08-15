@@ -535,6 +535,27 @@ void fastpy_set_intersection_update(FpyDict *a, FpyDict *b);
 void fastpy_set_difference_update(FpyDict *a, FpyDict *b);
 void fastpy_set_symmetric_difference_update(FpyDict *a, FpyDict *b);
 
+/* The set methods that take an "other", as codegen calls them: the argument
+ * arrives as (tag, data) because CPython accepts any iterable for all eleven
+ * and the argument's kind is a runtime fact, not a static one.  The FpyDict*
+ * forms stay for the *operators* (`|`, `&`, `-`, `^`, `|=`), which really do
+ * require a set on both sides.  Handing a non-set to one of those forms is
+ * BUG-SET-UPDATE-NON-SET-ITERABLE-SEGFAULTS — see fpy_iterable_as_set. */
+void fastpy_set_update_fv(FpyDict *a, int32_t tag, int64_t data);
+void fastpy_set_intersection_update_fv(FpyDict *a, int32_t tag, int64_t data);
+void fastpy_set_difference_update_fv(FpyDict *a, int32_t tag, int64_t data);
+void fastpy_set_symmetric_difference_update_fv(FpyDict *a, int32_t tag,
+                                               int64_t data);
+FpyDict* fastpy_set_union_fv(FpyDict *a, int32_t tag, int64_t data);
+FpyDict* fastpy_set_intersection_fv(FpyDict *a, int32_t tag, int64_t data);
+FpyDict* fastpy_set_difference_fv(FpyDict *a, int32_t tag, int64_t data);
+FpyDict* fastpy_set_symmetric_diff_fv(FpyDict *a, int32_t tag, int64_t data);
+int32_t fastpy_set_issubset_fv(FpyDict *a, int32_t tag, int64_t data);
+int32_t fastpy_set_issuperset_fv(FpyDict *a, int32_t tag, int64_t data);
+int32_t fastpy_set_isdisjoint_fv(FpyDict *a, int32_t tag, int64_t data);
+/* `set(x)` / `frozenset(x)` over any iterable — always a fresh set. */
+FpyDict* fastpy_set_from_iterable_fv(int32_t tag, int64_t data);
+
 /* zip with 1 iterable */
 FpyList* fastpy_zip1(FpyList *a);
 

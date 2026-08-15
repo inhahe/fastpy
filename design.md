@@ -1656,6 +1656,26 @@ body through a bare-i64 signature must therefore go through
 `_emit_set_arg_tags`, even where the tag looks statically obvious — "obvious"
 describes what the caller passes, not what the callee reads if we say nothing.
 
+**A runtime signature that names a concrete container type is a claim the call
+site has to prove.** `FpyValue` is tagged, so any argument whose Python type is
+not fixed by the language can be passed as `(int32_t tag, int64_t data)` and
+dispatched on at run time. Declaring it `FpyList *` or `FpyDict *` instead
+moves that dispatch to compile time, where the compiler frequently has nothing
+to dispatch *on* — and the failure mode is not a type error, it is a live
+object of one type read through another's field offsets. `s.update([1, 2])`
+handed an `FpyList` to `void fastpy_set_update(FpyDict *a, FpyDict *b)`, whose
+first act is `b->keys[i]`, which lands on the list's `items`/`length` and
+returns an `FpyValue` assembled out of a pointer and a capacity
+(BUG-SET-UPDATE-NON-SET-ITERABLE-SEGFAULTS; BUG-EMPTY-KWARGS-CALL-SEGFAULTS is
+the same shape one layer up). So: when Python accepts several types in an
+argument position, the runtime entry point takes a tag, and the coercion lives
+in **one** function rather than being repeated per call site — the eleven set
+methods that take an "other" share `fpy_iterable_as_set`, which returns an
+already-set argument unchanged and materialises everything else into a
+temporary, so the common case costs one comparison. The `FpyDict *` forms
+survive for the *operators* (`|`, `&`, `-`, `^`, `<=`), which really do require
+a set on both sides.
+
 **Prefer resolving the callee statically over the runtime's name-based
 dispatcher.** `fastpy_obj_call_methodN` looks a method up by name at runtime,
 which costs three things beyond the lookup: it exists only in 0-, 1- and

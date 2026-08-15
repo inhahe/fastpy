@@ -230,6 +230,44 @@ int main() {
 }
 """)
 
+# Building a set *from* something is a third path again, and one that had no
+# coverage until BUG-SET-UPDATE-NON-SET-ITERABLE-SEGFAULTS moved it onto a
+# runtime tag dispatch.  It is the shape where a coercion that copies its
+# argument first would cost real time and no test would notice, since a copy is
+# only slower, never wrong.  `set(xs)` and `s.update(xs)` share that coercion,
+# so measuring one measures both.
+
+bench("set from list 100K x 20", "common", """
+xs = []
+i = 0
+while i < 100000:
+    xs.append(i)
+    i = i + 1
+total = 0
+r = 0
+while r < 20:
+    s = set(xs)
+    total = total + len(s)
+    r = r + 1
+print(total)
+""", """
+#include <stdio.h>
+#include <stdint.h>
+#include <vector>
+#include <unordered_set>
+int main() {
+    std::vector<int64_t> xs;
+    for (int64_t i = 0; i < 100000; i++) xs.push_back(i);
+    int64_t total = 0;
+    for (int r = 0; r < 20; r++) {
+        std::unordered_set<int64_t> s(xs.begin(), xs.end());
+        total += (int64_t)s.size();
+    }
+    printf("%lld\\n", (long long)total);
+    return 0;
+}
+""")
+
 bench("str-key dict iterate 20K x 20", "common", """
 d = {}
 i = 0

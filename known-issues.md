@@ -66,7 +66,7 @@ and on the full `pytest tests` (1055 collected). The two misleading docstrings
 now state the consequence rather than only the mechanism. The canonical
 command remains `python -m pytest tests`.
 
-### BUG-SET-UPDATE-NON-SET-ITERABLE-SEGFAULTS. `s.update(<anything but a set>)` reads a list as a dict and dies — 2026-08-15
+### BUG-SET-UPDATE-NON-SET-ITERABLE-SEGFAULTS. `s.update(<anything but a set>)` reads a list as a dict and dies — 2026-08-15 — **FIXED 2026-08-15**
 
 **Reproduce:**
 
@@ -117,6 +117,86 @@ does.
 `fastpy_set_difference_update` and `fastpy_set_symmetric_difference_update`
 all take `FpyDict *b` with the same assumption, and CPython accepts any
 iterable for all three.
+
+**FIXED — and the siblings were not three, they were ten.** Every set method
+that takes an "other" had the same signature and the same assumption:
+`union`, `intersection`, `difference`, `symmetric_difference`, `issubset`,
+`issuperset`, `isdisjoint`, and the four in-place updates. All eleven
+segfaulted on a list.
+
+The fix put the coercion in **one** place rather than eleven, because eleven
+tag switches are eleven chances to disagree about what `s.update("ab")`
+means. `fpy_iterable_as_set(tag, data, &owned)` (objects.c, just above
+`fastpy_set_print`) returns a set: itself when the value already is one — so
+the common case costs one comparison and no allocation — and otherwise a
+temporary built from a dict's keys, a list's or tuple's items, a str's
+characters, or a bytes' ints. Anything else raises TypeError and returns
+NULL, which is the behaviour the old code had no way to express. Eleven
+three-line `_fv` entry points coerce, delegate to the *unchanged* algorithm,
+and release. `fastpy_raise` only sets a flag, so the error paths return an
+empty set rather than NULL: the caller has to be able to hold the value until
+it checks.
+
+Codegen's eleven emitters collapsed into one `_emit_set_iterable_method`,
+which passes `_to_tag_data_ir` on the argument — the same conclusion
+`.add()` had already reached for its element, one argument position over.
+
+The `FpyDict *` forms stay, and are still the right signature for the
+*operators* (`|`, `&`, `-`, `^`, `|=`, `<=`), which genuinely do require a
+set on both sides in Python. The four in-place ones are now called only from
+inside `objects.c`, so their codegen declarations were removed.
+
+**The constructor was the twelfth.** `set(x)` routed the FpyValue case by tag
+and everything else by handing the bare pointer to `fastpy_set_from_list`, so
+`set({"k": 1})`, `set(b"AB")` and `set({7, 8})` all died while `set("abc")`,
+`set((1, 2))` and `set([3, 1])` worked. Note which half worked: the bug
+appeared exactly where the compiler had *succeeded* in pinning the kind down,
+because succeeding is what let it emit a bare pointer instead of a tagged
+value. `_emit_builtin_set` now takes `_to_tag_data_ir` and calls
+`fastpy_set_from_iterable_fv`, which shares `fpy_iterable_as_set` and copies
+when the argument already is a set, since `set(s)` must not alias `s`.
+
+One deliberate exception to "route by tag": `_to_tag_data_ir` answers STR for
+a pointer whose kind it could not infer, and this call site's default has
+always been LIST. The default is kept, because the change is meant to stop
+guessing where the kind is *known* — giving the unknown case a new way to be
+wrong would be a different bug wearing this one's fix.
+
+`tests/regressions/set_iterable_args.py` covers all eleven methods and the
+constructor against list, tuple, set, str, bytes and dict arguments, plus the
+TypeError paths and a check that the non-mutating four leave both operands
+alone — an aliasing coercion would show up nowhere else.
+
+### BUG-FROZENSET-CALL-RETURNS-A-PYOBJECT-TAGGED-SET. `sorted(frozenset([2, 1]))` segfaults — 2026-08-15 — **FIXED 2026-08-15**
+
+Found while testing the constructor half of the entry above; it predates that
+work (reproduced on `6268414`).
+
+`frozenset` was absent from `_BUILTIN_DISPATCH`, so a `frozenset(...)` call
+fell through to `_route_unknown_builtin` and came back as a `PyObject *` from
+the CPython bridge. Every *other* part of the compiler already called that
+value a set: `_infer_type_tag` returns `ValueType(VKind.SET)` for the call
+(codegen.py ~21927) and `isinstance(x, frozenset)` compiles to a test against
+`FPY_TAG_SET` (~46001). So the PyObject pointer wore a SET tag, `sorted()`
+handed it to `fastpy_set_to_list`, and that read a PyObject header as an
+`FpyDict`. One type read as another again — this time because two parts of the
+*compiler* disagreed, not because the runtime signature was too narrow.
+
+**FIXED** by dispatching `frozenset` to `_emit_builtin_set`, i.e. by making
+the emitter agree with the type table rather than the other way round.
+
+### DEBT-FROZENSET-IS-A-MUTABLE-SET. `frozenset(...)` produces an ordinary mutable set — 2026-08-15
+
+The consequence of the fix above. `frozenset` and `set` are now the same
+constructor, so a frozenset can be mutated, is not hashable, and cannot be a
+dict key or a member of another set — `type(fz).__name__` says `"set"` too.
+
+This is strictly better than the segfault it replaced and matches what the
+type table already claimed, but it is not Python. The real fix needs an
+immutability bit on `FpyDict` (there is spare space in the struct, and
+`FpyList.is_tuple` is the exact precedent), checked by the mutating set
+entry points, plus `fpy_hash_value` learning to hash a frozen set by its
+elements. Worth doing when something actually needs a set of sets.
 
 ### PERF-INT-KEYED-DICT-UNPROVABLE-IN-A-WHILE-LOOP. `_is_int_keyed_dict` only recognises a loop-variable key in a `for` loop, so the commonest int-dict idiom of all is not provable — 2026-08-15
 
