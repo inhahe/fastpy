@@ -44,6 +44,72 @@ than documenting the trap — either have `test_comprehensive.py` /
 put the directories in `testpaths` in the pytest config so a bare `pytest`
 covers everything. Until then the canonical command is `python -m pytest tests/`.
 
+### PERF-EXC-CHECK-IN-HOT-LOOP. The post-call pending-exception check costs 2.5x on subscript-heavy loops — 2026-08-15
+
+**Reproduce** (`benchmarks/run_comparison.py`, `dict lookup 1K keys x 1K`):
+
+```python
+d = {}
+i = 0
+while i < 1000:
+    d[i] = i * i
+    i = i + 1
+total = 0
+j = 0
+while j < 1000:
+    i = 0
+    while i < 1000:
+        total = total + d[i]      # 1M iterations
+        i = i + 1
+    j = j + 1
+print(total)
+```
+
+Measured with `benchmarks/ab_bench.py` (paired, interleaved, spawn-floor
+subtracted), `096babe` vs `ab4e4a5`: **2.51x slower** idle, **2.44x** under
+an 80%-loaded machine — the two agree to 3%, so it is a real effect and not
+measurement noise.
+
+The generated IR for the inner loop gained a check after every lookup:
+
+```llvm
+%".111" = call i64 @"fastpy_dict_get_int_val"(i8* %".109", i64 %".110")
+%".112" = call i32 @"fastpy_exc_pending"()
+%".113" = icmp ne i32 %".112", 0
+br i1 %".113", label %"module.bail_exc.28", label %"module.bail_cont.29"
+```
+
+**This check is correct and must not simply be removed.** `d[i]` can raise
+`KeyError`, and before this the pending exception was ignored and execution
+continued on a bogus value. It is the fix, not the bug.
+
+The cost is in *how* it is checked, not *that* it is:
+
+1. `fastpy_exc_pending` is an opaque cross-module call, so LLVM must assume
+   it clobbers memory. `total`, `i` and `d` are reloaded from their allocas
+   every iteration instead of staying in registers — visible in the IR as
+   `load {i32, i64}` on all three per trip.
+2. It splits the loop body into `bail_exc` / `bail_cont` blocks, which costs
+   further optimisation on top.
+
+**Proper fix**, cheapest first:
+
+- Give the declaration `readonly nounwind willreturn` attributes. The
+  function is literally `return fpy_exc_type != FPY_EXC_NONE`. It cannot be
+  hoisted out of the loop — the preceding `dict_get` may set the flag — but
+  `readonly` stops it invalidating the *other* loads, which is likely the
+  bulk of the 2.5x.
+- Then consider emitting the test inline as a load of the flag rather than a
+  call. Note `fpy_exc_type` is `FPY_THREAD_LOCAL` (`runtime/runtime.c:669`),
+  so this needs `external thread_local global` and a TLS model that works on
+  Windows — not a drop-in change, which is why it is second.
+- Only then consider eliding the check where the callee provably cannot
+  raise. `dict_get` is not such a case.
+
+Other benchmarks are unaffected (fib, object creation, linked list, tree sum
+all within 3% across the same A/B), so this is specific to hot loops whose
+body contains a call that may raise.
+
 ### BUG-STARRED-UNPACK-LOSES-KIND. Every non-starred name in a `a, *b = ...` unpack is typed int, so a str comes back as a pointer and a float as its bit pattern — 2026-08-14
 
 **Reproduce:**

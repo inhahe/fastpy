@@ -26,3 +26,8 @@ benchmarks/_probe_status.json
 benchmarks/_probe_report.md
 benchmarks/_probe_stdout.log
 benchmarks/_probe_pid.txt
+
+# stable_bench.py / ab_bench.py results and the exes they build to compare
+benchmarks/_stable_*.json
+benchmarks/_ab_*.json
+benchmarks/_ab_exes/
