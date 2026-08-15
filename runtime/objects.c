@@ -653,8 +653,13 @@ void fpy_value_repr(FpyValue val, char *buf, int bufsize) {
  * than special-casing themselves.
  *
  * A stack buffer suffices because fastpy_raise copies the message into
- * header-backed storage before returning. */
-static void fpy_raise_key_error(FpyValue key) {
+ * header-backed storage before returning.
+ *
+ * FPY_NOINLINE because that buffer must stay out of the callers' frames: the
+ * dict lookups that call this are hot, and inlining put 256 bytes on their
+ * stack, which is what made MSVC give them /GS cookie code on the path where
+ * the key *is* found.  See the macro's comment in objects.h. */
+FPY_NOINLINE static void fpy_raise_key_error(FpyValue key) {
     char buf[256];
     fpy_value_repr(key, buf, sizeof(buf));
     fastpy_raise(FPY_EXC_KEYERROR, buf);
@@ -2548,14 +2553,27 @@ static int fpy_key_equal(FpyValue a, FpyValue b) {
  * naming the same slot, so `{2.0: 'two'}[2]` raised a KeyError while
  * `{2: 'two'}[2.0]` — which goes through the general path — worked.  They all
  * defer here now, so there is one rule for what makes two keys the same.
- * BUG-FLOAT-KEY-DICT-LITERAL-SEGFAULTS. */
-static int fpy_key_equal_int(FpyValue stored, int64_t key) {
-    if (stored.tag == FPY_TAG_INT) return stored.data.i == key;
+ * BUG-FLOAT-KEY-DICT-LITERAL-SEGFAULTS.
+ *
+ * Split in two, and taking the stored key by pointer, because the shape
+ * matters at this call frequency.  As one by-value function the probe loop
+ * had to materialise the whole 16-byte FpyValue — MSVC loaded it with
+ * `movups` into an XMM register and dug the tag and payload back out with
+ * `movd`/`psrldq`/`movq`, then produced the answer through `sete` instead of
+ * branching on the compare.  By pointer, the int/int case is the two scalar
+ * loads and two compares it always was, and the numeric-tower cases cost the
+ * hit path nothing because they live in their own frame. */
+FPY_NOINLINE static int fpy_key_equal_int_slow(FpyValue stored, int64_t key) {
     if (!fpy_key_tag_is_numeric(stored.tag)) return 0;
     FpyValue k;
     k.tag = FPY_TAG_INT;
     k.data.i = key;
     return fpy_key_numeric_equal(stored, k);
+}
+
+static int fpy_key_equal_int(const FpyValue *stored, int64_t key) {
+    if (stored->tag == FPY_TAG_INT) return stored->data.i == key;
+    return fpy_key_equal_int_slow(*stored, key);
 }
 
 static void fpy_dict_init_indices(FpyDict *dict) {
@@ -2812,7 +2830,7 @@ void fastpy_dict_set_int_int(FpyDict *dict, int64_t key, int64_t value) {
         if (idx == FPY_DICT_EMPTY) break;
         if (idx == FPY_DICT_DELETED) {
             if (first_deleted < 0) first_deleted = slot;
-        } else if (fpy_key_equal_int(dict->keys[idx], key)) {
+        } else if (fpy_key_equal_int(&dict->keys[idx], key)) {
             dict->values[idx] = v;
             return;
         }
@@ -2851,7 +2869,7 @@ void fastpy_dict_set_int_fv(FpyDict *dict, int64_t key,
         if (idx == FPY_DICT_EMPTY) break;
         if (idx == FPY_DICT_DELETED) {
             if (first_deleted < 0) first_deleted = slot;
-        } else if (fpy_key_equal_int(dict->keys[idx], key)) {
+        } else if (fpy_key_equal_int(&dict->keys[idx], key)) {
             FPY_VAL_DECREF(dict->values[idx]);
             dict->values[idx] = v;
             return;
@@ -2884,7 +2902,7 @@ void fastpy_dict_get_int_fv(FpyDict *dict, int64_t key,
         int64_t idx = dict->indices[slot];
         if (idx == FPY_DICT_EMPTY) break;
         if (idx != FPY_DICT_DELETED
-                && fpy_key_equal_int(dict->keys[idx], key)) {
+                && fpy_key_equal_int(&dict->keys[idx], key)) {
             *out_tag = dict->values[idx].tag;
             *out_data = dict->values[idx].data.i;
             return;
@@ -2906,7 +2924,7 @@ int64_t fastpy_dict_get_int_val(FpyDict *dict, int64_t key) {
         int64_t idx = dict->indices[slot];
         if (idx == FPY_DICT_EMPTY) break;
         if (idx != FPY_DICT_DELETED
-                && fpy_key_equal_int(dict->keys[idx], key)) {
+                && fpy_key_equal_int(&dict->keys[idx], key)) {
             return dict->values[idx].data.i;
         }
         slot = (slot + 1) & mask;
@@ -3003,7 +3021,7 @@ int32_t fastpy_dict_has_int_key(FpyDict *dict, int64_t key) {
         int64_t idx = dict->indices[slot];
         if (idx == FPY_DICT_EMPTY) return 0;
         if (idx != FPY_DICT_DELETED
-                && fpy_key_equal_int(dict->keys[idx], key))
+                && fpy_key_equal_int(&dict->keys[idx], key))
             return 1;
         slot = (slot + 1) & mask;
     }
@@ -3992,7 +4010,7 @@ void fastpy_dict_delete_int(FpyDict *dict, int64_t key) {
         int64_t idx = dict->indices[slot];
         if (idx == FPY_DICT_EMPTY) break;
         if (idx != FPY_DICT_DELETED
-            && fpy_key_equal_int(dict->keys[idx], key)) {
+            && fpy_key_equal_int(&dict->keys[idx], key)) {
             FPY_VAL_DECREF(dict->keys[idx]);
             FPY_VAL_DECREF(dict->values[idx]);
             dict->indices[slot] = FPY_DICT_DELETED;

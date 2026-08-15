@@ -27,6 +27,21 @@
 #define fpy_strdup strdup
 #endif
 
+/* Keep a cold helper out of its caller's frame.
+ *
+ * This is a performance guard, not a style preference.  A small hot function
+ * that inlines an error path pays for that path on every *successful* call:
+ * the error path's locals join the caller's frame, and a large buffer among
+ * them makes MSVC add /GS stack-cookie code, so the fast path acquires a
+ * frame setup and a `call __security_check_cookie` on the way out.  That is
+ * how a KeyError message costing nothing on a hit still cost ~40% of a dict
+ * lookup.  Mark raise-and-return helpers with this. */
+#ifdef _MSC_VER
+#define FPY_NOINLINE __declspec(noinline)
+#else
+#define FPY_NOINLINE __attribute__((noinline))
+#endif
+
 /* Type tags */
 #define FPY_TAG_INT    0
 #define FPY_TAG_FLOAT  1
