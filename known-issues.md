@@ -113,6 +113,63 @@ creates an unused Python attribute and emits a plain `external global`, which
 would read the wrong thread's flag. It would need a `descr()` override, and
 per the measurement above it would not be worth it.
 
+### PERF-EXC-CHECK-AFTER-NONRAISING-OPS. Every statement gets a pending-exception check, including ones whose only instructions are `sub` and `mul` — 2026-08-15
+
+The sibling of PERF-EXC-CHECK-IN-HOT-LOOP, and the larger of the two.
+`_emit_try_bail_if_exc` (`compiler/codegen.py:38848`) is called from 31 sites
+and always emits the check. On `dist_sq method 1M` that is 15 checks, and they
+are **the entire regression against `096babe` — and then some**:
+
+| build (1M calls) | min | net of 12.4ms floor |
+|---|---|---|
+| `096babe` | 14.5ms | 2.12ms |
+| HEAD | 16.1ms | 3.74ms |
+| HEAD, checks replaced by constant 0 | 13.8ms | **1.44ms** |
+
+So removing them leaves it *faster than it ever was*. This benchmark has been
+slower in all four A/B runs (1.12x, 1.40x, 1.43x, 1.68x), which is why it is
+worth doing rather than dismissing as noise.
+
+Most of these checks guard nothing. `dx = self.x - other.x` compiles to two
+`!invariant.load`s and a `sub`, then:
+
+```llvm
+%".48" = sub i64 %".32", %".47"
+%".49" = call i32 @"fastpy_exc_pending"()
+%".50" = icmp ne i32 %".49", 0
+br i1 %".50", label %"fn.exc_exit", label %"fn.bail_cont.15"
+```
+
+**Why the obvious fix is wrong.** "Skip the check when the current basic block
+contains no call" is unsound, and this function is exactly the counterexample:
+the block is `other.ok.14`, whose predecessors are the pure path *and*
+`other.undef.13`, which calls `fastpy_raise` and falls through
+(`_check_fv_undef`, `codegen.py:25119` — deliberately, so a caller's handler
+can see an unbound local: BUG-UNBOUND-NATIVE-LOCAL-READS-STACK). A pending
+exception really can be live on entry with no call in the block. Any rule
+based on emission order has the same hazard, because a block can gain a
+predecessor (a loop back-edge, an except handler) after codegen has moved past
+it. Getting this wrong silently swallows exceptions.
+
+**Three routes, in increasing order of how much they fix:**
+
+1. Have the undef guard branch to `_fn_exc_exit_block()` instead of falling
+   through to `ok_block`. Strictly better shape and removes this particular
+   hazard, but on its own removes no checks, so it buys nothing measurable.
+2. A redundant-check elimination pass over the *finished* module, where the
+   CFG is complete and the dataflow question ("is a raising call reachable
+   from the last check on every path to here?") can actually be answered.
+   Safer than deciding at emission time for the reason above.
+3. Compile the runtime to LLVM IR and link at IR level (LTO). Then
+   `fastpy_exc_pending` inlines to a load of `fpy_exc_type`, GVN removes the
+   redundant reloads, and LLVM sees for itself that a `sub` cannot raise. This
+   fixes the whole class rather than this instance, and would also subsume
+   PERF-EXC-CHECK-IN-HOT-LOOP. Build-system work, not codegen work.
+
+**Reproduce:** `benchmarks/_dist_src.py`, and the neutering trick from
+`benchmarks/_tls_experiment.py` (substitute `add i32 0, 0` for the call in the
+emitted IR, then `compile_and_link`).
+
 ### PERF-DICT-KEY-HOT-PATH-MSVC. FIXED 2026-08-15 — cold error paths inlined into hot dict lookups
 
 Recorded because the failure mode generalises and is invisible in C review.

@@ -35,3 +35,4 @@ benchmarks/_ab_exes/
 # _tls_experiment.py scratch: built variants and dumped IR
 benchmarks/_tls_exes/
 benchmarks/_dict_ir.ll
+benchmarks/_dist_ir.ll
