@@ -44,7 +44,7 @@ than documenting the trap — either have `test_comprehensive.py` /
 put the directories in `testpaths` in the pytest config so a bare `pytest`
 covers everything. Until then the canonical command is `python -m pytest tests/`.
 
-### PERF-EXC-CHECK-IN-HOT-LOOP. The post-call pending-exception check costs 2.5x on subscript-heavy loops — 2026-08-15
+### PERF-EXC-CHECK-IN-HOT-LOOP. The post-call pending-exception check costs ~30% on subscript-heavy loops — 2026-08-15
 
 **Reproduce** (`benchmarks/run_comparison.py`, `dict lookup 1K keys x 1K`):
 
@@ -65,10 +65,11 @@ while j < 1000:
 print(total)
 ```
 
-Measured with `benchmarks/ab_bench.py` (paired, interleaved, spawn-floor
-subtracted), `096babe` vs `ab4e4a5`: **2.51x slower** idle, **2.44x** under
-an 80%-loaded machine — the two agree to 3%, so it is a real effect and not
-measurement noise.
+`096babe` vs `ab4e4a5` measured **2.9x slower** on this benchmark. Most of
+that turned out not to be this issue at all — see the history below, which is
+kept because two plausible diagnoses were wrong and the way they were
+falsified is the useful part. After PERF-DICT-KEY-HOT-PATH-MSVC was fixed the
+remainder is **~1.9ns per lookup, about 30% of the original gap.**
 
 The generated IR for the inner loop gained a check after every lookup:
 
@@ -83,28 +84,64 @@ br i1 %".113", label %"module.bail_exc.28", label %"module.bail_cont.29"
 `KeyError`, and before this the pending exception was ignored and execution
 continued on a bogus value. It is the fix, not the bug.
 
-The cost is in *how* it is checked, not *that* it is:
+**Two hypotheses about the cost, both disproven by measurement:**
 
-1. `fastpy_exc_pending` is an opaque cross-module call, so LLVM must assume
-   it clobbers memory. `total`, `i` and `d` are reloaded from their allocas
-   every iteration instead of staying in registers — visible in the IR as
-   `load {i32, i64}` on all three per trip.
-2. It splits the loop body into `bail_exc` / `bail_cont` blocks, which costs
-   further optimisation on top.
+1. *"`fastpy_exc_pending` is opaque, so LLVM must assume it clobbers memory
+   and reloads `total`/`i`/`d` from their allocas every trip."* Adding
+   `readonly nounwind` to the declaration changed nothing measurable. The
+   allocas are not address-taken, so mem2reg promotes them regardless of what
+   the call may clobber; the reloads in the pre-optimisation IR are not what
+   the backend actually emits.
+2. *"Then it must be the cross-module call, so read the flag inline."*
+   Replacing every call with a load of the thread-local (by hand, in the IR
+   text — see `benchmarks/_tls_experiment.py`) bought **3%**. Deleting the
+   check outright — replacing the call with a constant 0 so the branch folds
+   away — bought the whole ~1.9ns. So the cost is not the call and not the
+   load; it is the *branch and the basic-block split* in the loop body.
 
-**Proper fix**, cheapest first:
+**Proper fix**, therefore, is to not emit the check rather than to make it
+cheaper: elide it where the callee provably cannot raise, or hoist one check
+out of a loop whose body has no other observable effect between iterations
+(a raise sets a sticky flag, so checking it once after N lookups reports the
+same exception — but only if nothing between the raise and the check depends
+on the bogus value, which for `total = total + d[i]` it does).
 
-- Give the declaration `readonly nounwind willreturn` attributes. The
-  function is literally `return fpy_exc_type != FPY_EXC_NONE`. It cannot be
-  hoisted out of the loop — the preceding `dict_get` may set the flag — but
-  `readonly` stops it invalidating the *other* loads, which is likely the
-  bulk of the 2.5x.
-- Then consider emitting the test inline as a load of the flag rather than a
-  call. Note `fpy_exc_type` is `FPY_THREAD_LOCAL` (`runtime/runtime.c:669`),
-  so this needs `external thread_local global` and a TLS model that works on
-  Windows — not a drop-in change, which is why it is second.
-- Only then consider eliding the check where the callee provably cannot
-  raise. `dict_get` is not such a case.
+Note for anyone revisiting the inline-load idea: llvmlite 0.47's
+`ir.GlobalVariable` has **no `thread_local` support at all** (see
+`llvmlite/ir/values.py:810`, `descr()`). Assigning `.thread_local` silently
+creates an unused Python attribute and emits a plain `external global`, which
+would read the wrong thread's flag. It would need a `descr()` override, and
+per the measurement above it would not be worth it.
+
+### PERF-DICT-KEY-HOT-PATH-MSVC. FIXED 2026-08-15 — cold error paths inlined into hot dict lookups
+
+Recorded because the failure mode generalises and is invisible in C review.
+Two correctness fixes each made a hot leaf function slower on the path where
+nothing went wrong, and together they were **~70% of the `dict lookup`
+regression above** (999k lookups: 10.50ms -> 6.15ms):
+
+1. `fpy_raise_key_error` (`runtime/objects.c`) gives KeyError a real message
+   by formatting the key into a `char buf[256]`. It was `static` and got
+   inlined into `fastpy_dict_get_int_val`, so that buffer joined the *hot*
+   function's frame — and a buffer that size makes MSVC add /GS stack-cookie
+   code, giving the found-the-key path a 0x140 frame, a `__security_cookie`
+   load/store and a `call __security_check_cookie` on the way out. Fixed with
+   `FPY_NOINLINE` (new macro in `objects.h`).
+2. `fpy_key_equal_int` took the stored key **by value**, so the probe loop had
+   to materialise the whole 16-byte `FpyValue`: MSVC loaded it with `movups`
+   into XMM and dug the fields back out with `movd`/`psrldq`/`movq`. Fixed by
+   taking a `const FpyValue *` and moving the numeric-tower cases (float and
+   bool keys naming the same slot as an int) into an `FPY_NOINLINE` slow path.
+
+**The general rule:** a `static` helper that only runs when something goes
+wrong still costs the success path if it inlines — through frame size, /GS,
+and register pressure. Mark raise-and-return helpers `FPY_NOINLINE`. Passing
+a 16-byte tagged value by value to a helper called once per hash probe is
+likewise not free.
+
+**How to check:** `dumpbin /disasm:nobytes runtime/objects.obj` and read the
+function. A stack cookie or an SSE extract sequence in a leaf lookup is the
+tell; neither is visible in the C.
 
 Other benchmarks are unaffected (fib, object creation, linked list, tree sum
 all within 3% across the same A/B), so this is specific to hot loops whose

@@ -31,3 +31,7 @@ benchmarks/_probe_pid.txt
 benchmarks/_stable_*.json
 benchmarks/_ab_*.json
 benchmarks/_ab_exes/
+
+# _tls_experiment.py scratch: built variants and dumped IR
+benchmarks/_tls_exes/
+benchmarks/_dict_ir.ll
