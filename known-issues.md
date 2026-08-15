@@ -98,6 +98,10 @@ continued on a bogus value. It is the fix, not the bug.
    check outright — replacing the call with a constant 0 so the branch folds
    away — bought the whole ~1.9ns. So the cost is not the call and not the
    load; it is the *branch and the basic-block split* in the loop body.
+   (The inline load has since been adopted anyway, but for an unrelated
+   reason — see PERF-EXC-CHECK-AFTER-NONRAISING-OPS. It does nothing for
+   *this* benchmark, whose one check per iteration guards a real call and so
+   is not redundant. This entry stands.)
 
 **Proper fix**, therefore, is to not emit the check rather than to make it
 cheaper: elide it where the callee provably cannot raise, or hoist one check
@@ -110,10 +114,10 @@ Note for anyone revisiting the inline-load idea: llvmlite 0.47's
 `ir.GlobalVariable` has **no `thread_local` support at all** (see
 `llvmlite/ir/values.py:810`, `descr()`). Assigning `.thread_local` silently
 creates an unused Python attribute and emits a plain `external global`, which
-would read the wrong thread's flag. It would need a `descr()` override, and
-per the measurement above it would not be worth it.
+would read the wrong thread's flag. This is why `_ExternalTLSGlobal`
+(`compiler/codegen.py`) overrides `descr()`.
 
-### PERF-EXC-CHECK-AFTER-NONRAISING-OPS. Every statement gets a pending-exception check, including ones whose only instructions are `sub` and `mul` — 2026-08-15
+### PERF-EXC-CHECK-AFTER-NONRAISING-OPS. FIXED 2026-08-15 — every statement got a pending-exception check, including ones whose only instructions are `sub` and `mul`
 
 The sibling of PERF-EXC-CHECK-IN-HOT-LOOP, and the larger of the two.
 `_emit_try_bail_if_exc` (`compiler/codegen.py:38848`) is called from 31 sites
@@ -151,24 +155,47 @@ based on emission order has the same hazard, because a block can gain a
 predecessor (a loop back-edge, an except handler) after codegen has moved past
 it. Getting this wrong silently swallows exceptions.
 
-**Three routes, in increasing order of how much they fix:**
+**The fix: emit the check as what it is — a load.** `_emit_exc_pending`
+(`compiler/codegen.py`) now emits `load i32, i32* @fpy_exc_type` against an
+`_ExternalTLSGlobal` declaration instead of `call i32 @fastpy_exc_pending()`.
+Nothing is elided at emission time, so none of the unsoundness above applies;
+the count of checks in the generated IR is unchanged. What changes is that the
+`-O2` pipeline already running in `compile_ir_to_obj` can now *see* them: GVN
+reuses the first load across pure code, and simplifycfg folds a branch on a
+condition it has already proven false on that path. Measured on
+`_dist_src.py`, checks surviving `-O2` went **21 → 12**, and the benchmark's
+A/B ratio against `096babe` went **1.40x → 1.14x** (net work 4.9ms → 3.6ms
+against a 3.2ms baseline; 1.34ms with every check removed by hand).
 
-1. Have the undef guard branch to `_fn_exc_exit_block()` instead of falling
-   through to `ok_block`. Strictly better shape and removes this particular
-   hazard, but on its own removes no checks, so it buys nothing measurable.
-2. A redundant-check elimination pass over the *finished* module, where the
-   CFG is complete and the dataflow question ("is a raising call reachable
-   from the last check on every path to here?") can actually be answered.
-   Safer than deciding at emission time for the reason above.
-3. Compile the runtime to LLVM IR and link at IR level (LTO). Then
-   `fastpy_exc_pending` inlines to a load of `fpy_exc_type`, GVN removes the
-   redundant reloads, and LLVM sees for itself that a `sub` cannot raise. This
-   fixes the whole class rather than this instance, and would also subsume
-   PERF-EXC-CHECK-IN-HOT-LOOP. Build-system work, not codegen work.
+This is route 2 from the original plan, but delegated: LLVM has the finished
+CFG, which is precisely what makes the dataflow question answerable, so
+hand-rolling the pass would have been reimplementing GVN with less
+information. Route 3 (IR-level LTO of the runtime) would subsume this and
+remains open; route 1 is unnecessary now that nothing depends on
+emission-order reasoning.
 
-**Reproduce:** `benchmarks/_dist_src.py`, and the neutering trick from
-`benchmarks/_tls_experiment.py` (substitute `add i32 0, 0` for the call in the
-emitted IR, then `compile_and_link`).
+**Safety rests on the flag being memory.** Anything that can raise is an
+opaque call that may write it, so LLVM cannot reuse a stale value across one,
+and cannot hoist the load out of a loop that can raise. The corollary is that
+marking runtime functions `readonly` is *not* a free win any more: a
+`readonly` function that can raise would let LLVM keep a stale answer and the
+exception would go unseen.
+
+**MCJIT is excluded.** `compiler/jit.py` passes `inline_exc_check=False`,
+which keeps the call form and suppresses the TLS declaration entirely —
+MCJIT's symbol resolver maps functions by address and cannot hand back a
+thread-local's per-thread address. The SlateOS cross-target path is fine
+(`localexec` relocations are resolved at link time, and the runtime already
+has `__thread` variables in `.tdata`); `tests/test_cross_target.py` passes
+including the full-program link.
+
+**Verified:** full suite 1054 passed (1 pre-existing unrelated failure);
+`benchmarks/_exc_src.py` — raised-and-caught KeyErrors in a loop and across a
+call boundary — still matches CPython exactly.
+
+**Reproduce the original:** `benchmarks/_dist_src.py`, and the neutering trick
+from `benchmarks/_tls_experiment.py` (substitute `add i32 0, 0` for the call
+in the emitted IR, then `compile_and_link`).
 
 ### PERF-DICT-KEY-HOT-PATH-MSVC. FIXED 2026-08-15 — cold error paths inlined into hot dict lookups
 

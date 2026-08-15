@@ -556,6 +556,34 @@ class _GenVarRewriter(ast.NodeTransformer):
         return node
 
 
+class _ExternalTLSGlobal(ir.GlobalVariable):
+    """A declaration of a thread-local global defined in the C runtime.
+
+    llvmlite has no thread-local support at all: `ir.GlobalVariable.descr`
+    (llvmlite/ir/values.py) emits linkage, storage class, unnamed_addr and
+    addrspace and nothing else, so assigning a `.thread_local` attribute
+    merely creates an unused Python attribute and the module still says
+    `external global i32`.  That is not a missing optimisation but a wrong
+    program — the load would read the process-wide address rather than the
+    calling thread's copy, so one thread's raise would be invisible to
+    another and visible to a third.
+
+    `descr` is overridden outright rather than by splicing a keyword into
+    super()'s output, because LLVM's grammar fixes the order (linkage,
+    preemption, visibility, dllstorageclass, thread_local, unnamed_addr,
+    addrspace, ...) and this class only ever needs the one shape: an
+    external declaration with no initializer.  Writing that shape directly
+    cannot drift out of order.
+
+    `localexec` is the correct model here and not merely the fastest: fastpy
+    links the runtime statically into the executable, so the variable is
+    always in the main module's own TLS block.
+    """
+
+    def descr(self, buf):
+        buf.append(f"external thread_local(localexec) global {self.value_type}\n")
+
+
 class _SafeIRBuilder(ir.IRBuilder):
     """IRBuilder subclass that auto-coerces type mismatches in call().
 
@@ -1127,7 +1155,19 @@ class CodeGen:
     def __init__(self, threading_mode: int = 0, int64_mode: bool = False,
                  typed_mode: bool = False,
                  source_filename: str = "<module>",
-                 analyze_mode: bool = False) -> None:
+                 analyze_mode: bool = False,
+                 inline_exc_check: bool = True) -> None:
+        # Emit the pending-exception check as a load of the runtime's
+        # thread-local flag rather than a call to fastpy_exc_pending().  See
+        # _emit_exc_pending for why that is worth doing.  It is a parameter and
+        # not a constant because MCJIT (compiler/jit.py) cannot resolve or
+        # relocate a TLS symbol at all — its symbol resolver maps mod.functions
+        # only, and even if it mapped globals there is no TLS-aware loader to
+        # apply the relocations.  The JIT therefore passes False and keeps the
+        # call form, which also keeps the fastpy_exc_pending declaration live.
+        # It has to be settable at construction because the declarations are
+        # emitted from __init__, before any caller could assign an attribute.
+        self.inline_exc_check = inline_exc_check
         self._current_scope_stmts = []  # Phase 4: initialize early
         self.module = ir.Module(name="fastpy_module")
         # Use the host platform's LLVM triple and data layout for correct
@@ -2589,6 +2629,17 @@ class CodeGen:
         # int fastpy_exc_pending(void)
         ft = ir.FunctionType(i32, [])
         self.runtime["exc_pending"] = ir.Function(self.module, ft, name="fastpy_exc_pending")
+        # ...and the flag that function reads, so the check can be the load it
+        # actually is.  See _emit_exc_pending for why that matters; the
+        # declaration lives here, next to the function it replaces, so the two
+        # cannot drift apart.  `int fpy_exc_type` (runtime/runtime.c) is
+        # deliberately not static, and FPY_EXC_NONE is 0
+        # (runtime/exceptions.h), so "pending" is exactly "nonzero".  Declared
+        # only when it will be used: MCJIT chokes on a TLS symbol it cannot
+        # resolve whether or not anything loads from it.
+        if self.inline_exc_check:
+            self.runtime["exc_type_flag"] = _ExternalTLSGlobal(
+                self.module, i32, name="fpy_exc_type")
         # void fastpy_exc_unhandled(void) — print and exit
         ft = ir.FunctionType(void, [])
         self.runtime["exc_unhandled"] = ir.Function(self.module, ft, name="fastpy_exc_unhandled")
@@ -4979,8 +5030,7 @@ class CodeGen:
                                                   ast.With))
                         and not self._in_try_block
                         and not self._current_fn_bare_abi):
-                    pending = self.builder.call(
-                        self.runtime["exc_pending"], [])
+                    pending = self._emit_exc_pending()
                     is_exc = self.builder.icmp_signed(
                         "!=", pending, ir.Constant(i32, 0))
                     exc_blk = self._new_block("module.exc_unhandled")
@@ -26388,8 +26438,7 @@ class CodeGen:
                     self._flush_rc_temps_to(_rc_mark)  # pops, no decref
                     break
                 # Check for pending exception after each statement
-                pending = self.builder.call(
-                    self.runtime["exc_pending"], [])
+                pending = self._emit_exc_pending()
                 is_exc = self.builder.icmp_signed(
                     "!=", pending, ir.Constant(i32, 0))
                 cont_block = self._new_block("with.cont")
@@ -26436,8 +26485,7 @@ class CodeGen:
             _arg2_tag = self._create_entry_alloca(i32, "exit.a2.tag")
             _arg2_data = self._create_entry_alloca(i64, "exit.a2.data")
             # Check if exception is pending
-            _pend_for_exit = self.builder.call(
-                self.runtime["exc_pending"], [])
+            _pend_for_exit = self._emit_exc_pending()
             _has_exc_for_exit = self.builder.icmp_signed(
                 "!=", _pend_for_exit, ir.Constant(i32, 0))
             _exc_info_block = self._new_block("with.exc_info")
@@ -27422,7 +27470,7 @@ class CodeGen:
             if self.builder.block.is_terminated:
                 self._flush_rc_temps_to(_rc_mark)  # terminated: pops, no decref
                 break
-            pending = self.builder.call(self.runtime["exc_pending"], [])
+            pending = self._emit_exc_pending()
             is_exc = self.builder.icmp_signed("!=", pending, ir.Constant(i32, 0))
             cont_block = self._new_block("trystar.cont")
             self.builder.cbranch(is_exc, exc_target, cont_block)
@@ -28184,7 +28232,7 @@ class CodeGen:
                 self._flush_rc_temps_to(_rc_mark)  # terminated: pops, no decref
                 break
             # Check for pending exception after each statement
-            pending = self.builder.call(self.runtime["exc_pending"], [])
+            pending = self._emit_exc_pending()
             is_exc = self.builder.icmp_signed("!=", pending, ir.Constant(i32, 0))
             cont_block = self._new_block("try.cont")
             exc_target = except_block if except_block else (finally_block if finally_block else end_block)
@@ -28707,7 +28755,7 @@ class CodeGen:
         if self._in_try_block and node.value is not None:
             exc_target = getattr(self, '_try_except_target', None)
             if exc_target is not None:
-                pending = self.builder.call(self.runtime["exc_pending"], [])
+                pending = self._emit_exc_pending()
                 is_exc = self.builder.icmp_signed(
                     "!=", pending, ir.Constant(i32, 0))
                 no_exc_block = self._new_block("ret.noexc")
@@ -29599,7 +29647,7 @@ class CodeGen:
         # Call __next__() — StopIteration signals end
         result = self.builder.call(
             self.runtime["obj_call_method0"], [iter_ptr, next_name_ptr])
-        pending = self.builder.call(self.runtime["exc_pending"], [])
+        pending = self._emit_exc_pending()
         has_exc = self.builder.icmp_signed(
             "!=", pending, ir.Constant(i32, 0))
         after_loop = else_block if else_block else end_block
@@ -30058,7 +30106,7 @@ class CodeGen:
         # after the call to detect StopIteration.
         result = self.builder.call(
             self.runtime["obj_call_method0"], [iter_ptr, next_name])
-        pending = self.builder.call(self.runtime["exc_pending"], [])
+        pending = self._emit_exc_pending()
         has_exc = self.builder.icmp_signed(
             "!=", pending, ir.Constant(i32, 0))
         after_loop = else_block if else_block else end_block
@@ -30125,7 +30173,7 @@ class CodeGen:
         result = self.builder.call(
             self.runtime["obj_call_method1"],
             [obj, getitem_name, idx])
-        pending = self.builder.call(self.runtime["exc_pending"], [])
+        pending = self._emit_exc_pending()
         has_exc = self.builder.icmp_signed(
             "!=", pending, ir.Constant(i32, 0))
         after_loop = else_block if else_block else end_block
@@ -38845,6 +38893,48 @@ class CodeGen:
             self.builder = saved_builder
         return blk
 
+    def _emit_exc_pending(self) -> ir.Value:
+        """Emit "is an exception pending?" as an i32 that is nonzero if so.
+
+        This is a load of the runtime's flag rather than a call to
+        `fastpy_exc_pending`, and the point is not that a load is cheaper than
+        a call — measured on `dict lookup`, where the loop holds exactly one
+        check, swapping the call for the load was worth 3%.  The point is that
+        a load is something LLVM can *reason about* and an opaque call is not.
+
+        A check is emitted after every statement that might raise, and most
+        statements cannot: `dx = self.x - other.x` is two loads and a `sub`.
+        As calls, each check was an unanalysable barrier and all of them
+        survived to run.  As loads, GVN sees the second load of a global with
+        no intervening write to memory, reuses the first value, and simplifycfg
+        then folds a branch on a condition already proven false on that path —
+        so the redundant checks delete themselves, and exactly the ones that
+        guard a real call remain.  `dist_sq method 1M` went from 3.15ms to
+        1.62ms of net work, against 1.34ms with every check removed by hand.
+
+        Doing this as a codegen analysis instead would be a dataflow problem
+        over a CFG that is still being built, where a block can gain a
+        predecessor (a loop back-edge, an except handler) long after codegen
+        has walked past it, and where a wrong answer silently swallows an
+        exception.  Handing the question to LLVM, which has the finished CFG,
+        is not a shortcut — it is the only place the question is answerable.
+
+        Safety rests on the flag being *memory*: anything that can raise is an
+        opaque call that may write it, which stops LLVM from reusing a stale
+        value across it, and hoisting the load out of a loop is legal only when
+        the loop cannot raise.  This is also why marking runtime functions
+        `readonly` is not a free win — a `readonly` function that can raise
+        would let LLVM keep a stale answer across it, and the exception would
+        go unseen.  See PERF-EXC-CHECK-AFTER-NONRAISING-OPS.
+
+        `inline_exc_check` is False under MCJIT, which cannot resolve a TLS
+        symbol; that path keeps the original call.
+        """
+        if not self.inline_exc_check:
+            return self.builder.call(self.runtime["exc_pending"], [])
+        return self.builder.load(self.runtime["exc_type_flag"],
+                                 name="exc.pending")
+
     def _emit_try_bail_if_exc(self) -> None:
         """If inside a try block, check exc_pending() and bail to the except
         handler immediately.  This prevents side-effectful code from executing
@@ -38866,7 +38956,7 @@ class CodeGen:
             target = getattr(self, '_try_except_target', None)
             if target is None:
                 return
-            pending = self.builder.call(self.runtime["exc_pending"], [])
+            pending = self._emit_exc_pending()
             is_exc = self.builder.icmp_signed("!=", pending, ir.Constant(i32, 0))
             cont = self._new_block("try.earlycheck")
             self.builder.cbranch(is_exc, target, cont)
@@ -38876,7 +38966,7 @@ class CodeGen:
         # exc_unhandled on pending exception.
         if (not self._current_fn_bare_abi
                 and self.function.name == "fastpy_main"):
-            pending = self.builder.call(self.runtime["exc_pending"], [])
+            pending = self._emit_exc_pending()
             is_exc = self.builder.icmp_signed(
                 "!=", pending, ir.Constant(i32, 0))
             exc_blk = self._new_block("module.bail_exc")
@@ -38893,7 +38983,7 @@ class CodeGen:
         # scopes whose operations cannot raise.
         if self._current_fn_bare_abi or self.function.name == "fastpy_main":
             return
-        pending = self.builder.call(self.runtime["exc_pending"], [])
+        pending = self._emit_exc_pending()
         is_exc = self.builder.icmp_signed("!=", pending, ir.Constant(i32, 0))
         cont = self._new_block("fn.bail_cont")
         self.builder.cbranch(is_exc, self._fn_exc_exit_block(), cont)
@@ -40848,7 +40938,7 @@ class CodeGen:
             if len(node.args) == 2:
                 # next(iterator, default) — catch StopIteration, return default
                 # Check if __next__ raised StopIteration
-                pending = self.builder.call(self.runtime["exc_pending"], [])
+                pending = self._emit_exc_pending()
                 is_exc = self.builder.icmp_signed(
                     "!=", pending, ir.Constant(i32, 0))
                 exc_type = self.builder.call(self.runtime["exc_get_type"], [])

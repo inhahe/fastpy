@@ -714,6 +714,30 @@ subscript needed the same treatment for the plainer reason that it raises:
 `_emit_subscript`'s result was returned to the expression dispatcher with no
 check, so `[1, 2][9] + "s"` reported TypeError rather than IndexError.
 
+**The check is emitted as a load, so that LLVM can delete the redundant ones.**
+Checks are emitted unconditionally — after every statement that *might* raise,
+which in practice means after nearly every statement, most of which compile to
+a `sub` and cannot raise at all. Deciding at emission time which to skip is
+unsound: a block can gain a predecessor (a loop back-edge, an except handler)
+long after codegen has walked past it, and `_check_fv_undef` deliberately falls
+through after `fastpy_raise`, so "no call in this block" does not mean "no
+exception pending". The question is only answerable against a *finished* CFG.
+So `_emit_exc_pending` emits `load i32, i32* @fpy_exc_type` (via
+`_ExternalTLSGlobal`, because llvmlite has no thread-local support) rather than
+`call i32 @fastpy_exc_pending()`, and the `-O2` pipeline already running in
+`compile_ir_to_obj` does the elimination itself: GVN reuses the loaded value
+across pure code and simplifycfg folds branches already proven false. Nothing
+is elided by the compiler, so no soundness argument is needed from it.
+
+Two consequences bind future work. First, safety rests on the flag being
+*memory* — a raising call is opaque and may write it, which is what stops LLVM
+reusing a stale value across one; so runtime functions that can raise must
+**not** be marked `readonly`, however tempting, or an exception goes unseen.
+Second, MCJIT cannot resolve a thread-local symbol, so `compiler/jit.py`
+constructs `CodeGen(inline_exc_check=False)` and keeps the call form. The
+SlateOS cross-target is unaffected — `thread_local(localexec)` is resolved at
+link time and the runtime already has `__thread` variables.
+
 **A cleanup is owed to every way out of the block, not just the one the
 lowering happens to fall through.** `_emit_with` builds its `__exit__` call by
 hand into a `with.finally` block, which the fall-through path branches to — and

@@ -139,7 +139,11 @@ def jit_compile(source: str) -> int:
         tree = ast.parse(source, mode="exec")
 
         # Compile to LLVM IR
-        codegen = CodeGen()
+        # inline_exc_check=False: MCJIT resolves symbols through
+        # _register_runtime_symbols below, which maps functions by address and
+        # has no way to hand back a thread-local's per-thread address, so the
+        # exception check has to stay a call here.
+        codegen = CodeGen(inline_exc_check=False)
         # Ensure pre-scan attributes exist (normally set by generate's pre-scan)
         if not hasattr(codegen, '_singledispatch'):
             codegen._singledispatch = {}
