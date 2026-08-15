@@ -5171,7 +5171,31 @@ wrong; `str` arguments correct but `float` ones wrong; `p = pick(...)` correct
 but `pick(...) ==` wrong. Each asymmetry named the exact reader that was
 missing an arm, which guessing would not have.
 
-### BUG-METHOD-RETURN-ELEM-KIND-LOST. A container returned from a *method* has no element kind, though the same body in a plain function does — 2026-07-27
+**A half-answer is worse than no answer.** This is the single most useful thing
+the whole element-kind cluster taught, and it is counter-intuitive enough to be
+worth stating on its own. A **bare** `"list"` tag declines to name the element,
+so every reader routes the element access through the *runtime* tag and gets it
+right — a bare tag costs speed, not correctness. A tag like `"list:list"` names
+the outer kind and leaves the inner one blank, and readers do not treat a blank
+as "unknown": they fill it in with `VKind.INT` and read a heap pointer as an
+integer. So a producer that half-knows the answer and writes down the half it
+has makes things **worse than if it had said nothing**, and every "improvement"
+that adds a kind to some classifier's `isinstance` chain without adding the
+nested case is this bug waiting to happen.
+
+Two consequences follow, and both are load-bearing in the fixes below:
+
+- When a classifier cannot determine the inner kind, it must return the **bare
+  head**, not a head plus a guess.
+- When it determines that the elements genuinely **disagree**, `mixed` is the
+  right answer and the bare head is the wrong one — `mixed` is a *complete*
+  answer meaning "dispatch at runtime", whereas the bare head reads as "one
+  unnamed kind" and gets completed with INT.
+
+The deeper fix, not attempted here, is to stop letting "no element kind" and
+"element kind INT" share a representation at all.
+
+### BUG-METHOD-RETURN-ELEM-KIND-LOST. FIXED 2026-08-15 — a container returned from a *method* had no element kind, though the same body in a plain function did
 
 **What** (both lines print `0`; CPython prints `2` and `3`):
 
@@ -5194,7 +5218,7 @@ identical body in a **plain function** is correct — `def g(): return ["x",
 this. Tuples behave the same way; this is not a tuple bug (found while probing
 for one).
 
-**Root cause (suspected, not yet confirmed):** `_csa_propagate_ret_types`
+**Root cause (confirmed):** `_csa_propagate_ret_types`
 records element-carrying return tags in `_func_ret_types`, keyed by *function*
 name, and `_infer_type_tag`'s call-subscript arm consults it. A method's return
 value goes through `_find_method_return_type` / `_method_returns_list`, which
@@ -5202,19 +5226,35 @@ answer the *LLVM* type or a yes/no — "returns a pointer", "returns a list" —
 and carry no element kind at all. So `c.m()[1]` falls to the `VKind.INT`
 element default and `len()` measures a pointer.
 
-**Proper fix:** give methods the same element-carrying return record functions
-have — a `(class, method) -> tag` map populated by the same CSA pass, consulted
-wherever `_func_ret_types` is consulted today. This is the method-shaped half of
-BUG-RETURNED-LIST-ELEM-TAG-LOST and BUG-CALL-SUBSCRIPT-ELEM-KIND-LOST, both of
-which were fixed for functions only.
-
 **Severity:** medium. Silently wrong; no crash in the shapes probed, but the
 same wrong answer routes `for` to the native list loop, so a crash is reachable.
 
 **Pre-existing:** reproduced identically at `5441451^`, before any of the tuple
 work.
 
-### BUG-DICT-VALUE-CONTAINER-ELEM-KIND-LOST-ON-BIND. `d["k"][1]` is right but `e = d["k"]; e[1]` is not — 2026-07-27
+**The fix**, as predicted above: methods get the same element-carrying return
+record functions have. The CSA pass builds a second view of the same ASTs keyed
+`Cls.meth` and runs the *existing* `_csa_propagate_ret_types` over it, so there
+is no second implementation of "what does this body return" to drift. A method
+already had an entry in `_func_ret_types` under its **bare** name — but under a
+key that collides with a module function of the same name and with every other
+class's `m`, so no call site could safely trust it; that is why the record
+looked present and was useless. `_method_call_ret_vtype` resolves the
+receiver's class (including `self`), walks the MRO because an inherited method
+is defined on the parent, and asks for the dotted key.
+
+Two readers had to be told to ask it: `_infer_call_type_tag` (whose
+method-return arm ran `_method_returns_list` and turned that bare yes into
+`elem_type=INT` — **a claim, not the absence of one**, so declining would have
+been *more* correct than what it did) and `_get_list_elem_type` (which had an
+arm for `ast.Name` callees only, so a method's element kind was discarded even
+once the analysis had computed it).
+
+**Verified:** `tests/regressions/container_elem_kind_survives.py`, section A —
+including `self.s()`, an inherited method, and the plain-function control that
+always worked.
+
+### BUG-DICT-VALUE-CONTAINER-ELEM-KIND-LOST-ON-BIND. FIXED 2026-08-15 — `d["k"][1]` was right but `e = d["k"]; e[1]` was not
 
 **What:**
 
@@ -5233,22 +5273,122 @@ The *direct* subscript chain keeps the element kind and the **one-assignment**
 form loses it — the same diagnostic shape as BUG-TUPLE-RETURN-SEGFAULTS, in a
 different producer. Tuples behave the same; not a tuple bug.
 
-**Root cause (suspected, not yet confirmed):** the assignment `e = d["k"]`
-records `e` as a bare `"list"` — `_dict_var_list_values` is a *set of names*,
-so it can say "this dict's values are lists" and nothing about what the lists
-hold. Reading `d["k"]` inline instead re-derives the value type from the dict
-literal, where the element kind is still visible.
-
-**Proper fix:** the same one as the `elem_type=VKind.INT` conflation generally —
-record a dict's value type as a `ValueType`, not membership in one of the
-`_dict_var_*_values` name-sets. Those sets are the boolean-kind-set pattern
-again (`_dict_var_int_values`, `_dict_var_list_values`, `_dict_var_dict_values`,
-`_dict_var_obj_values`), one level down, and they lose exactly what a
-`ValueType` would keep. See BUG-DICT-VALUE-STATIC-KIND.
-
 **Severity:** medium. Silently wrong.
 
 **Pre-existing:** reproduced identically at `5441451^`.
+
+**Root cause (confirmed — and it was two layers, only one of them the
+suspected one).** The suspected layer was real: `_dict_var_list_values` and its
+three siblings are *sets of names*, so they can say "this dict's values are
+lists" and nothing about what the lists hold, and `_infer_type_tag`'s
+dict-subscript arm turned that into the literal `ValueType(VKind.LIST,
+elem_type=ValueType(VKind.INT))` — the `elem_type=VKind.INT` conflation spelled
+out in source.
+
+But fixing that alone changed nothing, four separate times, because a **higher
+arm in the same function** answered first: `_dict_var_key_types`, a per-key
+`{key: tag}` map recorded at literal-assignment time. That one *does* map to a
+type, so it looked like the good design — except the tags it stores come from
+`_infer_constant_value_type`, which was the **fourth** copy in this file of the
+same subset-recognising literal classifier, and its container arms read in
+full:
+
+```python
+if isinstance(node, (ast.Dict, ast.DictComp)):
+    return "dict"
+if isinstance(node, (ast.List, ast.ListComp)):
+    return "list"
+```
+
+So `{"k": ["a", "bcd"]}` recorded key `"k"` as `"list"`, that flat tag beat
+every other inference in `_infer_type_tag`, and `e = d["k"]` bound a list of
+unknown — read back as int. The lesson is that a map to a type is only as good
+as the classifier filling it; the name-set was the *visible* offender and not
+the one that was actually answering.
+
+**The fix**, in three parts:
+
+- **`ValueType` gained a `value_type` slot**, kept deliberately apart from
+  `elem_type`. They are different questions: `elem_type` is what *iterating*
+  yields, which for a dict is a **key**, so overloading the one slot would make
+  every existing `elem_type is not None` test on a container silently start
+  answering the wrong one. `_to_tag` round-trips it as `dict:<value>`,
+  `from_old_tag` parses that suffix (it used to drop it on the floor), and
+  `__eq__`/`__hash__` include it.
+- **`_infer_constant_value_type` names the inner kind**, via one shared
+  `_literal_container_tag` helper that recurses through
+  `_infer_constant_value_type` itself — so it stays a pure AST classifier with
+  no emit-time state, and nesting comes free (`[["a", "bb"]]` → `list:list:str`).
+- **Disagreeing elements are `mixed`, not bare.** `{"k": ["a", [1, 2, 3]]}` has
+  no single element kind, and the honest tag is `list:mixed`, which routes the
+  read through the runtime tag and is correct. Falling back to the bare `"list"`
+  head there would have left it read as `list:int` — see "a half-answer is
+  worse than no answer" at the top of this cluster.
+
+**Verified:** `tests/regressions/container_elem_kind_survives.py`, section B —
+both scopes, two nesting levels, and a dict whose values disagree.
+
+### BUG-APPEND-ELEM-KIND-LAST-WRITE-WINS. FIXED 2026-08-15 — a list built by `.append()` took its element kind from the last append the scan recognised
+
+**What** (CPython prints `None text`; compiled printed `(null) text`):
+
+```python
+def mk():
+    x = []
+    x.append(None)
+    x.append("text")
+    return x
+
+a, b = mk()
+print(a, b)
+```
+
+**Found by** a *different* fix. `tests/regressions/unpack_none_mixed.py`
+covers this shape as a **method** and passed, so the plain-function spelling
+had never been tested — and it was wrong the whole time. Giving methods a real
+return record (BUG-METHOD-RETURN-ELEM-KIND-LOST, above) routed the method
+through the same analysis as the function, and the test went red. The fix
+exposed the bug rather than causing it; `git stash` on the working tree shows
+the function form printing `(null)` at `41cf0ea` with everything reverted.
+
+**Root cause.** *Three* scans answer "what does this list hold?" by walking
+its `.append()` calls: `_prescan_list_append_types` (codegen), and two inside
+`_csa_propagate_ret_types` — one filling `local_types`, one filling
+`_fn_append_types`, twenty lines apart in the same function. Each is a
+hand-rolled `isinstance` chain recognising its own subset of kinds, and each
+wrote its answer **straight into the map**. Two failures compound:
+
+- an append of a kind the chain does not name simply does not update the map,
+  so it cannot disagree with anything; and
+- the write is unconditional, so the last *recognised* append decides the
+  answer for the whole list.
+
+`None` has no arm in any of the three. So `[None, "text"]` built by appends
+recorded `list:str`, `print` took the str path, and the None — a NULL
+pointer — printed `(null)`. A list of *only* None was fine (nothing recorded,
+so the read went through the runtime tag), and the literal `[None, "text"]`
+was fine (`_csa_list_elem_tag` declines when the elements disagree). It needed
+an unclassifiable append *followed by* a classifiable one, which is why it
+survived.
+
+**The fix:** every append votes, and they have to agree. Two appends of
+different known kinds make the list `mixed` — a *complete* answer meaning
+"dispatch on the runtime tag" — and one append the scan cannot classify erases
+the element kind entirely, since a container of unknown is exactly what the
+bare tag means. Both outcomes are safe; naming one of several kinds is not.
+The `local_types` scan also became two-phase (collect votes, then write) so
+the answer no longer depends on the order `ast.walk` reaches the appends in,
+and all three now classify the appended expression with `_csa_elem_tag_of`
+rather than a private subset chain — bringing the count of hand-rolled literal
+classifiers folded into that one function to **eight**.
+
+**Severity:** medium. Silently wrong, and `print` — normally the one operation
+that is right regardless, because it reads the runtime tag — was wrong here
+too, because the static tag diverted it off the tag-reading path entirely.
+
+**Verified:** `tests/regressions/append_elem_kind_votes.py` — both orders, the
+method spelling, two disagreeing known kinds, and four controls where the
+appends agree and the precise kind must survive.
 
 ### BUG-CTOR-PARAM-CONTAINER-ATTR-ELEM-KIND-LOST. FIXED 2026-08-15 — `self.t = t` in `__init__` lost the container's element kind, and iterating it segfaulted
 
@@ -5324,7 +5464,7 @@ element kinds, two classes sharing an attribute name, and inheritance where the
 child's own assignment wins). Full suite 1055 passed, 0 failed. Codegen time
 unchanged (min 3.80s vs 3.99s over 40 regression programs).
 
-### BUG-NESTED-LIST-ARG-INNER-ELEM-LOST. A nested list literal argument keeps the outer element kind but not the inner — 2026-07-27
+### BUG-NESTED-LIST-ARG-INNER-ELEM-LOST. FIXED 2026-08-15 — a nested list literal argument kept the outer element kind but not the inner
 
 **What:**
 
@@ -5347,17 +5487,42 @@ module-scope case (see the nested-container half above), one representation
 over: there it was a bare `ValueType(VKind.LIST)`, here it is a bare `"list"`
 tag string.
 
-**Proper fix:** have `_csa_elem_tag_of` return the compound tag for a nested
-list element (`"list:str"`), so `_csa_list_elem_tag` yields `"list:list:str"`.
-`from_old_tag` already parses arbitrarily nested `list:` chains, so the reader
-needs no change. Check `_csa_iter_elem_tag`, which currently declines any tag
-containing a second `:` — it would need to hand back the compound tag rather
-than `None`.
-
 **Severity:** medium. Silently wrong, no crash. Covered (as a documented
 non-assertion) in `tests/regressions/list_literal_argument_keeps_its_element_kind.py`.
 
-### BUG-LIST-OF-DICTS-PARAM-VALUE-KIND-LOST. A list-of-dicts parameter carries no dict value type — 2026-07-27
+**The fix.** The argument half was as predicted: `_csa_elem_tag_of` returns the
+compound tag for a nested container element, `_csa_list_elem_tag` therefore
+yields `"list:list:str"`, and `_csa_iter_elem_tag` hands the whole suffix back
+instead of declining on a second `:`. `_csa_elem_tag_of`'s `ast.Name` arm was
+truncating the same way one producer over, and stopped.
+
+**That fixed nothing on its own**, which is the part worth recording. Dumping
+`_call_site_param_types` showed `{'inner_first': ['list:list:str']}` — the
+argument tag had been right all along at that point; the loss was on the
+**return** side, and there in *two* independent places that must agree:
+
+- `_duf_determine_ret_tag` picks the semantic tag. Only a **bare** parameter
+  had a subscript arm, so `return rows[0][0]` matched nothing at all and fell
+  through to the i8_ptr default — "ptr", i.e. list — even with the parameter
+  proved `list:list:str`.
+- `_duf_detect_ret_type` picks the LLVM type, and had no arm for a nested
+  subscript either. Fixing only the tag left `ret_type = i64`, so the corrected
+  answer was still returned through an integer and `len()` still said 0. The
+  instrumented line `RETTAG inner_first ret_type= i64 ... -> str` is what named
+  this second layer.
+
+Both now route through one `_ret_param_base_tag` helper, which peels the
+parameter's compound tag one `:` level per index — exactly the inverse of how
+the call site built it — and stops at a slice, since `xs[1:]` is the same kind
+as `xs`. It returns `(tag, root)` so that "not a parameter" and "a parameter of
+unknown kind" stay distinguishable; collapsing them would make the caller
+invent a kind where it should fall back to the runtime tag.
+
+**Verified:** `tests/regressions/container_elem_kind_survives.py`, section C —
+one, two and three levels, a slice, and inner elements that are themselves
+lists.
+
+### BUG-LIST-OF-DICTS-PARAM-VALUE-KIND-LOST. FIXED 2026-08-15 — a list-of-dicts parameter carried no dict value type
 
 **What:**
 
@@ -5380,10 +5545,24 @@ for a plain dict parameter — has nowhere to live for a dict *inside* a list.
 Same missing level of nesting as BUG-NESTED-LIST-ARG-INNER-ELEM-LOST, on the
 dict side.
 
-**Proper fix:** the same compound-tag widening (`"list:dict:str"`), or the
-reader-side fix in the parent entry, which subsumes both.
-
 **Severity:** medium.
+
+**The fix:** the compound-tag widening, as predicted — `"list:dict:str"`. What
+made it more than a one-liner is that the dict side had **three** hand-rolled
+copies of "what kind are this literal's values", one in the call-argument loop,
+one in `_csa_build_var_types` and one on the class-attr path, each a chain of
+`all(isinstance(...))` tests recognising a *different* subset of kinds
+(int/str/list/dict in one, fewer in the others). Every kind none of them
+named — float, bytes, bigint, a nested list — fell to a bare `"dict"` whose
+consumer fills the value kind in with INT. They are now one
+`_csa_dict_value_tag`, the dict-side twin of the `_csa_list_literal_tag` that
+replaced the same triplication on the list side. Its contract is deliberately
+"all values must agree or decline", because one tag has to describe *every*
+read out of the dict; `**spread` declines outright, since the values are not
+all visible from the literal.
+
+**Verified:** `tests/regressions/container_elem_kind_survives.py`, section D —
+int, str and list dict values through the same parameter.
 
 ### BUG-LOOP-CARRIED-BIGINT-KIND-LOST. A BigInt loses its kind across a loop-carried rebinding — 2026-07-27
 
@@ -5435,6 +5614,20 @@ compound tag, falling back to the bare kind name only when it is not. The map
 is the wrong shape for this — it discards the suffix by construction.
 
 **Severity:** medium. Not yet given a regression test.
+
+**NOT REPRODUCIBLE as written — 2026-08-15.** Four shapes were probed (`str`
+elements and nested-list elements, each called inline and via a binding) and
+all four already agree with CPython; `git log -S` confirms `_RET_TAG_TO_ARG`
+is unchanged since `bde6cd1`, so this is not something that was fixed in
+passing. The map really does discard the suffix by construction, so the
+analysis above is correct about the *code* — some later reader evidently
+recovers the element kind before it matters, which means the entry needs a
+shape that defeats that reader before it can be called a bug. Until then it is
+**structural debt, not an observed failure**: `_RET_TAG_TO_ARG` should still
+pass a compound `ret_tag` through rather than re-deriving a bare kind name.
+The four probed shapes are kept as the control section of
+`tests/regressions/container_elem_kind_survives.py`, so if a future change
+*does* break them it will be caught rather than rediscovered.
 
 ### BUG-HASH-BY-POINTER-FOR-HEAP-VALUES. BigInt, bytes, Decimal and complex hash by address, so they cannot be dict keys or set members — 2026-07-27
 

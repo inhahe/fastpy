@@ -246,13 +246,25 @@ class ValueType:
     (==, in, startswith, split) so existing code that reads variables[name][1]
     keeps working during the gradual migration to VKind-based dispatch."""
 
-    __slots__ = ('kind', 'elem_type', 'class_name', '_tag_cache')
+    __slots__ = ('kind', 'elem_type', 'class_name', 'value_type', '_tag_cache')
 
     def __init__(self, kind: VKind, elem_type: 'ValueType | None' = None,
-                 class_name: str | None = None):
+                 class_name: str | None = None,
+                 value_type: 'ValueType | None' = None):
         self.kind = kind
         self.elem_type = elem_type
         self.class_name = class_name
+        # A dict's *value* type, kept apart from `elem_type` on purpose.
+        # `elem_type` answers "what does iterating this yield", which for a
+        # dict is a key, not a value — overloading the one slot for both would
+        # make every existing `elem_type is not None` test on a container
+        # silently start answering the wrong question.  A dict's values were
+        # previously tracked as membership in `_dict_var_int_values` and three
+        # sibling *name-sets*, which can say "the values are lists" and nothing
+        # about what those lists hold: `e = d["k"]; len(e[1])` answered 0 while
+        # the direct `len(d["k"][1])` was right.
+        # BUG-DICT-VALUE-CONTAINER-ELEM-KIND-LOST-ON-BIND.
+        self.value_type = value_type
         self._tag_cache: str | None = None
 
     # --- String tag conversion ---
@@ -286,12 +298,16 @@ class ValueType:
             base = "list"
         elif self.kind == VKind.TUPLE and self.elem_type:
             base = f"tuple:{self.elem_type._to_tag()}"
+        elif self.kind == VKind.DICT and self.value_type:
+            base = f"dict:{self.value_type._to_tag()}"
         self._tag_cache = base
         return base
 
     def __eq__(self, other):
         if isinstance(other, ValueType):
-            return self.kind == other.kind and self.elem_type == other.elem_type
+            return (self.kind == other.kind
+                    and self.elem_type == other.elem_type
+                    and self.value_type == other.value_type)
         if isinstance(other, VKind):
             return self.kind == other
         return NotImplemented
@@ -303,7 +319,7 @@ class ValueType:
         return not result
 
     def __hash__(self):
-        return hash((self.kind, self.elem_type))
+        return hash((self.kind, self.elem_type, self.value_type))
 
     def __repr__(self):
         return f"ValueType({self._to_tag()})"
@@ -365,7 +381,13 @@ class ValueType:
             elem = tag.split(":", 1)[1]
             return ValueType(VKind.LIST, elem_type=ValueType.from_old_tag(elem))
         if tag.startswith("dict:"):
-            return ValueType(VKind.DICT)
+            # The suffix used to be dropped on the floor, so a `dict:list:str`
+            # tag reached the reader as a bare dict and `e = d["k"]` bound a
+            # value of unknown kind.  BUG-DICT-VALUE-CONTAINER-ELEM-KIND-LOST-
+            # ON-BIND.
+            return ValueType(VKind.DICT,
+                             value_type=ValueType.from_old_tag(
+                                 tag.split(":", 1)[1]))
         if tag.startswith("tuple:"):
             elem = tag.split(":", 1)[1]
             return ValueType(VKind.TUPLE, elem_type=ValueType.from_old_tag(elem))
@@ -7567,12 +7589,28 @@ class CodeGen:
         emits a bare "list", which is exactly the behaviour that existed
         before this helper.
         """
-        if isinstance(elt, (ast.List, ast.ListComp)):
-            return "list"
-        if isinstance(elt, ast.Tuple):
-            return "tuple"
+        if isinstance(elt, (ast.List, ast.ListComp, ast.Tuple)):
+            # A *nested* container element used to answer a flat "list", which
+            # says the elements are lists and nothing about what those hold —
+            # and a half-answer is worse here than none, because the reader
+            # defaults the missing inner element to INT and reads a str pointer
+            # as an integer, while a bare "list" declines and routes the read
+            # through the runtime tag.  `len(rows[0][0])` on `[["a", "bb"]]`
+            # answered 0.  BUG-NESTED-LIST-ARG-INNER-ELEM-LOST.
+            # `from_old_tag` already parses arbitrarily nested `list:` chains,
+            # so naming the inner kind costs the reader nothing.
+            head = "tuple" if isinstance(elt, ast.Tuple) else "list"
+            inner = self._csa_list_elem_tag(elt, local_types)
+            return f"{head}:{inner}" if inner else head
         if isinstance(elt, (ast.Dict, ast.DictComp)):
-            return "dict"
+            # `dict:<value>` for the same reason as `list:<elem>` above: a bare
+            # "dict" says the elements are dicts and nothing about their values,
+            # and the reader fills that in with INT.  `len(get_a([{"a": "x"}]))`
+            # answered 0.  BUG-LIST-OF-DICTS-PARAM-VALUE-KIND-LOST.  The
+            # `dict:X` form is not new — `func_param_dict_refinements` and the
+            # str-param arms of the return-tag scan already speak it.
+            vt = self._csa_dict_value_tag(elt, local_types)
+            return f"dict:{vt}" if vt else "dict"
         if isinstance(elt, (ast.Set, ast.SetComp)):
             return "set"
         if isinstance(elt, ast.JoinedStr):
@@ -7605,14 +7643,17 @@ class CodeGen:
             return a if a is not None and a == b else None
         if isinstance(elt, ast.Name):
             tag = local_types.get(elt.id)
-            # Only hand back tags this helper itself could have produced; a
-            # compound tag like "list:str" describes the *name*, not what an
-            # element of a list of those names would be.
+            # Only hand back tags this helper itself could have produced.
             if tag in ("int", "float", "bool", "str", "bytes", "dict", "set",
                        "tuple", "obj", "bigint", "decimal", "complex"):
                 return tag
-            if tag is not None and tag.startswith("list"):
-                return "list"
+            if tag is not None and (tag.startswith("list")
+                                    or tag.startswith("tuple:")):
+                # `xs` typed "list:str" *is* what an element equal to `xs`
+                # holds, so hand the compound tag back whole.  Truncating it to
+                # "list" here was the same half-answer as the literal arm
+                # above, one producer over.
+                return tag
             return None
         if isinstance(elt, ast.Call) and isinstance(elt.func, ast.Name):
             if elt.func.id in self._user_classes:
@@ -7648,20 +7689,35 @@ class CodeGen:
         op = elt.op
         rank = self._CSA_NUM_RANK
         seq = self._CSA_SEQ_TAGS
+        # The sequence and container tests below ask "what *kind* is this",
+        # so they have to look at the tag's head.  They used to compare the
+        # whole tag against a bare-name tuple, which was equivalent only
+        # while `_csa_elem_tag_of` never produced a compound one; once it
+        # started answering `list:int` for a nested list, `[0] * m` stopped
+        # matching the repetition rule, declined, and a function returning
+        # `[[0] * m for _ in range(n)]` lost its element kind entirely — its
+        # rows printed as pointers.  The *full* tag is what gets returned, so
+        # the element kind still survives the operator.
+        _head = (lambda t: t.partition(":")[0] if t else t)
+        lh, rh = _head(lt), _head(rt)
 
         if isinstance(op, ast.Mult):
             # Sequence repetition: `[0] * n`, `"-" * width`.  The count is
             # often a name this pre-scan cannot see, but the repeated side
             # decides the result on its own.
             for a, b in ((lt, rt), (rt, lt)):
-                if a in seq and b in ("int", "bool", None):
+                if _head(a) in seq and _head(b) in ("int", "bool", None):
                     return a
-        if isinstance(op, ast.Add) and lt in seq and lt == rt:
-            return lt  # "a" + "b", [1] + [2], b"x" + b"y"
+        if isinstance(op, ast.Add) and lh in seq and lh == rh:
+            # "a" + "b", [1] + [2], b"x" + b"y".  Two sequences of the same
+            # kind concatenate to that kind; the element kind survives only
+            # when both sides agree on it, so `list:int + list:str` answers
+            # the bare head rather than picking a side.
+            return lt if lt == rt else lh
         if isinstance(op, (ast.BitOr, ast.BitAnd, ast.BitXor, ast.Sub)):
-            if lt == "set" and rt == "set":
+            if lh == "set" and rh == "set":
                 return "set"
-            if isinstance(op, ast.BitOr) and lt == "dict" and rt == "dict":
+            if isinstance(op, ast.BitOr) and lh == "dict" and rh == "dict":
                 return "dict"
 
         if lt in rank and rt in rank:
@@ -7708,7 +7764,11 @@ class CodeGen:
                 return None   # a bare "list" is exactly the missing kind
             head, _, elem = tag.partition(":")
             if head in ("list", "tuple", "set", "ptr"):
-                return elem if ":" not in elem else None
+                # The nested case used to decline.  It no longer needs to:
+                # `from_old_tag` parses a `list:list:str` chain to the same
+                # depth it is written, so handing the whole suffix back keeps
+                # the inner kind that declining threw away.
+                return elem
             return None
         if isinstance(it, ast.Call) and isinstance(it.func, ast.Name):
             if it.func.id == "range":
@@ -7717,6 +7777,22 @@ class CodeGen:
                                "frozenset", "iter") and it.args):
                 return self._csa_iter_elem_tag(it.args[0], local_types)
         return None
+
+    def _csa_dict_value_tag(self, node: ast.expr,
+                            local_types: dict[str, str]) -> str | None:
+        """The common tag of a dict literal's *values*, or None.
+
+        Same contract as `_csa_list_elem_tag`: all values must agree, because
+        one tag has to describe every read out of the dict, and a wrong one is
+        worse than no information.  A `**spread` (a None key) makes the values
+        unknowable from here, so it declines.
+        """
+        if not isinstance(node, ast.Dict) or not node.values:
+            return None
+        if any(k is None for k in node.keys):
+            return None
+        tags = {self._csa_elem_tag_of(v, local_types) for v in node.values}
+        return tags.pop() if len(tags) == 1 and None not in tags else None
 
     def _csa_list_elem_tag(self, node: ast.expr,
                            local_types: dict[str, str]) -> str | None:
@@ -7951,7 +8027,21 @@ class CodeGen:
                             elif _cn in _func_ret_types and _tk(_func_ret_types[_cn]) == VKind.FLOAT:
                                 local_types[tgt] = "float"
                                 _changed = True
-            # Detect list element types from append patterns
+            # Detect list element types from append patterns.
+            #
+            # One classifier, and every append votes.  This was another
+            # subset-recognising `isinstance` chain — and, like its two
+            # siblings below, it wrote the answer straight into the map, so
+            # the *last* append it happened to recognise won outright:
+            # `x.append(None); x.append("text")` recorded `list:str`, because
+            # None has no arm and so nothing was there to disagree, and the
+            # None came home as a NULL pointer and printed `(null)`.
+            # BUG-APPEND-ELEM-KIND-LAST-WRITE-WINS.
+            #
+            # Two phases rather than one so the answer does not depend on the
+            # order `ast.walk` happens to reach the appends in.
+            _lt_votes: dict[str, str | None] = {}
+            _lt_heads: dict[str, str] = {}
             for n in ast.walk(fnode):
                 if (isinstance(n, ast.Expr) and isinstance(n.value, ast.Call)
                         and isinstance(n.value.func, ast.Attribute)
@@ -7962,52 +8052,30 @@ class CodeGen:
                         and len(n.value.args) == 1):
                     arg = n.value.args[0]
                     var = n.value.func.value.id
-                    if isinstance(arg, ast.Tuple):
-                        local_types[var] = "list:tuple"
-                    elif isinstance(arg, (ast.List, ast.ListComp)):
-                        # Detect inner list element types.
-                        # Accept Constant(float), Constant(int), UnaryOp(-, Constant),
-                        # BinOp with float operands — all produce numeric values.
-                        def _is_numeric_elt(e):
-                            if isinstance(e, ast.Constant) and isinstance(e.value, (int, float)):
-                                return True
-                            if (isinstance(e, ast.UnaryOp)
-                                    and isinstance(e.operand, ast.Constant)
-                                    and isinstance(e.operand.value, (int, float))):
-                                return True
-                            if isinstance(e, ast.BinOp):
-                                return True  # computed expression
-                            return False
-                        def _has_float_elt(e):
-                            if isinstance(e, ast.Constant) and isinstance(e.value, float):
-                                return True
-                            if (isinstance(e, ast.UnaryOp)
-                                    and isinstance(e.operand, ast.Constant)
-                                    and isinstance(e.operand.value, float)):
-                                return True
-                            if isinstance(e, ast.BinOp):
-                                return True  # computed → likely float
-                            return False
-                        if (isinstance(arg, ast.List) and arg.elts
-                                and all(_is_numeric_elt(e) for e in arg.elts)
-                                and any(_has_float_elt(e) for e in arg.elts)):
-                            local_types[var] = "list:list:float"
-                        else:
-                            local_types[var] = "list:list"
-                    elif isinstance(arg, (ast.Dict, ast.DictComp)):
-                        local_types[var] = "list:dict"
-                    elif isinstance(arg, ast.Constant) and isinstance(arg.value, str):
-                        local_types[var] = "list:str"
-                    elif isinstance(arg, ast.Constant) and isinstance(arg.value, float):
-                        local_types[var] = "list:float"
-                    elif isinstance(arg, ast.Name) and arg.id in local_types and _tk(local_types[arg.id]) == VKind.FLOAT:
-                        local_types[var] = "list:float"
+                    _lt_heads.setdefault(
+                        var, local_types[var].partition(":")[0])
+                    _el = self._csa_elem_tag_of(arg, local_types)
+                    if var not in _lt_votes:
+                        _lt_votes[var] = _el
+                    elif _lt_votes[var] != _el:
+                        # Disagreement between two *known* kinds is "mixed",
+                        # a complete answer meaning "dispatch at runtime".
+                        # Disagreement involving an unclassifiable append is
+                        # no answer at all, and the bare head is right.
+                        _lt_votes[var] = (None if _lt_votes[var] is None
+                                          or _el is None else "mixed")
+            for var, _el in _lt_votes.items():
+                local_types[var] = (f"{_lt_heads[var]}:{_el}" if _el
+                                    else _lt_heads[var])
             # Mini prescan: detect list-append element types within function
             # body. Needed so `return result` where `result.append(row)`
             # and `row = []` gets tagged as "list:list" not just "list".
             _fn_empty_lists: set[str] = set()
             _fn_list_vars: set[str] = set()
             _fn_append_types: dict[str, str] = {}
+            # Vars with an append this scan cannot classify: they get no
+            # element kind at all, no matter what their other appends say.
+            _fn_append_bad: set[str] = set()
             for n in ast.walk(fnode):
                 if (isinstance(n, ast.Assign) and len(n.targets) == 1
                         and isinstance(n.targets[0], ast.Name)
@@ -8024,23 +8092,29 @@ class CodeGen:
                         and len(n.value.args) == 1):
                     var = n.value.func.value.id
                     arg = n.value.args[0]
-                    if isinstance(arg, ast.Tuple):
-                        _fn_append_types[var] = "tuple"
-                    elif isinstance(arg, (ast.List, ast.ListComp)):
-                        _fn_append_types[var] = "list"
-                    elif isinstance(arg, ast.Name) and arg.id in _fn_list_vars:
-                        _fn_append_types[var] = "list"
-                    elif isinstance(arg, (ast.Dict, ast.DictComp)):
-                        _fn_append_types[var] = "dict"
-                    elif isinstance(arg, ast.Constant) and isinstance(arg.value, str):
-                        _fn_append_types[var] = "str"
-                    elif isinstance(arg, ast.Constant) and isinstance(arg.value, float):
-                        _fn_append_types[var] = "float"
-                    elif isinstance(arg, ast.Name) and arg.id in local_types and _tk(local_types[arg.id]) == VKind.FLOAT:
-                        _fn_append_types[var] = "float"
-                    elif isinstance(arg, ast.Call) and isinstance(arg.func, ast.Name):
-                        if arg.func.id in self._user_classes:
-                            _fn_append_types[var] = "obj"
+                    # One classifier, and every append gets a vote.  This was
+                    # a seventh hand-rolled `isinstance` chain recognising its
+                    # own subset of kinds, and — worse than the subset — it
+                    # was **last-write-wins**: `x.append(None); x.append("t")`
+                    # recorded `str`, because the None arm did not exist to
+                    # disagree with the str one, so the list claimed to hold
+                    # strs and the None came back as a NULL pointer and
+                    # printed `(null)`.  A list built from appends that
+                    # disagree is `mixed`, and one with an append this scan
+                    # cannot classify has no element kind at all — declining
+                    # routes the read through the runtime tag, which is right.
+                    # BUG-APPEND-ELEM-KIND-LAST-WRITE-WINS.
+                    _at = self._csa_elem_tag_of(arg, local_types)
+                    if _at is None and isinstance(arg, ast.Name) and \
+                            arg.id in _fn_list_vars:
+                        _at = "list"  # a local list literal the scan saw
+                    if _at is None:
+                        _fn_append_bad.add(var)
+                        _fn_append_types.pop(var, None)
+                    elif var not in _fn_append_bad:
+                        _prev = _fn_append_types.get(var)
+                        _fn_append_types[var] = (
+                            _at if _prev is None or _prev == _at else "mixed")
 
             for n in ast.walk(fnode):
                 if isinstance(n, ast.Return) and n.value is not None:
@@ -8545,28 +8619,16 @@ class CodeGen:
                 elif isinstance(arg, ast.Dict):
                     # Refine the dict tag with its value type when the literal
                     # has uniform values — propagates so callee's d[k] can
-                    # unwrap to the correct bare LLVM type.
-                    if arg.values and all(
-                            isinstance(v, ast.Constant)
-                            and isinstance(v.value, int)
-                            and not isinstance(v.value, bool)
-                            for v in arg.values):
-                        arg_types.append("dict:int")
-                    elif arg.values and all(
-                            isinstance(v, ast.Constant)
-                            and isinstance(v.value, str)
-                            for v in arg.values):
-                        arg_types.append("dict:str")
-                    elif arg.values and all(
-                            isinstance(v, (ast.List, ast.ListComp))
-                            for v in arg.values):
-                        arg_types.append("dict:list")
-                    elif arg.values and all(
-                            isinstance(v, (ast.Dict, ast.DictComp))
-                            for v in arg.values):
-                        arg_types.append("dict:dict")
-                    else:
-                        arg_types.append("dict")
+                    # unwrap to the correct bare LLVM type.  This was four
+                    # hand-rolled `all(isinstance(...))` tests recognising int,
+                    # str, list and dict values, i.e. the same subset-per-copy
+                    # classifier `_csa_list_literal_tag` replaced on the list
+                    # side: every kind it did not name — float, bytes, bigint,
+                    # a *nested* list — fell to a bare "dict" whose consumer
+                    # fills the value kind in with INT.
+                    _dvt = self._csa_dict_value_tag(
+                        arg, {**var_types, **_local_vt})
+                    arg_types.append(f"dict:{_dvt}" if _dvt else "dict")
                 elif (isinstance(arg, ast.Attribute)
                       and isinstance(arg.value, ast.Name)
                       and arg.value.id in obj_classes):
@@ -10065,27 +10127,13 @@ class CodeGen:
                         var_types[tgt.id] = self._csa_list_literal_tag(
                             node.value, var_types)
                     elif isinstance(node.value, (ast.Dict, ast.DictComp)):
-                        # Refine dict tag with value type when literal
-                        # has uniform values.
-                        if (isinstance(node.value, ast.Dict)
-                                and node.value.values
-                                and all(isinstance(v, ast.Constant)
-                                        and isinstance(v.value, int)
-                                        and not isinstance(v.value, bool)
-                                        for v in node.value.values)):
-                            var_types[tgt.id] = "dict:int"
-                        elif (isinstance(node.value, ast.Dict)
-                                and node.value.values
-                                and all(isinstance(v, (ast.List, ast.ListComp))
-                                        for v in node.value.values)):
-                            var_types[tgt.id] = "dict:list"
-                        elif (isinstance(node.value, ast.Dict)
-                                and node.value.values
-                                and all(isinstance(v, (ast.Dict, ast.DictComp))
-                                        for v in node.value.values)):
-                            var_types[tgt.id] = "dict:dict"
-                        else:
-                            var_types[tgt.id] = "dict"
+                        # Refine dict tag with value type when the literal has
+                        # uniform values.  The third copy of the same
+                        # subset-recognising classifier; see the call-argument
+                        # loop for why they all became one.
+                        _dvt = self._csa_dict_value_tag(node.value, var_types)
+                        var_types[tgt.id] = (
+                            f"dict:{_dvt}" if _dvt else "dict")
                     elif isinstance(node.value, ast.Set):
                         var_types[tgt.id] = "list"
                     elif isinstance(node.value, ast.Tuple):
@@ -10274,6 +10322,20 @@ class CodeGen:
         # Store shared context for use by helper methods
         self._csa_class_parents = class_parents
         self._csa_func_asts = func_asts
+        # The same ASTs again, keyed `Cls.meth`.  `_func_ret_types` is keyed by
+        # *bare* name, so a method already has an entry there — but under a key
+        # that collides with a module function of the same name and that no
+        # method call site can safely trust.  `c.m()[1]` therefore had no
+        # element kind at all and fell to the INT default, while the identical
+        # body in a plain function was correct: BUG-METHOD-RETURN-ELEM-KIND-LOST.
+        # Running the existing return-type analysis over these keys as well
+        # gives a method the same element-carrying record a function has,
+        # without a second implementation of "what does this body return".
+        method_asts: dict[str, ast.FunctionDef] = {}
+        for _cname, _cnode in self._csa_class_asts.items():
+            for _item in _cnode.body:
+                if isinstance(_item, ast.FunctionDef):
+                    method_asts[f"{_cname}.{_item.name}"] = _item
         # Element tags of sequence literals, keyed by the name they were bound
         # to — the only evidence a `f(*seq)` call site can offer about the
         # parameters it fills.  See _csa_splat_elem_tag.
@@ -10322,8 +10384,12 @@ class CodeGen:
 
         var_types = self._csa_build_var_types(tree)
 
+        # `Cls.meth` keys ride along in the same pass.  They cannot disturb the
+        # bare-name entries — the pass keys everything it writes by the name it
+        # was handed — and the module-level propagation loop at its end matches
+        # on `node.value.func.id`, which is never a dotted name.
         _func_ret_types = self._csa_propagate_ret_types(
-            tree, func_asts, var_types)
+            tree, {**func_asts, **method_asts}, var_types)
         self._csa_var_types = var_types
 
         # Track pyobj variables from bridge imports: `t = Template(...)` and
@@ -11919,12 +11985,15 @@ class CodeGen:
                     # element container (list:str / list:list / list:dict /
                     # dict:list / dict:dict / dict:str) → pointer return.
                     # Also: slice of a str param → str.
-                    if (isinstance(n.value, ast.Subscript)
-                            and isinstance(n.value.value, ast.Name)
-                            and n.value.value.id in param_names):
-                        pidx = param_names.index(n.value.value.id)
-                        if pidx < len(call_types) and call_types[pidx] is not None:
-                            ct = call_types[pidx]
+                    # The base may itself be an index into the param — `rows[0]`
+                    # in `return rows[0][0]` — which had no arm at all, so a
+                    # `list:list:str` parameter returned its str element through
+                    # an i64 and `len()` measured the truncated pointer.
+                    # BUG-NESTED-LIST-ARG-INNER-ELEM-LOST.
+                    if isinstance(n.value, ast.Subscript):
+                        ct, _root = self._ret_param_base_tag(
+                            n.value.value, param_names, call_types)
+                        if _root is not None and ct is not None:
                             _ctk = self._tag_kind(ct)
                             _ek = self._tag_elem_kind(ct)
                             # The test is whether the *element* is a pointer,
@@ -12289,13 +12358,19 @@ class CodeGen:
                                     and call_types[pidx] in ("dict:str", "list:str")):
                                 returns_str = True
                                 break
-                elif (isinstance(n.value, ast.Subscript)
-                        and isinstance(n.value.value, ast.Name)
-                        and n.value.value.id in param_names):
-                    # Subscript on a param whose element type is known
-                    pidx = param_names.index(n.value.value.id)
-                    if pidx < len(call_types) and call_types[pidx] is not None:
-                        ct = call_types[pidx]
+                elif isinstance(n.value, ast.Subscript):
+                    # Subscript on a param whose element type is known.
+                    #
+                    # Only a *bare* param base had an arm here, so
+                    # `return rows[0][0]` matched nothing at all and the i8_ptr
+                    # branch below fell through to its "ptr" default — list —
+                    # even when the call site had proved the parameter to be
+                    # `list:list:str`.  `len(inner_first([["a", "bb"]]))`
+                    # measured a str as a list and answered 0.
+                    # BUG-NESTED-LIST-ARG-INNER-ELEM-LOST.
+                    ct, _root = self._ret_param_base_tag(
+                        n.value.value, param_names, call_types)
+                    if _root is not None and ct is not None:
                         _ek = self._tag_elem_kind(ct)
                         if _ek == VKind.STR:
                             returns_str = True
@@ -12325,7 +12400,7 @@ class CodeGen:
                         elif (self._tag_kind(ct) == VKind.STR
                                 and isinstance(n.value.slice, ast.Slice)):
                             returns_str = True
-                    elif n.value.value.id not in _ann_params:
+                    elif _root is not None and _root not in _ann_params:
                         # An element of an untyped container is itself of
                         # unknown kind — `s[0]` is a str when the caller passed
                         # a str and an int when it passed a list of ints.  The
@@ -12554,6 +12629,42 @@ class CodeGen:
             ret_tag = "mixed"
 
         return ret_tag
+
+    _PEELABLE_HEADS = ("list", "tuple", "ptr", "dict", "set")
+
+    def _ret_param_base_tag(self, base: ast.expr, param_names: list[str],
+                            call_types: list) -> tuple[str | None, str | None]:
+        """The tag of `base`, when it is a parameter or an index chain into one.
+
+        Returns `(tag, root_param_name)`.  A `root` of None means `base` is not
+        rooted at a parameter at all; a `tag` of None with a real root means
+        "a parameter, but of unknown kind" — the caller's cue to fall back to
+        the runtime-tagged path rather than to invent one.
+
+        The chain is peeled one `:` level per index, which is exactly what the
+        call site's compound tag records: `rows` typed `list:list:str` makes
+        `rows[0]` a `list:str`.  Slices are not peeled — `xs[1:]` is the same
+        kind as `xs` — so the loop stops at one, and the caller's existing
+        slice arm still sees it.
+        """
+        chain = 0
+        node = base
+        while (isinstance(node, ast.Subscript)
+               and not isinstance(node.slice, ast.Slice)):
+            chain += 1
+            node = node.value
+        if not (isinstance(node, ast.Name) and node.id in param_names):
+            return None, None
+        pidx = param_names.index(node.id)
+        tag = call_types[pidx] if pidx < len(call_types) else None
+        for _ in range(chain):
+            if tag is None:
+                return None, node.id
+            head, sep, rest = str(tag).partition(":")
+            if not sep or head not in self._PEELABLE_HEADS:
+                return None, node.id
+            tag = rest
+        return tag, node.id
 
     def _duf_propagate_mixed_ret_tags(self) -> None:
         """Spread a `mixed` return tag through plain forwarding wrappers.
@@ -22329,7 +22440,18 @@ class CodeGen:
             elif method == "new_child":
                 if self._is_chainmap_expr(node.func.value):
                     return ValueType(VKind.CHAINMAP)
-            # User class method return: check method return type
+            # User class method return: check method return type.
+            #
+            # The recorded `Cls.meth` tag is asked first, because it is the only
+            # one of these that carries an element kind.  `_method_returns_list`
+            # answers a bare yes, and the arm below turned that into
+            # `elem_type=INT` — a claim, not the absence of one, so `r = c.m()`
+            # read every element of a list of strings back as an integer and
+            # `len(r[1])` measured a pointer.  BUG-METHOD-RETURN-ELEM-KIND-LOST.
+            _mrt = self._method_call_ret_vtype(node)
+            if (_mrt is not None and _mrt.elem_type is not None
+                    and _mrt.kind in _LIST_LIKE):
+                return _mrt
             ret_type = self._find_method_return_type(node.func.value, method)
             if ret_type is not None and isinstance(ret_type, ir.PointerType):
                 if self._method_returns_list(node.func.value, method):
@@ -22351,6 +22473,29 @@ class CodeGen:
                         return ValueType(VKind.LIST, elem_type=elem)
                 return ValueType(VKind.LIST, elem_type=ValueType(VKind.INT))
         return None
+
+    def _dict_literal_value_type(self, node: ast.expr) -> 'ValueType | None':
+        """The common value type of a dict literal, or None when they disagree.
+
+        Deliberately mirrors `_infer_list_elem_type`'s contract: one tag has to
+        describe every read out of the dict, so a literal whose values disagree
+        declines rather than picking the first.  Declining is safe — the read
+        then goes through the runtime tag — whereas naming the wrong kind reads
+        a pointer as an integer.
+        """
+        if not isinstance(node, ast.Dict) or not node.values:
+            return None
+        if any(k is None for k in node.keys):
+            return None  # `{**other}` — the values are not all visible here
+        vts = set()
+        for v in node.values:
+            vt = self._infer_type_tag(v, None)
+            if vt is None or vt.kind in (VKind.UNKNOWN, VKind.FVALUE):
+                return None
+            vts.add(vt)
+            if len(vts) > 1:
+                return None
+        return vts.pop()
 
     def _infer_type_tag(self, node: ast.expr, value: ir.Value) -> 'ValueType':
         """Infer the Python type from an AST node and LLVM value."""
@@ -22537,7 +22682,13 @@ class CodeGen:
             elem_type = self._infer_list_elem_type(node)
             return ValueType(VKind.LIST, elem_type=elem_type)
         elif isinstance(node, (ast.Dict, ast.DictComp)):
-            return ValueType(VKind.DICT)
+            # The value type, when the literal's values agree on one.  The list
+            # arm above has recorded its element type since the beginning; the
+            # dict arm recorded nothing at all, so `e = d["k"]` had no kind to
+            # inherit even when the literal was three lines up.
+            # BUG-DICT-VALUE-CONTAINER-ELEM-KIND-LOST-ON-BIND.
+            _dvt = self._dict_literal_value_type(node)
+            return ValueType(VKind.DICT, value_type=_dvt)
         elif isinstance(node, ast.Tuple):
             # The element type comes from the same classifier the list arm
             # above uses — `_infer_list_elem_type` has handled `ast.Tuple`
@@ -22762,6 +22913,12 @@ class CodeGen:
                     # defined for precisely this and had never once been used.
                     # BUG-TUPLE-SUBSCRIPT-ELEM-KIND-LOST.
                     return _vt.elem_type  # element type is already ValueType
+                if _vt.kind in _DICT_LIKE and _vt.value_type is not None:
+                    # `d[k]` is a *value*, and the recorded value type carries
+                    # its element kind too, so `e = d["k"]` binds a
+                    # `list:str` rather than a kindless pointer.
+                    # BUG-DICT-VALUE-CONTAINER-ELEM-KIND-LOST-ON-BIND.
+                    return _vt.value_type
             elif isinstance(node.value, (ast.Call, ast.Subscript,
                                         ast.Attribute)):
                 # Only a *name* had an arm here, so every other way of
@@ -22995,6 +23152,9 @@ class CodeGen:
         if not empty_list_vars:
             return
 
+        # Lists with an append this scan cannot classify.  They keep no
+        # element kind at all, whatever their other appends said.
+        _append_unknown: set[str] = set()
         # Walk all statements (including nested in loops/if) looking for .append() calls
         for stmt in stmts:
             for node in ast.walk(stmt):
@@ -23009,16 +23169,26 @@ class CodeGen:
                     continue
                 var_name = call.func.value.id
                 arg = call.args[0]
+                # Every append votes, and they have to agree.  This chain used
+                # to write straight into `self._list_append_types`, so the
+                # *last* append it happened to recognise won outright:
+                # `x.append(None); x.append("text")` recorded STR — there is
+                # no arm for None, so nothing was there to disagree — and the
+                # None came back as a NULL pointer and printed `(null)`.  A
+                # list whose appends disagree is MIXED; one with an append
+                # this scan cannot classify has no element kind at all, and
+                # declining is safe because the read then goes through the
+                # runtime tag.  BUG-APPEND-ELEM-KIND-LAST-WRITE-WINS.
+                _vt: 'ValueType | None' = None
                 # Bytes appends had no arm anywhere in this chain, so a list
                 # built by `parts.append(b[i:i+2])` was typed list:int and the
                 # loop that read it back got raw pointers.
                 # BUG-BYTES-IN-LIST-TAG-LOST.
                 if self._is_bytes_expr(arg, {**local_var_types,
                                              **loop_var_types}):
-                    self._list_append_types[var_name] = ValueType(VKind.BYTES)
-                    continue
+                    _vt = ValueType(VKind.BYTES)
                 # Infer what type is being appended
-                if isinstance(arg, (ast.List, ast.ListComp)):
+                elif isinstance(arg, (ast.List, ast.ListComp)):
                     # Detect inner list element type for list-of-lists
                     def _has_any_float(elts):
                         for e in elts:
@@ -23030,36 +23200,36 @@ class CodeGen:
                                 return True
                         return False
                     if isinstance(arg, ast.List) and arg.elts and _has_any_float(arg.elts):
-                        self._list_append_types[var_name] = ValueType(VKind.LIST, elem_type=ValueType(VKind.FLOAT))
+                        _vt = ValueType(VKind.LIST, elem_type=ValueType(VKind.FLOAT))
                     else:
-                        self._list_append_types[var_name] = ValueType(VKind.LIST)
+                        _vt = ValueType(VKind.LIST)
                 elif isinstance(arg, ast.Tuple):
                     # Appending a tuple literal — tuple elements
-                    self._list_append_types[var_name] = ValueType(VKind.TUPLE)
+                    _vt = ValueType(VKind.TUPLE)
                 elif isinstance(arg, (ast.Dict, ast.DictComp)):
                     # Appending a dict literal — dict elements
-                    self._list_append_types[var_name] = ValueType(VKind.DICT)
+                    _vt = ValueType(VKind.DICT)
                 elif (isinstance(arg, ast.Subscript)
                       and isinstance(arg.value, ast.Name)
                       and arg.value.id in _str_val_dicts):
                     # Appending d[k] where d has all-string values
-                    self._list_append_types[var_name] = ValueType(VKind.STR)
+                    _vt = ValueType(VKind.STR)
                 elif isinstance(arg, ast.Name) and (arg.id in self._list_append_types or arg.id in list_vars):
                     # Appending a variable that is a list
-                    self._list_append_types[var_name] = ValueType(VKind.LIST)
+                    _vt = ValueType(VKind.LIST)
                 elif isinstance(arg, ast.Call) and isinstance(arg.func, ast.Name):
                     _fn = arg.func.id
                     if _fn in self._user_classes:
-                        self._list_append_types[var_name] = ValueType(VKind.OBJ)
+                        _vt = ValueType(VKind.OBJ)
                     elif _fn in self._user_functions:
                         _rt = self._user_functions[_fn].ret_tag
                         _rtk = self._tag_kind(_rt)
                         if _rtk in (VKind.FLOAT, VKind.STR):
-                            self._list_append_types[var_name] = ValueType(_rtk)
+                            _vt = ValueType(_rtk)
                     elif _fn == "float":
-                        self._list_append_types[var_name] = ValueType(VKind.FLOAT)
+                        _vt = ValueType(VKind.FLOAT)
                     elif _fn == "str":
-                        self._list_append_types[var_name] = ValueType(VKind.STR)
+                        _vt = ValueType(VKind.STR)
                 elif (isinstance(arg, ast.Call)
                       and isinstance(arg.func, ast.Attribute)
                       and isinstance(arg.func.value, ast.Name)):
@@ -23068,13 +23238,13 @@ class CodeGen:
                     if (_mod in _imported_modules
                             and _mod not in self._NATIVE_MODULES
                             and _mod not in self._user_classes):
-                        self._list_append_types[var_name] = ValueType(VKind.PYOBJ)
+                        _vt = ValueType(VKind.PYOBJ)
                 elif isinstance(arg, ast.Constant):
                     # String/float/bool constants propagate to element type
                     if isinstance(arg.value, str):
-                        self._list_append_types[var_name] = ValueType(VKind.STR)
+                        _vt = ValueType(VKind.STR)
                     elif isinstance(arg.value, float):
-                        self._list_append_types[var_name] = ValueType(VKind.FLOAT)
+                        _vt = ValueType(VKind.FLOAT)
                 elif isinstance(arg, ast.BinOp):
                     # Arithmetic expression: x.append(a * 1.0) or
                     # x.append(0.0 - val) — detect float from operands
@@ -23091,19 +23261,19 @@ class CodeGen:
                                     and self._tag_kind(loop_var_types[_operand.id]) == VKind.FLOAT):
                                 _is_float_binop = True
                     if _is_float_binop:
-                        self._list_append_types[var_name] = ValueType(VKind.FLOAT)
+                        _vt = ValueType(VKind.FLOAT)
                 elif isinstance(arg, ast.UnaryOp) and isinstance(arg.op, ast.USub):
                     # Negation: x.append(-val) — detect float from operand
                     _inner = arg.operand
                     if (isinstance(_inner, ast.Constant)
                             and isinstance(_inner.value, float)):
-                        self._list_append_types[var_name] = ValueType(VKind.FLOAT)
+                        _vt = ValueType(VKind.FLOAT)
                     elif (isinstance(_inner, ast.Name)
                           and _inner.id in local_var_types
                           and self._tag_kind(local_var_types[_inner.id]) == VKind.FLOAT):
-                        self._list_append_types[var_name] = ValueType(VKind.FLOAT)
+                        _vt = ValueType(VKind.FLOAT)
                 elif isinstance(arg, ast.JoinedStr):
-                    self._list_append_types[var_name] = ValueType(VKind.STR)
+                    _vt = ValueType(VKind.STR)
                 elif isinstance(arg, ast.Name):
                     # Appending a known-typed variable (loop var from str
                     # iteration, previously-assigned str var, etc.).
@@ -23111,19 +23281,41 @@ class CodeGen:
                     if arg.id in loop_var_types:
                         _lvk = self._tag_kind(loop_var_types[arg.id])
                         if _lvk in _ELEM_KINDS:
-                            self._list_append_types[var_name] = ValueType(_lvk)
+                            _vt = ValueType(_lvk)
                     elif arg.id in local_var_types:
                         _lvk = self._tag_kind(local_var_types[arg.id])
                         if _lvk in _ELEM_KINDS:
-                            self._list_append_types[var_name] = ValueType(_lvk)
+                            _vt = ValueType(_lvk)
                     elif arg.id in self.variables:
                         _vk = self._var_kind(arg.id)
                         if _vk == VKind.STR:
-                            self._list_append_types[var_name] = ValueType(VKind.STR)
+                            _vt = ValueType(VKind.STR)
                         elif _vk == VKind.FLOAT:
-                            self._list_append_types[var_name] = ValueType(VKind.FLOAT)
+                            _vt = ValueType(VKind.FLOAT)
                         elif _vk == VKind.PYOBJ:
-                            self._list_append_types[var_name] = ValueType(VKind.PYOBJ)
+                            _vt = ValueType(VKind.PYOBJ)
+
+                # Merge this append's vote with the ones already cast.  An
+                # append nothing above recognised (`_vt is None`) is not
+                # "no news" — it is an element of unknown kind, which is a
+                # reason to forget what the other appends said, not to keep it.
+                if _vt is None:
+                    _append_unknown.add(var_name)
+                    self._list_append_types.pop(var_name, None)
+                elif var_name not in _append_unknown:
+                    _prev = self._list_append_types.get(var_name)
+                    if _prev is None or _prev == _vt:
+                        self._list_append_types[var_name] = _vt
+                    elif _prev.kind == _vt.kind:
+                        # Same kind, disagreeing element kind: keep the kind
+                        # and drop the element, rather than calling the whole
+                        # thing mixed.  `rows.append([1]); rows.append([2.0])`
+                        # is still a list of lists.
+                        self._list_append_types[var_name] = ValueType(
+                            _prev.kind)
+                    else:
+                        self._list_append_types[var_name] = ValueType(
+                            VKind.MIXED)
 
     def _infer_list_elem_type(self, node: ast.expr) -> 'ValueType':
         """Infer the element type of a list expression.
@@ -35925,6 +36117,40 @@ class CodeGen:
             _found = _vt
         return _found
 
+    def _method_call_ret_vtype(self, node: ast.expr) -> 'ValueType | None':
+        """The declared return type of `recv.meth()`, or None.
+
+        `_func_ret_types` records what a body returns, element kind included,
+        but every consumer looked it up by the callee's *bare* name — which a
+        method call cannot use, because two classes may each define `m` and a
+        module function may as well.  So `c.m()[1]` had no element kind and
+        fell to the INT default, measuring a pointer, while `g()[1]` on the
+        identical body was right: BUG-METHOD-RETURN-ELEM-KIND-LOST.  The CSA
+        pass now also records methods under `Cls.meth`; this resolves the
+        receiver's class and asks for that key, walking the MRO because an
+        inherited method is defined on the parent.
+        """
+        if not (isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)):
+            return None
+        recv = node.func.value
+        if isinstance(recv, ast.Name) and recv.id == "self":
+            cls_name = self._current_class
+        else:
+            cls_name = self._infer_object_class(recv)
+        if not cls_name:
+            return None
+        frt = getattr(self, "_func_ret_types", None) or {}
+        seen: set[str] = set()
+        while cls_name and cls_name not in seen:
+            seen.add(cls_name)
+            tag = frt.get(f"{cls_name}.{node.func.attr}")
+            if tag is not None:
+                return ValueType.from_old_tag(tag)
+            ci = self._user_classes.get(cls_name)
+            cls_name = ci.parent_name if ci else None
+        return None
+
     def _get_list_elem_type(self, node: ast.expr) -> 'ValueType':
         """Get the element type of a list expression."""
         # Object attribute holding a container: the recorded type carries the
@@ -36129,6 +36355,13 @@ class CodeGen:
                     rt = frt.get(node.func.id, "")
                     if self._tag_kind(rt) == VKind.TUPLE and ":" in str(rt):
                         return ValueType.from_old_tag(rt.split(":", 1)[1])
+        # The same question for `recv.meth()`.  Only `ast.Name` callees had an
+        # arm above, so a method's element kind was thrown away even though the
+        # analysis had computed it.  BUG-METHOD-RETURN-ELEM-KIND-LOST.
+        _mrt = self._method_call_ret_vtype(node)
+        if (_mrt is not None and _mrt.kind in _LIST_LIKE
+                and _mrt.elem_type is not None):
+            return _mrt.elem_type
         # Global variable whose element type isn't in the tag: look up the
         # module-level AST definition and infer element type from the literal.
         if isinstance(node, ast.Name):
@@ -50112,6 +50345,41 @@ class CodeGen:
                         return None
         return None
 
+    def _literal_container_tag(self, node: ast.expr, head: str,
+                               parts: list, keys: list | None = None
+                               ) -> str:
+        """`head:<inner>` when a literal's parts agree on one kind, else `head`.
+
+        The same contract as `_csa_list_elem_tag` and `_dict_literal_value_type`
+        one layer up: a single tag has to describe *every* read out of the
+        container, so parts that disagree — or any part whose kind is not
+        statically known — mean the inner kind is declined rather than guessed
+        from the first one.  Declining is safe (the read falls back to the
+        runtime tag); naming the wrong kind is not.
+
+        Recursing through `_infer_constant_value_type` rather than
+        `_infer_type_tag` keeps this a pure AST classifier with no emit-time
+        state or side effects, and gives nesting for free:
+        `[["a", "bb"]]` answers `list:list:str`, which `from_old_tag` parses
+        back to the same depth.
+        """
+        if not parts:
+            return head
+        if keys is not None and any(k is None for k in keys):
+            return head  # `{**other}` — the values are not all visible here
+        tags = {self._infer_constant_value_type(p) for p in parts}
+        if None in tags:
+            return head  # some part's kind is not statically known
+        if len(tags) == 1:
+            return f"{head}:{tags.pop()}"
+        # Parts of differing known kinds.  "mixed" is a *complete* answer, not
+        # a half one — it tells the reader to dispatch on the runtime tag —
+        # so it belongs here rather than the bare head, which would be read as
+        # "elements of one unnamed kind" and completed with INT.
+        # `{"k": ["a", [1, 2, 3]]}` is this case, and `len(e[1])` on its value
+        # measured a list pointer as an integer and answered 0.
+        return f"{head}:mixed"
+
     def _infer_constant_value_type(self, node: ast.expr) -> str | None:
         """Infer the Python type tag of a simple expression at AST level.
         Used to build per-key type maps for dict literals. Returns one of
@@ -50136,12 +50404,28 @@ class CodeGen:
                 return "int"
         if isinstance(node, ast.JoinedStr):
             return "str"
-        if isinstance(node, (ast.Dict, ast.DictComp)):
+        # Container values name their element kind when the literal agrees on
+        # one.  A bare "dict"/"list" names the outer kind and nothing about
+        # what it holds, and that half-answer is worse here than no answer at
+        # all: the reader completes the missing element with VKind.INT and
+        # reads a str pointer as an integer, whereas declining entirely routes
+        # the read through the runtime tag and is correct.  `d = {"k": ["a",
+        # "bcd"]}; e = d["k"]` recorded "list" for key "k", which beat every
+        # other inference in `_infer_type_tag`, so `len(e[1])` answered 0
+        # while the direct `len(d["k"][1])` was right.
+        # BUG-DICT-VALUE-CONTAINER-ELEM-KIND-LOST-ON-BIND.
+        if isinstance(node, ast.Dict):
+            return self._literal_container_tag(node, "dict", node.values,
+                                               node.keys)
+        if isinstance(node, ast.DictComp):
             return "dict"
-        if isinstance(node, (ast.List, ast.ListComp)):
+        if isinstance(node, ast.List):
+            return self._literal_container_tag(node, "list", node.elts)
+        if isinstance(node, ast.ListComp):
             return "list"
         if isinstance(node, ast.Tuple):
-            return "list"  # tuples stored as lists in FpyValue
+            # tuples stored as lists in FpyValue
+            return self._literal_container_tag(node, "list", node.elts)
         if isinstance(node, (ast.Set, ast.SetComp)):
             return "set"
         # Constructor calls for known user classes → obj

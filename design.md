@@ -1167,6 +1167,95 @@ a *fallback* rather than being replaced: the classifier declines as soon as any
 element is unclassified and so cannot see the heterogeneity in `[1, some_name]`,
 where the coarser test still can, and "mixed" beats the INT default.
 
+**And one for a dict literal — which turned out to be four copies, not three.**
+The dict side repeated the whole story: a chain of `all(isinstance(...))` tests
+in the call-argument loop, another in `_csa_build_var_types`, a third on the
+class-attr path, each recognising its own subset (int/str/list/dict in the
+fullest one, less in the others) and everything unnamed falling to a bare
+`"dict"`. These are now `_csa_dict_value_tag`, with the same
+"all values must agree or decline" contract as its list twin — one tag has to
+describe *every* read out of the dict, and `**spread` declines outright since
+the values are not all visible from the literal. The fourth copy was
+`_infer_constant_value_type`, a *codegen*-side classifier feeding the per-key
+`_dict_var_key_types` map, whose container arms returned the flat strings
+`"list"` and `"dict"`; because that map is consulted *before* everything else in
+`_infer_type_tag`'s subscript handling, its flat answer beat four successive
+correct fixes elsewhere. It now shares `_literal_container_tag`, which recurses
+through `_infer_constant_value_type` itself so it stays a pure AST classifier
+with no emit-time state, and gets nesting free.
+
+**And three more for `.append()`, where every append votes.** Two of the eight
+copies live in `_csa_propagate_ret_types` twenty lines apart (one filling
+`local_types`, one filling `_fn_append_types`) and one in
+`_prescan_list_append_types`; all three walked a list's appends and wrote each
+recognised kind **straight into the map**, so the last append the chain
+happened to name decided the answer for the whole list. `x.append(None);
+x.append("text")` recorded "list of str" — `None` has no arm in any of them, so
+nothing disagreed — and the None came home as a NULL pointer and *printed*
+`(null)`, which is notable because print is normally the one operation that is
+right regardless: the static tag diverted it off the tag-reading path. The rule
+is now that appends of two different known kinds make the list `mixed`, and a
+single append the scan cannot classify erases the element kind entirely; the
+`local_types` scan also became two-phase so the answer does not depend on the
+order `ast.walk` reaches the appends in.
+
+**A half-answer is worse than no answer.** A **bare** `"list"` declines to name
+the element, so readers route the element access through the *runtime* tag and
+are correct — a bare tag costs speed, not accuracy. A tag like `"list:list"`
+names the outer kind and leaves the inner blank, and no reader treats a blank as
+"unknown": they complete it with `VKind.INT` and read a heap pointer as an
+integer. So a producer that writes down the half it knows is worse than one that
+says nothing, and this is the single rule that governs every classifier above.
+Two corollaries: when the inner kind cannot be determined, return the **bare
+head** rather than a head plus a guess; and when the elements are determined to
+genuinely **disagree**, `mixed` is right and the bare head is wrong, because
+`mixed` is a complete answer meaning "dispatch at runtime" while the bare head
+reads as "one unnamed kind" and gets completed with INT. The root cause behind
+the rule is that "no element kind" and "element kind INT" share a
+representation; until they do not, every classifier has to be careful on its
+own behalf.
+
+**A dict's values are not its elements.** `ValueType` now carries a
+`value_type` alongside `elem_type`, and the two are kept apart deliberately:
+`elem_type` answers "what does iterating this yield", which for a dict is a
+**key**. Overloading the one slot would make every existing
+`elem_type is not None` test on a container silently start answering the other
+question. `_to_tag` round-trips it as `dict:<value>` and `from_old_tag` parses
+that suffix (it used to drop it), so a dict value's own element kind survives:
+`{"k": ["a", "bcd"]}` is `dict:list:str`, and `e = d["k"]` binds a `list:str`
+rather than a kindless pointer. This replaces what the
+`_dict_var_int_values` / `_dict_var_list_values` / `_dict_var_dict_values` /
+`_dict_var_obj_values` **name-sets** could express — the same
+set-of-names-standing-in-for-a-map-to-a-type pattern that `_class_attr_vtypes`
+replaced for attributes, one level down. The sets survive as the coarse yes/no
+views their older call sites ask for.
+
+**A method's return type needs a key a call site can trust.** `_func_ret_types`
+records element-carrying return tags keyed by *function* name, and methods had
+entries there too — under their **bare** name, which collides with every other
+class's method of that name and with module functions, so no call site could
+use it. The CSA pass now runs the same `_csa_propagate_ret_types` over a second
+view of the ASTs keyed `Cls.meth`, and `_method_call_ret_vtype` resolves the
+receiver's class (including `self`), walks the MRO, and asks for the dotted key.
+The alternative — a separate "what does this method return" analysis — is what
+`_find_method_return_type` and `_method_returns_list` already are, and their
+answers are an LLVM type and a yes/no: neither can carry an element kind, and
+`_infer_call_type_tag` was turning the bare yes into `elem_type=INT`, which is a
+claim rather than the absence of one.
+
+**A parameter's compound tag is peeled one level per index.** The return-type
+analysis had arms for `return <param>[i]` and nothing for `return <param>[i][j]`,
+so a nested subscript matched no arm and fell to the pointer default even when
+the call site had proved the parameter `list:list:str`. `_ret_param_base_tag`
+walks the index chain and strips one `:` level per index — the exact inverse of
+how the call site built the tag — stopping at a slice, since `xs[1:]` is the
+same kind as `xs`. It returns `(tag, root)` so "not a parameter" stays
+distinguishable from "a parameter of unknown kind"; collapsing the two would
+make the caller invent a kind exactly where it should fall back to the runtime
+tag. Both halves of a return must be told: `_duf_determine_ret_tag` picks the
+semantic tag and `_duf_detect_ret_type` picks the LLVM type, and fixing only
+the former left the corrected answer travelling home through an `i64`.
+
 **Knowing an element's kind is not knowing it is a pointer.** Teaching the
 producers to say more immediately broke a consumer that had been reading the
 weaker fact as the stronger one: the return-type analysis widened
