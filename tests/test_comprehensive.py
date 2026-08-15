@@ -4,7 +4,10 @@ Comprehensive test suite: unifies all existing tests and adds new tiers.
 Tiers (in order of increasing scope):
 
 1. **Regression tests** — existing tests/regressions/ and tests/programs/
-   (auto-collected by conftest.py, not repeated here)
+   (auto-collected by conftest.py, not repeated here — so naming *this file*
+   on the command line does NOT run them; only directory discovery does.
+   Use `python -m pytest tests`. conftest prints a "partial run" warning when
+   they are missed. DEBT-NAMED-SUITES-SKIP-THE-REGRESSION-CORPUS.)
 
 2. **Differential tests** — existing test_differential.py inline tests
    (not repeated here)

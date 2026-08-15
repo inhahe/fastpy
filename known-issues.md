@@ -8,7 +8,7 @@ how to reproduce it, and what the proper fix looks like.
 
 ## Active Bugs
 
-### DEBT-NAMED-SUITES-SKIP-THE-REGRESSION-CORPUS. Invoking pytest with explicit test-file names silently runs 57% of the suite — 2026-08-14
+### DEBT-NAMED-SUITES-SKIP-THE-REGRESSION-CORPUS. FIXED 2026-08-15 — invoking pytest with explicit test-file names silently ran 57% of the suite
 
 **Reproduce:**
 
@@ -37,12 +37,34 @@ tests** — existing tests/regressions/ and tests/programs/" and
 (test_differential.py + regressions/)", so both claim coverage the named-file
 invocation does not deliver.
 
-**Proper fix:** make the full-suite invocation impossible to get wrong rather
-than documenting the trap — either have `test_comprehensive.py` /
-`test_full_suite.py` genuinely parametrise over
-`_collect_python_files(_REGRESSIONS_DIR)` so their docstrings become true, or
-put the directories in `testpaths` in the pytest config so a bare `pytest`
-covers everything. Until then the canonical command is `python -m pytest tests/`.
+**FIXED 2026-08-15 — made loud rather than prevented.** Neither proposed fix
+was right. `testpaths = ["tests"]` was *already* set in `pyproject.toml`, so a
+bare `pytest` always covered everything; explicitly named paths override
+`testpaths` by design and pytest cannot be configured out of that. And
+parametrising `test_comprehensive.py` / `test_full_suite.py` over
+`_collect_python_files(_REGRESSIONS_DIR)` would make a full `pytest tests` run
+the 397-file corpus **twice**, roughly doubling a suite that already takes
+10–18 minutes, to fix a problem that is not "the corpus can't be reached" but
+"you weren't told it wasn't".
+
+So the hazard fixed is the *silence*. `pytest_collection_modifyitems` counts
+collected `ProgramTestItem`s and `pytest_terminal_summary` prints a `partial
+run` banner when that count is zero while other tests ran:
+
+```
+================================= partial run =================================
+This run covered 0 of 397 regression/program files. The corpus is collected by
+directory discovery, which naming test files on the command line bypasses.
+Before calling a change safe, run: python -m pytest tests
+```
+
+Zero-and-nothing-else-ran is deliberately the trigger: running a handful of
+regression files by name is obviously intentional and stays quiet, so the
+warning cannot become noise that gets tuned out. Verified firing on
+`pytest tests/test_cross_target.py`, quiet on a single named regression file
+and on the full `pytest tests` (1055 collected). The two misleading docstrings
+now state the consequence rather than only the mechanism. The canonical
+command remains `python -m pytest tests`.
 
 ### PERF-EXC-CHECK-IN-HOT-LOOP. The post-call pending-exception check costs ~30% on subscript-heavy loops — 2026-08-15
 
@@ -3780,20 +3802,25 @@ isn't there yet". A verifier error is categorically different from an
 unsupported-feature error and should be a hard failure — see
 BUG-SKIP-MASKS-VERIFIER-ERRORS below.
 
-### BUG-SKIP-MASKS-VERIFIER-ERRORS. Invalid-IR failures are reported as skips, not failures — 2026-07-26
+### BUG-SKIP-MASKS-VERIFIER-ERRORS. FIXED — invalid-IR failures were reported as skips, not failures — 2026-07-26
 
-**What:** the diff-test harness and `test_self_compile_real_module` both map any
-build failure to "compiler can't compile this yet" (a SKIP). That is right for
-an unsupported Python feature, but wrong for an **LLVM verifier** error, which
-always means codegen emitted invalid IR — a real defect that will never be fixed
-by adding a feature. BUG-DECREF-DOES-NOT-DOMINATE sat green in the suite this
-way; the new `rc_temp_in_conditional_arm.py` regression test likewise reports
-`skip`, not `fail`, when the fix is reverted.
+**What:** the diff-test harness and `test_self_compile_real_module` both mapped
+any build failure to "compiler can't compile this yet" (a SKIP). That is right
+for an unsupported Python feature, but wrong for an **LLVM verifier** error,
+which always means codegen emitted invalid IR — a real defect that will never
+be fixed by adding a feature. BUG-DECREF-DOES-NOT-DOMINATE sat green in the
+suite this way.
 
-**Proper fix:** in `tests/harness.py`, classify a build failure whose message
-contains an LLVM verifier signature (`Instruction does not dominate all uses`,
-`Invalid operand types`, `Broken module`, …) as a hard FAIL rather than a SKIP,
-so this class of bug can never hide again.
+**Fixed** as proposed: `_VERIFIER_ERROR_SIGNS` (8 signatures) and
+`_is_verifier_error` in `tests/harness.py` classify such a build failure as a
+hard FAIL. Both call sites are wired — `diff_test` (`harness.py:315`) and
+`test_self_compile_real_module` (`test_comprehensive.py:1568`).
+
+*This entry was stale: the fix had landed but was never marked, so the issue
+read as open for three weeks.* Re-verified 2026-08-15 by calling
+`_is_verifier_error` directly — `Broken module found` and `Instruction does not
+dominate all uses` classify as verifier errors, `not implemented: match
+statement` does not.
 
 ### ~~BUG-IS-COMPARE-DOUBLE-EVAL. `a is b` evaluated its left operand twice~~ — FIXED 2026-07-26
 

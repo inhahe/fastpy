@@ -2,7 +2,13 @@
 Full test suite: pyperformance benchmarks, stdlib tests, Django template tests,
 stdlib import tests, and CPython adapted test suite.
 
-Extends the base test suite (test_differential.py + regressions/) with:
+Extends the base test suite (test_differential.py + regressions/) with the
+tiers below.  "Extends" describes the *scope of the suite*, not what running
+this file alone does: `regressions/` is collected by directory discovery in
+conftest.py, which naming this file on the command line bypasses.  The full
+run is `python -m pytest tests`, and conftest prints a "partial run" warning
+when the corpus is missed.  DEBT-NAMED-SUITES-SKIP-THE-REGRESSION-CORPUS.
+
 
 1. **Pyperformance benchmarks** (compile + run, verify exit code 0)
    - These print timing-dependent output, so we can't diff stdout.
