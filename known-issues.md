@@ -66,6 +66,90 @@ and on the full `pytest tests` (1055 collected). The two misleading docstrings
 now state the consequence rather than only the mechanism. The canonical
 command remains `python -m pytest tests`.
 
+### PERF-INT-KEYED-DICT-UNPROVABLE-IN-A-WHILE-LOOP. `_is_int_keyed_dict` only recognises a loop-variable key in a `for` loop, so the commonest int-dict idiom of all is not provable — 2026-08-15
+
+**Reproduce** — this is not exotic code, it is the shape half the benchmarks use:
+
+```python
+d = {}
+i = 0
+while i < 100000:
+    d[i] = i
+    i = i + 1
+total = 0
+for k in d:            # <- key kind wanted here
+    total = total + k
+print(total)
+```
+
+`_is_int_keyed_dict(d)` returns False, on this checkout and on `20a5304`.
+
+**Why.** The `ast.Name` arm (codegen.py ~37218) proves int-keyed from three
+kinds of evidence: an int-keyed literal binding, an int-keyed *mutation*
+(`d[<int const>] = ...`, `d.setdefault(<int const>, ...)`,
+`d.setdefault(len(x), ...)`), or — when the only binding is `d = {}` — a
+`d[<loop var>] = ...` store whose loop variable comes from a `for` over
+`range(...)` or an int list literal. Every one of those is a *syntactic*
+pattern, and the last is spelled `isinstance(_f, ast.For)`. A `while` loop
+with a hand-rolled counter matches none of them, even though `i` is an
+ordinary int local whose kind the compiler already knows.
+
+**What it costs.** Nothing incorrect, now. Before
+BUG-FOR-DICT-KEY-KIND-GUESSED was fixed, "not provably int" fell through to a
+*claim* of str, so this program was compiled with its loop variable tagged
+`str` — it happens to print the right answer only because `total + k` consults
+the runtime tag rather than rebuilding the FV from the static one, which is
+precisely the accident that made that bug so hard to see. Since the fix the
+answer is `mixed`: correct, and dynamically dispatched. So this entry is a
+missing optimisation, not a wrong program — but it is a missing optimisation
+on a very common shape, and it is the reason the fix could look like a
+slowdown.
+
+**Proper fix.** Replace the syntactic key tests with one question asked of the
+type environment: *is this store's key expression provably an int?* A helper
+`_expr_is_provably_int(expr)` handling int constants, `len`/`int`/`abs`/`ord`/
+`hash` calls, arithmetic `BinOp`s over provably-int operands, and `Name`s
+whose every binding is itself provably int (with a recursion guard, so
+`i = i + 1` terminates) subsumes all four existing special cases and the
+`while` idiom together.
+
+Two hazards to respect while doing it, both already paid for elsewhere in this
+file:
+
+  * **Scope it.** The search runs over `_csa_root_tree`, i.e. the whole module,
+    so a binding of `i` in an unrelated function must not answer for this one.
+    That is BUG-UNCALLED-FN-PARAM-NAME-POISONS-A-CALLED-ONE with the names
+    changed; it needs a node→enclosing-`FunctionDef` map, not a bare
+    `ast.walk`.
+  * **Stay conservative.** A False here is a slow loop; a wrong True is a
+    miscompile of exactly the kind BUG-FOR-DICT-KEY-KIND-GUESSED was. One
+    unclassifiable store has to lose to the unproven answer.
+
+Coverage for the measurement now exists: `dict iterate 100K x 20`,
+`set iterate 100K x 20` and `str-key dict iterate 20K x 20` in
+`benchmarks/run_comparison.py`. The suite had no dict- or set-*iteration*
+workload at all before this — only `dict lookup 1K keys x 1K`, which never
+enters `_emit_for_dict` — so an A/B run over the old 16 could not have seen a
+regression in this code path either way.
+
+**Measured** (`ab_bench.py` vs `20a5304`, 41 interleaved reps, ratios only —
+the box was at 54% load from an unrelated process):
+
+| benchmark | B/A | |
+|---|---|---|
+| `dict iterate 100K x 20` | **0.40x** | 2.5x *faster* |
+| `set iterate 100K x 20` | **1.69x** | slower |
+| `str-key dict iterate 20K x 20` | 1.00x | unchanged |
+
+Both directions come from the same cause. Dropping the "str" guess made the
+int-dict loop *much* faster — the old static `str` tag was sending an integer
+key through string-shaped code that then had to sort itself out at runtime —
+which is a reminder that a wrong static kind was never buying speed either.
+Dropping the "int" guess for sets cost 1.69x, and there the guess was
+accidentally *right* for this workload, so the speed is real and has to be won
+back by proof rather than restored by assumption. See
+BUG-FOR-DICT-KEY-KIND-GUESSED for why it cannot simply be put back.
+
 ### PERF-EXC-CHECK-IN-HOT-LOOP. The post-call pending-exception check costs ~30% on subscript-heavy loops — 2026-08-15
 
 **Reproduce** (`benchmarks/run_comparison.py`, `dict lookup 1K keys x 1K`):
@@ -744,7 +828,38 @@ becomes a kind test, the alias fixpoint at 11313 becomes a plain dict copy, and
 removes the standing hazard that `list_vars` currently means "list *or* dict
 *or* set *or* tuple", which is why a returned tuple is tagged as a list.
 
-### BUG-UNCALLED-FN-PARAM-NAME-POISONS-A-CALLED-ONE. An *uncalled* function whose parameter happens to share a name with another function's parameter makes that other function segfault — 2026-07-27
+### BUG-UNCALLED-FN-PARAM-NAME-POISONS-A-CALLED-ONE. An *uncalled* function whose parameter happens to share a name with another function's parameter makes that other function segfault — 2026-07-27 — **FIXED 2026-08-15**
+
+**FIXED.** Two separate defects, and the crash needed both. The parameter
+lookup is now scoped, and the thing it feeds no longer guesses when the lookup
+comes back empty.
+
+*The bare-name lookup.* `_is_int_keyed_dict`'s final fallback
+(`compiler/codegen.py`, formerly ~37135) walked every `FunctionDef` in the
+module looking for one with a parameter of the right **bare name**, took the
+first, and `break`ed unconditionally. Parameter names are scoped and
+`_call_site_param_types` only has entries for functions that are *called*, so
+`def unused(data)` — first in the file, never called, hence no call-site
+evidence — answered for `def mode(data)` and returned `False`. It is now
+`_csa_tag_for_param`, which keys on `(function, parameter)` using
+`self._current_func_name`, exactly as the "Proper fix" below asked.
+`_uniquify_nested_def_names` already does the equivalent for *function* names
+by alpha-renaming; parameter names cannot be uniquified, so the lookup has to
+carry the scope itself.
+
+*Why a failed proof crashed rather than deoptimised.* See
+BUG-FOR-DICT-KEY-KIND-GUESSED. `_emit_for_dict` treated "not provably
+int-keyed" as "str-keyed", and that static tag is what `max_val = val`
+rebuilds the FpyValue from — with a literal `i32 2` — discarding the runtime
+tag `dict_key_fv` had just written. cdb pinned it precisely:
+`cmp dword ptr [rax],53545243h ds:ffffffff'fffffffd` — `0x53545243` is
+`FPY_STR_MAGIC` and `rax` is `-3`, i.e. integer key `5` minus the 8-byte
+string header.
+
+**Test:** `tests/regressions/for_dict_key_kind.py`, which carries the original
+repro verbatim plus the same shape with the definition order reversed and
+decoy functions either side, so it cannot pass merely because the first `def`
+happened to be the right one.
 
 **Reproduce** (compiles clean, then segfaults with no output; CPython prints
 `5`):
@@ -788,6 +903,82 @@ minimising an unrelated crash and the minimisation walked into it.
 
 **Proper fix:** key every per-parameter fact by `(function, parameter)`, the
 way `_func_local_vt` already does, rather than by the parameter's bare name.
+
+### BUG-FOR-DICT-KEY-KIND-GUESSED. Iterating a dict or set invented a key kind it had not proved, and a wrong guess was a segfault — 2026-08-15 — **FIXED 2026-08-15**
+
+**What:** `_emit_for_dict` (`compiler/codegen.py`) picked the loop variable's
+static kind like this:
+
+```python
+key_type = "str"                      # the default for dicts
+if dict_tv.vtype.kind == VKind.SET:
+    key_type = "int"                  # "default for sets (most common)"
+elif ... self._is_int_keyed_dict(node.iter):
+    key_type = "int"
+```
+
+Both defaults are guesses, and neither is recoverable. `dict_key_fv` always
+writes the key's *runtime* tag into the loop variable's FpyValue, so the
+static tag is not a hint — it is what later statements build **new** FpyValues
+from, with a literal tag:
+
+```llvm
+%".57" = extractvalue {i32, i64} %"k.fv", 1      ; the data, kept
+%".60" = insertvalue {i32, i64} undef, i32 2, 0  ; the tag, invented (STR)
+call void @"fpy_rc_incref"(i32 %".62", i64 %".63")
+```
+
+An integer key of `5` tagged STR makes that incref read the string header
+eight bytes before the payload — address `-3` — and the process dies with no
+output.
+
+**Reproduce** (CPython prints `7`; fastpy segfaulted):
+
+```python
+def build(n):
+    d = {}
+    d[n] = 1          # `n` is a parameter: nothing pins the key kind
+    return d
+
+def last_key(d):
+    out = 0
+    for k in d:
+        out = k       # rebuilds the FV from the *static* kind
+    return out
+
+print(last_key(build(7)))
+```
+
+This is the mechanism behind
+BUG-UNCALLED-FN-PARAM-NAME-POISONS-A-CALLED-ONE: that bug only broke the
+*proof*, and a broken proof was supposed to cost a fast path, not correctness.
+
+**FIXED.** `_dict_key_type_tag` replaces the guesses. A concrete kind is
+returned only when something proves it — a dict or set literal whose elements
+agree (`_sole_elem_tag`, resolved through a name's single binding by
+`_sole_binding_of`), a `ValueType` carrying an element type, or
+`_is_int_keyed_dict` / the new `_is_str_keyed_dict`. Everything else is
+`"mixed"`.
+
+Three things this cost, worth recording:
+
+- **`_is_str_keyed_dict` had to be written, not derived.** "Not provably
+  int-keyed" is a different claim from "str-keyed", and conflating them is the
+  whole bug. It answers True only when every binding and every key-store it
+  can see is a string constant, and a single unclassifiable store makes it
+  False.
+- **`"mixed"`, not `"unknown"`.** The first cut used `"unknown"` and printed
+  raw pointers, because `ValueType._to_tag()` maps `VKind.UNKNOWN` to
+  `"int"` — so an unknown loop variable comes back out of any string-tag
+  boundary claiming to be an integer. `design.md` already says a producer that
+  cannot commit must say `mixed`; this is why.
+- **Sets need their literal resolved through the name.** `ss = {"p", "q"}`
+  followed by `for e in ss:` reaches `_emit_for_dict` as an `ast.Name`, so
+  the `ast.Set` arm never fired and the old "most sets are int sets" default
+  won. `_sole_binding_of` deliberately returns None when a name has more than
+  one binding.
+
+**Test:** `tests/regressions/for_dict_key_kind.py`.
 
 ### BUG-PARAM-TAG-PROPAGATION-MERGES-COARSELY. A second copy of the parameter-tag merge called `list` and `list:int` a conflict, downgrading the parameter to an untyped value — 2026-07-27 — **FIXED**
 
@@ -1310,7 +1501,7 @@ and reader had exactly this relationship.
 
 **Severity:** silently wrong answers, no crash and no diagnostic — high.
 
-### BUG-FILEREAD-FN-RETTAG is a segfault, not just a wrong type — 2026-07-27
+### BUG-FILEREAD-FN-RETTAG is a segfault, not just a wrong type — 2026-07-27 — **FIXED with the parent entry, 2026-07-27** (marker added 2026-08-15; re-verified passing)
 
 Recorded here because the symptom is nothing like the entry's title and cost an
 hour of chasing the wrong subsystem. `def rd(p): ... return f.readline()`
@@ -1459,7 +1650,7 @@ packing in `compiler/codegen.py`.
 **Severity:** silently wrong or missing output on a legal signature. Verified
 pre-existing (`git stash`), not introduced by the unbound-local work.
 
-### BUG-EMPTY-KWARGS-CALL-SEGFAULTS. Calling a `**kwargs`-only function with no arguments segfaults — 2026-07-27
+### BUG-EMPTY-KWARGS-CALL-SEGFAULTS. Calling a `**kwargs`-only function with no arguments segfaults — 2026-07-27 — **FIXED 2026-08-15**
 
 **Reproduce:**
 ```python
@@ -1468,14 +1659,81 @@ def kw(**kwargs):
 print(kw())            # segfault
 ```
 
-**Where:** the `**kwargs` dict construction at the callee prologue in
-`compiler/codegen.py` — an empty kwargs almost certainly yields a null pointer
-where an empty `FpyDict*` is expected.
+**Not a null pointer** — the guess below was wrong, and the callee prologue was
+the wrong place to look. The call site passed a live `FpyList*` to a parameter
+the callee tags `FPY_TAG_DICT`:
 
-**Proper fix:** always materialise an empty dict for the kwargs parameter,
-never a null.
+```llvm
+%".2" = call i8* @"fastpy_list_new"()
+%".3" = call {i32, i64} @"fastpy.user.kw"(i8* %".2")   ; then read as a dict
+```
+
+**Root cause:** one arm served two different parameters. `*args` (a list) and
+`**kwargs` (a dict) shared the `param_count == 1` branch in `_emit_user_call`,
+and chose between them on `if node.keywords` — "did *this call site* pass any
+keywords?", which is a property of the caller and says nothing about the
+callee's signature. So a `**kwargs` function called with no keywords got the
+positional list.
+
+**FIXED.** Separate arms, keyed on `info.is_kwarg` / `info.is_vararg`, and the
+packing extracted into `_emit_kwargs_dict` (which always materialises a dict,
+empty or not) and `_emit_vararg_list`. `_emit_user_call` and
+`_emit_user_call_fv` each had their own copy of both the mistake and the
+keyword-packing loop — four sites, now one each. That incidentally fixed the
+`**d` splat whose dict is not a visible literal: keyword expansion leaves it as
+a `keyword` with `arg=None`, which the old loops handed to
+`_make_string_constant` as a key name.
+
+**Test:** `tests/regressions/kwargs_call_shapes.py`.
 
 **Severity:** crash. Verified pre-existing (`git stash -- compiler runtime`).
+
+### BUG-TYPE-NAME-OF-TUPLE-SAYS-LIST. `type(t).__name__` on a tuple returns `"list"` — 2026-08-15
+
+**Reproduce** — CPython prints `tuple`, fastpy prints `list`:
+```python
+t = (1, 2)
+print(type(t).__name__)
+```
+
+Tuples are `FpyList*` with a mark set by `fastpy_list_mark_tuple`, and `type()`
+does not consult the mark. Applies to tuple literals and to `*args` parameters
+alike. `repr`/`print` of the tuple itself *is* correct (`(1, 2)`), so the mark
+is read on the print path and not on the `type()` path.
+
+**Where:** the `type()` builtin's name lookup in `compiler/codegen.py`.
+
+**Proper fix:** read the tuple mark wherever a list's type name is produced —
+and audit the other consumers of `FPY_TAG_LIST` for the same omission, since
+`isinstance(t, tuple)` is the obvious next one.
+
+**Severity:** silently wrong value. Found while writing
+`tests/regressions/kwargs_call_shapes.py`; pre-existing.
+
+### BUG-LIST-OF-VARARGS-STAYS-A-TUPLE. `list(args)` on a `*args` parameter returns a tuple — 2026-08-15
+
+**Reproduce** — CPython prints `[1, 2]`, fastpy prints `(1, 2)`:
+```python
+def va(*args):
+    print(list(args))
+va(1, 2)
+```
+
+`list(t)` on a tuple *literal* is correct, so this is specific to the `*args`
+parameter: `list()` on it is a no-op that returns the same object with the
+tuple mark still set, rather than a fresh unmarked list.
+
+**Where:** the `list()` builtin in `compiler/codegen.py`, where a list argument
+is passed straight through. The pass-through is right for a plain list and
+wrong for a tuple-marked one.
+
+**Proper fix:** `list(x)` must copy whenever `x` is tuple-marked (and clear the
+mark), not just when `x` is some other container kind. Same question for
+`tuple(x)` in the other direction.
+
+**Severity:** silently wrong value; also makes the result compare unequal to
+the list CPython produces. Found alongside BUG-TYPE-NAME-OF-TUPLE-SAYS-LIST;
+pre-existing.
 
 ### BUG-CALL-VIA-CONTAINER-ELEM-DROPS-RETTAG. Calling a function fetched out of a container loses the return tag — 2026-07-27
 
@@ -5448,7 +5706,7 @@ rather than done.
 **Where:** the assignment/store path in `CodeGen`, and
 `_scan_fv_forced_locals` (`compiler/codegen.py:~23157`).
 
-### BUG-BIGINT-PROGRAM-HANGS-WHILE-COUNTER. Any big-integer constant makes every `while` loop counter spin forever — 2026-07-27
+### BUG-BIGINT-PROGRAM-HANGS-WHILE-COUNTER. Any big-integer constant makes every `while` loop counter spin forever — 2026-07-27 — **FIXED 2026-07-27** (marker added 2026-08-15; the fix is written up below but the heading never said so, so it kept being re-triaged as open)
 
 **What:** the compiled binary produces *no output at all* and never exits.
 

@@ -30703,31 +30703,20 @@ class CodeGen:
         dict_val = dict_tv.as_ptr(self.builder)
         dict_len = self._rt_call("dict_length", [dict_val])
 
-        # Determine the key/element type. For sets, the elements can be
-        # any type (int, str, etc.). For dicts, keys are typically strings
-        # but may be ints. Use VKind to determine:
-        # SET → "int" (default), DICT → "str" (default, but check for int keys).
-        key_type = "str"
-        if dict_tv.vtype.kind == VKind.SET:
-            # Try to infer element type from set literal or comprehension
-            key_type = "int"  # default for sets (most common)
-            if isinstance(node.iter, ast.Set):
-                if (node.iter.elts and isinstance(node.iter.elts[0], ast.Constant)
-                        and isinstance(node.iter.elts[0].value, str)):
-                    key_type = "str"
-            elif isinstance(node.iter, ast.Name) and node.iter.id in self.variables:
-                # Check if the set was built from string elements
-                pass  # int is a safe default for sets
-        elif (isinstance(node.iter, ast.Name)
-                and self._is_int_keyed_dict(node.iter)):
-            key_type = "int"
-        elif isinstance(node.iter, ast.Dict):
-            # Dict literal: check if keys are int constants
-            if (node.iter.keys
-                    and all(isinstance(k, ast.Constant)
-                            and isinstance(k.value, int)
-                            for k in node.iter.keys if k is not None)):
-                key_type = "int"
+        # Static type of the loop variable.  `dict_key_fv` always writes the
+        # key's *runtime* tag into the FV we store, so the only thing this
+        # decides is what downstream code is told the key is -- and downstream
+        # code trusts it hard enough to rebuild the FV with a literal tag
+        # (`insertvalue undef, i32 2, 0` for str), discarding the runtime one.
+        # So a wrong guess here is not a missed optimisation, it is a wrong
+        # program: guessing "str" for an int key makes `out = k` incref the
+        # integer as a string pointer and read its header at `k - 8`.
+        #
+        # Hence: only a *proven* key kind may be named.  "Not proven int" is
+        # not evidence of str, and "most sets are int sets" is not evidence of
+        # anything -- both must fall through to MIXED, which keeps the runtime
+        # tag and dispatches dynamically.  (BUG-FOR-DICT-KEY-KIND-GUESSED)
+        key_type = self._dict_key_type_tag(node.iter, dict_tv.vtype)
 
         idx_name = f"__idx_{var_name}"
         self._store_variable(idx_name, ir.Constant(i64, 0), ValueType(VKind.INT))
@@ -33595,6 +33584,54 @@ class CodeGen:
             result = self._emit_user_call(node)
             return result if result else ir.Constant(i64, 0)
 
+    def _emit_kwargs_dict(self, keywords: 'list[ast.keyword]') -> ir.Value:
+        """Build the `FpyDict*` for a callee's `**kwargs` parameter.
+
+        Always returns a dict, including for an empty keyword list.  That is
+        the whole point: the callee's prologue tags this pointer `FPY_TAG_DICT`
+        unconditionally, so it is not free to be anything else.  The call site
+        used to build the kwargs dict only `if node.keywords`, and pass the
+        *positional* list otherwise -- so `def kw(**kwargs): return kwargs`
+        called as `kw()` handed a `FpyList*` to code that reads it as a dict,
+        and printing the result segfaulted.  (BUG-EMPTY-KWARGS-CALL-SEGFAULTS)
+
+        A `**d` splat that `_emit_user_call`'s expansion could not turn into
+        explicit keywords (the dict is not a visible literal) arrives here as a
+        `keyword` with `arg=None` and is merged at runtime.  Passing that to
+        `_make_string_constant` would have used `None` as a key name.
+        """
+        dict_ptr = self.builder.call(self.runtime["dict_new"], [])
+        for kw in keywords or ():
+            if kw.arg is None:
+                src = self._ensure_ptr(self._emit_expr_value(kw.value))
+                self.builder.call(self.runtime["dict_update"],
+                                  [dict_ptr, src])
+                continue
+            key = self._make_string_constant(kw.arg)
+            val = self._emit_expr_value(kw.value)
+            tag, data = self._bare_to_tag_data(val, kw.value)
+            self.builder.call(self.runtime["dict_set_fv"],
+                              [dict_ptr, key, ir.Constant(i32, tag), data])
+        return dict_ptr
+
+    def _emit_vararg_list(self, args: 'list[ast.expr]') -> ir.Value:
+        """Build the `FpyList*` for a callee's `*args` parameter.
+
+        The caller marks it a tuple; this only packs.  A lone `f(*xs)` forwards
+        `xs` itself rather than wrapping it in a second list.
+        """
+        starred = [a for a in args if isinstance(a, ast.Starred)]
+        if len(starred) == 1 and len(args) == 1:
+            return self._ensure_ptr(self._emit_expr_value(args[0].value))
+        list_ptr = self.builder.call(self.runtime["list_new"], [])
+        for arg_node in args:
+            if isinstance(arg_node, ast.Starred):
+                src = self._ensure_ptr(self._emit_expr_value(arg_node.value))
+                self.builder.call(self.runtime["list_extend"], [list_ptr, src])
+            else:
+                self._emit_list_append_expr(list_ptr, arg_node)
+        return list_ptr
+
     def _emit_user_call(self, node: ast.Call) -> ir.Value | None:
         """Emit a call to a user-defined function. Returns the LLVM value (or None for void)."""
         # Expand **dict_literal or **dict_variable to individual keywords.
@@ -33748,60 +33785,25 @@ class CodeGen:
 
         if info.is_vararg and info.is_kwarg and info.param_count == 2:
             # *args + **kwargs: pack positional into tuple, keywords into dict
-            list_ptr = self.builder.call(self.runtime["list_new"], [])
-            for arg_node in node.args:
-                self._emit_list_append_expr(list_ptr, arg_node)
+            list_ptr = self._emit_vararg_list(node.args)
             self.builder.call(self.runtime["list_mark_tuple"], [list_ptr])
-            dict_ptr = self.builder.call(self.runtime["dict_new"], [])
-            if node.keywords:
-                for kw in node.keywords:
-                    key = self._make_string_constant(kw.arg)
-                    val = self._emit_expr_value(kw.value)
-                    tag, data = self._bare_to_tag_data(val, kw.value)
-                    self.builder.call(self.runtime["dict_set_fv"],
-                                      [dict_ptr, key, ir.Constant(i32, tag), data])
+            dict_ptr = self._emit_kwargs_dict(node.keywords)
             result = self.builder.call(info.func, [list_ptr, dict_ptr])
             return result if info.ret_tag != "void" else None
 
-        if (info.is_vararg or info.is_kwarg) and info.param_count == 1:
-            # Pack all provided args into a list (tuple for *args)
-            # Check for *splat forwarding: if a single starred arg is passed,
-            # forward the list directly instead of wrapping it in another list.
-            _has_star = any(isinstance(a, ast.Starred) for a in node.args)
-            if _has_star and len(node.args) == 1 and isinstance(node.args[0], ast.Starred):
-                # Simple forwarding: show(*args) → pass args list directly
-                list_ptr = self._emit_expr_value(node.args[0].value)
-                list_ptr = self._ensure_ptr(list_ptr)
-            elif _has_star:
-                # Mixed: some positional + *splat — build list and extend
-                list_ptr = self.builder.call(self.runtime["list_new"], [])
-                for arg_node in node.args:
-                    if isinstance(arg_node, ast.Starred):
-                        src = self._emit_expr_value(arg_node.value)
-                        src = self._ensure_ptr(src)
-                        self.builder.call(
-                            self.runtime["list_extend"], [list_ptr, src])
-                    else:
-                        self._emit_list_append_expr(list_ptr, arg_node)
-            else:
-                list_ptr = self.builder.call(self.runtime["list_new"], [])
-                for arg_node in node.args:
-                    self._emit_list_append_expr(list_ptr, arg_node)
-            # *args is a tuple in Python
-            if info.is_vararg:
-                self.builder.call(self.runtime["list_mark_tuple"], [list_ptr])
-            # For **kwargs, pack keyword args into a dict
-            if node.keywords:
-                dict_ptr = self.builder.call(self.runtime["dict_new"], [])
-                for kw in node.keywords:
-                    key = self._make_string_constant(kw.arg)
-                    val = self._emit_expr_value(kw.value)
-                    tag, data = self._bare_to_tag_data(val, kw.value)
-                    self.builder.call(self.runtime["dict_set_fv"],
-                                      [dict_ptr, key, ir.Constant(i32, tag), data])
-                result = self.builder.call(info.func, [dict_ptr])
-            else:
-                result = self.builder.call(info.func, [list_ptr])
+        # `*args` and `**kwargs` are different parameters holding different
+        # container types, so they get separate arms.  Sharing one arm and
+        # choosing between them on "were any keywords passed?" is what made
+        # `kw()` pass a list to a `**kwargs` parameter.
+        if info.is_kwarg and info.param_count == 1:
+            dict_ptr = self._emit_kwargs_dict(node.keywords)
+            result = self.builder.call(info.func, [dict_ptr])
+            return result if info.ret_tag != "void" else None
+
+        if info.is_vararg and info.param_count == 1:
+            list_ptr = self._emit_vararg_list(node.args)
+            self.builder.call(self.runtime["list_mark_tuple"], [list_ptr])
+            result = self.builder.call(info.func, [list_ptr])
             return result if info.ret_tag != "void" else None
 
         # Evaluate provided arguments (handling *args starred unpack)
@@ -34123,52 +34125,19 @@ class CodeGen:
         # Same argument handling as _emit_user_call, just skip the unwrap.
         # Handle *args + **kwargs together (2 params)
         if info.is_vararg and info.is_kwarg and info.param_count == 2:
-            list_ptr = self.builder.call(self.runtime["list_new"], [])
-            for arg_node in node.args:
-                self._emit_list_append_expr(list_ptr, arg_node)
+            list_ptr = self._emit_vararg_list(node.args)
             self.builder.call(self.runtime["list_mark_tuple"], [list_ptr])
-            dict_ptr = self.builder.call(self.runtime["dict_new"], [])
-            if node.keywords:
-                for kw in node.keywords:
-                    key = self._make_string_constant(kw.arg)
-                    val = self._emit_expr_value(kw.value)
-                    tag, data = self._bare_to_tag_data(val, kw.value)
-                    self.builder.call(self.runtime["dict_set_fv"],
-                                      [dict_ptr, key, ir.Constant(i32, tag), data])
+            dict_ptr = self._emit_kwargs_dict(node.keywords)
             return self.builder.call(info.func, [list_ptr, dict_ptr])
 
-        # Handle *args or **kwargs (single param)
-        if (info.is_vararg or info.is_kwarg) and info.param_count == 1:
-            _has_star = any(isinstance(a, ast.Starred) for a in node.args)
-            if _has_star and len(node.args) == 1 and isinstance(node.args[0], ast.Starred):
-                list_ptr = self._emit_expr_value(node.args[0].value)
-                list_ptr = self._ensure_ptr(list_ptr)
-            elif _has_star:
-                list_ptr = self.builder.call(self.runtime["list_new"], [])
-                for arg_node in node.args:
-                    if isinstance(arg_node, ast.Starred):
-                        src = self._emit_expr_value(arg_node.value)
-                        src = self._ensure_ptr(src)
-                        self.builder.call(
-                            self.runtime["list_extend"], [list_ptr, src])
-                    else:
-                        self._emit_list_append_expr(list_ptr, arg_node)
-            else:
-                list_ptr = self.builder.call(self.runtime["list_new"], [])
-                for arg_node in node.args:
-                    self._emit_list_append_expr(list_ptr, arg_node)
-            # *args is a tuple in Python
-            if info.is_vararg:
-                self.builder.call(self.runtime["list_mark_tuple"], [list_ptr])
-            if node.keywords:
-                dict_ptr = self.builder.call(self.runtime["dict_new"], [])
-                for kw in node.keywords:
-                    key = self._make_string_constant(kw.arg)
-                    val = self._emit_expr_value(kw.value)
-                    tag, data = self._bare_to_tag_data(val, kw.value)
-                    self.builder.call(self.runtime["dict_set_fv"],
-                                      [dict_ptr, key, ir.Constant(i32, tag), data])
-                return self.builder.call(info.func, [dict_ptr])
+        # Separate arms for *args and **kwargs — see _emit_user_call.
+        if info.is_kwarg and info.param_count == 1:
+            return self.builder.call(
+                info.func, [self._emit_kwargs_dict(node.keywords)])
+
+        if info.is_vararg and info.param_count == 1:
+            list_ptr = self._emit_vararg_list(node.args)
+            self.builder.call(self.runtime["list_mark_tuple"], [list_ptr])
             return self.builder.call(info.func, [list_ptr])
 
         # Mixed vararg: positional + *rest + kwonly
@@ -36908,6 +36877,261 @@ class CodeGen:
                 return True
         return False
 
+    def _dict_key_type_tag(self, node: ast.expr,
+                           vtype: 'ValueType') -> str:
+        """Static tag for the keys/elements produced by iterating `node`.
+
+        Returns a concrete tag only when the kind is *proven*; otherwise
+        "mixed", which is the compiler's word for "runtime dispatch needed" --
+        `_unwrap_fv_for_tag` passes MIXED through as a whole FpyValue instead
+        of unboxing it against a static kind.  Note it is *not* "unknown":
+        `ValueType._to_tag()` maps `VKind.UNKNOWN` to `"int"`, so an unknown
+        loop variable comes back out of any string-tag boundary claiming to be
+        an integer -- the exact failure this is here to prevent.
+
+        The old code returned "str" for any dict it couldn't prove int-keyed
+        and "int" for any set, i.e. it treated "no evidence" as evidence.  The
+        loop variable's FV carries the real tag from `dict_key_fv`, but the
+        static tag is what later statements build new FVs from, so an unproven
+        guess is miscompiled code rather than slow code.
+        """
+        if vtype.kind == VKind.SET:
+            # A set literal proves its element kind when the elements agree --
+            # here, or at the assignment this name was bound by.
+            _lit = node
+            if isinstance(node, ast.Name):
+                _lit = self._sole_binding_of(node.id)
+            if isinstance(_lit, ast.Set) and _lit.elts:
+                _only = self._sole_elem_tag(_lit.elts)
+                if _only is not None:
+                    return _only
+            # A set whose ValueType carries a proven element type.  It has to
+            # be asked through `_proven_tag`, not `_to_tag()`: an elem_type of
+            # VKind.UNKNOWN converts to the *string* "int", which would sneak
+            # "most sets are int sets" back in through a second door.
+            _et = self._proven_tag(vtype.elem_type)
+            return _et if _et is not None else "mixed"
+
+        # Dict literal: keys are right there.
+        if isinstance(node, ast.Dict):
+            _keys = [k for k in node.keys if k is not None]
+            _only = self._sole_elem_tag(_keys) if _keys else None
+            return _only if _only is not None else "mixed"
+
+        if isinstance(node, ast.Name):
+            if self._is_int_keyed_dict(node):
+                return "int"
+            if self._is_str_keyed_dict(node):
+                return "str"
+        return "mixed"
+
+    # The kinds whose `_to_tag()` string is a statement of fact.  Everything
+    # outside this set -- UNKNOWN, FVALUE, MIXED, and anything `_to_tag()`
+    # doesn't list and so answers with its "int" default -- is either an
+    # admission of ignorance or a request for dynamic dispatch, and neither
+    # may be handed to a caller that is going to stamp it into an FpyValue
+    # as a literal tag.
+    _PROVEN_ELEM_KINDS = frozenset((
+        VKind.INT, VKind.FLOAT, VKind.BOOL, VKind.STR, VKind.BYTES,
+        VKind.NONE, VKind.DICT, VKind.SET, VKind.TUPLE, VKind.LIST,
+        VKind.BIGINT, VKind.COMPLEX, VKind.DECIMAL, VKind.OBJ,
+    ))
+
+    def _proven_tag(self, vtype: 'ValueType | None') -> 'str | None':
+        """`vtype`'s tag if the kind is a fact, else None.
+
+        `ValueType._to_tag()` is lossy in the one direction that matters here:
+        it maps `VKind.UNKNOWN` and `VKind.FVALUE` to `"int"`, and falls back
+        to `"int"` for any kind missing from its table.  That is harmless for
+        its own callers, which use the tag to pick a calling convention, but
+        fatal for a caller deciding what a value *is* -- "I don't know" comes
+        back indistinguishable from "integer".  So kinds are whitelisted here
+        rather than filtered by comparing tag strings.
+        """
+        if vtype is None:
+            return None
+        if vtype.kind not in self._PROVEN_ELEM_KINDS:
+            return None
+        if vtype.kind in (VKind.LIST, VKind.TUPLE) and vtype.elem_type is not None:
+            # `_to_tag()` embeds the element tag ("list:int"), so an unproven
+            # element would be a lie one level down rather than at the top.
+            if self._proven_tag(vtype.elem_type) is None:
+                return "list" if vtype.kind == VKind.LIST else "tuple"
+        return vtype._to_tag()
+
+    def _sole_binding_of(self, name: str) -> 'ast.expr | None':
+        """The value of the one and only assignment to `name`, or None.
+
+        "One and only" is the point: two bindings mean the name's kind is not
+        settled by looking at either of them, so the answer has to be None
+        rather than whichever happened to be found first.
+        """
+        tree = getattr(self, "_csa_root_tree", None)
+        if tree is None:
+            return None
+        found = None
+        for n in ast.walk(tree):
+            if (isinstance(n, ast.Assign) and len(n.targets) == 1
+                    and isinstance(n.targets[0], ast.Name)
+                    and n.targets[0].id == name):
+                if found is not None:
+                    return None
+                found = n.value
+        return found
+
+    def _sole_elem_tag(self, nodes: 'list[ast.expr]') -> 'str | None':
+        """The one tag every node in `nodes` is, or None if they disagree or
+        any of them is not a literal we can read."""
+        tags = {self._const_elem_tag(n) for n in nodes}
+        if len(tags) != 1:
+            return None
+        only = tags.pop()
+        return only
+
+    @staticmethod
+    def _const_elem_tag(node: ast.expr) -> 'str | None':
+        """Tag for a literal element, or None if it isn't a literal we know.
+
+        `bool` is checked before `int` because `isinstance(True, int)` is true.
+        """
+        if isinstance(node, ast.JoinedStr):
+            return "str"
+        if not isinstance(node, ast.Constant):
+            return None
+        v = node.value
+        if isinstance(v, bool):
+            return "bool"
+        if isinstance(v, int):
+            return "int"
+        if isinstance(v, float):
+            return "float"
+        if isinstance(v, str):
+            return "str"
+        if isinstance(v, bytes):
+            return "bytes"
+        return None
+
+    def _is_str_keyed_dict(self, node: ast.expr) -> bool:
+        """Whether a dict provably has *string* keys.
+
+        The mirror image of `_is_int_keyed_dict`.  It exists because the two
+        questions are genuinely separate: "not provably int-keyed" is not the
+        same claim as "str-keyed", and conflating them is what let an
+        unprovable int-keyed dict be compiled as a str-keyed one.  Only
+        patterns that pin every key to a string answer True; anything mixed,
+        computed, or unseen answers False and the caller falls back to a
+        dynamic tag.
+        """
+        if isinstance(node, ast.Dict):
+            _keys = [k for k in node.keys if k is not None]
+            if not _keys:
+                return False
+            return all(self._const_elem_tag(k) == "str" for k in _keys)
+
+        if isinstance(node, ast.DictComp):
+            _key = node.key
+            if isinstance(_key, ast.JoinedStr):
+                return True
+            if (isinstance(_key, ast.Call)
+                    and isinstance(_key.func, ast.Name)
+                    and _key.func.id in ("str", "chr", "repr", "hex", "bin")):
+                return True
+            if self._const_elem_tag(_key) == "str":
+                return True
+            return False
+
+        if not isinstance(node, ast.Name):
+            return False
+
+        tree = getattr(self, "_csa_root_tree", None)
+        if tree is None:
+            return False
+
+        # Every binding and every key-store we can see must say "str", and we
+        # must have seen at least one of them.  A single store we can't
+        # classify (a computed key, a call result) makes the whole answer
+        # False -- an unproven claim is exactly what this is here to avoid.
+        _saw_str_evidence = False
+        for n in ast.walk(tree):
+            if (isinstance(n, ast.Assign) and len(n.targets) == 1
+                    and isinstance(n.targets[0], ast.Name)
+                    and n.targets[0].id == node.id):
+                _v = n.value
+                if isinstance(_v, ast.Dict):
+                    _keys = [k for k in _v.keys if k is not None]
+                    if not _keys:
+                        continue  # `d = {}` says nothing about key kind
+                    if all(self._const_elem_tag(k) == "str" for k in _keys):
+                        _saw_str_evidence = True
+                        continue
+                return False
+            # d[<key>] = ... and d[<key>] += ...
+            _slice = None
+            if (isinstance(n, ast.Assign) and len(n.targets) == 1
+                    and isinstance(n.targets[0], ast.Subscript)
+                    and isinstance(n.targets[0].value, ast.Name)
+                    and n.targets[0].value.id == node.id):
+                _slice = n.targets[0].slice
+            elif (isinstance(n, ast.AugAssign)
+                    and isinstance(n.target, ast.Subscript)
+                    and isinstance(n.target.value, ast.Name)
+                    and n.target.value.id == node.id):
+                _slice = n.target.slice
+            elif (isinstance(n, ast.Call)
+                    and isinstance(n.func, ast.Attribute)
+                    and n.func.attr == "setdefault"
+                    and isinstance(n.func.value, ast.Name)
+                    and n.func.value.id == node.id
+                    and n.args):
+                _slice = n.args[0]
+            if _slice is None:
+                continue
+            if self._const_elem_tag(_slice) == "str":
+                _saw_str_evidence = True
+                continue
+            return False
+        return _saw_str_evidence
+
+    def _csa_tag_for_param(self, param_name: str) -> 'str | None':
+        """Call-site type recorded for `param_name` **of the function now
+        being emitted**, or None if there isn't one.
+
+        Per-parameter facts have to be keyed by *(function, parameter)*, never
+        by the parameter's bare name.  Parameter names are scoped, so the same
+        name legitimately appears in many functions with unrelated types, and
+        `_call_site_param_types` only has entries for functions that are
+        actually called.  A bare-name search across the module therefore lets
+        an *uncalled* function -- which has no call-site evidence at all, so
+        answers "no type" -- shadow the called function whose parameter is
+        genuinely typed.  That is BUG-UNCALLED-FN-PARAM-NAME-POISONS-A-CALLED-ONE:
+        a dead `def unused(data)` sitting above a live `def mode(data)` made
+        `mode`'s `data` look untyped, which turned an int-keyed dict into a
+        str-keyed one and made the loop variable get dereferenced as a string
+        pointer.
+
+        `_uniquify_nested_def_names` fixes the same hazard for *function*
+        names by alpha-renaming; parameter names can't be uniquified (they're
+        legitimately scoped), so the lookup itself must carry the scope.
+        `self._current_func_name` is that scope: codegen sets it around every
+        function body, so it is exactly the function whose statement we are
+        emitting.
+        """
+        fname = getattr(self, "_current_func_name", None)
+        if not fname:
+            return None
+        fn_ast = getattr(self, "_csa_func_asts", {}).get(fname)
+        if fn_ast is None:
+            return None
+        params = [a.arg for a in fn_ast.args.args]
+        params += [a.arg for a in getattr(fn_ast.args, "kwonlyargs", [])]
+        if param_name not in params:
+            return None
+        idx = params.index(param_name)
+        csa = getattr(self, "_call_site_param_types", {}).get(fname, [])
+        if idx >= len(csa):
+            return None
+        return csa[idx]
+
     def _is_int_keyed_dict(self, node: ast.expr) -> bool:
         """Check if a dict expression uses integer keys (from dict comp with
         int iterator, dict literal with int keys, or subscript-store with
@@ -37133,19 +37357,13 @@ class CodeGen:
                             # "list" (plain) → int elements (default).
                             # "list:str" → string elements → NOT int.
                             if not _found_iter_def:
-                                _csa = getattr(self, '_call_site_param_types', {})
-                                for _fn2 in ast.walk(tree):
-                                    if not isinstance(_fn2, ast.FunctionDef):
-                                        continue
-                                    _prms = [a.arg for a in _fn2.args.args]
-                                    if _iter.id not in _prms:
-                                        continue
-                                    _pi = _prms.index(_iter.id)
-                                    _fcsa = _csa.get(_fn2.name, [])
-                                    if (_pi < len(_fcsa)
-                                            and self._tag_kind(_fcsa[_pi]) == VKind.LIST):
-                                        return True
-                                    break
+                                # Scoped to the function being emitted; see
+                                # _csa_tag_for_param for why a bare-name
+                                # search across the module is a bug.
+                                _ptag = self._csa_tag_for_param(_iter.id)
+                                if (_ptag is not None
+                                        and self._tag_kind(_ptag) == VKind.LIST):
+                                    return True
         return False
 
     def _func_returns_int_keyed_dict(self, func_ast: ast.FunctionDef) -> bool:

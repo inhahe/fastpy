@@ -191,6 +191,48 @@ act on when it is a fact, not an inference.** `VKind.MIXED` exists to say
 through as a whole FpyValue rather than unboxing it — so a producer that cannot
 commit to one kind must say `mixed` rather than pick a plausible kind.
 
+**`mixed` is specifically not `unknown`.** `ValueType._to_tag()` maps
+`VKind.UNKNOWN` to `"int"`, so a value marked unknown comes back out of any
+string-tag boundary claiming to be an integer — which is the wrong static kind
+again, one indirection later. `for k in d:` was first fixed by tagging an
+unprovable key `unknown` and it printed raw pointers; `mixed` is the word for
+"dispatch at runtime".
+
+**A default is not a proof, and for a *producer* of static kinds a wrong
+default is a crash rather than a slowdown.** `_emit_for_dict` used to name the
+loop variable's kind as `"str"` for any dict it could not prove int-keyed, and
+`"int"` for every set ("most common"). `dict_key_fv` writes the key's real
+runtime tag into the loop variable's FpyValue, so those tags looked harmless —
+but the static kind is what the *next* statement builds a new FpyValue from,
+with a literal tag, discarding the runtime one. `out = k` compiled to
+`insertvalue undef, i32 2, 0` for a key that was the integer `5`, and the
+incref read the string header at `5 - 8`. `_dict_key_type_tag` now names a kind
+only when a literal, a `ValueType` element type, `_is_int_keyed_dict` or
+`_is_str_keyed_dict` proves it.
+
+Two consequences worth generalising:
+
+- **The negation of a proof is not a proof.** `_is_str_keyed_dict` had to be
+  written rather than derived from `not _is_int_keyed_dict(...)`; a boolean
+  prover answers "yes" or "I could not tell", never "no".
+- **A prover that can fail needs a caller that tolerates failure.** The bare
+  reason this crashed at all was that failing to prove int-keyed *promoted*
+  into a claim of str-keyed, so an ordinary analysis gap
+  (BUG-UNCALLED-FN-PARAM-NAME-POISONS-A-CALLED-ONE — a bare-name parameter
+  lookup that let an uncalled function answer for a called one) turned into a
+  segfault instead of a missed fast path.
+
+**Per-parameter facts are keyed by (function, parameter), never by name.**
+`_uniquify_nested_def_names` alpha-renames colliding *function* names up front
+precisely because nearly every analysis map is keyed by bare name. Parameter
+names cannot be uniquified — they are legitimately scoped, and the same name
+recurs in every function — so the *lookup* has to carry the scope:
+`_csa_tag_for_param` reads `self._current_func_name`, which codegen maintains
+around every function body. The failure mode is asymmetric and quiet:
+`_call_site_param_types` only has entries for functions that are actually
+called, so a bare-name search is biased towards answering from **dead** code,
+which has no call sites and therefore no types.
+
 `_csa_propagate_ret_types` is the cautionary example. Its per-function loop
 walks every `ast.Return` and *overwrites* the recorded return type each time,
 so it is last-classifiable-return-wins — a function returning a str on one
@@ -1960,6 +2002,44 @@ carries a `duration` so the next one separates a hang from mere load. The
 budget is deliberately generous — the slowest legitimate file runs in ~2 s,
 and headroom costs nothing on a green run, whereas a suite that fails randomly
 under load trains you to re-run instead of investigate.
+
+## Benchmarks
+
+`benchmarks/run_comparison.py` holds the workload definitions and nothing else
+of consequence: a list of `(name, category, python_source, cpp_source)` built
+by the `bench()` helper. Everything downstream reads that one list —
+`_compile_all.py` compiles all of them in *one* checkout and prints a
+`{name: exe}` map, and `ab_bench.py` calls `_compile_all.py` twice, once per
+checkout, because `compiler` is a top-level package name and two copies cannot
+live in one interpreter.
+
+**Comparisons are paired and interleaved, not absolute.** `stable_bench.py`
+established that this machine's absolute timings move by up to 2x under load
+even pinned and prioritised, and that the inflation is not uniform across
+workloads, so it cannot be divided out by a single factor. `ab_bench.py`
+therefore runs A, B, A, B…, alternates which side goes first each repetition,
+and subtracts a per-side spawn floor measured the same interleaved way. The
+ratio is what survives; a `B/A` outside 0.90–1.10 is a verdict, and anything
+whose net time is under 3 ms is reported as `spawn-dominated` rather than given
+a ratio that is mostly noise.
+
+**A benchmark measures a code path, so the set of benchmarks is a coverage
+question** — and it is one the harness cannot report on, because a missing
+workload does not fail, it silently answers "no regression". The suite carried
+`dict lookup 1K keys x 1K` for a long time and no dict or set *iteration* at
+all; lookup never enters `_emit_for_dict`, so a change that rewrote how every
+`for k in <dict>` loop picks its key kind could be A/B'd against the whole
+suite and come back clean. Before measuring a change, check that some workload
+actually reaches the code it changed. If none does, writing that workload is
+part of the change, not a follow-up.
+
+When A/B'ing an *uncommitted* change, the baseline checkout
+(`../_fastpy_before`, a linked worktree) should be moved to `HEAD` first, or
+the measurement silently attributes the last few commits to the working tree as
+well. Workload definitions have to match on both sides — `ab_bench.py`
+intersects the two name sets and drops the rest — so a new benchmark must be
+copied into the baseline too. Copying `run_comparison.py` across is safe and
+correct: it is the workload, not the compiler.
 
 ## Git workflow (project rule)
 

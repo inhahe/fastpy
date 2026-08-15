@@ -36,3 +36,10 @@ benchmarks/_ab_exes/
 benchmarks/_tls_exes/
 benchmarks/_dict_ir.ll
 benchmarks/_dist_ir.ll
+
+# Compile-and-run probes: a throwaway .py is compiled here and its stdout
+# diffed against CPython's.  The probe itself is scratch -- the ones worth
+# keeping graduate to tests/regressions/ -- but its dumped IR and captured
+# output are pure artifacts and never belong in a commit.
+benchmarks/_probe*.ll
+benchmarks/*.out
