@@ -27,6 +27,21 @@
 #define fpy_strdup strdup
 #endif
 
+/* Keep a cold helper out of its caller's frame.
+ *
+ * This is a performance guard, not a style preference.  A small hot function
+ * that inlines an error path pays for that path on every *successful* call:
+ * the error path's locals join the caller's frame, and a large buffer among
+ * them makes MSVC add /GS stack-cookie code, so the fast path acquires a
+ * frame setup and a `call __security_check_cookie` on the way out.  That is
+ * how a KeyError message costing nothing on a hit still cost ~40% of a dict
+ * lookup.  Mark raise-and-return helpers with this. */
+#ifdef _MSC_VER
+#define FPY_NOINLINE __declspec(noinline)
+#else
+#define FPY_NOINLINE __attribute__((noinline))
+#endif
+
 /* Type tags */
 #define FPY_TAG_INT    0
 #define FPY_TAG_FLOAT  1
@@ -57,6 +72,12 @@ FpyComplex* fpy_complex_pow(FpyComplex *a, FpyComplex *b);
 FpyComplex* fpy_complex_neg(FpyComplex *a);
 double fpy_complex_abs(FpyComplex *a);
 void fpy_complex_print(FpyComplex *c);
+/* Returns a *header-backed* string (see fpy_str_buf below): the char* points
+ * 8 bytes into its malloc block, so the caller must release it with
+ * fpy_rc_decref(FPY_TAG_STR, …) — never free().  This differs from
+ * fpy_bigint_to_str / fpy_decimal_to_str, which hand back a bare malloc, and
+ * confusing the two corrupts the heap.
+ * BUG-COMPLEX-REPR-FREES-HEADERED-STRING. */
 char* fpy_complex_to_str(FpyComplex *c);
 
 /* Decimal number (fixed-precision: 18 digits via int64 coefficient) */
@@ -104,6 +125,24 @@ typedef int64_t (*FpyMethod1Func)(FpyObj *self, int64_t a);
 typedef int64_t (*FpyMethod2Func)(FpyObj *self, int64_t a, int64_t b);
 typedef int64_t (*FpyMethod3Func)(FpyObj *self, int64_t a, int64_t b, int64_t c);
 typedef int64_t (*FpyMethod4Func)(FpyObj *self, int64_t a, int64_t b, int64_t c, int64_t d);
+
+/* Void-returning counterparts.  A Python method that never executes a
+ * `return <expr>` is compiled to an LLVM function with a `void` return type,
+ * and codegen records that by passing returns_value=0 to
+ * fastpy_register_method().  Calling such a function through one of the
+ * int64_t-returning pointer types above does not merely produce an unspecified
+ * result — it reads whatever the callee happened to leave in the return
+ * register.  That bit us for real: `with` treated the garbage from a
+ * None-returning __exit__ as a truthy "suppress the exception" answer, and an
+ * exception raised in the with-body vanished instead of reaching its handler
+ * (the value was reliably zero for a trivial __exit__ and non-zero as soon as
+ * the body touched `self`, which is why it looked like a self-reference bug).
+ * Dispatch through these types whenever m->returns_value is 0. */
+typedef void (*FpyMethodVoidFunc)(FpyObj *self);
+typedef void (*FpyMethod1VoidFunc)(FpyObj *self, int64_t a);
+typedef void (*FpyMethod2VoidFunc)(FpyObj *self, int64_t a, int64_t b);
+typedef void (*FpyMethod3VoidFunc)(FpyObj *self, int64_t a, int64_t b, int64_t c);
+typedef void (*FpyMethod4VoidFunc)(FpyObj *self, int64_t a, int64_t b, int64_t c, int64_t d);
 
 /* Method entry in a class */
 typedef struct {
@@ -193,6 +232,11 @@ static inline int fpy_decref(int32_t *rc) {
 void fpy_incref_atomic(int32_t *rc);
 int fpy_decref_atomic(int32_t *rc);
 
+/* Tagged-value refcount release — decrefs and destroys when count hits 0.
+ * Defined in objects.c; declared here so callers (gc.c, runtime.c,
+ * cpython_bridge.c) don't rely on an implicit declaration. */
+void fpy_rc_decref(int32_t tag, int64_t data);
+
 #define FPY_OBJ_MAGIC 0x4F424A53  /* "OBJS" — distinguishes FpyObj from PyObject* */
 
 /* Weak reference: points to an object without preventing its collection.
@@ -279,6 +323,36 @@ typedef struct {
 
 /* Allocate a refcounted string of `len` chars (+ null terminator). */
 FpyString* fpy_str_alloc(int64_t len);
+
+/* Copy `len` bytes of `src` into a fresh refcounted (headered) string and
+ * return a pointer to its char data (i.e. what a STR-tagged FpyValue.data.s
+ * should point at). Unlike a bare `malloc`+`fpy_str`, the returned pointer has
+ * a valid FpyString header 8 bytes before it, so `fpy_str_header`/incref/decref
+ * work and the string is freed exactly once via the header (no leak, no
+ * out-of-bounds header read). Use this — not `fpy_strdup`/`malloc` — for any
+ * char* that becomes a STR value. See BUG-RUNTIME-STR-PRODUCERS-BARE-MALLOC. */
+static inline char* fpy_str_copy(const char *src, int64_t len) {
+    FpyString *h = fpy_str_alloc(len);
+    if (len > 0) memcpy(h->data, src, (size_t)len);
+    h->data[len] = '\0';
+    return h->data;
+}
+/* Convenience: headered copy of a NUL-terminated C string. */
+static inline char* fpy_str_from_cstr(const char *src) {
+    return fpy_str_copy(src, (int64_t)strlen(src));
+}
+/* Allocate an uninitialised, NUL-terminated writable buffer of `len` bytes
+ * (plus the terminator) that carries a valid FpyString header, and return a
+ * pointer to its char data. Use this instead of `malloc(len+1)` when a runtime
+ * string producer builds its result in place (loops/memcpy) and returns the
+ * char* as a STR value. The buffer is header-backed so incref/decref work and
+ * it is freed exactly once via the header. See
+ * BUG-RUNTIME-STR-PRODUCERS-BARE-MALLOC. */
+static inline char* fpy_str_buf(int64_t len) {
+    FpyString *h = fpy_str_alloc(len);
+    return h->data;
+}
+
 /* Get the FpyString header from a char* data pointer. Returns NULL if not owned. */
 static inline FpyString* fpy_str_header(const char *s) {
     FpyString *h = (FpyString*)((char*)s - offsetof(FpyString, data));
@@ -305,14 +379,30 @@ static inline char* fpy_bytes_alloc(int64_t len) {
 }
 /* Get the FpyBytes header from a char* data pointer. Returns NULL if not bytes. */
 static inline FpyBytes* fpy_bytes_header(const char *s) {
+    /* Subtracting from a null pointer is UB, and callers do reach here with
+     * NULL when a bridge-only operation returned nothing in pure mode. */
+    if (s == NULL) return NULL;
     FpyBytes *h = (FpyBytes*)((char*)s - offsetof(FpyBytes, data));
     return (h->magic == FPY_BYTES_MAGIC) ? h : NULL;
 }
 /* Get bytes length (FpyBytes-aware, falls back to strlen for plain strings) */
 static inline int64_t fpy_bytes_len(const char *s) {
+    if (s == NULL) return 0;
     FpyBytes *bh = fpy_bytes_header(s);
     if (bh) return bh->length;
     return (int64_t)strlen(s);  /* fallback for plain char* */
+}
+/* Refcount ops for header-backed bytes. A non-headered (constant) bytes
+ * pointer has no FpyBytes header → these are no-ops (immortal), mirroring
+ * fpy_str_incref/decref. */
+static inline void fpy_bytes_incref(const char *s) {
+    FpyBytes *h = fpy_bytes_header(s);
+    if (h && h->refcount != FPY_RC_IMMORTAL) h->refcount++;
+}
+static inline int fpy_bytes_decref(const char *s) {
+    FpyBytes *h = fpy_bytes_header(s);
+    if (!h || h->refcount == FPY_RC_IMMORTAL) return 0;
+    return (--h->refcount == 0);  /* returns 1 if should be freed */
 }
 
 /* Return the byte-length of the UTF-8 code point starting at *p.
@@ -445,11 +535,38 @@ void fastpy_set_intersection_update(FpyDict *a, FpyDict *b);
 void fastpy_set_difference_update(FpyDict *a, FpyDict *b);
 void fastpy_set_symmetric_difference_update(FpyDict *a, FpyDict *b);
 
+/* The set methods that take an "other", as codegen calls them: the argument
+ * arrives as (tag, data) because CPython accepts any iterable for all eleven
+ * and the argument's kind is a runtime fact, not a static one.  The FpyDict*
+ * forms stay for the *operators* (`|`, `&`, `-`, `^`, `|=`), which really do
+ * require a set on both sides.  Handing a non-set to one of those forms is
+ * BUG-SET-UPDATE-NON-SET-ITERABLE-SEGFAULTS — see fpy_iterable_as_set. */
+void fastpy_set_update_fv(FpyDict *a, int32_t tag, int64_t data);
+void fastpy_set_intersection_update_fv(FpyDict *a, int32_t tag, int64_t data);
+void fastpy_set_difference_update_fv(FpyDict *a, int32_t tag, int64_t data);
+void fastpy_set_symmetric_difference_update_fv(FpyDict *a, int32_t tag,
+                                               int64_t data);
+FpyDict* fastpy_set_union_fv(FpyDict *a, int32_t tag, int64_t data);
+FpyDict* fastpy_set_intersection_fv(FpyDict *a, int32_t tag, int64_t data);
+FpyDict* fastpy_set_difference_fv(FpyDict *a, int32_t tag, int64_t data);
+FpyDict* fastpy_set_symmetric_diff_fv(FpyDict *a, int32_t tag, int64_t data);
+int32_t fastpy_set_issubset_fv(FpyDict *a, int32_t tag, int64_t data);
+int32_t fastpy_set_issuperset_fv(FpyDict *a, int32_t tag, int64_t data);
+int32_t fastpy_set_isdisjoint_fv(FpyDict *a, int32_t tag, int64_t data);
+/* `set(x)` / `frozenset(x)` over any iterable — always a fresh set. */
+FpyDict* fastpy_set_from_iterable_fv(int32_t tag, int64_t data);
+
 /* zip with 1 iterable */
 FpyList* fastpy_zip1(FpyList *a);
 
 /* --- Built-in list/tuple iterator --- */
 FpyObj* fastpy_list_iter_new(FpyList *list);
+
+/* --- Built-in file object (open()) — C-stdio-backed, works in pure mode.
+ * Returns an FpyObj of the built-in "file" class; method dispatch
+ * (read/write/readline/readlines/close/__enter__/__exit__/__iter__/__next__)
+ * goes through the normal object machinery.  `mode` may be NULL ("r"). --- */
+FpyObj* fastpy_io_open(const char *path, const char *mode);
 
 /* --- Attribute access helpers (hasattr/getattr with default) --- */
 int32_t fastpy_obj_has_attr(FpyObj *obj, const char *name);

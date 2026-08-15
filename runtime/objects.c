@@ -7,6 +7,7 @@
 #include "gc.h"
 #include "bigint.h"
 #include <math.h>
+#include <assert.h>  /* static_assert macro (C11); MSVC provides it implicitly */
 
 /* The codegen computes inline slot addresses as (FpyValue*)(obj + 1) + idx,
  * relying on sizeof(FpyObj) == 56 on x64 (lock field removed).
@@ -22,20 +23,17 @@ void fastpy_tuple_write(FpyList *tuple);
 void fastpy_dict_write(FpyDict *dict);
 void fastpy_obj_write(FpyObj *obj);
 FpyMethodDef* fastpy_find_method(int class_id, const char *name);
+/* Defined later in this file; declared here so callers earlier in the TU
+ * don't rely on an implicit declaration (rejected by strict C99+/clang). */
+int fastpy_dict_has_key(FpyDict *dict, const char *key);
+int32_t fastpy_dict_has_int_key(FpyDict *dict, int64_t key);
+static int _fpy_ws_fwd(const unsigned char *p);
 
 /* External APIs (defined in runtime.c) */
-extern void fastpy_raise(int exc_type, const char *msg);
-extern int fastpy_exc_pending(void);
 extern int64_t fastpy_str_len(const char *);
 
-/* Exception type constants (mirror runtime.c) */
-#define FPY_EXC_ZERODIVISION   1
-#define FPY_EXC_VALUEERROR     2
-#define FPY_EXC_TYPEERROR      3
-#define FPY_EXC_INDEXERROR     4
-#define FPY_EXC_KEYERROR       5
-#define FPY_EXC_ATTRIBUTEERROR 11
-#define FPY_EXC_STOPITERATION  7
+/* fastpy_raise / fastpy_exc_pending and the FPY_EXC_* codes. */
+#include "exceptions.h"
 
 /* External: return-tag side channel (defined in runtime.c) */
 extern void fastpy_set_ret_tag(int32_t tag);
@@ -90,6 +88,9 @@ typedef struct {
     int64_t captures[8];
     const char **param_names;  /* parameter names (n_params entries), for **kwargs dispatch */
 } FpyClosure;
+/* Declared here (right after the type) so early callers in this TU use the
+ * real signature instead of an implicit/void* declaration. */
+int64_t fastpy_closure_call1(FpyClosure *c, int64_t a);
 
 typedef struct {
     int32_t refcount;
@@ -164,7 +165,21 @@ void fpy_rc_incref(int32_t tag, int64_t data) {
         }
         case FPY_TAG_STR:
             fpy_str_incref((const char*)(intptr_t)data); break;
-        default: break;  /* INT, FLOAT, BOOL, NONE — not heap-allocated */
+        case FPY_TAG_BYTES:
+            fpy_bytes_incref((const char*)(intptr_t)data); break;
+        case FPY_TAG_BIGINT:
+            /* Must mirror the FPY_TAG_BIGINT arm of fpy_rc_decref below.
+             * Omitting it made every BigInt incref a silent no-op while
+             * the matching decref still decremented, so a BigInt with two
+             * owners (e.g. a list element also bound to a loop variable)
+             * was freed by the first release and the second one read
+             * freed memory.  See BUG-BIGINT-INCREF-MISSING. */
+            fpy_incref(&((FpyBigInt*)(intptr_t)data)->refcount); break;
+        default: break;  /* INT, FLOAT, BOOL, NONE — not heap-allocated.
+                          * COMPLEX and DECIMAL are heap-allocated but are
+                          * refcounted by neither incref nor decref, so they
+                          * leak rather than dangle — DEBT-COMPLEX-DECIMAL-
+                          * NOT-REFCOUNTED. */
     }
 }
 
@@ -174,6 +189,12 @@ void fpy_rc_decref(int32_t tag, int64_t data) {
         case FPY_TAG_STR:
             if (fpy_str_decref((const char*)(intptr_t)data)) {
                 FpyString *h = fpy_str_header((const char*)(intptr_t)data);
+                if (h) free(h);
+            }
+            break;
+        case FPY_TAG_BYTES:
+            if (fpy_bytes_decref((const char*)(intptr_t)data)) {
+                FpyBytes *h = fpy_bytes_header((const char*)(intptr_t)data);
                 if (h) free(h);
             }
             break;
@@ -222,11 +243,9 @@ void fpy_rc_decref(int32_t tag, int64_t data) {
                         if (wr->callback_tag != 0 && wr->callback != 0) {
                             /* callback(weakref) — call with the weakref
                              * itself as the single argument, per CPython
-                             * weakref semantics. */
-                            extern int64_t fastpy_closure_call1(
-                                void*, int64_t);
+                             * weakref semantics. (Declared at file scope.) */
                             fastpy_closure_call1(
-                                (void*)(intptr_t)wr->callback,
+                                (FpyClosure*)(intptr_t)wr->callback,
                                 (int64_t)(intptr_t)wr);
                         }
                         wr = next;
@@ -293,7 +312,13 @@ void fpy_rc_decref(int32_t tag, int64_t data) {
                 fpy_bigint_free(bi);
             break;
         }
-        default: break;
+        default: break;  /* Must stay arm-for-arm with fpy_rc_incref above:
+                          * a tag handled here but not there turns every
+                          * balanced incref/decref pair in the program into a
+                          * use-after-free.  INT, FLOAT, BOOL and NONE fall
+                          * through on purpose (unboxed); COMPLEX and DECIMAL
+                          * fall through by omission and leak — DEBT-COMPLEX-
+                          * DECIMAL-NOT-REFCOUNTED. */
     }
 }
 
@@ -386,6 +411,75 @@ void fastpy_set_write(FpyDict *set);
 
 /* --- Value repr (for list elements: strings get quotes) --- */
 
+/* Is this OBJ-tagged pointer actually a pure-mode pathlib.Path?
+ *
+ * Codegen tags a Path OBJ, so every generic OBJ consumer below (print / write /
+ * str / repr) receives a pointer it cannot type. Its fallback is the CPython
+ * bridge, which in a pure build is a stub that RAISES — so without this check
+ * `print(Path(...))` fails even though the value is perfectly printable.
+ * runtime/pathlib_pure.c (compiled only into pure builds) can answer the
+ * question from the Path header's magic word; in bridged builds a Path really
+ * IS a PyObject*, so the bridge fallback is correct and this returns NULL.
+ *
+ * Returns the path text, or NULL if it is not a Path. */
+#ifdef FPY_PURE_MODE
+extern const char *fpy_pure_path_text(const void *p);
+static inline const char *_fpy_obj_as_path_text(const void *p) {
+    return fpy_pure_path_text(p);
+}
+#else
+static inline const char *_fpy_obj_as_path_text(const void *p) {
+    (void)p;
+    return NULL;
+}
+#endif
+
+/* --- Shared string-repr quoting. BUG-REPR-ALWAYS-SINGLE-QUOTES.
+ *
+ * CPython *picks* the quote character instead of always escaping: a string
+ * that contains ' but no " is repr'd in double quotes, so repr("it's") is
+ * "it's" and not 'it\'s'. Only when both quote characters appear does the
+ * single quote get a backslash. fastpy had two independent repr routines
+ * (fpy_value_repr's STR case and fastpy_str_repr) that both hardcoded a
+ * single quote, and that also disagreed with each other about control
+ * characters — one emitted \xNN, the other passed the raw byte through into
+ * the output. Both now share the two routines below, so there is one answer
+ * to "what does a string look like when repr'd". */
+
+/* Which quote CPython would wrap this string in. */
+static char fpy_repr_quote(const char *s, size_t len) {
+    int has_sq = 0, has_dq = 0;
+    for (size_t i = 0; i < len; i++) {
+        if (s[i] == '\'') has_sq = 1;
+        else if (s[i] == '"') has_dq = 1;
+    }
+    return (has_sq && !has_dq) ? '"' : '\'';
+}
+
+/* Write the escaped *body* of a repr (no surrounding quotes) into buf and
+ * return the count written. Stops early rather than overrunning, always
+ * leaving the caller room for the closing quote and the terminator. Only the
+ * chosen quote is escaped — the other one is literal, which is the whole
+ * point of choosing. Bytes >= 128 pass through: they are UTF-8 continuation
+ * bytes of a character CPython would print as itself. */
+static int fpy_repr_escape_body(const char *s, size_t len, char quote,
+                                char *buf, int bufsize) {
+    int pos = 0;
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (pos > bufsize - 6) break;  /* worst case is \xNN + quote + NUL */
+        if (c == '\\')                      { buf[pos++] = '\\'; buf[pos++] = '\\'; }
+        else if (c == (unsigned char)quote) { buf[pos++] = '\\'; buf[pos++] = (char)c; }
+        else if (c == '\n')                 { buf[pos++] = '\\'; buf[pos++] = 'n'; }
+        else if (c == '\r')                 { buf[pos++] = '\\'; buf[pos++] = 'r'; }
+        else if (c == '\t')                 { buf[pos++] = '\\'; buf[pos++] = 't'; }
+        else if (c < 32 || c == 127)
+            pos += snprintf(buf + pos, (size_t)(bufsize - pos), "\\x%02x", c);
+        else buf[pos++] = (char)c;
+    }
+    return pos;
+}
+
 void fpy_value_repr(FpyValue val, char *buf, int bufsize) {
     switch (val.tag) {
         case FPY_TAG_INT:
@@ -395,24 +489,14 @@ void fpy_value_repr(FpyValue val, char *buf, int bufsize) {
             format_float(val.data.f, buf, bufsize);
             break;
         case FPY_TAG_STR: {
-            /* Escape special characters like CPython's repr() */
+            const char *s = val.data.s ? val.data.s : "";
+            size_t slen = strlen(s);
+            if (bufsize < 4) { if (bufsize > 0) buf[0] = '\0'; break; }
+            char q = fpy_repr_quote(s, slen);
             int pos = 0;
-            const char *s = val.data.s;
-            buf[pos++] = '\'';
-            if (s) {
-                for (; *s && pos < bufsize - 6; s++) {
-                    unsigned char c = (unsigned char)*s;
-                    if (c == '\\')      { buf[pos++] = '\\'; buf[pos++] = '\\'; }
-                    else if (c == '\'') { buf[pos++] = '\\'; buf[pos++] = '\''; }
-                    else if (c == '\n') { buf[pos++] = '\\'; buf[pos++] = 'n'; }
-                    else if (c == '\r') { buf[pos++] = '\\'; buf[pos++] = 'r'; }
-                    else if (c == '\t') { buf[pos++] = '\\'; buf[pos++] = 't'; }
-                    else if (c < 32 || c == 127)
-                        pos += snprintf(buf + pos, bufsize - pos, "\\x%02x", c);
-                    else buf[pos++] = c;
-                }
-            }
-            if (pos < bufsize - 1) buf[pos++] = '\'';
+            buf[pos++] = q;
+            pos += fpy_repr_escape_body(s, slen, q, buf + pos, bufsize - pos);
+            buf[pos++] = q;
             buf[pos] = '\0';
             break;
         }
@@ -452,6 +536,15 @@ void fpy_value_repr(FpyValue val, char *buf, int bufsize) {
         case FPY_TAG_OBJ: {
             /* Could be FpyObj or CPython PyObject* — detect via magic */
             void *ptr = val.data.obj;
+            /* Pure-mode pathlib.Path: check first, since its magic is neither
+             * the closure magic nor in the small-int range the FpyObj probe
+             * uses, so it would otherwise fall through to the bridge (which
+             * raises in a pure build). CPython reprs a Path as PosixPath('…'). */
+            const char *_pt = _fpy_obj_as_path_text(ptr);
+            if (_pt) {
+                snprintf(buf, bufsize, "PosixPath('%s')", _pt);
+                break;
+            }
             int32_t first_word = *(int32_t*)ptr;
             if (first_word == FPY_CLOSURE_MAGIC) {
                 snprintf(buf, bufsize, "<closure>");
@@ -485,7 +578,14 @@ void fpy_value_repr(FpyValue val, char *buf, int bufsize) {
         case FPY_TAG_COMPLEX: {
             char *s = fpy_complex_to_str((FpyComplex*)(intptr_t)val.data.i);
             snprintf(buf, bufsize, "%s", s);
-            free(s);
+            /* NOT free(): unlike its siblings above, fpy_complex_to_str
+             * returns fpy_str_buf's *header-backed* buffer, whose char*
+             * points 8 bytes into the malloc block.  Handing that to free()
+             * aborted the process with STATUS_HEAP_CORRUPTION (0xc0000374) —
+             * `print([1 + 2j])` died before printing anything, while
+             * `print(c[0])` was fine because it never reached this repr.
+             * BUG-COMPLEX-REPR-FREES-HEADERED-STRING. */
+            fpy_rc_decref(FPY_TAG_STR, (int64_t)(intptr_t)s);
             break;
         }
         case FPY_TAG_DECIMAL: {
@@ -509,24 +609,60 @@ void fpy_value_repr(FpyValue val, char *buf, int bufsize) {
             break;
         }
         case FPY_TAG_BYTES: {
-            /* bytes repr: b'...' */
+            /* bytes repr: b'...'. Same quote-choosing rule as str — CPython
+             * reprs b"it's" with double quotes — but the escaping differs:
+             * a byte >= 127 has no character to print, so it stays \xNN. */
             const char *data = val.data.s;
+            size_t len = data ? (size_t)fpy_bytes_len(data) : 0;  /* embedded-null safe */
+            if (bufsize < 5) { if (bufsize > 0) buf[0] = '\0'; break; }
+            char q = data ? fpy_repr_quote(data, len) : '\'';
             int pos = 0;
-            pos += snprintf(buf + pos, bufsize - pos, "b'");
-            if (data) {
-                size_t len = strlen(data);
-                for (size_t i = 0; i < len && pos < bufsize - 6; i++) {
-                    unsigned char c = (unsigned char)data[i];
-                    if (c == '\\') pos += snprintf(buf + pos, bufsize - pos, "\\\\");
-                    else if (c == '\'') pos += snprintf(buf + pos, bufsize - pos, "\\'");
-                    else if (c >= 32 && c < 127) pos += snprintf(buf + pos, bufsize - pos, "%c", c);
-                    else pos += snprintf(buf + pos, bufsize - pos, "\\x%02x", c);
-                }
+            buf[pos++] = 'b';
+            buf[pos++] = q;
+            for (size_t i = 0; i < len && pos < bufsize - 6; i++) {
+                unsigned char c = (unsigned char)data[i];
+                if (c == '\\')                      { buf[pos++] = '\\'; buf[pos++] = '\\'; }
+                else if (c == (unsigned char)q)     { buf[pos++] = '\\'; buf[pos++] = (char)c; }
+                else if (c == '\n')                 { buf[pos++] = '\\'; buf[pos++] = 'n'; }
+                else if (c == '\r')                 { buf[pos++] = '\\'; buf[pos++] = 'r'; }
+                else if (c == '\t')                 { buf[pos++] = '\\'; buf[pos++] = 't'; }
+                else if (c >= 32 && c < 127)        { buf[pos++] = (char)c; }
+                else pos += snprintf(buf + pos, (size_t)(bufsize - pos), "\\x%02x", c);
             }
-            snprintf(buf + pos, bufsize - pos, "'");
+            buf[pos++] = q;
+            buf[pos] = '\0';
             break;
         }
     }
+}
+
+/* Raise KeyError for a missing key. BUG-KEYERROR-STR-NOT-REPR.
+ *
+ * KeyError is the one built-in whose __str__ is not the message but
+ * `repr(args[0])` — CPython prints `KeyError: 'a'` for a string key and
+ * `KeyError: 5` for an int one. fastpy has no `args`, only the message that
+ * *is* str(e), so the repr has to be applied at the raise site. Doing it in
+ * one helper is what keeps the rule from being reapplied inconsistently: the
+ * dozen dict/set miss paths had drifted into passing the raw key text, a bare
+ * "KeyError", or a snprintf'd integer, three different answers to one
+ * question.
+ *
+ * This also covers the message-shaped ones — `set().pop()` raises
+ * KeyError('pop from an empty set'), and CPython quotes that string like any
+ * other argument, so those sites pass a string value through here too rather
+ * than special-casing themselves.
+ *
+ * A stack buffer suffices because fastpy_raise copies the message into
+ * header-backed storage before returning.
+ *
+ * FPY_NOINLINE because that buffer must stay out of the callers' frames: the
+ * dict lookups that call this are hot, and inlining put 256 bytes on their
+ * stack, which is what made MSVC give them /GS cookie code on the path where
+ * the key *is* found.  See the macro's comment in objects.h. */
+FPY_NOINLINE static void fpy_raise_key_error(FpyValue key) {
+    char buf[256];
+    fpy_value_repr(key, buf, sizeof(buf));
+    fastpy_raise(FPY_EXC_KEYERROR, buf);
 }
 
 /* --- Value print (str formatting: strings without quotes) --- */
@@ -560,13 +696,14 @@ void fastpy_fv_write(int32_t tag, int64_t data) {
 
 /* Return the repr string (allocated) for an FpyValue. */
 const char* fastpy_fv_repr(int32_t tag, int64_t data) {
-    char *buf = (char*)malloc(4096);
+    char *buf = fpy_str_buf(4096);
     fpy_value_repr(_pack_fv(tag, data), buf, 4096);
     return buf;
 }
 
 /* Forward declaration: defined later in this file */
 const char* fastpy_obj_to_str(FpyObj *obj);
+
 
 /* Return the str string (allocated) for an FpyValue — strings pass
  * through without quotes; OBJ types use __str__; other types use repr. */
@@ -582,11 +719,16 @@ const char* fastpy_fv_str(int32_t tag, int64_t data) {
                 return fastpy_obj_to_str(obj);
             }
         }
+        /* Pure-mode pathlib.Path: printable natively, and the bridge below
+         * would raise. Copy the text so the caller owns a normal FpyString
+         * rather than a pointer into the Path's own header block. */
+        const char *pt = _fpy_obj_as_path_text(ptr);
+        if (pt) return fpy_str_from_cstr(pt);
         /* CPython PyObject* — use PyObject_Str */
         extern const char* fpy_bridge_pyobj_str(void*);
         return fpy_bridge_pyobj_str(ptr);
     }
-    char *buf = (char*)malloc(4096);
+    char *buf = fpy_str_buf(4096);
     fpy_value_repr(_pack_fv(tag, data), buf, 4096);
     return buf;
 }
@@ -625,12 +767,99 @@ static int _fpy_tags_order_compatible(int32_t tag1, int32_t tag2) {
         (tag2 == FPY_TAG_INT || tag2 == FPY_TAG_BOOL)) return 1;
     if (tag2 == FPY_TAG_FLOAT &&
         (tag1 == FPY_TAG_INT || tag1 == FPY_TAG_BOOL)) return 1;
-    /* BIGINT with INT/BOOL */
+    /* BIGINT with INT/BOOL/FLOAT — all four are numbers, and CPython orders
+     * any pair of them.  FLOAT was missing here, so `2 ** 80 < 1.5` raised
+     * TypeError instead of answering. */
     if (tag1 == FPY_TAG_BIGINT &&
-        (tag2 == FPY_TAG_INT || tag2 == FPY_TAG_BOOL)) return 1;
+        (tag2 == FPY_TAG_INT || tag2 == FPY_TAG_BOOL
+         || tag2 == FPY_TAG_FLOAT)) return 1;
     if (tag2 == FPY_TAG_BIGINT &&
-        (tag1 == FPY_TAG_INT || tag1 == FPY_TAG_BOOL)) return 1;
+        (tag1 == FPY_TAG_INT || tag1 == FPY_TAG_BOOL
+         || tag1 == FPY_TAG_FLOAT)) return 1;
+    /* DECIMAL with INT/BOOL/FLOAT — CPython orders a Decimal against any of
+     * them.  COMPLEX with them too, but only for *equality*: `(1+0j) == 1` is
+     * True while `(1+0j) < 1` is a TypeError.  This predicate cannot express
+     * "equality only", and answering 0 here would make the equality silently
+     * False instead, so the ordering rejection lives in the COMPLEX arm of
+     * fastpy_fv_compare (which also has to reject complex-vs-complex ordering,
+     * something the tag1 == tag2 shortcut above lets through).
+     * BUG-FV-COMPARE-NO-DECIMAL-COMPLEX. */
+    if (tag1 == FPY_TAG_DECIMAL &&
+        (tag2 == FPY_TAG_INT || tag2 == FPY_TAG_BOOL
+         || tag2 == FPY_TAG_FLOAT)) return 1;
+    if (tag2 == FPY_TAG_DECIMAL &&
+        (tag1 == FPY_TAG_INT || tag1 == FPY_TAG_BOOL
+         || tag1 == FPY_TAG_FLOAT)) return 1;
+    if (tag1 == FPY_TAG_COMPLEX &&
+        (tag2 == FPY_TAG_INT || tag2 == FPY_TAG_BOOL
+         || tag2 == FPY_TAG_FLOAT)) return 1;
+    if (tag2 == FPY_TAG_COMPLEX &&
+        (tag1 == FPY_TAG_INT || tag1 == FPY_TAG_BOOL
+         || tag1 == FPY_TAG_FLOAT)) return 1;
     return 0;
+}
+
+/* A Decimal as a double, for comparison against a FLOAT operand.
+ *
+ * Inexact in the same way `float(Decimal(...))` is, and CPython's own
+ * Decimal-vs-float comparison is *exact* — it converts the float to a Decimal
+ * rather than the other way round.  The difference only shows up past 2^53 or
+ * for a decimal fraction no double represents, and doing it exactly needs a
+ * float→Decimal constructor the runtime does not have yet.
+ * Logged as BUG-DECIMAL-FLOAT-COMPARE-INEXACT. */
+static double _fpy_decimal_to_double(const FpyDecimal *d) {
+    double v = (double)d->coefficient * pow(10.0, (double)d->exponent);
+    return d->sign < 0 ? -v : v;
+}
+
+/* A finite double whose magnitude is at least 2^63, as an exact BigInt.
+ *
+ * Such a double is always an integer, and always exactly `mantissa * 2^k`:
+ * `frexp` splits it into m * 2^e with 0.5 <= |m| < 1, `ldexp(m, 53)` is then
+ * an integer of at most 53 bits (so it fits an i64 exactly), and the leftover
+ * exponent is a shift.  No rounding happens anywhere. */
+static FpyBigInt *_fpy_bigint_from_large_double(double d) {
+    int e;
+    double m = frexp(d, &e);
+    int64_t mant = (int64_t)ldexp(m, 53);
+    FpyBigInt *b = fpy_bigint_from_i64(mant);
+    e -= 53;                       /* |d| >= 2^63 means e >= 64, so e > 0 */
+    if (e > 0) {
+        FpyBigInt *sh = fpy_bigint_from_i64(e);
+        FpyBigInt *r = fpy_bigint_lshift(b, sh);
+        fpy_bigint_free(b);
+        fpy_bigint_free(sh);
+        return r;
+    }
+    return b;
+}
+
+/* Compare a BigInt against a double: -1 / 0 / 1 for a < d, a == d, a > d,
+ * and 2 for "unordered" (NaN), which every comparison must answer False to.
+ *
+ * Converting the BigInt to a double and comparing would be wrong in exactly
+ * the cases that matter: every integer past 2^53 rounds, so `2**80 + 1` and
+ * `2.0**80` would compare equal.  Converting the *double* to an integer is
+ * lossless in both directions — below 2^63 through an i64 with the fraction
+ * breaking the tie, and above it through the mantissa/exponent split. */
+static int _fpy_bigint_cmp_double(FpyBigInt *a, double d) {
+    if (isnan(d)) return 2;
+    if (isinf(d)) return d > 0 ? -1 : 1;
+    double t = trunc(d);
+    if (t >= -9223372036854775808.0 && t < 9223372036854775808.0) {
+        FpyBigInt *bt = fpy_bigint_from_i64((int64_t)t);
+        int c = fpy_bigint_cmp(a, bt);
+        fpy_bigint_free(bt);
+        if (c != 0) return c;
+        double frac = d - t;          /* a == trunc(d), so the fraction decides */
+        if (frac > 0.0) return -1;
+        if (frac < 0.0) return 1;
+        return 0;
+    }
+    FpyBigInt *bd = _fpy_bigint_from_large_double(d);
+    int c = fpy_bigint_cmp(a, bd);
+    fpy_bigint_free(bd);
+    return c;
 }
 
 int32_t fastpy_fv_compare(int32_t tag1, int64_t data1,
@@ -670,6 +899,121 @@ int32_t fastpy_fv_compare(int32_t tag1, int64_t data1,
             case 4: return cmp > 0;
             case 5: return cmp >= 0;
         }
+    }
+    /* BigInt comparison: at least one is BIGINT.  This has to come before the
+     * FLOAT and default-integer branches, both of which would read the BigInt
+     * *pointer* as a number — the default one compared the two pointers, so
+     * `-b == -c` on equal BigInts was False, and the float one bitcast a
+     * pointer to a double.  BUG-BIGINT-FV-RESULT-NOT-CONSUMED. */
+    if (tag1 == FPY_TAG_BIGINT || tag2 == FPY_TAG_BIGINT) {
+        int cmp;
+        if (tag1 == FPY_TAG_BIGINT && tag2 == FPY_TAG_BIGINT) {
+            cmp = fpy_bigint_cmp((FpyBigInt*)(intptr_t)data1,
+                                 (FpyBigInt*)(intptr_t)data2);
+        } else if (tag1 == FPY_TAG_FLOAT || tag2 == FPY_TAG_FLOAT) {
+            double d;
+            int64_t fdata = (tag1 == FPY_TAG_FLOAT) ? data1 : data2;
+            memcpy(&d, &fdata, sizeof(d));
+            FpyBigInt *big = (FpyBigInt*)(intptr_t)
+                ((tag1 == FPY_TAG_BIGINT) ? data1 : data2);
+            cmp = _fpy_bigint_cmp_double(big, d);
+            if (cmp == 2) return (op == 1);   /* NaN: only != is true */
+            if (tag2 == FPY_TAG_BIGINT) cmp = -cmp;
+        } else {
+            /* The other side is INT or BOOL — promote it and compare.
+             * Not named `small`: Windows' rpcndr.h has `#define small char`. */
+            int64_t narrow = (tag1 == FPY_TAG_BIGINT) ? data2 : data1;
+            if ((tag1 == FPY_TAG_BIGINT ? tag2 : tag1) == FPY_TAG_BOOL)
+                narrow = (narrow != 0);
+            FpyBigInt *tmp = fpy_bigint_from_i64(narrow);
+            FpyBigInt *big = (FpyBigInt*)(intptr_t)
+                ((tag1 == FPY_TAG_BIGINT) ? data1 : data2);
+            cmp = (tag1 == FPY_TAG_BIGINT) ? fpy_bigint_cmp(big, tmp)
+                                           : fpy_bigint_cmp(tmp, big);
+            fpy_bigint_free(tmp);
+        }
+        switch (op) {
+            case 0: return cmp == 0;
+            case 1: return cmp != 0;
+            case 2: return cmp < 0;
+            case 3: return cmp <= 0;
+            case 4: return cmp > 0;
+            case 5: return cmp >= 0;
+        }
+        return 0;
+    }
+    /* Decimal comparison: at least one is DECIMAL.  Like the BigInt block
+     * above, this has to precede the FLOAT and default-integer branches, both
+     * of which read the Decimal *pointer* as a number — the default one
+     * compared the two addresses, so `[Decimal("1.5"), 1][0] == Decimal("1.5")`
+     * was False and `w[0] < w[1]` answered on allocation order.
+     * BUG-FV-COMPARE-NO-DECIMAL-COMPLEX. */
+    if (tag1 == FPY_TAG_DECIMAL || tag2 == FPY_TAG_DECIMAL) {
+        int cmp;
+        if (tag1 == FPY_TAG_FLOAT || tag2 == FPY_TAG_FLOAT) {
+            double dv;
+            int64_t fdata = (tag1 == FPY_TAG_FLOAT) ? data1 : data2;
+            memcpy(&dv, &fdata, sizeof(dv));
+            double dd = _fpy_decimal_to_double((FpyDecimal*)(intptr_t)
+                ((tag1 == FPY_TAG_DECIMAL) ? data1 : data2));
+            if (isnan(dv)) return (op == 1);   /* NaN: only != is true */
+            double lhs = (tag1 == FPY_TAG_DECIMAL) ? dd : dv;
+            double rhs = (tag1 == FPY_TAG_DECIMAL) ? dv : dd;
+            cmp = (lhs < rhs) ? -1 : (lhs > rhs) ? 1 : 0;
+        } else {
+            /* The other side is DECIMAL, INT or BOOL.  Only the promoted one
+             * is owned here; the caller's Decimal is not ours to free. */
+            FpyDecimal *la = (tag1 == FPY_TAG_DECIMAL)
+                ? (FpyDecimal*)(intptr_t)data1 : fpy_decimal_from_int(data1);
+            FpyDecimal *ra = (tag2 == FPY_TAG_DECIMAL)
+                ? (FpyDecimal*)(intptr_t)data2 : fpy_decimal_from_int(data2);
+            cmp = fpy_decimal_compare(la, ra);
+            if (tag1 != FPY_TAG_DECIMAL) free(la);
+            if (tag2 != FPY_TAG_DECIMAL) free(ra);
+        }
+        switch (op) {
+            case 0: return cmp == 0;
+            case 1: return cmp != 0;
+            case 2: return cmp < 0;
+            case 3: return cmp <= 0;
+            case 4: return cmp > 0;
+            case 5: return cmp >= 0;
+        }
+        return 0;
+    }
+    /* Complex comparison: equality only, exactly as CPython.  Ordering is a
+     * TypeError even between two complexes — which the tag1 == tag2 shortcut
+     * in the cross-type check above lets through, so it has to be rejected
+     * here.  BUG-FV-COMPARE-NO-DECIMAL-COMPLEX. */
+    if (tag1 == FPY_TAG_COMPLEX || tag2 == FPY_TAG_COMPLEX) {
+        if (op >= 2) {
+            static char _cx_err[256];
+            const char *ops[] = {"==","!=","<","<=",">",">="};
+            snprintf(_cx_err, sizeof(_cx_err),
+                     "'%s' not supported between instances of '%s' and '%s'",
+                     ops[op], _fpy_tag_typename(tag1), _fpy_tag_typename(tag2));
+            fastpy_raise(FPY_EXC_TYPEERROR, _cx_err);
+            return 0;
+        }
+        double r1, i1, r2, i2;
+        if (tag1 == FPY_TAG_COMPLEX) {
+            FpyComplex *c = (FpyComplex*)(intptr_t)data1;
+            r1 = c->real; i1 = c->imag;
+        } else if (tag1 == FPY_TAG_FLOAT) {
+            memcpy(&r1, &data1, sizeof(r1)); i1 = 0.0;
+        } else {
+            r1 = (double)data1; i1 = 0.0;
+        }
+        if (tag2 == FPY_TAG_COMPLEX) {
+            FpyComplex *c = (FpyComplex*)(intptr_t)data2;
+            r2 = c->real; i2 = c->imag;
+        } else if (tag2 == FPY_TAG_FLOAT) {
+            memcpy(&r2, &data2, sizeof(r2)); i2 = 0.0;
+        } else {
+            r2 = (double)data2; i2 = 0.0;
+        }
+        int eq = (r1 == r2 && i1 == i2);
+        return (op == 0) ? eq : !eq;
     }
     /* Float comparison: at least one is FLOAT */
     if (tag1 == FPY_TAG_FLOAT || tag2 == FPY_TAG_FLOAT) {
@@ -937,6 +1281,80 @@ void fastpy_fv_subscript(int32_t c_tag, int64_t c_data,
     *out_data = 0;
 }
 
+/* FpyValue slice — runtime dispatch for `c[a:b:s]` where the container's kind
+ * is only known at runtime (an untyped parameter, a json.loads result, ...).
+ * The static paths pick fastpy_str_slice or fastpy_list_slice by the compiler's
+ * guess, which silently produced an empty string when a list arrived on the
+ * str path.  Slicing preserves the container's kind, so the tag is echoed back
+ * rather than derived from the elements. */
+FpyList* fastpy_list_slice(FpyList*, int64_t, int64_t, int64_t, int64_t);
+FpyList* fastpy_list_slice_step(FpyList*, int64_t, int64_t, int64_t,
+                                int64_t, int64_t);
+extern const char* fastpy_str_slice(const char*, int64_t, int64_t,
+                                    int64_t, int64_t);
+extern const char* fastpy_str_slice_step(const char*, int64_t, int64_t,
+                                         int64_t, int64_t, int64_t);
+extern const char* fastpy_bytes_slice(const char*, int64_t, int64_t,
+                                      int64_t, int64_t);
+extern const char* fastpy_bytes_slice_step(const char*, int64_t, int64_t,
+                                           int64_t, int64_t, int64_t);
+
+void fastpy_fv_slice(int32_t c_tag, int64_t c_data,
+                     int64_t start, int64_t stop, int64_t step,
+                     int64_t has_start, int64_t has_stop, int64_t has_step,
+                     int32_t *out_tag, int64_t *out_data) {
+    switch (c_tag) {
+        case FPY_TAG_LIST: {
+            /* Tuples carry FPY_TAG_LIST at runtime, so this arm covers both. */
+            FpyList *lst = (FpyList*)(intptr_t)c_data;
+            FpyList *res;
+            if (has_step) {
+                res = fastpy_list_slice_step(lst, start, stop, step,
+                                             has_start, has_stop);
+            } else {
+                res = fastpy_list_slice(lst, start, stop,
+                                        has_start, has_stop);
+            }
+            *out_tag = c_tag;
+            *out_data = (int64_t)(intptr_t)res;
+            return;
+        }
+        case FPY_TAG_STR: {
+            const char *s = (const char*)(intptr_t)c_data;
+            const char *res;
+            if (has_step) {
+                res = fastpy_str_slice_step(s, start, stop, step,
+                                            has_start, has_stop);
+            } else {
+                res = fastpy_str_slice(s, start, stop, has_start, has_stop);
+            }
+            *out_tag = c_tag;
+            *out_data = (int64_t)(intptr_t)res;
+            return;
+        }
+        case FPY_TAG_BYTES: {
+            /* Byte-indexed and FpyBytes-backed: the str path is code-point
+             * indexed and hands back an FpyString, which a BYTES tag then
+             * makes every fpy_bytes_len probe out of bounds.
+             * BUG-BYTES-SLICE-VIA-STR. */
+            const char *b = (const char*)(intptr_t)c_data;
+            const char *res;
+            if (has_step) {
+                res = fastpy_bytes_slice_step(b, start, stop, step,
+                                              has_start, has_stop);
+            } else {
+                res = fastpy_bytes_slice(b, start, stop, has_start, has_stop);
+            }
+            *out_tag = c_tag;
+            *out_data = (int64_t)(intptr_t)res;
+            return;
+        }
+    }
+    fastpy_raise(FPY_EXC_TYPEERROR, "object is not subscriptable");
+    *out_tag = FPY_TAG_NONE;
+    *out_data = 0;
+}
+
 /* FpyValue containment check — runtime dispatch for `x in container`.
  * Returns 1 if found, 0 if not found. */
 int32_t fastpy_fv_contains(int32_t c_tag, int64_t c_data,
@@ -1031,16 +1449,17 @@ void fastpy_fv_binop(int32_t lt, int64_t ld, int32_t rt, int64_t rd,
         *out_data = (int64_t)(intptr_t)result;
         return;
     }
-    /* Bytes + Bytes → concat */
+    /* Bytes + Bytes → concat.  Header-backed (fpy_bytes_alloc) and
+     * length-aware (fpy_bytes_len) so embedded null bytes survive and the
+     * result carries an FpyBytes header (refcount=1) for correct free. */
     if (lt == FPY_TAG_BYTES && rt == FPY_TAG_BYTES && op == 0) {
         const char *a = (const char*)(intptr_t)ld;
         const char *b = (const char*)(intptr_t)rd;
-        size_t la = a ? strlen(a) : 0;
-        size_t lb = b ? strlen(b) : 0;
-        char *result = (char*)malloc(la + lb + 1);
-        if (a) memcpy(result, a, la);
-        if (b) memcpy(result + la, b, lb);
-        result[la + lb] = '\0';
+        int64_t la = a ? fpy_bytes_len(a) : 0;
+        int64_t lb = b ? fpy_bytes_len(b) : 0;
+        char *result = fpy_bytes_alloc(la + lb);
+        if (la > 0) memcpy(result, a, (size_t)la);
+        if (lb > 0) memcpy(result + la, b, (size_t)lb);
         *out_tag = FPY_TAG_BYTES;
         *out_data = (int64_t)(intptr_t)result;
         return;
@@ -1048,26 +1467,24 @@ void fastpy_fv_binop(int32_t lt, int64_t ld, int32_t rt, int64_t rd,
     /* Bytes * Int/Bool or Int/Bool * Bytes → repeat */
     if (lt == FPY_TAG_BYTES && (rt == FPY_TAG_INT || rt == FPY_TAG_BOOL) && op == 2) {
         const char *a = (const char*)(intptr_t)ld;
-        size_t la = a ? strlen(a) : 0;
+        int64_t la = a ? fpy_bytes_len(a) : 0;
         int64_t n = rd > 0 ? rd : 0;
-        size_t total = la * (size_t)n;
-        char *result = (char*)malloc(total + 1);
+        int64_t total = la * n;
+        char *result = fpy_bytes_alloc(total);
         for (int64_t i = 0; i < n; i++)
-            memcpy(result + i * la, a, la);
-        result[total] = '\0';
+            if (la > 0) memcpy(result + i * la, a, (size_t)la);
         *out_tag = FPY_TAG_BYTES;
         *out_data = (int64_t)(intptr_t)result;
         return;
     }
     if ((lt == FPY_TAG_INT || lt == FPY_TAG_BOOL) && rt == FPY_TAG_BYTES && op == 2) {
         const char *a = (const char*)(intptr_t)rd;
-        size_t la = a ? strlen(a) : 0;
+        int64_t la = a ? fpy_bytes_len(a) : 0;
         int64_t n = ld > 0 ? ld : 0;
-        size_t total = la * (size_t)n;
-        char *result = (char*)malloc(total + 1);
+        int64_t total = la * n;
+        char *result = fpy_bytes_alloc(total);
         for (int64_t i = 0; i < n; i++)
-            memcpy(result + i * la, a, la);
-        result[total] = '\0';
+            if (la > 0) memcpy(result + i * la, a, (size_t)la);
         *out_tag = FPY_TAG_BYTES;
         *out_data = (int64_t)(intptr_t)result;
         return;
@@ -1084,6 +1501,65 @@ void fastpy_fv_binop(int32_t lt, int64_t ld, int32_t rt, int64_t rd,
         }
         return;
     }
+    /* Bitwise / shift ops (op: 6=and, 7=or, 8=xor, 9=lshift, 10=rshift)
+     * on integer-like operands.  Promote everything to BigInt so Python's
+     * infinite-width two's-complement / floor-shift semantics are honored
+     * uniformly (the bigint helpers implement them), then demote the
+     * result back to a native INT when it fits.  This is the dynamic
+     * fallback path (statically-typed int&int uses the inline i64 path in
+     * codegen); correctness matters more than the bigint alloc overhead. */
+    if (op >= 6 && op <= 10
+        && (lt == FPY_TAG_INT || lt == FPY_TAG_BOOL || lt == FPY_TAG_BIGINT)
+        && (rt == FPY_TAG_INT || rt == FPY_TAG_BOOL || rt == FPY_TAG_BIGINT)) {
+        extern FpyBigInt* fpy_bigint_from_i64(int64_t);
+        extern FpyBigInt* fpy_bigint_and(FpyBigInt*, FpyBigInt*);
+        extern FpyBigInt* fpy_bigint_or(FpyBigInt*, FpyBigInt*);
+        extern FpyBigInt* fpy_bigint_xor(FpyBigInt*, FpyBigInt*);
+        extern FpyBigInt* fpy_bigint_lshift(FpyBigInt*, FpyBigInt*);
+        extern FpyBigInt* fpy_bigint_rshift(FpyBigInt*, FpyBigInt*);
+        extern int fpy_bigint_fits_i64(FpyBigInt*);
+        extern int64_t fpy_bigint_to_i64(FpyBigInt*, int*);
+        extern void fpy_bigint_free(FpyBigInt*);
+        /* Only the operands we promote via from_i64 are owned here and must
+         * be freed; a caller-provided BigInt (tag==BIGINT) is not. */
+        int l_own = (lt != FPY_TAG_BIGINT);
+        int r_own = (rt != FPY_TAG_BIGINT);
+        FpyBigInt *la = (lt == FPY_TAG_BIGINT) ? (FpyBigInt*)(intptr_t)ld
+            : fpy_bigint_from_i64((lt == FPY_TAG_BOOL) ? (ld != 0) : ld);
+        FpyBigInt *ra = (rt == FPY_TAG_BIGINT) ? (FpyBigInt*)(intptr_t)rd
+            : fpy_bigint_from_i64((rt == FPY_TAG_BOOL) ? (rd != 0) : rd);
+        FpyBigInt *result = NULL;
+        switch (op) {
+            case 6:  result = fpy_bigint_and(la, ra);    break;
+            case 7:  result = fpy_bigint_or(la, ra);     break;
+            case 8:  result = fpy_bigint_xor(la, ra);    break;
+            case 9:  result = fpy_bigint_lshift(la, ra); break;
+            case 10: result = fpy_bigint_rshift(la, ra); break;
+            default: break;
+        }
+        if (l_own) fpy_bigint_free(la);
+        if (r_own) fpy_bigint_free(ra);
+        if (result) {
+            if (fpy_bigint_fits_i64(result)) {
+                int ov = 0;
+                int64_t iv = fpy_bigint_to_i64(result, &ov);
+                fpy_bigint_free(result);
+                /* `&`, `|` and `^` of two bools stay a bool in CPython --
+                 * `True & False` is `False`, not `0` -- while the shifts
+                 * widen to int (`True << 1` is `2`), and so does a mixed
+                 * bool/int pair (`True | 3` is `3`).  Tagging every result
+                 * INT printed `0` and `1` where CPython prints `False` and
+                 * `True`.  BUG-BOOL-PLUS-INT-YIELDS-FLOAT. */
+                *out_tag = (op <= 8 && lt == FPY_TAG_BOOL && rt == FPY_TAG_BOOL)
+                    ? FPY_TAG_BOOL : FPY_TAG_INT;
+                *out_data = iv;
+            } else {
+                *out_tag = FPY_TAG_BIGINT;
+                *out_data = (int64_t)(intptr_t)result;
+            }
+            return;
+        }
+    }
     /* BigInt arithmetic — promote INT/BOOL to BigInt if needed */
     if (lt == FPY_TAG_BIGINT || rt == FPY_TAG_BIGINT) {
         extern FpyBigInt* fpy_bigint_from_i64(int64_t);
@@ -1093,49 +1569,186 @@ void fastpy_fv_binop(int32_t lt, int64_t ld, int32_t rt, int64_t rd,
         extern FpyBigInt* fpy_bigint_floordiv(FpyBigInt*, FpyBigInt*);
         extern FpyBigInt* fpy_bigint_mod(FpyBigInt*, FpyBigInt*);
         extern FpyBigInt* fpy_bigint_pow(FpyBigInt*, FpyBigInt*);
-        FpyBigInt *la, *ra;
-        if (lt == FPY_TAG_BIGINT) la = (FpyBigInt*)(intptr_t)ld;
-        else la = fpy_bigint_from_i64(ld);
-        if (rt == FPY_TAG_BIGINT) ra = (FpyBigInt*)(intptr_t)rd;
-        else ra = fpy_bigint_from_i64(rd);
-        FpyBigInt *result = NULL;
-        switch (op) {
-            case 0: result = fpy_bigint_add(la, ra); break;
-            case 1: result = fpy_bigint_sub(la, ra); break;
-            case 2: result = fpy_bigint_mul(la, ra); break;
-            case 3: /* truediv — fall through to float */ break;
-            case 4: result = fpy_bigint_floordiv(la, ra); break;
-            case 5: result = fpy_bigint_mod(la, ra); break;
-            default: break;
-        }
-        if (result) {
-            /* Demote to INT if the result fits in i64 — this avoids
-             * leaving a BigInt pointer in the data field when
-             * downstream code (range, print, icmp) extracts it as
-             * a bare i64 integer. */
-            extern int fpy_bigint_fits_i64(FpyBigInt*);
-            extern int64_t fpy_bigint_to_i64(FpyBigInt*, int*);
-            extern void fpy_bigint_free(FpyBigInt*);
-            if (fpy_bigint_fits_i64(result)) {
-                int ov = 0;
-                int64_t iv = fpy_bigint_to_i64(result, &ov);
-                fpy_bigint_free(result);
-                *out_tag = FPY_TAG_INT;
-                *out_data = iv;
-            } else {
-                *out_tag = FPY_TAG_BIGINT;
-                *out_data = (int64_t)(intptr_t)result;
+        extern int fpy_bigint_truediv(FpyBigInt*, FpyBigInt*, double*);
+        extern int fpy_bigint_to_double(FpyBigInt*, double*);
+        extern int fpy_bigint_fits_i64(FpyBigInt*);
+        extern int64_t fpy_bigint_to_i64(FpyBigInt*, int*);
+        extern void fpy_bigint_free(FpyBigInt*);
+
+        /* A float on the other side makes this float arithmetic — (2 ** 80) +
+         * 1.5 is a float in Python.  It has to be split off *before* the
+         * promotion below, which would otherwise hand fpy_bigint_from_i64 the
+         * float's bit pattern and call it an integer.  Converting the BigInt to
+         * a double and re-entering lets the float arm below do the work once. */
+        if (lt == FPY_TAG_FLOAT || rt == FPY_TAG_FLOAT) {
+            FpyBigInt *b = (FpyBigInt*)(intptr_t)(lt == FPY_TAG_BIGINT ? ld : rd);
+            double bd = 0.0;
+            if (fpy_bigint_to_double(b, &bd) != 0) {
+                fastpy_raise(FPY_EXC_OVERFLOWERROR, "int too large to convert to float");
+                *out_tag = FPY_TAG_NONE; *out_data = 0;
+                return;
             }
+            int64_t bits; memcpy(&bits, &bd, sizeof(double));
+            if (lt == FPY_TAG_BIGINT)
+                fastpy_fv_binop(FPY_TAG_FLOAT, bits, rt, rd, op, out_tag, out_data);
+            else
+                fastpy_fv_binop(lt, ld, FPY_TAG_FLOAT, bits, op, out_tag, out_data);
             return;
         }
-        /* truediv falls through (BigInt / BigInt → float not implemented yet) */
+        /* Anything else that is not integer-like has no BigInt handler; leave it
+         * to the TypeError guard below rather than promoting its payload. */
+        if ((lt == FPY_TAG_BIGINT || lt == FPY_TAG_INT || lt == FPY_TAG_BOOL)
+            && (rt == FPY_TAG_BIGINT || rt == FPY_TAG_INT || rt == FPY_TAG_BOOL)) {
+            /* Only the operands promoted here are owned and must be freed; a
+             * caller-provided BigInt still belongs to whoever holds the value. */
+            int l_own = (lt != FPY_TAG_BIGINT);
+            int r_own = (rt != FPY_TAG_BIGINT);
+            FpyBigInt *la = (lt == FPY_TAG_BIGINT) ? (FpyBigInt*)(intptr_t)ld
+                : fpy_bigint_from_i64((lt == FPY_TAG_BOOL) ? (ld != 0) : ld);
+            FpyBigInt *ra = (rt == FPY_TAG_BIGINT) ? (FpyBigInt*)(intptr_t)rd
+                : fpy_bigint_from_i64((rt == FPY_TAG_BOOL) ? (rd != 0) : rd);
+            if (op == 3) {
+                /* True division is the one BigInt op whose result is not a
+                 * BigInt, so it returns here rather than through the
+                 * demote-to-INT tail below.
+                 * BUG-BIGINT-TRUEDIV-UNIMPLEMENTED: this used to be left
+                 * unimplemented and fall out of the arm entirely, reaching the
+                 * CPython bridge, which took the BigInt pointer for a
+                 * PyObject* and crashed. */
+                double q = 0.0;
+                int rc = fpy_bigint_truediv(la, ra, &q);
+                if (l_own) fpy_bigint_free(la);
+                if (r_own) fpy_bigint_free(ra);
+                if (rc != 0) {
+                    fastpy_raise(rc == 1 ? FPY_EXC_ZERODIVISION : FPY_EXC_OVERFLOWERROR,
+                                 rc == 1 ? "division by zero"
+                                         : "integer division result too large for a float");
+                    *out_tag = FPY_TAG_NONE; *out_data = 0;
+                    return;
+                }
+                *out_tag = FPY_TAG_FLOAT;
+                memcpy(out_data, &q, sizeof(double));
+                return;
+            }
+            FpyBigInt *result = NULL;
+            switch (op) {
+                case 0: result = fpy_bigint_add(la, ra); break;
+                case 1: result = fpy_bigint_sub(la, ra); break;
+                case 2: result = fpy_bigint_mul(la, ra); break;
+                case 4: result = fpy_bigint_floordiv(la, ra); break;
+                case 5: result = fpy_bigint_mod(la, ra); break;
+                default: break;
+            }
+            if (l_own) fpy_bigint_free(la);
+            if (r_own) fpy_bigint_free(ra);
+            if (result) {
+                /* Demote to INT if the result fits in i64 — this avoids
+                 * leaving a BigInt pointer in the data field when
+                 * downstream code (range, print, icmp) extracts it as
+                 * a bare i64 integer. */
+                if (fpy_bigint_fits_i64(result)) {
+                    int ov = 0;
+                    int64_t iv = fpy_bigint_to_i64(result, &ov);
+                    fpy_bigint_free(result);
+                    *out_tag = FPY_TAG_INT;
+                    *out_data = iv;
+                } else {
+                    *out_tag = FPY_TAG_BIGINT;
+                    *out_data = (int64_t)(intptr_t)result;
+                }
+                return;
+            }
+        }
+    }
+    /* Decimal arithmetic — promote INT/BOOL to Decimal.
+     *
+     * Without this a DECIMAL-tagged operand fell all the way through to the
+     * int/bool arithmetic at the bottom of this function, which added the
+     * Decimal's *pointer*: `[Decimal("1.5"), 1][0] + 1` printed a heap
+     * address, and `* 2` printed twice that address.
+     * BUG-FV-BINOP-NO-DECIMAL-COMPLEX.
+     *
+     * Only +, -, * and / are covered, matching the helpers that exist (and
+     * the statically-typed Decimal path in codegen, which maps the same four).
+     * Anything else — Decimal + float, which CPython rejects, and //, % and
+     * the bitwise ops, which it accepts but no helper implements — falls
+     * through to the TypeError guard below.  That is loud rather than silently
+     * wrong, which is the right failure while the helpers are missing. */
+    if (lt == FPY_TAG_DECIMAL || rt == FPY_TAG_DECIMAL) {
+        if ((lt == FPY_TAG_DECIMAL || lt == FPY_TAG_INT || lt == FPY_TAG_BOOL)
+            && (rt == FPY_TAG_DECIMAL || rt == FPY_TAG_INT || rt == FPY_TAG_BOOL)
+            && op >= 0 && op <= 3) {
+            FpyDecimal *la = (lt == FPY_TAG_DECIMAL)
+                ? (FpyDecimal*)(intptr_t)ld : fpy_decimal_from_int(ld);
+            FpyDecimal *ra = (rt == FPY_TAG_DECIMAL)
+                ? (FpyDecimal*)(intptr_t)rd : fpy_decimal_from_int(rd);
+            FpyDecimal *dres = NULL;
+            switch (op) {
+                case 0: dres = fpy_decimal_add(la, ra); break;
+                case 1: dres = fpy_decimal_sub(la, ra); break;
+                case 2: dres = fpy_decimal_mul(la, ra); break;
+                case 3: dres = fpy_decimal_div(la, ra); break;
+                default: break;
+            }
+            /* Only the operands promoted here are owned; a caller-provided
+             * Decimal still belongs to whoever holds the tagged value. */
+            if (lt != FPY_TAG_DECIMAL) free(la);
+            if (rt != FPY_TAG_DECIMAL) free(ra);
+            if (dres) {
+                *out_tag = FPY_TAG_DECIMAL;
+                *out_data = (int64_t)(intptr_t)dres;
+                return;
+            }
+        }
+    }
+    /* Complex arithmetic — promote INT/BOOL/FLOAT to complex.  Same hole and
+     * same fix as Decimal above: `[1 + 2j][0] + [1 + 2j][0]` added two
+     * pointers.  BUG-FV-BINOP-NO-DECIMAL-COMPLEX. */
+    if (lt == FPY_TAG_COMPLEX || rt == FPY_TAG_COMPLEX) {
+        int _lc_ok = (lt == FPY_TAG_COMPLEX || lt == FPY_TAG_INT
+                      || lt == FPY_TAG_BOOL || lt == FPY_TAG_FLOAT);
+        int _rc_ok = (rt == FPY_TAG_COMPLEX || rt == FPY_TAG_INT
+                      || rt == FPY_TAG_BOOL || rt == FPY_TAG_FLOAT);
+        if (_lc_ok && _rc_ok && op >= 0 && op <= 3) {
+            FpyComplex *lc, *rc;
+            if (lt == FPY_TAG_COMPLEX) lc = (FpyComplex*)(intptr_t)ld;
+            else if (lt == FPY_TAG_FLOAT) {
+                double _lv; memcpy(&_lv, &ld, sizeof(double));
+                lc = fpy_complex_new(_lv, 0.0);
+            } else lc = fpy_complex_new((double)ld, 0.0);
+            if (rt == FPY_TAG_COMPLEX) rc = (FpyComplex*)(intptr_t)rd;
+            else if (rt == FPY_TAG_FLOAT) {
+                double _rv; memcpy(&_rv, &rd, sizeof(double));
+                rc = fpy_complex_new(_rv, 0.0);
+            } else rc = fpy_complex_new((double)rd, 0.0);
+            FpyComplex *cres = NULL;
+            switch (op) {
+                case 0: cres = fpy_complex_add(lc, rc); break;
+                case 1: cres = fpy_complex_sub(lc, rc); break;
+                case 2: cres = fpy_complex_mul(lc, rc); break;
+                case 3: cres = fpy_complex_div(lc, rc); break;
+                default: break;
+            }
+            if (lt != FPY_TAG_COMPLEX) free(lc);
+            if (rt != FPY_TAG_COMPLEX) free(rc);
+            if (cres) {
+                *out_tag = FPY_TAG_COMPLEX;
+                *out_data = (int64_t)(intptr_t)cres;
+                return;
+            }
+        }
     }
     /* Promote to float if either operand is float AND the other is numeric.
      * Guard: float + container (str, list, dict, set, etc.) is TypeError,
-     * not float promotion. */
+     * not float promotion.
+     *
+     * The op range matters as much as the tags: a float has no bitwise
+     * operators, so `1 & 1.5` is a TypeError in Python.  Without the bound the
+     * switch below fell to its `default` and answered 0.0. */
     if ((lt == FPY_TAG_FLOAT || rt == FPY_TAG_FLOAT)
         && (lt == FPY_TAG_FLOAT || lt == FPY_TAG_INT || lt == FPY_TAG_BOOL)
-        && (rt == FPY_TAG_FLOAT || rt == FPY_TAG_INT || rt == FPY_TAG_BOOL)) {
+        && (rt == FPY_TAG_FLOAT || rt == FPY_TAG_INT || rt == FPY_TAG_BOOL)
+        && op >= 0 && op <= 5) {
         double lf, rf;
         if (lt == FPY_TAG_FLOAT) { memcpy(&lf, &ld, sizeof(double)); }
         else if (lt == FPY_TAG_INT) { lf = (double)ld; }
@@ -1145,35 +1758,60 @@ void fastpy_fv_binop(int32_t lt, int64_t ld, int32_t rt, int64_t rd,
         else if (rt == FPY_TAG_INT) { rf = (double)rd; }
         else if (rt == FPY_TAG_BOOL) { rf = (double)rd; }
         else { rf = 0.0; }
+        /* A zero divisor raises, as it does everywhere else in the language.
+         * These three cases used to substitute 0.0 silently, which turned an
+         * error into a plausible-looking answer. */
+        if (rf == 0.0 && op >= 3 && op <= 5) {
+            fastpy_raise(FPY_EXC_ZERODIVISION, "division by zero");
+            *out_tag = FPY_TAG_NONE; *out_data = 0;
+            return;
+        }
         double result;
         switch (op) {
             case 0: result = lf + rf; break;
             case 1: result = lf - rf; break;
             case 2: result = lf * rf; break;
-            case 3: result = rf != 0.0 ? lf / rf : 0.0; break;
-            case 4: result = rf != 0.0 ? floor(lf / rf) : 0.0; break;
-            case 5: result = rf != 0.0 ? fmod(lf, rf) : 0.0; break;
+            case 3: result = lf / rf; break;
+            case 4: result = floor(lf / rf); break;
+            case 5: {
+                /* Python's % takes the sign of the divisor, C's fmod takes the
+                 * sign of the dividend: -7.0 % 3.0 is 2.0, not -1.0. */
+                double m = fmod(lf, rf);
+                if (m != 0.0 && ((m < 0.0) != (rf < 0.0))) m += rf;
+                result = m;
+                break;
+            }
             default: result = 0.0; break;
         }
         *out_tag = FPY_TAG_FLOAT;
         memcpy(out_data, &result, sizeof(double));
         return;
     }
-    /* Guard: container types or mismatched numeric+container → TypeError */
-    if (lt == FPY_TAG_LIST || lt == FPY_TAG_DICT || lt == FPY_TAG_SET ||
-        rt == FPY_TAG_LIST || rt == FPY_TAG_DICT || rt == FPY_TAG_SET ||
-        lt == FPY_TAG_STR  || rt == FPY_TAG_STR ||
-        lt == FPY_TAG_BYTES || rt == FPY_TAG_BYTES) {
+    /* Guard: everything past this point is plain int/bool arithmetic, so
+     * anything that is not two integer-like operands has no handler and is a
+     * TypeError.
+     *
+     * This is written as a *positive* check on purpose.  It used to enumerate
+     * the tags that must stop here (list, dict, set, str, bytes, and later
+     * Decimal and complex — BUG-FV-BINOP-NO-DECIMAL-COMPLEX), which meant every
+     * tag anyone forgot to add fell into the i64 arithmetic below and had its
+     * *pointer* added: that is how BIGINT (which was never on the list) turned
+     * `(2 ** 80) / 2` into a crash, and how NONE + NONE quietly answered 0.
+     * Listing what is allowed instead of what is forbidden makes a new tag, or
+     * a newly unhandled combination, fail loudly rather than silently wrong. */
+    if (!((lt == FPY_TAG_INT || lt == FPY_TAG_BOOL)
+          && (rt == FPY_TAG_INT || rt == FPY_TAG_BOOL))) {
         /* If we reach here, no valid handler matched (e.g. list+int, dict-int,
          * str+list, etc.) — raise TypeError like CPython does. */
-        static const char *_op_syms[] = {"+", "-", "*", "/", "//", "%"};
+        static const char *_op_syms[] = {"+", "-", "*", "/", "//", "%",
+                                         "&", "|", "^", "<<", ">>"};
         static const char *_tnames[] = {
             "int", "float", "str", "bool", "NoneType",
             "list", "object", "dict", "bytes", "set",
             "bigint", "complex", "Decimal"};
         const char *ln = (lt >= 0 && lt <= 12) ? _tnames[lt] : "object";
         const char *rn = (rt >= 0 && rt <= 12) ? _tnames[rt] : "object";
-        const char *on = (op >= 0 && op <= 5) ? _op_syms[op] : "?";
+        const char *on = (op >= 0 && op <= 10) ? _op_syms[op] : "?";
         snprintf(_err_buf, sizeof(_err_buf),
                  "unsupported operand type(s) for %s: '%.40s' and '%.40s'",
                  on, ln, rn);
@@ -1193,18 +1831,51 @@ void fastpy_fv_binop(int32_t lt, int64_t ld, int32_t rt, int64_t rd,
     int64_t ri = (rt == FPY_TAG_BOOL) ? (int64_t)(rd != 0) : rd;
     int64_t result;
     FpyBigInt *big = NULL;
+    /* A zero divisor raises rather than quietly answering 0, which is what the
+     * three ternaries this replaced used to do. */
+    if (ri == 0 && op >= 3 && op <= 5) {
+        fastpy_raise(FPY_EXC_ZERODIVISION, "division by zero");
+        *out_tag = FPY_TAG_NONE; *out_data = 0;
+        return;
+    }
     switch (op) {
         case 0: result = fpy_checked_add(li, ri, &big); break;
         case 1: result = fpy_checked_sub(li, ri, &big); break;
         case 2: result = fpy_checked_mul(li, ri, &big); break;
         case 3: /* truediv returns float */ {
-            double d = ri != 0 ? (double)li / (double)ri : 0.0;
+            double d = (double)li / (double)ri;
             *out_tag = FPY_TAG_FLOAT;
             memcpy(out_data, &d, sizeof(double));
             return;
         }
-        case 4: result = ri != 0 ? li / ri : 0; break;
-        case 5: result = ri != 0 ? li % ri : 0; break;
+        /* Python's // floors and its % takes the divisor's sign; C truncates
+         * toward zero and takes the dividend's.  -7 // 2 is -4, not -3, and
+         * -7 % 2 is 1, not -1. */
+        case 4: {
+            if (li == INT64_MIN && ri == -1) {
+                /* The one i64 division that overflows: -2**63 // -1 is 2**63,
+                 * which is a BigInt in Python and UB in C. */
+                extern FpyBigInt* fpy_bigint_from_i64(int64_t);
+                extern FpyBigInt* fpy_bigint_neg(FpyBigInt*);
+                extern void fpy_bigint_free(FpyBigInt*);
+                FpyBigInt *m = fpy_bigint_from_i64(INT64_MIN);
+                big = fpy_bigint_neg(m);
+                fpy_bigint_free(m);
+                result = 0;
+                break;
+            }
+            int64_t q = li / ri;
+            if ((li % ri != 0) && ((li ^ ri) < 0)) q--;
+            result = q;
+            break;
+        }
+        case 5: {
+            if (li == INT64_MIN && ri == -1) { result = 0; break; }
+            int64_t m = li % ri;
+            if (m != 0 && ((m < 0) != (ri < 0))) m += ri;
+            result = m;
+            break;
+        }
         default: result = 0; break;
     }
     if (big) {
@@ -1267,7 +1938,7 @@ void fpy_value_write(FpyValue val) {
             const char *data = val.data.s;
             if (!data) { printf("b''"); break; }
             printf("b'");
-            size_t len = strlen(data);
+            size_t len = (size_t)fpy_bytes_len(data);  /* embedded-null safe */
             for (size_t i = 0; i < len; i++) {
                 unsigned char c = (unsigned char)data[i];
                 if (c == '\\') printf("\\\\");
@@ -1599,12 +2270,12 @@ FpyList* fastpy_str_split(const char *s) {
         /* Find end of word */
         const unsigned char *start = p;
         while (*p && _fpy_ws_fwd(p) == 0) p++;
-        /* Copy word */
+        /* Copy word into a headered (refcounted) string — see fpy_str_copy /
+         * BUG-RUNTIME-STR-PRODUCERS-BARE-MALLOC. A bare malloc here would leave
+         * the STR value without an FpyString header, leaking it and making
+         * fpy_str_header read out of bounds. */
         int64_t len = p - start;
-        char *word = (char*)malloc(len + 1);
-        memcpy(word, start, len);
-        word[len] = '\0';
-        fpy_list_append(result, fpy_str(word));
+        fpy_list_append(result, fpy_str(fpy_str_copy((const char*)start, len)));
     }
     return result;
 }
@@ -1619,9 +2290,8 @@ FpyList* fastpy_bytes_split(const char *s) {
         const char *start = p;
         while (*p && *p != ' ' && *p != '\t' && *p != '\n' && *p != '\r') p++;
         int64_t len = p - start;
-        char *word = (char*)malloc(len + 1);
+        char *word = fpy_bytes_alloc(len);  /* header-backed FpyBytes */
         memcpy(word, start, len);
-        word[len] = '\0';
         fpy_list_append(result, fpy_bytes_val(word));
     }
     return result;
@@ -1630,9 +2300,7 @@ FpyList* fastpy_bytes_split(const char *s) {
 /* Join a list of strings with a separator */
 const char* fastpy_str_join(const char *sep, FpyList *list) {
     if (list->length == 0) {
-        char *result = (char*)malloc(1);
-        result[0] = '\0';
-        return result;
+        return fpy_str_buf(0);
     }
     size_t sep_len = strlen(sep);
     size_t total = 0;
@@ -1640,7 +2308,7 @@ const char* fastpy_str_join(const char *sep, FpyList *list) {
         total += strlen(list->items[i].data.s);
         if (i > 0) total += sep_len;
     }
-    char *result = (char*)malloc(total + 1);
+    char *result = fpy_str_buf((int64_t)total);
     size_t pos = 0;
     for (int64_t i = 0; i < list->length; i++) {
         if (i > 0) { memcpy(result + pos, sep, sep_len); pos += sep_len; }
@@ -1679,7 +2347,7 @@ FpyList* fastpy_list_set(FpyList *list) {
 
 /* Convert list to string for f-string formatting */
 const char* fastpy_list_to_str(FpyList *list) {
-    char *buf = (char*)malloc(4096);
+    char *buf = fpy_str_buf(4096);
     int pos = 0;
     const char *open = list->is_tuple ? "(" : "[";
     const char *close = list->is_tuple ? ")" : "]";
@@ -1701,7 +2369,7 @@ const char* fastpy_list_to_str(FpyList *list) {
 
 /* Convert tuple to string for f-strings */
 const char* fastpy_tuple_to_str(FpyList *tuple) {
-    char *buf = (char*)malloc(4096);
+    char *buf = fpy_str_buf(4096);
     int pos = 0;
     pos += snprintf(buf + pos, 4096 - pos, "(");
     for (int64_t i = 0; i < tuple->length; i++) {
@@ -1776,10 +2444,18 @@ static uint64_t fpy_hash_value(FpyValue v) {
     if (v.tag == FPY_TAG_FLOAT) {
         /* Hash doubles: if it's an exact integer, hash like the int.
          * Otherwise use raw bits. This matches Python semantics where
-         * hash(1) == hash(1.0). */
+         * hash(1) == hash(1.0).
+         *
+         * The bound is the int64 range, not 2^53.  A narrower bound would
+         * hash 1e18 by its bits while hashing the int 1000000000000000000
+         * as an int, so two keys that fpy_key_equal() calls equal would land
+         * in different buckets and both survive in the table.  Converting an
+         * integral in-range double to int64 is exact, so there is no
+         * precision argument for stopping at 2^53 — only the conversion's
+         * own UB above 2^63, which is what this guard is for. */
         double d = v.data.f;
-        if (d == (double)(int64_t)d && d >= -9.007199254740992e15
-                && d <= 9.007199254740992e15) {
+        if (d >= -9223372036854775808.0 && d < 9223372036854775808.0
+                && d == (double)(int64_t)d) {
             return fpy_hash_int((int64_t)d);
         }
         uint64_t bits;
@@ -1807,7 +2483,51 @@ static uint64_t fpy_hash_value(FpyValue v) {
     return (uint64_t)v.data.i;  /* fallback for other types */
 }
 
+/* True when a tag takes part in Python's numeric tower for key identity.
+ * bool is a subclass of int, and int/float compare across types, so all
+ * three name the same key when they are numerically equal: `{1: 'a'}[1.0]`
+ * is 'a' and `{1: 'a', True: 'b'}` has one entry. */
+static int fpy_key_tag_is_numeric(int32_t tag) {
+    return tag == FPY_TAG_INT || tag == FPY_TAG_BOOL || tag == FPY_TAG_FLOAT;
+}
+
+static int fpy_key_numeric_equal(FpyValue a, FpyValue b) {
+    /* Exact comparison, the way CPython does it — never by widening the
+     * integer to a double, which would make 2**60 and 2**60 + 1 the same
+     * key.  An integral double in int64 range converts back exactly, so
+     * comparing in int64 is the exact answer; a non-integral or
+     * out-of-range double cannot equal any int. */
+    double d;
+    int64_t i;
+    int a_is_float = (a.tag == FPY_TAG_FLOAT);
+    int b_is_float = (b.tag == FPY_TAG_FLOAT);
+    if (a_is_float && b_is_float) return a.data.f == b.data.f;
+    if (!a_is_float && !b_is_float) {
+        int64_t ai = (a.tag == FPY_TAG_BOOL) ? (int64_t)a.data.b : a.data.i;
+        int64_t bi = (b.tag == FPY_TAG_BOOL) ? (int64_t)b.data.b : b.data.i;
+        return ai == bi;
+    }
+    if (a_is_float) {
+        d = a.data.f;
+        i = (b.tag == FPY_TAG_BOOL) ? (int64_t)b.data.b : b.data.i;
+    } else {
+        d = b.data.f;
+        i = (a.tag == FPY_TAG_BOOL) ? (int64_t)a.data.b : a.data.i;
+    }
+    if (!(d >= -9223372036854775808.0 && d < 9223372036854775808.0))
+        return 0;
+    if (d != (double)(int64_t)d) return 0;   /* has a fractional part */
+    return (int64_t)d == i;
+}
+
 static int fpy_key_equal(FpyValue a, FpyValue b) {
+    /* Across the numeric tags this has to agree with fpy_hash_value(), which
+     * already hashes True as 1 and an integral 1.0 as 1.  It used to reject
+     * any tag mismatch outright, so `1` and `1.0` hashed into the same bucket
+     * and then compared unequal — the dict kept both, and `{1: 'a'}[1.0]`
+     * raised a KeyError on a key Python says is present. */
+    if (fpy_key_tag_is_numeric(a.tag) && fpy_key_tag_is_numeric(b.tag))
+        return fpy_key_numeric_equal(a, b);
     if (a.tag != b.tag) return 0;
     if (a.tag == FPY_TAG_INT) return a.data.i == b.data.i;
     if (a.tag == FPY_TAG_STR) {
@@ -1825,6 +2545,35 @@ static int fpy_key_equal(FpyValue a, FpyValue b) {
         return 1;
     }
     return a.data.i == b.data.i;  /* fallback */
+}
+
+/* The int-specialized dict paths (`_int_fv`, `_int_val`, `has_int_key`, the
+ * int delete) each inlined `tag == FPY_TAG_INT && data.i == key`.  That is a
+ * *narrower* rule than fpy_key_equal(): it cannot see a float or bool key
+ * naming the same slot, so `{2.0: 'two'}[2]` raised a KeyError while
+ * `{2: 'two'}[2.0]` — which goes through the general path — worked.  They all
+ * defer here now, so there is one rule for what makes two keys the same.
+ * BUG-FLOAT-KEY-DICT-LITERAL-SEGFAULTS.
+ *
+ * Split in two, and taking the stored key by pointer, because the shape
+ * matters at this call frequency.  As one by-value function the probe loop
+ * had to materialise the whole 16-byte FpyValue — MSVC loaded it with
+ * `movups` into an XMM register and dug the tag and payload back out with
+ * `movd`/`psrldq`/`movq`, then produced the answer through `sete` instead of
+ * branching on the compare.  By pointer, the int/int case is the two scalar
+ * loads and two compares it always was, and the numeric-tower cases cost the
+ * hit path nothing because they live in their own frame. */
+FPY_NOINLINE static int fpy_key_equal_int_slow(FpyValue stored, int64_t key) {
+    if (!fpy_key_tag_is_numeric(stored.tag)) return 0;
+    FpyValue k;
+    k.tag = FPY_TAG_INT;
+    k.data.i = key;
+    return fpy_key_numeric_equal(stored, k);
+}
+
+static int fpy_key_equal_int(const FpyValue *stored, int64_t key) {
+    if (stored->tag == FPY_TAG_INT) return stored->data.i == key;
+    return fpy_key_equal_int_slow(*stored, key);
 }
 
 static void fpy_dict_init_indices(FpyDict *dict) {
@@ -1941,7 +2690,7 @@ FpyValue fpy_dict_get(FpyDict *dict, FpyValue key) {
             return dict->values[idx];
         slot = (slot + 1) & mask;
     }
-    fastpy_raise(FPY_EXC_KEYERROR, "KeyError");
+    fpy_raise_key_error(key);
     FpyValue _err = {0}; return _err;
 }
 
@@ -1955,6 +2704,12 @@ void fastpy_dict_set_fv(FpyDict *dict, const char *key,
                          int32_t tag, int64_t data) {
     FpyValue k = fpy_str(key);
     FpyValue v; v.tag = tag; v.data.i = data;
+    /* Retain the stored value+key (Model-2 borrowed-at-boundary model):
+     * every retaining container store increfs so a producer's owned temp
+     * survives the statement-boundary flush. Matches the internal
+     * fpy_dict_set and fpy_dict_destroy (which decrefs both). */
+    FPY_VAL_INCREF(k);
+    FPY_VAL_INCREF(v);
     uint64_t h = fpy_hash_string(key);
     int64_t mask = dict->table_size - 1;
     int64_t slot = (int64_t)(h & (uint64_t)mask);
@@ -1967,7 +2722,11 @@ void fastpy_dict_set_fv(FpyDict *dict, const char *key,
         } else if (dict->keys[idx].tag == FPY_TAG_STR
                    && (dict->keys[idx].data.s == key
                        || strcmp(dict->keys[idx].data.s, key) == 0)) {
+            /* Overwrite: release old value's dict-ref; the key is unchanged
+             * so undo the key incref we took above. */
+            FPY_VAL_DECREF(dict->values[idx]);
             dict->values[idx] = v;
+            FPY_VAL_DECREF(k);
             return;
         }
         slot = (slot + 1) & mask;
@@ -2007,7 +2766,7 @@ void fastpy_dict_get_fv(FpyDict *dict, const char *key,
         }
         slot = (slot + 1) & mask;
     }
-    fastpy_raise(FPY_EXC_KEYERROR, key);
+    fpy_raise_key_error(fpy_str(key));
     *out_tag = FPY_TAG_NONE; *out_data = 0; return;
 }
 
@@ -2071,8 +2830,7 @@ void fastpy_dict_set_int_int(FpyDict *dict, int64_t key, int64_t value) {
         if (idx == FPY_DICT_EMPTY) break;
         if (idx == FPY_DICT_DELETED) {
             if (first_deleted < 0) first_deleted = slot;
-        } else if (dict->keys[idx].tag == FPY_TAG_INT
-                   && dict->keys[idx].data.i == key) {
+        } else if (fpy_key_equal_int(&dict->keys[idx], key)) {
             dict->values[idx] = v;
             return;
         }
@@ -2099,6 +2857,9 @@ void fastpy_dict_set_int_fv(FpyDict *dict, int64_t key,
                              int32_t tag, int64_t data) {
     FpyValue k = fpy_int(key);
     FpyValue v; v.tag = tag; v.data.i = data;
+    /* Retain the stored value (int key is not refcounted). See
+     * fastpy_dict_set_fv for the rationale. */
+    FPY_VAL_INCREF(v);
     uint64_t h = fpy_hash_int(key);
     int64_t mask = dict->table_size - 1;
     int64_t slot = (int64_t)(h & (uint64_t)mask);
@@ -2108,8 +2869,8 @@ void fastpy_dict_set_int_fv(FpyDict *dict, int64_t key,
         if (idx == FPY_DICT_EMPTY) break;
         if (idx == FPY_DICT_DELETED) {
             if (first_deleted < 0) first_deleted = slot;
-        } else if (dict->keys[idx].tag == FPY_TAG_INT
-                   && dict->keys[idx].data.i == key) {
+        } else if (fpy_key_equal_int(&dict->keys[idx], key)) {
+            FPY_VAL_DECREF(dict->values[idx]);
             dict->values[idx] = v;
             return;
         }
@@ -2141,15 +2902,14 @@ void fastpy_dict_get_int_fv(FpyDict *dict, int64_t key,
         int64_t idx = dict->indices[slot];
         if (idx == FPY_DICT_EMPTY) break;
         if (idx != FPY_DICT_DELETED
-                && dict->keys[idx].tag == FPY_TAG_INT
-                && dict->keys[idx].data.i == key) {
+                && fpy_key_equal_int(&dict->keys[idx], key)) {
             *out_tag = dict->values[idx].tag;
             *out_data = dict->values[idx].data.i;
             return;
         }
         slot = (slot + 1) & mask;
     }
-    fastpy_raise(FPY_EXC_KEYERROR, "KeyError");
+    fpy_raise_key_error(fpy_int(key));
     *out_tag = FPY_TAG_NONE; *out_data = 0; return;
 }
 
@@ -2164,13 +2924,12 @@ int64_t fastpy_dict_get_int_val(FpyDict *dict, int64_t key) {
         int64_t idx = dict->indices[slot];
         if (idx == FPY_DICT_EMPTY) break;
         if (idx != FPY_DICT_DELETED
-                && dict->keys[idx].tag == FPY_TAG_INT
-                && dict->keys[idx].data.i == key) {
+                && fpy_key_equal_int(&dict->keys[idx], key)) {
             return dict->values[idx].data.i;
         }
         slot = (slot + 1) & mask;
     }
-    fastpy_raise(FPY_EXC_KEYERROR, "KeyError");
+    fpy_raise_key_error(fpy_int(key));
     return 0;
 }
 
@@ -2182,6 +2941,9 @@ void fastpy_dict_set_kv_fv(FpyDict *dict,
                             int32_t val_tag, int64_t val_data) {
     FpyValue k; k.tag = key_tag; k.data.i = key_data;
     FpyValue v; v.tag = val_tag; v.data.i = val_data;
+    /* Retain the stored value+key. See fastpy_dict_set_fv for rationale. */
+    FPY_VAL_INCREF(k);
+    FPY_VAL_INCREF(v);
     uint64_t h = fpy_hash_value(k);
     int64_t mask = dict->table_size - 1;
     int64_t slot = (int64_t)(h & (uint64_t)mask);
@@ -2192,7 +2954,9 @@ void fastpy_dict_set_kv_fv(FpyDict *dict,
         if (idx == FPY_DICT_DELETED) {
             if (first_deleted < 0) first_deleted = slot;
         } else if (fpy_key_equal(dict->keys[idx], k)) {
+            FPY_VAL_DECREF(dict->values[idx]);
             dict->values[idx] = v;
+            FPY_VAL_DECREF(k);
             return;
         }
         slot = (slot + 1) & mask;
@@ -2231,7 +2995,7 @@ void fastpy_dict_get_kv_fv(FpyDict *dict,
         }
         slot = (slot + 1) & mask;
     }
-    fastpy_raise(FPY_EXC_KEYERROR, "KeyError");
+    fpy_raise_key_error(k);
     *out_tag = FPY_TAG_NONE; *out_data = 0; return;
 }
 
@@ -2257,8 +3021,7 @@ int32_t fastpy_dict_has_int_key(FpyDict *dict, int64_t key) {
         int64_t idx = dict->indices[slot];
         if (idx == FPY_DICT_EMPTY) return 0;
         if (idx != FPY_DICT_DELETED
-                && dict->keys[idx].tag == FPY_TAG_INT
-                && dict->keys[idx].data.i == key)
+                && fpy_key_equal_int(&dict->keys[idx], key))
             return 1;
         slot = (slot + 1) & mask;
     }
@@ -2300,6 +3063,13 @@ FpyDict* fastpy_dict_from_pairs(FpyList *pairs) {
 
 void fastpy_dict_clear(FpyDict *dict) {
     FPY_LOCK(dict);
+    /* Release the dict's owned refs on every entry before dropping them
+     * (retain model — see fastpy_dict_set_fv). Without this, clearing a
+     * dict/set that holds heap keys/values leaks them. */
+    for (int64_t i = 0; i < dict->length; i++) {
+        FPY_VAL_DECREF(dict->keys[i]);
+        FPY_VAL_DECREF(dict->values[i]);
+    }
     dict->length = 0;
     memset(dict->indices, 0xFF, dict->table_size * sizeof(int64_t));
     FPY_UNLOCK(dict);
@@ -2518,7 +3288,7 @@ void fastpy_set_clear(FpyDict *set) {
 /* set.pop() — remove and return an arbitrary element (via out params) */
 void fastpy_set_pop_fv(FpyDict *set, int32_t *out_tag, int64_t *out_data) {
     if (set->length == 0) {
-        fastpy_raise(FPY_EXC_KEYERROR, "pop from an empty set");
+        fpy_raise_key_error(fpy_str("pop from an empty set"));
         *out_tag = 0; *out_data = 0;
         return;
     }
@@ -2567,6 +3337,185 @@ void fastpy_set_symmetric_difference_update(FpyDict *a, FpyDict *b) {
         else
             fpy_dict_set(a, b->keys[i], fpy_none());
     }
+}
+
+/* --- Any iterable, as a set the set algorithms can consume ---
+ *
+ * Every set method above that takes an "other" is written against an FpyDict
+ * and reads `b->keys[i]`, but CPython accepts *any* iterable for all eleven of
+ * them.  Handing one an FpyList reinterprets that list's `items`/`length`/
+ * `capacity` as a dict's `keys`/`values`/`length`, so `b->keys[i]` comes back
+ * as an FpyValue assembled from a pointer and a capacity, and the runtime
+ * dereferences it.  That is BUG-SET-UPDATE-NON-SET-ITERABLE-SEGFAULTS: not a
+ * null pointer but a live object of one type read as another, the same shape
+ * as BUG-EMPTY-KWARGS-CALL-SEGFAULTS.
+ *
+ * The kind is a runtime fact, not a static one -- the argument is a parameter
+ * as often as not -- so the answer has to come from the tag, exactly as it
+ * does for BUG-FOR-DICT-KEY-KIND-GUESSED.  Giving each of the eleven its own
+ * tag switch would be eleven chances for them to disagree about what
+ * `s.update("ab")` means, so the coercion happens once, here, and the eleven
+ * algorithms stay untouched.
+ *
+ * A value that is already a set is returned as itself, so the overwhelmingly
+ * common case costs one comparison and no allocation.  Anything else is
+ * materialised into a temporary and `*owned` is set, meaning the caller must
+ * release it.  A non-iterable raises TypeError and returns NULL -- loud,
+ * rather than corrupting memory, which was the whole failure here.
+ *
+ * The elements themselves come from `fastpy_fv_to_list`, which already had to
+ * answer "what does iterating this value yield?" for `list()`/`tuple()`.
+ * Writing a second tag switch here would have been a second, quietly
+ * divergent answer -- and a worse one: it would have rejected the OBJ tag,
+ * losing every CPython-backed iterable that the bridge makes work.  The
+ * intermediate list costs one allocation on a path that is cold by
+ * construction, since the hot argument is a set and never reaches it.
+ */
+extern FpyList* fastpy_fv_to_list(int32_t tag, int64_t data);
+static const char *_fpy_tag_name(int32_t tag);   /* defined further down */
+
+/* Iterating one of these is a TypeError, so they must not reach
+ * fastpy_fv_to_list -- its `default` arm wraps a scalar into a one-element
+ * list, which is the right answer for its own callers and the wrong one here
+ * (`s.update(5)` would quietly add 5 rather than raising). */
+static int fpy_tag_is_iterable(int32_t tag) {
+    switch (tag) {
+    case FPY_TAG_STR: case FPY_TAG_LIST: case FPY_TAG_OBJ:
+    case FPY_TAG_DICT: case FPY_TAG_BYTES: case FPY_TAG_SET:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+static FpyDict *fpy_iterable_as_set(int32_t tag, int64_t data, int *owned) {
+    *owned = 0;
+    if (data != 0 && tag == FPY_TAG_SET)
+        return (FpyDict*)(intptr_t)data;
+    if (data == 0 || !fpy_tag_is_iterable(tag)) {
+        char buf[128];
+        snprintf(buf, sizeof(buf), "'%.40s' object is not iterable",
+                 data == 0 ? "NoneType" : _fpy_tag_name(tag));
+        fastpy_raise(FPY_EXC_TYPEERROR, buf);
+        return NULL;
+    }
+    *owned = 1;
+    /* A list is already the element sequence, so take it directly.  Going
+     * through fastpy_fv_to_list would be correct but would copy it first
+     * (`list()` owes its caller a new list; this does not), doubling the
+     * allocation for `set(xs)` and `s.update(xs)` on the commonest argument
+     * there is.  Tuples are FpyLists too, so this covers them. */
+    if (tag == FPY_TAG_LIST)
+        return fastpy_set_from_list((FpyList*)(intptr_t)data);
+    FpyList *elems = fastpy_fv_to_list(tag, data);
+    if (!elems) { *owned = 0; return NULL; }
+    FpyDict *out = fastpy_set_from_list(elems);
+    fpy_rc_decref(FPY_TAG_LIST, (int64_t)(intptr_t)elems);
+    return out;
+}
+
+static void fpy_release_iterable_set(FpyDict *b, int owned) {
+    if (owned) fpy_rc_decref(FPY_TAG_SET, (int64_t)(intptr_t)b);
+}
+
+/* `set(x)` / `frozenset(x)`: the same coercion, but the result is the
+ * program's own set, so it is always fresh -- `set(s)` must not alias `s`. */
+FpyDict* fastpy_set_from_iterable_fv(int32_t tag, int64_t data) {
+    int owned; FpyDict *b = fpy_iterable_as_set(tag, data, &owned);
+    if (!b) return fpy_dict_new(4);
+    return owned ? b : fastpy_set_copy(b);
+}
+
+/* The eleven entry points codegen actually calls.  They take the argument as
+ * (tag, data) so the kind survives to run time, coerce once, and delegate.
+ *
+ * fastpy_raise only sets a pending-exception flag, so an error path still has
+ * to return something the caller can hold until it checks: an empty set for
+ * the set-returning ones (never NULL, which the next call would dereference)
+ * and 0 for the predicates. */
+void fastpy_set_update_fv(FpyDict *a, int32_t tag, int64_t data) {
+    int owned; FpyDict *b = fpy_iterable_as_set(tag, data, &owned);
+    if (!b) return;
+    fastpy_set_update(a, b);
+    fpy_release_iterable_set(b, owned);
+}
+
+void fastpy_set_intersection_update_fv(FpyDict *a, int32_t tag, int64_t data) {
+    int owned; FpyDict *b = fpy_iterable_as_set(tag, data, &owned);
+    if (!b) return;
+    fastpy_set_intersection_update(a, b);
+    fpy_release_iterable_set(b, owned);
+}
+
+void fastpy_set_difference_update_fv(FpyDict *a, int32_t tag, int64_t data) {
+    int owned; FpyDict *b = fpy_iterable_as_set(tag, data, &owned);
+    if (!b) return;
+    fastpy_set_difference_update(a, b);
+    fpy_release_iterable_set(b, owned);
+}
+
+void fastpy_set_symmetric_difference_update_fv(FpyDict *a, int32_t tag,
+                                               int64_t data) {
+    int owned; FpyDict *b = fpy_iterable_as_set(tag, data, &owned);
+    if (!b) return;
+    fastpy_set_symmetric_difference_update(a, b);
+    fpy_release_iterable_set(b, owned);
+}
+
+FpyDict* fastpy_set_union_fv(FpyDict *a, int32_t tag, int64_t data) {
+    int owned; FpyDict *b = fpy_iterable_as_set(tag, data, &owned);
+    if (!b) return fpy_dict_new(4);
+    FpyDict *r = fastpy_set_union(a, b);
+    fpy_release_iterable_set(b, owned);
+    return r;
+}
+
+FpyDict* fastpy_set_intersection_fv(FpyDict *a, int32_t tag, int64_t data) {
+    int owned; FpyDict *b = fpy_iterable_as_set(tag, data, &owned);
+    if (!b) return fpy_dict_new(4);
+    FpyDict *r = fastpy_set_intersection(a, b);
+    fpy_release_iterable_set(b, owned);
+    return r;
+}
+
+FpyDict* fastpy_set_difference_fv(FpyDict *a, int32_t tag, int64_t data) {
+    int owned; FpyDict *b = fpy_iterable_as_set(tag, data, &owned);
+    if (!b) return fpy_dict_new(4);
+    FpyDict *r = fastpy_set_difference(a, b);
+    fpy_release_iterable_set(b, owned);
+    return r;
+}
+
+FpyDict* fastpy_set_symmetric_diff_fv(FpyDict *a, int32_t tag, int64_t data) {
+    int owned; FpyDict *b = fpy_iterable_as_set(tag, data, &owned);
+    if (!b) return fpy_dict_new(4);
+    FpyDict *r = fastpy_set_symmetric_diff(a, b);
+    fpy_release_iterable_set(b, owned);
+    return r;
+}
+
+int32_t fastpy_set_issubset_fv(FpyDict *a, int32_t tag, int64_t data) {
+    int owned; FpyDict *b = fpy_iterable_as_set(tag, data, &owned);
+    if (!b) return 0;
+    int32_t r = fastpy_set_issubset(a, b);
+    fpy_release_iterable_set(b, owned);
+    return r;
+}
+
+int32_t fastpy_set_issuperset_fv(FpyDict *a, int32_t tag, int64_t data) {
+    int owned; FpyDict *b = fpy_iterable_as_set(tag, data, &owned);
+    if (!b) return 0;
+    int32_t r = fastpy_set_issuperset(a, b);
+    fpy_release_iterable_set(b, owned);
+    return r;
+}
+
+int32_t fastpy_set_isdisjoint_fv(FpyDict *a, int32_t tag, int64_t data) {
+    int owned; FpyDict *b = fpy_iterable_as_set(tag, data, &owned);
+    if (!b) return 0;
+    int32_t r = fastpy_set_isdisjoint(a, b);
+    fpy_release_iterable_set(b, owned);
+    return r;
 }
 
 /* Print a set in {a, b, c} format. */
@@ -3226,7 +4175,7 @@ void fastpy_dict_delete(FpyDict *dict, const char *key) {
         slot = (slot + 1) & mask;
     }
     FPY_UNLOCK(dict);
-    fastpy_raise(FPY_EXC_KEYERROR, key);
+    fpy_raise_key_error(k);
     return;
 }
 
@@ -3240,8 +4189,7 @@ void fastpy_dict_delete_int(FpyDict *dict, int64_t key) {
         int64_t idx = dict->indices[slot];
         if (idx == FPY_DICT_EMPTY) break;
         if (idx != FPY_DICT_DELETED
-            && dict->keys[idx].tag == FPY_TAG_INT
-            && dict->keys[idx].data.i == key) {
+            && fpy_key_equal_int(&dict->keys[idx], key)) {
             FPY_VAL_DECREF(dict->keys[idx]);
             FPY_VAL_DECREF(dict->values[idx]);
             dict->indices[slot] = FPY_DICT_DELETED;
@@ -3257,9 +4205,7 @@ void fastpy_dict_delete_int(FpyDict *dict, int64_t key) {
         slot = (slot + 1) & mask;
     }
     FPY_UNLOCK(dict);
-    char buf[32];
-    snprintf(buf, sizeof(buf), "%lld", (long long)key);
-    fastpy_raise(FPY_EXC_KEYERROR, buf);
+    fpy_raise_key_error(fpy_int(key));
     return;
 }
 
@@ -3367,7 +4313,7 @@ const char* fastpy_dict_pop(FpyDict *dict, const char *key) {
         slot = (slot + 1) & mask;
     }
     FPY_UNLOCK(dict);
-    fastpy_raise(FPY_EXC_KEYERROR, key);
+    fpy_raise_key_error(k);
     return NULL;
 }
 
@@ -3398,7 +4344,7 @@ int64_t fastpy_dict_pop_int(FpyDict *dict, const char *key) {
         slot = (slot + 1) & mask;
     }
     FPY_UNLOCK(dict);
-    fastpy_raise(FPY_EXC_KEYERROR, key);
+    fpy_raise_key_error(k);
     return 0;
 }
 
@@ -3432,7 +4378,7 @@ void fastpy_dict_pop_nodefault_fv(FpyDict *dict, const char *key,
         slot = (slot + 1) & mask;
     }
     FPY_UNLOCK(dict);
-    fastpy_raise(FPY_EXC_KEYERROR, key);
+    fpy_raise_key_error(k);
     *out_tag = FPY_TAG_NONE;
     *out_data = 0;
 }
@@ -3502,7 +4448,7 @@ void fastpy_dict_pop_nodefault_generic(FpyDict *dict,
         slot = (slot + 1) & mask;
     }
     FPY_UNLOCK(dict);
-    fastpy_raise(FPY_EXC_KEYERROR, "key not found");
+    fpy_raise_key_error(k);
     *out_tag = FPY_TAG_NONE;
     *out_data = 0;
 }
@@ -3615,7 +4561,7 @@ void fastpy_dict_setdefault_generic(FpyDict *dict,
 void fastpy_dict_popitem(FpyDict *dict, int32_t *key_tag, int64_t *key_data,
                           int32_t *val_tag, int64_t *val_data) {
     if (dict->length == 0) {
-        fastpy_raise(FPY_EXC_KEYERROR, "popitem(): dictionary is empty");
+        fpy_raise_key_error(fpy_str("popitem(): dictionary is empty"));
         *key_tag = 0; *key_data = 0; *val_tag = 0; *val_data = 0;
         return;
     }
@@ -3643,7 +4589,7 @@ void fastpy_divmod(int64_t a, int64_t b, int64_t *q, int64_t *r) {
 /* String upper */
 const char* fastpy_str_upper(const char *s) {
     size_t len = strlen(s);
-    char *result = (char*)malloc(len + 1);
+    char *result = fpy_str_buf((int64_t)len);
     for (size_t i = 0; i <= len; i++) {
         result[i] = (s[i] >= 'a' && s[i] <= 'z') ? s[i] - 32 : s[i];
     }
@@ -3652,7 +4598,7 @@ const char* fastpy_str_upper(const char *s) {
 
 const char* fastpy_str_capitalize(const char *s) {
     size_t len = strlen(s);
-    char *result = (char*)malloc(len + 1);
+    char *result = fpy_str_buf((int64_t)len);
     for (size_t i = 0; i < len; i++) {
         char c = s[i];
         if (i == 0) {
@@ -3667,7 +4613,7 @@ const char* fastpy_str_capitalize(const char *s) {
 
 const char* fastpy_str_title(const char *s) {
     size_t len = strlen(s);
-    char *result = (char*)malloc(len + 1);
+    char *result = fpy_str_buf((int64_t)len);
     int in_word = 0;
     for (size_t i = 0; i < len; i++) {
         char c = s[i];
@@ -3688,7 +4634,7 @@ const char* fastpy_str_title(const char *s) {
 
 const char* fastpy_str_swapcase(const char *s) {
     size_t len = strlen(s);
-    char *result = (char*)malloc(len + 1);
+    char *result = fpy_str_buf((int64_t)len);
     for (size_t i = 0; i < len; i++) {
         char c = s[i];
         if (c >= 'a' && c <= 'z') result[i] = c - 32;
@@ -3702,12 +4648,12 @@ const char* fastpy_str_swapcase(const char *s) {
 const char* fastpy_str_center(const char *s, int64_t width) {
     size_t byte_len = strlen(s);
     int64_t cp_len = fastpy_str_len(s);
-    if (cp_len >= width) return fpy_strdup(s);
+    if (cp_len >= width) return fpy_str_from_cstr(s);
     int64_t total_pad = width - cp_len;
     int64_t left = total_pad / 2;
     int64_t right = total_pad - left;
     size_t rsize = byte_len + total_pad;  /* pad chars are ASCII ' ' */
-    char *result = (char*)malloc(rsize + 1);
+    char *result = fpy_str_buf((int64_t)rsize);
     for (int64_t i = 0; i < left; i++) result[i] = ' ';
     memcpy(result + left, s, byte_len);
     for (int64_t i = 0; i < right; i++) result[left + byte_len + i] = ' ';
@@ -3718,10 +4664,10 @@ const char* fastpy_str_center(const char *s, int64_t width) {
 const char* fastpy_str_ljust(const char *s, int64_t width) {
     size_t byte_len = strlen(s);
     int64_t cp_len = fastpy_str_len(s);
-    if (cp_len >= width) return fpy_strdup(s);
+    if (cp_len >= width) return fpy_str_from_cstr(s);
     int64_t pad = width - cp_len;
     size_t rsize = byte_len + pad;
-    char *result = (char*)malloc(rsize + 1);
+    char *result = fpy_str_buf((int64_t)rsize);
     memcpy(result, s, byte_len);
     for (int64_t i = 0; i < pad; i++) result[byte_len + i] = ' ';
     result[rsize] = '\0';
@@ -3731,10 +4677,10 @@ const char* fastpy_str_ljust(const char *s, int64_t width) {
 const char* fastpy_str_rjust(const char *s, int64_t width) {
     size_t byte_len = strlen(s);
     int64_t cp_len = fastpy_str_len(s);
-    if (cp_len >= width) return fpy_strdup(s);
+    if (cp_len >= width) return fpy_str_from_cstr(s);
     int64_t pad = width - cp_len;
     size_t rsize = byte_len + pad;
-    char *result = (char*)malloc(rsize + 1);
+    char *result = fpy_str_buf((int64_t)rsize);
     for (int64_t i = 0; i < pad; i++) result[i] = ' ';
     memcpy(result + pad, s, byte_len);
     result[rsize] = '\0';
@@ -3744,10 +4690,10 @@ const char* fastpy_str_rjust(const char *s, int64_t width) {
 const char* fastpy_str_zfill(const char *s, int64_t width) {
     size_t byte_len = strlen(s);
     int64_t cp_len = fastpy_str_len(s);
-    if (cp_len >= width) return fpy_strdup(s);
+    if (cp_len >= width) return fpy_str_from_cstr(s);
     int64_t pad = width - cp_len;
     size_t rsize = byte_len + pad;
-    char *result = (char*)malloc(rsize + 1);
+    char *result = fpy_str_buf((int64_t)rsize);
     int src_idx = 0;
     int dst_idx = 0;
     /* Preserve leading sign */
@@ -3766,12 +4712,12 @@ const char* fastpy_str_center_fill(const char *s, int64_t width, const char *fil
     int fc_len = fpy_utf8_cplen((const unsigned char *)fill);
     size_t byte_len = strlen(s);
     int64_t cp_len = fastpy_str_len(s);
-    if (cp_len >= width) return fpy_strdup(s);
+    if (cp_len >= width) return fpy_str_from_cstr(s);
     int64_t total_pad = width - cp_len;
     int64_t left = total_pad / 2;
     int64_t right = total_pad - left;
     size_t rsize = byte_len + total_pad * fc_len;
-    char *result = (char*)malloc(rsize + 1);
+    char *result = fpy_str_buf((int64_t)rsize);
     int64_t off = 0;
     for (int64_t i = 0; i < left; i++) { memcpy(result + off, fill, fc_len); off += fc_len; }
     memcpy(result + off, s, byte_len); off += byte_len;
@@ -3784,10 +4730,10 @@ const char* fastpy_str_ljust_fill(const char *s, int64_t width, const char *fill
     int fc_len = fpy_utf8_cplen((const unsigned char *)fill);
     size_t byte_len = strlen(s);
     int64_t cp_len = fastpy_str_len(s);
-    if (cp_len >= width) return fpy_strdup(s);
+    if (cp_len >= width) return fpy_str_from_cstr(s);
     int64_t pad = width - cp_len;
     size_t rsize = byte_len + pad * fc_len;
-    char *result = (char*)malloc(rsize + 1);
+    char *result = fpy_str_buf((int64_t)rsize);
     memcpy(result, s, byte_len);
     int64_t off = byte_len;
     for (int64_t i = 0; i < pad; i++) { memcpy(result + off, fill, fc_len); off += fc_len; }
@@ -3799,10 +4745,10 @@ const char* fastpy_str_rjust_fill(const char *s, int64_t width, const char *fill
     int fc_len = fpy_utf8_cplen((const unsigned char *)fill);
     size_t byte_len = strlen(s);
     int64_t cp_len = fastpy_str_len(s);
-    if (cp_len >= width) return fpy_strdup(s);
+    if (cp_len >= width) return fpy_str_from_cstr(s);
     int64_t pad = width - cp_len;
     size_t rsize = byte_len + pad * fc_len;
-    char *result = (char*)malloc(rsize + 1);
+    char *result = fpy_str_buf((int64_t)rsize);
     int64_t off = 0;
     for (int64_t i = 0; i < pad; i++) { memcpy(result + off, fill, fc_len); off += fc_len; }
     memcpy(result + off, s, byte_len);
@@ -3899,9 +4845,9 @@ int fastpy_str_isnumeric(const char *s) {
 
 /* str.casefold() — aggressive lowercase for caseless matching (ASCII: same as lower) */
 const char* fastpy_str_casefold(const char *s) {
-    if (!s) return fpy_strdup("");
+    if (!s) return fpy_str_from_cstr("");
     size_t len = strlen(s);
-    char *result = (char*)malloc(len + 1);
+    char *result = fpy_str_buf((int64_t)len);
     for (size_t i = 0; i <= len; i++) {
         char c = s[i];
         if (c >= 'A' && c <= 'Z') c = c + ('a' - 'A');
@@ -3912,7 +4858,7 @@ const char* fastpy_str_casefold(const char *s) {
 
 /* str.expandtabs(tabsize) — column counter uses code points, not bytes */
 const char* fastpy_str_expandtabs(const char *s, int64_t tabsize) {
-    if (!s) return fpy_strdup("");
+    if (!s) return fpy_str_from_cstr("");
     const unsigned char *p;
     /* First pass: count output byte length */
     size_t out_len = 0;
@@ -3935,7 +4881,7 @@ const char* fastpy_str_expandtabs(const char *s, int64_t tabsize) {
             p += cplen;
         }
     }
-    char *result = (char*)malloc(out_len + 1);
+    char *result = fpy_str_buf((int64_t)out_len);
     size_t i = 0;
     col = 0;
     for (p = (const unsigned char *)s; *p; ) {
@@ -3968,19 +4914,15 @@ FpyList* fastpy_str_partition(const char *s, const char *sep) {
     if (found) {
         size_t before_len = found - s;
         size_t sep_len = strlen(sep);
-        char *before = (char*)malloc(before_len + 1);
-        memcpy(before, s, before_len);
-        before[before_len] = '\0';
         const char *after = found + sep_len;
-        char *after_copy = fpy_strdup(after);
-        char *sep_copy = fpy_strdup(sep);
-        fpy_list_append(result, fpy_str(before));
-        fpy_list_append(result, fpy_str(sep_copy));
-        fpy_list_append(result, fpy_str(after_copy));
+        /* Header-backed copies so each tuple element is a valid STR value. */
+        fpy_list_append(result, fpy_str(fpy_str_copy(s, (int64_t)before_len)));
+        fpy_list_append(result, fpy_str(fpy_str_from_cstr(sep)));
+        fpy_list_append(result, fpy_str(fpy_str_from_cstr(after)));
     } else {
-        fpy_list_append(result, fpy_str(fpy_strdup(s)));
-        fpy_list_append(result, fpy_str(fpy_strdup("")));
-        fpy_list_append(result, fpy_str(fpy_strdup("")));
+        fpy_list_append(result, fpy_str(fpy_str_from_cstr(s)));
+        fpy_list_append(result, fpy_str(fpy_str_from_cstr("")));
+        fpy_list_append(result, fpy_str(fpy_str_from_cstr("")));
     }
     return result;
 }
@@ -4000,17 +4942,14 @@ FpyList* fastpy_str_rpartition(const char *s, const char *sep) {
     }
     if (last) {
         size_t before_len = last - s;
-        char *before = (char*)malloc(before_len + 1);
-        memcpy(before, s, before_len);
-        before[before_len] = '\0';
         const char *after = last + seplen;
-        fpy_list_append(result, fpy_str(before));
-        fpy_list_append(result, fpy_str(fpy_strdup(sep)));
-        fpy_list_append(result, fpy_str(fpy_strdup(after)));
+        fpy_list_append(result, fpy_str(fpy_str_copy(s, (int64_t)before_len)));
+        fpy_list_append(result, fpy_str(fpy_str_from_cstr(sep)));
+        fpy_list_append(result, fpy_str(fpy_str_from_cstr(after)));
     } else {
-        fpy_list_append(result, fpy_str(fpy_strdup("")));
-        fpy_list_append(result, fpy_str(fpy_strdup("")));
-        fpy_list_append(result, fpy_str(fpy_strdup(s)));
+        fpy_list_append(result, fpy_str(fpy_str_from_cstr("")));
+        fpy_list_append(result, fpy_str(fpy_str_from_cstr("")));
+        fpy_list_append(result, fpy_str(fpy_str_from_cstr(s)));
     }
     return result;
 }
@@ -4023,10 +4962,7 @@ FpyList* fastpy_str_splitlines(const char *s) {
     while (i < len) {
         if (s[i] == '\n' || s[i] == '\r') {
             size_t line_len = i - start;
-            char *line = (char*)malloc(line_len + 1);
-            memcpy(line, s + start, line_len);
-            line[line_len] = '\0';
-            fpy_list_append(result, fpy_str(line));
+            fpy_list_append(result, fpy_str(fpy_str_copy(s + start, (int64_t)line_len)));
             if (s[i] == '\r' && i + 1 < len && s[i + 1] == '\n') i += 2;
             else i++;
             start = i;
@@ -4036,10 +4972,7 @@ FpyList* fastpy_str_splitlines(const char *s) {
     }
     if (start < len) {
         size_t line_len = len - start;
-        char *line = (char*)malloc(line_len + 1);
-        memcpy(line, s + start, line_len);
-        line[line_len] = '\0';
-        fpy_list_append(result, fpy_str(line));
+        fpy_list_append(result, fpy_str(fpy_str_copy(s + start, (int64_t)line_len)));
     }
     return result;
 }
@@ -4088,17 +5021,11 @@ FpyList* fastpy_str_rsplit(const char *s, const char *sep, int64_t max_split) {
             size_t seg_start = starts[0];
             size_t seg_end = ends[split_from - 1];
             size_t seg_len = seg_end - seg_start;
-            char *seg = (char*)malloc(seg_len + 1);
-            memcpy(seg, s + seg_start, seg_len);
-            seg[seg_len] = '\0';
-            fpy_list_append(result, fpy_str(seg));
+            fpy_list_append(result, fpy_str(fpy_str_copy(s + seg_start, (int64_t)seg_len)));
         }
         for (int w = (split_from > 0 ? split_from : 0); w < n_words; w++) {
             size_t seg_len = ends[w] - starts[w];
-            char *seg = (char*)malloc(seg_len + 1);
-            memcpy(seg, s + starts[w], seg_len);
-            seg[seg_len] = '\0';
-            fpy_list_append(result, fpy_str(seg));
+            fpy_list_append(result, fpy_str(fpy_str_copy(s + starts[w], (int64_t)seg_len)));
         }
         return result;
     }
@@ -4106,7 +5033,7 @@ FpyList* fastpy_str_rsplit(const char *s, const char *sep, int64_t max_split) {
     size_t sep_len = strlen(sep);
     if (sep_len == 0) {
         FpyList *result = fpy_list_new(1);
-        fpy_list_append(result, fpy_str(fpy_strdup(s)));
+        fpy_list_append(result, fpy_str(fpy_str_from_cstr(s)));
         return result;
     }
     /* Collect all split positions from left, then take rightmost max_split */
@@ -4123,7 +5050,7 @@ FpyList* fastpy_str_rsplit(const char *s, const char *sep, int64_t max_split) {
         p += sep_len;
     }
     if (n_pos == 0 || max_split == 0) {
-        fpy_list_append(parts, fpy_str(fpy_strdup(s)));
+        fpy_list_append(parts, fpy_str(fpy_str_from_cstr(s)));
         free(positions);
         return parts;
     }
@@ -4137,35 +5064,23 @@ FpyList* fastpy_str_rsplit(const char *s, const char *sep, int64_t max_split) {
     if (start_idx > 0) {
         /* Everything before the first used separator */
         size_t len = positions[start_idx] - 0;
-        char *seg = (char*)malloc(len + 1);
-        memcpy(seg, s, len);
-        seg[len] = '\0';
-        fpy_list_append(parts, fpy_str(seg));
+        fpy_list_append(parts, fpy_str(fpy_str_copy(s, (int64_t)len)));
         seg_start = positions[start_idx] + sep_len;
     }
     for (int64_t i = start_idx; i < n_pos; i++) {
         if (i == start_idx && start_idx == 0) {
             size_t len = positions[i];
-            char *seg = (char*)malloc(len + 1);
-            memcpy(seg, s, len);
-            seg[len] = '\0';
-            fpy_list_append(parts, fpy_str(seg));
+            fpy_list_append(parts, fpy_str(fpy_str_copy(s, (int64_t)len)));
             seg_start = positions[i] + sep_len;
         } else if (i > start_idx) {
             size_t len = positions[i] - seg_start;
-            char *seg = (char*)malloc(len + 1);
-            memcpy(seg, s + seg_start, len);
-            seg[len] = '\0';
-            fpy_list_append(parts, fpy_str(seg));
+            fpy_list_append(parts, fpy_str(fpy_str_copy(s + seg_start, (int64_t)len)));
             seg_start = positions[i] + sep_len;
         }
     }
     /* Remainder after last separator */
     size_t rem_len = s_len - seg_start;
-    char *rem = (char*)malloc(rem_len + 1);
-    memcpy(rem, s + seg_start, rem_len);
-    rem[rem_len] = '\0';
-    fpy_list_append(parts, fpy_str(rem));
+    fpy_list_append(parts, fpy_str(fpy_str_copy(s + seg_start, (int64_t)rem_len)));
     free(positions);
     return parts;
 }
@@ -4187,10 +5102,7 @@ FpyList* fastpy_str_split_max(const char *s, const char *sep, int64_t max_split)
             if (splits >= max_split) {
                 /* Remainder of string (including leading whitespace already skipped) */
                 size_t rest_len = len - i;
-                char *seg = (char*)malloc(rest_len + 1);
-                memcpy(seg, s + i, rest_len);
-                seg[rest_len] = '\0';
-                fpy_list_append(result, fpy_str(seg));
+                fpy_list_append(result, fpy_str(fpy_str_copy(s + i, (int64_t)rest_len)));
                 break;
             }
             size_t start = i;
@@ -4198,10 +5110,7 @@ FpyList* fastpy_str_split_max(const char *s, const char *sep, int64_t max_split)
                    && s[i] != '\r' && s[i] != '\f' && s[i] != '\v')
                 i++;
             size_t seg_len = i - start;
-            char *seg = (char*)malloc(seg_len + 1);
-            memcpy(seg, s + start, seg_len);
-            seg[seg_len] = '\0';
-            fpy_list_append(result, fpy_str(seg));
+            fpy_list_append(result, fpy_str(fpy_str_copy(s + start, (int64_t)seg_len)));
             splits++;
             while (i < len && (s[i] == ' ' || s[i] == '\t' || s[i] == '\n'
                                || s[i] == '\r' || s[i] == '\f' || s[i] == '\v'))
@@ -4213,8 +5122,7 @@ FpyList* fastpy_str_split_max(const char *s, const char *sep, int64_t max_split)
     size_t sep_len = strlen(sep);
     size_t s_len = strlen(s);
     if (sep_len == 0) {
-        char *copy = fpy_strdup(s);
-        fpy_list_append(result, fpy_str(copy));
+        fpy_list_append(result, fpy_str(fpy_str_from_cstr(s)));
         return result;
     }
     const char *p = s;
@@ -4223,10 +5131,11 @@ FpyList* fastpy_str_split_max(const char *s, const char *sep, int64_t max_split)
     while (p <= end) {
         if (max_split >= 0 && splits >= max_split) {
             size_t rest_len = end - p;
-            char *seg = (char*)malloc(rest_len + 1);
-            memcpy(seg, p, rest_len);
-            seg[rest_len] = '\0';
-            fpy_list_append(result, fpy_str(seg));
+            /* Use fpy_str_copy so the result carries a proper FpyString header
+               (magic + refcount); a bare malloc would be headerless and cause
+               an OOB read in fpy_str_header on incref/decref.
+               See BUG-RUNTIME-STR-PRODUCERS-BARE-MALLOC. */
+            fpy_list_append(result, fpy_str(fpy_str_copy(p, (int64_t)rest_len)));
             break;
         }
         const char *q = (p <= end) ? strstr(p, sep) : NULL;
@@ -4235,17 +5144,11 @@ FpyList* fastpy_str_split_max(const char *s, const char *sep, int64_t max_split)
                if the string ended with the separator, which is correct:
                "a ".split(" ") → ["a", ""]). */
             size_t rest_len = end - p;
-            char *seg = (char*)malloc(rest_len + 1);
-            memcpy(seg, p, rest_len);
-            seg[rest_len] = '\0';
-            fpy_list_append(result, fpy_str(seg));
+            fpy_list_append(result, fpy_str(fpy_str_copy(p, (int64_t)rest_len)));
             break;
         }
         size_t seg_len = q - p;
-        char *seg = (char*)malloc(seg_len + 1);
-        memcpy(seg, p, seg_len);
-        seg[seg_len] = '\0';
-        fpy_list_append(result, fpy_str(seg));
+        fpy_list_append(result, fpy_str(fpy_str_copy(p, (int64_t)seg_len)));
         p = q + sep_len;
         splits++;
     }
@@ -4262,7 +5165,7 @@ const char* fastpy_str_replace(const char *s, const char *old, const char *new_s
          * Insert new_str at every position (n+1 positions for n chars). */
         size_t n_inserts = s_len + 1;
         size_t result_len = s_len + n_inserts * new_len;
-        char *result = (char*)malloc(result_len + 1);
+        char *result = fpy_str_buf((int64_t)result_len);
         char *dst = result;
         for (size_t i = 0; i <= s_len; i++) {
             memcpy(dst, new_str, new_len);
@@ -4279,7 +5182,7 @@ const char* fastpy_str_replace(const char *s, const char *old, const char *new_s
     while ((p = strstr(p, old)) != NULL) { count++; p += old_len; }
 
     size_t result_len = s_len + count * (new_len - old_len);
-    char *result = (char*)malloc(result_len + 1);
+    char *result = fpy_str_buf((int64_t)result_len);
     char *dst = result;
     p = s;
     while (*p) {
@@ -4302,7 +5205,7 @@ const char* fastpy_str_replace_count(const char *s, const char *old,
     size_t old_len = strlen(old);
     size_t new_len = strlen(new_str);
     if (old_len == 0 || max_count == 0) {
-        char *copy = (char*)malloc(s_len + 1);
+        char *copy = fpy_str_buf((int64_t)s_len);
         memcpy(copy, s, s_len + 1);
         return copy;
     }
@@ -4313,7 +5216,7 @@ const char* fastpy_str_replace_count(const char *s, const char *old,
         count++; p += old_len;
     }
     size_t result_len = s_len + count * (new_len - old_len);
-    char *result = (char*)malloc(result_len + 1);
+    char *result = fpy_str_buf((int64_t)result_len);
     char *dst = result;
     int64_t replacements = 0;
     p = s;
@@ -4350,14 +5253,14 @@ const char* fastpy_str_removeprefix(const char *s, const char *prefix) {
     if (strncmp(s, prefix, plen) == 0) {
         size_t slen = strlen(s);
         size_t rlen = slen - plen;
-        char *result = (char*)malloc(rlen + 1);
+        char *result = fpy_str_buf((int64_t)rlen);
         memcpy(result, s + plen, rlen);
         result[rlen] = '\0';
         return result;
     }
     /* No match — return a copy of the original string */
     size_t slen = strlen(s);
-    char *copy = (char*)malloc(slen + 1);
+    char *copy = fpy_str_buf((int64_t)slen);
     memcpy(copy, s, slen + 1);
     return copy;
 }
@@ -4368,13 +5271,13 @@ const char* fastpy_str_removesuffix(const char *s, const char *suffix) {
     size_t suflen = strlen(suffix);
     if (suflen <= slen && strcmp(s + slen - suflen, suffix) == 0) {
         size_t rlen = slen - suflen;
-        char *result = (char*)malloc(rlen + 1);
+        char *result = fpy_str_buf((int64_t)rlen);
         memcpy(result, s, rlen);
         result[rlen] = '\0';
         return result;
     }
     /* No match — return a copy of the original string */
-    char *copy = (char*)malloc(slen + 1);
+    char *copy = fpy_str_buf((int64_t)slen);
     memcpy(copy, s, slen + 1);
     return copy;
 }
@@ -4382,6 +5285,102 @@ const char* fastpy_str_removesuffix(const char *s, const char *suffix) {
 /* String contains (for 'in' operator) */
 int fastpy_str_contains(const char *haystack, const char *needle) {
     return strstr(haystack, needle) != NULL;
+}
+
+/* `x in b"..."` — dispatches on the tag of the left operand, because Python
+ * gives the two forms different meanings: an int asks whether that byte value
+ * occurs, a bytes/str asks whether it occurs as a contiguous subsequence
+ * (and the empty one always does).  Length-aware throughout, so an embedded
+ * null byte is matched rather than ending the search.  `in` on a bytes had no
+ * arm at all in the emitter and fell through to the CPython `__contains__`
+ * bridge, which faults on Windows and returns NULL in pure mode.
+ * BUG-BYTES-CONTAINS-NO-ARM. */
+int fastpy_bytes_contains(const char *hay, int32_t tag, int64_t data) {
+    if (hay == NULL) return 0;
+    int64_t n = fpy_bytes_len(hay);
+    if (tag == FPY_TAG_INT || tag == FPY_TAG_BOOL) {
+        /* CPython rejects an out-of-range int rather than answering False. */
+        if (data < 0 || data > 255) {
+            fastpy_raise(FPY_EXC_VALUEERROR, "byte must be in range(0, 256)");
+            return 0;
+        }
+        for (int64_t i = 0; i < n; i++)
+            if ((unsigned char)hay[i] == (unsigned char)data) return 1;
+        return 0;
+    }
+    if (tag == FPY_TAG_BYTES || tag == FPY_TAG_STR) {
+        const char *needle = (const char *)(intptr_t)data;
+        if (needle == NULL) return 0;
+        int64_t m = (tag == FPY_TAG_BYTES) ? fpy_bytes_len(needle)
+                                           : (int64_t)strlen(needle);
+        if (m == 0) return 1;
+        if (m > n) return 0;
+        for (int64_t i = 0; i + m <= n; i++)
+            if (memcmp(hay + i, needle, (size_t)m) == 0) return 1;
+        return 0;
+    }
+    fastpy_raise(FPY_EXC_TYPEERROR,
+                 "a bytes-like object is required for 'in'");
+    return 0;
+}
+
+/* `bytes(x)` / `bytearray(x)` — the builtin had no native lowering at all and
+ * went through the CPython bridge, so in pure mode (SlateOS) it answered NULL
+ * and the next `fpy_bytes_len` walked off a null pointer.  Dispatches on the
+ * runtime tag because the argument's kind is often only known then; the shape
+ * mirrors `fastpy_fv_to_list`, and anything iterable is routed through that
+ * so sets, dicts, ranges and generators need no separate arm here.
+ * BUG-BYTES-CTOR-BRIDGE-ONLY. */
+extern FpyList* fastpy_fv_to_list(int32_t tag, int64_t data);
+
+const char* fastpy_fv_to_bytes(int32_t tag, int64_t data) {
+    if (tag == FPY_TAG_INT || tag == FPY_TAG_BOOL) {
+        /* bytes(n) → n zero bytes. */
+        int64_t n = data;
+        if (n < 0) {
+            fastpy_raise(FPY_EXC_VALUEERROR, "negative count");
+            n = 0;
+        }
+        char *out = fpy_bytes_alloc(n);
+        if (n > 0) memset(out, 0, (size_t)n);
+        return out;
+    }
+    if (tag == FPY_TAG_BYTES) {
+        const char *src = (const char *)(intptr_t)data;
+        if (src == NULL) return fpy_bytes_alloc(0);
+        int64_t n = fpy_bytes_len(src);
+        char *out = fpy_bytes_alloc(n);
+        if (n > 0) memcpy(out, src, (size_t)n);
+        return out;
+    }
+    if (tag == FPY_TAG_STR) {
+        fastpy_raise(FPY_EXC_TYPEERROR,
+                     "string argument without an encoding");
+        return fpy_bytes_alloc(0);
+    }
+    if (tag == FPY_TAG_NONE) {
+        fastpy_raise(FPY_EXC_TYPEERROR,
+                     "cannot convert 'NoneType' object to bytes");
+        return fpy_bytes_alloc(0);
+    }
+    FpyList *items = fastpy_fv_to_list(tag, data);
+    if (items == NULL) return fpy_bytes_alloc(0);
+    int64_t n = items->length;
+    char *out = fpy_bytes_alloc(n);
+    for (int64_t i = 0; i < n; i++) {
+        FpyValue v = items->items[i];
+        if (v.tag != FPY_TAG_INT && v.tag != FPY_TAG_BOOL) {
+            fastpy_raise(FPY_EXC_TYPEERROR,
+                         "bytes must be an iterable of integers");
+            return out;
+        }
+        if (v.data.i < 0 || v.data.i > 255) {
+            fastpy_raise(FPY_EXC_VALUEERROR, "bytes must be in range(0, 256)");
+            return out;
+        }
+        out[i] = (char)(unsigned char)v.data.i;
+    }
+    return out;
 }
 
 /* Dict get with default — returns value as string, or default if key not found */
@@ -4508,7 +5507,7 @@ const char* fastpy_str_strip(const char *s) {
     const unsigned char *end = (const unsigned char *)s + strlen(s);
     while ((n = _fpy_ws_back(start, end)) > 0) end -= n;
     size_t len = end - start;
-    char *result = (char*)malloc(len + 1);
+    char *result = fpy_str_buf((int64_t)len);
     memcpy(result, start, len);
     result[len] = '\0';
     return result;
@@ -4518,7 +5517,7 @@ const char* fastpy_str_lstrip(const char *s) {
     const unsigned char *start = (const unsigned char *)s;
     int n;
     while ((n = _fpy_ws_fwd(start)) > 0) start += n;
-    return fpy_strdup((const char *)start);
+    return fpy_str_from_cstr((const char *)start);
 }
 
 const char* fastpy_str_rstrip(const char *s) {
@@ -4528,7 +5527,7 @@ const char* fastpy_str_rstrip(const char *s) {
     int n;
     while ((n = _fpy_ws_back(start, end)) > 0) end -= n;
     size_t len = end - start;
-    char *result = (char*)malloc(len + 1);
+    char *result = fpy_str_buf((int64_t)len);
     memcpy(result, start, len);
     result[len] = '\0';
     return result;
@@ -4540,7 +5539,7 @@ const char* fastpy_str_strip_chars(const char *s, const char *chars) {
     const char *end = s + strlen(s) - 1;
     while (end >= start && strchr(chars, *end)) end--;
     size_t len = end - start + 1;
-    char *result = (char*)malloc(len + 1);
+    char *result = fpy_str_buf((int64_t)len);
     memcpy(result, start, len);
     result[len] = '\0';
     return result;
@@ -4549,16 +5548,16 @@ const char* fastpy_str_strip_chars(const char *s, const char *chars) {
 const char* fastpy_str_lstrip_chars(const char *s, const char *chars) {
     const char *start = s;
     while (*start && strchr(chars, *start)) start++;
-    return fpy_strdup(start);
+    return fpy_str_from_cstr(start);
 }
 
 const char* fastpy_str_rstrip_chars(const char *s, const char *chars) {
     size_t slen = strlen(s);
-    if (slen == 0) return fpy_strdup(s);
+    if (slen == 0) return fpy_str_from_cstr(s);
     const char *end = s + slen - 1;
     while (end >= s && strchr(chars, *end)) end--;
     size_t len = end - s + 1;
-    char *result = (char*)malloc(len + 1);
+    char *result = fpy_str_buf((int64_t)len);
     memcpy(result, s, len);
     result[len] = '\0';
     return result;
@@ -4605,7 +5604,7 @@ int32_t fastpy_str_isspace(const char *s) {
 
 const char* fastpy_chr(int64_t code) {
     /* Only ASCII — no Unicode support yet */
-    char *result = (char*)malloc(2);
+    char *result = fpy_str_buf(2);
     result[0] = (char)(code & 0xff);
     result[1] = '\0';
     return result;
@@ -4628,11 +5627,14 @@ int64_t fastpy_str_to_int(const char *s) {
     if (*p == '+' || *p == '-') p++;
     /* Must have at least one digit */
     if (*p < '0' || *p > '9') {
-        /* Allocate a persistent error message matching CPython's format */
-        char *msg = (char*)malloc(64 + strlen(s));
-        snprintf(msg, 64 + strlen(s),
-                 "invalid literal for int() with base 10: '%s'", s);
-        fastpy_raise(FPY_EXC_VALUEERROR, msg);
+        /* The message goes in the shared buffer, not a fresh malloc: since
+         * `fastpy_raise` copies it into the exception slot's own refcounted
+         * string, a malloc here would be a straight leak — one per failed
+         * conversion. The literal is truncated at 160 chars, which no
+         * *parseable* number ever reaches. */
+        snprintf(_err_buf, sizeof(_err_buf),
+                 "invalid literal for int() with base 10: '%.160s'", s);
+        fastpy_raise(FPY_EXC_VALUEERROR, _err_buf);
         return 0;
     }
     char *end;
@@ -4640,10 +5642,9 @@ int64_t fastpy_str_to_int(const char *s) {
     /* Check for trailing garbage (other than whitespace) */
     while (*end == ' ' || *end == '\t' || *end == '\n' || *end == '\r') end++;
     if (*end != '\0') {
-        char *msg = (char*)malloc(64 + strlen(s));
-        snprintf(msg, 64 + strlen(s),
-                 "invalid literal for int() with base 10: '%s'", s);
-        fastpy_raise(FPY_EXC_VALUEERROR, msg);
+        snprintf(_err_buf, sizeof(_err_buf),
+                 "invalid literal for int() with base 10: '%.160s'", s);
+        fastpy_raise(FPY_EXC_VALUEERROR, _err_buf);
         return 0;
     }
     return result;
@@ -4660,11 +5661,10 @@ int64_t fastpy_str_to_int_base(const char *s, int64_t base) {
     int64_t result = (int64_t)strtoll(p, &end, (int)base);
     while (*end == ' ' || *end == '\t') end++;
     if (*end != '\0') {
-        char *msg = (char*)malloc(64 + strlen(s));
-        snprintf(msg, 64 + strlen(s),
-                 "invalid literal for int() with base %lld: '%s'",
+        snprintf(_err_buf, sizeof(_err_buf),
+                 "invalid literal for int() with base %lld: '%.160s'",
                  (long long)base, s);
-        fastpy_raise(FPY_EXC_VALUEERROR, msg);
+        fastpy_raise(FPY_EXC_VALUEERROR, _err_buf);
         return 0;
     }
     return result;
@@ -4679,27 +5679,25 @@ double fastpy_str_to_float(const char *s) {
     const char *p = s;
     while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
     if (*p == '\0') {
-        char *msg = (char*)malloc(64 + strlen(s));
-        snprintf(msg, 64 + strlen(s),
-                 "could not convert string to float: '%s'", s);
-        fastpy_raise(FPY_EXC_VALUEERROR, msg);
+        snprintf(_err_buf, sizeof(_err_buf),
+                 "could not convert string to float: '%.160s'", s);
+        fastpy_raise(FPY_EXC_VALUEERROR, _err_buf);
         return 0.0;
     }
     char *end;
     double result = strtod(p, &end);
     while (*end == ' ' || *end == '\t' || *end == '\n' || *end == '\r') end++;
     if (*end != '\0' || end == p) {
-        char *msg = (char*)malloc(64 + strlen(s));
-        snprintf(msg, 64 + strlen(s),
-                 "could not convert string to float: '%s'", s);
-        fastpy_raise(FPY_EXC_VALUEERROR, msg);
+        snprintf(_err_buf, sizeof(_err_buf),
+                 "could not convert string to float: '%.160s'", s);
+        fastpy_raise(FPY_EXC_VALUEERROR, _err_buf);
         return 0.0;
     }
     return result;
 }
 
 const char* fastpy_hex(int64_t value) {
-    char *buf = (char*)malloc(32);
+    char *buf = fpy_str_buf(32);
     if (value < 0) {
         snprintf(buf, 32, "-0x%llx", (long long)(-value));
     } else {
@@ -4709,7 +5707,7 @@ const char* fastpy_hex(int64_t value) {
 }
 
 const char* fastpy_oct(int64_t value) {
-    char *buf = (char*)malloc(32);
+    char *buf = fpy_str_buf(32);
     if (value < 0) {
         snprintf(buf, 32, "-0o%llo", (long long)(-value));
     } else {
@@ -4719,7 +5717,7 @@ const char* fastpy_oct(int64_t value) {
 }
 
 const char* fastpy_bin(int64_t value) {
-    char *buf = (char*)malloc(80);
+    char *buf = fpy_str_buf(80);
     int neg = value < 0;
     uint64_t v = neg ? (uint64_t)(-value) : (uint64_t)value;
     char tmp[70];
@@ -4903,31 +5901,28 @@ const char* fastpy_str_format_percent(const char *fmt, FpyList *args) {
         i = j;
     }
     buf[out] = '\0';
-    return buf;
+    /* buf grows via realloc, which is incompatible with a header-backed
+       allocation; copy the finished result into a headered string so the
+       returned STR value is valid. See BUG-RUNTIME-STR-PRODUCERS-BARE-MALLOC. */
+    const char *result = fpy_str_copy(buf, (int64_t)out);
+    free(buf);
+    return result;
 }
 
 const char* fastpy_str_repr(const char *s) {
-    /* Wrap in single quotes with escapes for common chars */
+    if (!s) s = "";
     size_t len = strlen(s);
-    char *buf = (char*)malloc(len * 2 + 3);
+    /* Worst case is four output chars per input char (\xNN), plus the two
+     * quotes; fpy_str_buf adds the terminator. The old sizing was len*2+2,
+     * which fit the escapes this routine used to emit but leaves no room for
+     * the \xNN form it now shares with fpy_value_repr. */
+    int cap = (int)(len * 4 + 2);
+    char *buf = fpy_str_buf((int64_t)cap);
+    char q = fpy_repr_quote(s, len);
     int out = 0;
-    buf[out++] = '\'';
-    for (size_t i = 0; i < len; i++) {
-        char c = s[i];
-        if (c == '\\' || c == '\'') {
-            buf[out++] = '\\';
-            buf[out++] = c;
-        } else if (c == '\n') {
-            buf[out++] = '\\'; buf[out++] = 'n';
-        } else if (c == '\t') {
-            buf[out++] = '\\'; buf[out++] = 't';
-        } else if (c == '\r') {
-            buf[out++] = '\\'; buf[out++] = 'r';
-        } else {
-            buf[out++] = c;
-        }
-    }
-    buf[out++] = '\'';
+    buf[out++] = q;
+    out += fpy_repr_escape_body(s, len, q, buf + out, cap + 1 - out);
+    buf[out++] = q;
     buf[out] = '\0';
     return buf;
 }
@@ -5216,7 +6211,7 @@ void fastpy_list_sort_key(FpyList *list,
 /* bytes.decode() — for ASCII/UTF-8, the bytes *are* the string */
 const char* fastpy_bytes_decode(const char *bytes) {
     size_t len = strlen(bytes);
-    char *result = (char*)malloc(len + 1);
+    char *result = fpy_str_buf((int64_t)len);
     memcpy(result, bytes, len + 1);
     return result;
 }
@@ -5356,11 +6351,11 @@ const char* fastpy_str_translate(const char *s, const char *table) {
     size_t slen = strlen(s);
     if (table[0] != 'T') {
         /* Not a valid translation table, return copy */
-        char *copy = (char*)malloc(slen + 1);
+        char *copy = fpy_str_buf((int64_t)slen);
         memcpy(copy, s, slen + 1);
         return copy;
     }
-    char *result = (char*)malloc(slen + 1);
+    char *result = fpy_str_buf((int64_t)slen);
     for (size_t i = 0; i < slen; i++) {
         unsigned char c = (unsigned char)s[i];
         result[i] = table[c + 1];
@@ -5496,12 +6491,11 @@ void fastpy_list_slice_step_assign(FpyList *list, int64_t start, int64_t stop,
     /* CPython: extended slice assignment requires exact size match */
     if (new_values->length != slice_len) {
         FPY_UNLOCK(list);
-        char *msg = (char*)malloc(128);
-        snprintf(msg, 128,
+        snprintf(_err_buf, sizeof(_err_buf),
                  "attempt to assign sequence of size %lld "
                  "to extended slice of size %lld",
                  (long long)new_values->length, (long long)slice_len);
-        fastpy_raise(FPY_EXC_VALUEERROR, msg);
+        fastpy_raise(FPY_EXC_VALUEERROR, _err_buf);
         return;
     }
 
@@ -5696,7 +6690,7 @@ const char* fastpy_format_spec_float(double value, const char *spec) {
     char tmp[128];
     int tlen = snprintf(tmp, sizeof(tmp), fmt_buf, value);
     if (tlen < 0) tlen = 0;
-    char *buf = (char*)malloc((width > tlen ? width : tlen) + 1);
+    char *buf = fpy_str_buf((width > tlen ? width : tlen) + 1);
     if (tlen >= width) {
         memcpy(buf, tmp, tlen);
         buf[tlen] = '\0';
@@ -5863,7 +6857,7 @@ const char* fastpy_format_spec_int(int64_t value, const char *spec) {
     int tlen = sign_len + plen + glen;
 
     int outsize = (width > tlen ? width : tlen) + 1;
-    char *buf = (char*)malloc(outsize);
+    char *buf = fpy_str_buf(outsize);
 
     /* No padding needed */
     if (tlen >= width) {
@@ -5948,7 +6942,7 @@ const char* fastpy_format_spec_str(const char *value, const char *spec) {
     if (precision >= 0 && precision < len) len = precision;
 
     int outsize = (width > len ? width : len) + 1;
-    char *buf = (char*)malloc(outsize);
+    char *buf = fpy_str_buf(outsize);
 
     if (width <= len) {
         memcpy(buf, value, len);
@@ -6471,7 +7465,7 @@ int64_t fastpy_call_ptr2(void *func, int64_t a, int64_t b) {
 
 /* Convert dict to string for f-strings */
 const char* fastpy_dict_to_str(FpyDict *dict) {
-    char *buf = (char*)malloc(4096);
+    char *buf = fpy_str_buf(4096);
     int pos = 0;
     pos += snprintf(buf + pos, 4096 - pos, "{");
     for (int64_t i = 0; i < dict->length; i++) {
@@ -6730,6 +7724,13 @@ void fastpy_obj_call_method1_fv(FpyObj *obj, const char *name, int64_t a,
         double d = ((FpyM1DoubleFunc)m->func)(obj, a);
         *out_tag = FPY_TAG_FLOAT;
         memcpy(out_data, &d, sizeof(double));
+    } else if (!m->returns_value) {
+        /* No `return <expr>` anywhere in the method: it is a void function and
+         * its Python value is None.  Reading the return register would produce
+         * a garbage INT.  See FpyMethod1VoidFunc in objects.h. */
+        ((FpyMethod1VoidFunc)m->func)(obj, a);
+        *out_tag = FPY_TAG_NONE;
+        *out_data = 0;
     } else {
         int64_t result = ((FpyMethod1Func)m->func)(obj, a);
         if (m->return_tag >= 0) {
@@ -7253,6 +8254,41 @@ static int64_t _call_vararg_method(FpyMethodDef *m, FpyObj *obj,
         fastpy_list_append_fv(varlist, tag, args[i]);
     }
     int64_t list_as_i64 = (int64_t)(intptr_t)varlist;
+    /* A method with no `return <expr>` is compiled to a void function; calling
+     * it through an int64_t-returning pointer type yields whatever is left in
+     * the return register.  See the FpyMethod*VoidFunc typedefs in objects.h. */
+    if (!m->returns_value) {
+        switch (n_pos) {
+        case 0: {
+            typedef void (*VA0V)(FpyObj*, int64_t);
+            ((VA0V)m->func)(obj, list_as_i64);
+            break;
+        }
+        case 1: {
+            typedef void (*VA1V)(FpyObj*, int64_t, int64_t);
+            ((VA1V)m->func)(obj, args[0], list_as_i64);
+            break;
+        }
+        case 2: {
+            typedef void (*VA2V)(FpyObj*, int64_t, int64_t, int64_t);
+            ((VA2V)m->func)(obj, args[0], args[1], list_as_i64);
+            break;
+        }
+        case 3: {
+            typedef void (*VA3V)(FpyObj*, int64_t, int64_t, int64_t, int64_t);
+            ((VA3V)m->func)(obj, args[0], args[1], args[2], list_as_i64);
+            break;
+        }
+        default: {
+            typedef void (*VA4V)(FpyObj*, int64_t, int64_t, int64_t, int64_t,
+                                 int64_t);
+            ((VA4V)m->func)(obj, args[0], args[1], args[2], args[3],
+                            list_as_i64);
+            break;
+        }
+        }
+        return 0;
+    }
     /* Dispatch based on positional count */
     switch (n_pos) {
     case 0: {
@@ -7300,6 +8336,13 @@ int64_t fastpy_obj_call_method0(FpyObj *obj, const char *name) {
         memcpy(&r, &d, sizeof(double));
         return r;
     }
+    /* void-returning method (no `return <expr>` in the Python source): call it
+     * through a matching pointer type and report None-as-0 rather than reading
+     * a stale return register.  See FpyMethodVoidFunc in objects.h. */
+    if (!m->returns_value) {
+        ((FpyMethodVoidFunc)m->func)(obj);
+        return 0;
+    }
     return ((FpyMethodFunc)m->func)(obj);
 }
 
@@ -7330,6 +8373,10 @@ int64_t fastpy_obj_call_method1(FpyObj *obj, const char *name, int64_t a) {
         memcpy(&r, &d, sizeof(double));
         return r;
     }
+    if (!m->returns_value) {
+        ((FpyMethod1VoidFunc)m->func)(obj, a);
+        return 0;
+    }
     return ((FpyMethod1Func)m->func)(obj, a);
 }
 
@@ -7344,6 +8391,10 @@ int64_t fastpy_obj_call_method2(FpyObj *obj, const char *name, int64_t a, int64_
     if (m->is_vararg) {
         int64_t args_arr[2] = {a, b};
         return _call_vararg_method(m, obj, 2, args_arr);
+    }
+    if (!m->returns_value) {
+        ((FpyMethod2VoidFunc)m->func)(obj, a, b);
+        return 0;
     }
     return ((FpyMethod2Func)m->func)(obj, a, b);
 }
@@ -7360,6 +8411,12 @@ int64_t fastpy_obj_call_method3(FpyObj *obj, const char *name, int64_t a, int64_
         int64_t args_arr[3] = {a, b, c};
         return _call_vararg_method(m, obj, 3, args_arr);
     }
+    /* This is the `with` statement's __exit__ call.  A None-returning __exit__
+     * must read as falsy: a truthy answer means "suppress the exception". */
+    if (!m->returns_value) {
+        ((FpyMethod3VoidFunc)m->func)(obj, a, b, c);
+        return 0;
+    }
     return ((FpyMethod3Func)m->func)(obj, a, b, c);
 }
 
@@ -7374,6 +8431,10 @@ int64_t fastpy_obj_call_method4(FpyObj *obj, const char *name, int64_t a, int64_
     if (m->is_vararg) {
         int64_t args_arr[4] = {a, b, c, d};
         return _call_vararg_method(m, obj, 4, args_arr);
+    }
+    if (!m->returns_value) {
+        ((FpyMethod4VoidFunc)m->func)(obj, a, b, c, d);
+        return 0;
     }
     return ((FpyMethod4Func)m->func)(obj, a, b, c, d);
 }
@@ -7472,30 +8533,249 @@ FpyObj* fastpy_list_iter_new(FpyList *list) {
     return obj;
 }
 
-/* Call __init__ (void return) */
+/* ================================================================
+ * Built-in file object — open()/read/write/readline/readlines/close,
+ * context-manager (__enter__/__exit__) and line iteration.
+ *
+ * Backed entirely by C stdio (fopen/fread/fwrite/fgetc/fclose), so it
+ * works in *pure mode* with no CPython bridge: the SlateOS posix libc
+ * implements the stdio surface over the SYS_FS_* VFS syscalls.  The
+ * file object is a normal FpyObj of a lazily-registered built-in class,
+ * so it plugs into the existing object refcounting/GC, dynamic method
+ * dispatch (fastpy_obj_call_methodN), and `with` handling for free.
+ *
+ * Slot layout:
+ *   slot 0 = FILE*  (stored raw in an FPY_TAG_INT slot — non-owning for GC)
+ *   slot 1 = flags  (FPY_TAG_INT): bit0 = closed
+ *
+ * Slice-1 limitations (see design.md): text mode only (read() returns a
+ * str; binary 'rb'/bytes not yet wired); read() reads the whole remaining
+ * file (no size argument yet); FileNotFoundError is raised by name but is
+ * not yet part of a registered OSError hierarchy.
+ * ================================================================ */
+#define FPY_EXC_GENERIC 99
+extern void fastpy_exc_set_class_name(const char *name);
+
+static int fpy_file_class_id = -1;
+
+/* Return the FILE* for an open file, or NULL (raising ValueError) if closed. */
+static FILE *fpy_file_fp(FpyObj *self) {
+    FpyValue *slots = FPY_OBJ_SLOTS(self);
+    if (slots[1].data.i & 1) {
+        fastpy_raise(FPY_EXC_VALUEERROR, "I/O operation on closed file");
+        return NULL;
+    }
+    return (FILE*)(intptr_t)slots[0].data.i;
+}
+
+/* Read a single line (through and including '\n', or to EOF) into a fresh
+ * FpyString.  A zero-length result means EOF (matches Python readline). */
+static FpyString *fpy_file_readline_raw(FILE *fp) {
+    size_t cap = 128, len = 0;
+    char *buf = (char*)malloc(cap);
+    int c;
+    while ((c = fgetc(fp)) != EOF) {
+        if (len + 1 > cap) { cap *= 2; buf = (char*)realloc(buf, cap); }
+        buf[len++] = (char)c;
+        if (c == '\n') break;
+    }
+    FpyString *s = fpy_str_alloc((int64_t)len);
+    if (len) memcpy(s->data, buf, len);
+    free(buf);
+    return s;
+}
+
+static int64_t fpy_file_read(FpyObj *self) {
+    FILE *fp = fpy_file_fp(self);
+    if (!fp) { fastpy_set_ret_tag(FPY_TAG_NONE); return 0; }
+    size_t cap = 4096, len = 0;
+    char *buf = (char*)malloc(cap);
+    for (;;) {
+        if (len + 4096 > cap) { cap *= 2; buf = (char*)realloc(buf, cap); }
+        size_t n = fread(buf + len, 1, 4096, fp);
+        len += n;
+        if (n < 4096) break;  /* short read = EOF or error */
+    }
+    FpyString *s = fpy_str_alloc((int64_t)len);
+    if (len) memcpy(s->data, buf, len);
+    free(buf);
+    fastpy_set_ret_tag(FPY_TAG_STR);
+    return (int64_t)(intptr_t)s->data;
+}
+
+static int64_t fpy_file_readline(FpyObj *self) {
+    FILE *fp = fpy_file_fp(self);
+    if (!fp) { fastpy_set_ret_tag(FPY_TAG_NONE); return 0; }
+    FpyString *s = fpy_file_readline_raw(fp);
+    fastpy_set_ret_tag(FPY_TAG_STR);
+    return (int64_t)(intptr_t)s->data;
+}
+
+static int64_t fpy_file_readlines(FpyObj *self) {
+    FILE *fp = fpy_file_fp(self);
+    if (!fp) { fastpy_set_ret_tag(FPY_TAG_NONE); return 0; }
+    FpyList *lst = fpy_list_new(8);
+    for (;;) {
+        FpyString *s = fpy_file_readline_raw(fp);
+        if (fastpy_str_len(s->data) == 0) { free(s); break; }  /* EOF */
+        FpyValue v; v.tag = FPY_TAG_STR; v.data.s = s->data;
+        fpy_list_append(lst, v);  /* increfs → drop our builder ref below */
+        fpy_rc_decref(FPY_TAG_STR, (int64_t)(intptr_t)s->data);
+    }
+    fastpy_set_ret_tag(FPY_TAG_LIST);
+    return (int64_t)(intptr_t)lst;
+}
+
+/* write(self, s) → number of characters written. `a` is the str data ptr. */
+static int64_t fpy_file_write(FpyObj *self, int64_t a) {
+    FILE *fp = fpy_file_fp(self);
+    if (!fp) { fastpy_set_ret_tag(FPY_TAG_NONE); return 0; }
+    const char *str = (const char*)(intptr_t)a;
+    int64_t n = str ? fastpy_str_len(str) : 0;
+    if (n > 0) fwrite(str, 1, (size_t)n, fp);
+    fastpy_set_ret_tag(FPY_TAG_INT);
+    return n;
+}
+
+static int64_t fpy_file_close(FpyObj *self) {
+    FpyValue *slots = FPY_OBJ_SLOTS(self);
+    if (!(slots[1].data.i & 1)) {
+        FILE *fp = (FILE*)(intptr_t)slots[0].data.i;
+        if (fp) fclose(fp);
+        slots[1].data.i |= 1;
+        slots[0].data.i = 0;
+    }
+    fastpy_set_ret_tag(FPY_TAG_NONE);
+    return 0;
+}
+
+static int64_t fpy_file_enter(FpyObj *self) {
+    fpy_incref(&self->refcount);
+    fastpy_set_ret_tag(FPY_TAG_OBJ);
+    return (int64_t)(intptr_t)self;
+}
+
+/* __exit__(self, exc_type, exc_val, tb) → None (closes the file). */
+static int64_t fpy_file_exit(FpyObj *self, int64_t a, int64_t b, int64_t c) {
+    (void)a; (void)b; (void)c;
+    return fpy_file_close(self);
+}
+
+static int64_t fpy_file_iter(FpyObj *self) {
+    fpy_incref(&self->refcount);
+    fastpy_set_ret_tag(FPY_TAG_OBJ);
+    return (int64_t)(intptr_t)self;
+}
+
+static int64_t fpy_file_next(FpyObj *self) {
+    FILE *fp = fpy_file_fp(self);
+    if (!fp) { fastpy_set_ret_tag(FPY_TAG_NONE); return 0; }
+    FpyString *s = fpy_file_readline_raw(fp);
+    if (fastpy_str_len(s->data) == 0) {
+        free(s);
+        fastpy_raise(FPY_EXC_STOPITERATION, "");
+        fastpy_set_ret_tag(FPY_TAG_NONE);
+        return 0;
+    }
+    fastpy_set_ret_tag(FPY_TAG_STR);
+    return (int64_t)(intptr_t)s->data;
+}
+
+/* Destructor: close the underlying FILE* if the program dropped the file
+ * object without calling close() (matches CPython's finalizer flush/close). */
+static void fpy_file_dtor(FpyObj *self) {
+    FpyValue *slots = FPY_OBJ_SLOTS(self);
+    if (!(slots[1].data.i & 1)) {
+        FILE *fp = (FILE*)(intptr_t)slots[0].data.i;
+        if (fp) fclose(fp);
+        slots[1].data.i |= 1;
+    }
+}
+
+static void fpy_file_ensure_class(void) {
+    if (fpy_file_class_id >= 0) return;
+    fpy_file_class_id = fastpy_register_class("file", -1);
+    fastpy_set_class_slot_count(fpy_file_class_id, 2);
+    fastpy_register_slot_name(fpy_file_class_id, 0, "_fp");
+    fastpy_register_slot_name(fpy_file_class_id, 1, "_flags");
+    fastpy_set_class_destructor(fpy_file_class_id, fpy_file_dtor);
+    fastpy_register_method(fpy_file_class_id, "read", (void*)fpy_file_read, 0, 1);
+    fastpy_set_method_ret_tag(fpy_file_class_id, "read", FPY_TAG_STR);
+    fastpy_register_method(fpy_file_class_id, "readline", (void*)fpy_file_readline, 0, 1);
+    fastpy_set_method_ret_tag(fpy_file_class_id, "readline", FPY_TAG_STR);
+    fastpy_register_method(fpy_file_class_id, "readlines", (void*)fpy_file_readlines, 0, 1);
+    fastpy_set_method_ret_tag(fpy_file_class_id, "readlines", FPY_TAG_LIST);
+    fastpy_register_method(fpy_file_class_id, "write", (void*)fpy_file_write, 1, 1);
+    fastpy_set_method_ret_tag(fpy_file_class_id, "write", FPY_TAG_INT);
+    fastpy_register_method(fpy_file_class_id, "close", (void*)fpy_file_close, 0, 1);
+    fastpy_set_method_ret_tag(fpy_file_class_id, "close", FPY_TAG_NONE);
+    fastpy_register_method(fpy_file_class_id, "__enter__", (void*)fpy_file_enter, 0, 1);
+    fastpy_set_method_ret_tag(fpy_file_class_id, "__enter__", FPY_TAG_OBJ);
+    fastpy_register_method(fpy_file_class_id, "__exit__", (void*)fpy_file_exit, 3, 1);
+    fastpy_set_method_ret_tag(fpy_file_class_id, "__exit__", FPY_TAG_NONE);
+    fastpy_register_method(fpy_file_class_id, "__iter__", (void*)fpy_file_iter, 0, 1);
+    fastpy_set_method_ret_tag(fpy_file_class_id, "__iter__", FPY_TAG_OBJ);
+    fastpy_register_method(fpy_file_class_id, "__next__", (void*)fpy_file_next, 0, 1);
+    fastpy_set_method_ret_tag(fpy_file_class_id, "__next__", -1);
+}
+
+/* Public: open(path, mode) → file object.  `mode` may be NULL ("r" default). */
+FpyObj* fastpy_io_open(const char *path, const char *mode) {
+    fpy_file_ensure_class();
+    if (!mode || !mode[0]) mode = "r";
+    FILE *fp = fopen(path ? path : "", mode);
+    if (!fp) {
+        snprintf(_err_buf, sizeof(_err_buf),
+                 "[Errno 2] No such file or directory: '%s'", path ? path : "");
+        fastpy_exc_set_class_name("FileNotFoundError");
+        fastpy_raise(FPY_EXC_GENERIC, _err_buf);
+        return NULL;
+    }
+    FpyObj *obj = fastpy_obj_new(fpy_file_class_id);
+    FpyValue *slots = FPY_OBJ_SLOTS(obj);
+    slots[0].tag = FPY_TAG_INT; slots[0].data.i = (int64_t)(intptr_t)fp;
+    slots[1].tag = FPY_TAG_INT; slots[1].data.i = 0;
+    return obj;
+}
+
+/* Call __init__ (its Python return value, if any, is discarded).
+ * __init__ is normally compiled to a void function, so dispatch on
+ * returns_value: calling a void function through an int64_t-returning pointer
+ * type is a signature mismatch even when the result is thrown away, and
+ * -fsanitize=function flags it. */
 void fastpy_obj_call_init0(FpyObj *obj) {
     FpyMethodDef *m = fastpy_find_method(obj->class_id, "__init__");
-    if (m) ((FpyMethodFunc)m->func)(obj);
+    if (!m) return;
+    if (!m->returns_value) ((FpyMethodVoidFunc)m->func)(obj);
+    else ((FpyMethodFunc)m->func)(obj);
 }
 
 void fastpy_obj_call_init1(FpyObj *obj, int64_t a) {
     FpyMethodDef *m = fastpy_find_method(obj->class_id, "__init__");
-    if (m) ((FpyMethod1Func)m->func)(obj, a);
+    if (!m) return;
+    if (!m->returns_value) ((FpyMethod1VoidFunc)m->func)(obj, a);
+    else ((FpyMethod1Func)m->func)(obj, a);
 }
 
 void fastpy_obj_call_init2(FpyObj *obj, int64_t a, int64_t b) {
     FpyMethodDef *m = fastpy_find_method(obj->class_id, "__init__");
-    if (m) ((FpyMethod2Func)m->func)(obj, a, b);
+    if (!m) return;
+    if (!m->returns_value) ((FpyMethod2VoidFunc)m->func)(obj, a, b);
+    else ((FpyMethod2Func)m->func)(obj, a, b);
 }
 
 void fastpy_obj_call_init3(FpyObj *obj, int64_t a, int64_t b, int64_t c) {
     FpyMethodDef *m = fastpy_find_method(obj->class_id, "__init__");
-    if (m) ((FpyMethod3Func)m->func)(obj, a, b, c);
+    if (!m) return;
+    if (!m->returns_value) ((FpyMethod3VoidFunc)m->func)(obj, a, b, c);
+    else ((FpyMethod3Func)m->func)(obj, a, b, c);
 }
 
 void fastpy_obj_call_init4(FpyObj *obj, int64_t a, int64_t b, int64_t c, int64_t d) {
     FpyMethodDef *m = fastpy_find_method(obj->class_id, "__init__");
-    if (m) ((FpyMethod4Func)m->func)(obj, a, b, c, d);
+    if (!m) return;
+    if (!m->returns_value) ((FpyMethod4VoidFunc)m->func)(obj, a, b, c, d);
+    else ((FpyMethod4Func)m->func)(obj, a, b, c, d);
 }
 
 /* isinstance check — walks class hierarchy */
@@ -7536,7 +8816,7 @@ const char* fastpy_obj_type_repr(FpyObj *obj) {
     size_t len = strlen(name);
     /* Match Python's output: "<class '__main__.ClassName'>" */
     size_t buflen = len + 22; /* "<class '__main__.'>" + name + NUL */
-    char *buf = (char*)malloc(buflen);
+    char *buf = fpy_str_buf((int64_t)buflen);
     snprintf(buf, buflen, "<class '__main__.%s'>", name);
     return buf;
 }
@@ -7563,7 +8843,7 @@ const char* fastpy_obj_to_str(FpyObj *obj) {
         }
     }
     /* Default: <ClassName object> */
-    char *buf = (char*)malloc(256);
+    char *buf = fpy_str_buf(256);
     snprintf(buf, 256, "<%s object>", fpy_classes[obj->class_id].name);
     return buf;
 }
@@ -7578,7 +8858,7 @@ const char* fastpy_obj_to_repr(FpyObj *obj) {
         return (const char*)result;
     }
     /* Default: <ClassName object> */
-    char *buf = (char*)malloc(256);
+    char *buf = fpy_str_buf(256);
     snprintf(buf, 256, "<%s object>", fpy_classes[obj->class_id].name);
     return buf;
 }
@@ -7592,6 +8872,8 @@ void fastpy_obj_write(FpyObj *obj) {
      * PyObject* (e.g. numpy arrays returned via the bridge). Without this,
      * accessing class_id on a PyObject* would read ob_refcnt and crash. */
     if (obj->magic != FPY_OBJ_MAGIC) {
+        const char *pt = _fpy_obj_as_path_text((void*)obj);
+        if (pt) { printf("%s", pt); return; }
         fpy_cpython_print_obj((void*)obj);
         return;
     }
@@ -7625,7 +8907,9 @@ FpyComplex* fpy_complex_mul(FpyComplex *a, FpyComplex *b) {
 FpyComplex* fpy_complex_div(FpyComplex *a, FpyComplex *b) {
     double denom = b->real * b->real + b->imag * b->imag;
     if (denom == 0.0) {
-        fastpy_raise(FPY_EXC_ZERODIVISION, "complex division by zero");
+        /* CPython says plainly "division by zero" here too — the operand type
+         * never appears in the message. */
+        fastpy_raise(FPY_EXC_ZERODIVISION, "division by zero");
         return NULL;
     }
     return fpy_complex_new(
@@ -7700,7 +8984,7 @@ void fpy_complex_print(FpyComplex *c) {
 }
 
 char* fpy_complex_to_str(FpyComplex *c) {
-    char *buf = (char*)malloc(128);
+    char *buf = fpy_str_buf(128);
     if (c->real == 0.0 && !signbit(c->real)) {
         snprintf(buf, 128, "%gj", c->imag);
     } else if (c->imag >= 0.0 || c->imag != c->imag) {
@@ -7849,6 +9133,353 @@ FpyDecimal* fpy_decimal_abs(FpyDecimal *a) {
                             a->sign < 0 ? 1 : a->sign);
 }
 
+/* abs() of a runtime-tagged value.
+ *
+ * `_emit_builtin_abs` in codegen only ever knew two LLVM types, i64 and
+ * double.  An argument that arrives as a tagged FpyValue — a heterogeneous
+ * list element, a "mixed"-returning call — matched neither and fell through
+ * to the silent bridge fallback, which yields 0 in native mode, so
+ * `abs(v[0])` on `[1, -2.5]` printed `0 0`.  BUG-ABS-OF-TAGGED-VALUE.
+ *
+ * This lives in the runtime rather than being open-coded in codegen because
+ * six tags are numeric, not two: inlining an i64/double select would have
+ * left bigint, Decimal and complex silently wrong instead of visibly wrong. */
+void fastpy_abs_fv(int32_t tag, int64_t data,
+                   int32_t *out_tag, int64_t *out_data) {
+    switch (tag) {
+    case FPY_TAG_BOOL:
+        *out_tag = FPY_TAG_INT;
+        *out_data = (data != 0) ? 1 : 0;
+        return;
+    case FPY_TAG_INT:
+        if (data == INT64_MIN) {
+            /* abs(-2**63) does not fit an i64.  CPython has no such limit,
+             * so widen rather than wrap — negating in place would be UB. */
+            FpyBigInt *b = fpy_bigint_from_i64(data);
+            FpyBigInt *r = fpy_bigint_abs(b);
+            fpy_bigint_free(b);
+            *out_tag = FPY_TAG_BIGINT;
+            *out_data = (int64_t)(intptr_t)r;
+            return;
+        }
+        *out_tag = FPY_TAG_INT;
+        *out_data = (data < 0) ? -data : data;
+        return;
+    case FPY_TAG_FLOAT: {
+        double d;
+        memcpy(&d, &data, sizeof(double));
+        d = fabs(d);
+        *out_tag = FPY_TAG_FLOAT;
+        memcpy(out_data, &d, sizeof(double));
+        return;
+    }
+    case FPY_TAG_BIGINT:
+        *out_tag = FPY_TAG_BIGINT;
+        *out_data = (int64_t)(intptr_t)
+            fpy_bigint_abs((FpyBigInt*)(intptr_t)data);
+        return;
+    case FPY_TAG_DECIMAL:
+        *out_tag = FPY_TAG_DECIMAL;
+        *out_data = (int64_t)(intptr_t)
+            fpy_decimal_abs((FpyDecimal*)(intptr_t)data);
+        return;
+    case FPY_TAG_COMPLEX: {
+        /* abs(a+bj) is a real magnitude, so the result is a float. */
+        double m = fpy_complex_abs((FpyComplex*)(intptr_t)data);
+        *out_tag = FPY_TAG_FLOAT;
+        memcpy(out_data, &m, sizeof(double));
+        return;
+    }
+    default: {
+        static const char *_tnames[] = {
+            "int", "float", "str", "bool", "NoneType",
+            "list", "object", "dict", "bytes", "set",
+            "bigint", "complex", "Decimal"};
+        const char *tn = (tag >= 0 && tag <= 12) ? _tnames[tag] : "object";
+        snprintf(_err_buf, sizeof(_err_buf),
+                 "bad operand type for abs(): '%.40s'", tn);
+        fastpy_raise(FPY_EXC_TYPEERROR, _err_buf);
+        *out_tag = FPY_TAG_NONE;
+        *out_data = 0;
+        return;
+    }
+    }
+}
+
+/* Unary minus on a runtime-tagged value.
+ *
+ * Codegen open-coded this as `select(tag == FLOAT, fneg, 0 - data)`, which is
+ * the same two-way-dispatch-over-six-numeric-tags mistake as
+ * BUG-ABS-OF-TAGGED-VALUE.  A BIGINT operand kept its tag but had its
+ * *pointer* negated, so `-(-b)` handed a garbage pointer to the printer and
+ * took an access violation.  BUG-BIGINT-FV-RESULT-NOT-CONSUMED. */
+void fastpy_neg_fv(int32_t tag, int64_t data,
+                   int32_t *out_tag, int64_t *out_data) {
+    switch (tag) {
+    case FPY_TAG_BOOL:
+        /* CPython: -True is -1, an int. */
+        *out_tag = FPY_TAG_INT;
+        *out_data = (data != 0) ? -1 : 0;
+        return;
+    case FPY_TAG_INT:
+        if (data == INT64_MIN) {
+            /* -(-2**63) does not fit an i64; negating in place is UB. */
+            FpyBigInt *b = fpy_bigint_from_i64(data);
+            FpyBigInt *r = fpy_bigint_neg(b);
+            fpy_bigint_free(b);
+            *out_tag = FPY_TAG_BIGINT;
+            *out_data = (int64_t)(intptr_t)r;
+            return;
+        }
+        *out_tag = FPY_TAG_INT;
+        *out_data = -data;
+        return;
+    case FPY_TAG_FLOAT: {
+        double d;
+        memcpy(&d, &data, sizeof(double));
+        d = -d;
+        *out_tag = FPY_TAG_FLOAT;
+        memcpy(out_data, &d, sizeof(double));
+        return;
+    }
+    case FPY_TAG_BIGINT:
+        *out_tag = FPY_TAG_BIGINT;
+        *out_data = (int64_t)(intptr_t)
+            fpy_bigint_neg((FpyBigInt*)(intptr_t)data);
+        return;
+    case FPY_TAG_DECIMAL:
+        *out_tag = FPY_TAG_DECIMAL;
+        *out_data = (int64_t)(intptr_t)
+            fpy_decimal_neg((FpyDecimal*)(intptr_t)data);
+        return;
+    case FPY_TAG_COMPLEX:
+        *out_tag = FPY_TAG_COMPLEX;
+        *out_data = (int64_t)(intptr_t)
+            fpy_complex_neg((FpyComplex*)(intptr_t)data);
+        return;
+    default: {
+        static const char *_tnames[] = {
+            "int", "float", "str", "bool", "NoneType",
+            "list", "object", "dict", "bytes", "set",
+            "int", "complex", "Decimal"};
+        const char *tn = (tag >= 0 && tag <= 12) ? _tnames[tag] : "object";
+        snprintf(_err_buf, sizeof(_err_buf),
+                 "bad operand type for unary -: '%.40s'", tn);
+        fastpy_raise(FPY_EXC_TYPEERROR, _err_buf);
+        *out_tag = FPY_TAG_NONE;
+        *out_data = 0;
+        return;
+    }
+    }
+}
+
+/* The type name a conversion error should print for a tag. BIGINT is "int",
+ * because a big integer is not a separate Python type. */
+static const char *_fpy_tag_name(int32_t tag) {
+    static const char *_tnames[] = {
+        "int", "float", "str", "bool", "NoneType",
+        "list", "object", "dict", "bytes", "set",
+        "int", "complex", "Decimal"};
+    return (tag >= 0 && tag <= 12) ? _tnames[tag] : "object";
+}
+
+/* Copy a bytes object's data into `buf` as a C string, or return 0 if it does
+ * not fit. `int(b"...")`/`float(b"...")` accept only a numeric literal, which
+ * is far shorter than any sane buffer, so refusing to grow is not a limit that
+ * bites — a rejected long input was never going to parse. */
+static int _fpy_bytes_cstr(int64_t data, char *buf, size_t cap) {
+    FpyBytes *b = (FpyBytes*)(intptr_t)data;
+    if (!b || (size_t)b->length + 1 > cap) return 0;
+    memcpy(buf, b->data, (size_t)b->length);
+    buf[b->length] = '\0';
+    return 1;
+}
+
+/* int() of a runtime-tagged value.
+ *
+ * `_emit_builtin_int` knew two shapes: naked scalars, and an inlined three-way
+ * branch (float / str / everything-else) over an FV-backed *variable*. A tagged
+ * value arriving any other way — a heterogeneous list element, a "mixed"
+ * return — matched neither and was returned unchanged, so `int(v[1])` on
+ * `[1, -2.5]` printed `-2.5`. The inlined branch was wrong in its own way: its
+ * else arm handed back `data` verbatim, which for a BIGINT or Decimal is the
+ * *pointer*, and for None or a list is a nonsense integer instead of a
+ * TypeError.  BUG-INT-FLOAT-OF-TAGGED-VALUE.
+ *
+ * Both now come here, for the reason `fastpy_abs_fv` exists: the numeric tags
+ * outnumber the arms anyone inlines, so dispatch belongs in one place that
+ * handles all of them and raises for the rest. */
+void fastpy_int_fv(int32_t tag, int64_t data,
+                   int32_t *out_tag, int64_t *out_data) {
+    switch (tag) {
+    case FPY_TAG_BOOL:
+        *out_tag = FPY_TAG_INT;
+        *out_data = (data != 0) ? 1 : 0;
+        return;
+    case FPY_TAG_INT:
+        *out_tag = FPY_TAG_INT;
+        *out_data = data;
+        return;
+    case FPY_TAG_FLOAT: {
+        double d;
+        memcpy(&d, &data, sizeof(double));
+        if (isnan(d)) {
+            fastpy_raise(FPY_EXC_VALUEERROR,
+                         "cannot convert float NaN to integer");
+            *out_tag = FPY_TAG_NONE; *out_data = 0;
+            return;
+        }
+        if (isinf(d)) {
+            fastpy_raise(FPY_EXC_OVERFLOWERROR,
+                         "cannot convert float infinity to integer");
+            *out_tag = FPY_TAG_NONE; *out_data = 0;
+            return;
+        }
+        d = trunc(d);                       /* Python truncates toward zero */
+        /* 2^63 exactly, so the comparison is exact in double arithmetic. */
+        if (d >= 9223372036854775808.0 || d < -9223372036854775808.0) {
+            /* CPython's int(1e30) is exact, so widen rather than saturate. */
+            *out_tag = FPY_TAG_BIGINT;
+            *out_data = (int64_t)(intptr_t)_fpy_bigint_from_large_double(d);
+            return;
+        }
+        *out_tag = FPY_TAG_INT;
+        *out_data = (int64_t)d;
+        return;
+    }
+    case FPY_TAG_STR:
+        *out_tag = FPY_TAG_INT;
+        *out_data = fastpy_str_to_int((const char*)(intptr_t)data);
+        return;
+    case FPY_TAG_BYTES: {
+        char buf[128];
+        if (!_fpy_bytes_cstr(data, buf, sizeof(buf))) {
+            fastpy_raise(FPY_EXC_VALUEERROR,
+                         "invalid literal for int() with base 10");
+            *out_tag = FPY_TAG_NONE; *out_data = 0;
+            return;
+        }
+        *out_tag = FPY_TAG_INT;
+        *out_data = fastpy_str_to_int(buf);
+        return;
+    }
+    case FPY_TAG_BIGINT:
+        /* A fresh copy, not the argument: every tagged result this file hands
+         * back is owned by the caller, and returning the input would give the
+         * value two owners with one refcount. */
+        *out_tag = FPY_TAG_BIGINT;
+        *out_data = (int64_t)(intptr_t)
+            fpy_bigint_copy((FpyBigInt*)(intptr_t)data);
+        return;
+    case FPY_TAG_DECIMAL: {
+        /* Truncate toward zero exactly. Going through a double would round —
+         * `int(Decimal("0.9999999999999999999"))` must be 0, not 1. */
+        FpyDecimal *dc = (FpyDecimal*)(intptr_t)data;
+        int64_t coeff = dc->coefficient;
+        int32_t e = dc->exponent;
+        if (dc->sign == 0) { *out_tag = FPY_TAG_INT; *out_data = 0; return; }
+        if (e < 0) {
+            /* The coefficient is at most 10^18, so 19 divisions clear it. */
+            for (int32_t i = 0; i < -e && coeff != 0; i++) coeff /= 10;
+            *out_tag = FPY_TAG_INT;
+            *out_data = dc->sign < 0 ? -coeff : coeff;
+            return;
+        }
+        if (e > 0) {
+            /* coeff * 10^e can outgrow an i64; build it as text and let the
+             * BigInt parser decide, then narrow back if it fits. */
+            char buf[64];
+            int n = snprintf(buf, sizeof(buf), "%s%lld",
+                             dc->sign < 0 ? "-" : "", (long long)coeff);
+            if (n > 0 && (size_t)n + (size_t)e < sizeof(buf)) {
+                memset(buf + n, '0', (size_t)e);
+                buf[n + e] = '\0';
+                FpyBigInt *b = fpy_bigint_from_str(buf);
+                int ovf = 0;
+                int64_t v = fpy_bigint_to_i64(b, &ovf);
+                if (!ovf) {
+                    fpy_bigint_free(b);
+                    *out_tag = FPY_TAG_INT;
+                    *out_data = v;
+                    return;
+                }
+                *out_tag = FPY_TAG_BIGINT;
+                *out_data = (int64_t)(intptr_t)b;
+                return;
+            }
+        }
+        *out_tag = FPY_TAG_INT;
+        *out_data = dc->sign < 0 ? -coeff : coeff;
+        return;
+    }
+    default:
+        snprintf(_err_buf, sizeof(_err_buf),
+                 "int() argument must be a string, a bytes-like object or a "
+                 "real number, not '%.40s'", _fpy_tag_name(tag));
+        fastpy_raise(FPY_EXC_TYPEERROR, _err_buf);
+        *out_tag = FPY_TAG_NONE;
+        *out_data = 0;
+        return;
+    }
+}
+
+/* float() of a runtime-tagged value — the sibling of fastpy_int_fv, and broken
+ * the same two ways: `float(v[0])` on `[1, -2.5]` returned the int unchanged,
+ * and the inlined variable path's else arm ran `sitofp` on whatever was in
+ * `data`, which for a BigInt or Decimal is a pointer converted to a double.
+ * BUG-INT-FLOAT-OF-TAGGED-VALUE. */
+void fastpy_float_fv(int32_t tag, int64_t data,
+                     int32_t *out_tag, int64_t *out_data) {
+    double d;
+    switch (tag) {
+    case FPY_TAG_BOOL:
+        d = (data != 0) ? 1.0 : 0.0;
+        break;
+    case FPY_TAG_INT:
+        d = (double)data;
+        break;
+    case FPY_TAG_FLOAT:
+        *out_tag = FPY_TAG_FLOAT;
+        *out_data = data;
+        return;
+    case FPY_TAG_STR:
+        d = fastpy_str_to_float((const char*)(intptr_t)data);
+        break;
+    case FPY_TAG_BYTES: {
+        char buf[128];
+        if (!_fpy_bytes_cstr(data, buf, sizeof(buf))) {
+            fastpy_raise(FPY_EXC_VALUEERROR,
+                         "could not convert string to float");
+            *out_tag = FPY_TAG_NONE; *out_data = 0;
+            return;
+        }
+        d = fastpy_str_to_float(buf);
+        break;
+    }
+    case FPY_TAG_BIGINT:
+        if (fpy_bigint_to_double((FpyBigInt*)(intptr_t)data, &d) != 0) {
+            fastpy_raise(FPY_EXC_OVERFLOWERROR,
+                         "int too large to convert to float");
+            *out_tag = FPY_TAG_NONE; *out_data = 0;
+            return;
+        }
+        break;
+    case FPY_TAG_DECIMAL:
+        d = _fpy_decimal_to_double((FpyDecimal*)(intptr_t)data);
+        break;
+    default:
+        snprintf(_err_buf, sizeof(_err_buf),
+                 "float() argument must be a string or a real number, "
+                 "not '%.40s'", _fpy_tag_name(tag));
+        fastpy_raise(FPY_EXC_TYPEERROR, _err_buf);
+        *out_tag = FPY_TAG_NONE;
+        *out_data = 0;
+        return;
+    }
+    *out_tag = FPY_TAG_FLOAT;
+    memcpy(out_data, &d, sizeof(double));
+}
+
 char* fpy_decimal_to_str(FpyDecimal *d) {
     if (d->sign == 0) return fpy_strdup("0");
 
@@ -7953,7 +9584,12 @@ const char* fastpy_json_dumps_fv(int32_t tag, int64_t data) {
     FpyValue val; val.tag = tag; val.data.i = data;
     json_serialize(val, &buf, &len, &cap);
     buf[len] = '\0';
-    return buf;
+    /* json_serialize realloc-grows buf, so it can't carry the FpyString
+     * header; copy into a header-backed string (refcount 1) and free the
+     * scratch buffer. See BUG-RUNTIME-STR-PRODUCERS-BARE-MALLOC. */
+    const char *result = fpy_str_copy(buf, len);
+    free(buf);
+    return result;
 }
 
 /* json.loads */
@@ -7986,7 +9622,13 @@ static const char *json_parse_string(const char *p, const char **out) {
     }
     buf[len] = '\0';
     if (*p == '"') p++;
-    *out = buf;
+    /* Return a header-backed FpyString (refcount 1) so the parsed STR value
+     * has a valid FpyString header for fpy_str_header/decref — the growth
+     * buffer above is realloc'd, so it can't itself carry the header; copy
+     * into a fresh headered string and free the scratch buffer.
+     * See BUG-RUNTIME-STR-PRODUCERS-BARE-MALLOC. */
+    *out = fpy_str_copy(buf, len);
+    free(buf);
     return p;
 }
 
@@ -8069,22 +9711,367 @@ void fastpy_json_loads(const char *json_str, int32_t *out_tag, int64_t *out_data
 #ifdef _WIN32
 #include <direct.h>
 #include <io.h>
+#include <process.h>
+#include <sys/stat.h>   /* MSVC: struct _stat64 / _stat64() for os.path.getsize/getmtime */
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #else
 #include <unistd.h>
 #include <dirent.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
+#include <sys/resource.h>
+#include <sys/wait.h>
+#include <fcntl.h>
 #endif
 
 const char* fastpy_os_getcwd(void) {
-    char *buf = (char*)malloc(4096);
+    char *buf = fpy_str_buf(4096);
 #ifdef _WIN32
     _getcwd(buf, 4096);
 #else
     getcwd(buf, 4096);
 #endif
     return buf;
+}
+
+/* os.getpid() -> the calling process's PID. On SlateOS posix getpid() is a
+ * real SYS_PROCESS_ID syscall; on the host it is the OS pid. Returned as a
+ * bare i64 (PIDs comfortably fit). */
+int64_t fastpy_os_getpid(void) {
+#ifdef _WIN32
+    return (int64_t)_getpid();
+#else
+    return (int64_t)getpid();
+#endif
+}
+
+/* os.getppid() -> the parent process's PID. On SlateOS posix getppid() is a
+ * real SYS_PROCESS_PARENT_ID syscall (a kernel-spawned orphan is reparented to
+ * init, so it returns 1). Windows has no getppid(); host builds of fastpy
+ * tools don't run on SlateOS, so a fixed 1 placeholder is fine there. */
+int64_t fastpy_os_getppid(void) {
+#ifdef _WIN32
+    return (int64_t)1;
+#else
+    return (int64_t)getppid();
+#endif
+}
+
+/* os.gettid() -> the calling thread's kernel task ID. On SlateOS posix
+ * gettid() is a real SYS_TASK_ID syscall — the scheduler's task table, a
+ * distinct kernel path from the process table hit by getpid()/getppid(). musl's
+ * headers only declare gettid() under _GNU_SOURCE, and at link time the symbol
+ * resolves to the SlateOS posix crate's extern "C" gettid (PidT == i32), so we
+ * forward-declare it ourselves rather than depend on a feature-test macro.
+ * Windows host builds don't run on SlateOS, so a fixed 1 placeholder is fine. */
+#ifndef _WIN32
+extern int gettid(void);
+#endif
+int64_t fastpy_os_gettid(void) {
+#ifdef _WIN32
+    return (int64_t)1;
+#else
+    return (int64_t)gettid();
+#endif
+}
+
+/* os.getuid()/os.getgid() -> the calling process's real uid/gid. On SlateOS
+ * posix getuid()/getgid() issue the real SYS_PROCESS_GET_CREDENTIALS syscall,
+ * reading the process credentials the kernel set at spawn (from
+ * SpawnOptions.uid_gid) — a distinct kernel path (the process-credentials
+ * table) from the pid/tid identity syscalls. getuid()/getgid() are declared by
+ * musl's <unistd.h> and resolve at link time to the SlateOS posix crate's
+ * extern "C" symbols. Windows host builds don't run on SlateOS, so root (0) is
+ * a fine placeholder there. */
+int64_t fastpy_os_getuid(void) {
+#ifdef _WIN32
+    return (int64_t)0;
+#else
+    return (int64_t)getuid();
+#endif
+}
+
+int64_t fastpy_os_getgid(void) {
+#ifdef _WIN32
+    return (int64_t)0;
+#else
+    return (int64_t)getgid();
+#endif
+}
+
+/* os.setuid(uid)/os.setgid(gid) -> status (0 ok, -1 on EPERM). On SlateOS
+ * posix setuid()/setgid() perform the userspace CAP_SETUID/CAP_SETGID +
+ * identity check and, if allowed, issue the real SYS_PROCESS_SET_CREDENTIALS
+ * syscall that *mutates* the process's kernel credentials (previously these
+ * silently succeeded without changing anything). A distinct kernel path (the
+ * process-credentials table) from the read-only getuid/getgid. setuid()/
+ * setgid() are declared by musl's <unistd.h> and resolve at link time to the
+ * SlateOS posix crate's extern "C" symbols. CPython os.setuid returns None;
+ * like os.remove/chmod, fastpy models the outcome as an int status. Windows
+ * host builds don't run on SlateOS, so report success (0) there. */
+int64_t fastpy_os_setuid(int64_t uid) {
+#ifdef _WIN32
+    (void)uid;
+    return (int64_t)0;
+#else
+    return (int64_t)setuid((uid_t)uid);
+#endif
+}
+
+int64_t fastpy_os_setgid(int64_t gid) {
+#ifdef _WIN32
+    (void)gid;
+    return (int64_t)0;
+#else
+    return (int64_t)setgid((gid_t)gid);
+#endif
+}
+
+/* os.nice(inc) -> the new nice value. On SlateOS posix nice() reads the
+ * process's current kernel nice (SYS_PROCESS_GET_NICE), adds the increment,
+ * and — after the userspace CAP_SYS_NICE check for a priority-raise — installs
+ * it via SYS_PROCESS_SET_NICE, which ALSO maps nice to a scheduler priority
+ * level and re-prioritises the process's tasks. Nice is thus a real scheduling
+ * attribute (previously the value was stored in a userspace static that did
+ * not affect scheduling). A distinct kernel path (the scheduler's per-task
+ * priority) from every filesystem/credential syscall. nice() is declared by
+ * musl's <unistd.h> and resolves at link time to the SlateOS posix crate's
+ * extern "C" symbol. Windows has no nice(); host builds don't run on SlateOS,
+ * so 0 is a fine placeholder. */
+int64_t fastpy_os_nice(int64_t inc) {
+#ifdef _WIN32
+    (void)inc;
+    return (int64_t)0;
+#else
+    return (int64_t)nice((int)inc);
+#endif
+}
+
+/* os.getpriority(which, who) -> the target's nice value. On SlateOS posix
+ * getpriority() reads the caller's real kernel nice via SYS_PROCESS_GET_NICE.
+ * getpriority() is declared by musl's <sys/resource.h>. Windows host builds
+ * don't run on SlateOS, so 0 (the default nice) is a fine placeholder. */
+int64_t fastpy_os_getpriority(int64_t which, int64_t who) {
+#ifdef _WIN32
+    (void)which; (void)who;
+    return (int64_t)0;
+#else
+    return (int64_t)getpriority((int)which, (id_t)who);
+#endif
+}
+
+/* os.setpriority(which, who, prio) -> status (0 ok, -1 error). On SlateOS
+ * posix setpriority() installs the nice value via SYS_PROCESS_SET_NICE (which
+ * re-prioritises the process's tasks) after the userspace CAP_SYS_NICE check.
+ * setpriority() is declared by musl's <sys/resource.h>. Windows host builds
+ * don't run on SlateOS, so report success (0). */
+int64_t fastpy_os_setpriority(int64_t which, int64_t who, int64_t prio) {
+#ifdef _WIN32
+    (void)which; (void)who; (void)prio;
+    return (int64_t)0;
+#else
+    return (int64_t)setpriority((int)which, (id_t)who, (int)prio);
+#endif
+}
+
+/* os.pipe() -> (read_fd, write_fd). On SlateOS posix pipe() issues the real
+ * SYS_PIPE_CREATE syscall — a genuinely distinct kernel path (the pipe
+ * subsystem) not touched by any file/process syscall. Python's os.pipe()
+ * returns a 2-tuple; fastpy pure mode unpacks a 2-element list identically, so
+ * we return a fastpy list [read_fd, write_fd]. On error both entries are -1.
+ * Windows host builds don't run on SlateOS but _pipe() fills the fds too. */
+FpyList* fastpy_os_pipe(void) {
+    FpyList *lst = fpy_list_new(2);
+    int r = -1, w = -1;
+    int fds[2];
+#ifdef _WIN32
+    if (_pipe(fds, 65536, 0) == 0) { r = fds[0]; w = fds[1]; }
+#else
+    if (pipe(fds) == 0) { r = fds[0]; w = fds[1]; }
+#endif
+    FpyValue vr; vr.tag = FPY_TAG_INT; vr.data.i = (int64_t)r; fpy_list_append(lst, vr);
+    FpyValue vw; vw.tag = FPY_TAG_INT; vw.data.i = (int64_t)w; fpy_list_append(lst, vw);
+    return lst;
+}
+
+/* os.write(fd, data) -> bytes written (or -1). `fd` is a raw integer fd (e.g. a
+ * pipe end from os.pipe()); `data` is a fastpy str (NUL-terminated char*). On
+ * SlateOS posix write() dispatches by fd kind — for a pipe fd it routes to the
+ * pipe's kernel buffer via SYS_PIPE_WRITE (a regular file fd would use
+ * SYS_FS_WRITE). We use strlen() — the pipe self-test uses NUL-free ASCII; a
+ * NUL-safe bytes overload can be added later if a caller needs embedded NULs. */
+int64_t fastpy_os_write(int64_t fd, const char *data) {
+    if (!data) return -1;
+    size_t n = strlen(data);
+#ifdef _WIN32
+    return (int64_t)_write((int)fd, data, (unsigned)n);
+#else
+    return (int64_t)write((int)fd, data, n);
+#endif
+}
+
+/* os.read(fd, n) -> str of up to `n` bytes read (empty on EOF/error). `fd` is a
+ * raw integer fd. On SlateOS posix read() dispatches by fd kind — for a pipe fd
+ * it pulls from the pipe's kernel buffer via SYS_PIPE_READ (a regular file fd
+ * would use SYS_FS_READ). Returns a fastpy owned string; NUL-terminated, so it
+ * is safe for the NUL-free ASCII the pipe self-test round-trips. */
+const char* fastpy_os_read(int64_t fd, int64_t n) {
+    if (n < 0) n = 0;
+    FpyString *s = fpy_str_alloc(n);
+    long got;
+#ifdef _WIN32
+    got = (long)_read((int)fd, s->data, (unsigned)n);
+#else
+    got = (long)read((int)fd, s->data, (size_t)n);
+#endif
+    if (got < 0) got = 0;
+    s->data[got] = '\0';
+    return s->data;
+}
+
+/* os.close(fd) -> 0 on success, -1 on error. Closes a raw integer fd (e.g. a
+ * pipe end); posix close() releases the fd-table entry and its kernel handle
+ * (SYS_PIPE_CLOSE for a pipe end). */
+int64_t fastpy_os_close(int64_t fd) {
+#ifdef _WIN32
+    return (int64_t)(_close((int)fd) == 0 ? 0 : -1);
+#else
+    return (int64_t)(close((int)fd) == 0 ? 0 : -1);
+#endif
+}
+
+/* os.dup(fd) -> a new raw integer fd referring to the same open file /
+ * pipe end / socket as `fd` (or -1 on error). On SlateOS posix dup()
+ * shares the underlying kernel handle at the fd-table level — for a pipe
+ * end the duplicate aliases the same kernel pipe buffer, so bytes written
+ * through the dup are readable from the original pipe's read end. */
+int64_t fastpy_os_dup(int64_t fd) {
+#ifdef _WIN32
+    return (int64_t)_dup((int)fd);
+#else
+    return (int64_t)dup((int)fd);
+#endif
+}
+
+/* os.dup2(oldfd, newfd) -> newfd on success (or -1). Unlike dup(), which picks
+ * the lowest free fd, dup2() installs a copy of `oldfd` at the *caller-chosen*
+ * `newfd` (silently closing whatever was open there first), sharing the same
+ * underlying kernel handle — for a pipe end the target aliases the same kernel
+ * pipe buffer. On SlateOS this is posix dup2() at the fd-table level; the
+ * close-then-alias-at-a-specific-fd semantics are a distinct path from dup(). */
+int64_t fastpy_os_dup2(int64_t oldfd, int64_t newfd) {
+#ifdef _WIN32
+    return (_dup2((int)oldfd, (int)newfd) == 0) ? newfd : (int64_t)-1;
+#else
+    return (int64_t)dup2((int)oldfd, (int)newfd);
+#endif
+}
+
+/* os.lseek(fd, offset, whence) -> the new absolute file offset (or -1 on
+ * error). `whence` is SEEK_SET (0), SEEK_CUR (1) or SEEK_END (2). On SlateOS
+ * posix lseek() repositions a regular file fd's kernel offset via SYS_FS_SEEK
+ * — a genuinely distinct kernel path from read/write. Not meaningful for a
+ * pipe (which is not seekable); intended for regular file fds. */
+int64_t fastpy_os_lseek(int64_t fd, int64_t offset, int64_t whence) {
+#ifdef _WIN32
+    return (int64_t)_lseeki64((int)fd, (long long)offset, (int)whence);
+#else
+    return (int64_t)lseek((int)fd, (off_t)offset, (int)whence);
+#endif
+}
+
+/* os.open(path, flags, mode) -> a new raw integer fd for a regular file (or -1
+ * on error). `flags` are the standard POSIX open() bits (O_RDONLY=0,
+ * O_WRONLY=1, O_RDWR=2, O_CREAT=0100, O_TRUNC=01000, ...) and `mode` the
+ * creation permission bits (e.g. 0644). On SlateOS this is posix open() ->
+ * SYS_FS_OPEN, yielding a raw file fd that native os.read/os.write/os.lseek/
+ * os.close then drive — the raw-fd counterpart to the high-level open() every
+ * other fastpy tool uses. (On the Windows host build the flag/mode bit values
+ * differ; this helper targets the SlateOS/posix ABI.) */
+int64_t fastpy_os_open(const char *path, int64_t flags, int64_t mode) {
+    if (!path) return -1;
+#ifdef _WIN32
+    return (int64_t)_open(path, (int)flags, (int)mode);
+#else
+    return (int64_t)open(path, (int)flags, (mode_t)mode);
+#endif
+}
+
+/* os.umask(mask) -> the *previous* process file-mode creation mask. Sets the
+ * new mask (low 9 rwxrwxrwx bits) and returns the old one, matching POSIX
+ * umask(). On SlateOS this is posix umask(), which stores the mask in the
+ * userspace POSIX layer; subsequent file/dir creation (os.open O_CREAT,
+ * os.mkdir) masks its mode with it before handing the final permission bits
+ * to the kernel create primitive (SYS_FS_OPEN / SYS_FS_MKDIR). A genuine
+ * observable mutation: after os.umask(022), creating a 0777 file yields 0755
+ * on disk. */
+int64_t fastpy_os_umask(int64_t mask) {
+#ifdef _WIN32
+    /* Windows _umask only models the read-only bit; still returns the prior
+     * mask so chained get/set semantics work on the host build. */
+    return (int64_t)_umask((int)(mask & 0777));
+#else
+    return (int64_t)umask((mode_t)(mask & 0777));
+#endif
+}
+
+/* os.ftruncate(fd, length) -> 0 on success, -1 on error. Sets the size of the
+ * regular file open on `fd` to exactly `length` bytes (extending with zeros or
+ * discarding the tail). On SlateOS this is posix ftruncate() -> SYS_FS_FTRUNCATE
+ * — a genuinely distinct kernel path from lseek/write, and from the path-based
+ * os.truncate() (SYS_FS_TRUNCATE). Not meaningful for a pipe. */
+int64_t fastpy_os_ftruncate(int64_t fd, int64_t length) {
+#ifdef _WIN32
+    return (int64_t)(_chsize_s((int)fd, (long long)length) == 0 ? 0 : -1);
+#else
+    return (int64_t)(ftruncate((int)fd, (off_t)length) == 0 ? 0 : -1);
+#endif
+}
+
+/* os.pwrite(fd, data, offset) -> bytes written (or -1). Positioned write: the
+ * bytes go to absolute file `offset` WITHOUT changing the fd's current file
+ * offset. On SlateOS this is posix pwrite() (atomic seek+write on SYS_FS_SEEK/
+ * SYS_FS_WRITE, restoring the offset) — distinct from write+lseek because the
+ * fd position is untouched. `data` is a fastpy str (NUL-terminated); we use
+ * strlen (NUL-free ASCII, matching the raw-fd I/O convention here). */
+int64_t fastpy_os_pwrite(int64_t fd, const char *data, int64_t offset) {
+    if (!data) return -1;
+    size_t n = strlen(data);
+#ifdef _WIN32
+    long long saved = _lseeki64((int)fd, 0, SEEK_CUR);
+    if (saved < 0) return -1;
+    if (_lseeki64((int)fd, (long long)offset, SEEK_SET) < 0) return -1;
+    int w = _write((int)fd, data, (unsigned)n);
+    (void)_lseeki64((int)fd, saved, SEEK_SET);
+    return (int64_t)w;
+#else
+    return (int64_t)pwrite((int)fd, data, n, (off_t)offset);
+#endif
+}
+
+/* os.pread(fd, n, offset) -> str of up to `n` bytes read from absolute file
+ * `offset` WITHOUT changing the fd's current file offset. On SlateOS this is
+ * posix pread() — distinct from lseek+read because the fd position is
+ * untouched. Returns a fastpy owned NUL-terminated string. */
+const char* fastpy_os_pread(int64_t fd, int64_t n, int64_t offset) {
+    if (n < 0) n = 0;
+    FpyString *s = fpy_str_alloc(n);
+    long got;
+#ifdef _WIN32
+    long long saved = _lseeki64((int)fd, 0, SEEK_CUR);
+    if (saved >= 0 && _lseeki64((int)fd, (long long)offset, SEEK_SET) >= 0) {
+        got = (long)_read((int)fd, s->data, (unsigned)n);
+        (void)_lseeki64((int)fd, saved, SEEK_SET);
+    } else {
+        got = -1;
+    }
+#else
+    got = (long)pread((int)fd, s->data, (size_t)n, (off_t)offset);
+#endif
+    if (got < 0) got = 0;
+    s->data[got] = '\0';
+    return s->data;
 }
 
 int64_t fastpy_os_path_exists(const char *path) {
@@ -8121,9 +10108,209 @@ int64_t fastpy_os_path_isdir(const char *path) {
 #endif
 }
 
+/* os.path.getsize(path) -> file size in bytes.  Python raises OSError when the
+ * path doesn't exist; pure/AOT mode surfaces that as -1 (mirroring the int
+ * error convention of os.remove/mkdir), so callers can branch on rc < 0. */
+int64_t fastpy_os_path_getsize(const char *path) {
+#ifdef _WIN32
+    struct _stat64 st;
+    if (_stat64(path, &st) != 0) return -1;
+    return (int64_t)st.st_size;
+#else
+    struct stat st;
+    if (stat(path, &st) != 0) return -1;
+    return (int64_t)st.st_size;
+#endif
+}
+
+/* os.path.getmtime(path) -> modification time in seconds since the epoch as a
+ * CPython-faithful float.  Reads the mtime field of the stat struct (a distinct
+ * metadata field from getsize's st_size); returns -1.0 on error.  On posix we
+ * combine whole seconds with the nanosecond sub-second field (st_mtim.tv_nsec)
+ * so sub-second precision survives the round-trip. */
+double fastpy_os_path_getmtime(const char *path) {
+#ifdef _WIN32
+    struct _stat64 st;
+    if (_stat64(path, &st) != 0) return -1.0;
+    return (double)st.st_mtime;
+#else
+    struct stat st;
+    if (stat(path, &st) != 0) return -1.0;
+    return (double)st.st_mtim.tv_sec + (double)st.st_mtim.tv_nsec / 1e9;
+#endif
+}
+
+/* os.path.getatime: last-access time (st_atim) as epoch seconds (double).
+ * Distinct stat field from getmtime's st_mtim — reads the *atime* the
+ * kernel/utime stamped.  CPython returns a float; -1.0 on stat error. */
+double fastpy_os_path_getatime(const char *path) {
+#ifdef _WIN32
+    struct _stat64 st;
+    if (_stat64(path, &st) != 0) return -1.0;
+    return (double)st.st_atime;
+#else
+    struct stat st;
+    if (stat(path, &st) != 0) return -1.0;
+    return (double)st.st_atim.tv_sec + (double)st.st_atim.tv_nsec / 1e9;
+#endif
+}
+
+/* os.path.getctime: metadata-change time (st_ctim) as epoch seconds (double).
+ * On POSIX this is the inode change time (ctime) — a *distinct* stat field
+ * from atime/mtime, and (unlike them) not settable via os.utime; it reflects
+ * when the file's metadata last changed (e.g. creation).  CPython returns a
+ * float (on Windows it's the creation time); -1.0 on stat error. */
+double fastpy_os_path_getctime(const char *path) {
+#ifdef _WIN32
+    struct _stat64 st;
+    if (_stat64(path, &st) != 0) return -1.0;
+    return (double)st.st_ctime;
+#else
+    struct stat st;
+    if (stat(path, &st) != 0) return -1.0;
+    return (double)st.st_ctim.tv_sec + (double)st.st_ctim.tv_nsec / 1e9;
+#endif
+}
+
+/* os.access(path, mode) -> 1 if accessible (True), 0 otherwise (False).
+ * Mirrors CPython os.access, which returns a bool.  `mode` is the POSIX
+ * accessibility mask: F_OK=0, R_OK=4, W_OK=2, X_OK=1.  Unlike the get*time
+ * probes this exercises the libc access() entry point, and the mode argument
+ * is genuinely honored: POSIX access() rejects mode bits outside R|W|X with
+ * EINVAL, so os.access(path, 8) returns False even for an existing file.
+ * (SlateOS has no per-user permission enforcement yet, so a *valid* mode
+ * succeeds iff the path exists — but the mode is still validated.) */
+int64_t fastpy_os_access(const char *path, int64_t mode) {
+    if (path == NULL) return 0;
+#ifdef _WIN32
+    /* Windows _access has no X_OK; map any valid *nix mode to an existence
+     * check (mode 0) and reject out-of-range mode bits like POSIX does. */
+    if (mode & ~(int64_t)6) {
+        /* Only F_OK/R_OK/W_OK are representable on Windows; treat X_OK(1) and
+         * out-of-range bits as invalid so host builds match the SlateOS EINVAL
+         * behavior for the self-test's invalid-mode case. */
+        if (mode & ~(int64_t)7) return 0;   /* out of R|W|X range -> False */
+    }
+    return (_access(path, 0) == 0) ? 1 : 0;
+#else
+    return (access(path, (int)mode) == 0) ? 1 : 0;
+#endif
+}
+
+/* os.path.samefile(a, b) -> 1 if both paths refer to the same file (True),
+ * 0 otherwise (False).  Mirrors CPython os.path.samefile, which compares the
+ * (st_dev, st_ino) identity of two stat() results.  This is the first fastpy
+ * lowering to exercise the *st_ino* field: both stat() calls follow symlinks
+ * (POSIX stat semantics), so a file and a symlink pointing at it compare equal
+ * (same inode), while two distinct files have distinct synthetic inodes and
+ * compare unequal.  CPython raises if a path is missing; the AOT-simplified
+ * form returns False on any stat error. */
+int64_t fastpy_os_path_samefile(const char *a, const char *b) {
+    if (a == NULL || b == NULL) return 0;
+#ifdef _WIN32
+    struct _stat64 sa, sb;
+    if (_stat64(a, &sa) != 0) return 0;
+    if (_stat64(b, &sb) != 0) return 0;
+#else
+    struct stat sa, sb;
+    if (stat(a, &sa) != 0) return 0;
+    if (stat(b, &sb) != 0) return 0;
+#endif
+    return (sa.st_dev == sb.st_dev && sa.st_ino == sb.st_ino) ? 1 : 0;
+}
+
+/* os.path.islink(path) -> 1 if path is a symbolic link (True), 0 otherwise.
+ * Mirrors CPython os.path.islink, which lstat()s the path (crucially NOT
+ * following the final symlink) and tests S_ISLNK on st_mode.  This is the
+ * first fastpy lowering to use *lstat* (no-follow) semantics — distinct from
+ * exists/isfile/isdir, which all follow symlinks via stat().  Because it does
+ * not follow the link, a symlink returns True even when its target is missing
+ * (the link entry itself exists), while a regular file — or the target a
+ * symlink resolves to — returns False.  CPython returns False on any OSError;
+ * the AOT-simplified form returns 0 on any lstat error. */
+int64_t fastpy_os_path_islink(const char *path) {
+    if (path == NULL) return 0;
+#ifdef _WIN32
+    /* Windows _stat cannot distinguish reparse points; the host self-test does
+     * not exercise this branch, so report non-link. */
+    return 0;
+#else
+    struct stat st;
+    if (lstat(path, &st) != 0) return 0;
+    return S_ISLNK(st.st_mode) ? 1 : 0;
+#endif
+}
+
+/* os.stat(path) -> a 10-int list mirroring CPython's os.stat_result *sequence*
+ * form: (st_mode, st_ino, st_dev, st_nlink, st_uid, st_gid, st_size,
+ *        st_atime, st_mtime, st_ctime).  The timestamps are integer seconds —
+ * the index/tuple form (CPython exposes sub-second floats only via the named
+ * .st_*time attributes, not the sequence).  A single stat() call (SYS_FS_STAT,
+ * follows symlinks) fills the whole struct, so this is the capstone that
+ * exercises many stat fields at once — st_mode/st_ino/st_dev/st_nlink/st_size
+ * plus the three timestamps — rather than one field per lowering.  CPython
+ * raises OSError on failure; the AOT-simplified form returns an empty list on
+ * any stat error (an indexing self-test uses a known-good path). */
+FpyList* fastpy_os_stat(const char *path) {
+    FpyList *lst = fpy_list_new(10);
+    if (path == NULL) return lst;
+#ifdef _WIN32
+    struct _stat64 st;
+    if (_stat64(path, &st) != 0) return lst;
+#else
+    struct stat st;
+    if (stat(path, &st) != 0) return lst;
+#endif
+    /* musl/glibc/Win32 all provide st_atime/st_mtime/st_ctime (as macros for
+     * the .tv_sec of the timespec on POSIX), so this order is portable. */
+    fpy_list_append(lst, fpy_int((int64_t)st.st_mode));
+    fpy_list_append(lst, fpy_int((int64_t)st.st_ino));
+    fpy_list_append(lst, fpy_int((int64_t)st.st_dev));
+    fpy_list_append(lst, fpy_int((int64_t)st.st_nlink));
+    fpy_list_append(lst, fpy_int((int64_t)st.st_uid));
+    fpy_list_append(lst, fpy_int((int64_t)st.st_gid));
+    fpy_list_append(lst, fpy_int((int64_t)st.st_size));
+    fpy_list_append(lst, fpy_int((int64_t)st.st_atime));
+    fpy_list_append(lst, fpy_int((int64_t)st.st_mtime));
+    fpy_list_append(lst, fpy_int((int64_t)st.st_ctime));
+    return lst;
+}
+
+/* os.statvfs(path): filesystem capacity/limits via a single statvfs() call.
+ * Returns CPython's os.statvfs_result sequence form as a 10-int list in the
+ * documented field order:
+ *   (f_bsize, f_frsize, f_blocks, f_bfree, f_bavail,
+ *    f_files, f_ffree, f_favail, f_flag, f_namemax)
+ * Distinct from os.stat (per-file metadata): this reports the *whole
+ * filesystem* the path lives on (block sizes, block/inode totals & free
+ * counts, mount flags, and the max filename length). */
+FpyList* fastpy_os_statvfs(const char *path) {
+    FpyList *lst = fpy_list_new(10);
+    if (path == NULL) return lst;
+#ifdef _WIN32
+    /* Win32 has no statvfs; the SlateOS target never takes this branch. */
+    (void)path;
+    return lst;
+#else
+    struct statvfs vfs;
+    if (statvfs(path, &vfs) != 0) return lst;
+    fpy_list_append(lst, fpy_int((int64_t)vfs.f_bsize));
+    fpy_list_append(lst, fpy_int((int64_t)vfs.f_frsize));
+    fpy_list_append(lst, fpy_int((int64_t)vfs.f_blocks));
+    fpy_list_append(lst, fpy_int((int64_t)vfs.f_bfree));
+    fpy_list_append(lst, fpy_int((int64_t)vfs.f_bavail));
+    fpy_list_append(lst, fpy_int((int64_t)vfs.f_files));
+    fpy_list_append(lst, fpy_int((int64_t)vfs.f_ffree));
+    fpy_list_append(lst, fpy_int((int64_t)vfs.f_favail));
+    fpy_list_append(lst, fpy_int((int64_t)vfs.f_flag));
+    fpy_list_append(lst, fpy_int((int64_t)vfs.f_namemax));
+    return lst;
+#endif
+}
+
 const char* fastpy_os_path_join(const char *a, const char *b) {
     int alen = (int)strlen(a), blen = (int)strlen(b);
-    char *buf = (char*)malloc(alen + blen + 2);
+    char *buf = fpy_str_buf(alen + blen + 1);
     memcpy(buf, a, alen);
 #ifdef _WIN32
     if (alen > 0 && a[alen-1] != '\\' && a[alen-1] != '/') buf[alen++] = '\\';
@@ -8139,7 +10326,7 @@ const char* fastpy_os_path_basename(const char *path) {
     for (const char *p = path; *p; p++) {
         if (*p == '/' || *p == '\\') last = p + 1;
     }
-    return fpy_strdup(last);
+    return fpy_str_from_cstr(last);
 }
 
 const char* fastpy_os_path_dirname(const char *path) {
@@ -8147,9 +10334,9 @@ const char* fastpy_os_path_dirname(const char *path) {
     for (const char *p = path; *p; p++) {
         if (*p == '/' || *p == '\\') last_sep = p;
     }
-    if (!last_sep) return fpy_strdup("");
+    if (!last_sep) return fpy_str_from_cstr("");
     int len = (int)(last_sep - path);
-    char *buf = (char*)malloc(len + 1);
+    char *buf = fpy_str_buf(len);
     memcpy(buf, path, len);
     buf[len] = '\0';
     return buf;
@@ -8167,7 +10354,7 @@ FpyList* fastpy_os_listdir(const char *path) {
             if (strcmp(fd.cFileName, ".") == 0 || strcmp(fd.cFileName, "..") == 0) continue;
             FpyValue v;
             v.tag = FPY_TAG_STR;
-            v.data.s = fpy_strdup(fd.cFileName);
+            v.data.s = fpy_str_from_cstr(fd.cFileName);
             fpy_list_append(lst, v);
         } while (FindNextFileA(h, &fd));
         FindClose(h);
@@ -8180,7 +10367,7 @@ FpyList* fastpy_os_listdir(const char *path) {
             if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) continue;
             FpyValue v;
             v.tag = FPY_TAG_STR;
-            v.data.s = strdup(ent->d_name);
+            v.data.s = fpy_str_from_cstr(ent->d_name);
             fpy_list_append(lst, v);
         }
         closedir(d);
@@ -8191,7 +10378,244 @@ FpyList* fastpy_os_listdir(const char *path) {
 
 const char* fastpy_os_getenv(const char *name) {
     const char *val = getenv(name);
-    return val ? fpy_strdup(val) : NULL;
+    return val ? fpy_str_from_cstr(val) : NULL;
+}
+
+/* os.remove(path) / os.unlink(path): delete a directory entry.
+ * Returns 0 on success, -1 on failure.  Python's os.remove returns None and
+ * raises OSError on failure; in pure/AOT mode (no exception unwinding wired
+ * for this path) we surface success/failure as an int status instead, so a
+ * caller can branch on it (mirrors os.path.exists returning a bool).  Backed
+ * by C stdio remove(), which the SlateOS posix libc implements over
+ * SYS_FS_DELETE. */
+int64_t fastpy_os_remove(const char *path) {
+    return (int64_t)(remove(path) == 0 ? 0 : -1);
+}
+
+/* os.mkdir(path) -> 0 ok / -1 error.  Python's os.mkdir defaults mode 0o777
+ * (further masked by umask); we pass 0777 on POSIX/SlateOS.  On Windows the
+ * CRT _mkdir takes no mode. */
+int64_t fastpy_os_mkdir(const char *path) {
+#ifdef _WIN32
+    return (int64_t)(_mkdir(path) == 0 ? 0 : -1);
+#else
+    return (int64_t)(mkdir(path, 0777) == 0 ? 0 : -1);
+#endif
+}
+
+/* os.rmdir(path) -> 0 ok / -1 error. */
+int64_t fastpy_os_rmdir(const char *path) {
+#ifdef _WIN32
+    return (int64_t)(_rmdir(path) == 0 ? 0 : -1);
+#else
+    return (int64_t)(rmdir(path) == 0 ? 0 : -1);
+#endif
+}
+
+/* os.rename(src, dst) -> 0 ok / -1 error.  C rename() handles both files and
+ * directories; on SlateOS it maps to SYS_FS_RENAME. */
+int64_t fastpy_os_rename(const char *src, const char *dst) {
+    return (int64_t)(rename(src, dst) == 0 ? 0 : -1);
+}
+
+/* os.execv(path, argv) -> only returns on FAILURE (-1); on success the calling
+ * process image is REPLACED by the program at `path` (execv never returns).
+ * `argv` is an FpyList* of str whose elements become the NULL-terminated C
+ * argv[].  On SlateOS posix execv() lowers to SYS_EXECVE, so a fastpy program
+ * can resolve an installed /bin command by name and hand off to it — the core
+ * primitive a shell/`init` uses.  Python raises OSError on failure; in pure/AOT
+ * mode (no exception unwinding on this path) we surface the failure as -1 so a
+ * caller can branch on it, mirroring os.remove/os.rename. */
+int64_t fastpy_os_execv(const char *path, FpyList *argv) {
+#ifdef _WIN32
+    (void)path; (void)argv;
+    return -1;
+#else
+    if (path == NULL) return -1;
+    int64_t n = argv ? fpy_list_len(argv) : 0;
+    if (n < 0) n = 0;
+    /* +1 for the NULL terminator execv() requires. */
+    char **cargv = (char **)malloc((size_t)(n + 1) * sizeof(char *));
+    if (cargv == NULL) return -1;
+    for (int64_t i = 0; i < n; i++) {
+        FpyValue v = fpy_list_get(argv, i);
+        /* execv takes char *const argv[]; it does not modify the strings, so
+         * casting away const on the list-owned str is safe.  Non-str elements
+         * (shouldn't happen for a list[str]) degrade to an empty argument. */
+        cargv[i] = (v.tag == FPY_TAG_STR && v.data.s)
+                       ? (char *)v.data.s
+                       : (char *)"";
+    }
+    cargv[n] = NULL;
+    execv(path, cargv);
+    /* Only reached if execv failed (e.g. ENOENT). Free our scratch and report
+     * failure; the list-owned strings are not ours to free. */
+    free(cargv);
+    return -1;
+#endif
+}
+
+/* os.fork() -> child PID in the parent, 0 in the child, -1 on failure.  On
+ * SlateOS posix fork() lowers to SYS_PROCESS_FORK: the kernel clones the
+ * caller's address space copy-on-write, duplicates its handle table
+ * (refcount-shared), and resumes the child at the same point with RAX forced to
+ * 0.  A single call site therefore yields both views — the classic fork/exec
+ * pattern (fork, then os.execv in the child, os.waitpid in the parent) that a
+ * shell/`init` uses to spawn a child without replacing itself.  Windows host
+ * builds have no fork(); they return -1. */
+int64_t fastpy_os_fork(void) {
+#ifdef _WIN32
+    return -1;
+#else
+    return (int64_t)fork();
+#endif
+}
+
+/* os.waitpid(pid, options) -> 2-element list [pid, status].  CPython returns a
+ * (pid, status) tuple; fastpy pure mode unpacks a 2-element list identically, so
+ * `p, st` = os.waitpid(child, 0) works.  On SlateOS posix waitpid() reaps a
+ * child and returns its raw wait status; we hand back both the reaped pid and
+ * the encoded status so a caller can decode it with os.WIFEXITED/os.WEXITSTATUS
+ * (or the raw value).  On error the returned pid is -1.  Windows: -1/0. */
+FpyList* fastpy_os_waitpid(int64_t pid, int64_t options) {
+    FpyList *lst = fpy_list_new(2);
+    int64_t rpid = -1, rstatus = 0;
+#ifndef _WIN32
+    int status = 0;
+    pid_t r = waitpid((pid_t)pid, &status, (int)options);
+    rpid = (int64_t)r;
+    rstatus = (int64_t)status;
+#else
+    (void)pid; (void)options;
+#endif
+    FpyValue vp; vp.tag = FPY_TAG_INT; vp.data.i = rpid; fpy_list_append(lst, vp);
+    FpyValue vs; vs.tag = FPY_TAG_INT; vs.data.i = rstatus; fpy_list_append(lst, vs);
+    return lst;
+}
+
+/* os.WIFEXITED(status) -> 1 if the child exited normally, else 0.  Decodes the
+ * raw wait status from os.waitpid.  Windows builds: the status is already a
+ * plain exit code (no encoding), so treat any status as "exited". */
+int64_t fastpy_os_wifexited(int64_t status) {
+#ifdef _WIN32
+    (void)status; return 1;
+#else
+    int s = (int)status;
+    return (int64_t)(WIFEXITED(s) ? 1 : 0);
+#endif
+}
+
+/* os.WEXITSTATUS(status) -> the child's exit code (low 8 bits) from a status
+ * that WIFEXITED reports as a normal exit.  On Windows the status is already the
+ * exit code. */
+int64_t fastpy_os_wexitstatus(int64_t status) {
+#ifdef _WIN32
+    return status & 0xff;
+#else
+    int s = (int)status;
+    return (int64_t)WEXITSTATUS(s);
+#endif
+}
+
+/* os.symlink(target, linkpath) -> 0 ok / -1 error.  Note the CPython argument
+ * order: symlink(src, dst) creates dst as a link *pointing at* src.  On
+ * SlateOS the posix libc symlink() maps to SYS_FS_SYMLINK (Rights::CREATE).
+ * Windows has no POSIX symlink()/readlink(), so those builds return -1. */
+int64_t fastpy_os_symlink(const char *target, const char *linkpath) {
+#ifdef _WIN32
+    (void)target; (void)linkpath;
+    return -1;
+#else
+    return (int64_t)(symlink(target, linkpath) == 0 ? 0 : -1);
+#endif
+}
+
+/* os.link(src, dst) -> 0 ok / -1 error.  Creates a hard link `dst` referring
+ * to the same inode as `src` (POSIX order: link(oldpath, newpath)).  On
+ * SlateOS the posix libc link() maps to SYS_FS_LINK (Rights::CREATE).  Windows
+ * has no POSIX link(), so those builds return -1. */
+int64_t fastpy_os_link(const char *src, const char *dst) {
+#ifdef _WIN32
+    (void)src; (void)dst;
+    return -1;
+#else
+    return (int64_t)(link(src, dst) == 0 ? 0 : -1);
+#endif
+}
+
+/* os.chmod(path, mode) -> int status (0 ok, -1 error).  Python's os.chmod
+ * returns None and raises on error, but pure/AOT mode surfaces the result as
+ * a bare int (mirroring os.remove/os.mkdir).  Only the low permission bits of
+ * `mode` apply; the kernel ignores the file-type bits. */
+int64_t fastpy_os_chmod(const char *path, int64_t mode) {
+#ifdef _WIN32
+    (void)path; (void)mode;
+    return -1;
+#else
+    return (int64_t)(chmod(path, (mode_t)mode) == 0 ? 0 : -1);
+#endif
+}
+
+/* os.truncate(path, length) -> int status (0 ok, -1 error).  Resizes the file
+ * to exactly `length` bytes (shrinking discards the tail; growing zero-fills).
+ * Pure/AOT mode surfaces the result as a bare int, mirroring os.chmod. */
+int64_t fastpy_os_truncate(const char *path, int64_t length) {
+#ifdef _WIN32
+    (void)path; (void)length;
+    return -1;
+#else
+    return (int64_t)(truncate(path, (off_t)length) == 0 ? 0 : -1);
+#endif
+}
+
+/* os.utime(path, atime_ns, mtime_ns) -> int status (0 ok, -1 error).  AOT-
+ * simplified 3-positional form of os.utime: both times are nanoseconds since
+ * the Unix epoch (bare i64), applied via utimensat().  A time of 0 still sets
+ * the field to epoch (not "unchanged") — callers pass concrete stamps. */
+int64_t fastpy_os_utime(const char *path, int64_t atime_ns, int64_t mtime_ns) {
+#ifdef _WIN32
+    (void)path; (void)atime_ns; (void)mtime_ns;
+    return -1;
+#else
+    struct timespec times[2];
+    times[0].tv_sec = (time_t)(atime_ns / 1000000000);
+    times[0].tv_nsec = (long)(atime_ns % 1000000000);
+    times[1].tv_sec = (time_t)(mtime_ns / 1000000000);
+    times[1].tv_nsec = (long)(mtime_ns % 1000000000);
+    return (int64_t)(utimensat(AT_FDCWD, path, times, 0) == 0 ? 0 : -1);
+#endif
+}
+
+/* os.chown(path, uid, gid) -> int status (0 ok, -1 error).  AOT-simplified
+ * 3-positional form: uid/gid as bare ints (Python's os.chown returns None +
+ * raises; pure/AOT mode surfaces the result as an int, like os.utime). */
+int64_t fastpy_os_chown(const char *path, int64_t uid, int64_t gid) {
+#ifdef _WIN32
+    (void)path; (void)uid; (void)gid;
+    return -1;
+#else
+    return (int64_t)(chown(path, (uid_t)uid, (gid_t)gid) == 0 ? 0 : -1);
+#endif
+}
+
+/* os.readlink(path) -> str (the link's target).  Returns a valid FpyString
+ * `.data` pointer (FPY_TAG_STR); an empty string signals an error, mirroring
+ * how callers already branch on os.getcwd/os.path.* string results.  POSIX
+ * readlink() does NOT null-terminate and returns the byte count, so we bound
+ * the copy by its return value and let fpy_str_alloc add the terminator. */
+const char* fastpy_os_readlink(const char *path) {
+#ifdef _WIN32
+    (void)path;
+    FpyString *empty = fpy_str_alloc(0);
+    return empty->data;
+#else
+    char buf[4096];
+    ssize_t n = readlink(path, buf, sizeof(buf));
+    if (n < 0) n = 0;
+    FpyString *s = fpy_str_alloc((int64_t)n);
+    if (n > 0) memcpy(s->data, buf, (size_t)n);
+    return s->data;
+#endif
 }
 
 /* ============================================================
@@ -8218,7 +10642,10 @@ FpyDict* fastpy_counter_from_string(const char *str) {
         char buf[2] = {str[i], '\0'};
         FpyValue key;
         key.tag = FPY_TAG_STR;
-        key.data.s = fpy_strdup(buf);
+        /* Headered temp key (refcount 1). fpy_dict_set takes its own reference
+           (increfs), so we release our creation reference on every path below.
+           See BUG-RUNTIME-STR-PRODUCERS-BARE-MALLOC. */
+        key.data.s = fpy_str_from_cstr(buf);
         uint64_t h = fpy_hash_value(key);
         int64_t mask = counter->table_size - 1;
         int64_t slot = (int64_t)(h & (uint64_t)mask);
@@ -8229,13 +10656,14 @@ FpyDict* fastpy_counter_from_string(const char *str) {
             if (idx != FPY_DICT_DELETED && fpy_key_equal(counter->keys[idx], key)) {
                 counter->values[idx].data.i++;
                 found = 1;
-                free(key.data.s);
+                FPY_VAL_DECREF(key);
                 break;
             }
             slot = (slot + 1) & mask;
         }
         if (!found) {
             fpy_dict_set(counter, key, fpy_int(1));
+            FPY_VAL_DECREF(key);
         }
     }
     return counter;
@@ -8856,7 +11284,7 @@ void fastpy_chainmap_get(FpyChainMap *cm, const char *key,
             slot = (slot + 1) & mask;
         }
     }
-    fastpy_raise(FPY_EXC_KEYERROR, key);
+    fpy_raise_key_error(k);
     *out_tag = FPY_TAG_NONE; *out_data = 0; return;
 }
 

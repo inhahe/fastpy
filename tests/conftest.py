@@ -14,7 +14,7 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
-from tests.harness import diff_test, diff_test_file, DiffResult
+from tests.harness import diff_test, diff_test_file, DiffResult, DEFAULT_TIMEOUT
 
 
 @pytest.fixture
@@ -29,7 +29,7 @@ def assert_compiles():
     Skips if the compiler can't handle the program yet.
     Fails if the compiled output differs from CPython.
     """
-    def _assert(source: str, timeout: float = 10.0) -> DiffResult:
+    def _assert(source: str, timeout: float = DEFAULT_TIMEOUT) -> DiffResult:
         result = diff_test(source, timeout)
         if result.skipped:
             pytest.skip(result.reason)
@@ -48,7 +48,7 @@ def assert_file_compiles():
         def test_something(assert_file_compiles):
             assert_file_compiles(Path("tests/programs/test_arith.py"))
     """
-    def _assert(path: Path, timeout: float = 10.0) -> DiffResult:
+    def _assert(path: Path, timeout: float = DEFAULT_TIMEOUT) -> DiffResult:
         result = diff_test_file(path, timeout)
         if result.skipped:
             pytest.skip(result.reason)
@@ -123,3 +123,45 @@ class ProgramTestItem(pytest.Item):
 
     def reportinfo(self):
         return self.path, 0, f"program: {self.path.name}"
+
+
+# ---------------------------------------------------------------------------
+# Coverage warning: a green run that skipped the regression corpus
+# ---------------------------------------------------------------------------
+#
+# `pytest_collect_file` above is a *discovery* hook: it only fires for files
+# pytest walks into.  Naming test files explicitly on the command line
+# overrides `testpaths`, so the hook never sees `regressions/` and the whole
+# corpus — the record of every bug already fixed — is silently absent.  The run
+# is green, just several hundred tests smaller, which is the worst possible
+# failure mode for something whose entire job is to tell you a change is safe.
+#
+# pytest cannot be configured out of this (explicit paths always win), so the
+# fix is to make it loud rather than to prevent it.  We warn only when the
+# corpus is *entirely* absent while other tests ran: naming a handful of
+# regression files is obviously deliberate and stays quiet.
+# DEBT-NAMED-SUITES-SKIP-THE-REGRESSION-CORPUS.
+
+def pytest_collection_modifyitems(session, config, items):
+    config._fastpy_program_items = sum(
+        1 for i in items if isinstance(i, ProgramTestItem))
+    config._fastpy_other_items = len(items) - config._fastpy_program_items
+
+
+def pytest_terminal_summary(terminalreporter, exitstatus, config):
+    collected = getattr(config, "_fastpy_program_items", None)
+    if collected is None or collected > 0:
+        return
+    if not getattr(config, "_fastpy_other_items", 0):
+        return  # collected nothing at all; not this hazard
+    available = (len(_collect_python_files(_REGRESSIONS_DIR))
+                 + len(_collect_python_files(_PROGRAMS_DIR)))
+    if not available:
+        return
+    terminalreporter.write_sep("=", "partial run", yellow=True, bold=True)
+    terminalreporter.write_line(
+        f"This run covered 0 of {available} regression/program files. The "
+        f"corpus is collected by directory discovery, which naming test "
+        f"files on the command line bypasses.")
+    terminalreporter.write_line(
+        "Before calling a change safe, run: python -m pytest tests")

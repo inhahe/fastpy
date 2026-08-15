@@ -246,13 +246,25 @@ class ValueType:
     (==, in, startswith, split) so existing code that reads variables[name][1]
     keeps working during the gradual migration to VKind-based dispatch."""
 
-    __slots__ = ('kind', 'elem_type', 'class_name', '_tag_cache')
+    __slots__ = ('kind', 'elem_type', 'class_name', 'value_type', '_tag_cache')
 
     def __init__(self, kind: VKind, elem_type: 'ValueType | None' = None,
-                 class_name: str | None = None):
+                 class_name: str | None = None,
+                 value_type: 'ValueType | None' = None):
         self.kind = kind
         self.elem_type = elem_type
         self.class_name = class_name
+        # A dict's *value* type, kept apart from `elem_type` on purpose.
+        # `elem_type` answers "what does iterating this yield", which for a
+        # dict is a key, not a value — overloading the one slot for both would
+        # make every existing `elem_type is not None` test on a container
+        # silently start answering the wrong question.  A dict's values were
+        # previously tracked as membership in `_dict_var_int_values` and three
+        # sibling *name-sets*, which can say "the values are lists" and nothing
+        # about what those lists hold: `e = d["k"]; len(e[1])` answered 0 while
+        # the direct `len(d["k"][1])` was right.
+        # BUG-DICT-VALUE-CONTAINER-ELEM-KIND-LOST-ON-BIND.
+        self.value_type = value_type
         self._tag_cache: str | None = None
 
     # --- String tag conversion ---
@@ -286,12 +298,16 @@ class ValueType:
             base = "list"
         elif self.kind == VKind.TUPLE and self.elem_type:
             base = f"tuple:{self.elem_type._to_tag()}"
+        elif self.kind == VKind.DICT and self.value_type:
+            base = f"dict:{self.value_type._to_tag()}"
         self._tag_cache = base
         return base
 
     def __eq__(self, other):
         if isinstance(other, ValueType):
-            return self.kind == other.kind and self.elem_type == other.elem_type
+            return (self.kind == other.kind
+                    and self.elem_type == other.elem_type
+                    and self.value_type == other.value_type)
         if isinstance(other, VKind):
             return self.kind == other
         return NotImplemented
@@ -303,7 +319,7 @@ class ValueType:
         return not result
 
     def __hash__(self):
-        return hash((self.kind, self.elem_type))
+        return hash((self.kind, self.elem_type, self.value_type))
 
     def __repr__(self):
         return f"ValueType({self._to_tag()})"
@@ -347,6 +363,14 @@ class ValueType:
             "path": VKind.PATH, "native_func": VKind.NATIVE_FUNC,
             "native_mod": VKind.NATIVE_MOD, "cls": VKind.CLS,
             "cell": VKind.CELL, "namedtuple_type": VKind.INT,
+            # A function with no `return <expr>` carries ret_tag "void" and
+            # compiles to an LLVM `void` function; call sites substitute the
+            # placeholder `i64 0`.  "void" used to be absent from this map, so it
+            # fell through to UNKNOWN — whose old_tag is "int" — and the
+            # placeholder read back as the integer 0 instead of None.  NONE is
+            # not is_ptr, so llvm_type stays i64 and only the *tag* changes
+            # (fpy_tag 4 == FPY_TAG_NONE).  See BUG-VOID-RETURNS-ZERO-NOT-NONE.
+            "void": VKind.NONE,
         }
         if tag.startswith("list"):
             if ":" in tag:
@@ -357,7 +381,13 @@ class ValueType:
             elem = tag.split(":", 1)[1]
             return ValueType(VKind.LIST, elem_type=ValueType.from_old_tag(elem))
         if tag.startswith("dict:"):
-            return ValueType(VKind.DICT)
+            # The suffix used to be dropped on the floor, so a `dict:list:str`
+            # tag reached the reader as a bare dict and `e = d["k"]` bound a
+            # value of unknown kind.  BUG-DICT-VALUE-CONTAINER-ELEM-KIND-LOST-
+            # ON-BIND.
+            return ValueType(VKind.DICT,
+                             value_type=ValueType.from_old_tag(
+                                 tag.split(":", 1)[1]))
         if tag.startswith("tuple:"):
             elem = tag.split(":", 1)[1]
             return ValueType(VKind.TUPLE, elem_type=ValueType.from_old_tag(elem))
@@ -546,6 +576,34 @@ class _GenVarRewriter(ast.NodeTransformer):
         # Don't recurse into nested function definitions — their
         # local variables are their own scope
         return node
+
+
+class _ExternalTLSGlobal(ir.GlobalVariable):
+    """A declaration of a thread-local global defined in the C runtime.
+
+    llvmlite has no thread-local support at all: `ir.GlobalVariable.descr`
+    (llvmlite/ir/values.py) emits linkage, storage class, unnamed_addr and
+    addrspace and nothing else, so assigning a `.thread_local` attribute
+    merely creates an unused Python attribute and the module still says
+    `external global i32`.  That is not a missing optimisation but a wrong
+    program — the load would read the process-wide address rather than the
+    calling thread's copy, so one thread's raise would be invisible to
+    another and visible to a third.
+
+    `descr` is overridden outright rather than by splicing a keyword into
+    super()'s output, because LLVM's grammar fixes the order (linkage,
+    preemption, visibility, dllstorageclass, thread_local, unnamed_addr,
+    addrspace, ...) and this class only ever needs the one shape: an
+    external declaration with no initializer.  Writing that shape directly
+    cannot drift out of order.
+
+    `localexec` is the correct model here and not merely the fastest: fastpy
+    links the runtime statically into the executable, so the variable is
+    always in the main module's own TLS block.
+    """
+
+    def descr(self, buf):
+        buf.append(f"external thread_local(localexec) global {self.value_type}\n")
 
 
 class _SafeIRBuilder(ir.IRBuilder):
@@ -1119,7 +1177,19 @@ class CodeGen:
     def __init__(self, threading_mode: int = 0, int64_mode: bool = False,
                  typed_mode: bool = False,
                  source_filename: str = "<module>",
-                 analyze_mode: bool = False) -> None:
+                 analyze_mode: bool = False,
+                 inline_exc_check: bool = True) -> None:
+        # Emit the pending-exception check as a load of the runtime's
+        # thread-local flag rather than a call to fastpy_exc_pending().  See
+        # _emit_exc_pending for why that is worth doing.  It is a parameter and
+        # not a constant because MCJIT (compiler/jit.py) cannot resolve or
+        # relocate a TLS symbol at all — its symbol resolver maps mod.functions
+        # only, and even if it mapped globals there is no TLS-aware loader to
+        # apply the relocations.  The JIT therefore passes False and keeps the
+        # call form, which also keeps the fastpy_exc_pending declaration live.
+        # It has to be settable at construction because the declarations are
+        # emitted from __init__, before any caller could assign an attribute.
+        self.inline_exc_check = inline_exc_check
         self._current_scope_stmts = []  # Phase 4: initialize early
         self.module = ir.Module(name="fastpy_module")
         # Use the host platform's LLVM triple and data layout for correct
@@ -1156,6 +1226,21 @@ class CodeGen:
         # when _typed_mode is True.  Variables in this dict bypass the FpyValue
         # wrapping/unwrapping in _store_variable / _load_variable.
         self._native_vars: dict[str, tuple] = {}
+
+        # Model-2 refcounting for *native* (non-FpyValue) variable slots.
+        # An FV local carries its tag with it, so _store_variable can always
+        # decref whatever the slot held.  A native slot is a bare alloca — the
+        # tag lives only in the compiler — so we remember, per function, the
+        # tag each slot was last retained with:
+        #     {ir.Function: {name: (alloca, fpy_tag)}}
+        # Keyed by function (rather than reset alongside self.variables) so the
+        # several places that swap self.variables in and out don't have to know
+        # about it.  See BUG-BARE-ABI-STORE-NO-RETAIN.
+        self._rc_native_slots: dict = {}
+        # Native allocas already zero-initialized in their entry block, so the
+        # very first decref of a conditionally-assigned slot reads NULL rather
+        # than stack garbage.  Holds the alloca instructions themselves.
+        self._entry_nulled: set = set()
 
         # Pre-initialize attributes that generate() sets later,
         # so early exceptions don't leave them missing.
@@ -1237,12 +1322,17 @@ class CodeGen:
         self.function: ir.Function | None = None
         self.builder: ir.IRBuilder | None = None
         self.variables: dict[str, tuple[ir.AllocaInstr, str]] = {}
-        self._loop_stack: list[tuple[ir.Block, ir.Block]] = []
+        # (break target, continue target, finally depth at loop entry).  The
+        # depth is what tells `break`/`continue` which cleanups they leave —
+        # the ones pushed inside the loop, not the ones enclosing it.
+        self._loop_stack: list[tuple[ir.Block, ir.Block, int]] = []
         self._in_try_block: bool = False
-        # Stack of finally-body AST lists currently enclosing the emitter.
-        # A `return` inside a try-with-finally must emit all pending finally
-        # bodies in LIFO order before actually returning.
-        self._finally_stack: list[list[ast.stmt]] = []
+        # Stack of cleanups currently enclosing the emitter.  A `return`
+        # inside a try-with-finally must emit all pending finally bodies in
+        # LIFO order before actually returning.  An entry is either a
+        # finally-body AST list or — for a `with`, whose cleanup is IR that
+        # was never an AST — a callable that emits it.
+        self._finally_stack: list = []
 
         # Generator functions: set of function names that contain yield
         self._generator_funcs: set[str] = set()
@@ -1276,6 +1366,28 @@ class CodeGen:
         # AnnAssign handler can skip native alloca creation for them.
         self._unsafe_typed_vars: set[str] = set()
 
+        # How many `finally` bodies (or `with` __exit__ calls) enclose the
+        # statement being emitted, each of which has moved a pending
+        # exception aside with fastpy_exc_save.  A `return` from inside one
+        # never reaches the matching restore, so it has to drop the saved
+        # frames itself — which is also the right semantics: in Python a
+        # `return` in a `finally` discards the exception it interrupted.
+        self._finally_exc_depth = 0
+
+        # Locals of the scope being emitted that a read can reach before any
+        # binding does.  They must live in an FpyValue slot, because only
+        # that carries FPY_TAG_UNDEF — the tag that makes the premature read
+        # raise instead of returning the stack word that happened to be
+        # there.  See `_names_maybe_unbound`.
+        self._scope_maybe_unbound: set[str] = set()
+
+        # Locals that must be given an FpyValue slot from their very first
+        # assignment because they can hold a value whose kind is only known
+        # at runtime.  Pre-scanned per scope by _scan_fv_forced_locals so the
+        # slot never has to be widened mid-body (which would strand loads
+        # already emitted against the narrower one).
+        self._fv_forced_locals: set[str] = set()
+
         # Per-variable integer overflow policy from Annotated markers or
         # constructor calls (unchecked_int / checked_int).
         # Maps variable name → "unchecked" | "checked".
@@ -1293,6 +1405,17 @@ class CodeGen:
         # Per-class container attribute detection:
         # Maps class name -> (list_attrs, dict_attrs)
         self._class_container_attrs: dict[str, tuple[set[str], set[str]]] = {}
+
+        # Per-class attribute *types*: class name -> attr -> ValueType.
+        # `_class_container_attrs` above can answer only "is this attr a list?"
+        # and "is this attr a dict?", which cannot distinguish a tuple from a
+        # list (so `for v in c.t[1]` crashed while the list spelling worked)
+        # and cannot carry an element kind (so `self.data = data` in __init__
+        # left `c.data[1]` at the INT default).  This map is the truth; the two
+        # sets remain as the coarse yes/no views the older call sites ask for.
+        # An attr absent from here means "no information", not "not a
+        # container" — consumers must fall back rather than conclude.
+        self._class_attr_vtypes: dict[str, dict[str, 'ValueType']] = {}
 
         # Per-class float/string/bool/int attribute detection (including inherited attrs)
         self._per_class_float_attrs: dict[str, set[str]] = {}
@@ -1321,6 +1444,16 @@ class CodeGen:
         #   prevent polymorphic dispatch in _receiver_may_be_subclass.
         self._obj_var_class: dict[str, str] = {}
         self._obj_var_pinned: set[str] = set()
+
+        # Variables bound to a built-in file object (from open()).  These are
+        # stored as VKind.OBJ but their class ("file") is runtime-only, so
+        # method calls route through _emit_method_call_file (obj_call_methodN
+        # + get_ret_tag recovery) instead of the user-class dispatch paths.
+        self._file_vars: set[str] = set()
+        # Whether the program rebinds `open`; computed once from the module
+        # AST, since the return-type pre-pass cannot ask `_user_functions`
+        # while that set is still being filled.  See `_open_is_shadowed`.
+        self._open_shadowed: bool | None = None
 
         # Track dict variables whose values are all lists (so d[k] returns a list)
         self._dict_var_list_values: set[str] = set()
@@ -1394,6 +1527,12 @@ class CodeGen:
         # void fastpy_fv_subscript(i32 c_tag, i64 c_data, i32 k_tag, i64 k_data, i32* out_tag, i64* out_data)
         ft = ir.FunctionType(void, [i32, i64, i32, i64, ir.PointerType(i32), ir.PointerType(i64)])
         self.runtime["fv_subscript"] = ir.Function(self.module, ft, name="fastpy_fv_subscript")
+        # void fastpy_fv_slice(i32 c_tag, i64 c_data, i64 start, i64 stop,
+        #                      i64 step, i64 has_start, i64 has_stop,
+        #                      i64 has_step, i32* out_tag, i64* out_data)
+        ft = ir.FunctionType(void, [i32, i64, i64, i64, i64, i64, i64, i64,
+                                    ir.PointerType(i32), ir.PointerType(i64)])
+        self.runtime["fv_slice"] = ir.Function(self.module, ft, name="fastpy_fv_slice")
         # i32 fastpy_fv_contains(i32 c_tag, i64 c_data, i32 v_tag, i64 v_data)
         ft = ir.FunctionType(i32, [i32, i64, i32, i64])
         self.runtime["fv_contains"] = ir.Function(self.module, ft, name="fastpy_fv_contains")
@@ -1422,6 +1561,16 @@ class CodeGen:
         self.runtime["str_slice"] = ir.Function(self.module, ft, name="fastpy_str_slice")
         ft = ir.FunctionType(i8_ptr, [i8_ptr, i64, i64, i64, i64, i64])
         self.runtime["str_slice_step"] = ir.Function(self.module, ft, name="fastpy_str_slice_step")
+        # Slicing a bytes needs its own pair: the str versions index by code
+        # point and hand back an FpyString, whose header is a different size —
+        # so a BYTES-tagged FpyString makes every later fpy_bytes_len probe out
+        # of bounds.  These are byte-indexed and FpyBytes-backed.
+        # BUG-BYTES-SLICE-VIA-STR.
+        ft = ir.FunctionType(i8_ptr, [i8_ptr, i64, i64, i64, i64])
+        self.runtime["bytes_slice"] = ir.Function(self.module, ft, name="fastpy_bytes_slice")
+        ft = ir.FunctionType(i8_ptr, [i8_ptr, i64, i64, i64, i64, i64])
+        self.runtime["bytes_slice_step"] = ir.Function(
+            self.module, ft, name="fastpy_bytes_slice_step")
         ft = ir.FunctionType(i8_ptr, [i8_ptr, i64])
         self.runtime["str_repeat"] = ir.Function(self.module, ft, name="fastpy_str_repeat")
         ft = ir.FunctionType(i8_ptr, [i8_ptr])
@@ -1446,6 +1595,20 @@ class CodeGen:
         self.runtime["list_get_fv"] = ir.Function(self.module, ft, name="fastpy_list_get_fv")
         ft = ir.FunctionType(void, [i8_ptr, i64, i32, i64])
         self.runtime["list_set_fv"] = ir.Function(self.module, ft, name="fastpy_list_set_fv")
+        # abs() of a tagged value.  Six tags are numeric, not two, so this
+        # cannot be open-coded as an i64/double select in codegen without
+        # silently mis-handling bigint/Decimal/complex.
+        # BUG-ABS-OF-TAGGED-VALUE.
+        ft = ir.FunctionType(void, [i32, i64, ir.PointerType(i32),
+                                    ir.PointerType(i64)])
+        self.runtime["abs_fv"] = ir.Function(self.module, ft, name="fastpy_abs_fv")
+        self.runtime["neg_fv"] = ir.Function(self.module, ft, name="fastpy_neg_fv")
+        # int()/float() of a tagged value, for the same reason: seven tags can
+        # convert (int, bool, float, str, bytes, bigint, Decimal) and the rest
+        # must raise, which is more arms than anyone inlines correctly.
+        # BUG-INT-FLOAT-OF-TAGGED-VALUE.
+        self.runtime["int_fv"] = ir.Function(self.module, ft, name="fastpy_int_fv")
+        self.runtime["float_fv"] = ir.Function(self.module, ft, name="fastpy_float_fv")
         ft = ir.FunctionType(void, [i8_ptr, i8_ptr, i32, i64])
         self.runtime["dict_set_fv"] = ir.Function(self.module, ft, name="fastpy_dict_set_fv")
         ft = ir.FunctionType(void, [i8_ptr, i8_ptr, ir.PointerType(i32), ir.PointerType(i64)])
@@ -1493,11 +1656,26 @@ class CodeGen:
         self.runtime["set_clear"] = ir.Function(self.module, ft, name="fastpy_set_clear")
         ft = ir.FunctionType(void, [i8_ptr, i32.as_pointer(), i64.as_pointer()])
         self.runtime["set_pop_fv"] = ir.Function(self.module, ft, name="fastpy_set_pop_fv")
-        ft = ir.FunctionType(void, [i8_ptr, i8_ptr])
-        self.runtime["set_update"] = ir.Function(self.module, ft, name="fastpy_set_update")
-        self.runtime["set_intersection_update"] = ir.Function(self.module, ft, name="fastpy_set_intersection_update")
-        self.runtime["set_difference_update"] = ir.Function(self.module, ft, name="fastpy_set_difference_update")
-        self.runtime["set_symmetric_difference_update"] = ir.Function(self.module, ft, name="fastpy_set_symmetric_difference_update")
+        # The (tag, data) forms.  Every set method that takes an "other" takes
+        # any iterable in CPython, and the argument's kind is a runtime fact --
+        # it is a parameter as often as not -- so the tag has to survive to the
+        # runtime rather than being assumed to be SET.  Assuming it segfaulted
+        # on `s.update([1])`: BUG-SET-UPDATE-NON-SET-ITERABLE-SEGFAULTS.  The
+        # FpyDict* forms above stay, because the *operators* (`|`, `&`, `-`,
+        # `^`, `|=`) really do require a set on both sides.
+        ft = ir.FunctionType(void, [i8_ptr, i32, i64])
+        for _n in ("update", "intersection_update", "difference_update",
+                   "symmetric_difference_update"):
+            self.runtime["set_%s_fv" % _n] = ir.Function(
+                self.module, ft, name="fastpy_set_%s_fv" % _n)
+        ft = ir.FunctionType(i8_ptr, [i8_ptr, i32, i64])
+        for _n in ("union", "intersection", "difference", "symmetric_diff"):
+            self.runtime["set_%s_fv" % _n] = ir.Function(
+                self.module, ft, name="fastpy_set_%s_fv" % _n)
+        ft = ir.FunctionType(i32, [i8_ptr, i32, i64])
+        for _n in ("issubset", "issuperset", "isdisjoint"):
+            self.runtime["set_%s_fv" % _n] = ir.Function(
+                self.module, ft, name="fastpy_set_%s_fv" % _n)
         ft = ir.FunctionType(i8_ptr, [i8_ptr])  # str_split(s) -> list
         self.runtime["str_split"] = ir.Function(self.module, ft, name="fastpy_str_split")
         ft = ir.FunctionType(i64, [i8_ptr, i8_ptr])
@@ -1514,6 +1692,11 @@ class CodeGen:
         self.runtime["str_endswith"] = ir.Function(self.module, ft, name="fastpy_str_endswith")
         ft = ir.FunctionType(i32, [i8_ptr, i8_ptr])
         self.runtime["str_contains"] = ir.Function(self.module, ft, name="fastpy_str_contains")
+        # `x in b"..."` — the left operand arrives tagged so the runtime can
+        # tell an int (byte value) from a bytes/str (subsequence).
+        ft = ir.FunctionType(i32, [i8_ptr, i32, i64])
+        self.runtime["bytes_contains"] = ir.Function(
+            self.module, ft, name="fastpy_bytes_contains")
         ft = ir.FunctionType(i8_ptr, [i8_ptr, i8_ptr])
         self.runtime["str_removeprefix"] = ir.Function(self.module, ft, name="fastpy_str_removeprefix")
         self.runtime["str_removesuffix"] = ir.Function(self.module, ft, name="fastpy_str_removesuffix")
@@ -1625,6 +1808,9 @@ class CodeGen:
         # Dict-backed set operations
         ft = ir.FunctionType(i8_ptr, [i8_ptr])  # set_from_list(list) -> set(dict)
         self.runtime["set_from_list"] = ir.Function(self.module, ft, name="fastpy_set_from_list")
+        ft = ir.FunctionType(i8_ptr, [i32, i64])  # set(x) over any iterable
+        self.runtime["set_from_iterable_fv"] = ir.Function(
+            self.module, ft, name="fastpy_set_from_iterable_fv")
         ft = ir.FunctionType(i8_ptr, [i8_ptr])  # set_to_list(set) -> list
         self.runtime["set_to_list"] = ir.Function(self.module, ft, name="fastpy_set_to_list")
         ft = ir.FunctionType(void, [i8_ptr, i32, i64])  # set_add_fv(set, tag, data)
@@ -1792,6 +1978,29 @@ class CodeGen:
         # bytes length (FpyBytes-aware, handles embedded null bytes)
         ft = ir.FunctionType(i64, [i8_ptr])
         self.runtime["bytes_len"] = ir.Function(self.module, ft, name="fastpy_bytes_len")
+        # bytes + bytes → concat (FpyBytes-aware, embedded-null safe, header-backed)
+        ft = ir.FunctionType(i8_ptr, [i8_ptr, i8_ptr])
+        self.runtime["bytes_concat"] = ir.Function(self.module, ft, name="fastpy_bytes_concat")
+        # bytes * int → repeat
+        ft = ir.FunctionType(i8_ptr, [i8_ptr, i64])
+        self.runtime["bytes_repeat"] = ir.Function(self.module, ft, name="fastpy_bytes_repeat")
+        # bytes-native methods (FpyBytes-aware, embedded-null safe, header-backed).
+        # Single-bytes → bytes results:
+        ft = ir.FunctionType(i8_ptr, [i8_ptr])
+        self.runtime["bytes_upper"] = ir.Function(self.module, ft, name="fastpy_bytes_upper")
+        self.runtime["bytes_lower"] = ir.Function(self.module, ft, name="fastpy_bytes_lower")
+        self.runtime["bytes_strip"] = ir.Function(self.module, ft, name="fastpy_bytes_strip")
+        self.runtime["bytes_lstrip"] = ir.Function(self.module, ft, name="fastpy_bytes_lstrip")
+        self.runtime["bytes_rstrip"] = ir.Function(self.module, ft, name="fastpy_bytes_rstrip")
+        # bytes.replace(old, new) → bytes
+        ft = ir.FunctionType(i8_ptr, [i8_ptr, i8_ptr, i8_ptr])
+        self.runtime["bytes_replace"] = ir.Function(self.module, ft, name="fastpy_bytes_replace")
+        # bytes.split(sep) → FpyList of bytes
+        ft = ir.FunctionType(i8_ptr, [i8_ptr, i8_ptr])
+        self.runtime["bytes_split_sep"] = ir.Function(self.module, ft, name="fastpy_bytes_split_sep")
+        # bytes.join(list) → bytes
+        ft = ir.FunctionType(i8_ptr, [i8_ptr, i8_ptr])
+        self.runtime["bytes_join"] = ir.Function(self.module, ft, name="fastpy_bytes_join")
         # dict.fromkeys(keys, value) and dict.fromkeys(keys)
         ft = ir.FunctionType(i8_ptr, [i8_ptr, i32, i64])
         self.runtime["dict_fromkeys"] = ir.Function(self.module, ft, name="fastpy_dict_fromkeys")
@@ -2192,6 +2401,14 @@ class CodeGen:
         self.runtime["cpython_import"] = ir.Function(self.module, ft, name="fpy_cpython_import")
         ft = ir.FunctionType(i8_ptr, [i8_ptr, i8_ptr])  # fpy_cpython_getattr(obj, name) -> PyObject*
         self.runtime["cpython_getattr"] = ir.Function(self.module, ft, name="fpy_cpython_getattr")
+        # Native-module variants: on host these are the real import/getattr;
+        # in pure mode (bridge_stub.c) they return a non-raising sentinel so
+        # `import sys` never hard-requires the CPython bridge (only an actual
+        # use of an unsupported non-native attribute raises).
+        ft = ir.FunctionType(i8_ptr, [i8_ptr])  # fpy_cpython_import_native(name) -> handle
+        self.runtime["cpython_import_native"] = ir.Function(self.module, ft, name="fpy_cpython_import_native")
+        ft = ir.FunctionType(i8_ptr, [i8_ptr, i8_ptr])  # fpy_cpython_getattr_native(obj, name) -> handle
+        self.runtime["cpython_getattr_native"] = ir.Function(self.module, ft, name="fpy_cpython_getattr_native")
         # get_builtin(name) -> PyObject* (str, int, float, list, …)
         ft = ir.FunctionType(i8_ptr, [i8_ptr])
         self.runtime["cpython_get_builtin"] = ir.Function(self.module, ft, name="fpy_cpython_get_builtin")
@@ -2278,6 +2495,11 @@ class CodeGen:
         # Convert any FpyValue (tag, data) to native FpyList* (dispatches by tag)
         ft = ir.FunctionType(i8_ptr, [i32, i64])
         self.runtime["fv_to_list"] = ir.Function(self.module, ft, name="fastpy_fv_to_list")
+        # bytes(x) — dispatches on the tag the same way, so an
+        # iterable of any kind, an int count, a bytes copy and the str error
+        # all resolve in one place instead of via the CPython bridge.
+        self.runtime["fv_to_bytes"] = ir.Function(
+            self.module, ft, name="fastpy_fv_to_bytes")
         # Convert CPython dict (PyObject*) to native FpyDict*
         self.runtime["cpython_to_dict"] = ir.Function(self.module, ft, name="fpy_cpython_to_dict")
         # pyobj subscript: getitem(obj, key_tag, key_data) → PyObject*
@@ -2354,6 +2576,8 @@ class CodeGen:
         self.runtime["obj_new"] = ir.Function(self.module, ft, name="fastpy_obj_new")
         ft = ir.FunctionType(i8_ptr, [i8_ptr])  # list_iter_new(list*) -> obj*
         self.runtime["list_iter_new"] = ir.Function(self.module, ft, name="fastpy_list_iter_new")
+        ft = ir.FunctionType(i8_ptr, [i8_ptr, i8_ptr])  # io_open(path, mode) -> file obj*
+        self.runtime["io_open"] = ir.Function(self.module, ft, name="fastpy_io_open")
         # Tagged-value attribute access (post-refactor). The old typed
         # variants (obj_set_int/float/str, obj_get_int/float/str) were
         # replaced — they're no longer emitted by the compiler.
@@ -2448,6 +2672,7 @@ class CodeGen:
         self.runtime["safe_mod"] = ir.Function(self.module, ft, name="fastpy_safe_mod")
         ft = ir.FunctionType(double, [double, double])
         self.runtime["safe_fdiv"] = ir.Function(self.module, ft, name="fastpy_safe_fdiv")
+        self.runtime["safe_fmod"] = ir.Function(self.module, ft, name="fastpy_safe_fmod")
         ft = ir.FunctionType(double, [i64, i64])
         self.runtime["safe_int_fdiv"] = ir.Function(self.module, ft, name="fastpy_safe_int_fdiv")
 
@@ -2455,6 +2680,17 @@ class CodeGen:
         # int fastpy_exc_pending(void)
         ft = ir.FunctionType(i32, [])
         self.runtime["exc_pending"] = ir.Function(self.module, ft, name="fastpy_exc_pending")
+        # ...and the flag that function reads, so the check can be the load it
+        # actually is.  See _emit_exc_pending for why that matters; the
+        # declaration lives here, next to the function it replaces, so the two
+        # cannot drift apart.  `int fpy_exc_type` (runtime/runtime.c) is
+        # deliberately not static, and FPY_EXC_NONE is 0
+        # (runtime/exceptions.h), so "pending" is exactly "nonzero".  Declared
+        # only when it will be used: MCJIT chokes on a TLS symbol it cannot
+        # resolve whether or not anything loads from it.
+        if self.inline_exc_check:
+            self.runtime["exc_type_flag"] = _ExternalTLSGlobal(
+                self.module, i32, name="fpy_exc_type")
         # void fastpy_exc_unhandled(void) — print and exit
         ft = ir.FunctionType(void, [])
         self.runtime["exc_unhandled"] = ir.Function(self.module, ft, name="fastpy_exc_unhandled")
@@ -2476,6 +2712,20 @@ class CodeGen:
         # void fastpy_exc_clear(void)
         ft = ir.FunctionType(void, [])
         self.runtime["exc_clear"] = ir.Function(self.module, ft, name="fastpy_exc_clear")
+        # Moving the pending exception aside while a `finally` body or a
+        # `with` block's __exit__ runs — see fastpy_exc_save in runtime.c.
+        ft = ir.FunctionType(void, [])
+        self.runtime["exc_save"] = ir.Function(
+            self.module, ft, name="fastpy_exc_save")
+        ft = ir.FunctionType(void, [])
+        self.runtime["exc_restore"] = ir.Function(
+            self.module, ft, name="fastpy_exc_restore")
+        ft = ir.FunctionType(void, [])
+        self.runtime["exc_drop"] = ir.Function(
+            self.module, ft, name="fastpy_exc_drop")
+        ft = ir.FunctionType(i32, [])
+        self.runtime["exc_saved_pending"] = ir.Function(
+            self.module, ft, name="fastpy_exc_saved_pending")
         # int fastpy_exc_name_to_id(const char *name)
         ft = ir.FunctionType(i32, [i8_ptr])
         self.runtime["exc_name_to_id"] = ir.Function(self.module, ft, name="fastpy_exc_name_to_id")
@@ -2538,11 +2788,13 @@ class CodeGen:
         self.runtime["checked_sub"] = ir.Function(self.module, ft, name="fpy_checked_sub")
         self.runtime["checked_mul"] = ir.Function(self.module, ft, name="fpy_checked_mul")
         self.runtime["checked_pow"] = ir.Function(self.module, ft, name="fpy_checked_pow")
+        self.runtime["checked_lshift"] = ir.Function(self.module, ft, name="fpy_checked_lshift")
         # BigInt operations
         ft = ir.FunctionType(i8_ptr, [i8_ptr])
         self.runtime["bigint_to_str"] = ir.Function(self.module, ft, name="fpy_bigint_to_str")
         self.runtime["bigint_from_str"] = ir.Function(self.module, ft, name="fpy_bigint_from_str")
         self.runtime["bigint_neg"] = ir.Function(self.module, ft, name="fpy_bigint_neg")
+        self.runtime["bigint_abs"] = ir.Function(self.module, ft, name="fpy_bigint_abs")
         # BigInt arithmetic (two FpyBigInt* → FpyBigInt*)
         ft = ir.FunctionType(i8_ptr, [i8_ptr, i8_ptr])
         self.runtime["bigint_add"] = ir.Function(self.module, ft, name="fpy_bigint_add")
@@ -2551,6 +2803,12 @@ class CodeGen:
         self.runtime["bigint_floordiv"] = ir.Function(self.module, ft, name="fpy_bigint_floordiv")
         self.runtime["bigint_mod"] = ir.Function(self.module, ft, name="fpy_bigint_mod")
         self.runtime["bigint_pow"] = ir.Function(self.module, ft, name="fpy_bigint_pow")
+        # BigInt bitwise / shift (two FpyBigInt* → FpyBigInt*)
+        self.runtime["bigint_and"] = ir.Function(self.module, ft, name="fpy_bigint_and")
+        self.runtime["bigint_or"] = ir.Function(self.module, ft, name="fpy_bigint_or")
+        self.runtime["bigint_xor"] = ir.Function(self.module, ft, name="fpy_bigint_xor")
+        self.runtime["bigint_lshift"] = ir.Function(self.module, ft, name="fpy_bigint_lshift")
+        self.runtime["bigint_rshift"] = ir.Function(self.module, ft, name="fpy_bigint_rshift")
         # BigInt comparison (returns i32: -1, 0, 1)
         ft = ir.FunctionType(i32, [i8_ptr, i8_ptr])
         self.runtime["bigint_cmp"] = ir.Function(self.module, ft, name="fpy_bigint_cmp")
@@ -2580,6 +2838,92 @@ class CodeGen:
         # Native OS functions
         ft = ir.FunctionType(i8_ptr, [])
         self.runtime["os_getcwd"] = ir.Function(self.module, ft, name="fastpy_os_getcwd")
+        # os.getpid() -> int (the calling process's PID; on SlateOS a real
+        # SYS_PROCESS_ID syscall via posix getpid()).
+        ft = ir.FunctionType(i64, [])
+        self.runtime["os_getpid"] = ir.Function(self.module, ft, name="fastpy_os_getpid")
+        # os.getppid() -> int (the parent PID; on SlateOS a real
+        # SYS_PROCESS_PARENT_ID syscall via posix getppid()).
+        self.runtime["os_getppid"] = ir.Function(self.module, ft, name="fastpy_os_getppid")
+        # os.gettid() -> int (the calling thread's kernel task ID; on SlateOS a
+        # real SYS_TASK_ID syscall via posix gettid() — a distinct kernel path
+        # from the process table, hitting the scheduler's task table).
+        self.runtime["os_gettid"] = ir.Function(self.module, ft, name="fastpy_os_gettid")
+        # os.getuid()/os.getgid() -> int (the calling process's real uid/gid; on
+        # SlateOS a real SYS_PROCESS_GET_CREDENTIALS syscall via posix
+        # getuid()/getgid() — reads the process credentials set at spawn, a
+        # distinct kernel path from the pid/tid identity syscalls).
+        self.runtime["os_getuid"] = ir.Function(self.module, ft, name="fastpy_os_getuid")
+        self.runtime["os_getgid"] = ir.Function(self.module, ft, name="fastpy_os_getgid")
+        # os.setuid(uid)/os.setgid(gid) -> int status (0 ok, -1 EPERM).  On
+        # SlateOS these call posix setuid()/setgid(), which — after the
+        # userspace CAP_SETUID/CAP_SETGID + identity check — issue the real
+        # SYS_PROCESS_SET_CREDENTIALS syscall that *mutates* the process's
+        # kernel credentials (previously a silent no-op).  A distinct kernel
+        # path (the process-credentials table) from the read-only getuid/getgid.
+        # CPython returns None; like os.remove/chmod we model the status as int.
+        ft = ir.FunctionType(i64, [i64])
+        self.runtime["os_setuid"] = ir.Function(self.module, ft, name="fastpy_os_setuid")
+        self.runtime["os_setgid"] = ir.Function(self.module, ft, name="fastpy_os_setgid")
+        # os.nice(inc) -> int new nice value.  On SlateOS posix nice() reads the
+        # process's current kernel nice (SYS_PROCESS_GET_NICE), adds the
+        # increment, and — after the userspace CAP_SYS_NICE check for a
+        # priority-raise — installs it via SYS_PROCESS_SET_NICE, which *also*
+        # maps nice to a scheduler priority level and re-prioritises the
+        # process's tasks.  Nice is a real scheduling attribute, not a stored
+        # no-op.  A distinct kernel path (the scheduler) from every filesystem/
+        # credential syscall.
+        ft = ir.FunctionType(i64, [i64])
+        self.runtime["os_nice"] = ir.Function(self.module, ft, name="fastpy_os_nice")
+        # os.getpriority(which, who) -> int nice value.  On SlateOS posix
+        # getpriority() reads the caller's real kernel nice via
+        # SYS_PROCESS_GET_NICE.
+        ft = ir.FunctionType(i64, [i64, i64])
+        self.runtime["os_getpriority"] = ir.Function(self.module, ft, name="fastpy_os_getpriority")
+        # os.setpriority(which, who, prio) -> int status (0 ok, -1 error).  On
+        # SlateOS posix setpriority() installs the nice value via
+        # SYS_PROCESS_SET_NICE (re-prioritising the process's tasks) after the
+        # userspace CAP_SYS_NICE check.
+        ft = ir.FunctionType(i64, [i64, i64, i64])
+        self.runtime["os_setpriority"] = ir.Function(self.module, ft, name="fastpy_os_setpriority")
+        # os.pipe() -> 2-element list [read_fd, write_fd] (FpyList* as i8_ptr).
+        # On SlateOS posix pipe() is a real SYS_PIPE_CREATE syscall — a distinct
+        # kernel path (the pipe subsystem) from file/process syscalls.
+        ft = ir.FunctionType(i8_ptr, [])
+        self.runtime["os_pipe"] = ir.Function(self.module, ft, name="fastpy_os_pipe")
+        # os.write(fd, data) -> bytes written (i64); fd is a raw int fd, data a str.
+        ft = ir.FunctionType(i64, [i64, i8_ptr])
+        self.runtime["os_write"] = ir.Function(self.module, ft, name="fastpy_os_write")
+        # os.read(fd, n) -> str (i8_ptr) of up to n bytes read.
+        ft = ir.FunctionType(i8_ptr, [i64, i64])
+        self.runtime["os_read"] = ir.Function(self.module, ft, name="fastpy_os_read")
+        # os.close(fd) -> int status (0 ok, -1 error).
+        ft = ir.FunctionType(i64, [i64])
+        self.runtime["os_close"] = ir.Function(self.module, ft, name="fastpy_os_close")
+        # os.dup(fd) -> new int fd aliasing the same kernel object (-1 error).
+        ft = ir.FunctionType(i64, [i64])
+        self.runtime["os_dup"] = ir.Function(self.module, ft, name="fastpy_os_dup")
+        # os.dup2(oldfd, newfd) -> newfd, aliasing oldfd's handle (-1 error).
+        ft = ir.FunctionType(i64, [i64, i64])
+        self.runtime["os_dup2"] = ir.Function(self.module, ft, name="fastpy_os_dup2")
+        # os.lseek(fd, offset, whence) -> new int file offset (-1 error).
+        ft = ir.FunctionType(i64, [i64, i64, i64])
+        self.runtime["os_lseek"] = ir.Function(self.module, ft, name="fastpy_os_lseek")
+        # os.open(path, flags, mode) -> new raw int file fd (-1 error).
+        ft = ir.FunctionType(i64, [i8_ptr, i64, i64])
+        self.runtime["os_open"] = ir.Function(self.module, ft, name="fastpy_os_open")
+        # os.umask(mask) -> previous mask (i64). Sets the process create mask.
+        ft = ir.FunctionType(i64, [i64])
+        self.runtime["os_umask"] = ir.Function(self.module, ft, name="fastpy_os_umask")
+        # os.ftruncate(fd, length) -> int status (0 ok, -1 error).
+        ft = ir.FunctionType(i64, [i64, i64])
+        self.runtime["os_ftruncate"] = ir.Function(self.module, ft, name="fastpy_os_ftruncate")
+        # os.pwrite(fd, data, offset) -> bytes written (i64); positioned write.
+        ft = ir.FunctionType(i64, [i64, i8_ptr, i64])
+        self.runtime["os_pwrite"] = ir.Function(self.module, ft, name="fastpy_os_pwrite")
+        # os.pread(fd, n, offset) -> str (i8_ptr); positioned read.
+        ft = ir.FunctionType(i8_ptr, [i64, i64, i64])
+        self.runtime["os_pread"] = ir.Function(self.module, ft, name="fastpy_os_pread")
         ft = ir.FunctionType(i64, [i8_ptr])
         self.runtime["os_path_exists"] = ir.Function(self.module, ft, name="fastpy_os_path_exists")
         self.runtime["os_path_isfile"] = ir.Function(self.module, ft, name="fastpy_os_path_isfile")
@@ -2592,6 +2936,117 @@ class CodeGen:
         self.runtime["os_getenv"] = ir.Function(self.module, ft, name="fastpy_os_getenv")
         ft = ir.FunctionType(i8_ptr, [i8_ptr])
         self.runtime["os_listdir"] = ir.Function(self.module, ft, name="fastpy_os_listdir")
+        # os.stat(path) -> FpyList* (opaque i8_ptr) of 10 ints, mirroring
+        # CPython's os.stat_result sequence form: (st_mode, st_ino, st_dev,
+        # st_nlink, st_uid, st_gid, st_size, st_atime, st_mtime, st_ctime).
+        # One SYS_FS_STAT fills the whole struct — the capstone exercising many
+        # stat fields at once. Returned like listdir (raw list pointer).
+        ft = ir.FunctionType(i8_ptr, [i8_ptr])
+        self.runtime["os_stat"] = ir.Function(self.module, ft, name="fastpy_os_stat")
+        # os.statvfs(path) -> FpyList* (opaque i8_ptr) of 10 ints, mirroring
+        # CPython's os.statvfs_result sequence form: (f_bsize, f_frsize,
+        # f_blocks, f_bfree, f_bavail, f_files, f_ffree, f_favail, f_flag,
+        # f_namemax). One SYS_FS_STATVFS reports the whole filesystem's
+        # capacity/limits — distinct from os.stat's per-file metadata.
+        ft = ir.FunctionType(i8_ptr, [i8_ptr])
+        self.runtime["os_statvfs"] = ir.Function(self.module, ft, name="fastpy_os_statvfs")
+        # os.remove(path)/os.unlink(path) -> int status (0 ok, -1 error)
+        ft = ir.FunctionType(i64, [i8_ptr])
+        self.runtime["os_remove"] = ir.Function(self.module, ft, name="fastpy_os_remove")
+        # os.mkdir(path)/os.rmdir(path) -> int status (0 ok, -1 error)
+        ft = ir.FunctionType(i64, [i8_ptr])
+        self.runtime["os_mkdir"] = ir.Function(self.module, ft, name="fastpy_os_mkdir")
+        self.runtime["os_rmdir"] = ir.Function(self.module, ft, name="fastpy_os_rmdir")
+        # os.rename(src, dst) -> int status (0 ok, -1 error)
+        ft = ir.FunctionType(i64, [i8_ptr, i8_ptr])
+        self.runtime["os_rename"] = ir.Function(self.module, ft, name="fastpy_os_rename")
+        # os.execv(path, argv) -> i64; only returns on failure (-1). On success
+        # the calling process image is replaced by the new program (execv never
+        # returns). path is a str; argv is an FpyList* of str (opaque i8_ptr)
+        # that becomes the NULL-terminated C argv[]. Backed by posix execv() ->
+        # SYS_EXECVE on SlateOS.
+        ft = ir.FunctionType(i64, [i8_ptr, i8_ptr])
+        self.runtime["os_execv"] = ir.Function(self.module, ft, name="fastpy_os_execv")
+        # os.fork() -> i64: child PID in the parent, 0 in the child, -1 on error.
+        # Backed by posix fork() -> SYS_PROCESS_FORK on SlateOS. The classic
+        # companion to os.execv: fork, then execv in the child.
+        ft = ir.FunctionType(i64, [])
+        self.runtime["os_fork"] = ir.Function(self.module, ft, name="fastpy_os_fork")
+        # os.waitpid(pid, options) -> FpyList* [pid, status] (as i8_ptr). CPython
+        # returns a (pid, status) tuple; pure mode unpacks a 2-element list the
+        # same way. Backed by posix waitpid() on SlateOS. Reaps a child; the
+        # status is decodable via os.WIFEXITED/os.WEXITSTATUS.
+        ft = ir.FunctionType(i8_ptr, [i64, i64])
+        self.runtime["os_waitpid"] = ir.Function(self.module, ft, name="fastpy_os_waitpid")
+        # os.WIFEXITED(status)/os.WEXITSTATUS(status) -> i64. Decode the raw wait
+        # status returned by os.waitpid: WIFEXITED is 1 for a normal exit, and
+        # WEXITSTATUS extracts the child's exit code.
+        ft = ir.FunctionType(i64, [i64])
+        self.runtime["os_wifexited"] = ir.Function(self.module, ft, name="fastpy_os_wifexited")
+        self.runtime["os_wexitstatus"] = ir.Function(self.module, ft, name="fastpy_os_wexitstatus")
+        # os.path.getsize(path) -> file size in bytes (i64; -1 on error)
+        ft = ir.FunctionType(i64, [i8_ptr])
+        self.runtime["os_path_getsize"] = ir.Function(self.module, ft, name="fastpy_os_path_getsize")
+        # os.path.getmtime(path) -> modification time in seconds since epoch
+        # (double, CPython-faithful float; -1.0 on error).  Reads the mtime
+        # field of the stat struct (SYS_FS_STAT) — a distinct metadata field
+        # from getsize's st_size.
+        ft = ir.FunctionType(ir.DoubleType(), [i8_ptr])
+        self.runtime["os_path_getmtime"] = ir.Function(self.module, ft, name="fastpy_os_path_getmtime")
+        # os.path.getatime(path) -> last-access time in seconds since epoch
+        # (double float; -1.0 on error).  Reads the *atime* field of the stat
+        # struct (SYS_FS_STAT) — a distinct timestamp field from getmtime's
+        # st_mtim.
+        ft = ir.FunctionType(ir.DoubleType(), [i8_ptr])
+        self.runtime["os_path_getatime"] = ir.Function(self.module, ft, name="fastpy_os_path_getatime")
+        # os.path.getctime(path) -> metadata-change (ctime) time in seconds since
+        # epoch (double float; -1.0 on error).  Reads the *ctime* field of the
+        # stat struct (SYS_FS_STAT) — a distinct timestamp field from atime/mtime
+        # that (unlike them) is not settable via os.utime.
+        ft = ir.FunctionType(ir.DoubleType(), [i8_ptr])
+        self.runtime["os_path_getctime"] = ir.Function(self.module, ft, name="fastpy_os_path_getctime")
+        # os.access(path, mode) -> bool (True if accessible).  mode is the POSIX
+        # accessibility mask (F_OK=0, R_OK=4, W_OK=2, X_OK=1) passed as an i64.
+        # Unlike the get*time stat-field reads, this exercises the libc access()
+        # entry point and the mode argument is honored (access() rejects mode
+        # bits outside R|W|X with EINVAL). Runtime returns i64 1/0.
+        ft = ir.FunctionType(i64, [i8_ptr, i64])
+        self.runtime["os_access"] = ir.Function(self.module, ft, name="fastpy_os_access")
+        # os.path.samefile(a, b) -> bool (True if both paths are the same file).
+        # Compares the (st_dev, st_ino) identity of two SYS_FS_STAT results — the
+        # first lowering to exercise the st_ino field. Both stats follow symlinks,
+        # so a file and a symlink to it compare equal. Runtime returns i64 1/0.
+        ft = ir.FunctionType(i64, [i8_ptr, i8_ptr])
+        self.runtime["os_path_samefile"] = ir.Function(self.module, ft, name="fastpy_os_path_samefile")
+        # os.path.islink(path) -> bool (True if path is a symbolic link).  Uses
+        # lstat() (no-follow) + S_ISLNK — the first lowering with lstat
+        # semantics, distinct from exists/isfile/isdir (which follow symlinks).
+        # A symlink reports True even when its target is missing.  i64 1/0.
+        ft = ir.FunctionType(i64, [i8_ptr])
+        self.runtime["os_path_islink"] = ir.Function(self.module, ft, name="fastpy_os_path_islink")
+        # os.symlink(target, linkpath) -> int status (0 ok, -1 error)
+        ft = ir.FunctionType(i64, [i8_ptr, i8_ptr])
+        self.runtime["os_symlink"] = ir.Function(self.module, ft, name="fastpy_os_symlink")
+        # os.link(src, dst) -> int status (0 ok, -1 error) [hard link]
+        ft = ir.FunctionType(i64, [i8_ptr, i8_ptr])
+        self.runtime["os_link"] = ir.Function(self.module, ft, name="fastpy_os_link")
+        # os.readlink(path) -> str (the link target); empty string on error
+        ft = ir.FunctionType(i8_ptr, [i8_ptr])
+        self.runtime["os_readlink"] = ir.Function(self.module, ft, name="fastpy_os_readlink")
+        # os.chmod(path, mode) -> int status (0 ok, -1 error); mode is an i64
+        ft = ir.FunctionType(i64, [i8_ptr, i64])
+        self.runtime["os_chmod"] = ir.Function(self.module, ft, name="fastpy_os_chmod")
+        # os.truncate(path, length) -> int status (0 ok, -1 error); length i64
+        ft = ir.FunctionType(i64, [i8_ptr, i64])
+        self.runtime["os_truncate"] = ir.Function(self.module, ft, name="fastpy_os_truncate")
+        # os.utime(path, atime_ns, mtime_ns) -> int status (0 ok, -1 error).
+        # AOT-simplified 3-positional form: nanoseconds-since-epoch as bare i64s.
+        ft = ir.FunctionType(i64, [i8_ptr, i64, i64])
+        self.runtime["os_utime"] = ir.Function(self.module, ft, name="fastpy_os_utime")
+        # os.chown(path, uid, gid) -> int status (0 ok, -1 error).
+        # AOT-simplified 3-positional form: uid/gid as bare i64s.
+        ft = ir.FunctionType(i64, [i8_ptr, i64, i64])
+        self.runtime["os_chown"] = ir.Function(self.module, ft, name="fastpy_os_chown")
         # Vtable dispatch
         ft = ir.FunctionType(void, [i32, i32, i8_ptr])
         self.runtime["set_vtable_entry"] = ir.Function(self.module, ft, name="fastpy_set_vtable_entry")
@@ -2654,8 +3109,25 @@ class CodeGen:
         ft = ir.FunctionType(void, [])
         self.runtime["write_space"] = ir.Function(self.module, ft, name="fastpy_write_space")
 
+    # An immortal FpyString header prefixes every string constant so the
+    # runtime's ownership check (`fpy_str_header`, objects.h) — which reads the
+    # magic 8 bytes BEFORE the char data — always lands in-bounds and reads a
+    # valid header, instead of reading off the front of a bare `.rodata` array
+    # (a benign-on-hardware but genuine out-of-bounds read that ASan flags and
+    # that could spuriously match the magic in adjacent bytes). The header is
+    # `{i32 magic, i32 refcount}` (== FpyString minus its flexible `data[]`),
+    # with refcount = FPY_RC_IMMORTAL so incref/decref are no-ops and the
+    # constant is never written to (safe for a read-only global) or freed.
+    _FPY_STR_MAGIC = 0x53545243   # "STRC" — must match FPY_STR_MAGIC (objects.h)
+    _FPY_RC_IMMORTAL = 0x7FFFFFFF  # INT32_MAX — must match FPY_RC_IMMORTAL
+
     def _make_string_constant(self, value: str) -> ir.Constant:
-        """Create a global string constant and return a pointer to it.
+        """Create a global string constant and return an i8* to its char data.
+
+        The global is an FpyString-compatible struct: an immortal
+        `{magic, refcount}` header followed by the NUL-terminated UTF-8 bytes.
+        Returns a GEP to the first data byte, so callers see a normal
+        `const char*` while `fpy_str_header(ptr)` (ptr-8) reads a real header.
 
         Deduplicates — returns the same GEP for identical string values.
         """
@@ -2664,20 +3136,78 @@ class CodeGen:
         global_str = self._str_constants.get(value)
         if global_str is None:
             encoded = value.encode("utf-8") + b"\x00"
-            str_type = ir.ArrayType(i8, len(encoded))
+            data_type = ir.ArrayType(i8, len(encoded))
+            # FpyString layout: { i32 magic, i32 refcount, i8 data[] }.
+            struct_type = ir.LiteralStructType([i32, i32, data_type])
             name = f".str.{self._str_counter}"
             self._str_counter += 1
-            global_str = ir.GlobalVariable(self.module, str_type, name=name)
+            global_str = ir.GlobalVariable(self.module, struct_type, name=name)
             global_str.global_constant = True
             global_str.linkage = "private"
-            global_str.initializer = ir.Constant(str_type, bytearray(encoded))
+            global_str.initializer = ir.Constant(struct_type, [
+                ir.Constant(i32, self._FPY_STR_MAGIC),
+                ir.Constant(i32, self._FPY_RC_IMMORTAL),
+                ir.Constant(data_type, bytearray(encoded)),
+            ])
             # unnamed_addr allows LLVM/linker to merge equivalent constants
             global_str.unnamed_addr = True
             self._str_constants[value] = global_str
 
-        # Get pointer to first element
-        zero = ir.Constant(i64, 0)
-        return self.builder.gep(global_str, [zero, zero], inbounds=True)
+        # GEP to the first char of the data[] field (struct field index 2).
+        return self.builder.gep(
+            global_str,
+            [ir.Constant(i32, 0), ir.Constant(i32, 2), ir.Constant(i32, 0)],
+            inbounds=True,
+        )
+
+    _FPY_BYTES_MAGIC = 0x42595445  # "BYTE" — must match FPY_BYTES_MAGIC (objects.h)
+
+    def _make_bytes_constant(self, value: bytes) -> ir.Constant:
+        """Create a global bytes constant and return an i8* to its data.
+
+        The global is an FpyBytes-compatible struct: an immortal
+        `{i32 magic, i32 refcount, i64 length}` header followed by the raw
+        bytes (+ a trailing NUL for C-compat). Returns a GEP to the first
+        data byte, so `fpy_bytes_header(ptr)` (ptr-16) reads a real header and
+        `fpy_bytes_len`/incref/decref work correctly — including embedded null
+        bytes (the length field, not strlen, is authoritative). refcount is
+        FPY_RC_IMMORTAL so incref/decref are no-ops and the read-only global is
+        never written to or freed. Deduplicates on value.
+
+        Bytes literals were previously emitted via `_make_string_constant`
+        (an FpyString header at offset -8), so any `fpy_bytes_*` access read a
+        bogus header 16 bytes before the data — an out-of-bounds read (ASan
+        global-buffer-overflow) and a length bug for embedded nulls. This gives
+        bytes their own correct header. See BUG-BYTES-REPR-AS-STRING.
+        """
+        if not hasattr(self, '_bytes_constants'):
+            self._bytes_constants: dict[bytes, ir.GlobalVariable] = {}
+        global_b = self._bytes_constants.get(value)
+        if global_b is None:
+            raw = bytes(value) + b"\x00"
+            data_type = ir.ArrayType(i8, len(raw))
+            # FpyBytes layout: { i32 magic, i32 refcount, i64 length, i8 data[] }.
+            struct_type = ir.LiteralStructType([i32, i32, i64, data_type])
+            name = f".bytes.{self._str_counter}"
+            self._str_counter += 1
+            global_b = ir.GlobalVariable(self.module, struct_type, name=name)
+            global_b.global_constant = True
+            global_b.linkage = "private"
+            global_b.initializer = ir.Constant(struct_type, [
+                ir.Constant(i32, self._FPY_BYTES_MAGIC),
+                ir.Constant(i32, self._FPY_RC_IMMORTAL),
+                ir.Constant(i64, len(value)),
+                ir.Constant(data_type, bytearray(raw)),
+            ])
+            global_b.unnamed_addr = True
+            self._bytes_constants[value] = global_b
+
+        # GEP to the first byte of the data[] field (struct field index 3).
+        return self.builder.gep(
+            global_b,
+            [ir.Constant(i32, 0), ir.Constant(i32, 3), ir.Constant(i32, 0)],
+            inbounds=True,
+        )
 
     # -------------------------------------------------------------
     # FpyValue helpers (Phase 1 of tagged-value refactor)
@@ -2766,13 +3296,22 @@ class CodeGen:
     def _load_fv_raw(self, name: str) -> 'ir.Value | None':
         """Load an FpyValue variable without unwrapping — preserves the
         runtime tag. Returns the fpy_val struct, or None if the variable
-        is not stored as an FpyValue alloca."""
+        is not stored as an FpyValue alloca.
+
+        UNDEF is a runtime tag like any other, so preserving the tag means
+        checking for it too: this is the load `return c` uses, and without
+        the check a function whose only binding of `c` is in a branch that
+        did not run returned the sentinel to its caller as if it were a
+        value.  BUG-UNBOUND-NATIVE-LOCAL-READS-STACK."""
         if name not in self.variables:
             return None
         alloca, _ = self.variables[name]
         if (isinstance(alloca.type, ir.PointerType)
                 and alloca.type.pointee is fpy_val):
-            return self.builder.load(alloca, name=f"{name}.fv_raw")
+            fv = self.builder.load(alloca, name=f"{name}.fv_raw")
+            if self._needs_undef_check(name):
+                self._check_fv_undef(fv, name)
+            return fv
         return None
 
     def _expr_to_tag_data(self, node: ast.expr) -> tuple:
@@ -3356,6 +3895,17 @@ class CodeGen:
         # Maps (func_name, signature) -> specialized mangled name when
         # the function is monomorphized. Populated in _declare_user_function.
         self._monomorphized: dict[str, list[tuple]] = {}
+        # Maps a specialization's mangled name -> {param name: call-site tag}
+        # for that variant.  Filled in _emit_function_def; read by
+        # _infer_call_arg_type so a parameter's kind survives being forwarded
+        # to an inner call.  BUG-INNER-CALL-PICKS-FIRST-SPECIALIZATION.
+        self._spec_param_tags: dict[str, dict[str, str]] = {}
+        # Maps id(<the call's ast.Starred node>) -> the signature call-site
+        # analysis computed for that `f(*seq)` call.  A splat spans an unknown
+        # number of parameter slots, so `_resolve_specialization` cannot
+        # rebuild the signature from the argument nodes on its own.
+        # BUG-SPLAT-CALL-PICKS-FIRST-SPECIALIZATION.
+        self._csa_splat_call_sigs: dict[int, tuple] = {}
         # Maps class_name -> list of constructor signatures when the class
         # is monomorphized (same class name used with scalar-conflicting
         # constructor arg types). Populated in _declare_class.
@@ -3451,6 +4001,19 @@ class CodeGen:
                 if (isinstance(n.right, ast.Constant)
                         and isinstance(n.right.value, int)
                         and n.right.value > 30):
+                    self._program_uses_bigint = True
+                    break
+            if isinstance(n, ast.BinOp) and isinstance(n.op, ast.LShift):
+                # x << k with a large constant shift can overflow i64 and
+                # must promote to BigInt (e.g. 7 << 70).  A constant shift
+                # >= 40 clearly risks overflow; small bit-flag shifts (1<<7)
+                # don't and are left on the fast bare-shl path.  Enabling
+                # bigint here makes _emit_int_binop route LShift through
+                # fpy_checked_lshift.  (BUG-INT-LSHIFT-OVERFLOW)
+                if (isinstance(n.right, ast.Constant)
+                        and isinstance(n.right.value, int)
+                        and not isinstance(n.right.value, bool)
+                        and n.right.value >= 40):
                     self._program_uses_bigint = True
                     break
 
@@ -3658,6 +4221,279 @@ class CodeGen:
                     self.runtime["cpython_exec_get"], [source_ptr, name_ptr])
                 self._store_variable(base_name, func_ptr, ValueType(VKind.PYOBJ))
 
+    # ------------------------------------------------------------------
+    # Definite assignment: which locals can be read before they are bound
+    # ------------------------------------------------------------------
+    #
+    # "Not bound yet" is a *state of the variable*, and a native slot has
+    # room for a value but not for the fact that there isn't one.  An FV
+    # local is initialized to FPY_TAG_UNDEF and `_check_fv_undef` turns a
+    # premature read into the NameError CPython raises; a bare `alloca
+    # i64` just hands back whatever the stack happened to hold — `0` on a
+    # fresh page, a stale pointer otherwise.
+    #
+    # So the rule is the one the bare ABI already applies to a BigInt
+    # result and to a mixed scalar return: if the value needs a tag the
+    # slot cannot hold, the slot is wrong.  The pass below finds the names
+    # that need the UNDEF tag, and they disqualify the scope from the
+    # bare ABI (and from a `--typed` native alloca).
+    #
+    # Precision here only buys performance — a name wrongly called
+    # possibly-unbound costs a scope its native slots, never correctness —
+    # so every construct whose control flow is not obvious (`try`, `match`,
+    # a loop body that may run zero times) contributes no bindings.
+
+    # A nested scope: its body does not execute here, so nothing it binds
+    # is bound in *this* scope, and nothing it reads is read here either.
+    _MU_NESTED = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+
+    @classmethod
+    def _mu_target_names(cls, target: ast.expr, out: set) -> None:
+        """The names an assignment target binds.  An attribute or a
+        subscript target binds nothing — `a.b = 1` does not bind `a`."""
+        if isinstance(target, ast.Name):
+            out.add(target.id)
+        elif isinstance(target, (ast.Tuple, ast.List)):
+            for elt in target.elts:
+                cls._mu_target_names(elt, out)
+        elif isinstance(target, ast.Starred):
+            cls._mu_target_names(target.value, out)
+
+    @classmethod
+    def _mu_locals(cls, stmts: list) -> set:
+        """Every name this scope binds anywhere — i.e. its locals.
+
+        A read of anything outside this set is a global or a builtin,
+        resolved by a different path entirely, so it is not our business.
+        `global`/`nonlocal` names are excluded for the same reason."""
+        names: set = set()
+        declared_elsewhere: set = set()
+        for stmt in stmts:
+            for n in ast.walk(stmt):
+                if isinstance(n, (ast.Global, ast.Nonlocal)):
+                    declared_elsewhere.update(n.names)
+                elif isinstance(n, ast.Assign):
+                    for t in n.targets:
+                        cls._mu_target_names(t, names)
+                elif isinstance(n, (ast.AugAssign, ast.AnnAssign)):
+                    cls._mu_target_names(n.target, names)
+                elif isinstance(n, ast.NamedExpr):
+                    cls._mu_target_names(n.target, names)
+                elif isinstance(n, (ast.For, ast.AsyncFor)):
+                    cls._mu_target_names(n.target, names)
+                elif isinstance(n, (ast.With, ast.AsyncWith)):
+                    for item in n.items:
+                        if item.optional_vars is not None:
+                            cls._mu_target_names(item.optional_vars, names)
+                elif isinstance(n, cls._MU_NESTED):
+                    names.add(n.name)
+                elif isinstance(n, ast.ExceptHandler) and n.name:
+                    names.add(n.name)
+                elif isinstance(n, (ast.Import, ast.ImportFrom)):
+                    for alias in n.names:
+                        names.add(alias.asname or alias.name.split(".")[0])
+                elif isinstance(n, ast.MatchAs) and n.name:
+                    names.add(n.name)
+                elif isinstance(n, ast.MatchStar) and n.name:
+                    names.add(n.name)
+                elif isinstance(n, ast.MatchMapping) and n.rest:
+                    names.add(n.rest)
+        return names - declared_elsewhere
+
+    @classmethod
+    def _mu_reads(cls, node: 'ast.AST | None') -> set:
+        """The names an expression reads when it is evaluated.
+
+        A comprehension's own loop targets are its locals, not this
+        scope's, so they are subtracted; a lambda's parameters likewise.
+        A lambda *body* is not evaluated here at all, but walking into it
+        only over-reports, which is harmless."""
+        if node is None:
+            return set()
+        out: set = set()
+        shadowed: set = set()
+        for n in ast.walk(node):
+            if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load):
+                out.add(n.id)
+            elif isinstance(n, (ast.ListComp, ast.SetComp,
+                                ast.DictComp, ast.GeneratorExp)):
+                for gen in n.generators:
+                    cls._mu_target_names(gen.target, shadowed)
+            elif isinstance(n, ast.Lambda):
+                shadowed.update(a.arg for a in n.args.args)
+                shadowed.update(a.arg for a in n.args.posonlyargs)
+                shadowed.update(a.arg for a in n.args.kwonlyargs)
+        return out - shadowed
+
+    @classmethod
+    def _mu_use(cls, node, bound: set, local_names: set, maybe: set) -> None:
+        """Record every read that no binding dominates."""
+        for name in cls._mu_reads(node):
+            if name in local_names and name not in bound:
+                maybe.add(name)
+
+    @classmethod
+    def _mu_scan(cls, stmts: list, bound: set,
+                 local_names: set, maybe: set) -> set:
+        """Walk `stmts` in order and return what is definitely bound on
+        normal exit, given `bound` on entry."""
+        bound = set(bound)
+        for st in stmts:
+            bound = cls._mu_stmt(st, bound, local_names, maybe)
+        return bound
+
+    @classmethod
+    def _mu_stmt(cls, st, bound: set, local_names: set, maybe: set) -> set:
+        use = cls._mu_use
+
+        if isinstance(st, cls._MU_NESTED):
+            # The decorators, defaults and bases *are* evaluated here; the
+            # body is not.  The `def` itself binds the name.
+            for dec in st.decorator_list:
+                use(dec, bound, local_names, maybe)
+            if isinstance(st, ast.ClassDef):
+                for b in st.bases:
+                    use(b, bound, local_names, maybe)
+            else:
+                for d in st.args.defaults:
+                    use(d, bound, local_names, maybe)
+                for d in st.args.kw_defaults:
+                    use(d, bound, local_names, maybe)
+            return bound | {st.name}
+
+        if isinstance(st, ast.Assign):
+            use(st.value, bound, local_names, maybe)
+            names: set = set()
+            for t in st.targets:
+                # A subscript or attribute target *reads* its base.
+                if not isinstance(t, ast.Name):
+                    use(t, bound, local_names, maybe)
+                cls._mu_target_names(t, names)
+            return bound | names
+
+        if isinstance(st, ast.AugAssign):
+            # `x += 1` reads x before it writes it.
+            if isinstance(st.target, ast.Name):
+                if (st.target.id in local_names
+                        and st.target.id not in bound):
+                    maybe.add(st.target.id)
+            else:
+                use(st.target, bound, local_names, maybe)
+            use(st.value, bound, local_names, maybe)
+            names = set()
+            cls._mu_target_names(st.target, names)
+            return bound | names
+
+        if isinstance(st, ast.AnnAssign):
+            use(st.value, bound, local_names, maybe)
+            if st.value is None:
+                # A bare `x: int` declares but does not bind.
+                return bound
+            names = set()
+            cls._mu_target_names(st.target, names)
+            return bound | names
+
+        if isinstance(st, ast.Delete):
+            for t in st.targets:
+                use(t, bound, local_names, maybe)
+            gone: set = set()
+            for t in st.targets:
+                cls._mu_target_names(t, gone)
+            return bound - gone
+
+        if isinstance(st, (ast.Import, ast.ImportFrom)):
+            return bound | {a.asname or a.name.split(".")[0]
+                            for a in st.names}
+
+        if isinstance(st, ast.If):
+            use(st.test, bound, local_names, maybe)
+            # `if False:` still binds in CPython's eyes — the name is a
+            # local either way, it just never gets a value — so a dead
+            # branch is scanned like any other and contributes nothing to
+            # the intersection.
+            b1 = cls._mu_scan(st.body, bound, local_names, maybe)
+            b2 = cls._mu_scan(st.orelse, bound, local_names, maybe)
+            return b1 & b2
+
+        if isinstance(st, (ast.While, ast.For, ast.AsyncFor)):
+            if isinstance(st, ast.While):
+                use(st.test, bound, local_names, maybe)
+                body_entry = bound
+            else:
+                use(st.iter, bound, local_names, maybe)
+                names = set()
+                cls._mu_target_names(st.target, names)
+                body_entry = bound | names
+            # One pass, with only what was bound *before* the loop.  A
+            # second pass carrying the first pass's bindings would model
+            # "this may not be the first iteration" — but the first
+            # iteration is a path too, and it is the one on which a name
+            # bound at the bottom of the body and read at the top is
+            # unbound.  Definitely-bound at body entry is the intersection
+            # over incoming edges (before-loop, and body-end), and
+            # `bound ∩ (bound | body_binds)` is just `bound`.
+            cls._mu_scan(st.body, body_entry, local_names, maybe)
+            cls._mu_scan(st.orelse, bound, local_names, maybe)
+            # The body may run zero times, so it binds nothing for good.
+            return bound
+
+        if isinstance(st, (ast.With, ast.AsyncWith)):
+            names = set()
+            for item in st.items:
+                use(item.context_expr, bound, local_names, maybe)
+                if item.optional_vars is not None:
+                    cls._mu_target_names(item.optional_vars, names)
+            return cls._mu_scan(st.body, bound | names, local_names, maybe)
+
+        if isinstance(st, ast.Try) or type(st).__name__ == "TryStar":
+            # An exception can cut the body off between any two
+            # statements, so nothing the body binds survives into a
+            # handler, and nothing it binds is guaranteed after.
+            cls._mu_scan(st.body, bound, local_names, maybe)
+            for h in st.handlers:
+                cls._mu_scan(h.body, bound, local_names, maybe)
+            cls._mu_scan(st.orelse, bound, local_names, maybe)
+            # `finally` does run, whichever way the block ends.
+            return cls._mu_scan(st.finalbody, bound, local_names, maybe)
+
+        if isinstance(st, ast.Match):
+            use(st.subject, bound, local_names, maybe)
+            for case in st.cases:
+                names = set()
+                for n in ast.walk(case.pattern):
+                    if isinstance(n, ast.MatchAs) and n.name:
+                        names.add(n.name)
+                    elif isinstance(n, ast.MatchStar) and n.name:
+                        names.add(n.name)
+                    elif isinstance(n, ast.MatchMapping) and n.rest:
+                        names.add(n.rest)
+                entry = bound | names
+                if case.guard is not None:
+                    use(case.guard, entry, local_names, maybe)
+                cls._mu_scan(case.body, entry, local_names, maybe)
+            # No case is guaranteed to match.
+            return bound
+
+        # Return / Expr / Assert / Raise / Pass / Break / Continue /
+        # Global / Nonlocal: reads only.
+        for field in ("value", "test", "msg", "exc", "cause"):
+            if hasattr(st, field):
+                use(getattr(st, field), bound, local_names, maybe)
+        return bound
+
+    @classmethod
+    def _names_maybe_unbound(cls, body: list, params=()) -> set:
+        """The locals of `body` that at least one read does not find bound.
+
+        Reading one of these must raise NameError/UnboundLocalError, which
+        only an FV slot can represent — see the note above `_MU_NESTED`."""
+        local_names = cls._mu_locals(body)
+        if not local_names:
+            return set()
+        maybe: set = set()
+        cls._mu_scan(body, set(params), local_names, maybe)
+        return maybe
+
     def _gen_detect_bare_abi(self, tree: ast.Module) -> None:
         """Determine if module-level code can use bare-ABI mode.
 
@@ -3684,8 +4520,15 @@ class CodeGen:
         # the i64 data in the alloca — the tag is lost, so subsequent loads
         # misinterpret the BigInt pointer as a plain integer.  Disable
         # bare-ABI to force fpy_val allocas that preserve the runtime tag.
+        # "Never assigned" is a tag too — FPY_TAG_UNDEF — and a bare i64
+        # slot has no room for it, so `for _ in range(0): z = 0` followed
+        # by `print(z)` printed the uninitialized stack slot instead of
+        # raising NameError.  BUG-UNBOUND-NATIVE-LOCAL-READS-STACK.
+        _maybe_unbound = self._names_maybe_unbound(tree.body)
+        self._scope_maybe_unbound = _maybe_unbound
         self._current_fn_bare_abi = (not _main_has_complex
-                                     and not self._program_uses_bigint)
+                                     and not self._program_uses_bigint
+                                     and not _maybe_unbound)
 
         if _main_has_complex and self._analyze_mode:
             from compiler.analysis import HIGH, IMPACT_BARE_ABI_MODULE
@@ -3719,11 +4562,133 @@ class CodeGen:
                            "module-level code as simple scalar arithmetic",
             )
 
+    def _uniquify_nested_def_names(self, tree: ast.Module) -> None:
+        """Alpha-rename nested `def`s whose bare name is used by another `def`.
+
+        Nearly every analysis map in this compiler is keyed by a function's
+        **bare** name — `_csa_func_asts`, `_func_ret_types`,
+        `_call_site_param_types`, `_monomorphized`, `_user_functions` — and
+        `_csa_func_asts` is built with a flat `setdefault(node.name, node)` over
+        `ast.walk`, so the *first* `def build(...)` in the file wins and every
+        other `build` silently inherits its analysis. That mistyped a
+        dict-returning nested `build` as a list, compiling `d["x"]` into a list
+        index (BUG-NESTED-DEF-NAME-COLLISION).
+
+        Re-keying all of those maps by scope would touch dozens of lookup sites
+        and leave the flat ones as latent traps. Uniquifying the names once, up
+        front, fixes every consumer by construction — the standard
+        alpha-renaming a compiler does before a flat-namespace analysis.
+
+        Deliberately conservative. Only *nested* defs are renamed (module-level
+        names are externally visible and class methods live in their own
+        namespace), and a name is left alone if anything makes the rewrite
+        unsafe: a `global`/`nonlocal` declaring it, or an assignment rebinding
+        it in the owner scope. Leaving a collision unrenamed reproduces the old
+        behaviour; renaming something we shouldn't would be a new bug.
+        """
+        FUNC = (ast.FunctionDef, ast.AsyncFunctionDef)
+        parents: dict[ast.AST, ast.AST] = {}
+        for _n in ast.walk(tree):
+            for _c in ast.iter_child_nodes(_n):
+                parents[_c] = _n
+
+        counts: dict[str, int] = {}
+        for _n in ast.walk(tree):
+            if isinstance(_n, FUNC):
+                counts[_n.name] = counts.get(_n.name, 0) + 1
+        if not any(c > 1 for c in counts.values()):
+            return
+
+        unsafe: set[str] = set()
+        for _n in ast.walk(tree):
+            if isinstance(_n, (ast.Global, ast.Nonlocal)):
+                unsafe.update(_n.names)
+
+        taken = set(counts)
+        for _n in ast.walk(tree):
+            if isinstance(_n, ast.Name):
+                taken.add(_n.id)
+            elif isinstance(_n, ast.ClassDef):
+                taken.add(_n.name)
+
+        def _owner_scope(node):
+            """Nearest enclosing `def`, or None. None also for methods — a
+            `ClassDef` between the def and its owner means it is a method."""
+            cur = parents.get(node)
+            while cur is not None:
+                if isinstance(cur, ast.ClassDef):
+                    return None
+                if isinstance(cur, FUNC):
+                    return cur
+                cur = parents.get(cur)
+            return None
+
+        def _rebound_elsewhere(scope, name, target):
+            """True if `name` is bound in `scope` by anything other than
+            `target` — another def, an assignment, a parameter, an import."""
+            for _n in ast.walk(scope):
+                if _n is target:
+                    continue
+                if isinstance(_n, FUNC) and _n.name == name and _n is not scope:
+                    return True
+                if isinstance(_n, ast.Name) and isinstance(_n.ctx, ast.Store):
+                    if _n.id == name:
+                        return True
+                if isinstance(_n, ast.arg) and _n.arg == name:
+                    return True
+                if isinstance(_n, (ast.Import, ast.ImportFrom)):
+                    for _a in _n.names:
+                        if (_a.asname or _a.name.split(".")[0]) == name:
+                            return True
+            return False
+
+        def _rewrite(node, old, new, target):
+            """Rename `old` → `new` throughout `node`, without descending into
+            a nested scope that shadows `old` with a parameter of its own."""
+            if isinstance(node, ast.Name) and node.id == old:
+                node.id = new
+                return
+            if isinstance(node, FUNC):
+                if node is target:
+                    node.name = new
+                elif any(a.arg == old
+                         for a in (node.args.posonlyargs + node.args.args
+                                   + node.args.kwonlyargs)):
+                    return  # parameter shadows the name in this scope
+            elif isinstance(node, ast.Lambda):
+                if any(a.arg == old
+                       for a in (node.args.posonlyargs + node.args.args
+                                 + node.args.kwonlyargs)):
+                    return
+            for child in ast.iter_child_nodes(node):
+                _rewrite(child, old, new, target)
+
+        counter = 0
+        for node in list(ast.walk(tree)):
+            if not isinstance(node, FUNC):
+                continue
+            if counts.get(node.name, 0) < 2 or node.name in unsafe:
+                continue
+            scope = _owner_scope(node)
+            if scope is None:
+                continue  # module-level def or class method — leave the name
+            if _rebound_elsewhere(scope, node.name, node):
+                continue
+            old = node.name
+            counter += 1
+            new = f"{old}__n{counter}"
+            while new in taken:
+                counter += 1
+                new = f"{old}__n{counter}"
+            taken.add(new)
+            _rewrite(scope, old, new, node)
+
     def generate(self, tree: ast.Module) -> str:
         """Generate LLVM IR from a Python AST. Returns IR as string."""
         import os as _os
         if _os.environ.get("FASTPY_COERCION_DEBUG"):
             _SafeIRBuilder.enable_coercion_debug()
+        self._uniquify_nested_def_names(tree)
         self._gen_prescan(tree)
 
         # Pass 1: forward-declare all user functions and class methods
@@ -3801,6 +4766,11 @@ class CodeGen:
         for inner in getattr(self, "_hoist_inner_funcs", []):
             if inner.name not in self._user_functions:
                 self._declare_user_function(inner)
+
+        # Every function that can be declared ahead of body emission now is,
+        # so a forwarding wrapper's return tag can be resolved against its
+        # callee regardless of the order the two were defined in.
+        self._duf_propagate_mixed_ret_tags()
 
         # Pass 1.5: generate code for module-level lambda functions.
         # Only process lambdas at the top level (tree.body), NOT inside
@@ -3908,6 +4878,19 @@ class CodeGen:
         for gname, (gvar, gtag) in self._global_vars.items():
             self.variables[gname] = (gvar, gtag)
         self._loop_stack = []
+
+        # Module scope needs the same one-slot-per-name guarantee a function
+        # body gets.  Without this scan `t = 0.0` opened a `double` alloca and
+        # a later `t = t + mixed()` opened a second `{i32, i64}` one; the load
+        # inside a loop stayed bound to the first, so the accumulator read 0
+        # on every iteration.  Names backed by an actual LLVM global are
+        # excluded — their storage is not an alloca and cannot be widened.
+        # BUG-VAR-RETYPED-MIDSCOPE-STALE-SLOT.
+        self._fv_forced_locals = self._scan_fv_forced_locals(
+            [s for s in tree.body
+             if not isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                   ast.ClassDef))],
+            set(self._global_vars))
 
         # Register classes with the runtime.
         # Deduplicate by identity: monomorphized aliases (e.g. "Counter"
@@ -4098,8 +5081,7 @@ class CodeGen:
                                                   ast.With))
                         and not self._in_try_block
                         and not self._current_fn_bare_abi):
-                    pending = self.builder.call(
-                        self.runtime["exc_pending"], [])
+                    pending = self._emit_exc_pending()
                     is_exc = self.builder.icmp_signed(
                         "!=", pending, ir.Constant(i32, 0))
                     exc_blk = self._new_block("module.exc_unhandled")
@@ -6125,6 +7107,815 @@ class CodeGen:
     # _analyze_call_sites helper methods (D2 extraction)
     # ------------------------------------------------------------------
 
+    def _csa_refine_params_from_call_returns(
+        self, tree: ast.AST, func_asts: dict, func_ret_types: dict,
+    ) -> None:
+        """Type parameters whose only call-site evidence is a user call.
+
+        `_infer_call_arg_type` cannot resolve `f(helper())` during the main
+        scan, for two independent reasons: `_user_functions` is still empty at
+        that point (so its user-call branch is dead code there), and
+        `_func_ret_types` has not been built yet.  Such an argument therefore
+        reads as "unknown", and a parameter passed *only* that way stays
+        untyped — which silently makes `len(v)` on it return 0 rather than
+        crashing.  See BUG-PARAM-TYPE-FROM-USER-CALL-ARG.
+
+        This is a fixed-point step, not a new source of truth.  It runs after
+        `_csa_propagate_ret_types` has populated *func_ret_types*, and it only
+        fills slots that are still `None`; it never overrides a type the main
+        merge already decided.  A slot is filled only when *every* call site
+        agrees on it, so one unclassifiable caller still forces the
+        conservative untyped ABI — the same "unknown doesn't override known"
+        rule the merge at the top of this pass relies on.
+
+        Note the coverage is bounded by what `_func_ret_types` records, which
+        is list/dict/tuple/float/mixed but *not* str/bytes/set: a plain
+        `return "abcd"` has no arm in that chain, so `f(returns_a_str())` is
+        still not refined.  That gap is the callee-side one and is tracked
+        separately rather than worked around here.
+        """
+        # Calls that would misalign positional slots disable refinement for
+        # the whole callee: we cannot tell which parameter a keyword or a
+        # `*args` splat lands on, and guessing could type the wrong one.
+        blocked: set[str] = set()
+        # (fname, arg index) -> set of candidate tags, or None once any call
+        # site at that position is unresolvable.
+        seen: dict[tuple[str, int], set | None] = {}
+
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name)):
+                continue
+            fname = node.func.id
+            if fname not in func_asts:
+                continue
+            if node.keywords or any(isinstance(a, ast.Starred)
+                                    for a in node.args):
+                blocked.add(fname)
+                continue
+            for i, arg in enumerate(node.args):
+                key = (fname, i)
+                if key in seen and seen[key] is None:
+                    continue  # already poisoned by an unresolvable caller
+                tag = None
+                if (isinstance(arg, ast.Call)
+                        and isinstance(arg.func, ast.Name)):
+                    tag = func_ret_types.get(arg.func.id)
+                if tag is None:
+                    seen[key] = None
+                else:
+                    seen.setdefault(key, set()).add(tag)
+
+        for (fname, i), tags in seen.items():
+            if fname in blocked or not tags:
+                continue
+            existing = self._call_site_param_types.get(fname)
+            if existing is None or i >= len(existing):
+                continue
+            if existing[i] is not None:
+                continue  # the main merge already decided; do not override
+            # Callers that resolve but disagree are the definition of MIXED,
+            # which the merge above already accepts as a parameter tag.  This
+            # is not a guess: every caller is known, they just are not the
+            # same kind.  Leaving it None instead would keep the untyped ABI
+            # and silently answer 0 for len(), which is how this bug hid.
+            existing[i] = next(iter(tags)) if len(tags) == 1 else "mixed"
+
+    # Return expressions whose *pointer* kind is readable straight off the
+    # AST.  Used only to detect returns that disagree with each other — see
+    # _csa_returns_disagree — so it is deliberately narrow: anything not
+    # listed here reads as "no constraint", never as disagreement.
+    _CSA_LITERAL_PTR_KIND: dict[type, str] = {
+        ast.List: "list", ast.ListComp: "list",
+        ast.Dict: "dict", ast.DictComp: "dict",
+        ast.Set: "set", ast.SetComp: "set",
+        ast.Tuple: "tuple",
+        ast.JoinedStr: "str",
+    }
+
+    @classmethod
+    def _csa_literal_ptr_kind(cls, expr: ast.expr) -> 'str | None':
+        """The pointer kind of *expr* when it is evident from the AST alone.
+
+        Returns None for anything else — a name, a call, a binop, a scalar,
+        or `None`.  None means "this return tells us nothing", which is the
+        only safe reading: treating an unclassifiable return as a *conflict*
+        would send every `return helper()` to MIXED.
+        """
+        k = cls._CSA_LITERAL_PTR_KIND.get(type(expr))
+        if k is not None:
+            return k
+        if isinstance(expr, ast.Constant):
+            if isinstance(expr.value, str):
+                return "str"
+            if isinstance(expr.value, bytes):
+                return "bytes"
+        return None
+
+    def _csa_elem_tag(self, elts: list, var_types: dict) -> 'str | None':
+        """The common tag of a sequence literal's elements, or None.
+
+        None means "no usable evidence": an empty literal, an element whose
+        kind cannot be read, or elements that disagree.  Only a sequence
+        every one of whose elements agrees can say anything about the
+        parameters a `f(*seq)` call fills.
+        """
+        if not elts:
+            return None
+        tag: str | None = None
+        for e in elts:
+            k = self._csa_literal_ptr_kind(e)
+            if k is None and isinstance(e, ast.Constant):
+                v = e.value
+                if isinstance(v, bool):
+                    k = "bool"
+                elif isinstance(v, float):
+                    k = "float"
+                elif isinstance(v, int):
+                    k = "int"
+            if k is None and isinstance(e, ast.Name):
+                k = var_types.get(e.id)
+            if k is None:
+                return None
+            if tag is None:
+                tag = k
+            elif tag != k:
+                return None
+        return tag
+
+    def _csa_splat_elem_tag(
+        self, expr: ast.expr, var_types: dict,
+    ) -> 'str | None':
+        """Element tag of the sequence a `f(*seq)` call splats, if evident.
+
+        `_csa_var_types` records only the coarse kind ("list"), never the
+        element type, so a splatted *name* has to be traced back to the
+        literal it was bound to.  `_csa_seq_binds` is that map, built once
+        over the whole tree; it stores the literal's element nodes rather
+        than a tag, because resolving a `Name` element needs the variable
+        types, which are not known when the map is built.
+
+        A name rebound anywhere — to a second literal, to a call result, by a
+        `for` loop — is poisoned to None rather than guessed at.  Flattening
+        every scope into one namespace is deliberately coarse: it can only
+        ever *lose* evidence, since a same-named local elsewhere poisons the
+        entry.
+        """
+        if isinstance(expr, (ast.List, ast.Tuple)):
+            return self._csa_elem_tag(expr.elts, var_types)
+        if isinstance(expr, ast.Name):
+            elts = getattr(self, "_csa_seq_binds", {}).get(expr.id)
+            if elts:
+                return self._csa_elem_tag(elts, var_types)
+        return None
+
+    def _csa_build_seq_binds(self, tree: ast.AST) -> None:
+        """Populate `_csa_seq_binds` — see `_csa_splat_elem_tag`."""
+        binds: dict[str, list | None] = {}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign):
+                targets, value = node.targets, node.value
+            elif isinstance(node, (ast.AugAssign, ast.AnnAssign)):
+                targets, value = [node.target], node.value
+            elif isinstance(node, (ast.For, ast.comprehension)):
+                targets, value = [node.target], None
+            else:
+                continue
+            for t in targets:
+                if not isinstance(t, ast.Name):
+                    continue
+                elts = (value.elts
+                        if isinstance(value, (ast.List, ast.Tuple)) else None)
+                binds[t.id] = None if t.id in binds else elts
+        self._csa_seq_binds = binds
+
+    @classmethod
+    def _csa_returns_disagree(cls, fnode: ast.AST) -> bool:
+        """True when *fnode*'s returns commit to more than one pointer kind.
+
+        Such a function cannot be described by any single static tag: the
+        kind depends on which branch runs.  The per-return loop below picks
+        the last return it can classify and silently drops the rest, so
+        `def pick(f): return "abcd" if f else [1,2,3]` is typed `list` and
+        every static list fast path then fires on a string.
+
+        Scoped to pointer kinds on purpose.  `return None` beside
+        `return [...]` is ubiquitous and already tolerated everywhere, and
+        int/float returns are settled by a separate mechanism (the i64 vs
+        double LLVM return type) that "mixed" would disrupt.  Restricting to
+        disagreeing *pointer* kinds fixes the breakage that is real without
+        perturbing either of those.
+        """
+        kinds = set()
+        for n in ast.walk(fnode):
+            if isinstance(n, ast.Return) and n.value is not None:
+                k = cls._csa_literal_ptr_kind(n.value)
+                if k is not None:
+                    kinds.add(k)
+                    if len(kinds) > 1:
+                        return True
+        return False
+
+    # Arithmetic operators for which one float operand forces a float result.
+    # `/` is handled separately (always float) and `**` too (`2 ** -1` is a
+    # float from two ints).  Bitwise and shift operators are absent because
+    # CPython rejects a float operand outright.
+    _SCALAR_ARITH_OPS = (ast.Add, ast.Sub, ast.Mult, ast.Mod, ast.FloorDiv)
+
+    @staticmethod
+    def _scalar_kinds_join(a: 'set[str] | None',
+                           b: 'set[str] | None') -> 'set[str] | None':
+        """Union of two kind sets, with None ("no constraint") absorbing."""
+        return None if a is None or b is None else a | b
+
+    @classmethod
+    def _scalar_kinds_of(cls, expr: ast.expr,
+                         local_kinds: 'dict[str, set[str] | None]',
+                         ) -> 'set[str] | None':
+        """The scalar kinds — "int" and/or "float" — *expr* can evaluate to.
+
+        The companion of `_csa_literal_ptr_kind` for the other half of the
+        type space, and just as deliberately narrow: it exists only to spot
+        values that have *more than one* kind, so anything unrecognised must
+        answer `None` — "no constraint" — rather than guess.  A bare `None`
+        answer for `helper()` is what keeps one unclassifiable return from
+        pushing a whole function off the bare ABI.
+
+        An empty set is not the same as `None`: it means "nothing has been
+        classified yet", the starting point of the `_local_scalar_kinds`
+        fixpoint below, and it must not read as a constraint either.
+
+        `bool` counts as "int" because that is how a bare scalar encodes it —
+        a value alternating `True` with `2.5` loses its tag exactly as an
+        int/float one does.
+        """
+        if isinstance(expr, ast.Constant):
+            v = expr.value
+            if isinstance(v, bool):
+                return {"int"}
+            if isinstance(v, float):
+                return {"float"}
+            if isinstance(v, int):
+                return {"int"}
+            return None
+        if isinstance(expr, ast.Name):
+            return local_kinds.get(expr.id)
+        # A conditional expression evaluates to whichever arm ran, so it has
+        # both arms' kinds.  This is why `1 if c else 2.5` is a two-kind value
+        # rather than the promoted double it used to compile to.
+        if isinstance(expr, ast.IfExp):
+            return cls._scalar_kinds_join(
+                cls._scalar_kinds_of(expr.body, local_kinds),
+                cls._scalar_kinds_of(expr.orelse, local_kinds))
+        if isinstance(expr, ast.UnaryOp):
+            if isinstance(expr.op, (ast.USub, ast.UAdd)):
+                return cls._scalar_kinds_of(expr.operand, local_kinds)
+            if isinstance(expr.op, ast.Not):
+                return {"int"}  # bool
+            return None
+        # A comparison is a bool whatever it compares.
+        if isinstance(expr, ast.Compare):
+            return {"int"}
+        # `a and b` evaluates to one of its operands, so it has all of them.
+        if isinstance(expr, ast.BoolOp):
+            acc: 'set[str] | None' = set()
+            for v in expr.values:
+                acc = cls._scalar_kinds_join(
+                    acc, cls._scalar_kinds_of(v, local_kinds))
+            return acc
+        if isinstance(expr, ast.BinOp):
+            return cls._scalar_kinds_binop(expr, local_kinds)
+        if isinstance(expr, ast.Call) and isinstance(expr.func, ast.Name):
+            if expr.func.id == "float":
+                return {"float"}
+            if expr.func.id in ("int", "len", "ord"):
+                return {"int"}
+        return None
+
+    @classmethod
+    def _scalar_kinds_binop(cls, expr: ast.BinOp,
+                            local_kinds: 'dict[str, set[str] | None]',
+                            ) -> 'set[str] | None':
+        """`_scalar_kinds_of` for a binary operator."""
+        # True division is float in Python whatever the operands are, so
+        # `a / b` is evidence even when a and b are both opaque.
+        if isinstance(expr.op, ast.Div):
+            return {"float"}
+        _l = cls._scalar_kinds_of(expr.left, local_kinds)
+        _r = cls._scalar_kinds_of(expr.right, local_kinds)
+        if isinstance(expr.op, cls._SCALAR_ARITH_OPS):
+            # A definitely-float operand makes the result float regardless of
+            # the other side — the only other side CPython would not reject
+            # with a TypeError is a number.  This is what lets
+            # `0.5 + recurse(n - 1)` be read as float even though the call
+            # itself says nothing, the shape a recursive accumulator takes.
+            if _l == {"float"} or _r == {"float"}:
+                return {"float"}
+        if _l is None or _r is None:
+            return None
+        # `2 ** -1` is 0.5, so two int operands do not make an int here
+        # unless the exponent is a literal that can be seen to be >= 0.
+        if isinstance(expr.op, ast.Pow):
+            if "float" in _l or "float" in _r:
+                return {"float"}
+            _e = expr.right
+            if isinstance(_e, ast.UnaryOp) and isinstance(_e.op, ast.USub):
+                return {"float"}
+            if isinstance(_e, ast.Constant) and isinstance(_e.value, int):
+                return {"float"} if _e.value < 0 else {"int"}
+            return None
+        return {"float" if "float" in (_a, _b) else "int"
+                for _a in _l for _b in _r}
+
+    @classmethod
+    def _nested_func_node_ids(cls, fnode: ast.AST) -> 'set[int]':
+        """ids of every node belonging to a `def`/`lambda` inside *fnode*."""
+        out: set[int] = set()
+        for _item in ast.walk(fnode):
+            if _item is not fnode and isinstance(
+                    _item, (ast.FunctionDef, ast.AsyncFunctionDef,
+                            ast.Lambda)):
+                for _sub in ast.walk(_item):
+                    out.add(id(_sub))
+        return out
+
+    @classmethod
+    def _local_scalar_kinds(cls, fnode: ast.AST, nested_ids: 'set[int]',
+                            ) -> 'dict[str, set[str] | None]':
+        """Which scalar kinds each local name in *fnode* can hold.
+
+        A small monotone fixpoint rather than a single pass, because an
+        accumulator refers to itself: `t = 0` then `t = t + (1 if c else 0.5)`
+        needs `t`'s own kinds on the right-hand side, and they grow from
+        `{"int"}` to `{"int", "float"}` on the second round.
+
+        The lattice is ∅ ⊑ {one kind} ⊑ {both} ⊑ None, where None is "no
+        constraint" — the top, reached by any assignment this analysis cannot
+        read, and never left.  Names bound by anything other than a plain
+        assignment (parameters, `for` targets, `with ... as`, walrus, imports,
+        unpacking) start at None: they are not evidence of anything.
+        """
+        assigns: list[tuple[str, ast.expr | None]] = []
+        for a in ast.walk(fnode):
+            if isinstance(a, ast.arg):
+                assigns.append((a.arg, None))
+        for n in ast.walk(fnode):
+            if id(n) in nested_ids:
+                continue
+            if (isinstance(n, ast.Assign) and len(n.targets) == 1
+                    and isinstance(n.targets[0], ast.Name)):
+                assigns.append((n.targets[0].id, n.value))
+            elif (isinstance(n, ast.AnnAssign)
+                    and isinstance(n.target, ast.Name) and n.value is not None):
+                assigns.append((n.target.id, n.value))
+            elif isinstance(n, ast.AugAssign) and isinstance(n.target,
+                                                             ast.Name):
+                assigns.append((n.target.id, ast.BinOp(
+                    left=n.target, op=n.op, right=n.value)))
+            elif isinstance(n, ast.NamedExpr) and isinstance(n.target,
+                                                             ast.Name):
+                assigns.append((n.target.id, n.value))
+            else:
+                # Every other binding form is unreadable here.
+                _tgts = []
+                if isinstance(n, (ast.For, ast.AsyncFor, ast.comprehension)):
+                    _tgts = [n.target]
+                elif isinstance(n, ast.withitem):
+                    _tgts = [n.optional_vars] if n.optional_vars else []
+                elif isinstance(n, ast.Assign):
+                    _tgts = n.targets
+                for _t in _tgts:
+                    for _s in ast.walk(_t):
+                        if isinstance(_s, ast.Name):
+                            assigns.append((_s.id, None))
+        kinds: dict[str, set[str] | None] = {}
+        for name, value in assigns:
+            if value is None:
+                kinds[name] = None
+            else:
+                kinds.setdefault(name, set())
+        # Each name can only rise ∅ → one → both → None, so three rounds
+        # suffice for a self-referential chain; the loop stops earlier when
+        # nothing moved.  The cap is a guard, not the expected exit.
+        for _ in range(8):
+            changed = False
+            for name, value in assigns:
+                if value is None or kinds.get(name) is None:
+                    continue
+                ks = cls._scalar_kinds_of(value, kinds)
+                if ks is None:
+                    kinds[name] = None
+                    changed = True
+                elif not ks <= kinds[name]:
+                    kinds[name] = kinds[name] | ks
+                    changed = True
+            if not changed:
+                break
+        return kinds
+
+    @classmethod
+    def _returns_mix_int_and_float(cls, fnode: ast.AST) -> bool:
+        """True when *fnode* returns an int on one path and a float on another.
+
+        The scalar counterpart of `_csa_returns_disagree`, which explicitly
+        scoped itself away from this case on the grounds that "int/float
+        returns are settled by a separate mechanism (the i64 vs double LLVM
+        return type)".  They are not settled by it — that mechanism picks *one*
+        of the two and the other is then reinterpreted:
+
+            def f(c):
+                if c:
+                    return 1
+                return 2.5
+            print(f(True), f(False))   # 1 2.5 in CPython
+
+        printed `1 4612811918334230528`, the IEEE-754 bits of 2.5 returned
+        through an i64.  The bare ABI has nowhere to put a runtime tag, so
+        such a function must not have it; the callers of this predicate deny
+        it the bare ABI and tag its return "mixed" instead.
+
+        Returns inside nested `def`s and lambdas belong to those functions,
+        not this one, so they are excluded.  The disagreement need not be
+        between two `return` statements: `return 1 if c else 2.5` is one
+        return with two kinds, and `v = 1 if c else 2.5; return v` is the same
+        thing again with a local in the way — which is why the local kinds are
+        worked out first rather than only literals being read.
+        """
+        _nested = cls._nested_func_node_ids(fnode)
+        _locals = cls._local_scalar_kinds(fnode, _nested)
+        kinds: set[str] = set()
+        for n in ast.walk(fnode):
+            if id(n) in _nested:
+                continue
+            if not isinstance(n, ast.Return) or n.value is None:
+                continue
+            ks = cls._scalar_kinds_of(n.value, _locals)
+            if ks:
+                kinds |= ks
+                if len(kinds) > 1:
+                    return True
+        return False
+
+    def _csa_const_elem_tag(self, value) -> str | None:
+        """The tag of a literal constant, or None when it doesn't decide one.
+
+        `bool` is tested before `int` because it is a subclass of it, and an
+        out-of-i64-range int is a BigInt — the whole point of the caller is
+        that a heap element read back as an i64 is a pointer, not a value.
+        """
+        if isinstance(value, bool):
+            return "bool"
+        if isinstance(value, int):
+            return ("bigint" if (value > 2**63 - 1 or value < -(2**63))
+                    else "int")
+        if isinstance(value, str):
+            return "str"
+        if isinstance(value, bytes):
+            return "bytes"
+        if isinstance(value, float):
+            return "float"
+        if isinstance(value, complex):
+            return "complex"
+        return None  # None, Ellipsis — nothing useful to say
+
+    def _csa_elem_tag_of(self, elt: ast.expr,
+                         local_types: dict[str, str]) -> str | None:
+        """The tag of one element *expression*, or None when undecidable.
+
+        Deliberately shallow and total: this runs in the CSA pre-scan, where
+        `self.variables` is empty and `_infer_type_tag` cannot be trusted, so
+        every answer comes from the AST plus the `local_types` the same scan
+        has already built.  Returning None is always safe — the caller then
+        emits a bare "list", which is exactly the behaviour that existed
+        before this helper.
+        """
+        if isinstance(elt, (ast.List, ast.ListComp, ast.Tuple)):
+            # A *nested* container element used to answer a flat "list", which
+            # says the elements are lists and nothing about what those hold —
+            # and a half-answer is worse here than none, because the reader
+            # defaults the missing inner element to INT and reads a str pointer
+            # as an integer, while a bare "list" declines and routes the read
+            # through the runtime tag.  `len(rows[0][0])` on `[["a", "bb"]]`
+            # answered 0.  BUG-NESTED-LIST-ARG-INNER-ELEM-LOST.
+            # `from_old_tag` already parses arbitrarily nested `list:` chains,
+            # so naming the inner kind costs the reader nothing.
+            head = "tuple" if isinstance(elt, ast.Tuple) else "list"
+            inner = self._csa_list_elem_tag(elt, local_types)
+            return f"{head}:{inner}" if inner else head
+        if isinstance(elt, (ast.Dict, ast.DictComp)):
+            # `dict:<value>` for the same reason as `list:<elem>` above: a bare
+            # "dict" says the elements are dicts and nothing about their values,
+            # and the reader fills that in with INT.  `len(get_a([{"a": "x"}]))`
+            # answered 0.  BUG-LIST-OF-DICTS-PARAM-VALUE-KIND-LOST.  The
+            # `dict:X` form is not new — `func_param_dict_refinements` and the
+            # str-param arms of the return-tag scan already speak it.
+            vt = self._csa_dict_value_tag(elt, local_types)
+            return f"dict:{vt}" if vt else "dict"
+        if isinstance(elt, (ast.Set, ast.SetComp)):
+            return "set"
+        if isinstance(elt, ast.JoinedStr):
+            return "str"
+        if isinstance(elt, ast.Constant):
+            return self._csa_const_elem_tag(elt.value)
+        if isinstance(elt, ast.UnaryOp) and isinstance(elt.op, ast.USub):
+            # `-(2 ** 80)` is as much a BigInt as `2 ** 80`.
+            return self._csa_elem_tag_of(elt.operand, local_types)
+        if (isinstance(elt, ast.BinOp) and isinstance(elt.op, ast.Pow)
+                and isinstance(elt.left, ast.Constant)
+                and isinstance(elt.right, ast.Constant)
+                and isinstance(elt.left.value, int)
+                and isinstance(elt.right.value, int)
+                and not isinstance(elt.left.value, bool)
+                and not isinstance(elt.right.value, bool)
+                and 0 <= elt.right.value <= 4096):
+            # `2 ** 80` is a BinOp of two small constants, so no literal-range
+            # test sees it; fold it.  The exponent bound keeps the fold cheap
+            # — anything larger is a BigInt whatever the base, short of 0/1.
+            return self._csa_const_elem_tag(
+                elt.left.value ** elt.right.value)
+        if isinstance(elt, ast.BinOp):
+            return self._csa_binop_elem_tag(elt, local_types)
+        if isinstance(elt, ast.Compare):
+            return "bool"
+        if isinstance(elt, ast.IfExp):
+            a = self._csa_elem_tag_of(elt.body, local_types)
+            b = self._csa_elem_tag_of(elt.orelse, local_types)
+            return a if a is not None and a == b else None
+        if isinstance(elt, ast.Name):
+            tag = local_types.get(elt.id)
+            # Only hand back tags this helper itself could have produced.
+            if tag in ("int", "float", "bool", "str", "bytes", "dict", "set",
+                       "tuple", "obj", "bigint", "decimal", "complex"):
+                return tag
+            if tag is not None and (tag.startswith("list")
+                                    or tag.startswith("tuple:")):
+                # `xs` typed "list:str" *is* what an element equal to `xs`
+                # holds, so hand the compound tag back whole.  Truncating it to
+                # "list" here was the same half-answer as the literal arm
+                # above, one producer over.
+                return tag
+            return None
+        if isinstance(elt, ast.Call) and isinstance(elt.func, ast.Name):
+            if elt.func.id in self._user_classes:
+                return "obj"
+            return {"Decimal": "decimal", "complex": "complex",
+                    "str": "str", "bytes": "bytes", "float": "float",
+                    "dict": "dict", "set": "set", "frozenset": "set",
+                    "list": "list", "tuple": "tuple", "len": "int",
+                    "ord": "int", "chr": "str", "repr": "str",
+                    "hex": "str", "oct": "str", "bin": "str",
+                    "bool": "bool"}.get(elt.func.id)
+        return None
+
+    # Numeric tags in Python's own promotion order.  `bool` sits below `int`
+    # because `True + 1` is an `int`; `bigint` below `float` because a BigInt
+    # divided by anything is a float.
+    _CSA_NUM_RANK = {"bool": 0, "int": 1, "bigint": 2,
+                     "float": 3, "decimal": 4, "complex": 5}
+    _CSA_SEQ_TAGS = ("str", "bytes", "list", "tuple")
+
+    def _csa_binop_elem_tag(self, elt: ast.BinOp,
+                            local_types: dict[str, str]) -> str | None:
+        """The tag of an arithmetic element expression, e.g. `i / 2`.
+
+        Without this arm `[i / 2 for i in range(3)]` had no element tag at
+        all, so a function returning it handed back a list whose elements
+        were float bits read as integers.  Declining stays safe, so anything
+        whose result kind depends on a *value* rather than a kind — `**`,
+        `<<`, which can promote int to BigInt on overflow — declines.
+        """
+        lt = self._csa_elem_tag_of(elt.left, local_types)
+        rt = self._csa_elem_tag_of(elt.right, local_types)
+        op = elt.op
+        rank = self._CSA_NUM_RANK
+        seq = self._CSA_SEQ_TAGS
+        # The sequence and container tests below ask "what *kind* is this",
+        # so they have to look at the tag's head.  They used to compare the
+        # whole tag against a bare-name tuple, which was equivalent only
+        # while `_csa_elem_tag_of` never produced a compound one; once it
+        # started answering `list:int` for a nested list, `[0] * m` stopped
+        # matching the repetition rule, declined, and a function returning
+        # `[[0] * m for _ in range(n)]` lost its element kind entirely — its
+        # rows printed as pointers.  The *full* tag is what gets returned, so
+        # the element kind still survives the operator.
+        _head = (lambda t: t.partition(":")[0] if t else t)
+        lh, rh = _head(lt), _head(rt)
+
+        if isinstance(op, ast.Mult):
+            # Sequence repetition: `[0] * n`, `"-" * width`.  The count is
+            # often a name this pre-scan cannot see, but the repeated side
+            # decides the result on its own.
+            for a, b in ((lt, rt), (rt, lt)):
+                if _head(a) in seq and _head(b) in ("int", "bool", None):
+                    return a
+        if isinstance(op, ast.Add) and lh in seq and lh == rh:
+            # "a" + "b", [1] + [2], b"x" + b"y".  Two sequences of the same
+            # kind concatenate to that kind; the element kind survives only
+            # when both sides agree on it, so `list:int + list:str` answers
+            # the bare head rather than picking a side.
+            return lt if lt == rt else lh
+        if isinstance(op, (ast.BitOr, ast.BitAnd, ast.BitXor, ast.Sub)):
+            if lh == "set" and rh == "set":
+                return "set"
+            if isinstance(op, ast.BitOr) and lh == "dict" and rh == "dict":
+                return "dict"
+
+        if lt in rank and rt in rank:
+            if isinstance(op, (ast.Pow, ast.LShift)):
+                # `2 ** n` and `1 << n` overflow into BigInt at a threshold
+                # only the value knows.  Float bases are safe.
+                return ("float" if max(rank[lt], rank[rt]) >= rank["float"]
+                        else None)
+            if isinstance(op, (ast.BitOr, ast.BitAnd, ast.BitXor,
+                               ast.RShift)):
+                return ("int" if max(rank[lt], rank[rt]) <= rank["bigint"]
+                        else None)
+            if not isinstance(op, (ast.Add, ast.Sub, ast.Mult, ast.Div,
+                                   ast.FloorDiv, ast.Mod)):
+                return None  # MatMult and anything future
+            wide = lt if rank[lt] >= rank[rt] else rt
+            if isinstance(op, ast.Div):
+                # True division never yields an integer.
+                return "float" if rank[wide] <= rank["bigint"] else wide
+            return "int" if wide == "bool" else wide
+        return None
+
+    def _csa_iter_elem_tag(self, it: ast.expr,
+                           local_types: dict[str, str]) -> str | None:
+        """The tag of one item yielded by an iterable expression.
+
+        Only used to bind a comprehension's loop variable, so that the
+        element expression that mentions it can be classified at all:
+        without this, the `i` in `[i / 2 for i in range(3)]` is an unknown
+        name and the whole comprehension declines.
+        """
+        if isinstance(it, ast.Constant) and isinstance(it.value, str):
+            return "str"
+        if isinstance(it, (ast.List, ast.Tuple, ast.Set)):
+            tags = {self._csa_elem_tag_of(e, local_types) for e in it.elts}
+            return tags.pop() if len(tags) == 1 else None
+        if isinstance(it, (ast.ListComp, ast.SetComp, ast.GeneratorExp)):
+            return self._csa_list_elem_tag(it, local_types)
+        if isinstance(it, ast.Name):
+            tag = local_types.get(it.id)
+            if tag == "str":
+                return "str"  # iterating a str yields one-character strs
+            if tag is None or ":" not in tag:
+                return None   # a bare "list" is exactly the missing kind
+            head, _, elem = tag.partition(":")
+            if head in ("list", "tuple", "set", "ptr"):
+                # The nested case used to decline.  It no longer needs to:
+                # `from_old_tag` parses a `list:list:str` chain to the same
+                # depth it is written, so handing the whole suffix back keeps
+                # the inner kind that declining threw away.
+                return elem
+            return None
+        if isinstance(it, ast.Call) and isinstance(it.func, ast.Name):
+            if it.func.id == "range":
+                return "int"
+            if (it.func.id in ("sorted", "reversed", "list", "tuple", "set",
+                               "frozenset", "iter") and it.args):
+                return self._csa_iter_elem_tag(it.args[0], local_types)
+        return None
+
+    def _csa_dict_value_tag(self, node: ast.expr,
+                            local_types: dict[str, str]) -> str | None:
+        """The common tag of a dict literal's *values*, or None.
+
+        Same contract as `_csa_list_elem_tag`: all values must agree, because
+        one tag has to describe every read out of the dict, and a wrong one is
+        worse than no information.  A `**spread` (a None key) makes the values
+        unknowable from here, so it declines.
+        """
+        if not isinstance(node, ast.Dict) or not node.values:
+            return None
+        if any(k is None for k in node.keys):
+            return None
+        tags = {self._csa_elem_tag_of(v, local_types) for v in node.values}
+        return tags.pop() if len(tags) == 1 and None not in tags else None
+
+    def _csa_list_elem_tag(self, node: ast.expr,
+                           local_types: dict[str, str]) -> str | None:
+        """The common element tag of a list literal / comprehension.
+
+        All elements must agree; a mixed list declines, because one tag has to
+        describe every read out of the list and a wrong one is worse than no
+        information.  An empty list also declines — there is nothing to read.
+        """
+        if isinstance(node, (ast.ListComp, ast.SetComp, ast.GeneratorExp)):
+            # Bind each loop variable to what its iterable yields, so the
+            # element expression can mention it.  A target this scan cannot
+            # type is *removed* rather than left alone: an outer name that
+            # the comprehension shadows would otherwise answer for it.
+            scope = dict(local_types)
+            for gen in node.generators:
+                yielded = self._csa_iter_elem_tag(gen.iter, scope)
+                if isinstance(gen.target, ast.Name) and yielded:
+                    scope[gen.target.id] = yielded
+                else:
+                    for nm in ast.walk(gen.target):
+                        if isinstance(nm, ast.Name):
+                            scope.pop(nm.id, None)
+            return self._csa_elem_tag_of(node.elt, scope)
+        if not isinstance(node, (ast.List, ast.Tuple)) or not node.elts:
+            return None
+        tags = {self._csa_elem_tag_of(e, local_types) for e in node.elts}
+        if len(tags) == 1:
+            return tags.pop()
+        if None not in tags:
+            # Every element was classified and they genuinely *disagree*.
+            # That is knowledge, not ignorance, and it is worth saying: a
+            # bare "list" defaults its element to INT, which reads a heap
+            # element back as its own address, whereas "mixed" routes the
+            # read through `list_get_fv` and keeps the per-element runtime
+            # tag that `FpyList.items` has carried all along.  The same
+            # literal written at module scope already behaves this way,
+            # which is why `[2 ** 85, "s"]` is correct there and was wrong
+            # through a `return`.
+            return "mixed"
+        return None  # at least one element is unclassified — say nothing
+
+    def _csa_list_literal_tag(self, node: ast.expr,
+                              local_types: dict[str, str]) -> str:
+        """The `"list:<elem>"` / `"tuple:<elem>"` tag of a sequence literal.
+
+        Three separate scans used to answer this question with their own
+        hand-rolled first-element guess, each recognising a *different* subset
+        of element kinds — `_build_local_vt` knew str and float,
+        `_csa_build_var_types` knew those plus list and tuple, and the
+        call-argument loop knew list, tuple and str.  Every kind a given copy
+        did not name fell to a bare `"list"`, which carries no element type and
+        whose consumer fills that in with `VKind.INT`.  So a BigInt argument
+        was compared by address and a float argument read as its own bit
+        pattern — `add_one([1.5, 2.5])` answered 4609434218613702657, which is
+        the IEEE-754 bits of 1.5 loaded as an i64.  `str` elements were right
+        all along, purely because every copy happened to name that one.
+        BUG-BIGINT-COMPARES-BY-POINTER (parameter half).
+
+        `_csa_list_is_mixed` stays as a fallback rather than being replaced.
+        The classifier declines as soon as *any* element is unclassified, so it
+        cannot see the heterogeneity in `[1, some_name]`; the coarser test
+        still can, and "mixed" beats the INT default.
+
+        A tuple literal answers with a `"tuple"` head rather than a `"list"`
+        one.  Tuples reached this classifier late — nothing recorded a tuple's
+        kind at all until BUG-TUPLE-RETURN-SEGFAULTS — and while a tuple *is*
+        an FPY_TAG_LIST at runtime, saying "list" here would be the same
+        compression this whole family is made of: `VKind.TUPLE` exists,
+        `from_old_tag` parses `"tuple:X"`, and the one place the distinction
+        is invisible is not a reason to throw it away everywhere else.
+        """
+        head = "tuple" if isinstance(node, ast.Tuple) else "list"
+        elem = self._csa_list_elem_tag(node, local_types)
+        if elem:
+            return f"{head}:{elem}"
+        if isinstance(node, (ast.List, ast.Tuple)) and node.elts and \
+                self._csa_list_is_mixed(node.elts):
+            return f"{head}:mixed"
+        return head
+
+    def _csa_merge_param_tag(self, existing: str, incoming: str) -> str:
+        """The single tag that describes two callers of one parameter.
+
+        Both arguments are known (non-``None``) tags; the caller decides what
+        an unknown one means, because that differs between the two places this
+        is used.  The answer is ``"mixed"`` — an FpyValue carrying its kind at
+        runtime — only when nothing narrower is true.
+
+        There used to be two copies of this rule: the direct call-site merge
+        knew about list refinement and bigint widening, and the
+        interprocedural propagation in `_csa_propagate_ret_types` knew only
+        bool/int.  Two copies of a *lattice* is a worse duplication than most,
+        because the coarser one does not merely miss an optimisation — it
+        answers "conflict" where the finer one answers "the same type, said
+        twice with different precision", and a spurious conflict downgrades a
+        list parameter to an untyped value.  They agreed for as long as the
+        call-site scan never produced an element kind; the moment it did, the
+        copy left behind started corrupting programs.
+        BUG-PARAM-TAG-PROPAGATION-MERGES-COARSELY.
+        """
+        if existing == incoming:
+            return existing
+        _ek = self._tag_kind(existing)
+        _ik = self._tag_kind(incoming)
+        if _ek == VKind.MIXED or _ik == VKind.MIXED:
+            return "mixed"
+        if _ek == _ik and _ek in (VKind.LIST, VKind.DICT):
+            # A container tag without an element kind is not a *different*
+            # type from one that has it — it is the same type described less
+            # precisely.  Keep whichever caller knows more.
+            if self._tag_elem_kind(existing) is None:
+                return incoming
+            if self._tag_elem_kind(incoming) is None:
+                return existing
+            # Both know, and they disagree.  That is a real conflict.
+            return "mixed"
+        # bool ⊂ int ⊂ bigint: widen to the largest of the two.
+        _numeric = (VKind.BOOL, VKind.INT, VKind.BIGINT)
+        if _ek in _numeric and _ik in _numeric:
+            return "bigint" if VKind.BIGINT in (_ek, _ik) else "int"
+        return "mixed"
+
     def _csa_propagate_ret_types(
         self, tree: ast.Module,
         func_asts: dict[str, ast.FunctionDef],
@@ -6165,6 +7956,12 @@ class CodeGen:
                         tgt = n.targets[0].id
                         if isinstance(n.value, (ast.List, ast.ListComp)):
                             local_types[tgt] = "list"
+                        elif isinstance(n.value, ast.Tuple):
+                            # Tuples had no arm here at all, so a function
+                            # returning a local tuple got no `_func_ret_types`
+                            # entry and the caller's `f()[0]` fell to the INT
+                            # element default.  BUG-TUPLE-RETURN-SEGFAULTS.
+                            local_types[tgt] = "tuple"
                         elif isinstance(n.value, (ast.Dict, ast.DictComp)):
                             local_types[tgt] = "dict"
                         elif isinstance(n.value, ast.Constant) and isinstance(n.value.value, str):
@@ -6230,7 +8027,21 @@ class CodeGen:
                             elif _cn in _func_ret_types and _tk(_func_ret_types[_cn]) == VKind.FLOAT:
                                 local_types[tgt] = "float"
                                 _changed = True
-            # Detect list element types from append patterns
+            # Detect list element types from append patterns.
+            #
+            # One classifier, and every append votes.  This was another
+            # subset-recognising `isinstance` chain — and, like its two
+            # siblings below, it wrote the answer straight into the map, so
+            # the *last* append it happened to recognise won outright:
+            # `x.append(None); x.append("text")` recorded `list:str`, because
+            # None has no arm and so nothing was there to disagree, and the
+            # None came home as a NULL pointer and printed `(null)`.
+            # BUG-APPEND-ELEM-KIND-LAST-WRITE-WINS.
+            #
+            # Two phases rather than one so the answer does not depend on the
+            # order `ast.walk` happens to reach the appends in.
+            _lt_votes: dict[str, str | None] = {}
+            _lt_heads: dict[str, str] = {}
             for n in ast.walk(fnode):
                 if (isinstance(n, ast.Expr) and isinstance(n.value, ast.Call)
                         and isinstance(n.value.func, ast.Attribute)
@@ -6241,52 +8052,30 @@ class CodeGen:
                         and len(n.value.args) == 1):
                     arg = n.value.args[0]
                     var = n.value.func.value.id
-                    if isinstance(arg, ast.Tuple):
-                        local_types[var] = "list:tuple"
-                    elif isinstance(arg, (ast.List, ast.ListComp)):
-                        # Detect inner list element types.
-                        # Accept Constant(float), Constant(int), UnaryOp(-, Constant),
-                        # BinOp with float operands — all produce numeric values.
-                        def _is_numeric_elt(e):
-                            if isinstance(e, ast.Constant) and isinstance(e.value, (int, float)):
-                                return True
-                            if (isinstance(e, ast.UnaryOp)
-                                    and isinstance(e.operand, ast.Constant)
-                                    and isinstance(e.operand.value, (int, float))):
-                                return True
-                            if isinstance(e, ast.BinOp):
-                                return True  # computed expression
-                            return False
-                        def _has_float_elt(e):
-                            if isinstance(e, ast.Constant) and isinstance(e.value, float):
-                                return True
-                            if (isinstance(e, ast.UnaryOp)
-                                    and isinstance(e.operand, ast.Constant)
-                                    and isinstance(e.operand.value, float)):
-                                return True
-                            if isinstance(e, ast.BinOp):
-                                return True  # computed → likely float
-                            return False
-                        if (isinstance(arg, ast.List) and arg.elts
-                                and all(_is_numeric_elt(e) for e in arg.elts)
-                                and any(_has_float_elt(e) for e in arg.elts)):
-                            local_types[var] = "list:list:float"
-                        else:
-                            local_types[var] = "list:list"
-                    elif isinstance(arg, (ast.Dict, ast.DictComp)):
-                        local_types[var] = "list:dict"
-                    elif isinstance(arg, ast.Constant) and isinstance(arg.value, str):
-                        local_types[var] = "list:str"
-                    elif isinstance(arg, ast.Constant) and isinstance(arg.value, float):
-                        local_types[var] = "list:float"
-                    elif isinstance(arg, ast.Name) and arg.id in local_types and _tk(local_types[arg.id]) == VKind.FLOAT:
-                        local_types[var] = "list:float"
+                    _lt_heads.setdefault(
+                        var, local_types[var].partition(":")[0])
+                    _el = self._csa_elem_tag_of(arg, local_types)
+                    if var not in _lt_votes:
+                        _lt_votes[var] = _el
+                    elif _lt_votes[var] != _el:
+                        # Disagreement between two *known* kinds is "mixed",
+                        # a complete answer meaning "dispatch at runtime".
+                        # Disagreement involving an unclassifiable append is
+                        # no answer at all, and the bare head is right.
+                        _lt_votes[var] = (None if _lt_votes[var] is None
+                                          or _el is None else "mixed")
+            for var, _el in _lt_votes.items():
+                local_types[var] = (f"{_lt_heads[var]}:{_el}" if _el
+                                    else _lt_heads[var])
             # Mini prescan: detect list-append element types within function
             # body. Needed so `return result` where `result.append(row)`
             # and `row = []` gets tagged as "list:list" not just "list".
             _fn_empty_lists: set[str] = set()
             _fn_list_vars: set[str] = set()
             _fn_append_types: dict[str, str] = {}
+            # Vars with an append this scan cannot classify: they get no
+            # element kind at all, no matter what their other appends say.
+            _fn_append_bad: set[str] = set()
             for n in ast.walk(fnode):
                 if (isinstance(n, ast.Assign) and len(n.targets) == 1
                         and isinstance(n.targets[0], ast.Name)
@@ -6303,54 +8092,87 @@ class CodeGen:
                         and len(n.value.args) == 1):
                     var = n.value.func.value.id
                     arg = n.value.args[0]
-                    if isinstance(arg, ast.Tuple):
-                        _fn_append_types[var] = "tuple"
-                    elif isinstance(arg, (ast.List, ast.ListComp)):
-                        _fn_append_types[var] = "list"
-                    elif isinstance(arg, ast.Name) and arg.id in _fn_list_vars:
-                        _fn_append_types[var] = "list"
-                    elif isinstance(arg, (ast.Dict, ast.DictComp)):
-                        _fn_append_types[var] = "dict"
-                    elif isinstance(arg, ast.Constant) and isinstance(arg.value, str):
-                        _fn_append_types[var] = "str"
-                    elif isinstance(arg, ast.Constant) and isinstance(arg.value, float):
-                        _fn_append_types[var] = "float"
-                    elif isinstance(arg, ast.Name) and arg.id in local_types and _tk(local_types[arg.id]) == VKind.FLOAT:
-                        _fn_append_types[var] = "float"
-                    elif isinstance(arg, ast.Call) and isinstance(arg.func, ast.Name):
-                        if arg.func.id in self._user_classes:
-                            _fn_append_types[var] = "obj"
+                    # One classifier, and every append gets a vote.  This was
+                    # a seventh hand-rolled `isinstance` chain recognising its
+                    # own subset of kinds, and — worse than the subset — it
+                    # was **last-write-wins**: `x.append(None); x.append("t")`
+                    # recorded `str`, because the None arm did not exist to
+                    # disagree with the str one, so the list claimed to hold
+                    # strs and the None came back as a NULL pointer and
+                    # printed `(null)`.  A list built from appends that
+                    # disagree is `mixed`, and one with an append this scan
+                    # cannot classify has no element kind at all — declining
+                    # routes the read through the runtime tag, which is right.
+                    # BUG-APPEND-ELEM-KIND-LAST-WRITE-WINS.
+                    _at = self._csa_elem_tag_of(arg, local_types)
+                    if _at is None and isinstance(arg, ast.Name) and \
+                            arg.id in _fn_list_vars:
+                        _at = "list"  # a local list literal the scan saw
+                    if _at is None:
+                        _fn_append_bad.add(var)
+                        _fn_append_types.pop(var, None)
+                    elif var not in _fn_append_bad:
+                        _prev = _fn_append_types.get(var)
+                        _fn_append_types[var] = (
+                            _at if _prev is None or _prev == _at else "mixed")
 
             for n in ast.walk(fnode):
                 if isinstance(n, ast.Return) and n.value is not None:
                     if isinstance(n.value, (ast.List, ast.ListComp)):
-                        # Detect list-of-lists: return [[...], [...]] or
-                        # return [expr for ...] where expr is a list/comp.
-                        _has_list_elems = False
-                        if isinstance(n.value, ast.List) and n.value.elts:
-                            _has_list_elems = all(
-                                isinstance(e, (ast.List, ast.ListComp))
-                                for e in n.value.elts)
-                        elif isinstance(n.value, ast.ListComp):
-                            _has_list_elems = isinstance(
-                                n.value.elt, (ast.List, ast.ListComp,
-                                              ast.BinOp))
-                            # [0]*N, [expr]*N are lists
-                            if (isinstance(n.value.elt, ast.BinOp)
-                                    and isinstance(n.value.elt.op, ast.Mult)):
-                                if isinstance(n.value.elt.left,
-                                              (ast.List, ast.ListComp)):
-                                    _has_list_elems = True
-                                elif isinstance(n.value.elt.right,
-                                                (ast.List, ast.ListComp)):
-                                    _has_list_elems = True
-                                else:
-                                    _has_list_elems = False
-                        _func_ret_types[fname] = ("ptr:list"
-                                                   if _has_list_elems
-                                                   else "list")
+                        # This used to ask a yes/no question — "is it a list
+                        # of lists?" — so every other element kind collapsed
+                        # to a bare "list", whose consumer then defaults the
+                        # element to VKind.INT: a returned `["alpha"]` read
+                        # its elements back as integers.  Worse, the
+                        # comprehension arm answered *yes* for any `BinOp`
+                        # element, so `[i / 2 for i in range(3)]` claimed to
+                        # be a list of lists and `+ 1` on an element raised
+                        # `unsupported operand type(s) for +: 'list' and
+                        # 'int'`.  Both directions are now one classifier
+                        # that names the kind.  BUG-RETURNED-LIST-ELEM-TAG-
+                        # LOST.
+                        _elem = self._csa_list_elem_tag(n.value, local_types)
+                        if _elem == "list":
+                            _func_ret_types[fname] = "ptr:list"
+                        else:
+                            _func_ret_types[fname] = (
+                                f"list:{_elem}" if _elem else "list")
+                    elif isinstance(n.value, ast.Tuple):
+                        # `return ("x", [1, 2, 3])` had no arm, so the function
+                        # got no `_func_ret_types` entry and the caller read
+                        # `f()[1]` at the INT element default: `len()` answered
+                        # 0 and iterating it segfaulted.  The list spelling of
+                        # the same return was correct throughout.  This is the
+                        # *fifth* place that needed to learn the word "tuple";
+                        # see BUG-TUPLE-RETURN-SEGFAULTS for the other four.
+                        # `_csa_list_literal_tag` rather than the bare
+                        # `_csa_list_elem_tag` above, so a heterogeneous tuple
+                        # reaches the "mixed" fallback instead of a bare
+                        # "tuple" that consumers default back to INT.
+                        _func_ret_types[fname] = self._csa_list_literal_tag(
+                            n.value, local_types)
                     elif isinstance(n.value, (ast.Dict, ast.DictComp)):
                         _func_ret_types[fname] = "dict"
+                    elif isinstance(n.value, (ast.Set, ast.SetComp)):
+                        _func_ret_types[fname] = "set"
+                    elif (isinstance(n.value, ast.Constant)
+                          and isinstance(n.value.value, bytes)):
+                        # `return b"abc"` had no arm at all, so the value
+                        # crossed the return untagged: `len()` answered 0 and
+                        # `print()` showed a pointer.  BUG-BYTES-RETURN-TAG-LOST.
+                        _func_ret_types[fname] = "bytes"
+                    elif (isinstance(n.value, ast.Call)
+                          and isinstance(n.value.func, ast.Attribute)
+                          and n.value.func.attr == "encode"):
+                        _func_ret_types[fname] = "bytes"
+                    elif (isinstance(n.value, ast.Call)
+                          and isinstance(n.value.func, ast.Name)
+                          and n.value.func.id == "bytes"):
+                        _func_ret_types[fname] = "bytes"
+                    elif (isinstance(n.value, ast.Call)
+                          and isinstance(n.value.func, ast.Name)
+                          and n.value.func.id in ("set", "frozenset")):
+                        _func_ret_types[fname] = "set"
                     elif isinstance(n.value, ast.Name):
                         ret_var = n.value.id
                         # Check append-based element type FIRST — it's more
@@ -6361,28 +8183,34 @@ class CodeGen:
                             _func_ret_types[fname] = f"list:{elem}"
                         elif ret_var in local_types:
                             _func_ret_types[fname] = local_types[ret_var]
-                            # Refine: if local_types says "list" but the
-                            # variable was assigned from a list-of-lists
-                            # expression, upgrade to "ptr:list".
-                            if _tk(local_types[ret_var]) == VKind.LIST:
+                            # Refine: `local_types` only ever says a bare
+                            # "list", so recover the element kind from the
+                            # expression the variable was assigned.  This used
+                            # to ask the same yes/no question as the literal
+                            # path above — "is it a list of lists" — and so
+                            # lost every other element kind the same way.
+                            # BUG-RETURNED-LIST-ELEM-TAG-LOST.
+                            # `VKind.TUPLE` joins `VKind.LIST` here rather than
+                            # being folded into it: the head is carried through
+                            # from `local_types` so a tuple stays a tuple, and
+                            # only the element kind is recovered.
+                            # BUG-TUPLE-RETURN-SEGFAULTS.
+                            if (_tk(local_types[ret_var]) in (VKind.LIST,
+                                                              VKind.TUPLE)
+                                    and ":" not in local_types[ret_var]):
+                                _head = local_types[ret_var]
                                 for a2 in ast.walk(fnode):
                                     if (isinstance(a2, ast.Assign)
                                             and len(a2.targets) == 1
                                             and isinstance(a2.targets[0], ast.Name)
                                             and a2.targets[0].id == ret_var):
-                                        _rv = a2.value
-                                        if isinstance(_rv, ast.ListComp):
-                                            elt = _rv.elt
-                                            if isinstance(elt, (ast.List, ast.ListComp)):
-                                                _func_ret_types[fname] = "ptr:list"
-                                            elif (isinstance(elt, ast.BinOp)
-                                                    and isinstance(elt.op, ast.Mult)
-                                                    and (isinstance(elt.left, (ast.List, ast.ListComp))
-                                                         or isinstance(elt.right, (ast.List, ast.ListComp)))):
-                                                _func_ret_types[fname] = "ptr:list"
-                                        elif isinstance(_rv, ast.List) and _rv.elts:
-                                            if all(isinstance(e, (ast.List, ast.ListComp)) for e in _rv.elts):
-                                                _func_ret_types[fname] = "ptr:list"
+                                        _elem = self._csa_list_elem_tag(
+                                            a2.value, local_types)
+                                        if _elem == "list":
+                                            _func_ret_types[fname] = "ptr:list"
+                                        elif _elem:
+                                            _func_ret_types[fname] = (
+                                                f"{_head}:{_elem}")
                                         break
                         elif ret_var in var_types:
                             _func_ret_types[fname] = var_types[ret_var]
@@ -6488,6 +8316,21 @@ class CodeGen:
                         # return func() — propagate callee's return type
                         elif n.value.func.id in _func_ret_types:
                             _func_ret_types[fname] = _func_ret_types[n.value.func.id]
+
+            # The loop above is last-classifiable-return-wins, which is a lie
+            # for a function whose returns commit to different pointer kinds.
+            # Say so instead: "mixed" -> VKind.MIXED, which _unwrap_fv_for_tag
+            # already passes through as a whole FpyValue so the runtime tag
+            # survives the load.  BUG-MODULE-DOCSTRING-UNBOXES-GLOBAL.
+            if self._csa_returns_disagree(fnode):
+                _func_ret_types[fname] = "mixed"
+            # Same lie, other half of the type space.  The loop above happily
+            # records "float" for a function that also returns an int, and
+            # `a = f(...)` at module level then types `a` float and reads the
+            # integer's bits as a double.  BUG-MIXED-SCALAR-RETURN-TAG.
+            elif self._returns_mix_int_and_float(fnode):
+                _func_ret_types[fname] = "mixed"
+
         # Propagate return types back to module-level var_types
         for node in ast.walk(tree):
             if (isinstance(node, ast.Assign) and len(node.targets) == 1
@@ -6498,7 +8341,8 @@ class CodeGen:
                 _rtk = self._tag_kind(rt)
                 tgt = node.targets[0]
                 if isinstance(tgt, ast.Name):
-                    if _rtk in (VKind.LIST, VKind.DICT, VKind.STR):
+                    if _rtk in (VKind.LIST, VKind.DICT, VKind.STR,
+                                VKind.BYTES, VKind.SET):
                         var_types[tgt.id] = rt
                 elif (isinstance(tgt, ast.Tuple)
                       and _tk(rt) == VKind.TUPLE
@@ -6569,19 +8413,18 @@ class CodeGen:
                 if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1:
                     tgt = stmt.targets[0]
                     if isinstance(tgt, ast.Name):
-                        if isinstance(stmt.value, (ast.List, ast.ListComp)):
-                            if (isinstance(stmt.value, ast.List)
-                                    and stmt.value.elts
-                                    and all(isinstance(e, ast.Constant) and isinstance(e.value, str)
-                                            for e in stmt.value.elts)):
-                                local_vt[tgt.id] = "list:str"
-                            elif (isinstance(stmt.value, ast.List)
-                                    and stmt.value.elts
-                                    and all(isinstance(e, ast.Constant) and isinstance(e.value, float)
-                                            for e in stmt.value.elts)):
-                                local_vt[tgt.id] = "list:float"
-                            else:
-                                local_vt[tgt.id] = "list"
+                        if isinstance(stmt.value, (ast.List, ast.ListComp,
+                                                   ast.Tuple)):
+                            # `ast.Tuple` here is what gives a returned local
+                            # tuple its element kind: without it `_func_ret_types`
+                            # had no entry for the function at all, so the
+                            # caller's `f()[0]` fell to the INT element default
+                            # and read a double's bits.  The *list* spelling of
+                            # the same function was always right, which is the
+                            # asymmetry that names the bug.
+                            # BUG-TUPLE-RETURN-SEGFAULTS.
+                            local_vt[tgt.id] = self._csa_list_literal_tag(
+                                stmt.value, local_vt)
                         elif isinstance(stmt.value, (ast.Dict, ast.DictComp)):
                             local_vt[tgt.id] = "dict"
                         elif isinstance(stmt.value, ast.Constant):
@@ -6760,43 +8603,32 @@ class CodeGen:
                         arg_types.append(None)
                 elif isinstance(arg, ast.JoinedStr):
                     arg_types.append("str")
-                elif isinstance(arg, ast.List):
-                    # Detect nested lists (list of lists) and list of tuples
-                    if arg.elts and isinstance(arg.elts[0], (ast.List, ast.ListComp)):
-                        arg_types.append("list:list")
-                    elif arg.elts and isinstance(arg.elts[0], ast.Tuple):
-                        arg_types.append("list:tuple")
-                    elif arg.elts and isinstance(arg.elts[0], ast.Constant) and isinstance(arg.elts[0].value, str):
-                        arg_types.append("list:str")
-                    elif arg.elts and self._csa_list_is_mixed(arg.elts):
-                        arg_types.append("list:mixed")
-                    else:
-                        arg_types.append("list")
+                elif isinstance(arg, (ast.List, ast.Tuple)):
+                    # One classifier for every element kind, rather than a
+                    # first-element guess that named three of them.
+                    # `ast.Tuple` belongs here for the same reason it belongs
+                    # in the other five copies of this classifier: without it
+                    # `C(("a", [1, 2, 3]))` passed no type at all, so
+                    # `self.t = t` in `__init__` recorded nothing and
+                    # `for v in c.t[1]:` segfaulted — while the list spelling
+                    # of the same call was correct.  `_csa_list_literal_tag`
+                    # has answered for tuples since BUG-TUPLE-RETURN-SEGFAULTS;
+                    # this call site was simply still asking only about lists.
+                    arg_types.append(self._csa_list_literal_tag(
+                        arg, {**var_types, **_local_vt}))
                 elif isinstance(arg, ast.Dict):
                     # Refine the dict tag with its value type when the literal
                     # has uniform values — propagates so callee's d[k] can
-                    # unwrap to the correct bare LLVM type.
-                    if arg.values and all(
-                            isinstance(v, ast.Constant)
-                            and isinstance(v.value, int)
-                            and not isinstance(v.value, bool)
-                            for v in arg.values):
-                        arg_types.append("dict:int")
-                    elif arg.values and all(
-                            isinstance(v, ast.Constant)
-                            and isinstance(v.value, str)
-                            for v in arg.values):
-                        arg_types.append("dict:str")
-                    elif arg.values and all(
-                            isinstance(v, (ast.List, ast.ListComp))
-                            for v in arg.values):
-                        arg_types.append("dict:list")
-                    elif arg.values and all(
-                            isinstance(v, (ast.Dict, ast.DictComp))
-                            for v in arg.values):
-                        arg_types.append("dict:dict")
-                    else:
-                        arg_types.append("dict")
+                    # unwrap to the correct bare LLVM type.  This was four
+                    # hand-rolled `all(isinstance(...))` tests recognising int,
+                    # str, list and dict values, i.e. the same subset-per-copy
+                    # classifier `_csa_list_literal_tag` replaced on the list
+                    # side: every kind it did not name — float, bytes, bigint,
+                    # a *nested* list — fell to a bare "dict" whose consumer
+                    # fills the value kind in with INT.
+                    _dvt = self._csa_dict_value_tag(
+                        arg, {**var_types, **_local_vt})
+                    arg_types.append(f"dict:{_dvt}" if _dvt else "dict")
                 elif (isinstance(arg, ast.Attribute)
                       and isinstance(arg.value, ast.Name)
                       and arg.value.id in obj_classes):
@@ -6860,6 +8692,36 @@ class CodeGen:
                                           'list', 'dict')):
                     # Built-in type conversion: float(...) -> "float", etc.
                     arg_types.append(arg.func.id)
+                elif (isinstance(arg, ast.Call)
+                      and isinstance(arg.func, ast.Name)
+                      and arg.func.id in self._csa_func_asts):
+                    # A call's type is its *callee's* return type.  The
+                    # catch-all below walks the argument expression for a
+                    # float constant, and on a call node that walk reaches
+                    # the arguments: `pick(a, 2.5, 0)` was typed float purely
+                    # because 2.5 was passed in, so the receiving parameter
+                    # became a bare double and the returned INT-tagged
+                    # FpyValue was read as a denormal.  The branch above
+                    # answers this from `ret_tag` once codegen has run; call
+                    # -site analysis runs first, so read the callee's own
+                    # return expressions instead.
+                    # BUG-CSA-ARG-TYPE-FLOAT-FROM-CALL-ARGS.
+                    _callee_ast = self._csa_func_asts[arg.func.id]
+                    _ret_float = False
+                    for _r in ast.walk(_callee_ast):
+                        if not (isinstance(_r, ast.Return)
+                                and _r.value is not None):
+                            continue
+                        for _s in ast.walk(_r.value):
+                            if (isinstance(_s, ast.Constant)
+                                    and isinstance(_s.value, float)):
+                                _ret_float = True
+                            elif (isinstance(_s, ast.BinOp)
+                                    and isinstance(_s.op, ast.Div)):
+                                _ret_float = True
+                        if _ret_float:
+                            break
+                    arg_types.append("float" if _ret_float else None)
                 elif (isinstance(arg, ast.Name)
                       and arg.id in var_types
                       and self._tag_kind(var_types[arg.id]) in (VKind.PATH, VKind.PYOBJ)):
@@ -7058,6 +8920,14 @@ class CodeGen:
             # when calls mix positional and keyword args:
             #   f(2.5, factor=4.0)  →  ("float", "float") not just ("float",)
             sig_arg_types = list(arg_types)
+            # Position of a `*seq` argument and the element tag it hands to
+            # every slot from there on.  An unresolvable sequence stays None,
+            # which simply means this call site adds no evidence.
+            _sp_at = next((i for i, a in enumerate(node.args)
+                           if isinstance(a, ast.Starred)), None)
+            _sp_elem: str | None = (
+                self._csa_splat_elem_tag(node.args[_sp_at].value, var_types)
+                if _sp_at is not None else None)
             if func_name in self._csa_func_asts:
                 fn_def = self._csa_func_asts[func_name]
                 fn_params = [a.arg for a in fn_def.args.args]
@@ -7080,6 +8950,53 @@ class CodeGen:
                     return None
                 # Regular param defaults (apply to last N params)
                 off = n_regular - len(defaults)
+                # `f(*seq)` fills every remaining positional slot from the
+                # sequence, so the sequence's *element* type is what those
+                # parameters actually receive.  A parameter fed only by a
+                # splat otherwise had no evidence at all and stayed untyped,
+                # which silently made len() answer 0 rather than fault.
+                # BUG-SPLAT-ARG-PARAM-UNTYPED.
+                #
+                # Only the *required* slots can be claimed outright.  A slot at
+                # or past `off` may take the element or the default depending
+                # on the sequence's runtime length, and neither answer is safe
+                # to assume on its own: typing it from the element
+                # reinterprets the default's bits when the sequence stops
+                # short, and typing it from the default does the reverse.
+                # Unless the two are positively known to agree, such a slot is
+                # therefore recorded as "mixed" — which is exactly what it is,
+                # a slot with no single static type — and that denies the
+                # function the bare ABI, so the value arrives carrying its own
+                # runtime tag.  Claiming the default's type there used to
+                # silently reinterpret a double as an i64: `def g(a, b=0)`
+                # called `g(*[1.5, 2.5])` printed 3.5 rather than 4.0.
+                # BUG-SPLAT-DEFAULTED-SLOT-TYPE.
+                #
+                # Note this arm runs even when the element tag is unknown.  An
+                # unreadable sequence is not evidence that the default wins;
+                # `mix(*[1, 2.5])` has no common element tag at all and still
+                # supplies 2.5 to a slot defaulted to `0`.
+                #
+                # This must run *before* the default-type fill below, which
+                # only writes into slots that are still None.
+                if _sp_at is not None:
+                    if _sp_elem is not None:
+                        for pi in range(_sp_at, min(off, n_regular)):
+                            if pi >= len(sig_arg_types):
+                                break
+                            if sig_arg_types[pi] is None:
+                                sig_arg_types[pi] = _sp_elem
+                    for pi in range(max(_sp_at, off), n_regular):
+                        if pi >= len(sig_arg_types):
+                            break
+                        if sig_arg_types[pi] is not None:
+                            continue  # caller named it explicitly
+                        _dt = _const_type(defaults[pi - off])
+                        # Agreement is not ambiguity: both candidates have the
+                        # same type, so the slot does have a single answer.
+                        sig_arg_types[pi] = (
+                            _dt if _dt is not None and _dt == _sp_elem
+                            else "mixed")
                 for di, d in enumerate(defaults):
                     pi = off + di
                     if pi < len(sig_arg_types) and sig_arg_types[pi] is None:
@@ -7123,6 +9040,18 @@ class CodeGen:
                     if kw_type is not None:
                         sig_arg_types[pi] = kw_type
             sig = tuple(sig_arg_types)
+            if _sp_at is not None:
+                # A `Starred` argument spans an unknown number of parameter
+                # slots, so the codegen-time `_resolve_specialization` cannot
+                # rebuild this signature from the argument nodes — it saw one
+                # arg it could not classify, scored every specialization zero
+                # and took the first.  `h(*[3])` therefore called the
+                # `(float, ...)` variant and read the integer 3 as a double.
+                # The signature is already computed here; record it against
+                # the splat node so the resolver can use the same answer
+                # rather than a worse re-derivation.
+                # BUG-SPLAT-CALL-PICKS-FIRST-SPECIALIZATION.
+                self._csa_splat_call_sigs[id(node.args[_sp_at])] = sig
             for name in names_to_register:
                 sigs = self._function_signatures.setdefault(name, [])
                 if sig not in sigs:
@@ -7139,7 +9068,6 @@ class CodeGen:
                         existing.append(sig_arg_types[i])
                     for i in range(min(len(existing), len(sig_arg_types))):
                         _ek = self._tag_kind(existing[i]) if existing[i] else None
-                        _sk = self._tag_kind(sig_arg_types[i]) if sig_arg_types[i] else None
                         if _ek == VKind.MIXED:
                             continue  # already mixed, can't refine further
                         if sig_arg_types[i] is None:
@@ -7154,33 +9082,8 @@ class CodeGen:
                         if existing[i] is None:
                             existing[i] = sig_arg_types[i]  # first known type
                             continue
-                        if sig_arg_types[i] == existing[i]:
-                            continue  # same type, no conflict
-                        # Types conflict — check if it's a safe refinement
-                        # or a genuine conflict requiring "mixed"
-                        if (_sk == VKind.LIST
-                                and _ek == VKind.LIST
-                                and self._tag_elem_kind(existing[i]) is None):
-                            existing[i] = sig_arg_types[i]  # refine list element type
-                        elif (_ek == VKind.LIST
-                              and _sk == VKind.LIST
-                              and self._tag_elem_kind(sig_arg_types[i]) is None):
-                            pass  # keep the more specific type
-                        elif (_sk == VKind.BOOL and _ek == VKind.INT):
-                            pass  # bool is a subtype of int, keep int
-                        elif (_ek == VKind.BOOL and _sk == VKind.INT):
-                            existing[i] = "int"  # widen to int
-                        elif (_sk == VKind.BIGINT and _ek == VKind.INT):
-                            existing[i] = "bigint"  # widen to bigint
-                        elif (_ek == VKind.BIGINT and _sk == VKind.INT):
-                            pass  # keep bigint (int is a subset)
-                        elif (_sk == VKind.BIGINT and _ek == VKind.BOOL):
-                            existing[i] = "bigint"  # widen to bigint
-                        elif (_ek == VKind.BIGINT and _sk == VKind.BOOL):
-                            pass  # keep bigint
-                        else:
-                            # Genuine type conflict (e.g. int vs str)
-                            existing[i] = "mixed"
+                        existing[i] = self._csa_merge_param_tag(
+                            existing[i], sig_arg_types[i])
 
         # Pre-cleanup: "mixed" means incompatible types within the same
         # category (e.g. str vs list vs dict — all pointers but not
@@ -7930,17 +9833,24 @@ class CodeGen:
                                 existing[i] = t
                                 changed = True
                             elif existing[i] != t:
-                                # Compatible bool/int? leave as int.
-                                _e_k = self._tag_kind(existing[i])
-                                _t_k = self._tag_kind(t)
-                                if {_e_k, _t_k} == {VKind.INT, VKind.BOOL}:
-                                    existing[i] = "int"
-                                elif _e_k == VKind.MIXED:
-                                    pass  # keep mixed
-                                else:
-                                    # Genuine conflict → "mixed" (will be
-                                    # handled by monomorphization pass).
-                                    existing[i] = "mixed"
+                                # The same rule the direct call-site merge
+                                # uses.  This arm used to have its own,
+                                # coarser copy that knew only bool/int, so a
+                                # container tag met a *less precise* container
+                                # tag — `list:int` from `mean([1, 2, 3])` and
+                                # `list` from `mean(list(range(10)))` — and
+                                # called that a genuine conflict.  "mixed" for
+                                # a parameter means "an FpyValue of unknown
+                                # kind", not "a list of unknown elements", so
+                                # the callee stopped treating `data` as a list
+                                # at all and `len(data)` read a tag as a
+                                # pointer.  The two tags were equal before the
+                                # call-site classifier learned element kinds,
+                                # which is why one copy could stay behind the
+                                # other for so long.
+                                # BUG-PARAM-TAG-PROPAGATION-MERGES-COARSELY.
+                                existing[i] = self._csa_merge_param_tag(
+                                    existing[i], t)
 
     @staticmethod
     def _csa_list_is_mixed(elts: list[ast.expr]) -> bool:
@@ -7972,6 +9882,212 @@ class CodeGen:
         cats = sum([_has_int, _has_str, _has_float,
                     _has_container, _has_name])
         return cats > 1
+
+    # Integer-valued binary operators.  `/` is excluded because it yields a
+    # float, and `**` because it is the one arithmetic op that reaches BigInt
+    # from small operands (`2 ** 64`).
+    _CSA_INT_BINOPS = (ast.Add, ast.Sub, ast.Mult, ast.FloorDiv, ast.Mod,
+                       ast.LShift, ast.RShift, ast.BitAnd, ast.BitOr,
+                       ast.BitXor)
+
+    def _csa_provably_int_names(
+        self, tree: ast.Module, mod_nodes: list,
+    ) -> set[str]:
+        """Module-level names whose *every* binding is a machine int.
+
+        Deliberately a predicate, not a second copy of the `var_types`
+        classifier above: it answers only "is this always an int?" and
+        declines on anything it does not recognise, so it can never
+        contradict a tag that classifier produced.  It exists because
+        `var_types` has no arm for a plain int, which used to be harmless
+        (`int` was also the fallback for "no evidence") but stopped being so
+        once `_duf_select_abi` began requiring *positive* evidence: a
+        parameter fed only by an unrecorded int counted as untyped and took
+        the whole function off the bare ABI.  `add(i, 1)` in a `while` loop
+        is the canonical case, and it cost ~9x.
+
+        Multiple bindings are accepted here — unlike `_csa_global_single_bind`
+        — because "all of them are ints" is a sound claim where "the last one
+        wins" is not.  Self-reference is allowed inductively: a name needs one
+        binding that is an int *without* referring to itself (the base case)
+        before `i = i + 1` may extend it, so a cycle with no base
+        (`x = y; y = x`) is refused rather than assumed.
+        """
+        # Overflow promotion is only emitted when the program mentions a
+        # BigInt (see `_program_uses_bigint`); where it is, an int-tagged
+        # name can hold a heap pointer instead, so claim nothing at all.
+        for n in ast.walk(tree):
+            if (isinstance(n, ast.Constant) and isinstance(n.value, int)
+                    and not isinstance(n.value, bool)
+                    and not -(2 ** 63) <= n.value <= 2 ** 63 - 1):
+                return set()
+
+        # Builtins this program rebinds.  `self._user_functions` is still
+        # empty this early -- consulting it silently answered "not shadowed"
+        # for every program -- so read the shadowing off the tree instead.
+        # Deliberately whole-tree and every binding form: a nested `def len`
+        # cannot shadow the module-level one, but declining costs a
+        # refinement while trusting it costs a pointer read as an integer.
+        _shadowed: set[str] = set()
+        for n in ast.walk(tree):
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef,
+                              ast.ClassDef)):
+                _shadowed.add(n.name)
+            elif isinstance(n, (ast.Import, ast.ImportFrom)):
+                for a in n.names:
+                    _shadowed.add((a.asname or a.name).split(".")[0])
+            elif isinstance(n, ast.Assign):
+                for t in n.targets:
+                    for s in ast.walk(t):
+                        if isinstance(s, ast.Name):
+                            _shadowed.add(s.id)
+            elif isinstance(n, (ast.AugAssign, ast.AnnAssign, ast.NamedExpr)):
+                for s in ast.walk(n.target):
+                    if isinstance(s, ast.Name):
+                        _shadowed.add(s.id)
+
+        bindings: dict[str, list] = {}
+        disqualified: set[str] = set()
+
+        def _bind(name: str, expr) -> None:
+            if expr is None:
+                disqualified.add(name)
+            else:
+                bindings.setdefault(name, []).append(expr)
+
+        def _unpack_pairs(tgt, value):
+            """`(a, b) = (x, y)` -> [(a, x), (b, y)], else None.
+
+            Only the shape where both sides are literal sequences of equal
+            length and every target is a plain `Name` is accepted; anything
+            with a `Starred`, a nested target or a non-literal right-hand
+            side is refused, since the pairing would then depend on a
+            runtime length this pass cannot see.
+            """
+            if not isinstance(tgt, (ast.Tuple, ast.List)):
+                return None
+            if not isinstance(value, (ast.Tuple, ast.List)):
+                return None
+            if len(tgt.elts) != len(value.elts):
+                return None
+            if not all(isinstance(e, ast.Name) for e in tgt.elts):
+                return None
+            if any(isinstance(e, ast.Starred) for e in value.elts):
+                return None
+            return [(e.id, v) for e, v in zip(tgt.elts, value.elts)]
+
+        for node in mod_nodes:
+            if isinstance(node, ast.Assign):
+                for tgt in node.targets:
+                    if isinstance(tgt, ast.Name):
+                        _bind(tgt.id, node.value)
+                    elif _unpack_pairs(tgt, node.value) is not None:
+                        # `i, j = 0, 1` is a literal-to-literal unpack: each
+                        # name gets exactly one element and the pairing is
+                        # visible in the AST, so it is no more of a guess
+                        # than `i = 0` written twice.
+                        for _nm, _val in _unpack_pairs(tgt, node.value):
+                            _bind(_nm, _val)
+                    else:
+                        # Starred, subscript and non-literal RHS unpacks are
+                        # not tracked.
+                        for sub in ast.walk(tgt):
+                            if isinstance(sub, ast.Name):
+                                disqualified.add(sub.id)
+            elif isinstance(node, ast.AugAssign):
+                if isinstance(node.target, ast.Name):
+                    if isinstance(node.op, self._CSA_INT_BINOPS):
+                        _bind(node.target.id,
+                              ast.BinOp(left=ast.Name(id=node.target.id,
+                                                      ctx=ast.Load()),
+                                        op=node.op, right=node.value))
+                    else:
+                        disqualified.add(node.target.id)
+            elif (isinstance(node, (ast.For, ast.AsyncFor))
+                  and isinstance(node.target, ast.Name)
+                  and isinstance(node.iter, ast.Call)
+                  and isinstance(node.iter.func, ast.Name)
+                  and node.iter.func.id == "range"
+                  and "range" not in _shadowed):
+                # `for i in range(...)` is the common counter loop, and it
+                # binds an int for any argument that does not raise — range
+                # rejects a float rather than yielding one — so the claim
+                # needs no evidence about the arguments.  Recorded as a
+                # binding rather than an exemption so that a later
+                # `i = "s"` still withdraws it.
+                _bind(node.target.id, ast.Constant(value=0))
+            elif isinstance(node, (ast.AnnAssign, ast.NamedExpr, ast.For,
+                                   ast.AsyncFor, ast.comprehension,
+                                   ast.With, ast.AsyncWith)):
+                _tgts = []
+                if isinstance(node, (ast.With, ast.AsyncWith)):
+                    _tgts = [i.optional_vars for i in node.items
+                             if i.optional_vars is not None]
+                elif node.target is not None:
+                    _tgts = [node.target]
+                for tgt in _tgts:
+                    for sub in ast.walk(tgt):
+                        if isinstance(sub, ast.Name):
+                            disqualified.add(sub.id)
+        # A `global` declaration means a function body may rebind the name,
+        # and `mod_nodes` deliberately never entered one.
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Global):
+                disqualified.update(node.names)
+
+        def _is_int(expr, cand: set) -> bool:
+            if isinstance(expr, ast.Constant):
+                return (isinstance(expr.value, int)
+                        and not isinstance(expr.value, bool))
+            if isinstance(expr, ast.Name):
+                return expr.id in cand
+            if isinstance(expr, ast.UnaryOp) and isinstance(
+                    expr.op, (ast.USub, ast.UAdd, ast.Invert)):
+                return _is_int(expr.operand, cand)
+            if isinstance(expr, ast.BinOp) and isinstance(
+                    expr.op, self._CSA_INT_BINOPS):
+                return (_is_int(expr.left, cand)
+                        and _is_int(expr.right, cand))
+            if (isinstance(expr, ast.Call)
+                    and isinstance(expr.func, ast.Name)
+                    and expr.func.id == "len"
+                    and "len" not in _shadowed):
+                return True
+            return False
+
+        for nm in disqualified:
+            bindings.pop(nm, None)
+
+        # Two obligations, and they need opposite fixpoints -- computing both
+        # in one loop is what limited an earlier version to *self*-reference,
+        # so `i, j = j, i` after `i = 0; j = 1` was refused even though both
+        # names are plainly ints.
+        #
+        # Agreement (greatest fixpoint): assume every name is an int, then
+        # repeatedly drop any name with a binding that is not.  Optimism is
+        # safe here only because it is paired with the second phase.
+        cand = set(bindings)
+        while True:
+            drop = {nm for nm in cand
+                    if not all(_is_int(e, cand) for e in bindings[nm])}
+            if not drop:
+                break
+            cand -= drop
+
+        # Groundedness (least fixpoint): agreement alone would also "prove"
+        # `x = y; y = x`, which never binds an int at all -- the assumption
+        # would be justifying itself.  So a name must additionally be
+        # reachable from some binding that is an int *without* assuming the
+        # names still under question.
+        proven: set[str] = set()
+        changed = True
+        while changed:
+            changed = False
+            for nm in cand - proven:
+                if any(_is_int(e, proven) for e in bindings[nm]):
+                    proven.add(nm)
+                    changed = True
+        return proven
 
     def _csa_build_var_types(self, tree: ast.Module) -> dict[str, str]:
         """Build static variable type map from module-level assignments."""
@@ -8007,52 +10123,26 @@ class CodeGen:
             if isinstance(node, ast.Assign) and len(node.targets) == 1:
                 tgt = node.targets[0]
                 if isinstance(tgt, ast.Name):
-                    if isinstance(node.value, ast.List):
-                        if node.value.elts and isinstance(node.value.elts[0], (ast.List, ast.ListComp)):
-                            var_types[tgt.id] = "list:list"
-                        elif node.value.elts and isinstance(node.value.elts[0], ast.Tuple):
-                            var_types[tgt.id] = "list:tuple"
-                        elif (node.value.elts
-                              and all(isinstance(e, ast.Constant)
-                                      and isinstance(e.value, str)
-                                      for e in node.value.elts)):
-                            var_types[tgt.id] = "list:str"
-                        elif (node.value.elts
-                              and all(isinstance(e, ast.Constant)
-                                      and isinstance(e.value, float)
-                                      for e in node.value.elts)):
-                            var_types[tgt.id] = "list:float"
-                        elif node.value.elts and self._csa_list_is_mixed(
-                                node.value.elts):
-                            var_types[tgt.id] = "list:mixed"
-                        else:
-                            var_types[tgt.id] = "list"
-                    elif isinstance(node.value, ast.ListComp):
-                        var_types[tgt.id] = "list"
+                    if isinstance(node.value, (ast.List, ast.ListComp)):
+                        var_types[tgt.id] = self._csa_list_literal_tag(
+                            node.value, var_types)
                     elif isinstance(node.value, (ast.Dict, ast.DictComp)):
-                        # Refine dict tag with value type when literal
-                        # has uniform values.
-                        if (isinstance(node.value, ast.Dict)
-                                and node.value.values
-                                and all(isinstance(v, ast.Constant)
-                                        and isinstance(v.value, int)
-                                        and not isinstance(v.value, bool)
-                                        for v in node.value.values)):
-                            var_types[tgt.id] = "dict:int"
-                        elif (isinstance(node.value, ast.Dict)
-                                and node.value.values
-                                and all(isinstance(v, (ast.List, ast.ListComp))
-                                        for v in node.value.values)):
-                            var_types[tgt.id] = "dict:list"
-                        elif (isinstance(node.value, ast.Dict)
-                                and node.value.values
-                                and all(isinstance(v, (ast.Dict, ast.DictComp))
-                                        for v in node.value.values)):
-                            var_types[tgt.id] = "dict:dict"
-                        else:
-                            var_types[tgt.id] = "dict"
+                        # Refine dict tag with value type when the literal has
+                        # uniform values.  The third copy of the same
+                        # subset-recognising classifier; see the call-argument
+                        # loop for why they all became one.
+                        _dvt = self._csa_dict_value_tag(node.value, var_types)
+                        var_types[tgt.id] = (
+                            f"dict:{_dvt}" if _dvt else "dict")
                     elif isinstance(node.value, ast.Set):
                         var_types[tgt.id] = "list"
+                    elif isinstance(node.value, ast.Tuple):
+                        # The one container literal with no arm here, so a
+                        # module-level `t = (10, 20)` had no recorded kind at
+                        # all and every consumer fell back to its int default.
+                        # BUG-TUPLE-RETURN-SEGFAULTS.
+                        var_types[tgt.id] = self._csa_list_literal_tag(
+                            node.value, var_types)
                     elif isinstance(node.value, ast.Constant):
                         if isinstance(node.value.value, str):
                             var_types[tgt.id] = "str"
@@ -8152,6 +10242,62 @@ class CodeGen:
                             # Unknown function on imported module —
                             # assume bridge result (pyobj).
                             var_types[tgt.id] = "pyobj"
+
+        # Which of these names a single static tag can actually describe.
+        #
+        # `var_types` is last-writer-wins and, worse, has no arm at all for a
+        # plain int, so a module that says `x = 10` and later `x = "global"`
+        # leaves the tag `str` — a tag that is wrong for every call made
+        # before line 95.  That is harmless for the call-site analysis, which
+        # reads `var_types` as a hint and can only lose precision by being
+        # wrong; it is not harmless for `_scope_global_tags`, whose answer
+        # picks a function's *return type*, and `return x` compiled to a str
+        # return crashed printing the integer 10 through it.
+        #
+        # Rebinding is exactly the case where one static tag cannot be right,
+        # so the trustworthy set is the names bound once and only once.
+        # Declining even when two bindings agree is deliberate: knowing they
+        # agree means classifying each assignment separately, and a second
+        # copy of the classifier above is a worse thing to own than a missed
+        # refinement.  Same discipline as `_scope_file_names`, which claims a
+        # name only when nothing else in the scope ever binds it.
+        # BUG-RETURN-OF-GLOBAL-LOSES-ITS-KIND.
+        _bound_once: set[str] = set()
+        _rebound: set[str] = set()
+        for node in _walk_skip_funcs(tree):
+            _targets: list = []
+            if isinstance(node, ast.Assign):
+                _targets = list(node.targets)
+            elif isinstance(node, (ast.AugAssign, ast.AnnAssign,
+                                   ast.NamedExpr)):
+                _targets = [node.target]
+            elif isinstance(node, (ast.For, ast.AsyncFor, ast.comprehension)):
+                _targets = [node.target]
+            elif isinstance(node, (ast.With, ast.AsyncWith)):
+                _targets = [i.optional_vars for i in node.items
+                            if i.optional_vars is not None]
+            for tgt in _targets:
+                for nm in ast.walk(tgt):
+                    if isinstance(nm, ast.Name):
+                        (_rebound if nm.id in _bound_once
+                         else _bound_once).add(nm.id)
+        # A `global` declaration means a *function body* may rebind the name,
+        # and the walk above deliberately never enters one.
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Global):
+                _rebound.update(node.names)
+        self._csa_global_single_bind = _bound_once - _rebound
+        # Record the plain-int names the classifier above has no arm for.
+        # Gap-fill only: a name it already tagged keeps that tag, so this
+        # can add evidence but never contradict any.  Names proven here are
+        # frequently rebound (`i = i + 1`) and so are absent from
+        # `_csa_global_single_bind`, which keeps them out of
+        # `_scope_global_tags` — the consumer for which a wrong tag is fatal
+        # rather than merely imprecise.
+        for _nm in self._csa_provably_int_names(tree,
+                                                list(_walk_skip_funcs(tree))):
+            if _nm not in var_types:
+                var_types[_nm] = "int"
         return var_types
 
     def _analyze_call_sites(self, tree: ast.Module) -> None:
@@ -8176,6 +10322,24 @@ class CodeGen:
         # Store shared context for use by helper methods
         self._csa_class_parents = class_parents
         self._csa_func_asts = func_asts
+        # The same ASTs again, keyed `Cls.meth`.  `_func_ret_types` is keyed by
+        # *bare* name, so a method already has an entry there — but under a key
+        # that collides with a module function of the same name and that no
+        # method call site can safely trust.  `c.m()[1]` therefore had no
+        # element kind at all and fell to the INT default, while the identical
+        # body in a plain function was correct: BUG-METHOD-RETURN-ELEM-KIND-LOST.
+        # Running the existing return-type analysis over these keys as well
+        # gives a method the same element-carrying record a function has,
+        # without a second implementation of "what does this body return".
+        method_asts: dict[str, ast.FunctionDef] = {}
+        for _cname, _cnode in self._csa_class_asts.items():
+            for _item in _cnode.body:
+                if isinstance(_item, ast.FunctionDef):
+                    method_asts[f"{_cname}.{_item.name}"] = _item
+        # Element tags of sequence literals, keyed by the name they were bound
+        # to — the only evidence a `f(*seq)` call site can offer about the
+        # parameters it fills.  See _csa_splat_elem_tag.
+        self._csa_build_seq_binds(tree)
 
         # ── Pre-scan: detect functions used as first-class values ──
         # A function "used as a value" is one that appears as a Name reference
@@ -8220,8 +10384,12 @@ class CodeGen:
 
         var_types = self._csa_build_var_types(tree)
 
+        # `Cls.meth` keys ride along in the same pass.  They cannot disturb the
+        # bare-name entries — the pass keys everything it writes by the name it
+        # was handed — and the module-level propagation loop at its end matches
+        # on `node.value.func.id`, which is never a dotted name.
         _func_ret_types = self._csa_propagate_ret_types(
-            tree, func_asts, var_types)
+            tree, {**func_asts, **method_asts}, var_types)
         self._csa_var_types = var_types
 
         # Track pyobj variables from bridge imports: `t = Template(...)` and
@@ -8357,6 +10525,9 @@ class CodeGen:
 
         self._csa_post_scan_propagation(
             tree, class_parents, obj_classes, var_types, func_asts)
+
+        self._csa_refine_params_from_call_returns(
+            tree, func_asts, _func_ret_types)
 
         # ── Analysis: report functions with unresolved parameter types ──
         if self._analyze_mode:
@@ -8589,6 +10760,8 @@ class CodeGen:
         # Evaluate body and return
         result = self._emit_expr_value(lam.body)
         expected_ret = func.return_value.type
+        _pre_conv = result
+        _dyn_ret_tag = None
         if result.type != expected_ret:
             if (isinstance(result.type, ir.LiteralStructType)
                     and result.type == fpy_val
@@ -8600,6 +10773,7 @@ class CodeGen:
                 _ret_tag = self.builder.extract_value(result, 0)
                 self.builder.call(self.runtime["set_arg_tag"],
                                   [ir.Constant(i32, 99), _ret_tag])
+                _dyn_ret_tag = _ret_tag
                 result = self.builder.extract_value(result, 1)
             elif isinstance(expected_ret, ir.IntType) and isinstance(result.type, ir.DoubleType):
                 result = self.builder.fptosi(result, expected_ret)
@@ -8609,6 +10783,26 @@ class CodeGen:
                 result = self.builder.ptrtoint(result, expected_ret)
             elif isinstance(expected_ret, ir.PointerType) and isinstance(result.type, ir.IntType):
                 result = self.builder.inttoptr(result, expected_ret)
+        # Publish the return tag, exactly as closure bodies do. A lambda is
+        # reached through `fastpy_call_ptrN`, which returns a bare `i64`, so
+        # call sites recover the kind with `get_ret_tag()`. Staying silent
+        # here does not mean "assume int" — it means the caller reads whatever
+        # `fpy_ret_tag` happens to hold from some *earlier* unrelated call.
+        # A str-returning nested def anywhere before the lambda call was
+        # enough to make `print(f(1))` interpret an int as a `char*` and
+        # segfault (BUG-INDIRECT-CALL-RET-TAG-INT, lambda facet).
+        if _dyn_ret_tag is not None:
+            self.builder.call(self.runtime["set_ret_tag"], [_dyn_ret_tag])
+        else:
+            _tag_value = (result
+                          if (isinstance(expected_ret, ir.PointerType)
+                              and isinstance(_pre_conv.type, ir.IntType))
+                          else _pre_conv)
+            self.builder.call(
+                self.runtime["set_ret_tag"],
+                [ir.Constant(i32,
+                             self._infer_ret_tag_for_value(_tag_value,
+                                                           lam.body))])
         self.builder.ret(result)
 
         # Now that body is emitted, safe to set internal linkage + inline
@@ -8728,6 +10922,18 @@ class CodeGen:
             return func_name
         # Infer types at the call site for positional args
         call_sig = list(self._infer_call_arg_type(a) for a in arg_nodes)
+        # A `f(*seq)` call has one argument node standing for several
+        # parameter slots, so the list above is both too short and unusable —
+        # every entry is None, every specialization scores zero, and the loops
+        # below fall through to "take the first one".  Call-site analysis
+        # already worked the signature out for exactly this call; use it.
+        # BUG-SPLAT-CALL-PICKS-FIRST-SPECIALIZATION.
+        for _a in arg_nodes:
+            if isinstance(_a, ast.Starred):
+                _rec = self._csa_splat_call_sigs.get(id(_a))
+                if _rec is not None:
+                    call_sig = list(_rec)
+                break
         # Map keyword args to positional slots using the function's AST so
         # the call sig reflects all arguments the callee will see.
         if keyword_nodes:
@@ -8750,7 +10956,7 @@ class CodeGen:
             if call_sig_t == sig:
                 return f"{func_name}__{self._mangle_sig(sig)}"
         # Partial match — find the best-matching signature by scoring:
-        # concrete type matches count +1, mismatches reject the sig.
+        # concrete type matches count +2, mismatches reject the sig.
         best_sig = None
         best_score = -1
         for sig in specs:
@@ -8760,10 +10966,22 @@ class CodeGen:
                 if ct is None or st is None:
                     continue
                 if ct == st:
-                    score += 1
+                    score += 2
                     continue
                 # bool/int compatible
                 if {ct, st} == {"bool", "int"}:
+                    score += 2
+                    continue
+                # A container tag may or may not carry its element type:
+                # the call site says "list:int" where the specialization was
+                # recorded as bare "list".  Treating that as a *conflict*
+                # rejected every candidate, so the loop fell through to
+                # "take specs[0]" and `idx(a, x)` inside the float variant of
+                # its caller called the *int* variant of `idx`, reading the
+                # double's bits as an index.  Agreeing on the base kind is
+                # real evidence — just weaker than an exact match, hence the
+                # +1 against +2.  BUG-INNER-CALL-PICKS-FIRST-SPECIALIZATION.
+                if (str(ct).split(":", 1)[0] == str(st).split(":", 1)[0]):
                     score += 1
                     continue
                 matches = False
@@ -8814,6 +11032,15 @@ class CodeGen:
                     return tag._to_tag() if isinstance(tag, ValueType) else str(tag)
                 if _tk in _DICT_LIKE_KINDS:
                     return "dict"
+            # A parameter of the specialization currently being emitted.  Its
+            # slot is an FpyValue, so `_var_kind` above only says MIXED, but
+            # the variant's own signature knows exactly what the caller
+            # passed — and forwarding that is the whole point of having the
+            # variant.  BUG-INNER-CALL-PICKS-FIRST-SPECIALIZATION.
+            _spec_tags = self._spec_param_tags.get(
+                getattr(self, "_current_func_name", ""), None)
+            if _spec_tags and node.id in _spec_tags:
+                return _spec_tags[node.id]
         # Attribute access: resolve via the owning class's attr-type sets.
         # This lets `compute(self.val)` monomorphize correctly when val is
         # a known-typed attr (float/bool/string/list/dict/obj).
@@ -8884,6 +11111,18 @@ class CodeGen:
                     return "bool"
                 elif _rtk == VKind.STR:
                     return "str"
+                # The callee's own return tag is authoritative.  A kind this
+                # table has no name for — "mixed" above all, but also a
+                # container or void — means *unknown*, not "guess from the
+                # call's syntax".  Falling through to the `has_float` walk
+                # below would inspect the call's *arguments*: `br(a, 1.5)`
+                # would be typed float purely because a float literal appears
+                # somewhere inside the call, even though `br` returns an
+                # index.  That mis-selects the caller's specialization and
+                # makes it read a "mixed" FpyValue as a double, so
+                # `_assert_eq(bisect_right([1, 2], 1.5), 1)` compared 1.0
+                # against 1.  BUG-CALL-ARG-TYPE-GUESSES-FLOAT-FROM-ARGS.
+                return None
         # Float-containing expression
         has_float = any(
             isinstance(sub, ast.Constant) and isinstance(sub.value, float)
@@ -8974,14 +11213,56 @@ class CodeGen:
         # through indirect dispatch with any argument types.
         _fn_name = _name_override if _name_override else node.name
         _used_as_value = _fn_name in getattr(self, '_funcs_used_as_values', set())
+        # An *untyped* parameter is not a scalar parameter.  It only looks
+        # like one because `param_types` falls back to i64 when nothing is
+        # known, so "no evidence" and "known to be an int" are indistinguishable
+        # by the time we get here.  Bare ABI has nowhere to put a runtime tag,
+        # so a caller handing such a parameter a str or a list drops the tag on
+        # the floor and the body reads the pointer as an integer: `len(s)`
+        # answers 0 instead of faulting, and `s[i]` falls through to the
+        # CPython bridge, which is NULL in pure mode.  Require positive
+        # evidence — an annotation or a call site — rather than inferring
+        # "scalar" from silence.
+        _annotated = {a.arg for a in node.args.args if a.annotation is not None}
+        _annotated |= {a.arg for a in node.args.kwonlyargs
+                       if a.annotation is not None}
+        _all_params_typed = all(
+            p in _annotated
+            or (i < len(call_types) and call_types[i] is not None)
+            for i, p in enumerate(param_names)
+        )
+        # A function that returns an int on one path and a float on another
+        # has no single scalar return type, and the bare ABI has nowhere to
+        # put a runtime tag — whichever of i64/double it is given, the other
+        # kind's bits travel back reinterpreted.  Deny it the bare ABI so the
+        # tag rides along in the FpyValue.  BUG-MIXED-SCALAR-RETURN-TAG.
+        _mixed_scalar_ret = self._returns_mix_int_and_float(node)
+        # Same argument for a return that can promote to BigInt: the bare i64
+        # has room for the pointer but not for the tag saying it is one, so the
+        # caller reads a heap address as a number.  Denying the bare ABI is
+        # only half the fix — the ret_tag inference must also say "mixed", or
+        # the FpyValue is unwrapped by a static `int` claim on arrival.
+        # BUG-BIGINT-RETURNED-FROM-FUNCTION-LOSES-TAG.
+        _bigint_ret = self._returns_may_be_bigint(node)
+        # A local that a read can reach before any binding does needs the
+        # UNDEF tag, and a bare scalar slot has nowhere to put it: the
+        # premature read hands back the uninitialized stack word instead
+        # of raising UnboundLocalError.  Same argument as the two above —
+        # the value needs a tag the ABI cannot carry.
+        # BUG-UNBOUND-NATIVE-LOCAL-READS-STACK.
+        _maybe_unbound = self._names_maybe_unbound(node.body, param_names)
         uses_bare = (
             not _used_as_value
+            and not _maybe_unbound
             and not has_vararg
             and not has_kwarg
             and not _may_return_none
+            and not _mixed_scalar_ret
+            and not _bigint_ret
             and _is_scalar_ret
             and _body_is_scalar
             and all(isinstance(t, _SCALAR_TYPES) for t in param_types)
+            and _all_params_typed
             and not node.decorator_list
             and not _has_mixed_call_types
             and not _has_ptr_in_sigs
@@ -8997,6 +11278,12 @@ class CodeGen:
                 blockers.append("**kwargs parameter")
             if _may_return_none:
                 blockers.append("may return None")
+            if _maybe_unbound:
+                blockers.append(
+                    "local(s) readable before assignment: "
+                    + ", ".join(sorted(_maybe_unbound)))
+            if _mixed_scalar_ret:
+                blockers.append("returns int on one path and float on another")
             if not _is_scalar_ret:
                 blockers.append("non-scalar return type")
             if not _body_is_scalar:
@@ -9004,6 +11291,9 @@ class CodeGen:
                                 "attrs, or exceptions)")
             if not all(isinstance(t, _SCALAR_TYPES) for t in param_types):
                 blockers.append("non-scalar parameter types")
+            if not _all_params_typed:
+                blockers.append("parameter with no annotation and no "
+                                "classifiable call site")
             if node.decorator_list:
                 blockers.append("has decorator(s)")
             if _has_mixed_call_types:
@@ -9217,6 +11507,69 @@ class CodeGen:
 
         return param_names, param_types, call_types, returns_param
 
+    # Builtins whose result is an integer no matter what they are handed, so
+    # a float argument inside the call says nothing about the call's type.
+    _INT_RESULT_BUILTINS = frozenset({
+        "int", "len", "ord", "hash", "id", "round",
+    })
+
+    def _walk_for_float_evidence(self, e: ast.expr):
+        """Yield the sub-nodes of *e* whose kind can make *e* a float.
+
+        Plain `ast.walk` descends into the **argument list** of a call, and
+        the callers below take any float constant or float-typed parameter
+        they find there as proof the whole expression is a float.  A call's
+        result type is the *callee's* return type; its arguments have nothing
+        to do with it.  `return idx(a, x) + k` is an integer even in the
+        specialization where the parameter `x` is a double, and typing it
+        `double` made the caller bitcast a returned INT-tagged FpyValue into
+        a denormal — `pick([1, 2, 3], 2.5, 0)` printed `1e-323` instead
+        of `2`.  BUG-RET-TYPE-FLOAT-FROM-CALL-ARGS.
+
+        So a call is skipped entirely when its callee already commits to a
+        non-float result: one of the always-integer builtins, or a user
+        function *every* declared specialization of which has a non-float
+        `ret_tag`.  Checking every variant matters — in a chain like
+        `A(x) -> B(x) + 1`, `B` has an int variant and a float one, and only
+        the caller's own float parameter says which is reached, so `A` must
+        keep taking the parameter as evidence.  A callee we cannot name is
+        still walked into, which keeps the old, deliberately eager behaviour
+        for `math.sqrt(x)` and friends.
+        """
+        stack = [e]
+        while stack:
+            n = stack.pop()
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Name):
+                if n.func.id in self._INT_RESULT_BUILTINS:
+                    continue
+                if self._callee_never_returns_float(n.func.id):
+                    continue
+            yield n
+            stack.extend(ast.iter_child_nodes(n))
+
+    _NON_FLOAT_RET_KINDS = frozenset({
+        VKind.INT, VKind.BOOL, VKind.STR, VKind.BYTES, VKind.MIXED,
+    })
+
+    def _callee_never_returns_float(self, name: str) -> bool:
+        """Do all known declarations of user function *name* return non-float?
+
+        False when nothing is known about the name, so the caller falls back
+        to its own (eager) inference rather than assuming.
+        """
+        _infos = []
+        _info, _ = self._lookup_user_function(name)
+        if _info is not None:
+            _infos.append(_info)
+        for _sig in self._monomorphized.get(name, ()):
+            _v = self._user_functions.get(f"{name}__{self._mangle_sig(_sig)}")
+            if _v is not None:
+                _infos.append(_v)
+        if not _infos:
+            return False
+        return all(self._tag_kind(i.ret_tag) in self._NON_FLOAT_RET_KINDS
+                   for i in _infos)
+
     def _duf_detect_ret_type(
         self, node: ast.FunctionDef, ret_type,
         param_names: list[str], call_types: list,
@@ -9236,6 +11589,10 @@ class CodeGen:
             for n in ast.walk(node)
             if id(n) not in _nested_ids
         )
+        # Which locals hold an open() file, computed from the AST because
+        # `_file_vars` is not filled in until the body is emitted — which is
+        # after this.  BUG-FILEREAD-FN-RETTAG.
+        file_names = self._scope_file_names(node)
         # Pre-collect string variables for return type detection
         str_vars = set()
         obj_vars: set[str] = set()
@@ -9282,7 +11639,13 @@ class CodeGen:
             for i, pname in enumerate(param_names):
                 if i < len(call_types) and call_types[i] is not None:
                     _ct_kind = self._tag_kind(call_types[i])
-                    if _ct_kind == VKind.LIST:
+                    if _ct_kind in _LIST_LIKE:
+                        # `_LIST_LIKE`, not `VKind.LIST`.  `list_vars` here
+                        # already means "container-like" — the DICT and SET
+                        # arms below both add to it — so a tuple parameter
+                        # belongs and its omission was an oversight, not a
+                        # policy.  It became reachable the moment the call
+                        # argument classifier learned to tag tuple literals.
                         list_vars.add(pname)
                     elif _ct_kind == VKind.DICT:
                         list_vars.add(pname)
@@ -9305,11 +11668,48 @@ class CodeGen:
                         dict_vars.add(_pname)
                     elif isinstance(_def, ast.Constant) and isinstance(_def.value, str):
                         str_vars.add(_pname)
+            # Module-level globals this function only reads.  Their kind was
+            # known all along — the CSA pre-pass recorded it — but nothing
+            # carried it into these sets, so `return s` for a global string
+            # matched no arm, fell through to the i64 default, and handed the
+            # caller a pointer typed as an integer.  Seeding the sets rather
+            # than adding one `return <global>` arm is what makes the aliased
+            # form `t = s; return t` work too: the alias fixpoint below already
+            # propagates membership, it just had nothing to propagate.
+            # BUG-RETURN-OF-GLOBAL-LOSES-ITS-KIND.
+            _global_tags = self._scope_global_tags(node)
+            for _gname, _gtag in _global_tags.items():
+                _gk = self._tag_kind(_gtag)
+                if _gk == VKind.STR:
+                    str_vars.add(_gname)
+                elif _gk == VKind.DICT:
+                    list_vars.add(_gname)
+                    dict_vars.add(_gname)
+                elif _gk in (VKind.LIST, VKind.SET, VKind.TUPLE):
+                    list_vars.add(_gname)
+                elif _gk == VKind.OBJ:
+                    obj_vars.add(_gname)
+                elif _gk == VKind.FLOAT:
+                    float_vars.add(_gname)
             for n in ast.walk(node):
                 if isinstance(n, ast.Assign):
                     for tgt in n.targets:
                         if isinstance(tgt, ast.Name):
-                            if isinstance(n.value, (ast.List, ast.ListComp, ast.Set, ast.SetComp)):
+                            if isinstance(n.value, (ast.List, ast.ListComp,
+                                                    ast.Set, ast.SetComp,
+                                                    ast.Tuple)):
+                                # `ast.Tuple` belongs here for the same reason
+                                # the *direct* return arm below already lists
+                                # it beside `ast.List`: a tuple is an
+                                # FPY_TAG_LIST at runtime, so "returns a
+                                # pointer, tagged list" is the right answer for
+                                # both.  Without it `q = (10, 20); return q`
+                                # recorded nothing, matched no arm, and
+                                # returned i64 — `len()` then measured the
+                                # address as 0 and `[0]` dereferenced it.
+                                # `return (10, 20)` written directly was always
+                                # correct, which is what made the omission hard
+                                # to see.  BUG-TUPLE-RETURN-SEGFAULTS.
                                 list_vars.add(tgt.id)
                             elif isinstance(n.value, (ast.Dict, ast.DictComp)):
                                 list_vars.add(tgt.id)
@@ -9327,10 +11727,22 @@ class CodeGen:
                                   and n.value.id in obj_vars):
                                 # `x = y` where y is known obj
                                 obj_vars.add(tgt.id)
-                            elif isinstance(n.value, ast.BinOp) and isinstance(n.value.op, ast.Add):
-                                # result = result + ch (string concat pattern)
-                                if isinstance(n.value.left, ast.Name) and n.value.left.id in str_vars:
-                                    str_vars.add(tgt.id)
+                            elif (isinstance(n.value, ast.BinOp)
+                                  and isinstance(n.value.op, ast.Add)
+                                  and ((isinstance(n.value.left, ast.Name)
+                                        and n.value.left.id in str_vars)
+                                       or (isinstance(n.value.right, ast.Name)
+                                           and n.value.right.id in str_vars))):
+                                # result = result + ch (string concat pattern),
+                                # and the mirrored ch + result.
+                                #
+                                # The str-var test used to live *inside* this
+                                # arm rather than in its guard, so any other
+                                # `+` was claimed by the arm and did nothing —
+                                # shadowing the general `_expr_is_str` test
+                                # below.  `raw = str(n) + "x"` is unambiguously
+                                # a str and was typed int for that reason.
+                                str_vars.add(tgt.id)
                             elif (isinstance(n.value, ast.Call)
                                   and isinstance(n.value.func, ast.Name)
                                   and n.value.func.id in (
@@ -9339,8 +11751,28 @@ class CodeGen:
                                 # n = int(x) — always produces an integer,
                                 # even when the argument is a float param.
                                 pass
+                            elif (_fk := self._file_method_kind(
+                                    n.value, file_names)) is not None:
+                                # `data = f.read()`.  The read produces a str,
+                                # but through a method on an object codegen
+                                # only recognises once it is emitting — which
+                                # is after this.  Without an arm here `return
+                                # data` inferred int and the caller re-tagged a
+                                # live string pointer as one.
+                                # BUG-FILEREAD-FN-RETTAG.
+                                if _fk == VKind.STR:
+                                    str_vars.add(tgt.id)
+                                elif _fk == VKind.LIST:
+                                    list_vars.add(tgt.id)
+                            elif self._expr_is_str(n.value):
+                                # `s = str(n)`, `s = x.upper()`, `s = ",".join(...)`
+                                # — the return-type inference below already knew
+                                # these produce strings when returned *directly*,
+                                # but not via a local, so `return s` inferred i64
+                                # and the caller printed a pointer as an integer.
+                                str_vars.add(tgt.id)
                             else:
-                                for sub in ast.walk(n.value):
+                                for sub in self._walk_for_float_evidence(n.value):
                                     if isinstance(sub, ast.Constant) and isinstance(sub.value, float):
                                         float_vars.add(tgt.id)
                                         break
@@ -9349,6 +11781,32 @@ class CodeGen:
                                             and sub.id in float_params):
                                         float_vars.add(tgt.id)
                                         break
+
+            # `out = raw` — a plain alias.  The scan above types a local from
+            # the *shape* of the expression assigned to it, and a bare Name has
+            # no shape, so one extra copy before the `return` dropped the kind
+            # and the caller read the pointer as an int:
+            # `raw = "abcdef"; out = raw; return out` measured 0.
+            # A fixpoint rather than one pass because `ast.walk` does not visit
+            # in source order and an alias chain can be any length.
+            # BUG-ALIASED-LOCAL-RETURN-KIND-LOST.
+            _aliases = []
+            for n in ast.walk(node):
+                if id(n) in _nested_ids:
+                    continue
+                if isinstance(n, ast.Assign) and isinstance(n.value, ast.Name):
+                    for tgt in n.targets:
+                        if isinstance(tgt, ast.Name):
+                            _aliases.append((tgt.id, n.value.id))
+            _changed = bool(_aliases)
+            while _changed:
+                _changed = False
+                for _dst, _src in _aliases:
+                    for _set in (str_vars, list_vars, dict_vars, obj_vars,
+                                 float_vars):
+                        if _src in _set and _dst not in _set:
+                            _set.add(_dst)
+                            _changed = True
 
             # Check return expression type (skip nested function returns)
             for n in ast.walk(node):
@@ -9368,6 +11826,34 @@ class CodeGen:
                             and isinstance(n.value.value, str)):
                         ret_type = i8_ptr
                         break
+                    # Direct bytes-literal return.  A bytes object is a
+                    # pointer exactly like a str, but had no arm here, so
+                    # `return b"abc"` was declared i64 and every pointer-gated
+                    # path downstream (subscript, concat, len) saw an integer.
+                    # BUG-BYTES-RETURN-TAG-LOST.
+                    if (isinstance(n.value, ast.Constant)
+                            and isinstance(n.value.value, bytes)):
+                        ret_type = i8_ptr
+                        break
+                    # `return s.encode()` / `return bytes(...)` — same thing
+                    # reached through a call.
+                    if (isinstance(n.value, ast.Call)
+                            and isinstance(n.value.func, ast.Attribute)
+                            and n.value.func.attr in ("encode", "decode")):
+                        ret_type = i8_ptr
+                        break
+                    if (isinstance(n.value, ast.Call)
+                            and isinstance(n.value.func, ast.Name)
+                            and n.value.func.id in (
+                                "bytes", "set", "frozenset")):
+                        ret_type = i8_ptr
+                        break
+                    # `return f.read()` / `return f.readlines()` — both hand
+                    # back a pointer.  BUG-FILEREAD-FN-RETTAG.
+                    if self._file_method_kind(n.value, file_names) in (
+                            VKind.STR, VKind.LIST):
+                        ret_type = i8_ptr
+                        break
                     # Check if returning a list/dict/string/obj variable
                     if isinstance(n.value, ast.Name) and n.value.id in list_vars:
                         ret_type = i8_ptr
@@ -9376,6 +11862,17 @@ class CodeGen:
                         ret_type = i8_ptr
                         break
                     if isinstance(n.value, ast.Name) and n.value.id in obj_vars:
+                        ret_type = i8_ptr
+                        break
+                    # `return <module-level global>` whose kind carries a
+                    # pointer but has no set of its own to live in — bytes,
+                    # BigInt, Decimal, complex.  The seeding above covers the
+                    # four kinds that do have one.
+                    # BUG-RETURN-OF-GLOBAL-LOSES-ITS-KIND.
+                    if (isinstance(n.value, ast.Name)
+                            and (_gt := _global_tags.get(n.value.id))
+                            is not None
+                            and self._tag_kind(_gt).is_ptr):
                         ret_type = i8_ptr
                         break
                     # Check if returning a JoinedStr (f-string)
@@ -9413,11 +11910,7 @@ class CodeGen:
                     # s.strip(), s.replace(...) etc.
                     if (isinstance(n.value, ast.Call)
                             and isinstance(n.value.func, ast.Attribute)
-                            and n.value.func.attr in (
-                                "upper", "lower", "strip", "lstrip", "rstrip",
-                                "replace", "capitalize", "title", "swapcase",
-                                "center", "ljust", "rjust", "zfill", "join",
-                                "format")):
+                            and n.value.func.attr in self._STR_METHODS):
                         ret_type = i8_ptr
                         break
                     # Returning a list-returning method call like d.keys(),
@@ -9438,8 +11931,7 @@ class CodeGen:
                     # Returning a builtin that produces a string
                     if (isinstance(n.value, ast.Call)
                             and isinstance(n.value.func, ast.Name)
-                            and n.value.func.id in ("str", "repr", "hex",
-                                                     "bin", "oct", "chr")):
+                            and n.value.func.id in self._STR_BUILTINS):
                         ret_type = i8_ptr
                         break
                     # Returning a builtin that produces a list
@@ -9458,7 +11950,8 @@ class CodeGen:
                         pidx = param_names.index(n.value.value.id)
                         if (pidx < len(call_types)
                                 and call_types[pidx] is not None
-                                and self._tag_kind(call_types[pidx]) == VKind.LIST):
+                                and self._tag_kind(call_types[pidx])
+                                    in _LIST_LIKE):
                             ret_type = i8_ptr
                             break
                     # str + str, str * int, list + list, etc. → ptr return
@@ -9492,16 +11985,37 @@ class CodeGen:
                     # element container (list:str / list:list / list:dict /
                     # dict:list / dict:dict / dict:str) → pointer return.
                     # Also: slice of a str param → str.
-                    if (isinstance(n.value, ast.Subscript)
-                            and isinstance(n.value.value, ast.Name)
-                            and n.value.value.id in param_names):
-                        pidx = param_names.index(n.value.value.id)
-                        if pidx < len(call_types) and call_types[pidx] is not None:
-                            ct = call_types[pidx]
+                    # The base may itself be an index into the param — `rows[0]`
+                    # in `return rows[0][0]` — which had no arm at all, so a
+                    # `list:list:str` parameter returned its str element through
+                    # an i64 and `len()` measured the truncated pointer.
+                    # BUG-NESTED-LIST-ARG-INNER-ELEM-LOST.
+                    if isinstance(n.value, ast.Subscript):
+                        ct, _root = self._ret_param_base_tag(
+                            n.value.value, param_names, call_types)
+                        if _root is not None and ct is not None:
                             _ctk = self._tag_kind(ct)
+                            _ek = self._tag_elem_kind(ct)
+                            # The test is whether the *element* is a pointer,
+                            # not merely whether its kind is known.  This used
+                            # to accept any known element kind, which was safe
+                            # only because the element was so rarely known:
+                            # once the call-site classifier learned to say
+                            # "list:float", `return fs[1]` started returning a
+                            # double through an i8* and `second([1.5, 2.5]) * 2`
+                            # segfaulted (it read a NaN bit pattern as an i64
+                            # before that, so it was already wrong).
                             if (_ctk in (VKind.LIST, VKind.DICT)
-                                    and self._tag_elem_kind(ct) is not None):
+                                    and _ek is not None and _ek.is_ptr):
                                 ret_type = i8_ptr
+                                break
+                            if (_ctk in (VKind.LIST, VKind.DICT)
+                                    and _ek == VKind.FLOAT):
+                                # A float element is the one non-pointer kind
+                                # the i64 default gets wrong: the float-evidence
+                                # walk below looks for float *constants* and
+                                # float-typed names, and `fs[1]` is neither.
+                                ret_type = double
                                 break
                             if (_ctk == VKind.STR
                                     and isinstance(n.value.slice, ast.Slice)):
@@ -9585,7 +12099,7 @@ class CodeGen:
                         # Check for float constants in return expression, or
                         # references to float-typed params (monomorphization).
                         returns_float = False
-                        for sub in ast.walk(n.value):
+                        for sub in self._walk_for_float_evidence(n.value):
                             if isinstance(sub, ast.Constant) and isinstance(sub.value, float):
                                 returns_float = True
                                 break
@@ -9692,12 +12206,62 @@ class CodeGen:
         returns_str = False
         returns_dict = False
         returns_list = False
+        # `return <param>` where nothing at all is known about that parameter.
+        # The honest tag is "mixed": the kind is whatever the caller passed, and
+        # only the runtime tag can say.  Falling through to the "int" default
+        # instead made the caller unwrap the returned FpyValue to a naked i64,
+        # so `len(echo(opaque_str()))` measured a string pointer as an integer
+        # and answered 0.  BUG-RETURNS-UNTYPED-PARAM-RET-TAG.
+        #
+        # An *annotated* parameter is excluded even when no call site classified
+        # it: the annotation is evidence, `_duf_select_abi` accepts it as such
+        # and may hand the function the bare ABI, and a bare i64 return has
+        # nowhere to carry a "mixed" tag.
+        _ann_params = {a.arg for a in node.args.args if a.annotation is not None}
+        _ann_params |= {a.arg for a in node.args.posonlyargs
+                        if a.annotation is not None}
+        _ann_params |= {a.arg for a in node.args.kwonlyargs
+                        if a.annotation is not None}
+        returns_untyped_param = False
+        # A returned parameter whose kind is pointer-carrying but is *not* a
+        # container, str, bytes or obj — BigInt, Decimal, complex.  Kept as a
+        # VKind rather than one boolean each, since the i8_ptr branch below
+        # only needs to name it.
+        returns_ptr_kind = None
+        # `bytes` and `set` had no arm here either, so a function returning
+        # one was typed `int` and the caller read the pointer as an integer.
+        # BUG-BYTES-RETURN-TAG-LOST.
+        returns_bytes = False
+        returns_set = False
+        # See _duf_detect_ret_type: which locals hold an open() file has to be
+        # read off the AST here too.  BUG-FILEREAD-FN-RETTAG.
+        file_names = self._scope_file_names(node)
+        # And which module-level globals this scope only reads, for the same
+        # reason: the sets handed to us cover str/dict/obj, but the kinds with
+        # no set of their own reached no arm at all and the i8_ptr branch
+        # below then fell through to its "ptr" default — which means *list*.
+        # BUG-RETURN-OF-GLOBAL-LOSES-ITS-KIND.
+        _global_tags = self._scope_global_tags(node)
         for n in ast.walk(node):
             if isinstance(n, ast.Return) and n.value is not None:
-                if isinstance(n.value, ast.JoinedStr):
+                if (_fk := self._file_method_kind(
+                        n.value, file_names)) is not None:
+                    # `return f.readline()` direct.  The i8_ptr type alone is
+                    # not enough — the tag is what tells the caller whether the
+                    # pointer is a string or a list.
+                    if _fk == VKind.STR:
+                        returns_str = True
+                    elif _fk == VKind.LIST:
+                        returns_list = True
+                elif isinstance(n.value, ast.JoinedStr):
                     returns_str = True
+                elif (isinstance(n.value, ast.Constant)
+                        and isinstance(n.value.value, bytes)):
+                    returns_bytes = True
                 elif isinstance(n.value, ast.Constant) and isinstance(n.value.value, str):
                     returns_str = True
+                elif isinstance(n.value, (ast.Set, ast.SetComp)):
+                    returns_set = True
                 elif isinstance(n.value, ast.Name) and n.value.id in str_vars:
                     returns_str = True
                 elif isinstance(n.value, (ast.Dict, ast.DictComp)):
@@ -9708,6 +12272,26 @@ class CodeGen:
                         and has_return_value
                         and n.value.id in dict_vars):
                     returns_dict = True
+                elif (isinstance(n.value, ast.Name)
+                        and (_gt := _global_tags.get(n.value.id)) is not None
+                        and (_gk := self._tag_kind(_gt)) is not None
+                        and (_gk.is_ptr or _gk == VKind.FLOAT)):
+                    # `return <module-level global>`, named explicitly rather
+                    # than left to the i8_ptr branch's "ptr" default, so a
+                    # global tuple, set, bytes or BigInt is not reported as a
+                    # list.  BUG-RETURN-OF-GLOBAL-LOSES-ITS-KIND.
+                    if _gk == VKind.STR:
+                        returns_str = True
+                    elif _gk == VKind.DICT:
+                        returns_dict = True
+                    elif _gk in (VKind.LIST, VKind.TUPLE):
+                        returns_list = True
+                    elif _gk == VKind.SET:
+                        returns_set = True
+                    elif _gk == VKind.BYTES:
+                        returns_bytes = True
+                    elif _gk in (VKind.BIGINT, VKind.DECIMAL, VKind.COMPLEX):
+                        returns_ptr_kind = _gk
                 elif (isinstance(n.value, ast.Call)
                         and isinstance(n.value.func, ast.Attribute)
                         and n.value.func.attr in (
@@ -9722,10 +12306,22 @@ class CodeGen:
                                                    "split", "splitlines")):
                     returns_list = True
                 elif (isinstance(n.value, ast.Call)
+                        and isinstance(n.value.func, ast.Attribute)
+                        and n.value.func.attr == "encode"):
+                    returns_bytes = True
+                elif (isinstance(n.value, ast.Call)
                         and isinstance(n.value.func, ast.Name)
                         and n.value.func.id in ("str", "repr", "hex",
                                                  "bin", "oct", "chr")):
                     returns_str = True
+                elif (isinstance(n.value, ast.Call)
+                        and isinstance(n.value.func, ast.Name)
+                        and n.value.func.id == "bytes"):
+                    returns_bytes = True
+                elif (isinstance(n.value, ast.Call)
+                        and isinstance(n.value.func, ast.Name)
+                        and n.value.func.id in ("set", "frozenset")):
+                    returns_set = True
                 elif (isinstance(n.value, ast.Call)
                         and isinstance(n.value.func, ast.Name)
                         and n.value.func.id in ("sorted", "reversed", "list",
@@ -9762,13 +12358,19 @@ class CodeGen:
                                     and call_types[pidx] in ("dict:str", "list:str")):
                                 returns_str = True
                                 break
-                elif (isinstance(n.value, ast.Subscript)
-                        and isinstance(n.value.value, ast.Name)
-                        and n.value.value.id in param_names):
-                    # Subscript on a param whose element type is known
-                    pidx = param_names.index(n.value.value.id)
-                    if pidx < len(call_types) and call_types[pidx] is not None:
-                        ct = call_types[pidx]
+                elif isinstance(n.value, ast.Subscript):
+                    # Subscript on a param whose element type is known.
+                    #
+                    # Only a *bare* param base had an arm here, so
+                    # `return rows[0][0]` matched nothing at all and the i8_ptr
+                    # branch below fell through to its "ptr" default — list —
+                    # even when the call site had proved the parameter to be
+                    # `list:list:str`.  `len(inner_first([["a", "bb"]]))`
+                    # measured a str as a list and answered 0.
+                    # BUG-NESTED-LIST-ARG-INNER-ELEM-LOST.
+                    ct, _root = self._ret_param_base_tag(
+                        n.value.value, param_names, call_types)
+                    if _root is not None and ct is not None:
                         _ek = self._tag_elem_kind(ct)
                         if _ek == VKind.STR:
                             returns_str = True
@@ -9776,9 +12378,36 @@ class CodeGen:
                             returns_dict = True
                         elif _ek == VKind.LIST:
                             returns_list = True
+                        elif _ek == VKind.BYTES:
+                            returns_bytes = True
+                        elif _ek == VKind.SET:
+                            returns_set = True
+                        elif _ek in (VKind.BIGINT, VKind.DECIMAL,
+                                     VKind.COMPLEX):
+                            # The mirror of the `return <param>` arm below,
+                            # which grew these three under
+                            # BUG-BIGINT-RETURNED-FROM-FUNCTION-LOSES-TAG while
+                            # this one — an *element* of a param rather than the
+                            # param itself — never did.  With no arm here
+                            # nothing was set at all, so the i8_ptr branch fell
+                            # through to its "ptr" default, which means *list*,
+                            # and `pick([2 ** 85]) == big` compared a BigInt
+                            # against a list by address.  Guessing list for an
+                            # unrecognised pointer is the worst available
+                            # default, because every pointer fits it.
+                            # BUG-BIGINT-COMPARES-BY-POINTER (parameter half).
+                            returns_ptr_kind = _ek
                         elif (self._tag_kind(ct) == VKind.STR
                                 and isinstance(n.value.slice, ast.Slice)):
                             returns_str = True
+                    elif _root is not None and _root not in _ann_params:
+                        # An element of an untyped container is itself of
+                        # unknown kind — `s[0]` is a str when the caller passed
+                        # a str and an int when it passed a list of ints.  The
+                        # subscript already lowers to `fv_subscript`, which
+                        # answers with a runtime tag; saying "int" here would
+                        # only make the caller throw that tag away again.
+                        returns_untyped_param = True
                 elif (isinstance(n.value, ast.Name)
                         and n.value.id in param_names):
                     # Param pass-through: inherit type info from call site
@@ -9792,6 +12421,26 @@ class CodeGen:
                             returns_dict = True
                         elif _ctk == VKind.LIST:
                             returns_list = True
+                        elif _ctk == VKind.BYTES:
+                            # `def echo(v): return v` called with bytes.  The
+                            # LLVM type was already widened to a pointer by
+                            # `_duf_detect_ret_type`, but with no tag here the
+                            # i8_ptr arm read "ptr" — i.e. list — and
+                            # `len(echo(ob()))` measured a bytes object as a
+                            # list.  BUG-BYTES-RETURN-TAG-LOST.
+                            returns_bytes = True
+                        elif _ctk == VKind.SET:
+                            returns_set = True
+                        elif _ctk in (VKind.BIGINT, VKind.DECIMAL,
+                                      VKind.COMPLEX):
+                            # The other three pointer-carrying numeric kinds.
+                            # With no arm here nothing was set at all, so the
+                            # i8_ptr branch below fell through to its "ptr"
+                            # default — which means *list* — and `f(2 ** 80)`
+                            # consumed as a number raised "unsupported operand
+                            # type(s) for +: 'list' and 'int'".
+                            # BUG-BIGINT-RETURNED-FROM-FUNCTION-LOSES-TAG.
+                            returns_ptr_kind = _ctk
                     else:
                         # Fallback: use local type tracking (from defaults,
                         # assignments, or .append calls) for param variables.
@@ -9802,6 +12451,8 @@ class CodeGen:
                             returns_dict = True
                         elif _vid in str_vars:
                             returns_str = True
+                        elif _vid not in _ann_params:
+                            returns_untyped_param = True
 
         # Detect obj-valued returns (variable tracked in obj_vars from the
         # local type-tracking scan above) so ret_tag is "obj" rather than
@@ -9820,7 +12471,25 @@ class CodeGen:
                     break
 
         if ret_type == i64:
-            ret_tag = "str" if returns_str else "int"
+            if returns_bytes:
+                ret_tag = "bytes"
+            elif returns_set:
+                ret_tag = "set"
+            elif returns_str:
+                ret_tag = "str"
+            elif (returns_untyped_param
+                  and not returns_dict and not returns_list
+                  and not returns_obj):
+                ret_tag = "mixed"
+            elif self._returns_may_be_bigint(node):
+                # `return -x` / `return r * 2` in a program that can promote to
+                # BigInt.  i64 is the right *width* but the wrong claim: the
+                # callee may hand back a BIGINT-tagged FpyValue, and narrowing
+                # that to its `data` field yields the pointer.
+                # BUG-BIGINT-RETURNED-FROM-FUNCTION-LOSES-TAG.
+                ret_tag = "mixed"
+            else:
+                ret_tag = "int"
         elif ret_type == double:
             ret_tag = "float"
         elif ret_type == i32:
@@ -9828,10 +12497,41 @@ class CodeGen:
         elif ret_type == i8_ptr:
             if (has_kwarg and returns_param) or returns_dict:
                 ret_tag = "dict"
+            elif returns_bytes:
+                # Without this arm a bytes-returning function fell through to
+                # the "ptr" default, which means list/tuple — so `ob() + b"d"`
+                # concatenated as a list and printed `()`.
+                # BUG-BYTES-RETURN-TAG-LOST.
+                ret_tag = "bytes"
+            elif returns_set and not returns_list:
+                ret_tag = "set"
             elif returns_str:
                 ret_tag = "str"
             elif returns_obj:
                 ret_tag = "obj"
+            elif returns_ptr_kind is not None or (returns_untyped_param
+                                                  and not returns_list):
+                # BigInt/Decimal/complex pass-through, and the genuinely
+                # unknown case, both answer "mixed" — keep the tagged
+                # FpyValue and let runtime dispatch read it.
+                #
+                # Naming the kind statically instead (`ret_tag = "bigint"`)
+                # was tried and only moved the error: the caller's kind for a
+                # bare call expression is guessed from `static_ret_type`,
+                # which is i8* for all of these, so `f(2 ** 80) + 0` went from
+                # claiming 'list' to claiming 'str'.  Committing to a static
+                # kind would require a matching arm in every consumer, which
+                # is the fragility that produced this whole bug family.  The
+                # FV ABI already carries the real tag; `fastpy_fv_binop` and
+                # `fastpy_fv_compare` handle BigInt and Decimal correctly.
+                #
+                # The i64 branch above has had the untyped-param arm since
+                # BUG-RETURNS-UNTYPED-PARAM-RET-TAG; the pointer branch never
+                # grew one, so a returned parameter of unknown kind was typed
+                # "ptr" — list.  Guessing list for an unrecognised *pointer*
+                # is the worst available default, because every pointer fits
+                # it.  BUG-BIGINT-RETURNED-FROM-FUNCTION-LOSES-TAG.
+                ret_tag = "mixed"
             else:
                 ret_tag = "ptr"  # list/tuple
                 # Try to determine list element type from return statements
@@ -9912,7 +12612,114 @@ class CodeGen:
                     elif ann.value.id in ("tuple", "Tuple"):
                         ret_tag = "ptr"
 
+        # An int-on-one-path/float-on-another function has no single scalar
+        # tag.  `_duf_select_abi` has already denied it the bare ABI so the
+        # FpyValue carries the real tag; saying "int" (or "float") here would
+        # hand the caller a static answer it would then unwrap by, undoing
+        # that.  BUG-MIXED-SCALAR-RETURN-TAG.
+        #
+        # This runs *after* the annotation override on purpose.  A `-> float`
+        # annotation on a function that also returns an int is simply wrong,
+        # and Python does not enforce it — `def a(x) -> float: return 1`
+        # returns the integer 1.  Letting the annotation win here produced
+        # neither answer: the tag said float, the value was an i64, and the
+        # caller printed 4612811918334230528.
+        if (ret_tag in ("int", "float", "bool")
+                and self._returns_mix_int_and_float(node)):
+            ret_tag = "mixed"
+
         return ret_tag
+
+    _PEELABLE_HEADS = ("list", "tuple", "ptr", "dict", "set")
+
+    def _ret_param_base_tag(self, base: ast.expr, param_names: list[str],
+                            call_types: list) -> tuple[str | None, str | None]:
+        """The tag of `base`, when it is a parameter or an index chain into one.
+
+        Returns `(tag, root_param_name)`.  A `root` of None means `base` is not
+        rooted at a parameter at all; a `tag` of None with a real root means
+        "a parameter, but of unknown kind" — the caller's cue to fall back to
+        the runtime-tagged path rather than to invent one.
+
+        The chain is peeled one `:` level per index, which is exactly what the
+        call site's compound tag records: `rows` typed `list:list:str` makes
+        `rows[0]` a `list:str`.  Slices are not peeled — `xs[1:]` is the same
+        kind as `xs` — so the loop stops at one, and the caller's existing
+        slice arm still sees it.
+        """
+        chain = 0
+        node = base
+        while (isinstance(node, ast.Subscript)
+               and not isinstance(node.slice, ast.Slice)):
+            chain += 1
+            node = node.value
+        if not (isinstance(node, ast.Name) and node.id in param_names):
+            return None, None
+        pidx = param_names.index(node.id)
+        tag = call_types[pidx] if pidx < len(call_types) else None
+        for _ in range(chain):
+            if tag is None:
+                return None, node.id
+            head, sep, rest = str(tag).partition(":")
+            if not sep or head not in self._PEELABLE_HEADS:
+                return None, node.id
+            tag = rest
+        return tag, node.id
+
+    def _duf_propagate_mixed_ret_tags(self) -> None:
+        """Spread a `mixed` return tag through plain forwarding wrappers.
+
+        `def wrap(v): return inner(v)` is declared before anything knows what
+        `inner` returns when `inner` is defined later in the file, and even in
+        source order `_duf_determine_ret_tag` has no arm for "returns a user
+        call" — so the wrapper fell through to the `"int"` default and its
+        callers unwrapped the tagged FpyValue away, exactly the way
+        BUG-RETURNS-UNTYPED-PARAM-RET-TAG does one level down.
+
+        The equivalent propagation already exists for the call-site analysis
+        (`_csa_propagate_ret_types` copies a callee's entry to the wrapper), so
+        a wrapper around a `pick()`-style mixed function was already correct.
+        This covers the tags only the declaration pass can see — chiefly
+        `return <untyped param>` — which reach `_user_functions` but never
+        `_func_ret_types`.
+
+        Run to a fixed point so chains of any length converge, and confined to
+        functions still carrying the bare `"int"` default: an annotation, a
+        `_func_ret_types` entry or any more specific tag is a real answer and
+        outranks this one.  Bare-ABI functions are skipped because their `i64`
+        return has nowhere to carry a tag.
+        """
+        nodes = getattr(self, "_function_def_nodes", None)
+        if not nodes:
+            return
+        frt = getattr(self, "_func_ret_types", None) or {}
+        for _ in range(8):
+            changed = False
+            for name, fnode in list(nodes.items()):
+                info = self._user_functions.get(name)
+                if (info is None or info.ret_tag != "int"
+                        or not info.uses_fv_abi
+                        or fnode.returns is not None
+                        or frt.get(name) is not None):
+                    continue
+                for n in ast.walk(fnode):
+                    if not (isinstance(n, ast.Return)
+                            and isinstance(n.value, ast.Call)
+                            and isinstance(n.value.func, ast.Name)):
+                        continue
+                    callee = n.value.func.id
+                    if callee == name:
+                        continue  # self-recursion says nothing new
+                    _ct = frt.get(callee)
+                    if _ct is None:
+                        _ci = self._user_functions.get(callee)
+                        _ct = _ci.ret_tag if _ci is not None else None
+                    if _ct is not None and self._tag_kind(_ct) == VKind.MIXED:
+                        info.ret_tag = "mixed"
+                        changed = True
+                        break
+            if not changed:
+                return
 
     def _declare_user_function(self, node: ast.FunctionDef,
                                _sig_override: list | None = None,
@@ -10361,6 +13168,15 @@ class CodeGen:
         else:
             call_types = self._call_site_param_types.get(node.name, [])
 
+        # An annotation is evidence in its own right, independent of any call
+        # site; a parameter that has one is never treated as unknown below.
+        _annotated_params = {a.arg for a in node.args.args
+                             if a.annotation is not None}
+        _annotated_params |= {a.arg for a in node.args.posonlyargs
+                              if a.annotation is not None}
+        _annotated_params |= {a.arg for a in node.args.kwonlyargs
+                              if a.annotation is not None}
+
         for param_idx, param in enumerate(info.func.args):
             if info.uses_bare_abi:
                 # Bare-type ABI: params are already native types (i64/double).
@@ -10469,7 +13285,18 @@ class CodeGen:
                                     _sig_types.add(sig[param_idx])
                                 else:
                                     _has_unknown_caller = True
-                        if len(_sig_types) > 1:
+                        _has_mixed_caller = any(
+                            self._tag_kind(t) == VKind.MIXED
+                            for t in _sig_types)
+                        if _has_mixed_caller:
+                            # A single call site can be ambiguous all by
+                            # itself — `f(*seq)` where `seq` may or may not
+                            # reach a defaulted slot records "mixed" there.
+                            # Without this arm one such signature looked like
+                            # one *known* type and the slot was tagged
+                            # statically.  BUG-SPLAT-DEFAULTED-SLOT-TYPE.
+                            tag = "mixed"
+                        elif len(_sig_types) > 1:
                             tag = "mixed"  # conflicting types → runtime dispatch
                         elif _has_unknown_caller and _sig_types:
                             # Some callers have known pointer types, others
@@ -10518,9 +13345,33 @@ class CodeGen:
                                     _sig_types.add(sig[param_idx])
                                 else:
                                     _has_unknown_caller = True
-                        if len(_sig_types) > 1:
+                        _has_mixed_caller = any(
+                            self._tag_kind(t) == VKind.MIXED
+                            for t in _sig_types)
+                        if _has_mixed_caller:
+                            # See the pointer branch above: one call site can
+                            # be ambiguous on its own, and "ambiguous" is not
+                            # "known".  BUG-SPLAT-DEFAULTED-SLOT-TYPE.
+                            tag = "mixed"
+                        elif len(_sig_types) > 1:
                             tag = "mixed"  # conflicting types → runtime dispatch
                         elif _has_unknown_caller and _sig_types:
+                            tag = "mixed"
+                        elif (_has_unknown_caller
+                                and param.name not in _annotated_params):
+                            # Every caller unresolvable and no annotation:
+                            # nothing at all is known.  `static_type` is only
+                            # i64 because `param_types` falls back to it when
+                            # it has no evidence, so calling that "int" is the
+                            # same silence-as-scalar guess the bare ABI used to
+                            # make.  A str parameter tagged "int" loads as a
+                            # naked pointer-as-integer, which sends `s[i]` past
+                            # the `fv_subscript` runtime-dispatch arm and into
+                            # the CPython `__getitem__` bridge — NULL in pure
+                            # mode, and a fault on the next use.  The pointer
+                            # branch above already answers "mixed" here; this
+                            # is the same answer for the other half of the
+                            # split.  BUG-SUBSCRIPT-UNTYPED-PARAM-BRIDGE.
                             tag = "mixed"
                         elif (not _sigs and node.name in getattr(
                                 self, '_funcs_used_as_values', set())):
@@ -10721,6 +13572,23 @@ class CodeGen:
         effective_name = _name_override if _name_override else node.name
         self._current_func_name = effective_name  # Phase 4: for indirect call ABI detection
 
+        # Record which tag each parameter carries *in this specialization*.
+        # `_infer_call_arg_type` needs it to forward a parameter's kind to an
+        # inner call: inside `pick__list_d_i`, `idx(a, x)` must pick
+        # `idx__list_d`, but `x` is stored as an FpyValue so `_var_kind` only
+        # says MIXED, the argument scored as "unknown", every candidate tied
+        # and the resolver took the *first* specialization — the int one,
+        # which read the double's bits as an index.
+        # BUG-INNER-CALL-PICKS-FIRST-SPECIALIZATION.
+        if _sig_override is not None:
+            _spec_pnames = ([a.arg for a in node.args.posonlyargs]
+                            + [a.arg for a in node.args.args]
+                            + [a.arg for a in node.args.kwonlyargs])
+            self._spec_param_tags[effective_name] = {
+                _pn: _pt for _pn, _pt in zip(_spec_pnames, _sig_override)
+                if _pt is not None
+            }
+
         # CPython generators: skip body emission. The function will be
         # compiled and stored via CPython bridge in fastpy_main.
         if effective_name in getattr(self, '_cpython_generators', set()):
@@ -10737,7 +13605,10 @@ class CodeGen:
                  self._obj_var_class, self._native_vars,
                  self._unsafe_typed_vars, self._int_mode_vars,
                  self._current_fn_bare_abi,
-                 self._current_func_explicit_globals)
+                 self._current_func_explicit_globals,
+                 self._fv_forced_locals,
+                 self._scope_maybe_unbound,
+                 self._finally_exc_depth)
 
         # Set up function state
         self.function = info.func
@@ -10757,6 +13628,13 @@ class CodeGen:
         self._obj_var_class = {}
         self._obj_var_pinned = set()
         self._int_mode_vars = {}
+        # A nested def emitted while inside a finally body is its own scope:
+        # its returns leave *it*, not the enclosing cleanup.
+        self._finally_exc_depth = 0
+        self._scope_maybe_unbound = self._names_maybe_unbound(
+            node.body, [a.arg for a in node.args.args]
+            + [a.arg for a in node.args.kwonlyargs]
+            + [a.arg for a in node.args.posonlyargs])
         # Pre-scan for typed annotations contradicted by later assignments
         if self._typed_mode:
             self._unsafe_typed_vars = self._scan_unsafe_typed_vars(node.body)
@@ -10811,6 +13689,44 @@ class CodeGen:
 
         self._efd_store_parameters(node, info, _sig_override,
                                    bool_default_params, string_params, saved)
+
+        # Parameters already have their slots, so they are excluded; every
+        # other local that can hold a runtime-tagged value is given an
+        # FpyValue slot on its first store instead of being widened later.
+        self._fv_forced_locals = self._scan_fv_forced_locals(
+            node.body, set(self.variables) | self._current_func_params)
+
+        # Excluding parameters is right for the *scan* — their slots are made
+        # by `_efd_store_parameters` above, not by a first store — but it left
+        # them without the one-slot guarantee, and a parameter is the most
+        # natural loop counter there is: `def f(i): while i < n: i = i + 1`
+        # widened `i` mid-loop into a second alloca, so the condition kept
+        # reading the abandoned one and the loop never terminated.
+        # BUG-BIGINT-PROGRAM-HANGS-WHILE-COUNTER.
+        #
+        # Re-running the scan with the parameters visible is safe to act on at
+        # exactly this point: only the parameter stores have been emitted, so
+        # rebuilding a slot now strands no loads.  Names already in
+        # `self.variables` that are *not* parameters stay skipped — a closure
+        # cell or a global is not ours to widen.
+        if self._USE_FV_LOCALS and self._current_func_params:
+            _forced_params = self._scan_fv_forced_locals(
+                node.body,
+                set(self.variables) - self._current_func_params,
+            ) & self._current_func_params
+            for _pname in sorted(_forced_params):
+                _entry = self.variables.get(_pname)
+                if _entry is None:
+                    continue
+                _palloca, _ptag = _entry
+                if _palloca.type.pointee == fpy_val:
+                    continue
+                _pcur = self.builder.load(_palloca)
+                self._fv_forced_locals.add(_pname)
+                # Drop the binding so `_store_variable` builds a fresh slot
+                # rather than reusing (or re-widening) the narrow one.
+                del self.variables[_pname]
+                self._store_variable(_pname, _pcur, _ptag)
 
         # --typed mode: parse parameter annotations and create native allocas
         # with entry guards that verify the FpyValue tag matches the annotation.
@@ -10984,7 +13900,10 @@ class CodeGen:
          self._obj_var_class, self._native_vars,
          self._unsafe_typed_vars, self._int_mode_vars,
          self._current_fn_bare_abi,
-         self._current_func_explicit_globals) = saved
+         self._current_func_explicit_globals,
+         self._fv_forced_locals,
+         self._scope_maybe_unbound,
+         self._finally_exc_depth) = saved
 
     # -----------------------------------------------------------------
     # Class support
@@ -13428,6 +16347,10 @@ class CodeGen:
                 list_attrs |= s_list
                 dict_attrs |= s_dict
                 self._class_container_attrs[class_name] = (list_attrs, dict_attrs)
+            if sec_base in self._class_attr_vtypes:
+                _sec = dict(self._class_attr_vtypes[sec_base])
+                _sec.update(self._class_attr_vtypes.get(class_name, {}))
+                self._class_attr_vtypes[class_name] = _sec
             self._per_class_float_attrs[class_name] |= self._per_class_float_attrs.get(sec_base, set())
             self._per_class_string_attrs[class_name] |= self._per_class_string_attrs.get(sec_base, set())
             self._per_class_bool_attrs[class_name] |= self._per_class_bool_attrs.get(sec_base, set())
@@ -13758,6 +16681,13 @@ class CodeGen:
             p_list, p_dict = self._class_container_attrs[parent_name]
             list_attrs |= p_list
             dict_attrs |= p_dict
+        if parent_name and parent_name in self._class_attr_vtypes:
+            # Inherit the parent's attr types, but never overwrite the child's
+            # own — a subclass that reassigns `self.items` in its `__init__`
+            # has the more specific answer.
+            _inherited = dict(self._class_attr_vtypes[parent_name])
+            _inherited.update(self._class_attr_vtypes.get(class_name, {}))
+            self._class_attr_vtypes[class_name] = _inherited
         self._class_container_attrs[class_name] = (list_attrs, dict_attrs)
 
         self._dcl_emit_class_var_globals(node, class_name)
@@ -14144,6 +17074,7 @@ class CodeGen:
         dict_attrs: set[str] = set()
         obj_attrs: set[str] = set()
         obj_attr_types: dict[str, str] = {}
+        attr_vtypes: dict[str, ValueType] = {}
         lookup_name = cname if cname is not None else node.name
 
         # Find __init__ to analyze param → attr relationships
@@ -14267,6 +17198,17 @@ class CodeGen:
                         if (isinstance(tgt, ast.Attribute)
                                 and isinstance(tgt.value, ast.Name)
                                 and tgt.value.id == "self"):
+                            # Record the attribute's *type* alongside the
+                            # coarse list/dict buckets below.  The buckets
+                            # cannot spell "tuple" and cannot carry an element
+                            # kind; this map can, and consumers that need
+                            # either consult it first.  Only container
+                            # literals are recorded — anything else stays
+                            # absent, i.e. "no information".
+                            _av = self._attr_vtype_of(n.value, method,
+                                                      lookup_name)
+                            if _av is not None:
+                                attr_vtypes[tgt.attr] = _av
                             if isinstance(n.value, (ast.List, ast.ListComp, ast.Set)):
                                 list_attrs.add(tgt.attr)
                             # [x] * N or [x, y] * N → list attribute
@@ -14424,6 +17366,46 @@ class CodeGen:
             # Also add any function-local vars — we scan each function
             # separately below, but for module-level we need the module
             # vars here.
+            #
+            # Precompute two variable→class maps ONCE per call (loop-invariant
+            # w.r.t. the assignment scan below). Previously these were rebuilt
+            # by re-walking the whole tree inside the per-assignment loop —
+            # O(assignments × tree) — which dominated compile time.
+            #
+            # Map A (_ctor_first): first `name = ClassName(...)` in walk order
+            # where ClassName is a known user class. Mirrors the original
+            # first-match-then-break inner walk.
+            _ctor_first: dict[str, str] = {}
+            # Map B (_ctor_fixpoint): iterative fixpoint over
+            # `name = ClassName(...)` and Name→Name chains, using the classes
+            # known during CSA. Mirrors the original 5-pass fixpoint inner walk.
+            _ctor_fixpoint: dict[str, str] = {}
+            _known_ctor_classes = set(self._csa_class_asts.keys())
+            _all_assigns: list[ast.Assign] = [
+                _an for _an in ast.walk(tree)
+                if isinstance(_an, ast.Assign) and len(_an.targets) == 1
+                and isinstance(_an.targets[0], ast.Name)
+            ]
+            for _an in _all_assigns:
+                _nm = _an.targets[0].id
+                if (isinstance(_an.value, ast.Call)
+                        and isinstance(_an.value.func, ast.Name)
+                        and _an.value.func.id in self._user_classes
+                        and _nm not in _ctor_first):
+                    _ctor_first[_nm] = _an.value.func.id
+            for _ in range(5):
+                _prev = len(_ctor_fixpoint)
+                for _an in _all_assigns:
+                    _nm = _an.targets[0].id
+                    if (isinstance(_an.value, ast.Call)
+                            and isinstance(_an.value.func, ast.Name)
+                            and _an.value.func.id in _known_ctor_classes):
+                        _ctor_fixpoint[_nm] = _an.value.func.id
+                    elif (isinstance(_an.value, ast.Name)
+                          and _an.value.id in _ctor_fixpoint):
+                        _ctor_fixpoint[_nm] = _ctor_fixpoint[_an.value.id]
+                if len(_ctor_fixpoint) == _prev:
+                    break
             for n in ast.walk(tree):
                 if not (isinstance(n, ast.Assign) and len(n.targets) == 1
                         and isinstance(n.targets[0], ast.Attribute)
@@ -14439,17 +17421,9 @@ class CodeGen:
                 # Try scoped lookup: find the enclosing function and check
                 # local assignments there.
                 if receiver_cls is None:
-                    # Walk tree for an assignment to receiver_name from a
-                    # ClassName(...) call in the same or module scope.
-                    for n2 in ast.walk(tree):
-                        if (isinstance(n2, ast.Assign) and len(n2.targets) == 1
-                                and isinstance(n2.targets[0], ast.Name)
-                                and n2.targets[0].id == receiver_name
-                                and isinstance(n2.value, ast.Call)
-                                and isinstance(n2.value.func, ast.Name)
-                                and n2.value.func.id in self._user_classes):
-                            receiver_cls = n2.value.func.id
-                            break
+                    # Precomputed: first `receiver_name = ClassName(...)` in
+                    # walk order (see _ctor_first above).
+                    receiver_cls = _ctor_first.get(receiver_name)
                 if receiver_cls != node.name:
                     continue
                 # Determine assigned value's class
@@ -14462,31 +17436,10 @@ class CodeGen:
                 elif isinstance(rhs, ast.Name):
                     rhs_cls = var_classes_module.get(rhs.id)
                     if rhs_cls is None:
-                        # Search for a constructor assignment of this name,
-                        # or a Name-to-Name chain ending in one (iterative
-                        # fixpoint, handles `head = None; head = n` where
-                        # n is Node(v)). Uses _csa_class_asts (populated
-                        # early) rather than _user_classes (not yet set
-                        # for classes currently being declared).
-                        known_classes = set(self._csa_class_asts.keys())
-                        local_obj: dict[str, str] = {}
-                        for _ in range(5):
-                            prev = len(local_obj)
-                            for n2 in ast.walk(tree):
-                                if not (isinstance(n2, ast.Assign) and len(n2.targets) == 1
-                                        and isinstance(n2.targets[0], ast.Name)):
-                                    continue
-                                tgt_name = n2.targets[0].id
-                                if (isinstance(n2.value, ast.Call)
-                                        and isinstance(n2.value.func, ast.Name)
-                                        and n2.value.func.id in known_classes):
-                                    local_obj[tgt_name] = n2.value.func.id
-                                elif (isinstance(n2.value, ast.Name)
-                                      and n2.value.id in local_obj):
-                                    local_obj[tgt_name] = local_obj[n2.value.id]
-                            if len(local_obj) == prev:
-                                break
-                        rhs_cls = local_obj.get(rhs.id)
+                        # Precomputed constructor-assignment fixpoint (handles
+                        # `head = None; head = n` where n is Node(v)); see
+                        # _ctor_fixpoint above.
+                        rhs_cls = _ctor_fixpoint.get(rhs.id)
                 if rhs_cls is not None:
                     obj_attrs.add(attr_name)
                     obj_attr_types[attr_name] = rhs_cls
@@ -14500,7 +17453,51 @@ class CodeGen:
             self._class_obj_attrs[lookup_name] = obj_attrs
         if obj_attr_types:
             self._class_obj_attr_types[lookup_name] = obj_attr_types
+        if attr_vtypes:
+            self._class_attr_vtypes.setdefault(
+                lookup_name, {}).update(attr_vtypes)
         return list_attrs, dict_attrs
+
+    def _attr_vtype_of(self, value: ast.expr, method: ast.FunctionDef,
+                       cls_name: str) -> 'ValueType | None':
+        """The full type of a container assigned to `self.attr`, or None.
+
+        `_class_container_attrs` records a *bucket* (list-ish / dict-ish) per
+        attribute.  A bucket cannot say "tuple, whose elements are lists", so
+        an attribute holding a tuple was invisible to `_is_tuple_expr` and an
+        attribute holding any container had its element kind defaulted to INT.
+        This answers with a `ValueType` instead, and declines (None) rather
+        than guessing, so an absent entry means "ask the old sets".
+        """
+        if isinstance(value, (ast.List, ast.ListComp)):
+            return ValueType(VKind.LIST,
+                             elem_type=self._infer_list_elem_type(value))
+        if isinstance(value, ast.Tuple):
+            return ValueType(VKind.TUPLE,
+                             elem_type=self._infer_list_elem_type(value))
+        if isinstance(value, (ast.Set, ast.SetComp)):
+            return ValueType(VKind.SET)
+        if isinstance(value, (ast.Dict, ast.DictComp)):
+            return ValueType(VKind.DICT)
+        # `self.attr = param` — the parameter's type is only known from the
+        # call sites, and it is the shape that loses the element kind today
+        # (BUG-CTOR-PARAM-CONTAINER-ATTR-ELEM-KIND-LOST).  `_call_site_param_types`
+        # holds a tag string, which `from_old_tag` parses into exactly the
+        # ValueType wanted here, element kind included.
+        if isinstance(value, ast.Name):
+            _params = [a.arg for a in method.args.args]
+            if value.id in _params:
+                _pidx = _params.index(value.id) - 1  # skip self
+                _csa = self._call_site_param_types
+                _ct = (_csa.get(cls_name, [])
+                       or _csa.get(f"{cls_name}.__init__", []))
+                if 0 <= _pidx < len(_ct) and _ct[_pidx]:
+                    _vt = _ct[_pidx]
+                    if not isinstance(_vt, ValueType):
+                        _vt = ValueType.from_old_tag(str(_vt))
+                    if _vt.kind in _LIST_LIKE or _vt.kind in _DICT_LIKE:
+                        return _vt
+        return None
 
     def _detect_class_string_attrs(self, node: ast.ClassDef,
                                     cname: str | None = None) -> set[str]:
@@ -15585,6 +18582,52 @@ class CodeGen:
         self._compiling_init, self._init_stored_slots = saved_init
         self._current_func_explicit_globals = saved_explicit_globals
 
+    def _emit_exc_handler_matches(self, exc_type: ir.Value,
+                                   handler_name: str) -> ir.Value:
+        """Does the pending exception satisfy `except <handler_name>:`?
+
+        Every handler shape — a bare name, a name in a tuple, a dotted
+        `module.Error` — asks this one question, and each used to answer it
+        with its own inline test.  They disagreed: the tuple arm compared
+        type codes and nothing else, so `except (LookupError, X):` could not
+        catch a KeyError, and the bare-name arm gated its hierarchy walk on
+        *both* sides being FPY_EXC_GENERIC, so `except ValueError:` did not
+        catch a user class derived from ValueError either.
+
+        The rule is one rule: the codes match exactly, or the raised class
+        name inherits from the handler's through `fastpy_exc_class_matches`,
+        which walks the registered user classes and then the builtin tree.
+        The code comparison is kept as well as the walk because it needs no
+        class name to have been published, and it folds to a constant when
+        the handler names a builtin.
+        """
+        exc_name = self._make_string_constant(handler_name)
+        # `except Exception:` / `except BaseException:` catch everything, and
+        # saying so as a constant lets LLVM drop the whole test.
+        if handler_name in ("Exception", "BaseException"):
+            return ir.Constant(ir.IntType(1), 1)
+        expected_id = self.builder.call(
+            self.runtime["exc_name_to_id"], [exc_name])
+        id_match = self.builder.icmp_signed("==", exc_type, expected_id)
+        # An abstract builtin (ArithmeticError, LookupError) has no code of
+        # its own — exc_name_to_id answers GENERIC — so a code comparison
+        # can never be what catches it.  The name walk is.
+        raised_name = self.builder.call(
+            self.runtime["exc_get_class_name"], [])
+        class_match = self.builder.call(
+            self.runtime["exc_class_matches"], [raised_name, exc_name])
+        class_match_bool = self.builder.icmp_signed(
+            "!=", class_match, ir.Constant(i32, 0))
+        # A handler that is itself GENERIC (a user class name) must not be
+        # matched by the code test — every user-raised exception carries
+        # GENERIC — or `except MyError:` would catch `class YourError`.
+        _EXC_GENERIC = ir.Constant(i32, 99)   # FPY_EXC_GENERIC
+        handler_is_generic = self.builder.icmp_signed(
+            "==", expected_id, _EXC_GENERIC)
+        id_match = self.builder.and_(
+            id_match, self.builder.not_(handler_is_generic))
+        return self.builder.or_(id_match, class_match_bool)
+
     def _emit_exc_class_hierarchy(self) -> None:
         """Register user-defined exception classes and their parents so
         the runtime can match except handlers via inheritance."""
@@ -15592,7 +18635,8 @@ class CodeGen:
             "Exception", "BaseException", "ZeroDivisionError",
             "ValueError", "TypeError", "IndexError", "KeyError",
             "RuntimeError", "StopIteration", "ExceptionGroup",
-            "NameError", "OverflowError", "AttributeError",
+            "NameError", "UnboundLocalError", "OverflowError",
+            "AttributeError",
             "AssertionError", "NotImplementedError", "FileNotFoundError",
             "OSError", "IOError", "ArithmeticError", "LookupError",
         }
@@ -16203,6 +19247,12 @@ class CodeGen:
                         print(f"fastpy: warning: ignoring type annotation for "
                               f"'{varname}' (contradicted by assignment in scope)",
                               file=sys.stderr)
+                    elif varname in self._scope_maybe_unbound:
+                        # `x: int` declares without binding, so a read can
+                        # still arrive first.  A native slot cannot say
+                        # "no value yet"; the FV slot's UNDEF tag can.
+                        # BUG-UNBOUND-NATIVE-LOCAL-READS-STACK.
+                        pass
                     elif varname not in self._native_vars:
                         native_type = self._VKIND_TO_LLVM[kind]
                         native_alloca = self._create_entry_alloca(
@@ -16405,6 +19455,12 @@ class CodeGen:
         self.builder.cbranch(cond, pass_block, fail_block)
 
         self.builder.position_at_end(fail_block)
+        # Owned temps produced by the message expression belong to *this arm*.
+        # `fail_block` always terminates (ret, or a branch to the except
+        # target), so it never dominates `pass_block` where the enclosing
+        # statement flush runs — letting them escape emits a decref whose
+        # operand does not dominate it (BUG-DECREF-DOES-NOT-DOMINATE).
+        _rc_mark_msg = len(self._rc_temps)
         # Raise AssertionError — evaluate the message expression
         # (only executed when the assertion fails)
         if node.msg is not None:
@@ -16425,6 +19481,16 @@ class CodeGen:
         exc_id = self.builder.call(self.runtime["exc_name_to_id"], [name_ptr])
         self.builder.call(self.runtime["raise"], [exc_id, msg_ptr])
         self.builder.call(self.runtime["exc_set_class_name"], [name_ptr])
+        # Release the message expression's temps *here*, while `fail_block` is
+        # still open. Below this point every path terminates it, and a flush
+        # after that can only pop the temps without emitting decrefs — which is
+        # how `assert i < 0, "m" * 350` in a loop leaked its message every
+        # iteration (500k iterations reached a 186 MB working set). Releasing
+        # is safe because fastpy_raise has already copied the message into the
+        # exception slot's own refcounted string, so what the handler reads
+        # through `fastpy_exc_get_msg()` does not depend on these temps.
+        # BUG-EXC-MSG-NOT-OWNED.
+        self._flush_rc_temps_to(_rc_mark_msg)
         # If not in try block, return early (exception will propagate to main)
         if not self._in_try_block:
             ret_type = self.function.return_value.type
@@ -16448,6 +19514,11 @@ class CodeGen:
             else:
                 self.builder.branch(pass_block)
 
+        # Belt and braces: the flush above already emptied the arm's temps
+        # while its block was open. This catches anything a future edit adds
+        # after the terminator, and pops it without emitting a decref that
+        # `pass_block` could not dominate (BUG-DECREF-DOES-NOT-DOMINATE).
+        self._flush_rc_temps_to(_rc_mark_msg)
         self.builder.position_at_end(pass_block)
 
     def _emit_expr_stmt(self, node: ast.Expr) -> None:
@@ -16500,14 +19571,24 @@ class CodeGen:
         # Exclude chained native module calls: os.path.join(a,b,c)
         # These should go through _emit_call_expr which has native handlers.
         # For `os.path.join(...)`, the AST is Name("os").Attribute("path").Attribute("join")
-        # so the dotted module is "os.path", which is what's stored in _native_modules.
+        # so the dotted module is "os.path".  We recognize the call as chained-
+        # native when *either* the full dotted module ("os.path", registered by
+        # `import os.path`) *or* just the top-level name ("os", registered by the
+        # far more common `import os`) is native — matching the top-level-name
+        # check `_emit_call_expr` uses for the direct-argument form (see line ~36601).
+        # Without the top-level fallback, `p = os.path.getsize(f)` under a plain
+        # `import os` fell through to the pyobj-call-chain branch and bridged to
+        # CPython (stubbed in pure mode -> undefined `fpy_cpython_*` at link time),
+        # while the direct form `sys.exit(os.path.getsize(f))` lowered natively.
         _is_chained_native = False
         if (isinstance(rhs, ast.Call)
                 and isinstance(rhs.func, ast.Attribute)
                 and isinstance(rhs.func.value, ast.Attribute)
                 and isinstance(rhs.func.value.value, ast.Name)):
+            _nm_set = getattr(self, '_native_modules', set())
             _dotted = rhs.func.value.value.id + "." + rhs.func.value.attr
-            _is_chained_native = _dotted in getattr(self, '_native_modules', set())
+            _is_chained_native = (_dotted in _nm_set
+                                  or rhs.func.value.value.id in _nm_set)
         is_pyobj_call_chain = (not is_pyobj_call
                                and not _is_chained_native
                                and isinstance(rhs, ast.Call)
@@ -16796,10 +19877,7 @@ class CodeGen:
 
     def _assign_try_int_constructor(self, node: ast.Assign) -> bool:
         """Handle unchecked_int/checked_int/int32 constructor calls. Returns True if handled."""
-        _INT_CONSTRUCTORS = {
-            'unchecked_int': 'unchecked', 'checked_int': 'checked',
-            'unchecked_int32': 'unchecked32', 'checked_int32': 'checked32',
-        }
+        _INT_CONSTRUCTORS = self._INT_CONSTRUCTORS
         if not (len(node.targets) == 1
                 and isinstance(node.targets[0], ast.Name)
                 and isinstance(node.value, ast.Call)
@@ -17164,6 +20242,11 @@ class CodeGen:
                 "issubclass", "id", "input", "open",
                 "locals", "globals", "eval", "exec", "complex",
                 "frozenset", "iter", "next",
+                # `bytes` gained a native lowering (BUG-BYTES-CTOR-BRIDGE-ONLY);
+                # leaving it off this list tagged `x = bytes(3)` pyobj, so
+                # `print(x)` handed a native FpyBytes to PyObject_Str.
+                # `bytearray` stays off it — that one really is bridge-only.
+                "bytes",
             }
             if builtin_name not in native_builtins:
                 type_tag = ValueType(VKind.PYOBJ)
@@ -17224,6 +20307,12 @@ class CodeGen:
 
         for target in node.targets:
             if isinstance(target, ast.Name):
+                # Track built-in file objects (open()) so their runtime-only
+                # "file" class dispatches through _emit_method_call_file.
+                if self._is_open_call(node.value):
+                    self._file_vars.add(target.id)
+                else:
+                    self._file_vars.discard(target.id)
                 if (isinstance(node.value, ast.Name)
                         and (node.value.id in self._user_functions
                              or node.value.id in self._func_aliases)):
@@ -17235,6 +20324,13 @@ class CodeGen:
                         and isinstance(node.value.func, ast.Name)
                         and node.value.func.id in self._user_classes):
                     _steal = True
+                # NOTE: str-concat is NOT stolen here under the Model-2
+                # refcount model. The concat producer (_owned_str_concat in
+                # _emit_binop) registers its result as an owned temp, released
+                # at the statement boundary; the store increfs to retain
+                # (rc 1→2), and the boundary flush drops it back to 1. Stealing
+                # here would skip the store incref, so the boundary flush would
+                # free a string the variable still references (UAF).
                 if class_name:
                     self._store_variable(target.id, value,
                                          ValueType(VKind.OBJ, class_name=class_name),
@@ -17580,8 +20676,11 @@ class CodeGen:
             obj = self._load_variable(target.value.id, target)
             obj = self._ensure_ptr(obj)
             key = self._emit_expr_value(target.slice)
-            key_tag, key_data = self._bare_to_tag_data(key, target.slice)
-            val_tag, val_data = self._bare_to_tag_data(value, value_node)
+            # Runtime tags: the bridge reconstructs a Python object from the
+            # tag, so a compile-time guess of INT would hand CPython the raw
+            # bit pattern of a tagged float.  BUG-DICT-VALUE-STATIC-KIND.
+            key_tag, key_data = self._to_tag_data_ir(key, target.slice)
+            val_tag, val_data = self._to_tag_data_ir(value, value_node)
             setitem = self._make_string_constant("__setitem__")
             callable_ptr = self.builder.call(
                 self.runtime["cpython_getattr"], [obj, setitem])
@@ -17589,8 +20688,8 @@ class CodeGen:
             out_data = self._create_entry_alloca(i64, "si.data")
             self.builder.call(self.runtime["cpython_call2"],
                               [callable_ptr,
-                               ir.Constant(i32, key_tag), key_data,
-                               ir.Constant(i32, val_tag), val_data,
+                               key_tag, key_data,
+                               val_tag, val_data,
                                out_tag, out_data])
             return
         # Slice assignment: a[start:stop] = new_values
@@ -17671,50 +20770,43 @@ class CodeGen:
         obj = self._emit_expr_value(target.value)
         obj = self._ensure_ptr(obj)
         index = self._emit_expr_value(target.slice)
-        tag, data = self._bare_to_tag_data(value, value_node=value_node)
+        # The mapping stores carry the value's tag into the container, so they
+        # need the *runtime* tag when the value is FV-backed — a compile-time
+        # guess of INT is how `d[k] = fl` stored a float's bit pattern.  The
+        # list store below still wants the static tag, because that is what
+        # decides whether its inline fast path is safe (a heap tag must go
+        # through the refcounting setter).  BUG-DICT-VALUE-STATIC-KIND.
         if self._is_chainmap_expr(target.value):
             # ChainMap set uses its own runtime function
+            tag, data = self._to_tag_data_ir(value, value_node)
             key = self._ensure_ptr(index)
             self.builder.call(self.runtime["chainmap_set"],
-                              [obj, key, ir.Constant(i32, tag), data])
+                              [obj, key, tag, data])
         elif (self._is_dict_expr(target.value)
                 or self._is_defaultdict_expr(target.value)
                 or self._is_counter_expr(target.value)):
-            # Tuple/list keys: use generic FpyValue-keyed setter
-            _key_is_tuple = (isinstance(target.slice, (ast.Tuple, ast.List))
-                             or (isinstance(target.slice, ast.Name)
-                                 and target.slice.id in self.variables
-                                 and self._var_kind(target.slice.id)
-                                 in (VKind.LIST, VKind.TUPLE)))
-            if _key_is_tuple:
-                key_tag, key_data = self._bare_to_tag_data(index, target.slice)
-                if not isinstance(key_data, ir.Constant) and isinstance(key_data.type, ir.PointerType):
-                    key_data = self.builder.ptrtoint(key_data, i64)
-                self.builder.call(self.runtime["dict_set_kv_fv"],
-                                  [obj, ir.Constant(i32, key_tag), key_data,
-                                   ir.Constant(i32, tag), data])
-            # Int keys use the int-keyed setter so the dict stores them
-            # natively (vs converting to strings, which would affect
-            # printed representation).
-            elif isinstance(index.type, ir.IntType):
-                self.builder.call(self.runtime["dict_set_int_fv"],
-                                  [obj, index, ir.Constant(i32, tag), data])
-            elif index.type == fpy_val:
-                # FpyValue key (e.g. from list.pop(), for-each iteration)
-                kt = self.builder.extract_value(index, 0, "dset.kt")
-                kd = self.builder.extract_value(index, 1, "dset.kd")
-                self.builder.call(self.runtime["dict_set_kv_fv"],
-                                  [obj, kt, kd,
-                                   ir.Constant(i32, tag), data])
-            else:
-                if not isinstance(index.type, ir.PointerType):
-                    return self._bridge_fallback_expr(node, "dict access with non-string key")
-                self.builder.call(self.runtime["dict_set_fv"],
-                                  [obj, index, ir.Constant(i32, tag), data])
+            tag, data = self._to_tag_data_ir(value, value_node)
+            # `d[k] = v` is the sixth emitter that used to dispatch on the
+            # key's shape inline, and it had drifted the same way the other
+            # five had — no float arm, so `d[2.5] = x` bailed to the bridge
+            # mid-statement.  It shares the one dispatch now.
+            if not self._emit_dict_store_by_key(obj, index, tag, data,
+                                                target.slice):
+                return self._bridge_fallback_expr(
+                    node, "dict access with non-string key")
         else:
-            # Inline fast path for scalar element lists (int/float)
+            # Inline fast path for scalar element lists (int/float). Only
+            # valid when the STORED value is itself a scalar (needs no
+            # refcounting): a list mis-inferred as scalar-element
+            # (BUG-LIST-ELEM-STR-TAG-LOST) could otherwise store a heap value
+            # (str/list/...) with no incref. Combined with Model-2 owned-temp
+            # registration (which flushes the value's +1 at the statement
+            # boundary) that frees the value while the list still holds it —
+            # a UAF. Route heap-tagged values through the refcounting runtime
+            # setter instead.
+            tag, data = self._bare_to_tag_data(value, value_node=value_node)
             _inline_et = self._can_inline_list_access(target.value)
-            if _inline_et is not None:
+            if _inline_et is not None and tag in self._SCALAR_TAGS_CLS:
                 self._inline_list_set(obj, index, tag, data)
             else:
                 # List set: fallback to runtime call
@@ -17820,6 +20912,14 @@ class CodeGen:
                         and value_node.func.id in self.variables
                         and self._var_kind(value_node.func.id) == VKind.PYOBJ):
                     return FPY_TAG_OBJ, value
+                # Call to a user function that never executes `return <expr>`:
+                # it compiles to a void LLVM function and the call site hands us
+                # the placeholder `i64 0`, whose IR type says INT even though the
+                # Python value is None.  Tag it NONE so print()/`is None`/`==`
+                # see None rather than the integer 0.  The data stays 0 — only
+                # the tag is corrected.  See BUG-VOID-RETURNS-ZERO-NOT-NONE.
+                elif value_node is not None and self._call_is_void(value_node):
+                    return FPY_TAG_NONE, ir.Constant(i64, 0)
                 # BigInt constant: large int that was folded at compile time
                 elif (value_node is not None
                         and isinstance(value_node, ast.Constant)
@@ -17990,6 +21090,23 @@ class CodeGen:
             tag_ir = self.builder.extract_value(value, 0)
             data_ir = self.builder.extract_value(value, 1)
             return tag_ir, data_ir
+        # An FV-backed *variable* is the other tagged shape, and it does not
+        # look like one here: `_emit_expr_value` hands a Name back as the bare
+        # i64 payload, so the struct test above misses it and the fallback
+        # below invents a compile-time tag for it.  That is how a dict built
+        # from tagged locals stored every value as INT — a float came back as
+        # its bit pattern (`4.5` → `4616752568008179712`) and a str as its
+        # address.  Reload the slot for both halves rather than pairing the
+        # runtime tag with the already-emitted payload, so the two always
+        # describe the same value.  BUG-DICT-VALUE-STATIC-KIND.
+        if (isinstance(value_node, ast.Name)
+                and value_node.id in self.variables):
+            _alloca, _ = self.variables[value_node.id]
+            if (isinstance(_alloca.type, ir.PointerType)
+                    and _alloca.type.pointee is fpy_val):
+                _fv = self.builder.load(_alloca, name=f"{value_node.id}.fv.td")
+                return (self.builder.extract_value(_fv, 0),
+                        self.builder.extract_value(_fv, 1))
         # Fall back to compile-time tag from _bare_to_tag_data
         tag_int, data_ir = self._bare_to_tag_data(value, value_node)
         return ir.Constant(i32, tag_int), data_ir
@@ -18780,6 +21897,19 @@ class CodeGen:
         _steal = isinstance(value_node, (
             ast.Call, ast.List, ast.ListComp,
             ast.Dict, ast.DictComp, ast.Set, ast.SetComp))
+        # Model-2: str-producing builtins (str/repr/hex/oct/bin/chr) register
+        # their owned result as a temp released at the statement boundary. If
+        # the slot STOLE that temp (no incref), the boundary flush would free
+        # the string the slot still references → UAF. Exclude them so the slot
+        # increfs (retains) instead. The exclusion is a superset of the
+        # actually-registered cases (see _STR_PRODUCING_BUILTINS): excluding an
+        # unregistered one only turns a steal into a retain → at worst a leak.
+        if (_steal and isinstance(value_node, ast.Call)
+                and isinstance(value_node.func, ast.Name)
+                and value_node.func.id in self._STR_PRODUCING_BUILTINS
+                and value_node.func.id not in self._user_functions
+                and value_node.func.id not in self._func_aliases):
+            _steal = False
         tag_const = ir.Constant(i32, tag)
         # Tags that have no heap allocation — no refcounting needed for
         # the NEW value.  Old slot value may still need decref (it could
@@ -18880,6 +22010,17 @@ class CodeGen:
         if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
                 and node.func.id == "iter"):
             return ValueType(VKind.OBJ)
+        # open() returns a native file object (built-in "file" FpyObj) — but
+        # only for the natively-handled positional form; the kwargs / 3+-arg
+        # form falls back to the bridge (PYOBJ).  Mirror the guard in
+        # _emit_builtin_open so the stored type matches what's emitted.
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id == "open"
+                and node.func.id not in self._user_functions
+                and node.func.id not in self._user_classes):
+            if 1 <= len(node.args) <= 2 and not node.keywords:
+                return ValueType(VKind.OBJ)
+            return ValueType(VKind.PYOBJ)
         # divmod returns a tuple
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
             if node.func.id == "divmod":
@@ -18925,6 +22066,16 @@ class CodeGen:
                             and self._is_dict_expr(arg.func.value)):
                         return ValueType(VKind.LIST, elem_type=ValueType(VKind.INT))
                 return ValueType(VKind.LIST, elem_type=ValueType(VKind.INT))
+            # A user function whose body never executes `return <expr>` compiles
+            # to a *void* LLVM function, and the call site substitutes the
+            # placeholder `i64 0`.  Nothing populates _func_ret_types for it, so
+            # the tag used to fall through to the placeholder's own LLVM type —
+            # INT — and `f()` read back as the integer 0 rather than None.  NONE
+            # is not is_ptr, so the emitted value is still the same i64; only the
+            # static tag changes.  See BUG-VOID-RETURNS-ZERO-NOT-NONE.
+            _uf = getattr(self, '_user_functions', {}).get(node.func.id)
+            if _uf is not None and getattr(_uf, 'ret_tag', None) == "void":
+                return ValueType(VKind.NONE)
             # User function with known return type (from return-type propagation)
             frt = getattr(self, '_func_ret_types', {})
             if node.func.id in frt:
@@ -18941,8 +22092,24 @@ class CodeGen:
                     return ValueType(VKind.STR)
                 elif fn in ("listdir",):
                     return ValueType(VKind.LIST, elem_type=ValueType(VKind.STR))
+                elif fn in ("stat", "statvfs", "waitpid"):
+                    return ValueType(VKind.LIST, elem_type=ValueType(VKind.INT))
+                elif fn in ("remove", "unlink", "mkdir", "rmdir", "rename",
+                           "getsize", "path_getsize", "symlink", "link",
+                           "chmod", "truncate", "utime", "chown",
+                           "getuid", "getgid", "setuid", "setgid", "execv",
+                           "fork", "WIFEXITED", "WEXITSTATUS"):
+                    return ValueType(VKind.INT)
+                elif fn in ("readlink",):
+                    return ValueType(VKind.STR)
+                elif fn in ("getmtime", "path_getmtime",
+                           "getatime", "path_getatime",
+                           "getctime", "path_getctime"):
+                    return ValueType(VKind.FLOAT)
                 elif fn in ("exists", "isfile", "isdir",
-                           "path_exists", "path_isfile", "path_isdir"):
+                           "path_exists", "path_isfile", "path_isdir",
+                           "access", "samefile", "path_samefile",
+                           "islink", "path_islink"):
                     return ValueType(VKind.BOOL)
                 # collections types via from-import
                 elif mod in ("collections", "_collections"):
@@ -19001,10 +22168,46 @@ class CodeGen:
                                            "b32encode", "b32decode",
                                            "b16encode", "b16decode"):
                 return ValueType(VKind.BYTES)
-            elif mod == "os" and fn in ("getcwd",):
+            elif mod == "os" and fn in ("getcwd", "readlink"):
                 return ValueType(VKind.STR)
+            elif mod == "os" and fn in ("getpid", "getppid", "gettid", "getuid", "getgid"):
+                return ValueType(VKind.INT)
+            elif mod == "os" and fn in ("setuid", "setgid"):
+                return ValueType(VKind.INT)
+            elif mod == "os" and fn in ("fork", "WIFEXITED", "WEXITSTATUS"):
+                # os.fork() -> child pid / 0 / -1; os.WIFEXITED/os.WEXITSTATUS
+                # decode a waitpid status. All int-valued.
+                return ValueType(VKind.INT)
+            elif mod == "os" and fn in ("nice", "getpriority", "setpriority"):
+                # os.nice(inc)/os.getpriority(which, who)/os.setpriority(which,
+                # who, prio) -> int. On SlateOS these issue the real
+                # SYS_PROCESS_GET_NICE/SYS_PROCESS_SET_NICE syscalls, which
+                # record the nice value AND map it to a scheduler priority
+                # level (nice becomes a real scheduling attribute) — a distinct
+                # kernel path (the scheduler's per-task priority) from every
+                # filesystem/credential syscall.
+                return ValueType(VKind.INT)
+            elif mod == "os" and fn in ("write", "close", "dup", "dup2", "lseek", "open", "umask", "ftruncate", "pwrite"):
+                return ValueType(VKind.INT)
+            elif mod == "os" and fn in ("read", "pread"):
+                return ValueType(VKind.STR)
+            elif mod == "os" and fn in ("pipe", "waitpid"):
+                # os.pipe() -> [r, w]; os.waitpid(pid, opts) -> [pid, status].
+                return ValueType(VKind.LIST, elem_type=ValueType(VKind.INT))
             elif mod == "os" and fn == "listdir":
                 return ValueType(VKind.LIST, elem_type=ValueType(VKind.STR))
+            elif mod == "os" and fn in ("stat", "statvfs"):
+                return ValueType(VKind.LIST, elem_type=ValueType(VKind.INT))
+            elif mod == "os" and fn in ("remove", "unlink", "mkdir", "rmdir", "rename", "symlink", "link", "chmod", "truncate", "utime", "chown", "execv"):
+                return ValueType(VKind.INT)
+            elif mod == "os" and fn == "access":
+                return ValueType(VKind.BOOL)
+            elif mod in ("os", "os.path") and fn in ("getsize", "path_getsize"):
+                return ValueType(VKind.INT)
+            elif mod in ("os", "os.path") and fn in ("getmtime", "path_getmtime",
+                                                     "getatime", "path_getatime",
+                                                     "getctime", "path_getctime"):
+                return ValueType(VKind.FLOAT)
             elif mod == "asyncio" and fn == "gather":
                 return ValueType(VKind.LIST, elem_type=ValueType(VKind.INT))
             elif mod == "logging" and fn == "getLogger":
@@ -19049,6 +22252,35 @@ class CodeGen:
                     return ValueType(VKind.INT)
                 elif fn == "ChainMap":
                     return ValueType(VKind.CHAINMAP)
+        # Native module method calls in *chained* (submodule) form, e.g.
+        # os.path.getmtime(f) / os.path.getsize(f) / os.path.join(a, b).  Here
+        # `node.func.value` is an Attribute (`os.path`), not a Name, so the
+        # Name-receiver native-module block above never runs — and the generic
+        # pyobj-receiver fallback further down tags the result PYOBJ.  When such
+        # a call is *assigned* to a variable, that PYOBJ tag then makes a later
+        # int()/float()/arith over the var bridge to CPython (stubbed in pure
+        # mode).  Recognize `<pkg>.<sub>.<fn>` where <pkg> (or `<pkg>.<sub>`) is
+        # a native module and map exactly the natively-lowered os.path
+        # functions to their return kinds — mirroring the direct-form block
+        # above and the `_os_path_fns` emit map.  Fixes
+        # BUG-SCALARKIND-LOST-ON-NATIVE-MODULE-CALL-ASSIGN.
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Attribute)
+                and isinstance(node.func.value.value, ast.Name)):
+            _pkg = node.func.value.value.id
+            _sub = node.func.value.attr
+            _fn = node.func.attr
+            _nm = getattr(self, '_native_modules', set())
+            if ((_pkg + "." + _sub) in _nm or _pkg in _nm):
+                if (_pkg == "os" and _sub == "path") or (_pkg + "." + _sub) == "os.path":
+                    if _fn in ("join", "basename", "dirname"):
+                        return ValueType(VKind.STR)
+                    if _fn == "getsize":
+                        return ValueType(VKind.INT)
+                    if _fn in ("getmtime", "getatime", "getctime"):
+                        return ValueType(VKind.FLOAT)
+                    if _fn in ("exists", "isfile", "isdir", "samefile", "islink"):
+                        return ValueType(VKind.BOOL)
         # Collections module — from-import calls: Counter(), defaultdict(), deque()
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
             native_imports = getattr(self, '_native_imports', {})
@@ -19084,6 +22316,25 @@ class CodeGen:
                     # Return same type as input argument
                     if node.args:
                         return self._infer_type_tag(node.args[0], None)
+        # Path-returning method calls: d.joinpath(...), p.resolve(),
+        # p.with_suffix(...), p.absolute() on a Path receiver all return a
+        # Path.  Without this, the assigned variable loses its PATH tag and
+        # str()/print() fall back to the generic fastpy_fv_str dispatch, which
+        # in pure mode routes a Path (OBJ-tagged raw char*) through the CPython
+        # bridge stub and raises.  _is_path_expr already encodes the
+        # PATH-returning-method set, so reuse it.
+        if (isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and self._is_path_expr(node)):
+            return ValueType(VKind.PATH)
+        # p.iterdir() → list[Path].  Both runtimes materialize the directory
+        # listing eagerly and return an FpyList* of OBJ-tagged Paths (bridge:
+        # PySequence_List over CPython's generator; pure: readdir into
+        # fpy_list_append).  Typing it as an opaque PYOBJ instead would send
+        # the for-loop through the CPython iterator protocol, which in pure
+        # mode is a link error against the absent fpy_cpython_iter* symbols.
+        if self._is_path_iterdir_call(node):
+            return ValueType(VKind.LIST, elem_type=ValueType(VKind.PATH))
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
             if node.func.id in self._user_classes:
                 return ValueType(VKind.OBJ, class_name=node.func.id)
@@ -19098,9 +22349,11 @@ class CodeGen:
             for full_name in self._closure_info:
                 if full_name.startswith(f"{node.func.id}."):
                     return ValueType(VKind.CLOSURE)
-            # Check if function returns a pointer (tuple, list, or dict)
-            if node.func.id in self._user_functions:
-                info = self._user_functions[node.func.id]
+            # Check if function returns a pointer (tuple, list, or dict).
+            # Scope-first: a nested `def` shadows a same-named sibling that was
+            # hoisted to module scope (BUG-NESTED-DEF-NAME-COLLISION).
+            info, _ = self._lookup_user_function(node.func.id)
+            if info is not None:
                 _rtk = self._tag_kind(info.ret_tag)
                 if _rtk == VKind.DICT:
                     return ValueType(VKind.DICT)
@@ -19187,7 +22440,18 @@ class CodeGen:
             elif method == "new_child":
                 if self._is_chainmap_expr(node.func.value):
                     return ValueType(VKind.CHAINMAP)
-            # User class method return: check method return type
+            # User class method return: check method return type.
+            #
+            # The recorded `Cls.meth` tag is asked first, because it is the only
+            # one of these that carries an element kind.  `_method_returns_list`
+            # answers a bare yes, and the arm below turned that into
+            # `elem_type=INT` — a claim, not the absence of one, so `r = c.m()`
+            # read every element of a list of strings back as an integer and
+            # `len(r[1])` measured a pointer.  BUG-METHOD-RETURN-ELEM-KIND-LOST.
+            _mrt = self._method_call_ret_vtype(node)
+            if (_mrt is not None and _mrt.elem_type is not None
+                    and _mrt.kind in _LIST_LIKE):
+                return _mrt
             ret_type = self._find_method_return_type(node.func.value, method)
             if ret_type is not None and isinstance(ret_type, ir.PointerType):
                 if self._method_returns_list(node.func.value, method):
@@ -19210,8 +22474,36 @@ class CodeGen:
                 return ValueType(VKind.LIST, elem_type=ValueType(VKind.INT))
         return None
 
+    def _dict_literal_value_type(self, node: ast.expr) -> 'ValueType | None':
+        """The common value type of a dict literal, or None when they disagree.
+
+        Deliberately mirrors `_infer_list_elem_type`'s contract: one tag has to
+        describe every read out of the dict, so a literal whose values disagree
+        declines rather than picking the first.  Declining is safe — the read
+        then goes through the runtime tag — whereas naming the wrong kind reads
+        a pointer as an integer.
+        """
+        if not isinstance(node, ast.Dict) or not node.values:
+            return None
+        if any(k is None for k in node.keys):
+            return None  # `{**other}` — the values are not all visible here
+        vts = set()
+        for v in node.values:
+            vt = self._infer_type_tag(v, None)
+            if vt is None or vt.kind in (VKind.UNKNOWN, VKind.FVALUE):
+                return None
+            vts.add(vt)
+            if len(vts) > 1:
+                return None
+        return vts.pop()
+
     def _infer_type_tag(self, node: ast.expr, value: ir.Value) -> 'ValueType':
         """Infer the Python type from an AST node and LLVM value."""
+        # A call to a function/method with no `return <expr>` yields the
+        # placeholder `i64 0`, so `value` alone says INT — but the Python value
+        # is None. See BUG-VOID-RETURNS-ZERO-NOT-NONE.
+        if self._call_is_void(node):
+            return ValueType(VKind.NONE)
         if isinstance(node, ast.Constant):
             if node.value is None:
                 return ValueType(VKind.NONE)
@@ -19297,6 +22589,17 @@ class CodeGen:
         # Attribute access: detect container (list/dict) and object attrs
         # so len(), print, and binops dispatch correctly.
         if isinstance(node, ast.Attribute):
+            # Native-module container attributes (sys.argv/path → list[str];
+            # sys.version_info → tuple).  Consult this FIRST so the
+            # store-incref uses the correct container tag (LIST) instead of
+            # the i8* STR default.  With the STR default, rc_incref/decref
+            # would misread the FpyString header at data-8 (OOB read) and
+            # skip proper list refcounting.  _native_module_attr_vtype
+            # returns None for every non-sys attribute, so this is inert
+            # for all other attribute accesses.
+            _nm_vt = self._native_module_attr_vtype(node)
+            if _nm_vt is not None:
+                return _nm_vt
             # ClassName.__mro__ → tuple of type proxy objects
             if (isinstance(node.value, ast.Name)
                     and node.value.id in self._user_classes
@@ -19318,6 +22621,13 @@ class CodeGen:
                 if node.attr in _path_path_attrs:
                     return ValueType(VKind.PATH)
             obj_cls = self._infer_object_class(node.value)
+            # The recorded type first: it distinguishes a tuple from a list and
+            # carries the element kind, both of which the two buckets below
+            # discard — `list_attrs` answers `elem_type=INT` for every list
+            # attribute whatever it holds.
+            _avt = self._lookup_attr_vtype(obj_cls, node.attr)
+            if _avt is not None:
+                return _avt
             if obj_cls and obj_cls in self._class_container_attrs:
                 list_attrs, dict_attrs = self._class_container_attrs[obj_cls]
                 if node.attr in list_attrs:
@@ -19372,21 +22682,33 @@ class CodeGen:
             elem_type = self._infer_list_elem_type(node)
             return ValueType(VKind.LIST, elem_type=elem_type)
         elif isinstance(node, (ast.Dict, ast.DictComp)):
-            return ValueType(VKind.DICT)
+            # The value type, when the literal's values agree on one.  The list
+            # arm above has recorded its element type since the beginning; the
+            # dict arm recorded nothing at all, so `e = d["k"]` had no kind to
+            # inherit even when the literal was three lines up.
+            # BUG-DICT-VALUE-CONTAINER-ELEM-KIND-LOST-ON-BIND.
+            _dvt = self._dict_literal_value_type(node)
+            return ValueType(VKind.DICT, value_type=_dvt)
         elif isinstance(node, ast.Tuple):
-            return ValueType(VKind.TUPLE)
+            # The element type comes from the same classifier the list arm
+            # above uses — `_infer_list_elem_type` has handled `ast.Tuple`
+            # all along and was simply never asked.  A bare
+            # `ValueType(VKind.TUPLE)` meant every read of an element fell
+            # through to `_llvm_type_tag`, i.e. INT, so `for v in nested[1]:`
+            # on `nested = ("head", [10, 20, 30])` iterated an FpyValue as a
+            # native list and crashed.  The list spelling of the identical
+            # program was right.  BUG-TUPLE-SUBSCRIPT-ELEM-KIND-LOST.
+            return ValueType(VKind.TUPLE,
+                             elem_type=self._infer_list_elem_type(node))
         # dict | dict → dict
         if (isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr)
                 and self._is_dict_expr(node.left) and self._is_dict_expr(node.right)):
             return ValueType(VKind.DICT)
         # bytes * int, int * bytes → bytes; bytes + bytes → bytes
         if isinstance(node, ast.BinOp):
-            def _is_bytes(n):
-                if isinstance(n, ast.Constant) and isinstance(n.value, bytes):
-                    return True
-                if isinstance(n, ast.Name) and n.id in self.variables:
-                    return self._var_kind(n.id) == VKind.BYTES
-                return False
+            # One definition of "is this bytes?", so a call-valued operand is
+            # recognised here exactly as it is on the TypedValue fast path.
+            _is_bytes = self._is_bytes_expr
             if isinstance(node.op, ast.Mult):
                 if _is_bytes(node.left) or _is_bytes(node.right):
                     return ValueType(VKind.BYTES)
@@ -19410,14 +22732,13 @@ class CodeGen:
                 return ValueType(VKind.DECIMAL)
         # Subscript on bytes: slice → bytes, index → int
         if isinstance(node, ast.Subscript):
-            recv = node.value
-            is_bytes_recv = False
-            if isinstance(recv, ast.Constant) and isinstance(recv.value, bytes):
-                is_bytes_recv = True
-            elif (isinstance(recv, ast.Name) and recv.id in self.variables
-                    and self._var_kind(recv.id) == VKind.BYTES):
-                is_bytes_recv = True
-            if is_bytes_recv:
+            # One definition of "is this bytes?", so a call- or slice-valued
+            # receiver is recognised here exactly as it is everywhere else:
+            # `ob()[1:]` is as much a bytes slice as `b[1:]` is, and `b[1:3]`
+            # is as much a bytes receiver as `b` is.  Both used to come back
+            # tagged str and print `bc` instead of `b'bc'`.
+            # BUG-BYTES-RETURN-TAG-LOST / BUG-BYTES-SLICE-VIA-STR.
+            if self._is_bytes_expr(node.value):
                 if isinstance(node.slice, ast.Slice):
                     return ValueType(VKind.BYTES)
                 return ValueType(VKind.INT)  # single index returns byte value
@@ -19506,11 +22827,18 @@ class CodeGen:
             elem = self._get_list_elem_type(node.value)
             if not isinstance(elem, ValueType):
                 elem = ValueType.from_old_tag(elem)
-            if elem.kind == VKind.LIST:
+            # An enumeration of "kinds we believe" is the shape that keeps
+            # losing a kind here — it listed LIST, STR, DICT, OBJ, TUPLE and
+            # FLOAT, and so silently dropped MIXED, BYTES, BIGINT, SET, DEQUE
+            # and every kind added after it was written.  MIXED is the one
+            # that crashed: `self.t = ("a", [1, 2, 3])` gives a `tuple:mixed`
+            # attribute, `c.t[1]` fell through to the loaded i64 (INT), and
+            # `for v in c.t[1]:` chose the native list loop over an FpyValue.
+            # Inverted: believe the recorded element kind unless it is the one
+            # that *is* the default, so "no information" still falls through
+            # to `_llvm_type_tag` exactly as before.
+            if elem.kind not in (VKind.INT, VKind.UNKNOWN):
                 return elem  # compound: list:float stays as ValueType
-            if elem.kind in (VKind.STR, VKind.DICT, VKind.OBJ, VKind.TUPLE, VKind.FLOAT):
-                return elem
-            # "int" / unknown → fall through to _llvm_type_tag
         # BinOp: object operator overloading OR list concat/repeat
         if isinstance(node, ast.BinOp):
             if self._is_obj_expr(node.left):
@@ -19571,8 +22899,43 @@ class CodeGen:
             if isinstance(node.value, ast.Name) and node.value.id in self.variables:
                 _vt = self.variables[node.value.id][1]
                 _vt = _vt if isinstance(_vt, ValueType) else ValueType.from_old_tag(_vt)
-                if _vt.kind == VKind.LIST and _vt.elem_type is not None:
+                if _vt.kind in _LIST_LIKE and _vt.elem_type is not None:
+                    # `_LIST_LIKE`, not `VKind.LIST`: a tuple and a deque
+                    # subscript to an element exactly as a list does, and the
+                    # elem_type they carry is the same kind of fact.  With
+                    # only LIST here, `node[1]` on a `tuple:mixed` parameter
+                    # fell past every arm to `_llvm_type_tag`, which reports
+                    # the loaded i64 as INT — so `for stmt in node[1]:` chose
+                    # the native list loop over the runtime-dispatched one and
+                    # called `list_length` on an FpyValue.  The identical
+                    # program written with a list literal was correct, which
+                    # is the asymmetry that found it.  `_LIST_LIKE` was
+                    # defined for precisely this and had never once been used.
+                    # BUG-TUPLE-SUBSCRIPT-ELEM-KIND-LOST.
                     return _vt.elem_type  # element type is already ValueType
+                if _vt.kind in _DICT_LIKE and _vt.value_type is not None:
+                    # `d[k]` is a *value*, and the recorded value type carries
+                    # its element kind too, so `e = d["k"]` binds a
+                    # `list:str` rather than a kindless pointer.
+                    # BUG-DICT-VALUE-CONTAINER-ELEM-KIND-LOST-ON-BIND.
+                    return _vt.value_type
+            elif isinstance(node.value, (ast.Call, ast.Subscript,
+                                        ast.Attribute)):
+                # Only a *name* had an arm here, so every other way of
+                # naming a list took the LLVM type of the loaded i64 — INT
+                # — whatever it actually held.  `f()[0]` compared a returned
+                # BigInt by address while `xs = f(); xs[0]` was fine
+                # (BUG-CALL-SUBSCRIPT-ELEM-KIND-LOST), and `outer[0][0]` did
+                # the same one level down even though `outer`'s element type
+                # records the inner element kind perfectly well
+                # (BUG-BIGINT-COMPARES-BY-POINTER).  `_get_list_elem_type`
+                # already knows how to answer for all three shapes; it was
+                # simply never asked.  The recursion is well-founded — it
+                # always descends to a strictly smaller node.
+                if self._is_list_expr(node.value):
+                    _et = self._get_list_elem_type(node.value)
+                    if _et.kind != VKind.UNKNOWN:
+                        return _et
         # Set operations (|, &, -, ^) produce sets
         if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.BitOr, ast.BitAnd, ast.BitXor, ast.Sub)):
             if self._is_set_expr(node.left) or self._is_set_expr(node.right):
@@ -19706,6 +23069,11 @@ class CodeGen:
                           and isinstance(node.value.value, str)):
                         local_var_types[tgt] = "str"
                     elif (isinstance(node.value, ast.Constant)
+                          and isinstance(node.value.value, bytes)):
+                        # Recorded so `parts.append(b[i:i+2])` below can tell
+                        # that `b` is bytes.  BUG-BYTES-IN-LIST-TAG-LOST.
+                        local_var_types[tgt] = "bytes"
+                    elif (isinstance(node.value, ast.Constant)
                           and isinstance(node.value.value, float)):
                         local_var_types[tgt] = "float"
                     elif isinstance(node.value, ast.JoinedStr):
@@ -19784,6 +23152,9 @@ class CodeGen:
         if not empty_list_vars:
             return
 
+        # Lists with an append this scan cannot classify.  They keep no
+        # element kind at all, whatever their other appends said.
+        _append_unknown: set[str] = set()
         # Walk all statements (including nested in loops/if) looking for .append() calls
         for stmt in stmts:
             for node in ast.walk(stmt):
@@ -19798,8 +23169,26 @@ class CodeGen:
                     continue
                 var_name = call.func.value.id
                 arg = call.args[0]
+                # Every append votes, and they have to agree.  This chain used
+                # to write straight into `self._list_append_types`, so the
+                # *last* append it happened to recognise won outright:
+                # `x.append(None); x.append("text")` recorded STR — there is
+                # no arm for None, so nothing was there to disagree — and the
+                # None came back as a NULL pointer and printed `(null)`.  A
+                # list whose appends disagree is MIXED; one with an append
+                # this scan cannot classify has no element kind at all, and
+                # declining is safe because the read then goes through the
+                # runtime tag.  BUG-APPEND-ELEM-KIND-LAST-WRITE-WINS.
+                _vt: 'ValueType | None' = None
+                # Bytes appends had no arm anywhere in this chain, so a list
+                # built by `parts.append(b[i:i+2])` was typed list:int and the
+                # loop that read it back got raw pointers.
+                # BUG-BYTES-IN-LIST-TAG-LOST.
+                if self._is_bytes_expr(arg, {**local_var_types,
+                                             **loop_var_types}):
+                    _vt = ValueType(VKind.BYTES)
                 # Infer what type is being appended
-                if isinstance(arg, (ast.List, ast.ListComp)):
+                elif isinstance(arg, (ast.List, ast.ListComp)):
                     # Detect inner list element type for list-of-lists
                     def _has_any_float(elts):
                         for e in elts:
@@ -19811,36 +23200,36 @@ class CodeGen:
                                 return True
                         return False
                     if isinstance(arg, ast.List) and arg.elts and _has_any_float(arg.elts):
-                        self._list_append_types[var_name] = ValueType(VKind.LIST, elem_type=ValueType(VKind.FLOAT))
+                        _vt = ValueType(VKind.LIST, elem_type=ValueType(VKind.FLOAT))
                     else:
-                        self._list_append_types[var_name] = ValueType(VKind.LIST)
+                        _vt = ValueType(VKind.LIST)
                 elif isinstance(arg, ast.Tuple):
                     # Appending a tuple literal — tuple elements
-                    self._list_append_types[var_name] = ValueType(VKind.TUPLE)
+                    _vt = ValueType(VKind.TUPLE)
                 elif isinstance(arg, (ast.Dict, ast.DictComp)):
                     # Appending a dict literal — dict elements
-                    self._list_append_types[var_name] = ValueType(VKind.DICT)
+                    _vt = ValueType(VKind.DICT)
                 elif (isinstance(arg, ast.Subscript)
                       and isinstance(arg.value, ast.Name)
                       and arg.value.id in _str_val_dicts):
                     # Appending d[k] where d has all-string values
-                    self._list_append_types[var_name] = ValueType(VKind.STR)
+                    _vt = ValueType(VKind.STR)
                 elif isinstance(arg, ast.Name) and (arg.id in self._list_append_types or arg.id in list_vars):
                     # Appending a variable that is a list
-                    self._list_append_types[var_name] = ValueType(VKind.LIST)
+                    _vt = ValueType(VKind.LIST)
                 elif isinstance(arg, ast.Call) and isinstance(arg.func, ast.Name):
                     _fn = arg.func.id
                     if _fn in self._user_classes:
-                        self._list_append_types[var_name] = ValueType(VKind.OBJ)
+                        _vt = ValueType(VKind.OBJ)
                     elif _fn in self._user_functions:
                         _rt = self._user_functions[_fn].ret_tag
                         _rtk = self._tag_kind(_rt)
                         if _rtk in (VKind.FLOAT, VKind.STR):
-                            self._list_append_types[var_name] = ValueType(_rtk)
+                            _vt = ValueType(_rtk)
                     elif _fn == "float":
-                        self._list_append_types[var_name] = ValueType(VKind.FLOAT)
+                        _vt = ValueType(VKind.FLOAT)
                     elif _fn == "str":
-                        self._list_append_types[var_name] = ValueType(VKind.STR)
+                        _vt = ValueType(VKind.STR)
                 elif (isinstance(arg, ast.Call)
                       and isinstance(arg.func, ast.Attribute)
                       and isinstance(arg.func.value, ast.Name)):
@@ -19849,13 +23238,13 @@ class CodeGen:
                     if (_mod in _imported_modules
                             and _mod not in self._NATIVE_MODULES
                             and _mod not in self._user_classes):
-                        self._list_append_types[var_name] = ValueType(VKind.PYOBJ)
+                        _vt = ValueType(VKind.PYOBJ)
                 elif isinstance(arg, ast.Constant):
                     # String/float/bool constants propagate to element type
                     if isinstance(arg.value, str):
-                        self._list_append_types[var_name] = ValueType(VKind.STR)
+                        _vt = ValueType(VKind.STR)
                     elif isinstance(arg.value, float):
-                        self._list_append_types[var_name] = ValueType(VKind.FLOAT)
+                        _vt = ValueType(VKind.FLOAT)
                 elif isinstance(arg, ast.BinOp):
                     # Arithmetic expression: x.append(a * 1.0) or
                     # x.append(0.0 - val) — detect float from operands
@@ -19872,19 +23261,19 @@ class CodeGen:
                                     and self._tag_kind(loop_var_types[_operand.id]) == VKind.FLOAT):
                                 _is_float_binop = True
                     if _is_float_binop:
-                        self._list_append_types[var_name] = ValueType(VKind.FLOAT)
+                        _vt = ValueType(VKind.FLOAT)
                 elif isinstance(arg, ast.UnaryOp) and isinstance(arg.op, ast.USub):
                     # Negation: x.append(-val) — detect float from operand
                     _inner = arg.operand
                     if (isinstance(_inner, ast.Constant)
                             and isinstance(_inner.value, float)):
-                        self._list_append_types[var_name] = ValueType(VKind.FLOAT)
+                        _vt = ValueType(VKind.FLOAT)
                     elif (isinstance(_inner, ast.Name)
                           and _inner.id in local_var_types
                           and self._tag_kind(local_var_types[_inner.id]) == VKind.FLOAT):
-                        self._list_append_types[var_name] = ValueType(VKind.FLOAT)
+                        _vt = ValueType(VKind.FLOAT)
                 elif isinstance(arg, ast.JoinedStr):
-                    self._list_append_types[var_name] = ValueType(VKind.STR)
+                    _vt = ValueType(VKind.STR)
                 elif isinstance(arg, ast.Name):
                     # Appending a known-typed variable (loop var from str
                     # iteration, previously-assigned str var, etc.).
@@ -19892,19 +23281,41 @@ class CodeGen:
                     if arg.id in loop_var_types:
                         _lvk = self._tag_kind(loop_var_types[arg.id])
                         if _lvk in _ELEM_KINDS:
-                            self._list_append_types[var_name] = ValueType(_lvk)
+                            _vt = ValueType(_lvk)
                     elif arg.id in local_var_types:
                         _lvk = self._tag_kind(local_var_types[arg.id])
                         if _lvk in _ELEM_KINDS:
-                            self._list_append_types[var_name] = ValueType(_lvk)
+                            _vt = ValueType(_lvk)
                     elif arg.id in self.variables:
                         _vk = self._var_kind(arg.id)
                         if _vk == VKind.STR:
-                            self._list_append_types[var_name] = ValueType(VKind.STR)
+                            _vt = ValueType(VKind.STR)
                         elif _vk == VKind.FLOAT:
-                            self._list_append_types[var_name] = ValueType(VKind.FLOAT)
+                            _vt = ValueType(VKind.FLOAT)
                         elif _vk == VKind.PYOBJ:
-                            self._list_append_types[var_name] = ValueType(VKind.PYOBJ)
+                            _vt = ValueType(VKind.PYOBJ)
+
+                # Merge this append's vote with the ones already cast.  An
+                # append nothing above recognised (`_vt is None`) is not
+                # "no news" — it is an element of unknown kind, which is a
+                # reason to forget what the other appends said, not to keep it.
+                if _vt is None:
+                    _append_unknown.add(var_name)
+                    self._list_append_types.pop(var_name, None)
+                elif var_name not in _append_unknown:
+                    _prev = self._list_append_types.get(var_name)
+                    if _prev is None or _prev == _vt:
+                        self._list_append_types[var_name] = _vt
+                    elif _prev.kind == _vt.kind:
+                        # Same kind, disagreeing element kind: keep the kind
+                        # and drop the element, rather than calling the whole
+                        # thing mixed.  `rows.append([1]); rows.append([2.0])`
+                        # is still a list of lists.
+                        self._list_append_types[var_name] = ValueType(
+                            _prev.kind)
+                    else:
+                        self._list_append_types[var_name] = ValueType(
+                            VKind.MIXED)
 
     def _infer_list_elem_type(self, node: ast.expr) -> 'ValueType':
         """Infer the element type of a list expression.
@@ -19988,6 +23399,23 @@ class CodeGen:
                     return ValueType(VKind.NONE)
                 elif isinstance(first.value, bool):
                     return ValueType(VKind.BOOL)
+            # Bytes elements.  There was no arm for them anywhere here, so
+            # `[b"ab", b"cd"]` fell all the way through to the int default and
+            # `for p in parts` handed the loop body a raw pointer as an
+            # integer.  BUG-BYTES-IN-LIST-TAG-LOST.
+            if self._is_bytes_expr(first):
+                return ValueType(VKind.BYTES)
+            # Complex / Decimal / BigInt elements.  With no arm for them here
+            # `[1 + 2j]` fell through to the INT default at the bottom,
+            # `_can_inline_list_access` answered "int", and `c[0]` became an
+            # inline i64 load of the complex's *pointer* — so `c[0] + c[0]`
+            # added two addresses.  The store side has tagged these correctly
+            # since BUG-LIST-LITERAL-BIGINT-DECIMAL-ELEM; this is the matching
+            # read.  None of the three is inlineable, so naming the kind is
+            # what routes the access through `list_get_fv` and keeps the tag.
+            _first_kind = self._infer_type_tag(first, None).kind
+            if _first_kind in (VKind.COMPLEX, VKind.DECIMAL, VKind.BIGINT):
+                return ValueType(_first_kind)
             # Handle negative float literals: -1.0 is parsed as
             # UnaryOp(USub, Constant(1.0)), not Constant(-1.0).
             if (isinstance(first, ast.UnaryOp)
@@ -19997,6 +23425,16 @@ class CodeGen:
                     return ValueType(VKind.FLOAT)
             # Check if elements are nested lists or tuples (both stored as list pointers)
             if isinstance(first, (ast.List, ast.ListComp, ast.Tuple)):
+                # Recurse so the *inner* element kind survives too.  This
+                # returned a bare LIST, so `[["one", "two"]]` knew its
+                # elements were lists but not that theirs were strs, and
+                # `lit[0][1]` fell to the INT default — `len()` answered 0
+                # and `==` compared addresses.  The `[a, b]` arm below has
+                # propagated the inner type all along; the literal form
+                # simply never did.  BUG-BIGINT-COMPARES-BY-POINTER.
+                _inner = self._infer_list_elem_type(first)
+                if _inner.kind != VKind.INT:
+                    return ValueType(VKind.LIST, elem_type=_inner)
                 return ValueType(VKind.LIST)
             # Check if elements are dicts
             if isinstance(first, (ast.Dict, ast.DictComp)):
@@ -20595,16 +24033,16 @@ class CodeGen:
 
         # STR += (string concatenation)
         if left_kind == VKind.STR and isinstance(node.op, ast.Add):
-            result = self._rt_call("str_concat",
-                                   [tv_current.as_ptr(self.builder),
-                                    self._ensure_ptr(rhs)])
+            result = self._owned_str_concat(
+                [tv_current.as_ptr(self.builder),
+                 self._ensure_ptr(rhs)])
             self._store_variable(target_name, result, ValueType(VKind.STR))
             return
 
         # STR *= n (string repetition)
         if left_kind == VKind.STR and isinstance(node.op, ast.Mult):
-            result = self._rt_call("str_repeat",
-                                   [tv_current.as_ptr(self.builder), rhs])
+            result = self._owned_str_repeat(
+                [tv_current.as_ptr(self.builder), rhs])
             self._store_variable(target_name, result, ValueType(VKind.STR))
             return
 
@@ -20781,6 +24219,175 @@ class CodeGen:
         self.builder.store(undef_fv, alloca)
         self.builder.position_at_end(saved_block)
 
+    # Static kinds whose runtime representation is a refcounted heap pointer,
+    # mapped to the fpy_rc_incref/decref tag that dispatches to the right
+    # object header.  PYOBJ is deliberately absent: those are CPython-bridge
+    # pointers whose lifetime the bridge owns, not fpy_rc_*.
+    _NATIVE_HEAP_TAGS = {
+        VKind.STR: FPY_TAG_STR,
+        VKind.BYTES: FPY_TAG_BYTES,
+        VKind.LIST: FPY_TAG_LIST,
+        VKind.TUPLE: FPY_TAG_LIST,   # tuples are FpyList at runtime
+        VKind.DICT: FPY_TAG_DICT,
+        VKind.SET: FPY_TAG_SET,
+        VKind.OBJ: FPY_TAG_OBJ,
+    }
+
+    # Registry sentinel: this slot holds a whole FpyValue, so the tag to
+    # retain/release with is the one *in the value*, not a compile-time
+    # constant.  A bare alloca is normally a single native pointer whose kind
+    # the compiler knows statically, but the bare-ABI store path also takes
+    # `{i32, i64}` values whose kind is only known at runtime — a function
+    # returning a str on one branch and a list on another is typed `list`
+    # statically, and retaining a str pointer as FPY_TAG_LIST writes through
+    # the wrong header offset.  See BUG-NATIVE-SLOT-CONST-RC-TAG.
+    _RC_TAG_DYNAMIC = -2
+
+    @classmethod
+    def _native_heap_tag(cls, type_tag) -> 'int | None':
+        """The fpy_rc_* tag for a native slot of this static kind, or None if
+        the kind is a non-refcounted scalar (INT/FLOAT/BOOL/NONE) or is not
+        managed by fpy_rc_* at all (PYOBJ, CELL, UNKNOWN)."""
+        return cls._NATIVE_HEAP_TAGS.get(cls._tag_kind(type_tag))
+
+    def _ptr_as_i64(self, value: ir.Value) -> ir.Value:
+        """Widen a native heap value to the i64 `data` word that
+        fpy_rc_incref/fpy_rc_decref take."""
+        if isinstance(value.type, ir.PointerType):
+            return self.builder.ptrtoint(value, i64)
+        if isinstance(value.type, ir.IntType):
+            if value.type.width < 64:
+                return self.builder.zext(value, i64)
+            if value.type.width > 64:
+                return self.builder.trunc(value, i64)
+        return value
+
+    def _rc_native_slots_for_fn(self) -> dict:
+        """The native-slot refcount registry for the function being emitted."""
+        return self._rc_native_slots.setdefault(self.function, {})
+
+    def _entry_store_null(self, alloca: ir.AllocaInstr) -> None:
+        """Zero-initialize a *native* (non-FpyValue) alloca in the entry block,
+        after all allocas — the native counterpart of _entry_store_fv_none.
+
+        _create_entry_alloca deliberately leaves slots uninitialized, so a
+        variable assigned only inside an `if` would have the release on its
+        store path (and the one in _emit_scope_decref) read stack garbage and
+        decref a wild pointer.  fpy_rc_decref's `if (data == 0) return;` guard
+        makes a zeroed slot a safe no-op.  Idempotent per alloca.
+        """
+        if alloca in self._entry_nulled:
+            return
+        self._entry_nulled.add(alloca)
+        saved_block = self.builder.block
+        entry_block = self.function.entry_basic_block
+        insert_before = None
+        for inst in entry_block.instructions:
+            if not isinstance(inst, ir.AllocaInstr):
+                insert_before = inst
+                break
+        if insert_before is not None:
+            self.builder.position_before(insert_before)
+        else:
+            self.builder.position_at_end(entry_block)
+        # ir.Constant only — an instruction here could violate dominance.
+        self.builder.store(ir.Constant(alloca.type.pointee, None), alloca)
+        self.builder.position_at_end(saved_block)
+
+    def _retain_native_store(self, name: str, alloca: ir.AllocaInstr,
+                              value: ir.Value, type_tag,
+                              steal: bool = False) -> None:
+        """Make a native slot *own* the reference it is about to hold.
+
+        FV locals get this for free in the FV path of _store_variable; native
+        slots (--typed `_native_vars` and bare-ABI locals) used to be a plain
+        `builder.store`, which under Model-2 is a use-after-free: the producer
+        registered the fresh +1 as an owned temp, the statement-boundary flush
+        released it, and the variable was left pointing at freed memory.
+        See BUG-BARE-ABI-STORE-NO-RETAIN.
+
+        Order matters: **incref the new value before decref'ing the old one**,
+        so `x = x` (and `x = x[0]`, `x = f(x)`, ...) cannot drop the last
+        reference before taking the new one.  The old value is released with
+        the tag it was *retained* with, read from the registry, because a slot
+        can be rebound to a different static kind.
+        """
+        if not self._USE_REFCOUNT:
+            return
+        # An FpyValue-typed slot carries its own tag, and that tag is the only
+        # trustworthy one: the static kind may say LIST for a callee that
+        # returned a str on this path.  Retain and release with the runtime
+        # tag instead of a constant (BUG-NATIVE-SLOT-CONST-RC-TAG).  This has
+        # to precede the `fpy_tag is None` early-out, because a static scalar
+        # kind says nothing about what the struct actually holds.
+        _is_fv = (isinstance(value.type, ir.LiteralStructType)
+                  and value.type == fpy_val)
+        fpy_tag = (self._RC_TAG_DYNAMIC if _is_fv
+                   else self._native_heap_tag(type_tag))
+        reg = self._rc_native_slots_for_fn()
+        prev = reg.get(name)
+
+        # A registry entry of (alloca, None) means "this slot is tracked but
+        # currently holds no reference" — e.g. a heap-typed name overwritten
+        # with an int.  That is distinct from *absent*, which means "never
+        # stored, contents may be stack garbage": the former must not be
+        # released, the latter needs the entry-block zero-init first.
+        if prev is not None and prev[0] is not alloca:
+            # The name was rebound to a *different* alloca (the bare-ABI path
+            # re-allocas on an LLVM type change).  The old one is now
+            # unreachable, so release it and treat this alloca as fresh.
+            if prev[1] is not None:
+                self._release_native_slot(name, *prev)
+            prev = None
+
+        if fpy_tag is None:
+            # Storing a scalar over whatever was there: nothing to retain, but
+            # the old heap value (if any) still has to be released.
+            if prev is not None and prev[1] is not None:
+                self._release_native_slot(name, *prev)
+            reg[name] = (alloca, None)
+            return
+
+        # 1. Retain the incoming value (unless the producer handed us its +1).
+        if not steal:
+            if fpy_tag == self._RC_TAG_DYNAMIC:
+                self.builder.call(
+                    self.runtime["rc_incref"],
+                    [self.builder.extract_value(value, 0),
+                     self.builder.extract_value(value, 1)])
+            else:
+                self.builder.call(
+                    self.runtime["rc_incref"],
+                    [ir.Constant(i32, fpy_tag), self._ptr_as_i64(value)])
+        # 2. Release what the slot held before.
+        if prev is None:
+            # First store into this slot — the alloca may hold stack garbage,
+            # so make sure the entry block zeroed it, then release whatever it
+            # holds (NULL on the first execution, a real value if this store is
+            # inside a loop).
+            self._entry_store_null(alloca)
+            self._release_native_slot(name, alloca, fpy_tag)
+        elif prev[1] is not None:
+            self._release_native_slot(name, *prev)
+        reg[name] = (alloca, fpy_tag)
+
+    def _release_native_slot(self, name: str, alloca: ir.AllocaInstr,
+                              fpy_tag: int) -> None:
+        """Emit `rc_decref(fpy_tag, <current contents of alloca>)`.
+
+        `fpy_tag == _RC_TAG_DYNAMIC` means the slot holds a whole FpyValue, so
+        the tag to release with travels in the value itself — releasing with a
+        constant would treat, say, a str as an FpyList.
+        """
+        old = self.builder.load(alloca, name=f"{name}.rcold")
+        if fpy_tag == self._RC_TAG_DYNAMIC:
+            self.builder.call(self.runtime["rc_decref"],
+                              [self.builder.extract_value(old, 0),
+                               self.builder.extract_value(old, 1)])
+            return
+        self.builder.call(self.runtime["rc_decref"],
+                          [ir.Constant(i32, fpy_tag), self._ptr_as_i64(old)])
+
     # Flip this to True to store locals as FpyValue. Globals and closure
     # cells keep their old representation (globals as i64, cells as heap-
     # allocated FpyCell). During the gradual migration, setting this to
@@ -20868,6 +24475,9 @@ class CodeGen:
                     else self.builder.trunc(value, i64)
             elif kind == VKind.STR and isinstance(value.type, ir.IntType):
                 value = self._ensure_ptr(value)
+            # The slot must own what it holds: the producer's +1 belongs to the
+            # pending-temp list and is released at the statement boundary.
+            self._retain_native_store(name, alloca, value, ValueType(kind), steal)
             self.builder.store(value, alloca)
             # Also update self.variables type tag so _emit_expr reads the
             # correct VKind for this variable.
@@ -20902,7 +24512,19 @@ class CodeGen:
             self.builder.store(value, alloca)
             return
 
-        if not self._USE_FV_LOCALS or self._current_fn_bare_abi:
+        # A local the pre-scan marked as runtime-tagged keeps one FpyValue slot
+        # for the whole body: `t = 0` must not open an i64 slot that a later
+        # `t = t + mixed()` would abandon in favour of a second, wider one.
+        # Its kind is genuinely unknown, so the tag says so from the start —
+        # otherwise a load emitted before the widening would unbox a later
+        # iteration's value against the wrong kind.
+        # BUG-SUBSCRIPT-UNTYPED-PARAM-BRIDGE.
+        _forced_fv = (self._USE_FV_LOCALS and name in self._fv_forced_locals)
+        if _forced_fv:
+            type_tag = ValueType(VKind.MIXED)
+
+        if (not self._USE_FV_LOCALS
+                or (self._current_fn_bare_abi and not _forced_fv)):
             # Bare-type alloca: store native values directly (no FpyValue wrapping).
             # Used in both legacy mode (_USE_FV_LOCALS=False) and bare-ABI functions.
             if name in self.variables:
@@ -20913,6 +24535,10 @@ class CodeGen:
             else:
                 alloca = self._create_entry_alloca(value.type, name)
                 self.variables[name] = (alloca, type_tag)
+            # Bare allocas carry no runtime tag, so ownership has to be tracked
+            # compiler-side — otherwise the statement-boundary flush frees the
+            # value out from under the variable.  See BUG-BARE-ABI-STORE-NO-RETAIN.
+            self._retain_native_store(name, alloca, value, type_tag, steal)
             self.builder.store(value, alloca)
             return
 
@@ -21005,6 +24631,26 @@ class CodeGen:
         _new_is_scalar = (isinstance(type_tag, ValueType)
                           and type_tag.kind in _SCALAR_VKINDS)
 
+        # Incref the new value being stored (skip if stealing an owned ref).
+        # This MUST happen before the old value is released below: when both
+        # are the same object and the slot holds the last reference, releasing
+        # first would free it and leave the incref resurrecting freed memory.
+        #   s = str(7)
+        #   s = s        # decref(old) -> 0 -> freed; then incref(freed)
+        # The native-slot path (_retain_native_store) applies the same rule.
+        # See BUG-FV-STORE-DECREF-BEFORE-INCREF.
+        if self._USE_REFCOUNT and not steal and not _new_is_scalar:
+            new_tag = self.builder.extract_value(fv, 0)
+            new_data = self.builder.extract_value(fv, 1)
+            # Inline fast path for OBJ: direct refcount increment as IR
+            _new_kind = (type_tag.kind if isinstance(type_tag, ValueType)
+                         else self._tag_kind(type_tag))
+            if _new_kind == VKind.OBJ:
+                self._emit_inline_obj_incref(new_data)
+            else:
+                self.builder.call(self.runtime["rc_incref"],
+                                  [new_tag, new_data])
+
         if name in self.variables:
             alloca, old_tag = self.variables[name]
             _old_kind_s = (old_tag.kind if isinstance(old_tag, ValueType)
@@ -21061,18 +24707,6 @@ class CodeGen:
                 else:
                     self.builder.call(self.runtime["rc_decref"],
                                       [old_tag_val, old_data])
-        # Incref the new value being stored (skip if stealing an owned ref)
-        if self._USE_REFCOUNT and not steal and not _new_is_scalar:
-            new_tag = self.builder.extract_value(fv, 0)
-            new_data = self.builder.extract_value(fv, 1)
-            # Inline fast path for OBJ: direct refcount increment as IR
-            _new_kind = (type_tag.kind if isinstance(type_tag, ValueType)
-                         else self._tag_kind(type_tag))
-            if _new_kind == VKind.OBJ:
-                self._emit_inline_obj_incref(new_data)
-            else:
-                self.builder.call(self.runtime["rc_incref"],
-                                  [new_tag, new_data])
         self.variables[name] = (alloca, type_tag)
         self.builder.store(fv, alloca)
         # Track that this variable has been assigned a real value.  Inside
@@ -21301,6 +24935,20 @@ class CodeGen:
             return VKind.TUPLE
         if isinstance(node, ast.JoinedStr):
             return VKind.STR
+        if isinstance(node, ast.BinOp):
+            # `"fmt" % x` and `"a" + x` are strings whenever one side is known
+            # to be one.  The recursion only ever concludes STR from an
+            # unambiguous leaf, so this can't mistype an arithmetic `%`: an
+            # int left operand returns INT and falls through to None here.
+            left = CodeGen._infer_expr_kind(node.left)
+            if isinstance(node.op, ast.Mod):
+                if left == VKind.STR:
+                    return VKind.STR
+            elif isinstance(node.op, ast.Add):
+                if (left == VKind.STR
+                        or CodeGen._infer_expr_kind(node.right) == VKind.STR):
+                    return VKind.STR
+            return None
         return None
 
     def _scan_unsafe_typed_vars(self, body: list[ast.stmt]) -> set[str]:
@@ -21352,6 +25000,356 @@ class CodeGen:
                     if rhs_kind is not None and rhs_kind != annotated[stmt.target.id]:
                         unsafe.add(stmt.target.id)
         return unsafe
+
+    # Constructors that pin a variable to an explicit i64 overflow policy.
+    # Shared with `_scan_fv_forced_locals`, which has to recognise them
+    # syntactically: `_int_mode_vars` is not filled until emission.
+    _INT_CONSTRUCTORS = {
+        'unchecked_int': 'unchecked', 'checked_int': 'checked',
+        'unchecked_int32': 'unchecked32', 'checked_int32': 'checked32',
+    }
+
+    _INT_MODE_MARKERS = frozenset({'Unchecked', 'Checked',
+                                   'Unchecked32', 'Checked32'})
+
+    @staticmethod
+    def _is_constant_arith(e: ast.expr) -> bool:
+        """Is *e* arithmetic over literals alone, with no names or calls?
+
+        Such an expression is folded to a single constant whose kind codegen
+        knows exactly — `2 ** 63` is a BigInt, always — so it is never the
+        "might be narrow, might promote" shape that forces a wide slot.
+        """
+        if isinstance(e, ast.Constant):
+            return isinstance(e.value, (int, float)) and not isinstance(e.value, bool)
+        if isinstance(e, ast.BinOp):
+            return (CodeGen._is_constant_arith(e.left)
+                    and CodeGen._is_constant_arith(e.right))
+        if isinstance(e, ast.UnaryOp) and isinstance(e.op, (ast.USub, ast.UAdd)):
+            return CodeGen._is_constant_arith(e.operand)
+        return False
+
+    # Expression nodes that can never be an integer, so `_emit_int_binop` is
+    # never reached for them and the `_program_uses_bigint` widening below
+    # must not fire.  Containers, comprehensions and f-strings are obvious;
+    # `Compare`/`BoolOp` yield bools, which take the bool path.
+    _NEVER_INT_NODES = (ast.List, ast.Tuple, ast.Dict, ast.Set, ast.ListComp,
+                        ast.SetComp, ast.DictComp, ast.GeneratorExp,
+                        ast.JoinedStr, ast.Compare, ast.BoolOp, ast.Lambda)
+
+    @property
+    def _program_class_names(self) -> set[str]:
+        """Every `class` name in the program, for spotting constructor calls.
+
+        `_scan_fv_forced_locals` needs this to tell `v1 + v2` on two `Vector`s
+        from `i + 1` on two ints, and it runs before any class is emitted, so
+        it reads the module AST saved in Pass 0 rather than a codegen-side
+        registry that does not exist yet.
+        """
+        cached = getattr(self, '_program_class_names_cache', None)
+        if cached is None:
+            cached = {n.name for n in ast.walk(self._module_tree)
+                      if isinstance(n, ast.ClassDef)}
+            self._program_class_names_cache = cached
+        return cached
+
+    # The operators `_emit_int_binop` routes through `fpy_checked_*` when
+    # `_program_uses_bigint` is set, i.e. the ones whose result can be a
+    # BIGINT-tagged FpyValue rather than an i64.
+    _BIGINT_CAPABLE_OPS = (ast.Add, ast.Sub, ast.Mult, ast.Pow, ast.LShift)
+
+    def _returns_may_be_bigint(self, node: ast.FunctionDef) -> bool:
+        """Could any `return` in *node* hand back a BigInt?
+
+        Return-type inference otherwise types `return -x` and `return r * 2`
+        as `int`/i64, so the caller narrows the FpyValue to its `data` field —
+        which for a BIGINT is the *pointer*.  `print(neg(b) + 0)` then printed
+        a heap address, and it varied run to run.
+        BUG-BIGINT-RETURNED-FROM-FUNCTION-LOSES-TAG.
+
+        This is the return-side counterpart of the widening clause in
+        `_scan_fv_forced_locals`, and deliberately shares its shape: the same
+        operator set, the same `_is_constant_arith` exemption (an all-constant
+        expression is folded to a static BigInt, not a tagged one), and the
+        same over-approximating stance — a name is "maybe big" if *any*
+        assignment to it in this function is, resolved by a small fixpoint
+        because `r = r * k` refers to itself.
+
+        Over-approximating costs a wide return slot; under-approximating hands
+        back a pointer as a number, so the bias is deliberate.
+        """
+        if not self._program_uses_bigint:
+            return False
+
+        def arith_may_be_big(e) -> bool:
+            if isinstance(e, ast.BinOp):
+                return (isinstance(e.op, self._BIGINT_CAPABLE_OPS)
+                        and not self._is_constant_arith(e))
+            if isinstance(e, ast.UnaryOp) and isinstance(e.op, ast.USub):
+                # Negation preserves a BigInt rather than creating one, so the
+                # question is whether the *operand* could already be one — and
+                # a bare name usually can be, which is why this does not just
+                # recurse.  `-x` on a parameter is the reported repro; only a
+                # literal (`-5`) and the never-int nodes are ruled out.
+                inner = e.operand
+                if isinstance(inner, ast.Constant):
+                    return False
+                if isinstance(inner, self._NEVER_INT_NODES):
+                    return False
+                return not self._is_constant_arith(inner)
+            return False
+
+        maybe_big: set[str] = set()
+        for _ in range(4):
+            grew = False
+            for stmt in ast.walk(node):
+                if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1:
+                    tgt, val = stmt.targets[0], stmt.value
+                elif isinstance(stmt, (ast.AnnAssign, ast.AugAssign)):
+                    tgt, val = stmt.target, stmt.value
+                else:
+                    continue
+                if not isinstance(tgt, ast.Name) or val is None:
+                    continue
+                if tgt.id in maybe_big:
+                    continue
+                if arith_may_be_big(val) or (isinstance(val, ast.Name)
+                                             and val.id in maybe_big):
+                    maybe_big.add(tgt.id)
+                    grew = True
+            if not grew:
+                break
+
+        for n in ast.walk(node):
+            if not isinstance(n, ast.Return) or n.value is None:
+                continue
+            v = n.value
+            if arith_may_be_big(v):
+                return True
+            if isinstance(v, ast.Name) and v.id in maybe_big:
+                return True
+        return False
+
+    # Builtins whose result kind is their argument's kind, so a tagged
+    # argument makes the result tagged too.  `round` is included even though
+    # one-argument `round` is always an int in CPython: this scan is allowed
+    # to over-approximate (a wide slot is correct for any value, merely
+    # wider than needed) and is not allowed to under-approximate.
+    _KIND_FORWARDING_BUILTINS = frozenset({"abs", "min", "max", "sum", "round"})
+
+    def _scan_fv_forced_locals(self, body: list[ast.stmt],
+                                skip: set[str]) -> set[str]:
+        """Locals that must get an FpyValue slot from their first assignment.
+
+        A local's storage class is decided by its *first* store: `t = 0` in a
+        bare-ABI function gets an `i64` alloca.  If a later store needs an
+        `FpyValue` — because the value's kind is only known at runtime — the
+        store path used to allocate a *second*, wider slot and leave the first
+        one behind.  Straight-line code survives that, because every load after
+        the switch reads the new slot; a loop does not:
+
+            t = 0
+            while i < n:
+                t = t + at(lst, i)   # load reads the dead i64 slot,
+                i = i + 1            # store writes the FpyValue slot
+
+        The load was emitted before the widening, so it is bound to the old
+        alloca forever and the accumulation is thrown away on every iteration.
+        The same split silently drops the initial value when the widening
+        happens inside an `if`.
+
+        The fix is to never widen: decide up front which locals can hold a
+        runtime-tagged value and give those an FpyValue slot from the start,
+        so there is exactly one slot per name.  This scan answers that
+        question conservatively — a name is forced when it is assigned from an
+        expression whose kind is not statically known, which today means a
+        call to a function returning `mixed`, an element or slice of such a
+        value, or arithmetic involving one.  Over-approximating is safe: an
+        FpyValue slot is correct for any value, only wider than it needs to
+        be.  Parameters are excluded because their slots are created by
+        `_efd_store_parameters` before this runs.
+
+        Not descending into nested functions is deliberate: they are separate
+        scopes and get their own scan.  BUG-SUBSCRIPT-UNTYPED-PARAM-BRIDGE.
+        """
+        forced: set[str] = set()
+
+        # A variable with an explicit per-variable overflow policy never
+        # promotes: `unchecked_int` wraps and `checked_int` raises, and
+        # neither ever yields a tagged value.  Widening one anyway breaks the
+        # policy — it crashed `annotated_overflow_behavior` outright.  The
+        # markers have to be read syntactically here because `_int_mode_vars`
+        # is not filled until emission, long after this scan.
+        _mode_pinned: set[str] = set()
+        for _stmt in self._walk_scope(body):
+            if isinstance(_stmt, ast.Assign) and len(_stmt.targets) == 1:
+                _tgt, _val = _stmt.targets[0], _stmt.value
+            elif isinstance(_stmt, ast.AnnAssign):
+                _tgt, _val = _stmt.target, _stmt.value
+            else:
+                continue
+            if not isinstance(_tgt, ast.Name):
+                continue
+            if (isinstance(_val, ast.Call) and isinstance(_val.func, ast.Name)
+                    and _val.func.id in self._INT_CONSTRUCTORS):
+                _mode_pinned.add(_tgt.id)
+            elif (isinstance(_stmt, ast.AnnAssign)
+                    and _stmt.annotation is not None):
+                _markers = self._unwrap_annotated(_stmt.annotation)[1]
+                if any(_m in self._INT_MODE_MARKERS for _m in _markers):
+                    _mode_pinned.add(_tgt.id)
+        if _mode_pinned:
+            skip = set(skip) | _mode_pinned
+
+        # `_program_uses_bigint` only changes how *integer* arithmetic is
+        # emitted, so the widening below has to be able to tell `i + 1` from
+        # `v1 + v2` on two `Vector`s.  Getting that wrong printed an empty
+        # string for `f"{v1 + v2}"`: the object went into a tagged slot and
+        # its `__str__` was never found.  Names are classified by what they
+        # are assigned syntactically — a container, an f-string, a string
+        # literal or a constructor call for a class in this program all mean
+        # "never an int".  This deliberately answers "maybe" for anything it
+        # cannot see through (a plain call, an attribute, a subscript), since
+        # under-approximating here brings the hang back.
+        _never_int: set[str] = set()
+
+        def maybe_int(e) -> bool:
+            if isinstance(e, ast.Constant):
+                return isinstance(e.value, int) and not isinstance(e.value, bool)
+            if isinstance(e, self._NEVER_INT_NODES):
+                return False
+            if isinstance(e, ast.Name):
+                return e.id not in _never_int
+            if isinstance(e, ast.BinOp):
+                return maybe_int(e.left) and maybe_int(e.right)
+            if isinstance(e, ast.UnaryOp):
+                return (isinstance(e.op, (ast.USub, ast.UAdd, ast.Invert))
+                        and maybe_int(e.operand))
+            if isinstance(e, ast.IfExp):
+                return maybe_int(e.body) or maybe_int(e.orelse)
+            if isinstance(e, ast.Call):
+                return not (isinstance(e.func, ast.Name)
+                            and e.func.id in self._program_class_names)
+            return True
+
+        for _ in range(4):
+            _grew = False
+            for _stmt in self._walk_scope(body):
+                if isinstance(_stmt, ast.Assign) and len(_stmt.targets) == 1:
+                    _tgt, _val = _stmt.targets[0], _stmt.value
+                elif isinstance(_stmt, (ast.AnnAssign, ast.AugAssign)):
+                    _tgt, _val = _stmt.target, _stmt.value
+                else:
+                    continue
+                if (isinstance(_tgt, ast.Name) and _val is not None
+                        and _tgt.id not in _never_int and not maybe_int(_val)):
+                    _never_int.add(_tgt.id)
+                    _grew = True
+            if not _grew:
+                break
+
+        def yields_mixed(e) -> bool:
+            if isinstance(e, ast.Name):
+                return e.id in forced
+            if isinstance(e, ast.Call):
+                if isinstance(e.func, ast.Name):
+                    if e.func.id in forced:
+                        return True
+                    # A builtin that hands back one of its arguments, or a
+                    # value of the same kind, is mixed exactly when that
+                    # argument is: `abs(f(x))` for a "mixed"-returning `f`
+                    # yields a tagged FpyValue, and an accumulator fed from
+                    # it needs its wide slot from the first store.
+                    if e.func.id in self._KIND_FORWARDING_BUILTINS:
+                        return any(yields_mixed(a) for a in e.args)
+                    return self._callee_returns_mixed(e.func.id)
+                return False
+            if isinstance(e, ast.Subscript):
+                # An element or slice of a runtime-tagged container is itself
+                # of unknown kind — that is exactly what fv_subscript and
+                # fv_slice hand back.
+                return yields_mixed(e.value)
+            if isinstance(e, ast.BinOp):
+                if yields_mixed(e.left) or yields_mixed(e.right):
+                    return True
+                # Both operands can be plain ints and the result still be
+                # tagged.  Pass 0.9 sets `_program_uses_bigint` for the *whole
+                # program* when any constant reaches BigInt range, and
+                # `_emit_int_binop` then routes every integer +/-/*/**/<<
+                # through `fpy_checked_*`, which hands back an FpyValue
+                # carrying FPY_TAG_BIGINT on overflow.  So the operator alone
+                # decides this, not the operands — and missing it meant
+                # `i = 0` / `while i < n: i = i + 1` gave `i` an i64 slot and
+                # then widened mid-loop into a second one, leaving the
+                # condition reading a slot nobody stores to again.  The
+                # counter stayed 0 and the loop never terminated.
+                # BUG-BIGINT-PROGRAM-HANGS-WHILE-COUNTER.
+                #
+                # An all-constant expression is exempt, and that exemption is
+                # load-bearing rather than an optimisation.  `x = 2 ** 63` is
+                # *unconditionally* a BigInt, not a value that might promote,
+                # and codegen already gives it a static BIGINT slot holding a
+                # pointer.  Widening it to a tagged slot instead breaks every
+                # consumer that expects the pointer — `print(add_big(x, y))`
+                # printed an address — because a BIGINT-tagged FpyValue is not
+                # narrowed back at a call boundary.  That is
+                # BUG-BIGINT-FV-RESULT-NOT-CONSUMED, and until it is fixed,
+                # over-approximating here is *not* free: a wide slot is only
+                # harmless for values the tagged paths handle correctly.
+                #
+                # `maybe_int` keeps this to arithmetic that could actually
+                # reach `_emit_int_binop`.  Without it the clause fired on
+                # `v3 = v1 + v2` for a user class with `__add__`, put the
+                # object in a tagged slot and lost its `__str__`, so
+                # `f"v1 + v2 = {v3}"` printed nothing after the `=`.  A float
+                # operand is excluded the same way and for the same reason:
+                # `t + 1.5` is a double, never a tagged value.
+                if (self._program_uses_bigint
+                        and isinstance(e.op, (ast.Add, ast.Sub, ast.Mult,
+                                              ast.Pow, ast.LShift))
+                        and maybe_int(e)
+                        and not self._is_constant_arith(e)):
+                    return True
+                return False
+            if isinstance(e, ast.UnaryOp):
+                return yields_mixed(e.operand)
+            if isinstance(e, ast.IfExp):
+                if yields_mixed(e.body) or yields_mixed(e.orelse):
+                    return True
+                # Arms of different scalar kinds make the value's kind a
+                # runtime question too — `1 if c else 2.5` is an int on one
+                # path and a float on the other, and used to be forced to
+                # double so that one LLVM type could hold both.
+                # BUG-IFEXP-INT-FLOAT-PROMOTE.
+                _ks = self._scalar_kinds_of(e, {})
+                return _ks is not None and len(_ks) > 1
+            return False
+
+        def note(target, value) -> bool:
+            if not isinstance(target, ast.Name) or target.id in skip:
+                return False
+            if target.id in forced or not yields_mixed(value):
+                return False
+            forced.add(target.id)
+            return True
+
+        # A back edge can make a name mixed only on a later iteration
+        # (`t = t + f(x)` where `f` is mixed), so iterate to a fixpoint.
+        for _ in range(8):
+            changed = False
+            for stmt in self._walk_scope(body):
+                if isinstance(stmt, ast.Assign):
+                    for target in stmt.targets:
+                        changed |= note(target, stmt.value)
+                elif isinstance(stmt, ast.AugAssign):
+                    changed |= note(stmt.target, stmt.value)
+                elif isinstance(stmt, (ast.For, ast.AsyncFor)):
+                    # Iterating a runtime-tagged container yields elements of
+                    # the same unknown kind.
+                    changed |= note(stmt.target, stmt.iter)
+            if not changed:
+                break
+        return forced
 
     @staticmethod
     def _walk_scope(body: list[ast.stmt]):
@@ -21411,15 +25409,45 @@ class CodeGen:
         else:
             return data
 
+    def _needs_undef_check(self, name: str) -> bool:
+        """Whether a load of `name` has to test for the UNDEF sentinel.
+
+        The check is an icmp plus a predicted-not-taken branch per load,
+        which blocks LLVM's loop optimizations, so it is skipped wherever a
+        read cannot find the variable unbound.
+
+        `_definitely_assigned` alone is not that test: it records that a
+        store has been *emitted*, and a store in a loop body that runs zero
+        times — or in a dead `if` branch — is emitted just the same.
+        `for _ in range(0): z = 0` followed by `0 + z` skipped the check and
+        added the UNDEF sentinel's data word as if it were a number.  The
+        dominance answer comes from `_names_maybe_unbound`.
+
+        Every site that loads an FV local has to ask *this* question, not its
+        own version of it: `return x` for a float-returning function had its
+        own raw-FV load that skipped the check entirely, so the one shape
+        where a float local is read is the one shape that did not raise.
+        BUG-UNBOUND-NATIVE-LOCAL-READS-STACK.
+        """
+        return (name in self._scope_maybe_unbound
+                or not (name in self._definitely_assigned
+                        and not self._in_try_block))
+
     def _check_fv_undef(self, fv: ir.Value, name: str) -> ir.Value:
         """Check if a loaded FpyValue has the UNDEF tag (never assigned).
 
-        Emits a runtime NameError if so, matching CPython semantics for
-        accessing a variable that was never defined (or whose assignment
-        was interrupted by an exception in a try block).  Returns the
-        original fpy_val struct unchanged — the caller proceeds only if
-        the ok-block is reached.  The cost is one icmp + one predicted-
-        not-taken branch per load.
+        Emits the exception CPython raises for reading a variable that was
+        never given a value (or whose assignment an exception in a try
+        block interrupted).  Returns the original fpy_val struct unchanged
+        — the caller proceeds only if the ok-block is reached.  The cost is
+        one icmp + one predicted-not-taken branch per load.
+
+        Which exception depends on the scope: a *local* gets
+        UnboundLocalError, a module-level name gets NameError.  They are
+        not interchangeable — the messages differ, and while
+        UnboundLocalError is a subclass of NameError (so `except
+        NameError:` catches both), only the subclass is caught by `except
+        UnboundLocalError:`.
         """
         rt_tag = self.builder.extract_value(fv, 0, name=f"{name}.rtag")
         is_undef = self.builder.icmp_signed(
@@ -21429,19 +25457,32 @@ class CodeGen:
         self.builder.cbranch(is_undef, undef_block, ok_block)
 
         self.builder.position_at_end(undef_block)
-        ne_name_ptr = self._make_string_constant("NameError")
+        _at_module_scope = (
+            getattr(self, "_current_func_name", "fastpy_main")
+            == "fastpy_main")
+        if _at_module_scope:
+            _exc, _msg = "NameError", f"name '{name}' is not defined"
+        else:
+            _exc = "UnboundLocalError"
+            _msg = (f"cannot access local variable '{name}' where it is "
+                    f"not associated with a value")
+        ne_name_ptr = self._make_string_constant(_exc)
         ne_exc_id = self.builder.call(
             self.runtime["exc_name_to_id"], [ne_name_ptr])
-        ne_msg_ptr = self._make_string_constant(
-            f"name '{name}' is not defined")
+        ne_msg_ptr = self._make_string_constant(_msg)
         self.builder.call(self.runtime["raise"],
                           [ne_exc_id, ne_msg_ptr])
-        if not self._in_try_block:
+        # Only module-level code may declare the exception unhandled here.
+        # Inside a function the *caller* can be in a try block, and calling
+        # exc_unhandled exits the process before its handler ever runs:
+        # `try: f() except NameError:` did not catch the unbound local that
+        # `f` read.  Leaving the exception merely pending lets the ordinary
+        # bail-out checks carry it out of the function.
+        if _at_module_scope and not self._in_try_block:
             self.builder.call(self.runtime["exc_unhandled"], [])
-        # Must terminate the block — branch to ok_block.  In the
-        # non-try case exc_unhandled already exited, so this is
-        # dead code.  In the try case the exception is pending and
-        # the next exc_pending check will catch it.
+        # Must terminate the block — branch to ok_block.  Where
+        # exc_unhandled was emitted this is dead code; otherwise the
+        # exception is pending and the next exc_pending check finds it.
         self.builder.branch(ok_block)
 
         self.builder.position_at_end(ok_block)
@@ -21455,9 +25496,25 @@ class CodeGen:
             alloca, _kind = self._native_vars[name]
             return self.builder.load(alloca, name=name)
         if name not in self.variables:
-            # Fallback: check module-level globals (Python allows reading
-            # globals without explicit `global` declaration).
-            if name in self._global_vars:
+            # A local whose slot the *store* creates, read before that store
+            # was emitted, has no slot yet — so `y = y + 1` inside a function
+            # fell all the way through to the "truly undefined" arm below and
+            # answered NameError, where CPython says UnboundLocalError, and
+            # then called exc_unhandled from inside the callee (killing the
+            # process before the caller's handler could run).  A local shadows
+            # a global of the same name for the *whole* scope, so this has to
+            # come before the _global_vars fallback: a name assigned anywhere
+            # in the function is local even where it is read first.  Give it
+            # the FV slot the analysis already says it needs; the UNDEF
+            # sentinel then reaches _check_fv_undef, which picks the exception
+            # by scope.  BUG-UNBOUND-NATIVE-LOCAL-READS-STACK.
+            if (name in self._scope_maybe_unbound
+                    and self._USE_FV_LOCALS
+                    and not self._current_fn_bare_abi):
+                alloca = self._create_entry_alloca(fpy_val, name)
+                self._entry_store_fv_none(alloca)
+                self.variables[name] = (alloca, ValueType(VKind.MIXED))
+            elif name in self._global_vars:
                 self.variables[name] = self._global_vars[name]
             elif name in self._user_functions:
                 # User function used as a value (e.g., callback = add, or
@@ -21503,6 +25560,7 @@ class CodeGen:
                          "GeneratorExit", "SystemExit",
                          "KeyboardInterrupt", "ArithmeticError",
                          "LookupError", "SyntaxError", "NameError",
+                         "UnboundLocalError",
                          "ModuleNotFoundError", "RecursionError",
                          "BrokenPipeError", "EOFError",
                          "BufferError", "AssertionError"):
@@ -21575,12 +25633,7 @@ class CodeGen:
         # (determined by the variable's current type_tag)
         if isinstance(alloca.type, ir.PointerType) and alloca.type.pointee is fpy_val:
             fv = self.builder.load(alloca, name=f"{name}.fv")
-            # Skip the UNDEF tag check for variables that have been
-            # assigned at least once (outside try blocks).  The check
-            # is an icmp + predicted-not-taken branch per load which
-            # prevents LLVM from optimizing hot loops.
-            if not (name in self._definitely_assigned
-                    and not self._in_try_block):
+            if self._needs_undef_check(name):
                 self._check_fv_undef(fv, name)
             # Unchecked/checked int-mode variables (from unchecked_int() /
             # checked_int() constructors): always unwrap to bare i64.
@@ -22065,6 +26118,13 @@ class CodeGen:
                 and node.value.id in self._user_classes):
             return TypedValue(val, ValueType(VKind.TUPLE,
                                              elem_type=ValueType(VKind.OBJ)))
+        # Native-module container attributes (sys.argv, sys.path → list[str];
+        # sys.version_info → tuple).  Without this, len()/iteration/subscript
+        # over sys.argv fall to the scalar fv_len fallback and misread the
+        # list pointer (returning 1 for a 3-element argv).
+        nm_vtype = self._native_module_attr_vtype(node)
+        if nm_vtype is not None:
+            return TypedValue(val, nm_vtype)
         # Default: infer type
         vtype = self._infer_type_tag(node, val)
         return TypedValue(val, vtype)
@@ -22080,7 +26140,13 @@ class CodeGen:
             # Don't emit code after a terminator (break/continue/return)
             if self.builder.block.is_terminated:
                     break
+            # Model-2 watermark: release owned temporaries produced while
+            # evaluating this statement at the statement boundary. Only temps
+            # created by this statement are flushed (loop iterables registered
+            # by an enclosing construct survive).
+            _rc_mark = len(self._rc_temps)
             self._emit_stmt(stmt)
+            self._flush_rc_temps_to(_rc_mark)
 
     # -----------------------------------------------------------------
     # Control flow
@@ -22144,7 +26210,11 @@ class CodeGen:
 
     def _emit_if(self, node: ast.If) -> None:
         """Emit if/elif/else."""
+        _cond_mark = len(self._rc_temps)
         cond = self._emit_condition(node.test)
+        # Release owned temporaries created while evaluating the condition
+        # before we branch (they must not leak into either arm).
+        self._flush_rc_temps_to(_cond_mark)
         then_block = self._new_block("if.then")
         merge_block = self._new_block("if.end")
 
@@ -22202,18 +26272,22 @@ class CodeGen:
 
         # Condition check
         self.builder.position_at_end(cond_block)
+        _cond_mark = len(self._rc_temps)
         cond = self._emit_condition(node.test)
+        # Flush condition temps each iteration (cond_block is re-entered every
+        # loop pass), so they don't accumulate across iterations.
+        self._flush_rc_temps_to(_cond_mark)
         after_loop = else_block if else_block else end_block
         self.builder.cbranch(cond, body_block, after_loop)
 
         # Body
         self.builder.position_at_end(body_block)
-        self._loop_stack.append((end_block, cond_block))
+        self._push_loop(end_block, cond_block)
         _prev_hot = self._in_hot_loop
         self._in_hot_loop = True
         self._emit_stmts(node.body)
         self._in_hot_loop = _prev_hot
-        self._loop_stack.pop()
+        self._pop_loop()
         if not self.builder.block.is_terminated:
             self.builder.branch(cond_block)
 
@@ -22271,6 +26345,9 @@ class CodeGen:
             elif vtype.kind == VKind.STR:
                 self._emit_for_string(node)
                 return
+            elif vtype.kind == VKind.BYTES:
+                self._emit_for_bytes(node)
+                return
             elif vtype.kind in (VKind.DICT, VKind.SET, VKind.DEFAULTDICT, VKind.COUNTER):
                 self._emit_for_dict(node)
                 return
@@ -22322,6 +26399,13 @@ class CodeGen:
         # Check for `for ch in string`
         if isinstance(node.iter, ast.Constant) and isinstance(node.iter.value, str):
             self._emit_for_string(node)
+            return
+        # `for b in b"..."` — bytes literal or any expression inferred BYTES
+        if isinstance(node.iter, ast.Constant) and isinstance(node.iter.value, (bytes, bytearray)):
+            self._emit_for_bytes(node)
+            return
+        if self._infer_type_tag(node.iter, None).kind == VKind.BYTES:
+            self._emit_for_bytes(node)
             return
         if self._is_dict_expr(node.iter):
             self._emit_for_dict(node)
@@ -22425,12 +26509,12 @@ class CodeGen:
 
         # Body
         self.builder.position_at_end(body_block)
-        self._loop_stack.append((end_block, incr_block))
+        self._push_loop(end_block, incr_block)
         _prev_hot = self._in_hot_loop
         self._in_hot_loop = True
         self._emit_stmts(node.body)
         self._in_hot_loop = _prev_hot
-        self._loop_stack.pop()
+        self._pop_loop()
         if not self.builder.block.is_terminated:
             self.builder.branch(incr_block)
 
@@ -22450,6 +26534,52 @@ class CodeGen:
                 self.builder.branch(end_block)
 
         self.builder.position_at_end(end_block)
+
+    def _emit_with_exit_unwind(self, mgr_alloca, pyobj_flag) -> None:
+        """Emit `mgr.__exit__(None, None, None)` for a `return` out of a `with`.
+
+        `_emit_with` lowers the block by hand, and the `__exit__` it emits
+        lives in a block that a `return` inside the body branches straight
+        past.  The finally stack is what a `return` consults, so this is what
+        goes on it — the same two-way dispatch as the fall-through path, but
+        with none of its exception plumbing, because a `return` reaching here
+        has already been checked for a pending exception and cannot have one.
+        The result is discarded for the same reason: there is nothing left to
+        suppress.  See BUG-RETURN-IN-WITH-SKIPS-EXIT.
+        """
+        saved_mgr = self.builder.load(mgr_alloca, name="with.mgr.ret")
+        flag = self.builder.load(pyobj_flag)
+        is_pyobj = self.builder.icmp_signed(
+            "!=", flag, ir.Constant(i32, 0))
+        b_pyobj = self._new_block("with.ret.exit.pyobj")
+        b_native = self._new_block("with.ret.exit.native")
+        b_done = self._new_block("with.ret.exit.done")
+        self.builder.cbranch(is_pyobj, b_pyobj, b_native)
+
+        self.builder.position_at_end(b_pyobj)
+        none_tag = ir.Constant(i32, FPY_TAG_NONE)
+        none_data = ir.Constant(i64, 0)
+        exit_method = self.builder.call(
+            self.runtime["cpython_getattr"],
+            [saved_mgr, self._make_string_constant("__exit__")])
+        self.builder.call(
+            self.runtime["cpython_call3"],
+            [exit_method, none_tag, none_data, none_tag, none_data,
+             none_tag, none_data,
+             self._create_entry_alloca(i32, "with.ret.exit.tag"),
+             self._create_entry_alloca(i64, "with.ret.exit.data")])
+        # __exit__ may have printed through CPython's sys.stdout.
+        self.builder.call(self.runtime["cpython_flush"], [])
+        self.builder.branch(b_done)
+
+        self.builder.position_at_end(b_native)
+        self.builder.call(
+            self.runtime["obj_call_method3"],
+            [saved_mgr, self._make_string_constant("__exit__"),
+             ir.Constant(i64, 0), ir.Constant(i64, 0), ir.Constant(i64, 0)])
+        self.builder.branch(b_done)
+
+        self.builder.position_at_end(b_done)
 
     def _emit_with(self, node: ast.With) -> None:
         """Emit `with expr as var: body`.
@@ -22545,33 +26675,43 @@ class CodeGen:
 
                 # Bind `as var` if present
                 if opt_var is not None and isinstance(opt_var, ast.Name):
-                    # Check if __enter__ returns self (common case) by
-                    # analyzing the class's __enter__ method AST.
-                    cls = self._infer_object_class(ctx_expr)
-                    _returns_self = False
-                    if cls:
-                        ci = self._user_classes.get(cls)
-                        if ci and ci.method_asts:
-                            enter_ast = ci.method_asts.get("__enter__")
-                            if enter_ast:
-                                for stmt in ast.walk(enter_ast):
-                                    if (isinstance(stmt, ast.Return)
-                                            and isinstance(stmt.value, ast.Name)
-                                            and stmt.value.id == "self"):
-                                        _returns_self = True
-                                        break
-                    if _returns_self and cls:
+                    # Built-in file object (with open(...) as fh): __enter__
+                    # returns self.  Bind fh as a file var so its method calls
+                    # and iteration dispatch through the file/OBJ paths.
+                    if self._is_file_expr(ctx_expr):
                         val_ptr = self._ensure_ptr(
-                            enter_result, name="with.val")
-                        self._store_variable(opt_var.id, val_ptr, ValueType(VKind.OBJ))
-                        self._obj_var_class[opt_var.id] = cls
+                            enter_result, name="with.file")
+                        self._store_variable(opt_var.id, val_ptr,
+                                             ValueType(VKind.OBJ))
+                        self._file_vars.add(opt_var.id)
                     else:
-                        # __enter__ returns a non-self value (int, str, etc.)
-                        # Use get_ret_tag to determine the actual type
-                        ret_tag = self.builder.call(
-                            self.runtime["get_ret_tag"], [])
-                        fv = self._fv_build_from_slots(ret_tag, enter_result)
-                        self._store_variable(opt_var.id, fv, ValueType(VKind.INT))
+                        # Check if __enter__ returns self (common case) by
+                        # analyzing the class's __enter__ method AST.
+                        cls = self._infer_object_class(ctx_expr)
+                        _returns_self = False
+                        if cls:
+                            ci = self._user_classes.get(cls)
+                            if ci and ci.method_asts:
+                                enter_ast = ci.method_asts.get("__enter__")
+                                if enter_ast:
+                                    for stmt in ast.walk(enter_ast):
+                                        if (isinstance(stmt, ast.Return)
+                                                and isinstance(stmt.value, ast.Name)
+                                                and stmt.value.id == "self"):
+                                            _returns_self = True
+                                            break
+                        if _returns_self and cls:
+                            val_ptr = self._ensure_ptr(
+                                enter_result, name="with.val")
+                            self._store_variable(opt_var.id, val_ptr, ValueType(VKind.OBJ))
+                            self._obj_var_class[opt_var.id] = cls
+                        else:
+                            # __enter__ returns a non-self value (int, str, etc.)
+                            # Use get_ret_tag to determine the actual type
+                            ret_tag = self.builder.call(
+                                self.runtime["get_ret_tag"], [])
+                            fv = self._fv_build_from_slots(ret_tag, enter_result)
+                            self._store_variable(opt_var.id, fv, ValueType(VKind.INT))
 
             # Store mgr pointer for the finally block's __exit__ call.
             # Use a local alloca so it survives across basic blocks.
@@ -22589,11 +26729,14 @@ class CodeGen:
             finally_block = self._new_block("with.finally")
             end_block = self._new_block("with.end")
 
-            # Push finally onto stack (for returns inside the with body)
-            # We'll emit the finally body inline, but also need it for
-            # the _finally_stack so `return` inside with-body triggers it.
-            # Create a dummy finalbody list — we'll emit manually.
-            self._finally_stack.append([])  # placeholder
+            # A `return` inside the body branches past the `with.finally`
+            # block below, so the finally stack — which is what `_emit_return`
+            # consults — carries a callback that emits the `__exit__` call
+            # again at the return site.  It used to carry an empty list, which
+            # emitted nothing and skipped the cleanup entirely.
+            self._finally_stack.append(
+                lambda _m=mgr_alloca, _f=_pyobj_mgr_flag:
+                    self._emit_with_exit_unwind(_m, _f))
 
             # Emit with-body in try context
             saved_in_try = self._in_try_block
@@ -22604,17 +26747,21 @@ class CodeGen:
             for stmt in node.body:
                 if self.builder.block.is_terminated:
                     break
+                # Per-statement watermark flush — see `_emit_try` for why the
+                # flush lands in `cont_block`, not before the pending check.
+                _rc_mark = len(self._rc_temps)
                 self._emit_stmt(stmt)
                 if self.builder.block.is_terminated:
+                    self._flush_rc_temps_to(_rc_mark)  # pops, no decref
                     break
                 # Check for pending exception after each statement
-                pending = self.builder.call(
-                    self.runtime["exc_pending"], [])
+                pending = self._emit_exc_pending()
                 is_exc = self.builder.icmp_signed(
                     "!=", pending, ir.Constant(i32, 0))
                 cont_block = self._new_block("with.cont")
                 self.builder.cbranch(is_exc, finally_block, cont_block)
                 self.builder.position_at_end(cont_block)
+                self._flush_rc_temps_to(_rc_mark)
 
             self._in_try_block = saved_in_try
             self._try_except_target = saved_exc_target
@@ -22655,8 +26802,7 @@ class CodeGen:
             _arg2_tag = self._create_entry_alloca(i32, "exit.a2.tag")
             _arg2_data = self._create_entry_alloca(i64, "exit.a2.data")
             # Check if exception is pending
-            _pend_for_exit = self.builder.call(
-                self.runtime["exc_pending"], [])
+            _pend_for_exit = self._emit_exc_pending()
             _has_exc_for_exit = self.builder.icmp_signed(
                 "!=", _pend_for_exit, ir.Constant(i32, 0))
             _exc_info_block = self._new_block("with.exc_info")
@@ -22687,8 +26833,14 @@ class CodeGen:
             self.builder.store(none_tag, _arg2_tag)
             self.builder.store(none_data, _arg2_data)
             self.builder.branch(_call_exit_block)
-            # Call __exit__(arg1, arg2, None)  — tb is always None
+            # Call __exit__(arg1, arg2, None)  — tb is always None.
+            # The exception (if any) has to be moved aside first: __exit__ is
+            # an ordinary function, and every call in it is followed by a
+            # pending-exception check that would unwind the frame before the
+            # body ran.  The arguments above were read while it was still
+            # pending, which is why the save lands here and not earlier.
             self.builder.position_at_end(_call_exit_block)
+            self.builder.call(self.runtime["exc_save"], [])
             self.builder.call(
                 self.runtime["cpython_call3"],
                 [exit_method,
@@ -22708,45 +26860,52 @@ class CodeGen:
                 self.runtime["fv_truthy"], [_exit_tag_v, _exit_data_v])
             _is_truthy_py = self.builder.icmp_signed(
                 "!=", _exit_truthy_py, ir.Constant(i32, 0))
+            # Truthy → the saved exception is suppressed and discarded;
+            # falsy → it goes back.  Either way the save is balanced here,
+            # and either way anything __exit__ itself raised survives.
             _pyobj_suppress = self._new_block("with.suppress.pyobj")
-            self.builder.cbranch(_is_truthy_py, _pyobj_suppress, after_exit_block)
+            _pyobj_keep = self._new_block("with.keep.pyobj")
+            self.builder.cbranch(_is_truthy_py, _pyobj_suppress, _pyobj_keep)
             self.builder.position_at_end(_pyobj_suppress)
-            _pend_py = self.builder.call(self.runtime["exc_pending"], [])
-            _has_exc_py = self.builder.icmp_signed(
-                "!=", _pend_py, ir.Constant(i32, 0))
-            _do_clear_py = self._new_block("with.clear.pyobj")
-            self.builder.cbranch(_has_exc_py, _do_clear_py, after_exit_block)
-            self.builder.position_at_end(_do_clear_py)
-            self.builder.call(self.runtime["exc_clear"], [])
+            self.builder.call(self.runtime["exc_drop"], [])
+            self.builder.branch(after_exit_block)
+            self.builder.position_at_end(_pyobj_keep)
+            self.builder.call(self.runtime["exc_restore"], [])
             self.builder.branch(after_exit_block)
 
             # Native FpyObj* path: use obj_call_method3
             self.builder.position_at_end(native_exit_block)
             exit_name = self._make_string_constant("__exit__")
             zero = ir.Constant(i64, 0)
+            self.builder.call(self.runtime["exc_save"], [])
             exit_ret = self.builder.call(
                 self.runtime["obj_call_method3"],
                 [saved_mgr, exit_name, zero, zero, zero])
-            # If __exit__ returned truthy and there's a pending exception,
-            # suppress it (clear the exception state).
+            # Truthy __exit__ suppresses the saved exception; otherwise it
+            # goes back.  See the PyObject path above.
             exit_truthy = self.builder.icmp_signed(
                 "!=", exit_ret, ir.Constant(i64, 0))
             _native_suppress = self._new_block("with.suppress.native")
-            self.builder.cbranch(exit_truthy, _native_suppress, after_exit_block)
+            _native_keep = self._new_block("with.keep.native")
+            self.builder.cbranch(exit_truthy, _native_suppress, _native_keep)
             self.builder.position_at_end(_native_suppress)
-            _pend = self.builder.call(self.runtime["exc_pending"], [])
-            _has_exc = self.builder.icmp_signed(
-                "!=", _pend, ir.Constant(i32, 0))
-            _do_clear = self._new_block("with.clear.native")
-            self.builder.cbranch(_has_exc, _do_clear, after_exit_block)
-            self.builder.position_at_end(_do_clear)
-            self.builder.call(self.runtime["exc_clear"], [])
+            self.builder.call(self.runtime["exc_drop"], [])
+            self.builder.branch(after_exit_block)
+            self.builder.position_at_end(_native_keep)
+            self.builder.call(self.runtime["exc_restore"], [])
             self.builder.branch(after_exit_block)
 
             self.builder.position_at_end(after_exit_block)
             self.builder.branch(end_block)
 
             self.builder.position_at_end(end_block)
+            # `end_block` is reached on both paths: the body ran to the end,
+            # or it was cut short and __exit__ declined to suppress and the
+            # exception was put back.  On the second the statement after the
+            # `with` must not run — this is the same check every raising
+            # operation gets, just at the one place where the exception was
+            # invisible while the cleanup was in progress.
+            self._emit_try_bail_if_exc()
 
     def _emit_match(self, node: ast.Match) -> None:
         """Emit match/case statement (Python 3.10+ structural pattern matching).
@@ -23298,6 +27457,7 @@ class CodeGen:
         "GeneratorExit", "SystemExit",
         "KeyboardInterrupt", "ArithmeticError",
         "LookupError", "SyntaxError", "NameError",
+        "UnboundLocalError",
         "ModuleNotFoundError", "RecursionError",
         "BrokenPipeError", "EOFError",
         "BufferError", "AssertionError",
@@ -23360,9 +27520,13 @@ class CodeGen:
                 if not hasattr(self, '_native_modules'):
                     self._native_modules = set()
                 self._native_modules.add(var_name)
-                # Import the REAL module through CPython so bridge fallback works
+                # Import the REAL module through CPython so non-native attribute
+                # fallback works.  Use the *native* import variant: on host it's
+                # the real import; in pure mode it returns a non-raising sentinel
+                # so `import sys` links and runs without a CPython bridge (only
+                # an actual unsupported-attribute access raises).
                 mod_ptr = self.builder.call(
-                    self.runtime["cpython_import"],
+                    self.runtime["cpython_import_native"],
                     [self._make_string_constant(mod_name)])
                 self._store_variable(var_name, mod_ptr, ValueType(VKind.NATIVE_MOD))
                 # For dotted imports (import os.path), also store top-level name
@@ -23371,7 +27535,7 @@ class CodeGen:
                     if top not in self.variables:
                         self._native_modules.add(top)
                         top_ptr = self.builder.call(
-                            self.runtime["cpython_import"],
+                            self.runtime["cpython_import_native"],
                             [self._make_string_constant(top)])
                         self._store_variable(top, top_ptr, ValueType(VKind.NATIVE_MOD))
                 continue
@@ -23457,9 +27621,15 @@ class CodeGen:
                     gv.initializer = ir.Constant(i8_ptr, None)
                     gv.linkage = "private"
                     self._cpython_modules[mod_name] = gv
+                # Bind the real objects for value-use (e.g. `type=Path`).  Use
+                # the *native* import/getattr variants so pure-mode builds bind
+                # a non-raising sentinel instead of hard-failing at import;
+                # native dispatch (len(sys.argv) etc.) never reads these globals,
+                # and an actual value-use of an unsupported name raises cleanly
+                # at the point of use.
                 name_ptr = self._make_string_constant(mod_name)
                 mod_ptr = self.builder.call(
-                    self.runtime["cpython_import"], [name_ptr])
+                    self.runtime["cpython_import_native"], [name_ptr])
                 self.builder.store(mod_ptr, self._cpython_modules[mod_name])
                 for alias in node.names:
                     attr_name = alias.name
@@ -23474,7 +27644,7 @@ class CodeGen:
                             gvar, ValueType(VKind.PYOBJ))
                     attr_ptr = self._make_string_constant(attr_name)
                     pyobj = self.builder.call(
-                        self.runtime["cpython_getattr"],
+                        self.runtime["cpython_getattr_native"],
                         [mod_ptr, attr_ptr])
                     self.builder.store(
                         pyobj, self._global_vars[var_name][0])
@@ -23590,6 +27760,7 @@ class CodeGen:
         For the common case of single-type groups, this is semantically
         equivalent to CPython's behavior."""
         # TryStar has the same structure as Try: body, handlers, orelse, finalbody
+        _outer_saved_exc = self._push_saved_exc_slots()
         has_except = bool(node.handlers)
         has_finally = bool(node.finalbody)
 
@@ -23609,14 +27780,19 @@ class CodeGen:
         for stmt in node.body:
             if self.builder.block.is_terminated:
                 break
+            # Per-statement watermark flush — see `_emit_try` for why the flush
+            # lands in `cont_block` rather than before the pending check.
+            _rc_mark = len(self._rc_temps)
             self._emit_stmt(stmt)
             if self.builder.block.is_terminated:
+                self._flush_rc_temps_to(_rc_mark)  # terminated: pops, no decref
                 break
-            pending = self.builder.call(self.runtime["exc_pending"], [])
+            pending = self._emit_exc_pending()
             is_exc = self.builder.icmp_signed("!=", pending, ir.Constant(i32, 0))
             cont_block = self._new_block("trystar.cont")
             self.builder.cbranch(is_exc, exc_target, cont_block)
             self.builder.position_at_end(cont_block)
+            self._flush_rc_temps_to(_rc_mark)
 
         self._in_try_block = saved_in_try
         self._try_except_target = saved_exc_target
@@ -23637,6 +27813,7 @@ class CodeGen:
             saved_exc_msg_alloca = self._create_entry_alloca(i8_ptr, "saved.exc.msg")
             self.builder.store(exc_type, saved_exc_type_alloca)
             saved_msg = self.builder.call(self.runtime["exc_get_msg"], [])
+            self._retain_exc_msg_slot(saved_exc_msg_alloca, saved_msg)
             self.builder.store(saved_msg, saved_exc_msg_alloca)
             self._saved_exc_type = saved_exc_type_alloca
             self._saved_exc_msg = saved_exc_msg_alloca
@@ -23742,11 +27919,20 @@ class CodeGen:
 
         if has_finally:
             self.builder.position_at_end(finally_block)
+            # Same reasoning as the `try` finally — see _emit_try.
+            self.builder.call(self.runtime["exc_save"], [])
+            self._finally_exc_depth += 1
             self._emit_stmts(node.finalbody)
+            self._finally_exc_depth -= 1
             if not self.builder.block.is_terminated:
+                self.builder.call(self.runtime["exc_restore"], [])
                 self.builder.branch(end_block)
 
+        self._pop_saved_exc_slots(_outer_saved_exc)
         self.builder.position_at_end(end_block)
+        if has_finally:
+            # See _emit_try: the restore makes the exception visible again.
+            self._emit_try_bail_if_exc()
 
     # ── Optimization analysis recording ─────────────────────────────────
 
@@ -24332,6 +28518,7 @@ class CodeGen:
 
     def _emit_try(self, node: ast.Try) -> None:
         """Emit try/except/finally using flag-based exception checking."""
+        _outer_saved_exc = self._push_saved_exc_slots()
         has_except = bool(node.handlers)
         has_finally = bool(node.finalbody)
 
@@ -24352,16 +28539,28 @@ class CodeGen:
         for stmt in node.body:
             if self.builder.block.is_terminated:
                 break
+            # Per-statement watermark flush, exactly as `_emit_stmts` does.
+            # Without it the whole try body's temps accumulate and are released
+            # in a block that does not dominate their definitions —
+            # BUG-DECREF-DOES-NOT-DOMINATE facet (c).
+            _rc_mark = len(self._rc_temps)
             self._emit_stmt(stmt)
             if self.builder.block.is_terminated:
+                self._flush_rc_temps_to(_rc_mark)  # terminated: pops, no decref
                 break
             # Check for pending exception after each statement
-            pending = self.builder.call(self.runtime["exc_pending"], [])
+            pending = self._emit_exc_pending()
             is_exc = self.builder.icmp_signed("!=", pending, ir.Constant(i32, 0))
             cont_block = self._new_block("try.cont")
             exc_target = except_block if except_block else (finally_block if finally_block else end_block)
             self.builder.cbranch(is_exc, exc_target, cont_block)
             self.builder.position_at_end(cont_block)
+            # Flush in `cont_block`, i.e. on the *no-exception* path only. On
+            # the raising path a partially-executed statement may have left a
+            # registered temp holding an undefined value, and decref'ing that
+            # is a UAF; leaking it is the safe direction (see the owned/borrowed
+            # asymmetry note in design.md).
+            self._flush_rc_temps_to(_rc_mark)
 
         self._in_try_block = saved_in_try
         self._try_except_target = saved_exc_target
@@ -24390,6 +28589,7 @@ class CodeGen:
             saved_exc_class_alloca = self._create_entry_alloca(i8_ptr, "saved.exc.class")
             self.builder.store(exc_type, saved_exc_type_alloca)
             saved_msg = self.builder.call(self.runtime["exc_get_msg"], [])
+            self._retain_exc_msg_slot(saved_exc_msg_alloca, saved_msg)
             self.builder.store(saved_msg, saved_exc_msg_alloca)
             saved_class = self.builder.call(self.runtime["exc_get_class_name"], [])
             self.builder.store(saved_class, saved_exc_class_alloca)
@@ -24415,63 +28615,27 @@ class CodeGen:
                     next_handler = self._new_block("except.next")
 
                     if isinstance(handler.type, ast.Name):
-                        handler_type_name = handler.type.id
-                        exc_name = self._make_string_constant(handler_type_name)
-                        expected_id = self.builder.call(
-                            self.runtime["exc_name_to_id"], [exc_name])
-                        # "Exception"/"BaseException" catch everything
-                        if handler_type_name in ("Exception", "BaseException"):
-                            matches = ir.Constant(ir.IntType(1), 1)
-                        else:
-                            # FPY_EXC_GENERIC = 99 in the runtime
-                            _EXC_GENERIC = ir.Constant(i32, 99)
-                            is_generic = self.builder.icmp_signed(
-                                "==", exc_type, _EXC_GENERIC)
-                            handler_is_generic = self.builder.icmp_signed(
-                                "==", expected_id, _EXC_GENERIC)
-                            both_generic = self.builder.and_(
-                                is_generic, handler_is_generic)
-                            # For user-defined exceptions: match via class hierarchy
-                            raised_name = self.builder.call(
-                                self.runtime["exc_get_class_name"], [])
-                            class_match = self.builder.call(
-                                self.runtime["exc_class_matches"],
-                                [raised_name, exc_name])
-                            class_match_bool = self.builder.icmp_signed(
-                                "!=", class_match, ir.Constant(i32, 0))
-                            hierarchy_match = self.builder.and_(
-                                both_generic, class_match_bool)
-                            # For builtin exceptions: match via ID
-                            builtin_match = self.builder.and_(
-                                self.builder.not_(is_generic),
-                                self.builder.icmp_signed("==", exc_type, expected_id))
-                            matches = self.builder.or_(
-                                builtin_match, hierarchy_match)
+                        matches = self._emit_exc_handler_matches(
+                            exc_type, handler.type.id)
                         self.builder.cbranch(matches, handler_block, next_handler)
                     elif isinstance(handler.type, ast.Tuple):
                         # except (TypeError, ValueError): — OR chain of type checks
                         any_match = ir.Constant(ir.IntType(1), 0)
                         for elt in handler.type.elts:
                             if isinstance(elt, ast.Name):
-                                elt_name = self._make_string_constant(elt.id)
-                                elt_id = self.builder.call(
-                                    self.runtime["exc_name_to_id"], [elt_name])
-                                elt_match = self.builder.icmp_signed(
-                                    "==", exc_type, elt_id)
-                                any_match = self.builder.or_(any_match, elt_match)
+                                any_match = self.builder.or_(
+                                    any_match,
+                                    self._emit_exc_handler_matches(
+                                        exc_type, elt.id))
                             elif isinstance(elt, ast.Attribute):
-                                elt_name = self._make_string_constant(elt.attr)
-                                elt_id = self.builder.call(
-                                    self.runtime["exc_name_to_id"], [elt_name])
-                                elt_match = self.builder.icmp_signed(
-                                    "==", exc_type, elt_id)
-                                any_match = self.builder.or_(any_match, elt_match)
+                                any_match = self.builder.or_(
+                                    any_match,
+                                    self._emit_exc_handler_matches(
+                                        exc_type, elt.attr))
                         self.builder.cbranch(any_match, handler_block, next_handler)
                     elif isinstance(handler.type, ast.Attribute):
-                        exc_name = self._make_string_constant(handler.type.attr)
-                        expected_id = self.builder.call(
-                            self.runtime["exc_name_to_id"], [exc_name])
-                        matches = self.builder.icmp_signed("==", exc_type, expected_id)
+                        matches = self._emit_exc_handler_matches(
+                            exc_type, handler.type.attr)
                         self.builder.cbranch(matches, handler_block, next_handler)
                     else:
                         self.builder.branch(handler_block)
@@ -24549,14 +28713,31 @@ class CodeGen:
         if has_finally:
             self._finally_stack.pop()
 
-        # Finally block
+        # Finally block.  The body runs on the exception path too, so the
+        # exception is moved aside for its duration — otherwise the first
+        # call in it unwinds the frame instead of doing the cleanup.  A
+        # `return` inside the body never reaches the restore, which is
+        # right: in Python a `return` in `finally` discards the exception,
+        # and `_emit_return` drops the saved frame for exactly that reason.
         if has_finally:
             self.builder.position_at_end(finally_block)
+            self.builder.call(self.runtime["exc_save"], [])
+            self._finally_exc_depth += 1
             self._emit_stmts(node.finalbody)
+            self._finally_exc_depth -= 1
             if not self.builder.block.is_terminated:
+                self.builder.call(self.runtime["exc_restore"], [])
                 self.builder.branch(end_block)
 
+        self._pop_saved_exc_slots(_outer_saved_exc)
         self.builder.position_at_end(end_block)
+        if has_finally:
+            # The finally body put the exception back (or a handler re-raised
+            # through it).  Whatever follows the `try` must not run on that
+            # path — while the cleanup was in progress the exception was
+            # deliberately invisible, so this is where it becomes visible
+            # again and has to be acted on.
+            self._emit_try_bail_if_exc()
 
     def _emit_raise(self, node: ast.Raise) -> None:
         """Emit raise ExcType('msg'). Sets the exception flag; caller checks it."""
@@ -24581,6 +28762,14 @@ class CodeGen:
             exc_name = node.exc.func.id
             name_ptr = self._make_string_constant(exc_name)
             exc_id = self.builder.call(self.runtime["exc_name_to_id"], [name_ptr])
+            # Temps built for the message have to be released *here*, right
+            # after the raise, not at the statement boundary: that flush is
+            # emitted in the no-exception continuation block, which a raise
+            # never reaches, so `raise ValueError("m" * n)` in a loop leaked
+            # the whole message every iteration.  Releasing is safe because
+            # fastpy_raise copies the message into the exception slot's own
+            # refcounted string.  BUG-RAISE-MESSAGE-TEMP-LEAKS.
+            _rc_mark = len(self._rc_temps)
 
             # ExceptionGroup("g", [ValueError("a"), ...]) — store inner types
             if exc_name == "ExceptionGroup" and len(node.exc.args) >= 2:
@@ -24677,8 +28866,8 @@ class CodeGen:
                     # Standard exception or user-class without __init__
                     if node.exc.args:
                         msg = self._emit_expr_value(node.exc.args[0])
-                        if not isinstance(msg.type, ir.PointerType):
-                            msg = self._value_to_str(msg, node)
+                        msg = self._exc_arg_to_message(
+                            msg, node.exc.args[0], exc_name, node)
                     else:
                         msg = self._make_string_constant("")
                     self.builder.call(self.runtime["raise"], [exc_id, msg])
@@ -24688,6 +28877,7 @@ class CodeGen:
                 # to the exception struct. This avoids silently ignoring it.
                 if node.cause is not None:
                     self._emit_expr_value(node.cause)
+            self._flush_rc_temps_to(_rc_mark)
             # If we're inside a try block, the exception check after this
             # statement will catch it. If not, early-return so the caller
             # can check the exception flag.
@@ -24765,6 +28955,15 @@ class CodeGen:
         try-with-finally blocks), emit them in LIFO order before the
         actual return.
         """
+        # A `return` written *inside* a finally body leaves without passing
+        # the restore that body's exit would have run, so the frames that
+        # `fastpy_exc_save` pushed have to be dropped here.  Dropping is also
+        # the semantics: `return` in a `finally` discards the exception it
+        # interrupted.  Emitted before the return expression, so a raise in
+        # that expression is the exception that propagates.
+        for _ in range(self._finally_exc_depth):
+            self.builder.call(self.runtime["exc_drop"], [])
+
         # Evaluate the return value first (side effects happen before finally).
         # When the function returns FpyValue, use _load_or_wrap_fv so that
         # dict subscripts, list subscripts, and FV-backed variables preserve
@@ -24794,6 +28993,8 @@ class CodeGen:
                         if (isinstance(alloca.type, ir.PointerType)
                                 and alloca.type.pointee is fpy_val):
                             value = self.builder.load(alloca, name=f"{node.value.id}.retfv")
+                            if self._needs_undef_check(node.value.id):
+                                self._check_fv_undef(value, node.value.id)
                         else:
                             bare = self._emit_expr_value(node.value)
                             if isinstance(bare.type, ir.IntType):
@@ -24806,11 +29007,23 @@ class CodeGen:
                         if isinstance(bare.type, ir.DoubleType):
                             value = self._fv_from_float(bare)
                         elif isinstance(bare.type, ir.IntType):
+                            # `return True` and `return x > 0` are bools, and
+                            # this path used to tag every integer INT — so a
+                            # function returning a bool on one path and a float
+                            # on another printed `1` where CPython prints
+                            # `True`.  BUG-MIXED-SCALAR-RETURN-TAG.
+                            _bool_ret = (bare.type.width == 1
+                                         or self._expr_is_bool_ast(node.value))
                             if bare.type.width == 1 or bare.type.width == 32:
                                 bare = self.builder.zext(bare, i64)
+                            # A bool is checked first: `_is_float_expr` answers
+                            # yes for `x > 5` when x is float-typed, but a
+                            # comparison is a bool whatever it compares.
+                            if _bool_ret:
+                                value = self._wrap_bare_to_fv(bare, "bool")
                             # Check if this expression is KNOWN to be float
                             # (e.g. division, float literal, float binop).
-                            if self._is_float_expr(node.value):
+                            elif self._is_float_expr(node.value):
                                 bare = self.builder.sitofp(bare, double)
                                 value = self._fv_from_float(bare)
                             else:
@@ -24859,7 +29072,7 @@ class CodeGen:
         if self._in_try_block and node.value is not None:
             exc_target = getattr(self, '_try_except_target', None)
             if exc_target is not None:
-                pending = self.builder.call(self.runtime["exc_pending"], [])
+                pending = self._emit_exc_pending()
                 is_exc = self.builder.icmp_signed(
                     "!=", pending, ir.Constant(i32, 0))
                 no_exc_block = self._new_block("ret.noexc")
@@ -24868,14 +29081,10 @@ class CodeGen:
 
         # Emit enclosing finally bodies in LIFO order. Take a snapshot to
         # avoid re-entrance if a finally body itself has a try-finally.
-        if self._finally_stack:
-            for finalbody in reversed(self._finally_stack):
-                saved_stack = self._finally_stack
-                self._finally_stack = []
-                self._emit_stmts(finalbody)
-                self._finally_stack = saved_stack
-                if self.builder.block.is_terminated:
-                    return  # finally block unconditionally terminated
+        # A `return` leaves every one of them, so the bound is zero.  (An
+        # entry is a statement list or, for a `with`, a callback.)
+        if self._emit_loop_exit_cleanups(0):
+            return  # a finally body unconditionally terminated
 
         # Pop shadow stack before returning (skip for bare-ABI — no frame pushed)
         if not self._current_fn_bare_abi:
@@ -25180,15 +29389,270 @@ class CodeGen:
                                           [ir.Constant(i32, tag)])
                 self.builder.ret(value)
 
-    def _flush_rc_temps(self) -> None:
-        """Decref any temporary values created during expression evaluation.
-        Called at statement boundaries to free temporaries that weren't
-        stored in variables (e.g., intermediate strings from concat)."""
-        if not self._USE_REFCOUNT or not self._rc_temps:
+    def _push_saved_exc_slots(self) -> tuple:
+        """Remember which try statement a bare `raise` currently belongs to.
+
+        `_saved_exc_type` / `_saved_exc_msg` / `_saved_exc_class` name the
+        allocas holding the exception a bare `raise` re-raises. Each try
+        statement overwrites them while emitting its handlers, and they were
+        never put back — so a nested try *inside* a handler left its own
+        exception in place and the outer handler's `raise` re-raised the inner
+        one:
+
+            try: raise ValueError("outer")
+            except ValueError:
+                try: raise KeyError("inner")
+                except KeyError: pass
+                raise            # re-raised KeyError('inner')
+
+        The pair of calls restores the enclosing statement's slots when a
+        nested try finishes emitting. Emission order makes the `try` body
+        itself correct for free: the body is emitted before the handlers, so a
+        bare `raise` there still sees the enclosing handler's slots — which is
+        what Python does, since the body of a nested try is still running
+        inside the outer handler. BUG-BARE-RAISE-TAKES-INNERMOST-HANDLER.
+        """
+        return (getattr(self, '_saved_exc_type', None),
+                getattr(self, '_saved_exc_msg', None),
+                getattr(self, '_saved_exc_class', None))
+
+    def _pop_saved_exc_slots(self, saved: tuple) -> None:
+        """Restore the slots a nested try statement displaced."""
+        (self._saved_exc_type, self._saved_exc_msg,
+         self._saved_exc_class) = saved
+
+    def _retain_exc_msg_slot(self, alloca: ir.AllocaInstr,
+                             msg: ir.Value) -> None:
+        """Make a `saved.exc.msg` slot own the message it is about to hold.
+
+        The runtime publishes each exception message as a refcounted string and
+        releases it on the *next* raise (and on exc_clear), so a slot that
+        outlives either — this one does: it backs a bare `raise` and the
+        except* binding, both of which run after the handler's exc_clear and
+        possibly after a nested raise — has to take a reference of its own.
+        Without it the message a re-raise reads is freed memory.
+
+        Going through _retain_native_store rather than emitting a bare incref
+        gets the rest of the bookkeeping for free: the entry-block zero-init,
+        the release of the previous iteration's message when a try runs inside
+        a loop, and the release at every function exit. The slot gets a
+        synthetic, per-statement name because that registry is keyed by name
+        and two try statements in one function must not share an entry.
+        BUG-EXC-MSG-BUFFER-ALIASES-ACROSS-RAISES.
+        """
+        self._exc_msg_slot_n = getattr(self, "_exc_msg_slot_n", 0) + 1
+        self._retain_native_store(f"__exc.saved.msg.{self._exc_msg_slot_n}",
+                                  alloca, msg, ValueType(VKind.STR))
+
+    def _register_owned_temp(self, tag_val, data_val) -> None:
+        """Register an owned (+1) temporary produced during expression
+        evaluation so it can be released at the next statement/expression
+        boundary. Part of the Model-2 (borrowed-at-boundary) refcount model:
+        owned producers register their result, all consumers uniformly incref
+        to retain, and the +1 registered here is released by a watermark flush.
+        """
+        if not self._USE_REFCOUNT:
             return
-        for tag_val, data_val in self._rc_temps:
+        self._rc_temps.append((tag_val, data_val))
+
+    def _register_owned_str_ptr(self, result) -> ir.Value:
+        """Register a runtime-call result that is a freshly-allocated, owned
+        (+1) FpyString as a Model-2 owned temp, so it is released at the next
+        statement/expression boundary. No-op unless refcounting is on, the
+        result is a pointer, and the current block isn't terminated. Returns
+        `result` unchanged for call-site convenience."""
+        if (result is not None and self._USE_REFCOUNT
+                and isinstance(result, ir.Value)
+                and isinstance(result.type, ir.PointerType)
+                and self.builder is not None and self.builder.block is not None
+                and not self.builder.block.is_terminated):
+            data = self.builder.ptrtoint(result, i64)
+            self._register_owned_temp(ir.Constant(i32, FPY_TAG_STR), data)
+        return result
+
+    # Built-in calls that produce a string. Their result is registered as an
+    # owned temp (Model 2) via _register_owned_str_ptr where the runtime
+    # producer is unconditionally owned. This name set is ALSO used to EXCLUDE
+    # them from the attribute-store Call `_steal` (a registered temp that a
+    # slot steals would be freed by the boundary flush while the slot still
+    # holds it → UAF). The exclusion set is a deliberate SUPERSET of the
+    # actually-registered cases: excluding one we didn't register only turns a
+    # steal into a retain (incref) — at worst a leak, never a UAF.
+    _STR_PRODUCING_BUILTINS = frozenset({"str", "repr", "hex", "oct", "bin", "chr"})
+
+    # Tags with no heap allocation — storing/overwriting one needs no
+    # refcounting on the NEW value. Used to gate the no-refcount inline
+    # list/attr store fast paths: a heap-tagged value (str/list/dict/obj)
+    # must go through the refcounting runtime setter even when the container
+    # is (mis)inferred as scalar-element (see BUG-LIST-ELEM-STR-TAG-LOST).
+    _SCALAR_TAGS_CLS = frozenset({FPY_TAG_INT, FPY_TAG_FLOAT,
+                                  FPY_TAG_BOOL, FPY_TAG_NONE})
+
+    def _call_arg0_is_static_scalar(self, node) -> bool:
+        """True when a 1-arg call's argument is statically a scalar (int/
+        float/bool). For str()/repr() such an argument routes through
+        fastpy_fv_str's fresh-buffer (owned) branch — never the borrowed
+        `return (const char*)data` STR passthrough nor the runtime-conditional
+        OBJ→obj_to_str path (whose user __str__ may return a borrowed attr).
+        Conservative: anything not provably scalar returns False (→ not
+        registered → at worst a leak, never a UAF)."""
+        if (not isinstance(node, ast.Call) or len(node.args) != 1
+                or node.keywords):
+            return False
+        return self._expr_is_static_scalar(node.args[0])
+
+    def _expr_is_static_scalar(self, arg) -> bool:
+        """True when `arg` is statically an int/float/bool. Such a value routes
+        through fastpy_fv_str's fresh-buffer (owned) branch — never the borrowed
+        STR passthrough nor the runtime-conditional OBJ→obj_to_str path.
+        Conservative: anything not provably scalar returns False (→ not
+        registered → at worst a leak, never a UAF)."""
+        if isinstance(arg, ast.Name):
+            return self._var_kind(arg.id) in (VKind.INT, VKind.FLOAT, VKind.BOOL)
+        if self._is_float_expr(arg):
+            return True
+        return self._infer_expr_kind(arg) in (VKind.INT, VKind.FLOAT, VKind.BOOL)
+
+    def _owned_str_concat(self, args) -> ir.Value:
+        """Emit a str_concat call and register its (freshly-allocated, +1)
+        result as an owned temp so it is released at the statement boundary.
+        Used by the statically-typed str+str concat producers in _emit_binop.
+        Every fastpy_str_concat call allocates a new FpyString (verified in
+        runtime.c — no borrowed-operand shortcut), so the result is always
+        owned. Registering here (at the producer) is robust: it does not
+        depend on re-inferring the result type at the consumer."""
+        r = self._rt_call("str_concat", args)
+        if (self._USE_REFCOUNT and self.builder is not None
+                and self.builder.block is not None
+                and not self.builder.block.is_terminated):
+            rp = self._ensure_ptr(r)
+            data = self.builder.ptrtoint(rp, i64)
+            self._register_owned_temp(ir.Constant(i32, FPY_TAG_STR), data)
+        return r
+
+    def _owned_str_repeat(self, args) -> ir.Value:
+        """Emit a str_repeat call and register its (+1) result as an owned temp.
+
+        fastpy_str_repeat always allocates — even `s * 0` returns a fresh empty
+        buffer — so like str_concat its result is unconditionally owned. It was
+        the one statically-typed str producer nobody registered, which made
+        `s = "m" * 350` in a loop leak the whole 350 bytes every iteration
+        (500k iterations reached a 187 MB working set).
+        BUG-STR-REPEAT-RESULT-LEAKS."""
+        return self._register_owned_str_ptr(
+            self._ensure_ptr(self._rt_call("str_repeat", args)))
+
+    def _owned_bytes_result(self, fn_name, args) -> ir.Value:
+        """Emit a bytes-producing runtime call (bytes_concat/bytes_repeat) and
+        register its freshly-allocated, +1 owned FpyBytes as a Model-2 owned
+        temp (tag FPY_TAG_BYTES) so it is released at the statement boundary.
+        fpy_rc_incref/decref handle FPY_TAG_BYTES (via fpy_bytes_incref/decref
+        on the FpyBytes header), so retaining consumers incref and the boundary
+        flush frees the +1. Bytes are pure-refcount (not GC-tracked), so
+        without this the result would be a genuine leak."""
+        r = self._rt_call(fn_name, args)
+        if (self._USE_REFCOUNT and self.builder is not None
+                and self.builder.block is not None
+                and not self.builder.block.is_terminated):
+            rp = self._ensure_ptr(r)
+            data = self.builder.ptrtoint(rp, i64)
+            self._register_owned_temp(ir.Constant(i32, FPY_TAG_BYTES), data)
+        return r
+
+    def _flush_rc_temps_to(self, mark: int) -> None:
+        """Release every owned temp registered since `mark`, popping the list
+        back down to `mark`. Emits `rc_decref` for each temp ONLY when the
+        current block is not terminated — if the block already ended (return/
+        break/continue), we merely truncate the list without emitting decrefs.
+        This makes early-exit statements auto-safe: a returned temp's +1
+        transfers to the caller (or leaks exactly as before), never a UAF.
+
+        The watermark form is essential inside loops: the for-iterable temp
+        is registered before the loop body and must survive every iteration,
+        so body/condition flushes only pop temps created *after* the mark."""
+        if not self._USE_REFCOUNT:
+            return
+        n = len(self._rc_temps)
+        if n <= mark:
+            return
+        terminated = (self.builder is None or self.builder.block is None
+                      or self.builder.block.is_terminated)
+        if not terminated:
+            for tag_val, data_val in self._rc_temps[mark:]:
+                self.builder.call(self.runtime["rc_decref"], [tag_val, data_val])
+        del self._rc_temps[mark:]
+
+    def _flush_rc_temps(self) -> None:
+        """Decref every registered temporary (flush to 0). Statement-boundary
+        helper retained for callers that want a full flush."""
+        self._flush_rc_temps_to(0)
+
+    def _release_rc_temps_since(self, mark: int) -> None:
+        """Emit `rc_decref` for every temp registered since `mark` WITHOUT
+        popping them from the pending list.
+
+        For a fork into mutually exclusive paths (a comprehension filter's
+        skip-vs-keep arms): the temps created before the fork must be released
+        on *whichever* path runs, so each path emits its own release and the
+        pending list stays intact for the sibling. The definitions dominate
+        both arms — the fork's block is their only predecessor — so this is
+        valid IR. See BUG-DECREF-DOES-NOT-DOMINATE."""
+        if not self._USE_REFCOUNT:
+            return
+        if len(self._rc_temps) <= mark:
+            return
+        if (self.builder is None or self.builder.block is None
+                or self.builder.block.is_terminated):
+            return
+        for tag_val, data_val in self._rc_temps[mark:]:
             self.builder.call(self.runtime["rc_decref"], [tag_val, data_val])
-        self._rc_temps.clear()
+
+    def _capture_arm_rc_temps(self, mark: int) -> list:
+        """Pop and return every owned temp registered since `mark`.
+
+        A conditional *expression* arm (an if-expression branch, an `and`/`or`
+        short-circuit tail) is emitted into its own basic block, but the
+        enclosing statement's flush happens later, in the merge block — which
+        the arm does NOT dominate.  Emitting the arm's `rc_decref` there is
+        invalid IR ("Instruction does not dominate all uses"), so the arm's
+        temps are lifted out of the pending list here and re-registered in the
+        merge block by _rejoin_arm_rc_temps().  Call this while the builder is
+        still positioned in the arm.  See BUG-DECREF-DOES-NOT-DOMINATE."""
+        if not self._USE_REFCOUNT:
+            return []
+        temps = self._rc_temps[mark:]
+        del self._rc_temps[mark:]
+        return temps
+
+    def _rejoin_arm_rc_temps(self, arms: list) -> None:
+        """Re-register conditional-arm owned temps in the current merge block.
+
+        `arms` is a list of (pred_block, temps) pairs: the block that branched
+        into the merge point, and the temps captured from it by
+        _capture_arm_rc_temps().  Each temp is rebuilt as a pair of phis whose
+        incoming value from every *other* predecessor is 0.  fpy_rc_decref
+        treats data == 0 as a no-op, so the merged temp releases exactly the
+        arm that actually executed, and the release is now emitted on a value
+        that dominates its use.  The +1 itself is untouched — Model-2 semantics
+        are preserved, the release is merely relocated to the merge point.
+
+        Must be called with the builder at the TOP of the merge block, before
+        any non-phi instruction is emitted there."""
+        if not self._USE_REFCOUNT:
+            return
+        if not any(temps for _blk, temps in arms):
+            return
+        zero32 = ir.Constant(i32, 0)
+        zero64 = ir.Constant(i64, 0)
+        for owner, temps in arms:
+            for tag_val, data_val in temps:
+                tag_phi = self.builder.phi(i32, "rc.arm.tag")
+                data_phi = self.builder.phi(i64, "rc.arm.data")
+                for blk, _t in arms:
+                    own = blk is owner
+                    tag_phi.add_incoming(tag_val if own else zero32, blk)
+                    data_phi.add_incoming(data_val if own else zero64, blk)
+                self._register_owned_temp(tag_phi, data_phi)
 
     def _emit_scope_decref(self, exclude_var: str | None = None) -> None:
         """Emit decref for all FV-local variables in the current scope.
@@ -25223,6 +29687,26 @@ class CodeGen:
             fv_tag = self.builder.extract_value(fv, 0)
             fv_data = self.builder.extract_value(fv, 1)
             self.builder.call(self.runtime["rc_decref"], [fv_tag, fv_data])
+
+        # Native (non-FpyValue) slots that _retain_native_store made owning.
+        # The loop above skips them because their alloca isn't an fpy_val, so
+        # without this they would retain-on-store and never release.
+        for var_name, (alloca, fpy_tag) in self._rc_native_slots_for_fn().items():
+            if fpy_tag is None:
+                continue  # tracked, but currently holds no reference
+            if var_name == exclude_var:
+                continue
+            if var_name in param_names:
+                continue  # borrowed reference from caller
+            if var_name in self._global_vars:
+                continue  # globals outlive the function
+            # If the name has since been rebound to a different alloca, the
+            # registry entry is stale — the live binding is what self.variables
+            # says, and it was released when it was rebound.
+            cur = self.variables.get(var_name)
+            if cur is None or cur[0] is not alloca:
+                continue
+            self._release_native_slot(var_name, alloca, fpy_tag)
 
     def _infer_ret_tag_for_value(self, value: ir.Value,
                                   node: ast.expr) -> int:
@@ -25480,7 +29964,7 @@ class CodeGen:
         # Call __next__() — StopIteration signals end
         result = self.builder.call(
             self.runtime["obj_call_method0"], [iter_ptr, next_name_ptr])
-        pending = self.builder.call(self.runtime["exc_pending"], [])
+        pending = self._emit_exc_pending()
         has_exc = self.builder.icmp_signed(
             "!=", pending, ir.Constant(i32, 0))
         after_loop = else_block if else_block else end_block
@@ -25506,12 +29990,12 @@ class CodeGen:
         new_cnt = self.builder.add(cnt, ir.Constant(i64, 1))
         self._store_variable(cnt_name, new_cnt, ValueType(VKind.INT))
 
-        self._loop_stack.append((end_block, cond_block))
+        self._push_loop(end_block, cond_block)
         _prev_hot = self._in_hot_loop
         self._in_hot_loop = True
         self._emit_stmts(node.body)
         self._in_hot_loop = _prev_hot
-        self._loop_stack.pop()
+        self._pop_loop()
         if not self.builder.block.is_terminated:
             self.builder.branch(cond_block)
 
@@ -25624,12 +30108,12 @@ class CodeGen:
             inner_list = self._list_get_as_bare(lst_ptr, idx, "list")
             self._unpack_targets_from_list(val_target.elts, inner_list, node)
 
-        self._loop_stack.append((end_block, incr_block))
+        self._push_loop(end_block, incr_block)
         _prev_hot = self._in_hot_loop
         self._in_hot_loop = True
         self._emit_stmts(node.body)
         self._in_hot_loop = _prev_hot
-        self._loop_stack.pop()
+        self._pop_loop()
         if not self.builder.block.is_terminated:
             self.builder.branch(incr_block)
 
@@ -25776,12 +30260,12 @@ class CodeGen:
                 else:
                     self._bridge_fallback_stmt(node, "unsupported for tuple unpack target")
 
-        self._loop_stack.append((end_block, incr_block))
+        self._push_loop(end_block, incr_block)
         _prev_hot = self._in_hot_loop
         self._in_hot_loop = True
         self._emit_stmts(node.body)
         self._in_hot_loop = _prev_hot
-        self._loop_stack.pop()
+        self._pop_loop()
         if not self.builder.block.is_terminated:
             self.builder.branch(incr_block)
 
@@ -25827,12 +30311,12 @@ class CodeGen:
         ch = self._rt_call("str_index", [str_val, idx])
         self._store_variable(var_name, ch, ValueType(VKind.STR))
 
-        self._loop_stack.append((end_block, incr_block))
+        self._push_loop(end_block, incr_block)
         _prev_hot = self._in_hot_loop
         self._in_hot_loop = True
         self._emit_stmts(node.body)
         self._in_hot_loop = _prev_hot
-        self._loop_stack.pop()
+        self._pop_loop()
         if not self.builder.block.is_terminated:
             self.builder.branch(incr_block)
 
@@ -25850,6 +30334,63 @@ class CodeGen:
         if not _is_named_var and self._USE_REFCOUNT:
             _tag = ir.Constant(i32, FPY_TAG_STR)
             _data = self.builder.ptrtoint(str_val, i64)
+            self.builder.call(self.runtime["rc_decref"], [_tag, _data])
+
+    def _emit_for_bytes(self, node: ast.For) -> None:
+        """Emit `for b in bytes_obj`: iterate yielding int byte values.
+
+        Mirrors _emit_for_string but uses the length-aware bytes helpers
+        (fastpy_bytes_len / fastpy_bytes_get) so embedded null bytes are
+        handled, and binds the loop variable as an INT (0..255) — Python
+        iterates bytes as ints, not 1-length bytes objects.
+        """
+        var_name = node.target.id
+        b_tv = self._emit_expr(node.iter)
+        b_val = b_tv.as_ptr(self.builder)
+        b_len = self._rt_call("bytes_len", [b_val])
+
+        idx_name = f"__idx_bytes_{var_name}"
+        self._store_variable(idx_name, ir.Constant(i64, 0), ValueType(VKind.INT))
+
+        cond_block = self._new_block("forb.cond")
+        body_block = self._new_block("forb.body")
+        incr_block = self._new_block("forb.incr")
+        end_block = self._new_block("forb.end")
+
+        self.builder.branch(cond_block)
+        self.builder.position_at_end(cond_block)
+        idx = self._load_variable(idx_name, node)
+        cond = self.builder.icmp_signed("<", idx, b_len)
+        self.builder.cbranch(cond, body_block, end_block)
+
+        self.builder.position_at_end(body_block)
+        idx = self._load_variable(idx_name, node)
+        byte_val = self._rt_call("bytes_get", [b_val, idx])
+        self._store_variable(var_name, byte_val, ValueType(VKind.INT))
+
+        self._push_loop(end_block, incr_block)
+        _prev_hot = self._in_hot_loop
+        self._in_hot_loop = True
+        self._emit_stmts(node.body)
+        self._in_hot_loop = _prev_hot
+        self._pop_loop()
+        if not self.builder.block.is_terminated:
+            self.builder.branch(incr_block)
+
+        self.builder.position_at_end(incr_block)
+        idx = self._load_variable(idx_name, node)
+        self._store_variable(idx_name, self.builder.add(idx, ir.Constant(i64, 1)), ValueType(VKind.INT))
+        self.builder.branch(cond_block)
+
+        self.builder.position_at_end(end_block)
+
+        # Decref temporary bytes iterables (e.g. `for b in get_bytes():`)
+        _is_named_var = (isinstance(node.iter, ast.Name)
+                         and (node.iter.id in self.variables
+                              or node.iter.id in self._global_vars))
+        if not _is_named_var and self._USE_REFCOUNT:
+            _tag = ir.Constant(i32, FPY_TAG_BYTES)
+            _data = self.builder.ptrtoint(b_val, i64)
             self.builder.call(self.runtime["rc_decref"], [_tag, _data])
 
     def _emit_for_iter_protocol(self, node: ast.For) -> None:
@@ -25882,7 +30423,7 @@ class CodeGen:
         # after the call to detect StopIteration.
         result = self.builder.call(
             self.runtime["obj_call_method0"], [iter_ptr, next_name])
-        pending = self.builder.call(self.runtime["exc_pending"], [])
+        pending = self._emit_exc_pending()
         has_exc = self.builder.icmp_signed(
             "!=", pending, ir.Constant(i32, 0))
         after_loop = else_block if else_block else end_block
@@ -25897,12 +30438,12 @@ class CodeGen:
         fv = self._fv_build_from_slots(ret_tag, result)
         self._store_variable(var_name, fv, ValueType(VKind.FVALUE))
 
-        self._loop_stack.append((end_block, cond_block))
+        self._push_loop(end_block, cond_block)
         _prev_hot = self._in_hot_loop
         self._in_hot_loop = True
         self._emit_stmts(node.body)
         self._in_hot_loop = _prev_hot
-        self._loop_stack.pop()
+        self._pop_loop()
         if not self.builder.block.is_terminated:
             self.builder.branch(cond_block)
 
@@ -25949,7 +30490,7 @@ class CodeGen:
         result = self.builder.call(
             self.runtime["obj_call_method1"],
             [obj, getitem_name, idx])
-        pending = self.builder.call(self.runtime["exc_pending"], [])
+        pending = self._emit_exc_pending()
         has_exc = self.builder.icmp_signed(
             "!=", pending, ir.Constant(i32, 0))
         after_loop = else_block if else_block else end_block
@@ -25965,12 +30506,12 @@ class CodeGen:
         next_idx = self.builder.add(idx, ir.Constant(i64, 1))
         self.builder.store(next_idx, idx_slot)
 
-        self._loop_stack.append((end_block, cond_block))
+        self._push_loop(end_block, cond_block)
         _prev_hot = self._in_hot_loop
         self._in_hot_loop = True
         self._emit_stmts(node.body)
         self._in_hot_loop = _prev_hot
-        self._loop_stack.pop()
+        self._pop_loop()
         if not self.builder.block.is_terminated:
             self.builder.branch(cond_block)
 
@@ -26027,12 +30568,12 @@ class CodeGen:
         # for downstream operations (print, attribute access, method calls).
         self._store_variable(var_name, raw_item, ValueType(VKind.PYOBJ))
 
-        self._loop_stack.append((end_block, cond_block))
+        self._push_loop(end_block, cond_block)
         _prev_hot = self._in_hot_loop
         self._in_hot_loop = True
         self._emit_stmts(node.body)
         self._in_hot_loop = _prev_hot
-        self._loop_stack.pop()
+        self._pop_loop()
         if not self.builder.block.is_terminated:
             self.builder.branch(cond_block)
 
@@ -26073,12 +30614,12 @@ class CodeGen:
         fv_elem = self._fv_build_from_slots(elem_tag, elem_data)
         self._store_variable(var_name, fv_elem, ValueType(VKind.MIXED))
 
-        self._loop_stack.append((end_block, cond_block))
+        self._push_loop(end_block, cond_block)
         _prev_hot = self._in_hot_loop
         self._in_hot_loop = True
         self._emit_stmts(node.body)
         self._in_hot_loop = _prev_hot
-        self._loop_stack.pop()
+        self._pop_loop()
         if not self.builder.block.is_terminated:
             next_idx = self.builder.add(
                 self.builder.load(idx_alloca), ir.Constant(i64, 1))
@@ -26151,12 +30692,12 @@ class CodeGen:
         fv_elem = self._fv_build_from_slots(elem_tag, elem_data)
         self._store_variable(var_name, fv_elem, ValueType(VKind.MIXED))
 
-        self._loop_stack.append((end_block, incr_block))
+        self._push_loop(end_block, incr_block)
         _prev_hot = self._in_hot_loop
         self._in_hot_loop = True
         self._emit_stmts(node.body)
         self._in_hot_loop = _prev_hot
-        self._loop_stack.pop()
+        self._pop_loop()
         if not self.builder.block.is_terminated:
             self.builder.branch(incr_block)
 
@@ -26319,12 +30860,12 @@ class CodeGen:
             if key_types:
                 self._dict_var_key_types[var_name] = key_types
 
-        self._loop_stack.append((end_block, incr_block))
+        self._push_loop(end_block, incr_block)
         _prev_hot = self._in_hot_loop
         self._in_hot_loop = True
         self._emit_stmts(node.body)
         self._in_hot_loop = _prev_hot
-        self._loop_stack.pop()
+        self._pop_loop()
         if not self.builder.block.is_terminated:
             self.builder.branch(incr_block)
 
@@ -26372,31 +30913,20 @@ class CodeGen:
         dict_val = dict_tv.as_ptr(self.builder)
         dict_len = self._rt_call("dict_length", [dict_val])
 
-        # Determine the key/element type. For sets, the elements can be
-        # any type (int, str, etc.). For dicts, keys are typically strings
-        # but may be ints. Use VKind to determine:
-        # SET → "int" (default), DICT → "str" (default, but check for int keys).
-        key_type = "str"
-        if dict_tv.vtype.kind == VKind.SET:
-            # Try to infer element type from set literal or comprehension
-            key_type = "int"  # default for sets (most common)
-            if isinstance(node.iter, ast.Set):
-                if (node.iter.elts and isinstance(node.iter.elts[0], ast.Constant)
-                        and isinstance(node.iter.elts[0].value, str)):
-                    key_type = "str"
-            elif isinstance(node.iter, ast.Name) and node.iter.id in self.variables:
-                # Check if the set was built from string elements
-                pass  # int is a safe default for sets
-        elif (isinstance(node.iter, ast.Name)
-                and self._is_int_keyed_dict(node.iter)):
-            key_type = "int"
-        elif isinstance(node.iter, ast.Dict):
-            # Dict literal: check if keys are int constants
-            if (node.iter.keys
-                    and all(isinstance(k, ast.Constant)
-                            and isinstance(k.value, int)
-                            for k in node.iter.keys if k is not None)):
-                key_type = "int"
+        # Static type of the loop variable.  `dict_key_fv` always writes the
+        # key's *runtime* tag into the FV we store, so the only thing this
+        # decides is what downstream code is told the key is -- and downstream
+        # code trusts it hard enough to rebuild the FV with a literal tag
+        # (`insertvalue undef, i32 2, 0` for str), discarding the runtime one.
+        # So a wrong guess here is not a missed optimisation, it is a wrong
+        # program: guessing "str" for an int key makes `out = k` incref the
+        # integer as a string pointer and read its header at `k - 8`.
+        #
+        # Hence: only a *proven* key kind may be named.  "Not proven int" is
+        # not evidence of str, and "most sets are int sets" is not evidence of
+        # anything -- both must fall through to MIXED, which keeps the runtime
+        # tag and dispatches dynamically.  (BUG-FOR-DICT-KEY-KIND-GUESSED)
+        key_type = self._dict_key_type_tag(node.iter, dict_tv.vtype)
 
         idx_name = f"__idx_{var_name}"
         self._store_variable(idx_name, ir.Constant(i64, 0), ValueType(VKind.INT))
@@ -26421,12 +30951,12 @@ class CodeGen:
         self._fv_store_from_list(var_name, dict_val, idx, key_type,
                                  get_fn="dict_key_fv")
 
-        self._loop_stack.append((end_block, incr_block))
+        self._push_loop(end_block, incr_block)
         _prev_hot = self._in_hot_loop
         self._in_hot_loop = True
         self._emit_stmts(node.body)
         self._in_hot_loop = _prev_hot
-        self._loop_stack.pop()
+        self._pop_loop()
         if not self.builder.block.is_terminated:
             self.builder.branch(incr_block)
 
@@ -26493,12 +31023,12 @@ class CodeGen:
         self._fv_store_from_list(val_target.id, dict_val, idx, val_type,
                                  get_fn="dict_value_fv")
 
-        self._loop_stack.append((end_block, incr_block))
+        self._push_loop(end_block, incr_block)
         _prev_hot = self._in_hot_loop
         self._in_hot_loop = True
         self._emit_stmts(node.body)
         self._in_hot_loop = _prev_hot
-        self._loop_stack.pop()
+        self._pop_loop()
         if not self.builder.block.is_terminated:
             self.builder.branch(incr_block)
 
@@ -26516,16 +31046,54 @@ class CodeGen:
 
         self.builder.position_at_end(end_block)
 
+    def _push_loop(self, break_block, continue_block) -> None:
+        """Open a loop, freezing the finally depth that bounds break/continue.
+
+        Every loop emitter goes through here rather than appending to
+        `_loop_stack` itself, so that the one fact `break` needs — how much of
+        the finally stack belongs to this loop — cannot be forgotten at one of
+        the dozen-odd specialized `for`/`while` lowerings."""
+        self._loop_stack.append(
+            (break_block, continue_block, len(self._finally_stack)))
+
+    def _pop_loop(self) -> None:
+        self._loop_stack.pop()
+
+    def _emit_loop_exit_cleanups(self, depth: int) -> bool:
+        """Emit the cleanups `break`/`continue` unwind out of, LIFO.
+
+        Returns True if one of them terminated the block, in which case the
+        caller must not emit its branch."""
+        for cleanup in reversed(self._finally_stack[depth:]):
+            saved_stack = self._finally_stack
+            self._finally_stack = []
+            try:
+                if callable(cleanup):
+                    cleanup()
+                else:
+                    self._emit_stmts(cleanup)
+            finally:
+                self._finally_stack = saved_stack
+            if self.builder.block.is_terminated:
+                return True
+        return False
+
     def _emit_break(self, node: ast.Break) -> None:
         if not self._loop_stack:
             raise CodeGenError("'break' outside loop", node)
-        end_block, _ = self._loop_stack[-1]
+        end_block, _, depth = self._loop_stack[-1]
+        # Leaving a `with` or a `try`'s body runs its cleanup, the same as a
+        # `return` does — see BUG-RETURN-IN-WITH-SKIPS-EXIT.
+        if self._emit_loop_exit_cleanups(depth):
+            return
         self.builder.branch(end_block)
 
     def _emit_continue(self, node: ast.Continue) -> None:
         if not self._loop_stack:
             raise CodeGenError("'continue' outside loop", node)
-        _, continue_block = self._loop_stack[-1]
+        _, continue_block, depth = self._loop_stack[-1]
+        if self._emit_loop_exit_cleanups(depth):
+            return
         self.builder.branch(continue_block)
 
     # -----------------------------------------------------------------
@@ -26784,14 +31352,38 @@ class CodeGen:
         if _TYPE_CHECK is not None:
             return _TYPE_CHECK
 
-        tv_left = self._emit_expr(node.left)
-        left = tv_left.val
+        # `is` / `is not` are emitted from the AST node rather than from an
+        # already-computed value (they need the node to reach the FpyValue tag,
+        # which the unwrapped value has lost), so _emit_is_compare emits the left
+        # operand itself.  Emitting it eagerly here as well ran any call in it
+        # twice — `val() is val()` bumped a global three times instead of twice.
+        # Skip the eager emission when every operator is an identity test; `in`
+        # and the ordering/equality operators still need the value.
+        # `== None` joins them: it is identity against a singleton, and the
+        # value-based path folds it to a constant.  Only take the AST route
+        # when *every* operator wants it, so `left` is either emitted once for
+        # the value path or not at all — a mixed chain would otherwise emit
+        # node.left twice.  BUG-IS-NONE-ON-TAGGED-VALUE.
+        _all_identity_like = all(
+            self._is_identity_like_op(o, c, node.left)
+            for o, c in zip(node.ops, node.comparators))
+        if _all_identity_like:
+            tv_left = None
+            left = None
+        else:
+            tv_left = self._emit_expr(node.left)
+            left = tv_left.val
         result = None
 
         for op, comparator_node in zip(node.ops, node.comparators):
             # Handle `is`/`is not` specially (identity comparison)
             if isinstance(op, (ast.Is, ast.IsNot)):
                 cmp = self._emit_is_compare(op, node.left, comparator_node, node)
+            elif _all_identity_like and isinstance(op, (ast.Eq, ast.NotEq)):
+                # `x == None` must agree with `x is None`.
+                cmp = self._emit_is_compare(
+                    ast.IsNot() if isinstance(op, ast.NotEq) else ast.Is(),
+                    node.left, comparator_node, node)
             # Handle `in`/`not in` specially
             elif isinstance(op, (ast.In, ast.NotIn)):
                 cmp = self._emit_in_compare(op, left, comparator_node, node,
@@ -26979,6 +31571,41 @@ class CodeGen:
                         cmp = self.builder.icmp_signed(">", cmp_result, zero)
                     else:
                         cmp = self.builder.icmp_signed(">=", cmp_result, zero)
+
+                # DECIMAL / COMPLEX comparison.  Both are heap numbers behind
+                # a pointer, and neither had an arm here — so two Decimals,
+                # having the *same* kind, also missed the cross-type
+                # fv_compare branch above and fell all the way to the generic
+                # pointer/integer compare at the bottom.  `Decimal("1.5") <
+                # Decimal("2.5")` was therefore answered on heap *address*
+                # order and flipped from run to run.
+                # BUG-DECIMAL-COMPLEX-COMPARE-BY-POINTER.
+                #
+                # Unlike the BIGINT arm above this does not open-code the
+                # promotion: `fastpy_fv_compare` gained proper Decimal and
+                # complex arms (BUG-FV-COMPARE-NO-DECIMAL-COMPLEX), and it
+                # covers every partner tag — INT, BOOL and FLOAT included —
+                # plus the TypeError that complex ordering has to raise.
+                # `_to_tag_data_ir` reaches the same `_infer_type_tag` the
+                # container element paths use, so the tag it stamps here and
+                # the tag a list stores agree by construction.
+                elif (isinstance(op, (ast.Eq, ast.NotEq, ast.Lt, ast.LtE,
+                                      ast.Gt, ast.GtE))
+                        and (left_kind in (VKind.DECIMAL, VKind.COMPLEX)
+                             or tv_right.vtype.kind in (VKind.DECIMAL,
+                                                        VKind.COMPLEX))):
+                    _cmp_ops = {ast.Eq: 0, ast.NotEq: 1, ast.Lt: 2,
+                                ast.LtE: 3, ast.Gt: 4, ast.GtE: 5}
+                    l_tag, l_data = self._to_tag_data_ir(cmp_left, node.left)
+                    r_tag, r_data = self._to_tag_data_ir(cmp_right,
+                                                         comparator_node)
+                    cmp_result = self.builder.call(
+                        self.runtime["fv_compare"],
+                        [l_tag, l_data, r_tag, r_data,
+                         ir.Constant(i32, _cmp_ops[type(op)])])
+                    self._emit_try_bail_if_exc()
+                    cmp = self.builder.icmp_signed(
+                        "!=", cmp_result, ir.Constant(i32, 0))
 
                 # STR comparison (only when we KNOW it's a string, not a generic ptr)
                 elif (left_kind == VKind.STR
@@ -27172,12 +31799,32 @@ class CodeGen:
 
         return result
 
+    @staticmethod
+    def _is_none_literal(n: 'ast.expr | None') -> bool:
+        """True for the literal `None` as written in the source."""
+        return isinstance(n, ast.Constant) and n.value is None
+
+    def _is_identity_like_op(self, op, comparator_node, left_node) -> bool:
+        """True when an operator must be emitted from the AST, not from a value.
+
+        `is`/`is not` always are.  So is `== None` / `!= None`: `None` is a
+        singleton, so equality against it *is* identity, and the value-based
+        path can only see that one side inferred to VKind.NONE and the other
+        didn't — which folds `x == None` to False for every `x` whose noneness
+        is a runtime tag.  BUG-IS-NONE-ON-TAGGED-VALUE.
+        """
+        if isinstance(op, (ast.Is, ast.IsNot)):
+            return True
+        if isinstance(op, (ast.Eq, ast.NotEq)):
+            return (self._is_none_literal(comparator_node)
+                    or self._is_none_literal(left_node))
+        return False
+
     def _emit_is_compare(self, op, left_node, right_node, node) -> ir.Value:
         """Emit `is` / `is not` comparison. Supports None and Ellipsis."""
         # Check if comparing to None
         is_none_check = (
-            (isinstance(left_node, ast.Constant) and left_node.value is None) or
-            (isinstance(right_node, ast.Constant) and right_node.value is None)
+            self._is_none_literal(left_node) or self._is_none_literal(right_node)
         )
         # Check if comparing to Ellipsis
         is_ellipsis = (
@@ -27223,6 +31870,17 @@ class CodeGen:
             return self.builder.icmp_signed("==", left, right)
         # Determine if the non-None side is statically known to be None
         other = left_node if isinstance(right_node, ast.Constant) and right_node.value is None else right_node
+
+        # A call to a function/method with no `return <expr>` is None by
+        # definition, so fold the comparison — there is no runtime tag to test
+        # (the call site substitutes the untyped placeholder `i64 0`, which
+        # would compare equal to a null pointer and read as "not None" here).
+        # The call is still emitted, for its side effects.
+        # See BUG-VOID-RETURNS-ZERO-NOT-NONE.
+        if self._call_is_void(other):
+            self._emit_expr_value(other)
+            return ir.Constant(ir.IntType(1),
+                               0 if isinstance(op, ast.IsNot) else 1)
 
         # For FV-backed variables, compare the runtime tag with FPY_TAG_NONE.
         # This handles functions that return None on some paths but not others.
@@ -27270,6 +31928,27 @@ class CodeGen:
                         "!=", tag, ir.Constant(i32, FPY_TAG_NONE))
                 return self.builder.icmp_signed(
                     "==", tag, ir.Constant(i32, FPY_TAG_NONE))
+
+        # A container element carries its noneness in its runtime tag and
+        # nowhere else: `_emit_expr_value` hands a subscript back as the bare
+        # payload, and None's payload is 0 — indistinguishable from the int 0
+        # or a null pointer.  Without this arm the test fell all the way to the
+        # AST fold below, which can only say "the inferred kind isn't NONE" and
+        # answered False, so `if m[1] is None:` never fired.
+        # BUG-IS-NONE-ON-TAGGED-VALUE.
+        if (self._USE_FV_LOCALS
+                and isinstance(other, ast.Subscript)
+                and not isinstance(other.slice, ast.Slice)
+                and (self._is_dict_expr(other.value)
+                     or self._is_list_expr(other.value)
+                     or self._is_tuple_expr(other.value))):
+            fv = self._load_or_wrap_fv(other)
+            if (isinstance(fv.type, ir.LiteralStructType)
+                    and fv.type == fpy_val):
+                tag = self.builder.extract_value(fv, 0, name="is_none.tag")
+                return self.builder.icmp_signed(
+                    "!=" if isinstance(op, ast.IsNot) else "==",
+                    tag, ir.Constant(i32, FPY_TAG_NONE))
 
         # Class variable attribute access: cls.attr is None / ClassName.attr is None
         # Load the pointer from the class var global and compare to null.
@@ -27328,10 +32007,14 @@ class CodeGen:
         if c_kind == VKind.SET or self._is_set_expr(container_node):
             container = self._emit_expr_value(container_node)
             container = self._ensure_ptr(container)
-            tag, data = self._bare_to_tag_data(left_val, None)
+            # The probe is hashed against what `set.add` stored, so it needs
+            # the same runtime tag the store side now uses — a static INT
+            # guess here made `4.5 in s` compare a bit pattern against a
+            # FLOAT-tagged entry and miss.  BUG-DICT-VALUE-STATIC-KIND.
+            tag, data = self._to_tag_data_ir(left_val, node.left)
             result = self.builder.call(
                 self.runtime["set_contains_fv"],
-                [container, ir.Constant(i32, tag), data])
+                [container, tag, data])
             result = self.builder.trunc(result, ir.IntType(1))
             if isinstance(op, ast.NotIn):
                 result = self.builder.not_(result)
@@ -27449,10 +32132,18 @@ class CodeGen:
                 result = self.builder.call(
                     self.runtime["dict_has_int_key"], [container, left_val])
             else:
-                if not isinstance(left_val.type, ir.PointerType):
-                    left_val = self._ensure_ptr(left_val)
+                # Anything else — a float, a tagged FpyValue, an object — goes
+                # through the tag-aware lookup.  This used to coerce the value
+                # to a pointer and hand it to `dict_has_key`, which strcmps it:
+                # `2.5 in {"a": 1}` reinterpreted the double's bit pattern as a
+                # `char*` and segfaulted, on a comparison whose answer is just
+                # False.  Every setter stores keys as tagged FpyValues in one
+                # table (`dict_set_fv` included), so `dict_has_kv_key` finds a
+                # str key too and simply misses on a tag that was never stored.
+                # BUG-DICT-IN-COERCES-NON-STR-KEY-TO-CHAR-PTR.
+                kt, kd = self._to_tag_data_ir(left_val, node.left)
                 result = self.builder.call(
-                    self.runtime["dict_has_key"], [container, left_val])
+                    self.runtime["dict_has_kv_key"], [container, kt, kd])
             result_i1 = self.builder.icmp_signed("!=", result, ir.Constant(i32, 0))
             if isinstance(op, ast.NotIn):
                 result_i1 = self.builder.not_(result_i1)
@@ -27486,6 +32177,23 @@ class CodeGen:
             if isinstance(op, ast.NotIn):
                 result = self.builder.not_(result)
             return result
+
+        # Bytes 'in': `97 in b"abc"` (byte value) or `b"bc" in b"abc"`
+        # (subsequence).  Must precede the STR arm and the legacy pointer
+        # fallback — a bytes object is a pointer too, and both of those would
+        # treat it as a NUL-terminated string.  BUG-BYTES-CONTAINS-NO-ARM.
+        if c_kind == VKind.BYTES:
+            container = self._emit_expr_value(container_node)
+            container = self._ensure_ptr(container)
+            tag, data = self._bare_to_tag_data(left_val, node.left)
+            result = self.builder.call(
+                self.runtime["bytes_contains"],
+                [container, ir.Constant(i32, tag), data])
+            result_i1 = self.builder.icmp_signed(
+                "!=", result, ir.Constant(i32, 0))
+            if isinstance(op, ast.NotIn):
+                result_i1 = self.builder.not_(result_i1)
+            return result_i1
 
         # String 'in': "x" in "hello"
         if c_kind == VKind.STR:
@@ -27614,7 +32322,14 @@ class CodeGen:
         result_alloca = self._create_entry_alloca(result_type, "and.result")
         merge_block = self._new_block("and.end")
 
+        # Each operand is emitted into its own block, and every one of those
+        # blocks is a predecessor of the merge. Owned temps created by an
+        # operand must therefore be released at the merge, not left pending for
+        # the enclosing statement's flush — which would decref a value its own
+        # block doesn't dominate. See BUG-DECREF-DOES-NOT-DOMINATE.
+        _arms: list[tuple] = []
         for i, val_node in enumerate(values):
+            _arm_mark = len(self._rc_temps)
             val = self._emit_expr_value(val_node)
             if i < len(values) - 1:
                 # Test truthiness BEFORE coercion so the original type
@@ -27625,6 +32340,8 @@ class CodeGen:
                 truthy = self._value_truthiness(val, is_list=is_list)
             coerced = self._coerce_to_type(val, result_type)
             self.builder.store(coerced, result_alloca)
+            _arms.append((self.builder.block,
+                          self._capture_arm_rc_temps(_arm_mark)))
             if i < len(values) - 1:
                 next_block = self._new_block("and.next")
                 # If truthy, continue; else short-circuit with current value
@@ -27634,6 +32351,7 @@ class CodeGen:
                 self.builder.branch(merge_block)
 
         self.builder.position_at_end(merge_block)
+        self._rejoin_arm_rc_temps(_arms)
         return self.builder.load(result_alloca)
 
     def _emit_short_circuit_or(self, values: list[ast.expr]) -> ir.Value:
@@ -27645,7 +32363,10 @@ class CodeGen:
         result_alloca = self._create_entry_alloca(result_type, "or.result")
         merge_block = self._new_block("or.end")
 
+        # Per-operand owned-temp capture — see _emit_short_circuit_and.
+        _arms: list[tuple] = []
         for i, val_node in enumerate(values):
+            _arm_mark = len(self._rc_temps)
             val = self._emit_expr_value(val_node)
             if i < len(values) - 1:
                 # Test truthiness BEFORE coercion (see _emit_short_circuit_and).
@@ -27653,6 +32374,8 @@ class CodeGen:
                 truthy = self._value_truthiness(val, is_list=is_list)
             coerced = self._coerce_to_type(val, result_type)
             self.builder.store(coerced, result_alloca)
+            _arms.append((self.builder.block,
+                          self._capture_arm_rc_temps(_arm_mark)))
             if i < len(values) - 1:
                 next_block = self._new_block("or.next")
                 # If truthy, short-circuit; else continue
@@ -27662,6 +32385,7 @@ class CodeGen:
                 self.builder.branch(merge_block)
 
         self.builder.position_at_end(merge_block)
+        self._rejoin_arm_rc_temps(_arms)
         return self.builder.load(result_alloca)
 
     def _common_boolop_type(self, values: list[ast.expr]) -> ir.Type:
@@ -28325,6 +33049,102 @@ class CodeGen:
             # Non-FV mode: return the object pointer as i64 (0 if dead)
             return self.builder.ptrtoint(obj_ptr, i64)
 
+    def _lookup_user_function(self, name: str):
+        """Resolve a call-site name to its `FuncInfo`, scope-qualified first.
+
+        Returns `(info, key)`, or `(None, None)`. `key` is the dict key the
+        lookup actually hit, so callers can index the parallel
+        `_function_def_nodes` map consistently.
+
+        Nested `def`s are registered under two different key shapes. One with
+        no free variables is *hoisted* to module scope and keyed by its **bare**
+        name; a capturing one — or one whose bare name is already taken — is
+        keyed `outer.inner`. A bare-name-only lookup therefore resolves a nested
+        `def build(...)` to a same-named sibling in a completely different
+        enclosing function, and the caller silently inherits the sibling's
+        return type: BUG-NESTED-DEF-NAME-COLLISION, where a dict-returning
+        `build` was typed `list` and `d["x"]` compiled to a list index.
+
+        Trying `f"{_current_func_name}.{name}"` first lets the local definition
+        win, which is also what Python scoping says. The bare name stays as the
+        fallback, for module-level functions and for the hoisted nested defs
+        that legitimately live under it.
+        """
+        _scope = getattr(self, "_current_func_name", None)
+        if _scope:
+            _qual = f"{_scope}.{name}"
+            info = self._user_functions.get(_qual)
+            if info is not None:
+                return info, _qual
+        return self._user_functions.get(name), name
+
+    def _recover_closure_ret_tag(self, name: str, result: ir.Value) -> ir.Value:
+        """Rebuild an FpyValue from an indirect call's `i64` result.
+
+        `fastpy_call_ptrN` returns a bare `i64`, so a callee returning a str /
+        list / dict comes back untagged and the caller would treat it as an
+        int — printing a pointer as a decimal number
+        (BUG-INDIRECT-CALL-RET-TAG-INT).
+
+        A *static* tag is no help: `FuncInfo.ret_tag` is left at `"int"` for
+        FpyValue-ABI functions because their real tag travels in the returned
+        `{i32, i64}` struct, and a function can return different kinds per
+        branch anyway. The tag must come from the runtime — the `__i64_wrap`
+        thunk already publishes it with `set_ret_tag` before discarding the
+        struct, so we only have to read it back.
+
+        Applied narrowly: only when the callee is a nested `def` that really
+        does publish a tag. Two lowerings qualify:
+
+          * FpyValue-ABI functions (`uses_fv_abi`), reached through the
+            `__i64_wrap` thunk described above — this covers the zero-capture
+            nested defs that get hoisted to module scope; and
+          * `fastpy.closure.*` bodies, which return `i64` directly but whose
+            `return` emitter already calls `set_ret_tag` on every path (see
+            the `_needs_ret_tag` logic in `_emit_return`) — this covers
+            capturing closures.
+
+        Everything else — lambdas, decorator-returned closures, function-
+        pointer parameters — keeps the plain `i64` path, because for those
+        `fpy_ret_tag` holds a stale value left by some earlier call.
+
+        The callee is resolved scope-first (`outer.inner` before `inner`):
+        zero-capture nested defs are registered under their bare name, so a
+        bare lookup can land on a same-named sibling in another scope.
+
+        A **decorated** name is excluded even though the lookup succeeds: for
+        `@deco def f(...)`, `_user_functions["f"]` describes the *undecorated*
+        function while the variable `f` holds the decorator's wrapper. The
+        wrapper is a different callee with a different (and, when the same
+        wrapper is reused for several callees, statically-inferred and
+        therefore unreliable) return tag.
+        """
+        if (isinstance(result.type, ir.LiteralStructType)
+                and result.type == fpy_val):
+            return result  # already tagged (e.g. the kwargs path)
+        info, _key = self._lookup_user_function(name)
+        if info is None:
+            return result
+        _def_node = getattr(self, "_function_def_nodes", {}).get(_key)
+        if _def_node is not None and getattr(_def_node, "decorator_list", None):
+            return result  # name is bound to the decorator's result, not this
+        _publishes_tag = (
+            getattr(info, "uses_fv_abi", False)
+            or info.func.name.startswith("fastpy.closure."))
+        if not _publishes_tag:
+            return result
+        ret_tag = self.builder.call(self.runtime["get_ret_tag"], [])
+        if isinstance(result.type, ir.PointerType):
+            result = self.builder.ptrtoint(result, i64)
+        elif isinstance(result.type, ir.DoubleType):
+            result = self.builder.bitcast(result, i64)
+        elif (isinstance(result.type, ir.IntType)
+                and result.type.width != 64):
+            result = self.builder.zext(result, i64)
+        elif not isinstance(result.type, ir.IntType):
+            return result  # void or something unexpected — leave it alone
+        return self._fv_build_from_slots(ret_tag, result)
+
     def _emit_closure_call(self, node: ast.Call) -> ir.Value:
         """Call a closure or function-pointer variable."""
         name = node.func.id
@@ -28974,6 +33794,54 @@ class CodeGen:
             result = self._emit_user_call(node)
             return result if result else ir.Constant(i64, 0)
 
+    def _emit_kwargs_dict(self, keywords: 'list[ast.keyword]') -> ir.Value:
+        """Build the `FpyDict*` for a callee's `**kwargs` parameter.
+
+        Always returns a dict, including for an empty keyword list.  That is
+        the whole point: the callee's prologue tags this pointer `FPY_TAG_DICT`
+        unconditionally, so it is not free to be anything else.  The call site
+        used to build the kwargs dict only `if node.keywords`, and pass the
+        *positional* list otherwise -- so `def kw(**kwargs): return kwargs`
+        called as `kw()` handed a `FpyList*` to code that reads it as a dict,
+        and printing the result segfaulted.  (BUG-EMPTY-KWARGS-CALL-SEGFAULTS)
+
+        A `**d` splat that `_emit_user_call`'s expansion could not turn into
+        explicit keywords (the dict is not a visible literal) arrives here as a
+        `keyword` with `arg=None` and is merged at runtime.  Passing that to
+        `_make_string_constant` would have used `None` as a key name.
+        """
+        dict_ptr = self.builder.call(self.runtime["dict_new"], [])
+        for kw in keywords or ():
+            if kw.arg is None:
+                src = self._ensure_ptr(self._emit_expr_value(kw.value))
+                self.builder.call(self.runtime["dict_update"],
+                                  [dict_ptr, src])
+                continue
+            key = self._make_string_constant(kw.arg)
+            val = self._emit_expr_value(kw.value)
+            tag, data = self._bare_to_tag_data(val, kw.value)
+            self.builder.call(self.runtime["dict_set_fv"],
+                              [dict_ptr, key, ir.Constant(i32, tag), data])
+        return dict_ptr
+
+    def _emit_vararg_list(self, args: 'list[ast.expr]') -> ir.Value:
+        """Build the `FpyList*` for a callee's `*args` parameter.
+
+        The caller marks it a tuple; this only packs.  A lone `f(*xs)` forwards
+        `xs` itself rather than wrapping it in a second list.
+        """
+        starred = [a for a in args if isinstance(a, ast.Starred)]
+        if len(starred) == 1 and len(args) == 1:
+            return self._ensure_ptr(self._emit_expr_value(args[0].value))
+        list_ptr = self.builder.call(self.runtime["list_new"], [])
+        for arg_node in args:
+            if isinstance(arg_node, ast.Starred):
+                src = self._ensure_ptr(self._emit_expr_value(arg_node.value))
+                self.builder.call(self.runtime["list_extend"], [list_ptr, src])
+            else:
+                self._emit_list_append_expr(list_ptr, arg_node)
+        return list_ptr
+
     def _emit_user_call(self, node: ast.Call) -> ir.Value | None:
         """Emit a call to a user-defined function. Returns the LLVM value (or None for void)."""
         # Expand **dict_literal or **dict_variable to individual keywords.
@@ -29127,60 +33995,25 @@ class CodeGen:
 
         if info.is_vararg and info.is_kwarg and info.param_count == 2:
             # *args + **kwargs: pack positional into tuple, keywords into dict
-            list_ptr = self.builder.call(self.runtime["list_new"], [])
-            for arg_node in node.args:
-                self._emit_list_append_expr(list_ptr, arg_node)
+            list_ptr = self._emit_vararg_list(node.args)
             self.builder.call(self.runtime["list_mark_tuple"], [list_ptr])
-            dict_ptr = self.builder.call(self.runtime["dict_new"], [])
-            if node.keywords:
-                for kw in node.keywords:
-                    key = self._make_string_constant(kw.arg)
-                    val = self._emit_expr_value(kw.value)
-                    tag, data = self._bare_to_tag_data(val, kw.value)
-                    self.builder.call(self.runtime["dict_set_fv"],
-                                      [dict_ptr, key, ir.Constant(i32, tag), data])
+            dict_ptr = self._emit_kwargs_dict(node.keywords)
             result = self.builder.call(info.func, [list_ptr, dict_ptr])
             return result if info.ret_tag != "void" else None
 
-        if (info.is_vararg or info.is_kwarg) and info.param_count == 1:
-            # Pack all provided args into a list (tuple for *args)
-            # Check for *splat forwarding: if a single starred arg is passed,
-            # forward the list directly instead of wrapping it in another list.
-            _has_star = any(isinstance(a, ast.Starred) for a in node.args)
-            if _has_star and len(node.args) == 1 and isinstance(node.args[0], ast.Starred):
-                # Simple forwarding: show(*args) → pass args list directly
-                list_ptr = self._emit_expr_value(node.args[0].value)
-                list_ptr = self._ensure_ptr(list_ptr)
-            elif _has_star:
-                # Mixed: some positional + *splat — build list and extend
-                list_ptr = self.builder.call(self.runtime["list_new"], [])
-                for arg_node in node.args:
-                    if isinstance(arg_node, ast.Starred):
-                        src = self._emit_expr_value(arg_node.value)
-                        src = self._ensure_ptr(src)
-                        self.builder.call(
-                            self.runtime["list_extend"], [list_ptr, src])
-                    else:
-                        self._emit_list_append_expr(list_ptr, arg_node)
-            else:
-                list_ptr = self.builder.call(self.runtime["list_new"], [])
-                for arg_node in node.args:
-                    self._emit_list_append_expr(list_ptr, arg_node)
-            # *args is a tuple in Python
-            if info.is_vararg:
-                self.builder.call(self.runtime["list_mark_tuple"], [list_ptr])
-            # For **kwargs, pack keyword args into a dict
-            if node.keywords:
-                dict_ptr = self.builder.call(self.runtime["dict_new"], [])
-                for kw in node.keywords:
-                    key = self._make_string_constant(kw.arg)
-                    val = self._emit_expr_value(kw.value)
-                    tag, data = self._bare_to_tag_data(val, kw.value)
-                    self.builder.call(self.runtime["dict_set_fv"],
-                                      [dict_ptr, key, ir.Constant(i32, tag), data])
-                result = self.builder.call(info.func, [dict_ptr])
-            else:
-                result = self.builder.call(info.func, [list_ptr])
+        # `*args` and `**kwargs` are different parameters holding different
+        # container types, so they get separate arms.  Sharing one arm and
+        # choosing between them on "were any keywords passed?" is what made
+        # `kw()` pass a list to a `**kwargs` parameter.
+        if info.is_kwarg and info.param_count == 1:
+            dict_ptr = self._emit_kwargs_dict(node.keywords)
+            result = self.builder.call(info.func, [dict_ptr])
+            return result if info.ret_tag != "void" else None
+
+        if info.is_vararg and info.param_count == 1:
+            list_ptr = self._emit_vararg_list(node.args)
+            self.builder.call(self.runtime["list_mark_tuple"], [list_ptr])
+            result = self.builder.call(info.func, [list_ptr])
             return result if info.ret_tag != "void" else None
 
         # Evaluate provided arguments (handling *args starred unpack)
@@ -29241,12 +34074,8 @@ class CodeGen:
                         self.builder.position_at_end(_sl_end)
                         args.append(sub)
                 else:
-                    remaining = info.param_count - len(args)
-                    elem_type = self._get_list_elem_type(arg_node.value)
-                    for i in range(remaining):
-                        elem = self._list_get_as_bare(
-                            list_val, ir.Constant(i64, i), elem_type)
-                        args.append(elem)
+                    self._splat_positional_args(
+                        list_val, arg_node.value, info, args)
                 break  # starred must be last
             val = self._emit_expr_value(arg_node)
             args.append(val)
@@ -29423,11 +34252,44 @@ class CodeGen:
 
         result = self.builder.call(info.func, coerced)
 
-        # Unwrap FV return to the caller's expected bare type
+        # Unwrap FV return to the caller's expected bare type -- unless there
+        # is no single bare type to unwrap to.  A callee whose returns commit
+        # to different pointer kinds is typed "mixed", and _unwrap_return_value
+        # would pick one from info.static_ret_type and drop the runtime tag,
+        # so `len(pick(True))` measured a string as a list.  Hand back the
+        # tagged FpyValue instead; _emit_expr tags any fpy_val-typed result
+        # FVALUE, which routes downstream operations through runtime dispatch.
+        # BUG-DIRECT-CALL-LEN-STATIC-TAG.
         if info.uses_fv_abi and info.ret_tag != "void":
-            result = self._unwrap_return_value(result, info)
+            if not self._callee_returns_mixed(name):
+                result = self._unwrap_return_value(result, info)
 
         return result if info.ret_tag != "void" else None
+
+    def _callee_returns_mixed(self, name: str) -> bool:
+        """True when either analysis typed *name*'s return as `mixed`.
+
+        `_func_ret_types` is the reconciled answer of the call-site analysis,
+        and it is what `_assign_fv_fast_path` consults when storing a call
+        result to a name.  Both call sites must agree, or `v = f(x); len(v)`
+        and `len(f(x))` disagree — which is exactly BUG-DIRECT-CALL-LEN-
+        STATIC-TAG.
+
+        `info.ret_tag` is normally the *coarser* of the two — it is fixed in
+        the declaration pass, before the call-site analysis has run — so it is
+        consulted only for the one thing it alone can see: `return <param>`
+        where the parameter has no known type.  The CSA chain has no arm for
+        that shape and leaves `_func_ret_types` empty, so without this the
+        declaration pass's "mixed" would be ignored and the tag unwrapped away.
+        BUG-RETURNS-UNTYPED-PARAM-RET-TAG.
+        """
+        frt = getattr(self, "_func_ret_types", None) or {}
+        tag = frt.get(name)
+        if tag is not None:
+            return self._tag_kind(tag) == VKind.MIXED
+        info = self._user_functions.get(name)
+        return (info is not None
+                and self._tag_kind(info.ret_tag) == VKind.MIXED)
 
     def _emit_user_call_fv(self, node: ast.Call) -> ir.Value:
         """Emit a user function call and return the raw FpyValue without
@@ -29473,52 +34335,19 @@ class CodeGen:
         # Same argument handling as _emit_user_call, just skip the unwrap.
         # Handle *args + **kwargs together (2 params)
         if info.is_vararg and info.is_kwarg and info.param_count == 2:
-            list_ptr = self.builder.call(self.runtime["list_new"], [])
-            for arg_node in node.args:
-                self._emit_list_append_expr(list_ptr, arg_node)
+            list_ptr = self._emit_vararg_list(node.args)
             self.builder.call(self.runtime["list_mark_tuple"], [list_ptr])
-            dict_ptr = self.builder.call(self.runtime["dict_new"], [])
-            if node.keywords:
-                for kw in node.keywords:
-                    key = self._make_string_constant(kw.arg)
-                    val = self._emit_expr_value(kw.value)
-                    tag, data = self._bare_to_tag_data(val, kw.value)
-                    self.builder.call(self.runtime["dict_set_fv"],
-                                      [dict_ptr, key, ir.Constant(i32, tag), data])
+            dict_ptr = self._emit_kwargs_dict(node.keywords)
             return self.builder.call(info.func, [list_ptr, dict_ptr])
 
-        # Handle *args or **kwargs (single param)
-        if (info.is_vararg or info.is_kwarg) and info.param_count == 1:
-            _has_star = any(isinstance(a, ast.Starred) for a in node.args)
-            if _has_star and len(node.args) == 1 and isinstance(node.args[0], ast.Starred):
-                list_ptr = self._emit_expr_value(node.args[0].value)
-                list_ptr = self._ensure_ptr(list_ptr)
-            elif _has_star:
-                list_ptr = self.builder.call(self.runtime["list_new"], [])
-                for arg_node in node.args:
-                    if isinstance(arg_node, ast.Starred):
-                        src = self._emit_expr_value(arg_node.value)
-                        src = self._ensure_ptr(src)
-                        self.builder.call(
-                            self.runtime["list_extend"], [list_ptr, src])
-                    else:
-                        self._emit_list_append_expr(list_ptr, arg_node)
-            else:
-                list_ptr = self.builder.call(self.runtime["list_new"], [])
-                for arg_node in node.args:
-                    self._emit_list_append_expr(list_ptr, arg_node)
-            # *args is a tuple in Python
-            if info.is_vararg:
-                self.builder.call(self.runtime["list_mark_tuple"], [list_ptr])
-            if node.keywords:
-                dict_ptr = self.builder.call(self.runtime["dict_new"], [])
-                for kw in node.keywords:
-                    key = self._make_string_constant(kw.arg)
-                    val = self._emit_expr_value(kw.value)
-                    tag, data = self._bare_to_tag_data(val, kw.value)
-                    self.builder.call(self.runtime["dict_set_fv"],
-                                      [dict_ptr, key, ir.Constant(i32, tag), data])
-                return self.builder.call(info.func, [dict_ptr])
+        # Separate arms for *args and **kwargs — see _emit_user_call.
+        if info.is_kwarg and info.param_count == 1:
+            return self.builder.call(
+                info.func, [self._emit_kwargs_dict(node.keywords)])
+
+        if info.is_vararg and info.param_count == 1:
+            list_ptr = self._emit_vararg_list(node.args)
+            self.builder.call(self.runtime["list_mark_tuple"], [list_ptr])
             return self.builder.call(info.func, [list_ptr])
 
         # Mixed vararg: positional + *rest + kwonly
@@ -29586,12 +34415,10 @@ class CodeGen:
         for arg_node in node.args:
             if isinstance(arg_node, ast.Starred):
                 list_val = self._emit_expr_value(arg_node.value)
-                remaining = info.param_count - len(args)
-                elem_type = self._get_list_elem_type(arg_node.value)
-                for i in range(remaining):
-                    elem = self._list_get_as_bare(list_val, ir.Constant(i64, i), elem_type)
-                    args.append(elem)
-                    arg_source_nodes.append(None)
+                _before = len(args)
+                self._splat_positional_args(
+                    list_val, arg_node.value, info, args)
+                arg_source_nodes.extend([None] * (len(args) - _before))
                 break
             val = self._emit_expr_value(arg_node)
             args.append(val)
@@ -29688,6 +34515,184 @@ class CodeGen:
                 and default_globals[default_idx] is not None):
             return self.builder.load(default_globals[default_idx])
         return None
+
+    def _splat_positional_args(
+        self, list_val: ir.Value, seq_node: ast.expr, info: "FuncInfo",
+        args: list,
+    ) -> None:
+        """Expand `f(*seq)` into positional arguments, appending onto *args*.
+
+        A splatted sequence supplies as many arguments as it has elements, not
+        as many as the callee happens to declare.  Extracting `param_count` of
+        them read past the end of a shorter sequence, which is an outright
+        IndexError for any callee with a default
+        (BUG-STARARG-SPLAT-DEFAULT-PARAM).
+
+        Required parameters are still extracted unconditionally: a too-short
+        sequence is a TypeError in Python, and the caller's `min_args` check is
+        what reports it.  Only the defaulted slots are ambiguous, and the
+        sequence's length is not known until runtime, so each of those is
+        resolved against the real length there.
+
+        `_emit_user_call` and `_emit_user_call_fv` each carried their own copy
+        of this loop, so the bug had to be fixed twice and one copy was missed.
+        They share this one instead; the FV variant only has to pad its
+        parallel `arg_source_nodes` list afterwards.
+
+        Every element is read as a tagged `FpyValue` and only then narrowed to
+        what the parameter wants.  The required slots used to take the shortcut
+        of `_list_get_as_bare`, which unwraps by the sequence's *static*
+        element type — and that type is a single answer even for a sequence
+        that has no single answer, so `two(*[1, 2.5])` reinterpreted the
+        double's bits and printed 4612811918334230528.
+        BUG-SPLAT-HETEROGENEOUS-ELEM.
+        """
+        remaining = info.param_count - len(args)
+        elem_type = self._get_list_elem_type(seq_node)
+        splat_len = None
+        for i in range(remaining):
+            pos = len(args)
+            if pos < info.min_args:
+                _tag, _data = self._fv_list_get(list_val, ir.Constant(i64, i),
+                                                "splat.req")
+                args.append(self._splat_fv_to_param(
+                    self._fv_build_from_slots(_tag, _data),
+                    info, pos, elem_type))
+                continue
+            if splat_len is None:
+                splat_len = self.builder.sext(
+                    self.builder.call(self.runtime["list_length"], [list_val]),
+                    i64)
+            args.append(self._splat_elem_or_default(
+                list_val, i, splat_len, info, pos, elem_type))
+
+    def _splat_elem_or_default(
+        self, list_val: ir.Value, idx: int, splat_len: ir.Value,
+        info: "FuncInfo", pos: int, elem_type,
+    ) -> ir.Value:
+        """One defaulted parameter filled from `f(*seq)`, chosen at runtime.
+
+        Position *pos* has a default, so whether the splatted sequence reaches
+        it is a property of the sequence's length -- which is a runtime value.
+        Emits the equivalent of ``seq[idx] if idx < len(seq) else <default>``.
+        See BUG-STARARG-SPLAT-DEFAULT-PARAM.
+
+        The value is built as an FpyValue regardless of the element's static
+        kind, because the two arms need a common LLVM type and an element and
+        its default need not agree (``def f(v, n=1)`` splatted from a list of
+        strings).  For an FV-ABI callee that is also exactly what the argument
+        coercion wants -- `_wrap_arg_value` passes an FpyValue through
+        untouched -- so it is unwrapped again only for the bare-ABI path.
+
+        Mutable defaults go through `_load_cached_default` like everywhere
+        else: Python evaluates a default once at def-time, so re-evaluating
+        ``def f(x=[])`` per call would hand out a fresh list each time.
+        """
+        _blk_take = self._new_block("splat.take")
+        _blk_def = self._new_block("splat.default")
+        _blk_join = self._new_block("splat.join")
+
+        in_range = self.builder.icmp_signed(
+            "<", ir.Constant(i64, idx), splat_len)
+        self.builder.cbranch(in_range, _blk_take, _blk_def)
+
+        # The sequence is long enough — take the element, tag and all.
+        self.builder.position_at_end(_blk_take)
+        _tag_slot = self._create_entry_alloca(i32, "splat.el.tag")
+        _data_slot = self._create_entry_alloca(i64, "splat.el.data")
+        self.builder.call(
+            self.runtime["list_get_fv"],
+            [list_val, ir.Constant(i64, idx), _tag_slot, _data_slot])
+        _take_fv = self._fv_build_from_slots(self.builder.load(_tag_slot),
+                                             self.builder.load(_data_slot))
+        _blk_take_end = self.builder.block
+        self.builder.branch(_blk_join)
+
+        # The sequence stopped short — use the declared default.
+        self.builder.position_at_end(_blk_def)
+        di = pos - info.min_args
+        default_node = (info.defaults[di]
+                        if di < len(info.defaults) else None)
+        cached = self._load_cached_default(info.default_globals, di)
+        if cached is not None:
+            _def_fv = self._wrap_for_print(cached, default_node)
+        elif default_node is not None:
+            _def_fv = self._load_or_wrap_fv(default_node)
+        else:
+            _def_fv = self._fv_none()
+        _blk_def_end = self.builder.block
+        self.builder.branch(_blk_join)
+
+        self.builder.position_at_end(_blk_join)
+        phi = self.builder.phi(fpy_val, name="splat.arg")
+        phi.add_incoming(_take_fv, _blk_take_end)
+        phi.add_incoming(_def_fv, _blk_def_end)
+
+        return self._splat_fv_to_param(phi, info, pos, elem_type)
+
+    def _splat_fv_to_param(self, fv: ir.Value, info: "FuncInfo", pos: int,
+                            elem_type) -> ir.Value:
+        """Narrow a splatted element (an `FpyValue`) to what slot *pos* wants.
+
+        An FV-ABI callee wants the tagged value exactly as it is — that ABI
+        exists so the tag survives the call.  A bare-ABI one wants a naked
+        value, and the type to unwrap to is the *parameter's*, not the
+        splatted sequence's element type: a defaulted slot holds a default as
+        often as an element, and `def f(v, n=1)` splatted from a list of lists
+        would otherwise read the integer 1 back as a pointer.
+
+        The narrowing consults the runtime tag (`_splat_fv_as_double` /
+        `_splat_fv_as_i64`) rather than reinterpreting the bits, because
+        neither a heterogeneous sequence nor an element-or-default slot has a
+        single static kind to reinterpret from.
+        """
+        if info.uses_fv_abi:
+            return fv
+        _pt = None
+        if info.static_param_types and pos < len(info.static_param_types):
+            _pt = info.static_param_types[pos]
+        if _pt is None:
+            _pt = elem_type
+        if isinstance(_pt, ir.DoubleType):
+            return self._splat_fv_as_double(fv)
+        if isinstance(_pt, ir.IntType):
+            _iv = self._splat_fv_as_i64(fv)
+            return (self.builder.trunc(_iv, i32)
+                    if _pt.width == 32 else _iv)
+        if isinstance(_pt, ir.PointerType):
+            return self._fv_as_ptr(fv)
+        _ek = _pt.kind if isinstance(_pt, ValueType) else self._tag_kind(_pt)
+        if _ek == VKind.FLOAT:
+            return self._splat_fv_as_double(fv)
+        if _ek in (VKind.INT, VKind.BOOL):
+            return self._splat_fv_as_i64(fv)
+        return self._fv_as_ptr(fv)
+
+    def _splat_fv_is_float(self, fv: ir.Value) -> ir.Value:
+        """i1: does *fv* carry the FLOAT tag?"""
+        return self.builder.icmp_signed(
+            "==", self._fv_tag(fv), ir.Constant(i32, FPY_TAG_FLOAT))
+
+    def _splat_fv_as_double(self, fv: ir.Value) -> ir.Value:
+        """Read *fv* as a double, converting when it holds an int.
+
+        The two arms of the splat phi need not agree on kind — `f(v, n=1.5)`
+        fed from a list of ints takes the element on a long sequence and the
+        float default on a short one — so unwrapping to the parameter's
+        declared type has to consult the runtime tag.  Reinterpreting the
+        bits instead is how a splatted 2.5 came back as 4.6e18.
+        """
+        return self.builder.select(
+            self._splat_fv_is_float(fv),
+            self._fv_as_float(fv),
+            self.builder.sitofp(self._fv_data_i64(fv), double))
+
+    def _splat_fv_as_i64(self, fv: ir.Value) -> ir.Value:
+        """Read *fv* as an i64, truncating when it holds a float."""
+        return self.builder.select(
+            self._splat_fv_is_float(fv),
+            self.builder.fptosi(self._fv_as_float(fv), i64),
+            self._fv_data_i64(fv))
 
     def _wrap_arg_value(self, val: ir.Value, arg_node: ast.expr | None) -> ir.Value:
         """Wrap a bare argument value into an FpyValue for the FV-ABI call.
@@ -30245,57 +35250,9 @@ class CodeGen:
             obj = self._emit_expr_value(node.value)
             obj = self._ensure_ptr(obj)
             key = self._emit_expr_value(node.slice)
-            # Tuple/list keys: use generic FpyValue-keyed getter
-            _key_is_tuple = (isinstance(node.slice, (ast.Tuple, ast.List))
-                             or (isinstance(node.slice, ast.Name)
-                                 and node.slice.id in self.variables
-                                 and self._var_kind(node.slice.id)
-                                 in (VKind.LIST, VKind.TUPLE)))
-            if _key_is_tuple:
-                kt, kd = self._bare_to_tag_data(key, node.slice)
-                if (not isinstance(kd, ir.Constant)
-                        and isinstance(kd.type, ir.PointerType)):
-                    kd = self.builder.ptrtoint(kd, i64)
-                tag_slot = self._create_entry_alloca(i32, "dget.tag")
-                data_slot = self._create_entry_alloca(i64, "dget.data")
-                self.builder.call(self.runtime["dict_get_kv_fv"],
-                                  [obj, ir.Constant(i32, kt), kd,
-                                   tag_slot, data_slot])
-                return self._fv_build_from_slots(
-                    self.builder.load(tag_slot),
-                    self.builder.load(data_slot))
-            # FpyValue key (from fpy_val variable, e.g. key from dict
-            # iteration stored in an fpy_val alloca): extract tag+data and
-            # use the generic kv_fv getter which handles all key types.
-            if (isinstance(key.type, ir.LiteralStructType)
-                    and key.type == fpy_val):
-                key_tag = self.builder.extract_value(key, 0)
-                key_data = self.builder.extract_value(key, 1)
-                tag_slot = self._create_entry_alloca(i32, "dget.tag")
-                data_slot = self._create_entry_alloca(i64, "dget.data")
-                self.builder.call(self.runtime["dict_get_kv_fv"],
-                                  [obj, key_tag, key_data,
-                                   tag_slot, data_slot])
-                return self._fv_build_from_slots(
-                    self.builder.load(tag_slot),
-                    self.builder.load(data_slot))
-            if isinstance(key.type, ir.PointerType):
-                tag_slot = self._create_entry_alloca(i32, "dget.tag")
-                data_slot = self._create_entry_alloca(i64, "dget.data")
-                self.builder.call(self.runtime["dict_get_fv"],
-                                  [obj, key, tag_slot, data_slot])
-                return self._fv_build_from_slots(
-                    self.builder.load(tag_slot),
-                    self.builder.load(data_slot))
-            # i64 integer key (e.g. from sorted(dict) with int keys)
-            if isinstance(key.type, ir.IntType) and key.type.width == 64:
-                tag_slot = self._create_entry_alloca(i32, "dget.tag")
-                data_slot = self._create_entry_alloca(i64, "dget.data")
-                self.builder.call(self.runtime["dict_get_int_fv"],
-                                  [obj, key, tag_slot, data_slot])
-                return self._fv_build_from_slots(
-                    self.builder.load(tag_slot),
-                    self.builder.load(data_slot))
+            _loaded = self._emit_dict_load_by_key(obj, key, node.slice)
+            if _loaded is not None:
+                return self._fv_build_from_slots(*_loaded)
         # List / tuple subscript: load FV directly for runtime-tag print.
         # Tuples can have heterogeneous types (int, str, float, etc.),
         # so the only correct way to access an element is via the runtime
@@ -30582,6 +35539,12 @@ class CodeGen:
                     and isinstance(_recv.func, ast.Name)
                     and _recv.func.id in self._user_classes):
                 _is_obj_method_call = True
+        # ...but a method with no `return <expr>` never calls set_ret_tag at
+        # all, so get_ret_tag() would hand back whatever the last tagged return
+        # left behind. Fall through to _wrap_for_print, which knows the answer
+        # is None. See BUG-VOID-RETURNS-ZERO-NOT-NONE.
+        if _is_obj_method_call and self._call_is_void(node):
+            _is_obj_method_call = False
         if _is_obj_method_call:
             data = self._emit_expr_value(node)
             if (isinstance(data.type, ir.LiteralStructType)
@@ -30610,6 +35573,11 @@ class CodeGen:
         if (isinstance(value.type, ir.LiteralStructType)
                 and value.type == fpy_val):
             return value
+        # A call to a function/method with no `return <expr>` yields the
+        # placeholder `i64 0`, whose IR type says INT even though the Python
+        # value is None.  Print it as None.
+        if self._call_is_void(node):
+            return self._fv_none()
         # Constants: inline the tag
         if isinstance(node, ast.Constant):
             if node.value is None:
@@ -31127,14 +36095,88 @@ class CodeGen:
             return at
         return None
 
+    def _lookup_attr_vtype(self, cls_name: 'str | None',
+                           attr: str) -> 'ValueType | None':
+        """The recorded `ValueType` of `cls_name.attr`, or None if unknown.
+
+        Returning None rather than a default is the whole point: every caller
+        has a pre-existing fallback that is right often enough, and a guess
+        here would silently replace it.  When the class is unknown, the attr
+        name is claimed only if exactly one class defines it — the same
+        "decline rather than guess" rule `_scope_file_names` uses.
+        """
+        if cls_name:
+            return self._class_attr_vtypes.get(cls_name, {}).get(attr)
+        _found: 'ValueType | None' = None
+        for _c, _attrs in self._class_attr_vtypes.items():
+            _vt = _attrs.get(attr)
+            if _vt is None:
+                continue
+            if _found is not None and _found != _vt:
+                return None  # two classes disagree — no answer is safe
+            _found = _vt
+        return _found
+
+    def _method_call_ret_vtype(self, node: ast.expr) -> 'ValueType | None':
+        """The declared return type of `recv.meth()`, or None.
+
+        `_func_ret_types` records what a body returns, element kind included,
+        but every consumer looked it up by the callee's *bare* name — which a
+        method call cannot use, because two classes may each define `m` and a
+        module function may as well.  So `c.m()[1]` had no element kind and
+        fell to the INT default, measuring a pointer, while `g()[1]` on the
+        identical body was right: BUG-METHOD-RETURN-ELEM-KIND-LOST.  The CSA
+        pass now also records methods under `Cls.meth`; this resolves the
+        receiver's class and asks for that key, walking the MRO because an
+        inherited method is defined on the parent.
+        """
+        if not (isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)):
+            return None
+        recv = node.func.value
+        if isinstance(recv, ast.Name) and recv.id == "self":
+            cls_name = self._current_class
+        else:
+            cls_name = self._infer_object_class(recv)
+        if not cls_name:
+            return None
+        frt = getattr(self, "_func_ret_types", None) or {}
+        seen: set[str] = set()
+        while cls_name and cls_name not in seen:
+            seen.add(cls_name)
+            tag = frt.get(f"{cls_name}.{node.func.attr}")
+            if tag is not None:
+                return ValueType.from_old_tag(tag)
+            ci = self._user_classes.get(cls_name)
+            cls_name = ci.parent_name if ci else None
+        return None
+
     def _get_list_elem_type(self, node: ast.expr) -> 'ValueType':
         """Get the element type of a list expression."""
+        # Object attribute holding a container: the recorded type carries the
+        # element kind, where the `self.attr` walk below only fires inside the
+        # class and the `list_attrs` bucket carries nothing at all.
+        if isinstance(node, ast.Attribute) and not (
+                isinstance(node.value, ast.Name) and node.value.id == "self"):
+            _avt = self._lookup_attr_vtype(
+                self._infer_object_class(node.value), node.attr)
+            if _avt is not None and _avt.elem_type is not None:
+                return _avt.elem_type
+        # p.iterdir() yields Paths — checked first so the loop variable keeps
+        # its PATH tag and .name/str()/read_text() on it hit the native Path
+        # entry points instead of the generic FpyValue/bridge dispatch.
+        if self._is_path_iterdir_call(node):
+            return ValueType(VKind.PATH)
         # ClassName.__mro__ → elements are type proxy FpyObj instances
         if (isinstance(node, ast.Attribute)
                 and node.attr == "__mro__"
                 and isinstance(node.value, ast.Name)
                 and node.value.id in self._user_classes):
             return ValueType(VKind.OBJ)
+        # Native-module container attributes: sys.argv / sys.path hold strings
+        _nm = self._native_module_attr_vtype(node)
+        if _nm is not None and _nm.elem_type is not None:
+            return _nm.elem_type
         # self.attr on the current class: resolve through __init__ AST
         # to find the assignment `self.attr = [...]` and infer elem type
         # from the literal.  Also walks parent classes.
@@ -31298,12 +36340,28 @@ class CodeGen:
                 info = self._user_functions[node.func.id]
                 frt = getattr(self, '_func_ret_types', {})
                 _actual_ret = frt.get(node.func.id, info.ret_tag)
-                if _actual_ret == "ptr:list":
-                    return ValueType(VKind.LIST)
+                # `ptr:list` used to be the only element type a returned list
+                # could carry, because the CSA pass only ever asked "is it a
+                # list of lists".  Now that it names the element kind, read
+                # whatever it says — otherwise `return ["alpha"]` still hands
+                # the caller a list whose elements default to INT, and the
+                # string pointers read back as integers.
+                # BUG-RETURNED-LIST-ELEM-TAG-LOST.
+                _ret_vt = ValueType.from_old_tag(_actual_ret)
+                if (_ret_vt.kind == VKind.LIST
+                        and _ret_vt.elem_type is not None):
+                    return _ret_vt.elem_type
                 if info.ret_tag == "ptr":
                     rt = frt.get(node.func.id, "")
                     if self._tag_kind(rt) == VKind.TUPLE and ":" in str(rt):
                         return ValueType.from_old_tag(rt.split(":", 1)[1])
+        # The same question for `recv.meth()`.  Only `ast.Name` callees had an
+        # arm above, so a method's element kind was thrown away even though the
+        # analysis had computed it.  BUG-METHOD-RETURN-ELEM-KIND-LOST.
+        _mrt = self._method_call_ret_vtype(node)
+        if (_mrt is not None and _mrt.kind in _LIST_LIKE
+                and _mrt.elem_type is not None):
+            return _mrt.elem_type
         # Global variable whose element type isn't in the tag: look up the
         # module-level AST definition and infer element type from the literal.
         if isinstance(node, ast.Name):
@@ -31340,6 +36398,21 @@ class CodeGen:
         if (isinstance(node, ast.Subscript)
                 and isinstance(node.slice, ast.Slice)):
             return self._get_list_elem_type(node.value)
+        # Index subscript: `outer[0]` where `outer` is a list of lists.  The
+        # element type of that inner list is the *outer* element's own
+        # element type, which `outer` already records.  Only the slice case
+        # above had an arm, so this fell through to the INT default and
+        # `outer[0][0]` read a heap element back as its own address —
+        # `outer[0][0] == inner[0]` answered False while the identical read
+        # through a temporary (`x = outer[0]; x[0]`) was correct.
+        # BUG-BIGINT-COMPARES-BY-POINTER.
+        if (isinstance(node, ast.Subscript)
+                and not isinstance(node.slice, ast.Slice)
+                and self._is_list_expr(node.value)):
+            _outer_elem = self._get_list_elem_type(node.value)
+            if (_outer_elem.kind == VKind.LIST
+                    and _outer_elem.elem_type is not None):
+                return _outer_elem.elem_type
         # Infer from AST
         return self._infer_list_elem_type(node)
 
@@ -31541,6 +36614,12 @@ class CodeGen:
             return self._var_kind(node.id) == VKind.PYOBJ
         # Attribute on pyobj: User.objects where User is pyobj
         if isinstance(node, ast.Attribute):
+            # Natively-handled native-module container attributes (sys.argv,
+            # sys.path, sys.version_info) are real fastpy containers, not
+            # bridge PyObjects — subscript/iteration must use the native path,
+            # not cpython_getitem (which would deref a fastpy list as PyObject*).
+            if self._native_module_attr_vtype(node) is not None:
+                return False
             return self._is_pyobj_receiver(node.value,
                                            include_native_mod=include_native_mod)
         # Subscript on pyobj: data["key"] where data is pyobj
@@ -31684,6 +36763,90 @@ class CodeGen:
                 and isinstance(node.op, ast.Div)
                 and self._is_path_expr(node.left)):
             return True
+        # Path classmethod constructors: Path.cwd() yields a Path.
+        if (isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr in self._PATH_CLASSMETHODS
+                and not node.args
+                and self._is_path_class_ref(node.func.value)):
+            return True
+        return False
+
+    # pathlib.Path classmethods with a native runtime entry point. These are
+    # called on the CLASS, not on an instance, so they need a separate
+    # dispatch from _is_path_expr's instance-method handling.
+    _PATH_CLASSMETHODS = {"cwd": "path_cwd"}
+
+    def _is_path_class_ref(self, node: ast.expr) -> bool:
+        """True if `node` names the pathlib.Path CLASS itself (not an instance).
+
+        `Path.cwd()` looks like a method call whose receiver is `Path`, but that
+        receiver is a class, not a value. Without this check the generic
+        object-method path evaluates the bare name and hands
+        `fastpy_obj_call_method0` a non-object pointer (observed: 0x1), which is
+        undefined behavior — UBSan flags a misaligned FpyObj access.
+        """
+        if isinstance(node, ast.Name):
+            entry = getattr(self, '_native_imports', {}).get(node.id)
+            if entry and entry[0] == "pathlib" and entry[1] == "Path":
+                # `from pathlib import Path` also binds `Path` as a variable, so
+                # presence in self.variables does not disqualify it. Only a
+                # rebinding to an actual Path *instance* shadows the class.
+                return (node.id not in self.variables
+                        or self._var_kind(node.id) != VKind.PATH)
+            return False
+        # Module-qualified: pathlib.Path.cwd()
+        return (isinstance(node, ast.Attribute) and node.attr == "Path"
+                and isinstance(node.value, ast.Name)
+                and node.value.id == "pathlib")
+
+    def _is_path_iterdir_call(self, node: ast.expr) -> bool:
+        """True for `<path expr>.iterdir()` — the one Path method returning a
+        list.  Both runtimes materialize the listing into an FpyList* of
+        OBJ-tagged Paths, so it is a native list expression whose elements are
+        Paths, not an opaque CPython iterator."""
+        return (isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "iterdir"
+                and not node.args
+                and self._is_path_expr(node.func.value))
+
+    # Builtins and str methods that always produce a new string.  Shared by
+    # _expr_is_str and by the return-type inference in
+    # _analyze_function_signature, so the two can't drift out of sync — they
+    # did, and `def f(n): s = str(n); return s` inferred an i64 return and
+    # printed the pointer as an integer.
+    _STR_BUILTINS = frozenset(("str", "repr", "hex", "bin", "oct", "chr"))
+    _STR_METHODS = frozenset((
+        "upper", "lower", "strip", "lstrip", "rstrip", "replace",
+        "capitalize", "title", "swapcase", "center", "ljust", "rjust",
+        "zfill", "join", "format",
+    ))
+
+    def _expr_is_str(self, node: ast.expr) -> bool:
+        """True when an expression statically, unambiguously evaluates to a
+        `str`.  Conservative: a False answer only costs precision."""
+        if isinstance(node, ast.Constant):
+            return isinstance(node.value, str)
+        if isinstance(node, ast.JoinedStr):
+            return True
+        if isinstance(node, ast.Call):
+            if (isinstance(node.func, ast.Name)
+                    and node.func.id in self._STR_BUILTINS):
+                return True
+            if (isinstance(node.func, ast.Attribute)
+                    and node.func.attr in self._STR_METHODS):
+                # `d.items().join`-style false positives aren't possible: these
+                # names are str-only in the supported subset, except `format`
+                # which is also str-only here.
+                return True
+            return False
+        # `a if c else b` — a str only when both arms are.
+        if isinstance(node, ast.IfExp):
+            return self._expr_is_str(node.body) and self._expr_is_str(node.orelse)
+        # Concatenation / repetition of a known str.
+        if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Mult)):
+            return self._expr_is_str(node.left) or self._expr_is_str(node.right)
         return False
 
     def _is_list_expr(self, node: ast.expr) -> bool:
@@ -31693,6 +36856,10 @@ class CodeGen:
         # Ternary: `x if cond else []` → list if either branch is a list
         if isinstance(node, ast.IfExp):
             return self._is_list_expr(node.body) or self._is_list_expr(node.orelse)
+        # Native-module container attributes: sys.argv / sys.path → list
+        _nm = self._native_module_attr_vtype(node)
+        if _nm is not None and _nm.kind == VKind.LIST:
+            return True
 
         if isinstance(node, ast.Name) and node.id in self.variables:
             kind = self._var_kind(node.id)
@@ -31718,6 +36885,12 @@ class CodeGen:
                 and node.func.attr in ("split", "rsplit", "keys", "values", "items",
                                       "splitlines", "copy", "partition", "rpartition")):
             return True
+        # Path.iterdir() returns an FpyList* of Paths in both runtimes — see
+        # _infer_type_tag.  Recognising it here is what routes `for e in
+        # p.iterdir()` to _emit_for_list instead of the CPython iterator
+        # protocol (which does not link in pure mode).
+        if self._is_path_iterdir_call(node):
+            return True
         # dict.setdefault(key, default) / dict.get(key, default) — if the
         # default is a list, the result is a list.  Recognising this lets
         # chained mutations like d.setdefault("a", []).append(1) emit a
@@ -31735,11 +36908,16 @@ class CodeGen:
                 return True
         # List slicing returns a list
         if isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Slice):
-            if self._is_list_expr(node.value):
+            # `or _is_tuple_expr`: slicing a tuple yields a sequence exactly
+            # the same way, and asking only about lists is the same omission
+            # `_infer_type_tag`'s matching arm already corrects one screen up.
+            if (self._is_list_expr(node.value)
+                    or self._is_tuple_expr(node.value)):
                 return True
         # Indexing a list-of-lists returns a list
         if isinstance(node, ast.Subscript) and not isinstance(node.slice, ast.Slice):
-            if self._is_list_expr(node.value):
+            if (self._is_list_expr(node.value)
+                    or self._is_tuple_expr(node.value)):
                 elem_type = self._get_list_elem_type(node.value)
                 if elem_type.kind == VKind.LIST:
                     return True
@@ -31761,6 +36939,17 @@ class CodeGen:
         # Object attribute access: obj.attr where attr is a list
         if isinstance(node, ast.Attribute):
             obj_cls = self._infer_object_class(node.value)
+            # The recorded type overrules the bucket.  `list_attrs` is
+            # deliberately coarse — a tuple *parameter* is put in it so that
+            # iteration, `len` and indexing all work — but "list-ish" is the
+            # wrong answer for the one caller that asks in order to *skip* a
+            # conversion: `list(q.pos)` on a tuple attribute handed the tuple
+            # straight back.  Where `_class_attr_vtypes` knows the real kind,
+            # believe it; where it does not, the bucket is still the best
+            # available answer.
+            _avt = self._lookup_attr_vtype(obj_cls, node.attr)
+            if _avt is not None and _avt.kind == VKind.TUPLE:
+                return False
             if obj_cls and obj_cls in self._class_container_attrs:
                 list_attrs, _ = self._class_container_attrs[obj_cls]
                 if node.attr in list_attrs:
@@ -31878,6 +37067,26 @@ class CodeGen:
     def _is_tuple_expr(self, node: ast.expr) -> bool:
         if isinstance(node, ast.Tuple):
             return True
+        # Object attribute holding a tuple.  `_is_list_expr` has had the
+        # matching arm all along, via `_class_container_attrs`' list bucket —
+        # but a bucket cannot spell "tuple", so `self.t = ("a", [1, 2, 3])`
+        # was neither a list expression nor a tuple one, and `c.t[1]` fell
+        # past every element-type arm to the loaded i64, i.e. INT.  `for v in
+        # c.t[1]:` then took the native list loop over an FpyValue and
+        # segfaulted while the list spelling was correct.
+        # Answering through `_class_attr_vtypes` rather than widening the list
+        # bucket keeps `list(c.t)` a real conversion: were the attr simply
+        # added to `list_attrs`, `list()` would see "already a list" and hand
+        # back the tuple unchanged.
+        if isinstance(node, ast.Attribute):
+            _avt = self._lookup_attr_vtype(
+                self._infer_object_class(node.value), node.attr)
+            if _avt is not None and _avt.kind == VKind.TUPLE:
+                return True
+        # Native-module container attributes: sys.version_info → tuple
+        _nm = self._native_module_attr_vtype(node)
+        if _nm is not None and _nm.kind == VKind.TUPLE:
+            return True
         # ClassName.__mro__ → tuple of type proxy objects
         if (isinstance(node, ast.Attribute) and node.attr == "__mro__"
                 and isinstance(node.value, ast.Name)
@@ -31918,6 +37127,596 @@ class CodeGen:
             if node.func.attr == "as_integer_ratio":
                 return True
         return False
+
+    # ── Proving an expression is an int ────────────────────────────────
+    #
+    # Removing the two key-kind guesses in `_emit_for_dict` cost 1.69x on
+    # `set iterate 100K x 20`: "most sets are int sets" happened to be right
+    # for that workload, and dynamic dispatch is correct but slower.  A guess
+    # cannot come back, so the speed is won back by proving the same fact.
+    #
+    # Everything below is conservative in one direction on purpose.  A False
+    # is a slower loop; a wrong True is a miscompile of exactly the kind
+    # BUG-FOR-DICT-KEY-KIND-GUESSED was.  So a construct that isn't recognised
+    # makes the binding collector return None -- "something happened to this
+    # name I can't read" -- rather than being skipped, because a binding that
+    # goes unread is precisely how a name acquires a kind it doesn't have.
+
+    # Calls whose result is an int whatever the argument is.
+    _INT_CALLS = frozenset(("len", "int", "abs", "ord", "hash", "id"))
+
+    # Operators that keep two ints an int.  `/` is deliberately absent: it is
+    # true division and yields a float.
+    _INT_BINOPS = (ast.Add, ast.Sub, ast.Mult, ast.FloorDiv, ast.Mod,
+                   ast.Pow, ast.LShift, ast.RShift, ast.BitAnd, ast.BitOr,
+                   ast.BitXor)
+    _INT_UNARYOPS = (ast.UAdd, ast.USub, ast.Invert)
+
+    _SCOPE_NODES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
+
+    @staticmethod
+    def _is_int_const(node: ast.AST) -> bool:
+        """An int literal.  `bool` is excluded: `isinstance(True, int)` is
+        true, and a set of bools is not a set of ints to the tag machinery."""
+        return (isinstance(node, ast.Constant)
+                and isinstance(node.value, int)
+                and not isinstance(node.value, bool))
+
+    def _scope_map(self) -> dict:
+        """{id(node): enclosing function node, or None at module level}.
+
+        Built once per module and cached against the tree's identity; the
+        callers below ask it per name lookup, and rebuilding it each time
+        showed up as compile time.
+
+        A `ClassDef` is deliberately not a scope here: a statement in a class
+        body is not a separate variable environment for the names this cares
+        about, and treating it as one would only lose facts.
+        """
+        tree = getattr(self, "_csa_root_tree", None)
+        if tree is None:
+            return {}
+        cached = getattr(self, "_scope_map_cache", None)
+        if cached is not None and cached[0] is tree:
+            return cached[1]
+
+        smap = {id(tree): None}
+
+        def _walk(node, scope):
+            for child in ast.iter_child_nodes(node):
+                if isinstance(child, self._SCOPE_NODES):
+                    smap[id(child)] = scope
+                    _walk(child, child)
+                else:
+                    smap[id(child)] = scope
+                    _walk(child, scope)
+
+        _walk(tree, None)
+        self._scope_map_cache = (tree, smap)
+        self._scoped_binding_cache = {}
+        return smap
+
+    def _scope_of(self, node: ast.AST):
+        """The function node enclosing `node`, or None for module level."""
+        return self._scope_map().get(id(node))
+
+    def _scoped_bindings_of(self, name: str, scope):
+        """Every expression bound to `name` within `scope`, or None.
+
+        None means "give up": the name is a parameter, is declared `global` or
+        `nonlocal`, or is bound by a form not modelled here.  `scope` is
+        matched by identity, so a binding inside a nested `def` is not a
+        binding of this variable -- the scoping that
+        BUG-UNCALLED-FN-PARAM-NAME-POISONS-A-CALLED-ONE was about.
+        """
+        self._scope_map()                       # ensure the caches exist
+        cache = getattr(self, "_scoped_binding_cache", None)
+        if cache is None:
+            cache = self._scoped_binding_cache = {}
+        ckey = (name, id(scope))
+        if ckey in cache:
+            return cache[ckey]
+
+        result = self._collect_scoped_bindings(name, scope)
+        cache[ckey] = result
+        return result
+
+    def _collect_scoped_bindings(self, name: str, scope):
+        tree = getattr(self, "_csa_root_tree", None)
+        if tree is None:
+            return None
+        root = scope if scope is not None else tree
+
+        if isinstance(scope, self._SCOPE_NODES):
+            a = scope.args
+            params = [x.arg for x in (list(getattr(a, "posonlyargs", []))
+                                      + list(a.args) + list(a.kwonlyargs))]
+            if a.vararg:
+                params.append(a.vararg.arg)
+            if a.kwarg:
+                params.append(a.kwarg.arg)
+            if name in params:
+                # A parameter's kind comes from call sites, not from this
+                # walk.  Answering from the walk is the uncalled-function bug.
+                return None
+
+        out = []
+        for n in ast.walk(root):
+            if self._scope_of(n) is not scope:
+                continue
+
+            if isinstance(n, (ast.Global, ast.Nonlocal)):
+                if name in n.names:
+                    return None
+                continue
+
+            if isinstance(n, ast.Assign):
+                for tgt in n.targets:
+                    if isinstance(tgt, ast.Name) and tgt.id == name:
+                        out.append(n.value)
+                    elif self._target_binds_name(tgt, name):
+                        return None         # tuple / starred unpack: unread
+                continue
+
+            if isinstance(n, ast.AnnAssign):
+                if isinstance(n.target, ast.Name) and n.target.id == name:
+                    if n.value is not None:
+                        out.append(n.value)  # a bare annotation binds nothing
+                continue
+
+            if isinstance(n, ast.AugAssign):
+                if isinstance(n.target, ast.Name) and n.target.id == name:
+                    # `i += 1` is `i = i + 1`; modelling it as exactly that
+                    # lets the self-referential case use one code path.
+                    out.append(ast.BinOp(
+                        left=ast.Name(id=name, ctx=ast.Load()),
+                        op=n.op, right=n.value))
+                continue
+
+            if isinstance(n, ast.NamedExpr):
+                if isinstance(n.target, ast.Name) and n.target.id == name:
+                    out.append(n.value)
+                continue
+
+            if isinstance(n, (ast.For, ast.AsyncFor)):
+                if isinstance(n.target, ast.Name) and n.target.id == name:
+                    _it = n.iter
+                    if (isinstance(_it, ast.Call)
+                            and isinstance(_it.func, ast.Name)
+                            and _it.func.id == "range"):
+                        out.append(ast.Constant(value=0))   # range yields ints
+                    elif (isinstance(_it, (ast.List, ast.Tuple)) and _it.elts
+                            and all(self._is_int_const(e) for e in _it.elts)):
+                        out.append(ast.Constant(value=0))
+                    else:
+                        return None
+                elif self._target_binds_name(n.target, name):
+                    return None
+                continue
+
+            if isinstance(n, ast.comprehension):
+                if self._target_binds_name(n.target, name):
+                    return None
+                continue
+
+            if isinstance(n, (ast.With, ast.AsyncWith)):
+                for item in n.items:
+                    if (item.optional_vars is not None
+                            and self._target_binds_name(
+                                item.optional_vars, name)):
+                        return None
+                continue
+
+            if isinstance(n, ast.ExceptHandler):
+                if n.name == name:
+                    return None
+                continue
+
+            if isinstance(n, (ast.Import, ast.ImportFrom)):
+                for al in n.names:
+                    if (al.asname or al.name.split(".")[0]) == name:
+                        return None
+                continue
+
+            if isinstance(n, ast.Delete):
+                for t in n.targets:
+                    if isinstance(t, ast.Name) and t.id == name:
+                        return None
+                continue
+
+            if (isinstance(n, (ast.ClassDef,) + self._SCOPE_NODES)
+                    and getattr(n, "name", None) == name):
+                return None
+
+        return out
+
+    @staticmethod
+    def _target_binds_name(target: ast.AST, name: str) -> bool:
+        """Whether an assignment target binds `name` anywhere inside it."""
+        for t in ast.walk(target):
+            if isinstance(t, ast.Name) and t.id == name:
+                return True
+        return False
+
+    @staticmethod
+    def _expr_mentions_name(expr: ast.AST, name: str) -> bool:
+        for n in ast.walk(expr):
+            if isinstance(n, ast.Name) and n.id == name:
+                return True
+        return False
+
+    def _expr_is_provably_int(self, expr: ast.expr, scope,
+                              _seen=frozenset()) -> bool:
+        """Whether `expr`, evaluated in `scope`, is certainly an int."""
+        if self._is_int_const(expr):
+            return True
+
+        if (isinstance(expr, ast.Call) and isinstance(expr.func, ast.Name)
+                and expr.func.id in self._INT_CALLS):
+            return True
+
+        if (isinstance(expr, ast.UnaryOp)
+                and isinstance(expr.op, self._INT_UNARYOPS)):
+            return self._expr_is_provably_int(expr.operand, scope, _seen)
+
+        if (isinstance(expr, ast.BinOp)
+                and isinstance(expr.op, self._INT_BINOPS)):
+            return (self._expr_is_provably_int(expr.left, scope, _seen)
+                    and self._expr_is_provably_int(expr.right, scope, _seen))
+
+        if isinstance(expr, ast.Name):
+            key = (expr.id, id(scope))
+            if key in _seen:
+                # Reached this name while already proving it: the `i` in
+                # `i = i + 1`.  Assume int here, and require below that some
+                # *other* binding proves it without the assumption -- so a
+                # name defined only in terms of itself stays unproven.
+                return True
+            binds = self._scoped_bindings_of(expr.id, scope)
+            if not binds:
+                return False        # None (unreadable) or [] (never bound)
+            inner = _seen | {key}
+            grounded = False
+            for b in binds:
+                if not self._expr_is_provably_int(b, scope, inner):
+                    return False
+                if not self._expr_mentions_name(b, expr.id):
+                    grounded = True
+            return grounded
+
+        return False
+
+    def _set_elem_tag(self, node: ast.expr) -> 'str | None':
+        """"int" if a set provably holds only ints, else None.
+
+        Only `.add()` grows a set with a value that can be read here.
+        Anything else that could introduce an element -- `update`, `|=`,
+        `symmetric_difference_update` -- makes the answer None, because the
+        element came from a container whose kind is not being proven.
+
+        The search is confined to the scope `node` lives in, for the same
+        reason the counter lookup is: two functions may each have a local `s`
+        and they are not the same variable.  Walking the whole module would
+        not be *unsound* -- every `.add()` found anywhere would still have to
+        prove int, so a foreign str set could only turn the answer into None
+        -- but it would discard facts for nothing, and it is the habit that
+        caused the bug this is recovering the speed from.
+        """
+        if isinstance(node, ast.Set):
+            if not node.elts:
+                return None
+            return ("int" if all(self._is_int_const(e) for e in node.elts)
+                    else None)
+
+        if not isinstance(node, ast.Name):
+            return None
+        tree = getattr(self, "_csa_root_tree", None)
+        if tree is None:
+            return None
+
+        scope = self._scope_of(node)
+        root = scope if scope is not None else tree
+
+        _saw_int_evidence = False
+        for n in ast.walk(root):
+            if self._scope_of(n) is not scope:
+                continue
+
+            if (isinstance(n, ast.Assign) and len(n.targets) == 1
+                    and isinstance(n.targets[0], ast.Name)
+                    and n.targets[0].id == node.id):
+                _v = n.value
+                if (isinstance(_v, ast.Call) and isinstance(_v.func, ast.Name)
+                        and _v.func.id == "set" and not _v.args):
+                    continue                  # `s = set()` says nothing
+                if isinstance(_v, ast.Set) and _v.elts:
+                    if all(self._is_int_const(e) for e in _v.elts):
+                        _saw_int_evidence = True
+                        continue
+                return None
+
+            if (isinstance(n, ast.Call)
+                    and isinstance(n.func, ast.Attribute)
+                    and isinstance(n.func.value, ast.Name)
+                    and n.func.value.id == node.id):
+                _meth = n.func.attr
+                if _meth == "add" and len(n.args) == 1:
+                    if self._expr_is_provably_int(n.args[0], scope):
+                        _saw_int_evidence = True
+                        continue
+                    return None
+                if _meth in ("discard", "remove", "clear", "pop", "copy",
+                             "issubset", "issuperset", "isdisjoint"):
+                    continue                  # cannot introduce an element
+                return None
+
+            if (isinstance(n, ast.AugAssign)
+                    and isinstance(n.target, ast.Name)
+                    and n.target.id == node.id):
+                return None                   # `s |= other`
+
+        return "int" if _saw_int_evidence else None
+
+    def _dict_key_type_tag(self, node: ast.expr,
+                           vtype: 'ValueType') -> str:
+        """Static tag for the keys/elements produced by iterating `node`.
+
+        Returns a concrete tag only when the kind is *proven*; otherwise
+        "mixed", which is the compiler's word for "runtime dispatch needed" --
+        `_unwrap_fv_for_tag` passes MIXED through as a whole FpyValue instead
+        of unboxing it against a static kind.  Note it is *not* "unknown":
+        `ValueType._to_tag()` maps `VKind.UNKNOWN` to `"int"`, so an unknown
+        loop variable comes back out of any string-tag boundary claiming to be
+        an integer -- the exact failure this is here to prevent.
+
+        The old code returned "str" for any dict it couldn't prove int-keyed
+        and "int" for any set, i.e. it treated "no evidence" as evidence.  The
+        loop variable's FV carries the real tag from `dict_key_fv`, but the
+        static tag is what later statements build new FVs from, so an unproven
+        guess is miscompiled code rather than slow code.
+        """
+        if vtype.kind == VKind.SET:
+            # A set literal proves its element kind when the elements agree --
+            # here, or at the assignment this name was bound by.
+            _lit = node
+            if isinstance(node, ast.Name):
+                _lit = self._sole_binding_of(node.id)
+            if isinstance(_lit, ast.Set) and _lit.elts:
+                _only = self._sole_elem_tag(_lit.elts)
+                if _only is not None:
+                    return _only
+            # A set grown by `.add()` proves its element kind when every value
+            # added is provably an int.  This is what recovers the 1.69x that
+            # dropping the "most sets are int sets" guess cost -- by proof
+            # this time, so `set()` + `.add(<str>)` still answers "mixed".
+            if self._set_elem_tag(node) == "int":
+                return "int"
+            # A set whose ValueType carries a proven element type.  It has to
+            # be asked through `_proven_tag`, not `_to_tag()`: an elem_type of
+            # VKind.UNKNOWN converts to the *string* "int", which would sneak
+            # the same guess back in through a second door.
+            _et = self._proven_tag(vtype.elem_type)
+            return _et if _et is not None else "mixed"
+
+        # Dict literal: keys are right there.
+        if isinstance(node, ast.Dict):
+            _keys = [k for k in node.keys if k is not None]
+            _only = self._sole_elem_tag(_keys) if _keys else None
+            return _only if _only is not None else "mixed"
+
+        if isinstance(node, ast.Name):
+            if self._is_int_keyed_dict(node):
+                return "int"
+            if self._is_str_keyed_dict(node):
+                return "str"
+        return "mixed"
+
+    # The kinds whose `_to_tag()` string is a statement of fact.  Everything
+    # outside this set -- UNKNOWN, FVALUE, MIXED, and anything `_to_tag()`
+    # doesn't list and so answers with its "int" default -- is either an
+    # admission of ignorance or a request for dynamic dispatch, and neither
+    # may be handed to a caller that is going to stamp it into an FpyValue
+    # as a literal tag.
+    _PROVEN_ELEM_KINDS = frozenset((
+        VKind.INT, VKind.FLOAT, VKind.BOOL, VKind.STR, VKind.BYTES,
+        VKind.NONE, VKind.DICT, VKind.SET, VKind.TUPLE, VKind.LIST,
+        VKind.BIGINT, VKind.COMPLEX, VKind.DECIMAL, VKind.OBJ,
+    ))
+
+    def _proven_tag(self, vtype: 'ValueType | None') -> 'str | None':
+        """`vtype`'s tag if the kind is a fact, else None.
+
+        `ValueType._to_tag()` is lossy in the one direction that matters here:
+        it maps `VKind.UNKNOWN` and `VKind.FVALUE` to `"int"`, and falls back
+        to `"int"` for any kind missing from its table.  That is harmless for
+        its own callers, which use the tag to pick a calling convention, but
+        fatal for a caller deciding what a value *is* -- "I don't know" comes
+        back indistinguishable from "integer".  So kinds are whitelisted here
+        rather than filtered by comparing tag strings.
+        """
+        if vtype is None:
+            return None
+        if vtype.kind not in self._PROVEN_ELEM_KINDS:
+            return None
+        if vtype.kind in (VKind.LIST, VKind.TUPLE) and vtype.elem_type is not None:
+            # `_to_tag()` embeds the element tag ("list:int"), so an unproven
+            # element would be a lie one level down rather than at the top.
+            if self._proven_tag(vtype.elem_type) is None:
+                return "list" if vtype.kind == VKind.LIST else "tuple"
+        return vtype._to_tag()
+
+    def _sole_binding_of(self, name: str) -> 'ast.expr | None':
+        """The value of the one and only assignment to `name`, or None.
+
+        "One and only" is the point: two bindings mean the name's kind is not
+        settled by looking at either of them, so the answer has to be None
+        rather than whichever happened to be found first.
+        """
+        tree = getattr(self, "_csa_root_tree", None)
+        if tree is None:
+            return None
+        found = None
+        for n in ast.walk(tree):
+            if (isinstance(n, ast.Assign) and len(n.targets) == 1
+                    and isinstance(n.targets[0], ast.Name)
+                    and n.targets[0].id == name):
+                if found is not None:
+                    return None
+                found = n.value
+        return found
+
+    def _sole_elem_tag(self, nodes: 'list[ast.expr]') -> 'str | None':
+        """The one tag every node in `nodes` is, or None if they disagree or
+        any of them is not a literal we can read."""
+        tags = {self._const_elem_tag(n) for n in nodes}
+        if len(tags) != 1:
+            return None
+        only = tags.pop()
+        return only
+
+    @staticmethod
+    def _const_elem_tag(node: ast.expr) -> 'str | None':
+        """Tag for a literal element, or None if it isn't a literal we know.
+
+        `bool` is checked before `int` because `isinstance(True, int)` is true.
+        """
+        if isinstance(node, ast.JoinedStr):
+            return "str"
+        if not isinstance(node, ast.Constant):
+            return None
+        v = node.value
+        if isinstance(v, bool):
+            return "bool"
+        if isinstance(v, int):
+            return "int"
+        if isinstance(v, float):
+            return "float"
+        if isinstance(v, str):
+            return "str"
+        if isinstance(v, bytes):
+            return "bytes"
+        return None
+
+    def _is_str_keyed_dict(self, node: ast.expr) -> bool:
+        """Whether a dict provably has *string* keys.
+
+        The mirror image of `_is_int_keyed_dict`.  It exists because the two
+        questions are genuinely separate: "not provably int-keyed" is not the
+        same claim as "str-keyed", and conflating them is what let an
+        unprovable int-keyed dict be compiled as a str-keyed one.  Only
+        patterns that pin every key to a string answer True; anything mixed,
+        computed, or unseen answers False and the caller falls back to a
+        dynamic tag.
+        """
+        if isinstance(node, ast.Dict):
+            _keys = [k for k in node.keys if k is not None]
+            if not _keys:
+                return False
+            return all(self._const_elem_tag(k) == "str" for k in _keys)
+
+        if isinstance(node, ast.DictComp):
+            _key = node.key
+            if isinstance(_key, ast.JoinedStr):
+                return True
+            if (isinstance(_key, ast.Call)
+                    and isinstance(_key.func, ast.Name)
+                    and _key.func.id in ("str", "chr", "repr", "hex", "bin")):
+                return True
+            if self._const_elem_tag(_key) == "str":
+                return True
+            return False
+
+        if not isinstance(node, ast.Name):
+            return False
+
+        tree = getattr(self, "_csa_root_tree", None)
+        if tree is None:
+            return False
+
+        # Every binding and every key-store we can see must say "str", and we
+        # must have seen at least one of them.  A single store we can't
+        # classify (a computed key, a call result) makes the whole answer
+        # False -- an unproven claim is exactly what this is here to avoid.
+        _saw_str_evidence = False
+        for n in ast.walk(tree):
+            if (isinstance(n, ast.Assign) and len(n.targets) == 1
+                    and isinstance(n.targets[0], ast.Name)
+                    and n.targets[0].id == node.id):
+                _v = n.value
+                if isinstance(_v, ast.Dict):
+                    _keys = [k for k in _v.keys if k is not None]
+                    if not _keys:
+                        continue  # `d = {}` says nothing about key kind
+                    if all(self._const_elem_tag(k) == "str" for k in _keys):
+                        _saw_str_evidence = True
+                        continue
+                return False
+            # d[<key>] = ... and d[<key>] += ...
+            _slice = None
+            if (isinstance(n, ast.Assign) and len(n.targets) == 1
+                    and isinstance(n.targets[0], ast.Subscript)
+                    and isinstance(n.targets[0].value, ast.Name)
+                    and n.targets[0].value.id == node.id):
+                _slice = n.targets[0].slice
+            elif (isinstance(n, ast.AugAssign)
+                    and isinstance(n.target, ast.Subscript)
+                    and isinstance(n.target.value, ast.Name)
+                    and n.target.value.id == node.id):
+                _slice = n.target.slice
+            elif (isinstance(n, ast.Call)
+                    and isinstance(n.func, ast.Attribute)
+                    and n.func.attr == "setdefault"
+                    and isinstance(n.func.value, ast.Name)
+                    and n.func.value.id == node.id
+                    and n.args):
+                _slice = n.args[0]
+            if _slice is None:
+                continue
+            if self._const_elem_tag(_slice) == "str":
+                _saw_str_evidence = True
+                continue
+            return False
+        return _saw_str_evidence
+
+    def _csa_tag_for_param(self, param_name: str) -> 'str | None':
+        """Call-site type recorded for `param_name` **of the function now
+        being emitted**, or None if there isn't one.
+
+        Per-parameter facts have to be keyed by *(function, parameter)*, never
+        by the parameter's bare name.  Parameter names are scoped, so the same
+        name legitimately appears in many functions with unrelated types, and
+        `_call_site_param_types` only has entries for functions that are
+        actually called.  A bare-name search across the module therefore lets
+        an *uncalled* function -- which has no call-site evidence at all, so
+        answers "no type" -- shadow the called function whose parameter is
+        genuinely typed.  That is BUG-UNCALLED-FN-PARAM-NAME-POISONS-A-CALLED-ONE:
+        a dead `def unused(data)` sitting above a live `def mode(data)` made
+        `mode`'s `data` look untyped, which turned an int-keyed dict into a
+        str-keyed one and made the loop variable get dereferenced as a string
+        pointer.
+
+        `_uniquify_nested_def_names` fixes the same hazard for *function*
+        names by alpha-renaming; parameter names can't be uniquified (they're
+        legitimately scoped), so the lookup itself must carry the scope.
+        `self._current_func_name` is that scope: codegen sets it around every
+        function body, so it is exactly the function whose statement we are
+        emitting.
+        """
+        fname = getattr(self, "_current_func_name", None)
+        if not fname:
+            return None
+        fn_ast = getattr(self, "_csa_func_asts", {}).get(fname)
+        if fn_ast is None:
+            return None
+        params = [a.arg for a in fn_ast.args.args]
+        params += [a.arg for a in getattr(fn_ast.args, "kwonlyargs", [])]
+        if param_name not in params:
+            return None
+        idx = params.index(param_name)
+        csa = getattr(self, "_call_site_param_types", {}).get(fname, [])
+        if idx >= len(csa):
+            return None
+        return csa[idx]
 
     def _is_int_keyed_dict(self, node: ast.expr) -> bool:
         """Check if a dict expression uses integer keys (from dict comp with
@@ -32144,19 +37943,13 @@ class CodeGen:
                             # "list" (plain) → int elements (default).
                             # "list:str" → string elements → NOT int.
                             if not _found_iter_def:
-                                _csa = getattr(self, '_call_site_param_types', {})
-                                for _fn2 in ast.walk(tree):
-                                    if not isinstance(_fn2, ast.FunctionDef):
-                                        continue
-                                    _prms = [a.arg for a in _fn2.args.args]
-                                    if _iter.id not in _prms:
-                                        continue
-                                    _pi = _prms.index(_iter.id)
-                                    _fcsa = _csa.get(_fn2.name, [])
-                                    if (_pi < len(_fcsa)
-                                            and self._tag_kind(_fcsa[_pi]) == VKind.LIST):
-                                        return True
-                                    break
+                                # Scoped to the function being emitted; see
+                                # _csa_tag_for_param for why a bare-name
+                                # search across the module is a bug.
+                                _ptag = self._csa_tag_for_param(_iter.id)
+                                if (_ptag is not None
+                                        and self._tag_kind(_ptag) == VKind.LIST):
+                                    return True
         return False
 
     def _func_returns_int_keyed_dict(self, func_ast: ast.FunctionDef) -> bool:
@@ -32289,7 +38082,17 @@ class CodeGen:
                         return True
         # Indexing a list of dicts or dict-of-dicts returns a dict
         if isinstance(node, ast.Subscript) and not isinstance(node.slice, ast.Slice):
-            if self._is_list_expr(node.value):
+            # A *tuple* of dicts indexes to a dict for exactly the same
+            # reason, and this arm asking only about lists is what made
+            # `self.dicts = ({"a": 1}, {"b": 2})` then `h.dicts[1]["c"]`
+            # raise "string index out of range": with no dict arm the outer
+            # subscript fell through to the str path and indexed the dict's
+            # own pointer as characters.  It stayed invisible only while
+            # tuple attributes were invisible too — the moment
+            # `_class_attr_vtypes` let `h.dicts` be recognised as a tuple,
+            # this consumer started answering "not a dict" out loud.
+            if (self._is_list_expr(node.value)
+                    or self._is_tuple_expr(node.value)):
                 elem_type = self._get_list_elem_type(node.value)
                 if elem_type.kind == VKind.DICT:
                     return True
@@ -32449,6 +38252,31 @@ class CodeGen:
             return self._is_bigint_expr(node.operand)
         return False
 
+    def _is_decimal_expr(self, node: ast.expr) -> bool:
+        """Check if an expression evaluates to a Decimal value.
+
+        Deliberately narrower than `_is_bigint_expr`: a BinOp is not walked,
+        because `Decimal("1") + 2` is a Decimal but `2 + 2` is not, and the
+        operand kinds are what decide it.  A name and a `Decimal(...)` call
+        are enough for the callers that exist.
+        """
+        if isinstance(node, ast.Name) and node.id in self.variables:
+            return self._var_kind(node.id) == VKind.DECIMAL
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id == "Decimal"):
+            return True
+        if isinstance(node, ast.Subscript) and not isinstance(node.slice,
+                                                              ast.Slice):
+            # An element read out of a Decimal-element container is a Decimal,
+            # exactly as the name it was read into would be.  Without this arm
+            # `d = Decimal("1.5"); z = [...]; d < z[1]` saw a Decimal on one
+            # side only and compared it against the element's *pointer* as an
+            # integer, answering False.  Same hole and same fix as
+            # `_is_complex_expr`'s Subscript arm below.
+            # BUG-DECIMAL-SUBSCRIPT-NOT-DECIMAL-EXPR.
+            return self._infer_type_tag(node, None).kind == VKind.DECIMAL
+        return False
+
     def _is_complex_expr(self, node: ast.expr) -> bool:
         """Check if an expression evaluates to a complex number."""
         if isinstance(node, ast.Constant) and isinstance(node.value, complex):
@@ -32463,17 +38291,65 @@ class CodeGen:
                     or self._is_complex_expr(node.right))
         if isinstance(node, ast.UnaryOp):
             return self._is_complex_expr(node.operand)
+        if isinstance(node, ast.Subscript) and not isinstance(node.slice,
+                                                              ast.Slice):
+            # An element read out of a complex-element container is complex,
+            # exactly as the name it was read into would be.  Without this arm
+            # `c = [1 + 2j, 1j]; c[0] + c[1]` typed the *BinOp* INT — the
+            # subscript itself was already typed COMPLEX by `_infer_type_tag`,
+            # but the BinOp arm above asks this predicate, not that one — so
+            # print() rendered the resulting FpyComplex* as an integer
+            # (`2716821164608`).  BUG-COMPLEX-SUBSCRIPT-NOT-COMPLEX-EXPR.
+            #
+            # Deferring to `_infer_type_tag` rather than re-deriving the
+            # element kind here keeps the one definition of "what kind does
+            # this subscript yield", the same way `_emit_list_append_expr` and
+            # `_infer_list_elem_type` were collapsed onto it.  The recursion
+            # terminates: the Subscript arm of `_infer_type_tag` only ever
+            # descends into `node.value`, a strictly smaller node.
+            return self._infer_type_tag(node, None).kind == VKind.COMPLEX
         return False
 
-    def _is_bytes_expr(self, node: ast.expr) -> bool:
-        """Check if an expression evaluates to a bytes value."""
+    def _is_bytes_expr(self, node: ast.expr, env: dict | None = None) -> bool:
+        """Check if an expression evaluates to a bytes value.
+
+        `env` is an optional name → type-tag map consulted ahead of
+        `self.variables`.  The static pre-passes (list element-type inference,
+        for one) run before any variable has been emitted, so they carry their
+        own name table; without a way to hand it in they had to re-implement
+        this predicate and inevitably re-implemented it incompletely.
+        """
         if isinstance(node, ast.Constant) and isinstance(node.value, bytes):
             return True
-        if isinstance(node, ast.Name) and node.id in self.variables:
-            return self._var_kind(node.id) == VKind.BYTES
+        if isinstance(node, ast.Name):
+            if env is not None and node.id in env:
+                return self._tag_kind(env[node.id]) == VKind.BYTES
+            if node.id in self.variables:
+                return self._var_kind(node.id) == VKind.BYTES
         if isinstance(node, ast.BinOp):
-            return (self._is_bytes_expr(node.left)
-                    or self._is_bytes_expr(node.right))
+            return (self._is_bytes_expr(node.left, env)
+                    or self._is_bytes_expr(node.right, env))
+        if isinstance(node, ast.Call):
+            # `ob() + b"d"` used to lose the kind that `b = ob(); b + b"d"`
+            # kept, because only a *variable* could be known to hold bytes.
+            # The declared return tag says the same thing one step earlier.
+            # BUG-BYTES-RETURN-TAG-LOST.
+            if isinstance(node.func, ast.Attribute):
+                return node.func.attr == "encode"
+            if isinstance(node.func, ast.Name):
+                if node.func.id == "bytes":
+                    return True
+                _fn = self._user_functions.get(node.func.id)
+                if _fn is not None:
+                    return self._tag_kind(_fn.ret_tag) == VKind.BYTES
+                _frt = getattr(self, '_func_ret_types', {}).get(node.func.id)
+                if _frt is not None:
+                    return self._tag_kind(_frt) == VKind.BYTES
+        if isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Slice):
+            # A slice keeps the kind of what it came from, so `b[1:3] + b"XY"`
+            # is a bytes concat.  An *integer* index does not — `b[0]` is an
+            # int — hence the Slice test.  BUG-BYTES-SLICE-VIA-STR.
+            return self._is_bytes_expr(node.value, env)
         return False
 
     def _emit_complex_binop(self, node: ast.BinOp,
@@ -32546,6 +38422,71 @@ class CodeGen:
         if isinstance(val.type, ir.IntType):
             return self.builder.sitofp(val, double)
         return val
+
+    # Operator → `fastpy_fv_binop` opcode.  Shared by the generic dispatch at
+    # the end of `_emit_binop_unknown` and by the fallback edge of its inlined
+    # fast paths, which must agree on the encoding.
+    _FV_BINOP_OPCODES = {ast.Add: 0, ast.Sub: 1, ast.Mult: 2, ast.Div: 3,
+                         ast.FloorDiv: 4, ast.Mod: 5,
+                         ast.BitAnd: 6, ast.BitOr: 7, ast.BitXor: 8,
+                         ast.LShift: 9, ast.RShift: 10}
+
+    def _fv_tag_is_plain_scalar(self, tag: 'ir.Value') -> 'ir.Value':
+        """i1: is *tag* INT, FLOAT or BOOL — a value that fits in an i64/double?
+
+        The inlined arithmetic fast paths convert their operands with
+        `sitofp`/`bitcast`, which is meaningful only for these three.  BIGINT,
+        DECIMAL, COMPLEX and every non-numeric tag carry a *pointer* in `data`
+        and must be routed to the runtime instead.
+        """
+        return self.builder.or_(
+            self.builder.or_(
+                self.builder.icmp_unsigned(
+                    "==", tag, ir.Constant(i32, FPY_TAG_INT)),
+                self.builder.icmp_unsigned(
+                    "==", tag, ir.Constant(i32, FPY_TAG_FLOAT))),
+            self.builder.icmp_unsigned(
+                "==", tag, ir.Constant(i32, FPY_TAG_BOOL)))
+
+    def _fv_tag_is_integral(self, tag: 'ir.Value') -> 'ir.Value':
+        """i1: does *tag* denote a value the integer edge can handle?
+
+        That is INT **or BOOL**.  CPython's `bool` is a subclass of `int` and
+        behaves as one in arithmetic — `True + 3` is `4`, `True << 2` is `4`,
+        `True % 2` is `1` — so a BOOL operand belongs on the same edge as an
+        INT one.  The inlined splits used to test `== INT` alone, which sent
+        every bool down the *float* edge: `[3, 4.5, True][2] + 3` printed
+        `4.0`, `True % 2` bitcast the integer result and printed `5e-324`,
+        and `True << 2` raised `unsupported operand type(s) for <<: 'float'
+        and 'float'`.  BUG-BOOL-PLUS-INT-YIELDS-FLOAT.
+        """
+        return self.builder.or_(
+            self.builder.icmp_unsigned(
+                "==", tag, ir.Constant(i32, FPY_TAG_INT)),
+            self.builder.icmp_unsigned(
+                "==", tag, ir.Constant(i32, FPY_TAG_BOOL)))
+
+    def _fv_int_result_tag(self, op, ltag, rtag) -> 'ir.Value':
+        """Tag for a result computed on the integer edge of an FV binop.
+
+        Almost always INT.  The one exception is CPython's rule that `&`, `|`
+        and `^` of two *bools* stay a bool — `True & False` is `False`, not
+        `0` — while every other operator on bools widens to a plain int
+        (`True + True` is `2`, `True << 1` is `2`).  So the bool result tag
+        is conditional on both operands being BOOL at runtime, which is only
+        knowable here as a `select`.
+        """
+        if (op not in (ast.BitAnd, ast.BitOr, ast.BitXor)
+                or ltag is None or rtag is None):
+            return ir.Constant(i32, FPY_TAG_INT)
+        both_bool = self.builder.and_(
+            self.builder.icmp_unsigned(
+                "==", ltag, ir.Constant(i32, FPY_TAG_BOOL)),
+            self.builder.icmp_unsigned(
+                "==", rtag, ir.Constant(i32, FPY_TAG_BOOL)))
+        return self.builder.select(both_bool,
+                                   ir.Constant(i32, FPY_TAG_BOOL),
+                                   ir.Constant(i32, FPY_TAG_INT))
 
     def _emit_binop_unknown(self, node, ltv, rtv, lk, rk, op):
         """Handle binop when either operand has VKind.UNKNOWN or FVALUE (runtime-tag dispatch)."""
@@ -32628,16 +38569,28 @@ class CodeGen:
                           and _nr.type.width == 64
                           else self.builder.sext(_nr, i64)
                           if isinstance(_nr.type, ir.IntType) else _nr)
-                # Check if both are INT
+                # Check if both are integral (INT or BOOL — see
+                # `_fv_tag_is_integral`; a bool is an int in CPython)
                 _n_both_int = self.builder.and_(
-                    self.builder.icmp_unsigned(
-                        "==", l_tag, ir.Constant(i32, FPY_TAG_INT)),
-                    self.builder.icmp_unsigned(
-                        "==", r_tag, ir.Constant(i32, FPY_TAG_INT)))
+                    self._fv_tag_is_integral(l_tag),
+                    self._fv_tag_is_integral(r_tag))
                 _n_int_blk = self._new_block("unkn.num_int")
                 _n_flt_blk = self._new_block("unkn.num_flt")
                 _n_join = self._new_block("unkn.num_join")
-                self.builder.cbranch(_n_both_int, _n_int_blk, _n_flt_blk)
+                # As in the `_uu` split below: the float edge is only correct
+                # for tags whose `data` really is a number, so anything else
+                # goes to the runtime rather than having its pointer bitcast
+                # to a double.  `abs(-b) + abs(b)` on a BigInt landed here —
+                # both operands are BIGINT-tagged — and printed a float.
+                # BUG-BIGINT-FV-RESULT-NOT-CONSUMED.
+                _n_gen_blk = self._new_block("unkn.num_gen")
+                _n_pick = self._new_block("unkn.num_pick")
+                self.builder.cbranch(_n_both_int, _n_int_blk, _n_pick)
+                self.builder.position_at_end(_n_pick)
+                self.builder.cbranch(
+                    self.builder.and_(self._fv_tag_is_plain_scalar(l_tag),
+                                      self._fv_tag_is_plain_scalar(r_tag)),
+                    _n_flt_blk, _n_gen_blk)
                 # ── both-INT sub-path: integer addition ──
                 self.builder.position_at_end(_n_int_blk)
                 _n_ires = self._emit_int_binop(
@@ -32693,13 +38646,29 @@ class CodeGen:
                         else self.builder.ptrtoint(_n_fres, i64)
                 self.builder.branch(_n_join)
                 _n_flt_end = self.builder.block
+                # ── generic sub-path: BigInt, Decimal, complex, … ──
+                self.builder.position_at_end(_n_gen_blk)
+                _n_ot = self._create_entry_alloca(i32, "ngen.tag")
+                _n_od = self._create_entry_alloca(i64, "ngen.data")
+                self.builder.call(
+                    self.runtime["fv_binop"],
+                    [l_tag, _nl_i64, r_tag, _nr_i64,
+                     ir.Constant(i32, self._FV_BINOP_OPCODES[ast.Add]),
+                     _n_ot, _n_od])
+                self._emit_try_bail_if_exc()
+                _n_gtag = self.builder.load(_n_ot)
+                _n_gdata = self.builder.load(_n_od)
+                self.builder.branch(_n_join)
+                _n_gen_end = self.builder.block
                 # ── numeric merge ──
                 self.builder.position_at_end(_n_join)
                 _n_tphi = self.builder.phi(i32, "unkn.num.tag")
                 _n_tphi.add_incoming(_n_itag, _n_int_end)
                 _n_tphi.add_incoming(
                     ir.Constant(i32, FPY_TAG_FLOAT), _n_flt_end)
+                _n_tphi.add_incoming(_n_gtag, _n_gen_end)
                 _n_dphi = self.builder.phi(i64, "unkn.num.data")
+                _n_dphi.add_incoming(_n_gdata, _n_gen_end)
                 _n_dphi.add_incoming(_n_idata, _n_int_end)
                 _n_dphi.add_incoming(_n_fdata, _n_flt_end)
                 num_as_i64 = _n_dphi
@@ -32758,44 +38727,43 @@ class CodeGen:
                     _unkn_i64 = unkn_raw if unkn_raw.type.width == 64 \
                         else self.builder.sext(unkn_raw, i64)
             if _rt_tag is not None and _unkn_i64 is not None:
-                _is_int = self.builder.icmp_unsigned(
-                    "==", _rt_tag, ir.Constant(i32, FPY_TAG_INT))
+                _is_int = self._fv_tag_is_integral(_rt_tag)
                 _int_bb = self._new_block("unkn_int.iarith")
                 _flt_bb = self._new_block("unkn_int.farith")
                 _mrg_bb = self._new_block("unkn_int.merge")
-                # When BigInt promotion is possible, the UNKNOWN operand
-                # might be BIGINT at runtime (e.g., after overflow in a
-                # loop).  Add a BIGINT branch that routes through fv_binop
-                # which handles all BigInt operations correctly.
-                _big_bb = None
-                if self._program_uses_bigint:
-                    _is_big = self.builder.icmp_unsigned(
-                        "==", _rt_tag, ir.Constant(i32, FPY_TAG_BIGINT))
-                    _big_bb = self._new_block("unkn_int.bigint")
-                    _notbig_bb = self._new_block("unkn_int.notbig")
-                    self.builder.cbranch(_is_big, _big_bb, _notbig_bb)
-                    # ── BIGINT path: dispatch through fv_binop ──
-                    self.builder.position_at_end(_big_bb)
-                    _fv_ops = {ast.Add: 0, ast.Sub: 1, ast.Mult: 2,
-                               ast.Div: 3, ast.FloorDiv: 4, ast.Mod: 5}
-                    _opc = _fv_ops.get(op, 0)
-                    _big_ot = self._create_entry_alloca(i32, "ubig.tag")
-                    _big_od = self._create_entry_alloca(i64, "ubig.data")
-                    _int_tag_c = ir.Constant(i32, FPY_TAG_INT)
-                    if unkn_left:
-                        self.builder.call(self.runtime["fv_binop"],
-                            [_rt_tag, _unkn_i64, _int_tag_c, int_val,
-                             ir.Constant(i32, _opc), _big_ot, _big_od])
-                    else:
-                        self.builder.call(self.runtime["fv_binop"],
-                            [_int_tag_c, int_val, _rt_tag, _unkn_i64,
-                             ir.Constant(i32, _opc), _big_ot, _big_od])
-                    _big_tag = self.builder.load(_big_ot)
-                    _big_data = self.builder.load(_big_od)
-                    self.builder.branch(_mrg_bb)
-                    _big_end = self.builder.block
-                    self.builder.position_at_end(_notbig_bb)
-                self.builder.cbranch(_is_int, _int_bb, _flt_bb)
+                # The FLOAT edge below bitcasts `_unkn_i64` to a double, which
+                # is only meaningful when the runtime tag says that i64 really
+                # holds a number.  BIGINT, DECIMAL, COMPLEX, STR and LIST all
+                # keep a *pointer* there, so `[Decimal("1.5"), 1][0] + 1` read
+                # the Decimal's address as a denormal double and printed
+                # `1.0`.  BUG-UNKNOWN-INT-BINOP-FLOAT-EDGE.
+                #
+                # This is the third copy of the same two-way split — see
+                # BUG-BIGINT-FV-RESULT-NOT-CONSUMED for the other two — and it
+                # takes the same answer: guard the float edge with a real
+                # "the tag is a plain scalar" test and give everything else a
+                # third edge to `fastpy_fv_binop`, which handles every tag
+                # combination (BigInt, Decimal, str concat, and the TypeErrors)
+                # correctly.
+                #
+                # That generic edge subsumes the BIGINT-only branch this block
+                # used to carry, which was both narrower — one tag out of the
+                # five that break the float edge — and gated on
+                # `_program_uses_bigint`, a condition the runtime tag does not
+                # respect: a value can arrive BIGINT-tagged through a list or a
+                # call without the program mentioning a big literal at all.
+                _gen_opc = self._FV_BINOP_OPCODES.get(op)
+                _gen_bb = (self._new_block("unkn_int.gen")
+                           if _gen_opc is not None else None)
+                if _gen_bb is not None:
+                    _pick_bb = self._new_block("unkn_int.pick")
+                    self.builder.cbranch(_is_int, _int_bb, _pick_bb)
+                    self.builder.position_at_end(_pick_bb)
+                    self.builder.cbranch(
+                        self._fv_tag_is_plain_scalar(_rt_tag),
+                        _flt_bb, _gen_bb)
+                else:
+                    self.builder.cbranch(_is_int, _int_bb, _flt_bb)
                 # ── INT path: integer arithmetic ──
                 self.builder.position_at_end(_int_bb)
                 if unkn_left:
@@ -32848,6 +38816,26 @@ class CodeGen:
                         else self.builder.ptrtoint(_fres, i64)
                 self.builder.branch(_mrg_bb)
                 _flt_end = self.builder.block
+                # ── GENERIC path: every tag the two edges above misread ──
+                _gen_end = _gen_tag = _gen_data = None
+                if _gen_bb is not None:
+                    self.builder.position_at_end(_gen_bb)
+                    _gen_ot = self._create_entry_alloca(i32, "ugen.tag")
+                    _gen_od = self._create_entry_alloca(i64, "ugen.data")
+                    _int_tag_c = ir.Constant(i32, FPY_TAG_INT)
+                    if unkn_left:
+                        _gen_args = [_rt_tag, _unkn_i64, _int_tag_c, int_val]
+                    else:
+                        _gen_args = [_int_tag_c, int_val, _rt_tag, _unkn_i64]
+                    self.builder.call(
+                        self.runtime["fv_binop"],
+                        _gen_args + [ir.Constant(i32, _gen_opc),
+                                     _gen_ot, _gen_od])
+                    self._emit_try_bail_if_exc()
+                    _gen_tag = self.builder.load(_gen_ot)
+                    _gen_data = self.builder.load(_gen_od)
+                    self.builder.branch(_mrg_bb)
+                    _gen_end = self.builder.block
                 # ── Merge: FpyValue with runtime-correct tag ──
                 self.builder.position_at_end(_mrg_bb)
                 _tag_phi = self.builder.phi(i32, "unkn_int.tag")
@@ -32857,18 +38845,24 @@ class CodeGen:
                 _data_phi = self.builder.phi(i64, "unkn_int.data")
                 _data_phi.add_incoming(_idata, _int_end)
                 _data_phi.add_incoming(_fdata, _flt_end)
-                # Add BIGINT incoming edge if the branch exists
-                if _big_bb is not None:
-                    _tag_phi.add_incoming(_big_tag, _big_end)
-                    _data_phi.add_incoming(_big_data, _big_end)
+                if _gen_end is not None:
+                    _tag_phi.add_incoming(_gen_tag, _gen_end)
+                    _data_phi.add_incoming(_gen_data, _gen_end)
                 return self._fv_build_from_slots(_tag_phi, _data_phi)
 
         # ── UNKNOWN + UNKNOWN: runtime branch preserving int-ness ──
         # When both operands are UNKNOWN FpyValue structs (e.g. two
         # dict.get() calls), check if both are INT at runtime and use
         # integer arithmetic if so.
+        # Exclude bitwise/shift ops here: the int/float split below can't
+        # handle a BIGINT operand at runtime (the both-INT check fails and
+        # it would route a BigInt pointer through _emit_float_binop).  Let
+        # bitwise ops fall through to the general fv_binop dispatch, which
+        # promotes to BigInt correctly (BUG-BIGINT-BITWISE-DYNAMIC).
+        _BITWISE_UNKN = (ast.BitAnd, ast.BitOr, ast.BitXor,
+                         ast.LShift, ast.RShift)
         if (lk == VKind.UNKNOWN and rk == VKind.UNKNOWN
-                and op != ast.Div):
+                and op != ast.Div and op not in _BITWISE_UNKN):
             _lraw = ltv.val
             _rraw = rtv.val
             _ltag = _rtag = None
@@ -32908,14 +38902,36 @@ class CodeGen:
             if (_ltag is not None and _rtag is not None
                     and _li64 is not None and _ri64 is not None):
                 _both_int = self.builder.and_(
-                    self.builder.icmp_unsigned(
-                        "==", _ltag, ir.Constant(i32, FPY_TAG_INT)),
-                    self.builder.icmp_unsigned(
-                        "==", _rtag, ir.Constant(i32, FPY_TAG_INT)))
+                    self._fv_tag_is_integral(_ltag),
+                    self._fv_tag_is_integral(_rtag))
                 _uu_int = self._new_block("unkn_uu.iarith")
                 _uu_flt = self._new_block("unkn_uu.farith")
                 _uu_mrg = self._new_block("unkn_uu.merge")
-                self.builder.cbranch(_both_int, _uu_int, _uu_flt)
+                # A two-way int-vs-float split is wrong: six tags are numeric,
+                # not two.  A BIGINT operand (tag 10) took the float edge and
+                # had its *pointer* bitcast to a double, so `-b - -c` on two
+                # equal BigInts printed 1024.0 — the same "inlined binary
+                # dispatch over six numeric tags" shape as
+                # BUG-ABS-OF-TAGGED-VALUE.  The float edge is now guarded by
+                # an actual check that both operands are plain scalars, and
+                # anything else goes to the runtime's `fv_binop`, which
+                # already handles BigInt, Decimal, str concat and the
+                # TypeErrors correctly.  The int and float fast paths stay
+                # inline; only the cases that were wrong pay for a call.
+                # BUG-BIGINT-FV-RESULT-NOT-CONSUMED.
+                _uu_gen_opc = self._FV_BINOP_OPCODES.get(op)
+                _uu_gen = (self._new_block("unkn_uu.gen")
+                           if _uu_gen_opc is not None else None)
+                if _uu_gen is not None:
+                    _uu_pick = self._new_block("unkn_uu.pick")
+                    self.builder.cbranch(_both_int, _uu_int, _uu_pick)
+                    self.builder.position_at_end(_uu_pick)
+                    self.builder.cbranch(
+                        self.builder.and_(self._fv_tag_is_plain_scalar(_ltag),
+                                          self._fv_tag_is_plain_scalar(_rtag)),
+                        _uu_flt, _uu_gen)
+                else:
+                    self.builder.cbranch(_both_int, _uu_int, _uu_flt)
                 # ── both-INT path ──
                 self.builder.position_at_end(_uu_int)
                 _uires = self._emit_int_binop(
@@ -32933,18 +38949,21 @@ class CodeGen:
                 elif (isinstance(_uires.type, ir.IntType)
                         and _uires.type.width == 64):
                     _uidata = _uires
+                    # INT, or BOOL when `&`/`|`/`^` joined two bools — see
+                    # `_fv_int_result_tag`.
+                    _uu_scalar_tag = self._fv_int_result_tag(op, _ltag, _rtag)
                     if _uu_bigint_flag is not None:
                         _uitag = self.builder.select(
                             _uu_bigint_flag,
                             ir.Constant(i32, FPY_TAG_BIGINT),
-                            ir.Constant(i32, FPY_TAG_INT))
+                            _uu_scalar_tag)
                     else:
-                        _uitag = ir.Constant(i32, FPY_TAG_INT)
+                        _uitag = _uu_scalar_tag
                 else:
                     _uidata = self.builder.sext(_uires, i64) \
                         if isinstance(_uires.type, ir.IntType) \
                         else self.builder.ptrtoint(_uires, i64)
-                    _uitag = ir.Constant(i32, FPY_TAG_INT)
+                    _uitag = self._fv_int_result_tag(op, _ltag, _rtag)
                 self.builder.branch(_uu_mrg)
                 _uu_int_end = self.builder.block
                 # ── float path: tag-aware conversion ──
@@ -32974,6 +38993,21 @@ class CodeGen:
                         else self.builder.ptrtoint(_ufres, i64)
                 self.builder.branch(_uu_mrg)
                 _uu_flt_end = self.builder.block
+                # ── generic path: everything the two fast paths misread ──
+                _uu_gen_end = _uu_gtag = _uu_gdata = None
+                if _uu_gen is not None:
+                    self.builder.position_at_end(_uu_gen)
+                    _uu_ot = self._create_entry_alloca(i32, "uugen.tag")
+                    _uu_od = self._create_entry_alloca(i64, "uugen.data")
+                    self.builder.call(
+                        self.runtime["fv_binop"],
+                        [_ltag, _li64, _rtag, _ri64,
+                         ir.Constant(i32, _uu_gen_opc), _uu_ot, _uu_od])
+                    self._emit_try_bail_if_exc()
+                    _uu_gtag = self.builder.load(_uu_ot)
+                    _uu_gdata = self.builder.load(_uu_od)
+                    self.builder.branch(_uu_mrg)
+                    _uu_gen_end = self.builder.block
                 # ── merge ──
                 self.builder.position_at_end(_uu_mrg)
                 _uu_tphi = self.builder.phi(i32, "unkn_uu.tag")
@@ -32983,6 +39017,9 @@ class CodeGen:
                 _uu_dphi = self.builder.phi(i64, "unkn_uu.data")
                 _uu_dphi.add_incoming(_uidata, _uu_int_end)
                 _uu_dphi.add_incoming(_ufdata, _uu_flt_end)
+                if _uu_gen_end is not None:
+                    _uu_tphi.add_incoming(_uu_gtag, _uu_gen_end)
+                    _uu_dphi.add_incoming(_uu_gdata, _uu_gen_end)
                 return self._fv_build_from_slots(_uu_tphi, _uu_dphi)
 
         # ── UNKNOWN with extractable tags: fv_binop dispatch ─────
@@ -32993,9 +39030,7 @@ class CodeGen:
         # C fv_binop which handles ALL type combinations correctly
         # (str concat, repeat, TypeError for invalid combos, and
         # proper INT→FLOAT promotion for truediv).
-        _fv_op_map = {ast.Add: 0, ast.Sub: 1, ast.Mult: 2, ast.Div: 3,
-                      ast.FloorDiv: 4, ast.Mod: 5}
-        _gf_opc = _fv_op_map.get(op)
+        _gf_opc = self._FV_BINOP_OPCODES.get(op)
         if _gf_opc is not None:
             _gf_lt = _gf_ld = _gf_rt = _gf_rd = None
             # Extract left tag + data
@@ -33105,7 +39140,15 @@ class CodeGen:
             return self._emit_binop_unknown(node, ltv, rtv, lk, rk, op)
 
         # ── Fast path: BigInt arithmetic ───────────────────────────────
-        if lk == VKind.BIGINT or rk == VKind.BIGINT:
+        # Only for integer-like operands.  The promotion below is
+        # `bigint_from_i64(other.as_i64())`, which for a float operand hands
+        # over the double's *bit pattern* as an integer: `(2 ** 80) + 0.5`
+        # came out as 2**80 plus 4602678819172646912.  A float on either side
+        # makes this float arithmetic, and the runtime's fv_binop arm converts
+        # the BigInt properly, so let it fall through to the guard below.
+        _bigint_ok = (VKind.BIGINT, VKind.INT, VKind.BOOL)
+        if ((lk == VKind.BIGINT or rk == VKind.BIGINT)
+                and lk in _bigint_ok and rk in _bigint_ok):
             # Promote INT operand to BigInt if needed
             if lk == VKind.BIGINT:
                 l_ptr = ltv.as_ptr(self.builder)
@@ -33123,6 +39166,13 @@ class CodeGen:
                 ast.Add: "bigint_add", ast.Sub: "bigint_sub",
                 ast.Mult: "bigint_mul", ast.FloorDiv: "bigint_floordiv",
                 ast.Mod: "bigint_mod", ast.Pow: "bigint_pow",
+                # Bitwise / shift: Python two's-complement / floor semantics.
+                # Without these, a mixed bigint⊕int bitwise op fell through
+                # to the CPython bridge slow path, which dereferenced the int
+                # operand as a pointer → access violation (BUG-BIGINT-BITWISE).
+                ast.BitAnd: "bigint_and", ast.BitOr: "bigint_or",
+                ast.BitXor: "bigint_xor", ast.LShift: "bigint_lshift",
+                ast.RShift: "bigint_rshift",
             }
             rt_name = _bigint_ops.get(op)
             if rt_name:
@@ -33158,31 +39208,51 @@ class CodeGen:
             return self._rt_call("str_format_percent", [ltv, TypedValue(args_list, ValueType(VKind.LIST))])
 
         # ── Fast path: float op float (or int+float promotion) ─────────
-        # Guard: float+container is always TypeError (e.g. "hello" + 1.5).
-        # Only promote to float when the other side is numeric-compatible.
-        _float_incompatible = (VKind.STR, VKind.LIST, VKind.DICT, VKind.SET,
-                               VKind.TUPLE, VKind.BYTES, VKind.OBJ)
+        # The other side must be something `sitofp` is actually meaningful on,
+        # which is only a machine integer.  This used to be a *deny* list of
+        # kinds (str, list, dict, set, tuple, bytes, obj), so every pointer
+        # kind missing from it — BigInt, Decimal, complex — had its pointer
+        # sitofp'd into a double: `(2 ** 80) + 0.5` printed the heap address of
+        # the BigInt plus a half.  Naming what is allowed instead means a new
+        # pointer kind falls through to fv_binop, which knows how to convert.
+        _float_ok = (VKind.FLOAT, VKind.INT, VKind.BOOL)
         if ((lk == VKind.FLOAT or rk == VKind.FLOAT)
-                and lk not in _float_incompatible
-                and rk not in _float_incompatible):
+                and lk in _float_ok and rk in _float_ok):
+            # A float has no bitwise operators; `1 & 1.5` is a TypeError.
+            # Raised here rather than inside _emit_float_binop because only
+            # here are the operand kinds still known well enough to name them.
+            _bit_sym = {ast.BitAnd: "&", ast.BitOr: "|", ast.BitXor: "^",
+                        ast.LShift: "<<", ast.RShift: ">>"}.get(op)
+            if _bit_sym:
+                _tn = {VKind.FLOAT: "float", VKind.INT: "int",
+                       VKind.BOOL: "bool"}
+                self._emit_runtime_type_error(
+                    f"unsupported operand type(s) for {_bit_sym}: "
+                    f"'{_tn[lk]}' and '{_tn[rk]}'")
+                return ir.Constant(double, 0.0)
             left_d = ltv.val if lk == VKind.FLOAT else self.builder.sitofp(ltv.as_i64(self.builder), double)
             right_d = rtv.val if rk == VKind.FLOAT else self.builder.sitofp(rtv.as_i64(self.builder), double)
             return self._emit_float_binop(node.op, left_d, right_d, node)
 
         # ── Fast path: str + str → concat ──────────────────────────────
         if lk == VKind.STR and rk == VKind.STR and op == ast.Add:
-            return self._rt_call("str_concat", [ltv, rtv])
+            return self._owned_str_concat([ltv, rtv])
         if lk == VKind.STR and rk in (VKind.INT, VKind.BOOL) and op == ast.Mult:
-            return self._rt_call("str_repeat", [ltv, rtv])
+            return self._owned_str_repeat([ltv, rtv])
         if lk in (VKind.INT, VKind.BOOL) and rk == VKind.STR and op == ast.Mult:
-            return self._rt_call("str_repeat", [rtv, ltv])
-        # bytes + bytes → concat, bytes * int → repetition (same runtime as str)
+            return self._owned_str_repeat([rtv, ltv])
+        # bytes + bytes → concat, bytes * int → repetition. Use dedicated
+        # FpyBytes-aware runtime funcs (length-preserving for embedded nulls,
+        # header-backed so incref/decref work), NOT the str_* funcs (which
+        # strlen-truncate on embedded nulls and produce an FpyString whose
+        # header layout differs from FpyBytes → OOB reads via fpy_bytes_len).
+        # Result is an owned (+1) FpyBytes registered as a Model-2 temp.
         if lk == VKind.BYTES and rk == VKind.BYTES and op == ast.Add:
-            return self._rt_call("str_concat", [ltv, rtv])
+            return self._owned_bytes_result("bytes_concat", [ltv, rtv])
         if lk == VKind.BYTES and rk in (VKind.INT, VKind.BOOL) and op == ast.Mult:
-            return self._rt_call("str_repeat", [ltv, rtv])
+            return self._owned_bytes_result("bytes_repeat", [ltv, rtv])
         if lk in (VKind.INT, VKind.BOOL) and rk == VKind.BYTES and op == ast.Mult:
-            return self._rt_call("str_repeat", [rtv, ltv])
+            return self._owned_bytes_result("bytes_repeat", [rtv, ltv])
         # str + i64 or i64 + str from a closure/function-pointer call:
         # the i64 is likely a string pointer whose type tag was lost through
         # the closure calling convention (common in decorator wrappers doing
@@ -33200,8 +39270,8 @@ class CodeGen:
             if _is_closure_result:
                 r_ptr = self.builder.inttoptr(
                     rtv.as_i64(self.builder), i8_ptr)
-                return self._rt_call("str_concat",
-                                     [ltv.as_ptr(self.builder), r_ptr])
+                return self._owned_str_concat(
+                    [ltv.as_ptr(self.builder), r_ptr])
         if op == ast.Add and lk == VKind.INT and rk == VKind.STR:
             _is_closure_result = (
                 (isinstance(node.left, ast.Call)
@@ -33212,8 +39282,8 @@ class CodeGen:
             if _is_closure_result:
                 l_ptr = self.builder.inttoptr(
                     ltv.as_i64(self.builder), i8_ptr)
-                return self._rt_call("str_concat",
-                                     [l_ptr, rtv.as_ptr(self.builder)])
+                return self._owned_str_concat(
+                    [l_ptr, rtv.as_ptr(self.builder)])
         # NOTE: true str + int and int + str are NOT valid in Python (TypeError).
         # These fall through to the container guard → fv_binop → TypeError.
 
@@ -33262,6 +39332,12 @@ class CodeGen:
 
         # ── Fast path: Path / str → path join ─────────────────────────
         if op == ast.Div and (lk == VKind.PATH or self._is_path_expr(node.left)):
+            # path_join takes its right operand as plain text; a Path there
+            # (p / other_path) must be converted, since in pure mode a Path's
+            # text does not start at the pointer. See _emit_path_text_arg.
+            if rk == VKind.PATH or self._is_path_expr(node.right):
+                rtv = TypedValue(self._rt_call("path_str", [rtv]),
+                                 ValueType(VKind.STR))
             return self._rt_call("path_join", [ltv, rtv])
 
         # ── Fast path: Decimal arithmetic ──────────────────────────────
@@ -33396,19 +39472,33 @@ class CodeGen:
                 return self._fv_build_from_slots(
                     self.builder.load(out_tag),
                     self.builder.load(out_data))
-            # Bitwise/shift ops on FpyValue: extract the i64 data and
-            # dispatch through _emit_int_binop.  This handles the common
-            # case where an earlier checked_* (BigInt-capable) arithmetic
-            # result feeds a bitwise/shift operator — the FpyValue struct
-            # must not reach cpython_binop (which treats it as PyObject*).
-            _BITWISE_OPS = (ast.BitAnd, ast.BitOr, ast.BitXor,
-                            ast.LShift, ast.RShift)
-            if op in _BITWISE_OPS:
-                l_i64 = (self.builder.extract_value(ltv.val, 1)
-                         if _l_is_fv else ltv.as_i64(self.builder))
-                r_i64 = (self.builder.extract_value(rtv.val, 1)
-                         if _r_is_fv else rtv.as_i64(self.builder))
-                return self._emit_int_binop(node.op, l_i64, r_i64, node)
+            # Bitwise/shift ops on FpyValue: dispatch through fv_binop
+            # (opcodes 6..10) so a BIGINT-tagged operand is handled with
+            # correct Python semantics.  Using _emit_int_binop here would
+            # treat a BigInt pointer as a raw i64 and corrupt it — the bug
+            # behind BUG-BIGINT-BITWISE-DYNAMIC.  fv_binop promotes to
+            # BigInt as needed and demotes the result if it fits an i64.
+            _fv_bitwise = {ast.BitAnd: 6, ast.BitOr: 7, ast.BitXor: 8,
+                           ast.LShift: 9, ast.RShift: 10}
+            if op in _fv_bitwise:
+                lt_tag, lt_data = (self.builder.extract_value(ltv.val, 0),
+                                   self.builder.extract_value(ltv.val, 1)) \
+                    if _l_is_fv else (ir.Constant(i32, ltv.vtype.kind.fpy_tag),
+                                       ltv.as_i64(self.builder))
+                rt_tag, rt_data = (self.builder.extract_value(rtv.val, 0),
+                                   self.builder.extract_value(rtv.val, 1)) \
+                    if _r_is_fv else (ir.Constant(i32, rtv.vtype.kind.fpy_tag),
+                                       rtv.as_i64(self.builder))
+                out_tag = self._create_entry_alloca(i32, "fvbw.tag")
+                out_data = self._create_entry_alloca(i64, "fvbw.data")
+                self.builder.call(self.runtime["fv_binop"],
+                                  [lt_tag, lt_data, rt_tag, rt_data,
+                                   ir.Constant(i32, _fv_bitwise[op]),
+                                   out_tag, out_data])
+                self._emit_try_bail_if_exc()
+                return self._fv_build_from_slots(
+                    self.builder.load(out_tag),
+                    self.builder.load(out_data))
 
         # ── Fast path: PYOBJ binary ops — dispatch to CPython ──────────
         if lk == VKind.PYOBJ or rk == VKind.PYOBJ:
@@ -33443,13 +39533,23 @@ class CodeGen:
             return self._emit_int_binop(node.op, ltv.as_i64(self.builder),
                                          rtv.as_i64(self.builder), node)
 
-        # ── Guard: native container types must not reach cpython_binop ──
-        # Native containers (FpyList*, FpyDict*, etc.) are not PyObject*;
-        # passing them to cpython_binop causes an access violation.  Route
-        # through fv_binop which handles valid ops (concat, repeat) and
-        # raises TypeError for invalid combinations.
+        # ── Guard: native pointer types must not reach cpython_binop ────
+        # Native values (FpyList*, FpyDict*, FpyBigInt*, ...) are not
+        # PyObject*; passing one to cpython_binop causes an access violation.
+        # Route through fv_binop, which handles the valid ops and raises
+        # TypeError for the rest.
+        #
+        # BigInt, Decimal and complex belong here too and were missing.  The
+        # omission was only *latent* for Decimal and complex, whose fv_binop
+        # arms happen to catch every op the front end sends here — but BigInt
+        # had no true-division arm, so `(2 ** 80) / 2` fell through to the
+        # bridge and handed PyNumber_TrueDivide a raw FpyBigInt*, which
+        # crashed.  The arm exists now; the kinds are listed anyway, because
+        # what makes this safe must be the guard, not a coincidence about
+        # which ops the runtime happens to implement.
         _container_kinds = (VKind.LIST, VKind.DICT, VKind.SET, VKind.TUPLE,
-                            VKind.STR, VKind.BYTES)
+                            VKind.STR, VKind.BYTES,
+                            VKind.BIGINT, VKind.DECIMAL, VKind.COMPLEX)
         if lk in _container_kinds or rk in _container_kinds:
             _fv_ops = {ast.Add: 0, ast.Sub: 1, ast.Mult: 2, ast.Div: 3,
                        ast.FloorDiv: 4, ast.Mod: 5}
@@ -33710,11 +39810,114 @@ class CodeGen:
         elif isinstance(op, ast.BitXor):
             return self.builder.xor(left, right)
         elif isinstance(op, ast.LShift):
-            return self.builder.shl(left, right)
+            # Left shift can overflow i64 (e.g. 7 << 70) and must promote to
+            # BigInt, exactly like +/-/*.  Route through the overflow-checked
+            # path: when _program_uses_bigint is False it degrades to a bare
+            # `shl` (via the `plain` dict), so non-bigint programs pay no
+            # overhead.  (BUG-INT-LSHIFT-OVERFLOW)
+            return self._emit_checked_int_op(op, left, right)
         elif isinstance(op, ast.RShift):
             return self.builder.ashr(left, right)
         else:
             return self._bridge_fallback_expr(node, f"unsupported int operator: {type(op).__name__}")
+
+    def _fn_exc_exit_block(self) -> 'ir.Block':
+        """The block a raise in the middle of a statement branches to when the
+        current function has no enclosing `try`.
+
+        Every function needs somewhere to go on the exception path, and until
+        this existed there was nowhere: `_emit_try_bail_if_exc` had an arm for
+        "inside a try" and an arm for "module level", and inside a function
+        that was neither it emitted *nothing* — so codegen carried on emitting
+        the rest of the statement, the next operation ran on whatever the
+        failed one left behind, and its exception replaced the real one.
+        `def f(a): return (1 // a) + "s"` reported TypeError rather than
+        ZeroDivisionError, because the `+` ran anyway.
+        BUG-PENDING-EXC-CLOBBERED-IN-FUNCTION.
+
+        The block is what a `return` would be on that path: pop the shadow
+        stack, release the scope's owned locals, hand back a zero of the
+        return type.  The value is never read — every caller checks
+        `exc_pending` before using a result — but the *shadow pop* is not
+        optional, or the traceback of the exception this is propagating grows
+        a frame per unwound call.
+
+        Created on demand and hung off the `ir.Function`, so each of the
+        several function-emitting paths gets its own without threading another
+        field through the save/restore tuples.  It is emitted at the first
+        bail site, which means it decrefs the locals that exist *then* — the
+        same window an early `return` inside a loop already has, since
+        `_emit_return` calls `_emit_scope_decref` at its own emission point
+        too.
+        """
+        blk = getattr(self.function, "_fpy_exc_exit", None)
+        if blk is not None:
+            return blk
+        blk = self.function.append_basic_block("fn.exc_exit")
+        # Attach before emitting: _emit_scope_decref can reach code that
+        # asks for the block again, and a second append would leave the
+        # first one unterminated.
+        self.function._fpy_exc_exit = blk
+        saved_builder = self.builder
+        self.builder = _SafeIRBuilder(blk)
+        try:
+            if not self._current_fn_bare_abi:
+                self.builder.call(self.runtime["shadow_pop"], [])
+            self._emit_scope_decref()
+            ret_ty = self.function.return_value.type
+            if isinstance(ret_ty, ir.VoidType):
+                self.builder.ret_void()
+            elif isinstance(ret_ty, ir.LiteralStructType):
+                self.builder.ret(self._fv_none())
+            elif isinstance(ret_ty, ir.PointerType):
+                self.builder.ret(ir.Constant(ret_ty, None))
+            else:
+                self.builder.ret(ir.Constant(ret_ty, 0))
+        finally:
+            self.builder = saved_builder
+        return blk
+
+    def _emit_exc_pending(self) -> ir.Value:
+        """Emit "is an exception pending?" as an i32 that is nonzero if so.
+
+        This is a load of the runtime's flag rather than a call to
+        `fastpy_exc_pending`, and the point is not that a load is cheaper than
+        a call — measured on `dict lookup`, where the loop holds exactly one
+        check, swapping the call for the load was worth 3%.  The point is that
+        a load is something LLVM can *reason about* and an opaque call is not.
+
+        A check is emitted after every statement that might raise, and most
+        statements cannot: `dx = self.x - other.x` is two loads and a `sub`.
+        As calls, each check was an unanalysable barrier and all of them
+        survived to run.  As loads, GVN sees the second load of a global with
+        no intervening write to memory, reuses the first value, and simplifycfg
+        then folds a branch on a condition already proven false on that path —
+        so the redundant checks delete themselves, and exactly the ones that
+        guard a real call remain.  `dist_sq method 1M` went from 3.15ms to
+        1.62ms of net work, against 1.34ms with every check removed by hand.
+
+        Doing this as a codegen analysis instead would be a dataflow problem
+        over a CFG that is still being built, where a block can gain a
+        predecessor (a loop back-edge, an except handler) long after codegen
+        has walked past it, and where a wrong answer silently swallows an
+        exception.  Handing the question to LLVM, which has the finished CFG,
+        is not a shortcut — it is the only place the question is answerable.
+
+        Safety rests on the flag being *memory*: anything that can raise is an
+        opaque call that may write it, which stops LLVM from reusing a stale
+        value across it, and hoisting the load out of a loop is legal only when
+        the loop cannot raise.  This is also why marking runtime functions
+        `readonly` is not a free win — a `readonly` function that can raise
+        would let LLVM keep a stale answer across it, and the exception would
+        go unseen.  See PERF-EXC-CHECK-AFTER-NONRAISING-OPS.
+
+        `inline_exc_check` is False under MCJIT, which cannot resolve a TLS
+        symbol; that path keeps the original call.
+        """
+        if not self.inline_exc_check:
+            return self.builder.call(self.runtime["exc_pending"], [])
+        return self.builder.load(self.runtime["exc_type_flag"],
+                                 name="exc.pending")
 
     def _emit_try_bail_if_exc(self) -> None:
         """If inside a try block, check exc_pending() and bail to the except
@@ -33725,12 +39928,19 @@ class CodeGen:
         At module level (fastpy_main, not in a try block), check exc_pending()
         and call exc_unhandled() (print traceback + exit) — uncaught exceptions
         must halt execution immediately, not let subsequent code run with
-        garbage values."""
+        garbage values.
+
+        Inside a function that is in neither situation, bail to the function's
+        exception-exit block: the exception is real and pending, and the rest
+        of the statement must not run.  The caller's own bail check is what
+        picks it up, so this arm is what makes an exception raised three calls
+        deep arrive at the handler that named it, rather than whatever the
+        unwound frames raised on their way out."""
         if self._in_try_block:
             target = getattr(self, '_try_except_target', None)
             if target is None:
                 return
-            pending = self.builder.call(self.runtime["exc_pending"], [])
+            pending = self._emit_exc_pending()
             is_exc = self.builder.icmp_signed("!=", pending, ir.Constant(i32, 0))
             cont = self._new_block("try.earlycheck")
             self.builder.cbranch(is_exc, target, cont)
@@ -33740,7 +39950,7 @@ class CodeGen:
         # exc_unhandled on pending exception.
         if (not self._current_fn_bare_abi
                 and self.function.name == "fastpy_main"):
-            pending = self.builder.call(self.runtime["exc_pending"], [])
+            pending = self._emit_exc_pending()
             is_exc = self.builder.icmp_signed(
                 "!=", pending, ir.Constant(i32, 0))
             exc_blk = self._new_block("module.bail_exc")
@@ -33750,6 +39960,18 @@ class CodeGen:
             self.builder.call(self.runtime["exc_unhandled"], [])
             self.builder.unreachable()
             self.builder.position_at_end(cont)
+            return
+        # Inside a function, outside any try: stop the statement and unwind.
+        # Not for a bare-ABI function — it has no shadow frame to pop and no
+        # FV locals to release, and more to the point it was chosen for
+        # scopes whose operations cannot raise.
+        if self._current_fn_bare_abi or self.function.name == "fastpy_main":
+            return
+        pending = self._emit_exc_pending()
+        is_exc = self.builder.icmp_signed("!=", pending, ir.Constant(i32, 0))
+        cont = self._new_block("fn.bail_cont")
+        self.builder.cbranch(is_exc, self._fn_exc_exit_block(), cont)
+        self.builder.position_at_end(cont)
 
     def _emit_python_floordiv(self, left: ir.Value, right: ir.Value) -> ir.Value:
         """
@@ -33816,6 +40038,7 @@ class CodeGen:
                 ast.Add: self.builder.add,
                 ast.Sub: self.builder.sub,
                 ast.Mult: self.builder.mul,
+                ast.LShift: self.builder.shl,
             }.get(type(op))
             if plain is not None:
                 return plain(left, right)
@@ -33831,6 +40054,7 @@ class CodeGen:
                 ast.Add: self.builder.add,
                 ast.Sub: self.builder.sub,
                 ast.Mult: self.builder.mul,
+                ast.LShift: self.builder.shl,
             }.get(type(op))
             if plain is not None:
                 return plain(left, right)
@@ -33858,6 +40082,7 @@ class CodeGen:
             ast.Sub: "checked_sub",
             ast.Mult: "checked_mul",
             ast.Pow: "checked_pow",
+            ast.LShift: "checked_lshift",
         }
         rt_name = op_map.get(type(op))
         if rt_name is None:
@@ -34043,16 +40268,14 @@ class CodeGen:
             floor_fn = self.module.declare_intrinsic("llvm.floor", [double])
             return self.builder.call(floor_fn, [result])
         elif isinstance(op, ast.Mod):
-            # Python-compatible float modulo: result has same sign as divisor.
-            # rem = fmod(a, b); if sign(rem) != sign(b) and rem != 0: rem += b
-            rem = self.builder.frem(left, right)
-            rem_neg = self.builder.fcmp_ordered("<", rem, ir.Constant(double, 0.0))
-            b_neg = self.builder.fcmp_ordered("<", right, ir.Constant(double, 0.0))
-            signs_differ = self.builder.xor(rem_neg, b_neg)
-            rem_nonzero = self.builder.fcmp_ordered("!=", rem, ir.Constant(double, 0.0))
-            needs_adjust = self.builder.and_(signs_differ, rem_nonzero)
-            adjusted = self.builder.fadd(rem, right)
-            return self.builder.select(needs_adjust, adjusted, rem)
+            # Python-compatible float modulo (sign of the divisor) *and* a
+            # raise on a zero divisor.  This used to be an inline frem plus a
+            # sign fixup, which left `1.0 % 0.0` answering nan where CPython
+            # raises ZeroDivisionError; safe_fmod does both.
+            result = self.builder.call(self.runtime["safe_fmod"],
+                                       [left, right])
+            self._emit_try_bail_if_exc()
+            return result
         elif isinstance(op, ast.Div):
             result = self.builder.call(self.runtime["safe_fdiv"],
                                      [left, right])
@@ -34061,7 +40284,30 @@ class CodeGen:
         elif isinstance(op, ast.Pow):
             return self.builder.call(self.runtime["pow_float"], [left, right])
         else:
-            return self._bridge_fallback_expr(node, f"unsupported float operator: {type(op).__name__}")
+            # The only operators left are the bitwise ones, and a float has
+            # none: `1 & 1.5` is a TypeError in Python.  Callers that know the
+            # operand kinds raise with the real type names before getting here;
+            # this is the backstop.  It used to be _bridge_fallback_expr, whose
+            # no-match answer is 0 — so the program silently continued with a
+            # plausible number.
+            _sym = {ast.BitAnd: "&", ast.BitOr: "|", ast.BitXor: "^",
+                    ast.LShift: "<<", ast.RShift: ">>"}.get(type(op), "?")
+            self._emit_runtime_type_error(
+                f"unsupported operand type(s) for {_sym}: 'float' and 'float'")
+            return ir.Constant(double, 0.0)
+
+    def _emit_runtime_type_error(self, message: str) -> None:
+        """Raise TypeError at run time with a message known at compile time.
+
+        fastpy_raise sets the pending-exception flag and returns, so the caller
+        still has to produce *some* value for the expression; the bail check
+        emitted here routes to the handler before that value is used.
+        """
+        exc_name = self._make_string_constant("TypeError")
+        exc_id = self.builder.call(self.runtime["exc_name_to_id"], [exc_name])
+        msg = self._make_string_constant(message)
+        self.builder.call(self.runtime["raise"], [exc_id, msg])
+        self._emit_try_bail_if_exc()
 
     def _try_constant_fold(self, node: ast.expr) -> int | float | str | None:
         """Try to evaluate an expression at compile time. Returns None if not constant."""
@@ -34155,20 +40401,23 @@ class CodeGen:
                 return self.builder.fneg(operand)
             elif (isinstance(operand.type, ir.LiteralStructType)
                   and operand.type == fpy_val):
-                # FpyValue: runtime dispatch based on tag (INT vs FLOAT)
+                # FpyValue: dispatch on the tag in the runtime.  This used to
+                # be an inlined `select(tag == FLOAT, fneg, 0 - data)`, which
+                # is the same mistake as BUG-ABS-OF-TAGGED-VALUE: six tags are
+                # numeric, not two.  A BIGINT operand kept its tag and had its
+                # *pointer* negated, so `-(-b)` handed a garbage pointer to
+                # the printer and took an access violation; Decimal and
+                # complex were silently wrong the same way.
+                # BUG-BIGINT-FV-RESULT-NOT-CONSUMED.
                 tag = self.builder.extract_value(operand, 0)
                 data = self.builder.extract_value(operand, 1)
-                is_float = self.builder.icmp_unsigned(
-                    "==", tag, ir.Constant(i32, FPY_TAG_FLOAT))
-                int_neg = self.builder.neg(data)
-                float_val = self.builder.bitcast(data, double)
-                float_neg = self.builder.fneg(float_val)
-                float_neg_i64 = self.builder.bitcast(float_neg, i64)
-                neg_data = self.builder.select(is_float, float_neg_i64, int_neg)
-                result = ir.Constant(fpy_val, ir.Undefined)
-                result = self.builder.insert_value(result, tag, 0)
-                result = self.builder.insert_value(result, neg_data, 1)
-                return result
+                _nt = self._create_entry_alloca(i32, "neg.tag")
+                _nd = self._create_entry_alloca(i64, "neg.data")
+                self.builder.call(self.runtime["neg_fv"],
+                                  [tag, data, _nt, _nd])
+                self._emit_try_bail_if_exc()
+                return self._fv_build_from_slots(
+                    self.builder.load(_nt), self.builder.load(_nd))
             return self._bridge_fallback_expr(node, "unsupported unary operand type")
         elif isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.UAdd):
             # __pos__ on user-class objects
@@ -34181,7 +40430,22 @@ class CodeGen:
                     result = self.builder.call(
                         self.runtime["obj_call_method0"], [obj, name_ptr])
                     return self._ensure_ptr(result)
-            return self._emit_expr_value(node.operand)
+            _pos = self._emit_expr_value(node.operand)
+            # Unary `+` is the identity on the *value* but not on the type:
+            # `+True` is `1`, not `True`, because bool has no `__pos__` and
+            # inherits int's.  Returning the operand untouched kept the BOOL
+            # tag and printed `True`.  Only the tag changes, and only for
+            # BOOL — every other tag is genuinely unchanged.
+            # BUG-BOOL-PLUS-INT-YIELDS-FLOAT.
+            if isinstance(_pos.type, ir.LiteralStructType) and _pos.type == fpy_val:
+                _pt = self.builder.extract_value(_pos, 0)
+                _pd = self.builder.extract_value(_pos, 1)
+                _pt = self.builder.select(
+                    self.builder.icmp_unsigned(
+                        "==", _pt, ir.Constant(i32, FPY_TAG_BOOL)),
+                    ir.Constant(i32, FPY_TAG_INT), _pt)
+                return self._fv_build_from_slots(_pt, _pd)
+            return _pos
         elif isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Invert):
             # __invert__ on user-class objects
             if self._is_obj_expr(node.operand):
@@ -34212,7 +40476,15 @@ class CodeGen:
             result = self.builder.not_(cmp)
             return self.builder.zext(result, i32)
         elif isinstance(node, ast.Subscript):
-            return self._emit_subscript(node)
+            value = self._emit_subscript(node)
+            # A subscript is a raising operation — IndexError, KeyError — and
+            # nothing checked afterwards, so `xs[9] + "s"` ran the `+` on the
+            # miss value and reported the `+`'s TypeError instead.  The check
+            # goes here rather than inside `_emit_subscript`, which has two
+            # dozen return paths that would each need their own.
+            # BUG-PENDING-EXC-CLOBBERED-IN-FUNCTION.
+            self._emit_try_bail_if_exc()
+            return value
         elif isinstance(node, ast.JoinedStr):
             return self._emit_fstring(node)
         elif isinstance(node, ast.List):
@@ -34456,6 +40728,8 @@ class CodeGen:
 
         "bool": "_emit_builtin_bool",
 
+        "bytes": "_emit_builtin_bytes",
+
         "callable": "_emit_builtin_callable",
 
         "chr": "_emit_builtin_chr",
@@ -34510,6 +40784,8 @@ class CodeGen:
 
         "oct": "_emit_builtin_oct",
 
+        "open": "_emit_builtin_open",
+
         "ord": "_emit_builtin_ord",
 
         "pow": "_emit_builtin_pow",
@@ -34523,6 +40799,17 @@ class CodeGen:
         "round": "_emit_builtin_round",
 
         "set": "_emit_builtin_set",
+
+        # `frozenset` builds a set, because that is what the rest of the
+        # compiler already says it does: `_infer_type_tag` answers
+        # ValueType(VKind.SET) for a `frozenset(...)` call and `isinstance(x,
+        # frozenset)` tests for FPY_TAG_SET.  Only the emitter disagreed --
+        # it fell through to the CPython bridge and returned a PyObject*
+        # carrying a SET tag, so `sorted(frozenset([2, 1]))` handed that
+        # pointer to `fastpy_set_to_list` and died.  Agreeing with the type
+        # table is the fix; the cost is that a frozenset is not actually
+        # immutable here, which is DEBT-FROZENSET-IS-A-MUTABLE-SET.
+        "frozenset": "_emit_builtin_set",
 
         "setattr": "_emit_builtin_setattr",
 
@@ -34751,6 +41038,33 @@ class CodeGen:
             raise CodeGenError("range() takes 1-3 arguments", node)
         return self.builder.call(self.runtime["range"], [start, stop, step])
 
+    def _emit_builtin_bytes(self, node):
+        """bytes(x) → a native FpyBytes buffer.
+
+        The constructor had no native lowering and went through the CPython
+        bridge: unavailable in pure mode, where it answered NULL and the next
+        `fpy_bytes_len` then walked off a null pointer. The argument is handed
+        to the runtime *tagged* so one helper covers an int count, a bytes
+        copy, the str-without-encoding error and any iterable of ints.
+        `bytearray` deliberately stays on the bridge — fastpy has no mutable
+        bytes type, so answering with an FpyBytes would print it as `b'..'`
+        rather than `bytearray(b'..')`. BUG-BYTES-CTOR-BRIDGE-ONLY.
+        """
+        if node.keywords:
+            # bytes(s, "utf-8") / bytes(s, encoding=...) — an encode by
+            # another name, and str.encode already has a native path.
+            return self._emit_unknown_builtin_call(node, "bytes")
+        if len(node.args) == 0:
+            return self.builder.call(
+                self.runtime["fv_to_bytes"],
+                [ir.Constant(i32, FPY_TAG_INT), ir.Constant(i64, 0)])
+        if len(node.args) != 1:
+            return self._emit_unknown_builtin_call(node, "bytes")
+        arg_node = node.args[0]
+        val = self._emit_expr_value(arg_node)
+        tag, data = self._to_tag_data_ir(val, arg_node)
+        return self.builder.call(self.runtime["fv_to_bytes"], [tag, data])
+
     def _emit_builtin_list(self, node):
         # list(dict) → list of keys
         if len(node.args) == 1 and self._is_dict_expr(node.args[0]):
@@ -34764,12 +41078,12 @@ class CodeGen:
         # list(bytes) → list of byte values (ints)
         if len(node.args) == 1:
             arg = node.args[0]
-            # Check if argument is a bytes-typed variable
-            is_bytes = False
-            if isinstance(arg, ast.Name) and arg.id in self.variables:
-                _, vtag = self.variables[arg.id]
-                is_bytes = (self._tag_kind(vtag) == VKind.BYTES)
-            if is_bytes:
+            # One definition of "is this bytes?": a literal, a slice
+            # (`list(z[1:4])`) and a call result are all as much a bytes as a
+            # variable is.  Only the variable case was recognised, so the rest
+            # fell through to the str/pyobj arms below and answered `()`.
+            # BUG-BYTES-SLICE-VIA-STR.
+            if self._is_bytes_expr(arg):
                 b = self._emit_expr_value(arg)
                 b = self._ensure_ptr(b)
                 return self.builder.call(self.runtime["bytes_to_list"], [b])
@@ -35005,6 +41319,76 @@ class CodeGen:
             return self._rt_call("list_reversed", [arg])
         raise CodeGenError("reversed() takes exactly one argument", node)
 
+    def _emit_int_float_fv(self, rt_name: str, fv: ir.Value, label: str):
+        """Convert a runtime-tagged value with `fastpy_int_fv`/`fastpy_float_fv`.
+
+        The two differ in what they hand back. `float()` always produces a
+        FLOAT, so the double is unpacked and returned bare — the shape every
+        caller of `_emit_builtin_float` already expects. `int()` cannot: a
+        float past 2^63 and a BigInt argument both yield a BigInt, so the
+        result stays tagged, the way `abs()`'s does.
+
+        Either call can raise — a str that will not parse, a list argument —
+        so the try-bail goes here rather than at each call site.
+        BUG-INT-FLOAT-OF-TAGGED-VALUE.
+        """
+        tag_slot = self._create_entry_alloca(i32, f"{label}.tag")
+        data_slot = self._create_entry_alloca(i64, f"{label}.data")
+        self.builder.call(
+            self.runtime[rt_name],
+            [self.builder.extract_value(fv, 0),
+             self.builder.extract_value(fv, 1), tag_slot, data_slot])
+        self._emit_try_bail_if_exc()
+        if rt_name == "float_fv":
+            return self.builder.bitcast(self.builder.load(data_slot), double)
+        return self._fv_build_from_slots(self.builder.load(tag_slot),
+                                         self.builder.load(data_slot))
+
+    def _emit_int_of_double(self, val: ir.Value) -> ir.Value:
+        """`int()` of a naked double, without the undefined behaviour.
+
+        `fptosi` is only defined when the truncated value fits the target, so
+        the plain lowering was wrong in three ways at once: `int(1e30)` gave
+        20, `int(float("nan"))` and `int(float("inf"))` both gave INT64_MIN
+        where CPython raises ValueError and OverflowError. Those are not exotic
+        inputs — `float("inf")` is what a parse of an overflowing literal
+        yields.
+
+        The in-range case still lowers to a bare `fptosi`, guarded by an
+        *ordered* comparison so NaN (unordered against everything) takes the
+        other edge. Only the edge calls the runtime, which promotes a big
+        magnitude to a BigInt and raises for NaN/infinity. The result is
+        therefore tagged rather than a bare i64, since it may be either.
+        BUG-INT-FLOAT-OF-TAGGED-VALUE.
+        """
+        # 2^63 and -2^63 are both exactly representable, so these bounds are
+        # exact; `< 2^63` is the right test because 2^63 itself does not fit.
+        lo = ir.Constant(double, -9223372036854775808.0)
+        hi = ir.Constant(double, 9223372036854775808.0)
+        in_range = self.builder.and_(
+            self.builder.fcmp_ordered(">=", val, lo),
+            self.builder.fcmp_ordered("<", val, hi))
+        tag_slot = self._create_entry_alloca(i32, "intd.tag")
+        data_slot = self._create_entry_alloca(i64, "intd.data")
+        fast_bb = self._new_block("intd.fast")
+        slow_bb = self._new_block("intd.slow")
+        merge_bb = self._new_block("intd.merge")
+        self.builder.cbranch(in_range, fast_bb, slow_bb)
+        self.builder.position_at_end(fast_bb)
+        self.builder.store(ir.Constant(i32, FPY_TAG_INT), tag_slot)
+        self.builder.store(self.builder.fptosi(val, i64), data_slot)
+        self.builder.branch(merge_bb)
+        self.builder.position_at_end(slow_bb)
+        self.builder.call(
+            self.runtime["int_fv"],
+            [ir.Constant(i32, FPY_TAG_FLOAT), self.builder.bitcast(val, i64),
+             tag_slot, data_slot])
+        self.builder.branch(merge_bb)
+        self.builder.position_at_end(merge_bb)
+        self._emit_try_bail_if_exc()
+        return self._fv_build_from_slots(self.builder.load(tag_slot),
+                                         self.builder.load(data_slot))
+
     def _emit_builtin_int(self, node):
         if len(node.args) == 1:
             arg_node = node.args[0]
@@ -35049,70 +41433,20 @@ class CodeGen:
                                    self.builder.ptrtoint(ptr, i64),
                                    out_tag, out_data])
                 return self.builder.load(out_data)
-            # FV-backed variables: dispatch by runtime tag
-            # to handle int, float, and str arguments.
+            # FV-backed variables: dispatch by runtime tag in the runtime.
+            # This used to be an inlined three-way branch — float → fptosi,
+            # str → str_to_int, everything else → the raw `data` — whose else
+            # arm returned a BigInt's or a Decimal's *pointer* as though it
+            # were the integer, and turned `int([1])` into a nonsense number
+            # instead of a TypeError.  BUG-INT-FLOAT-OF-TAGGED-VALUE.
             if (self._USE_FV_LOCALS
                     and isinstance(arg_node, ast.Name)
                     and arg_node.id in self.variables):
                 alloca, tag = self.variables[arg_node.id]
                 if (isinstance(alloca.type, ir.PointerType)
                         and alloca.type.pointee is fpy_val):
-                    fv = self.builder.load(alloca)
-                    fv_tag = self.builder.extract_value(fv, 0)
-                    fv_data = self.builder.extract_value(fv, 1)
-                    # 3-way branch: float → fptosi, str → str_to_int, else → data
-                    is_float = self.builder.icmp_unsigned(
-                        "==", fv_tag, ir.Constant(i32, FPY_TAG_FLOAT))
-                    result_alloca = self._create_entry_alloca(i64, "int.res")
-                    float_bb = self._new_block("int.float")
-                    check_str_bb = self._new_block("int.chkstr")
-                    str_bb = self._new_block("int.str")
-                    else_bb = self._new_block("int.else")
-                    merge_bb = self._new_block("int.merge")
-                    self.builder.cbranch(is_float, float_bb, check_str_bb)
-                    # Float path
-                    self.builder.position_at_end(float_bb)
-                    float_val = self.builder.bitcast(fv_data, double)
-                    int_from_float = self.builder.fptosi(float_val, i64)
-                    self.builder.store(int_from_float, result_alloca)
-                    self.builder.branch(merge_bb)
-                    # Check string tag
-                    self.builder.position_at_end(check_str_bb)
-                    is_str = self.builder.icmp_unsigned(
-                        "==", fv_tag, ir.Constant(i32, FPY_TAG_STR))
-                    self.builder.cbranch(is_str, str_bb, else_bb)
-                    # String path
-                    self.builder.position_at_end(str_bb)
-                    str_ptr = self._ensure_ptr(fv_data)
-                    int_from_str = self._rt_call("str_to_int", [str_ptr])
-                    self._emit_try_bail_if_exc()
-                    self.builder.store(int_from_str, result_alloca)
-                    self.builder.branch(merge_bb)
-                    # Else path: check for None/unsupported types → TypeError
-                    self.builder.position_at_end(else_bb)
-                    is_none = self.builder.icmp_unsigned(
-                        "==", fv_tag, ir.Constant(i32, FPY_TAG_NONE))
-                    none_bb = self._new_block("int.none")
-                    ok_bb = self._new_block("int.ok")
-                    self.builder.cbranch(is_none, none_bb, ok_bb)
-                    # None → TypeError
-                    self.builder.position_at_end(none_bb)
-                    exc_name = self._make_string_constant("TypeError")
-                    exc_id = self.builder.call(
-                        self.runtime["exc_name_to_id"], [exc_name])
-                    msg_ptr = self._make_string_constant(
-                        "int() argument must be a string, a bytes-like "
-                        "object or a real number, not 'NoneType'")
-                    self.builder.call(self.runtime["raise"], [exc_id, msg_ptr])
-                    self.builder.store(ir.Constant(i64, 0), result_alloca)
-                    self.builder.branch(merge_bb)
-                    # OK path (already int/bool)
-                    self.builder.position_at_end(ok_bb)
-                    self.builder.store(fv_data, result_alloca)
-                    self.builder.branch(merge_bb)
-                    # Merge
-                    self.builder.position_at_end(merge_bb)
-                    return self.builder.load(result_alloca)
+                    return self._emit_int_float_fv(
+                        "int_fv", self.builder.load(alloca), "int")
             # int(None) → TypeError at compile time
             if isinstance(arg_node, ast.Constant) and arg_node.value is None:
                 exc_name = self._make_string_constant("TypeError")
@@ -35124,8 +41458,14 @@ class CodeGen:
                 self.builder.call(self.runtime["raise"], [exc_id, msg_ptr])
                 return ir.Constant(i64, 0)
             val = self._emit_expr_value(arg_node)
+            if val.type == fpy_val:
+                # A tagged argument that is not a bare variable — a list
+                # element, a "mixed"-returning call — used to fall past every
+                # branch here and be returned *unchanged*, so `int(v[1])` on
+                # `[1, -2.5]` printed `-2.5`.  BUG-INT-FLOAT-OF-TAGGED-VALUE.
+                return self._emit_int_float_fv("int_fv", val, "int")
             if isinstance(val.type, ir.DoubleType):
-                return self.builder.fptosi(val, i64)
+                return self._emit_int_of_double(val)
             if isinstance(val.type, ir.IntType) and val.type.width < 64:
                 return self.builder.zext(val, i64)
             if isinstance(val.type, ir.PointerType):
@@ -35409,53 +41749,24 @@ class CodeGen:
                                    out_tag, out_data])
                 data = self.builder.load(out_data)
                 return self.builder.bitcast(data, double)
-            # FV-backed variables: dispatch by runtime tag
-            # to handle int, float, str, and bool arguments.
+            # FV-backed variables: dispatch by runtime tag in the runtime.
+            # The inlined version's else arm ran `sitofp` on the raw `data`,
+            # which for a BigInt or a Decimal converts the *pointer* to a
+            # double and for a list or None invents a number where CPython
+            # raises.  BUG-INT-FLOAT-OF-TAGGED-VALUE.
             if (self._USE_FV_LOCALS
                     and isinstance(arg_node, ast.Name)
                     and arg_node.id in self.variables):
                 alloca, _ftag = self.variables[arg_node.id]
                 if (isinstance(alloca.type, ir.PointerType)
                         and alloca.type.pointee is fpy_val):
-                    fv = self.builder.load(alloca)
-                    fv_tag = self.builder.extract_value(fv, 0)
-                    fv_data = self.builder.extract_value(fv, 1)
-                    is_str = self.builder.icmp_unsigned(
-                        "==", fv_tag, ir.Constant(i32, FPY_TAG_STR))
-                    is_float = self.builder.icmp_unsigned(
-                        "==", fv_tag, ir.Constant(i32, FPY_TAG_FLOAT))
-                    result_alloca = self._create_entry_alloca(
-                        double, "float.res")
-                    str_bb = self._new_block("float.str")
-                    check_float_bb = self._new_block("float.chkflt")
-                    float_bb = self._new_block("float.flt")
-                    else_bb = self._new_block("float.else")
-                    merge_bb = self._new_block("float.merge")
-                    self.builder.cbranch(is_str, str_bb, check_float_bb)
-                    # String path
-                    self.builder.position_at_end(str_bb)
-                    str_ptr = self._ensure_ptr(fv_data)
-                    f_from_str = self._rt_call("str_to_float", [str_ptr])
-                    self._emit_try_bail_if_exc()
-                    self.builder.store(f_from_str, result_alloca)
-                    self.builder.branch(merge_bb)
-                    # Check float
-                    self.builder.position_at_end(check_float_bb)
-                    self.builder.cbranch(is_float, float_bb, else_bb)
-                    # Float path (already float)
-                    self.builder.position_at_end(float_bb)
-                    already_f = self.builder.bitcast(fv_data, double)
-                    self.builder.store(already_f, result_alloca)
-                    self.builder.branch(merge_bb)
-                    # Else (int/bool → sitofp)
-                    self.builder.position_at_end(else_bb)
-                    f_from_int = self.builder.sitofp(fv_data, double)
-                    self.builder.store(f_from_int, result_alloca)
-                    self.builder.branch(merge_bb)
-                    # Merge
-                    self.builder.position_at_end(merge_bb)
-                    return self.builder.load(result_alloca)
+                    return self._emit_int_float_fv(
+                        "float_fv", self.builder.load(alloca), "float")
             val = self._emit_expr_value(arg_node)
+            if val.type == fpy_val:
+                # A tagged argument that is not a bare variable was returned
+                # unchanged, so `float(v[0])` on `[1, -2.5]` printed `1`.
+                return self._emit_int_float_fv("float_fv", val, "float")
             if isinstance(val.type, ir.IntType):
                 return self.builder.sitofp(val, double)
             if isinstance(val.type, ir.PointerType):
@@ -35470,6 +41781,15 @@ class CodeGen:
     def _emit_builtin_str(self, node):
         if len(node.args) == 1:
             arg_node = node.args[0]
+            # PATH fast path: a pure-mode Path is tagged OBJ but its data is a
+            # raw char* (the path text), NOT an FpyObj.  The generic
+            # fastpy_fv_str() would misread it as an FpyObj/PyObject* and, in
+            # pure mode, route through the CPython bridge stub which RAISES.
+            # Specialize to fastpy_path_str(ptr), the native handler.
+            if self._is_path_expr(arg_node):
+                obj = self._emit_expr_value(arg_node)
+                obj = self._ensure_ptr(obj)
+                return self.builder.call(self.runtime["path_str"], [obj])
             # OBJ fast path: use obj_to_str which handles
             # __str__ → __repr__ → default fallback safely
             if self._is_obj_expr(arg_node):
@@ -35481,7 +41801,15 @@ class CodeGen:
             # Use FV dispatch so runtime tag drives the conversion
             # (e.g. dict values whose compile-time tag is wrong).
             fv = self._load_or_wrap_fv(node.args[0])
-            return self._fv_call_str(fv)
+            result = self._fv_call_str(fv)
+            # Model-2: register the owned result only when the argument is a
+            # static scalar — then fastpy_fv_str allocates a fresh buffer
+            # (owned). For str/obj/unknown args it may return borrowed, so we
+            # conservatively leave it unregistered (see
+            # _call_arg0_is_static_scalar).
+            if self._call_arg0_is_static_scalar(node):
+                self._register_owned_str_ptr(result)
+            return result
         # str(bytes, encoding) → just return the first arg as string
         if len(node.args) >= 1:
             return self._emit_expr_value(node.args[0])
@@ -35605,7 +41933,7 @@ class CodeGen:
             if len(node.args) == 2:
                 # next(iterator, default) — catch StopIteration, return default
                 # Check if __next__ raised StopIteration
-                pending = self.builder.call(self.runtime["exc_pending"], [])
+                pending = self._emit_exc_pending()
                 is_exc = self.builder.icmp_signed(
                     "!=", pending, ir.Constant(i32, 0))
                 exc_type = self.builder.call(self.runtime["exc_get_type"], [])
@@ -35766,6 +42094,25 @@ class CodeGen:
                 ptr = self._ensure_ptr(val)
                 return self.builder.call(
                     self.runtime["complex_abs"], [ptr])
+            # BigInt and Decimal are pointers, so they matched neither the
+            # IntType nor the DoubleType branch below and fell through to the
+            # silent bridge fallback: `b = 2 ** 80; print(abs(b))` printed 0,
+            # as did `abs(Decimal("-2.5"))`.  `decimal_abs` had in fact been
+            # declared in the runtime table all along and never called.
+            # The result is returned tagged, the way `bigint_neg`'s is, so
+            # print and assignment see a BigInt rather than a raw pointer.
+            # BUG-ABS-OF-TAGGED-VALUE.
+            for _pred, _rt, _tag in (
+                    (self._is_bigint_expr, "bigint_abs", FPY_TAG_BIGINT),
+                    (self._is_decimal_expr, "decimal_abs", FPY_TAG_DECIMAL)):
+                if _pred(arg_node):
+                    _ptr = self._ensure_ptr(self._emit_expr_value(arg_node))
+                    _res = self.builder.call(self.runtime[_rt], [_ptr])
+                    _fv = ir.Constant(fpy_val, ir.Undefined)
+                    _fv = self.builder.insert_value(
+                        _fv, ir.Constant(i32, _tag), 0)
+                    return self.builder.insert_value(
+                        _fv, self.builder.ptrtoint(_res, i64), 1)
             # Object __abs__: dispatch to dunder (returns object)
             if self._is_obj_expr(arg_node):
                 obj = self._emit_expr_value(arg_node)
@@ -35783,6 +42130,23 @@ class CodeGen:
             elif isinstance(val.type, ir.DoubleType):
                 fabs_fn = self.module.declare_intrinsic("llvm.fabs", [double])
                 return self.builder.call(fabs_fn, [val])
+            elif val.type == fpy_val:
+                # A tagged argument — a heterogeneous list element, a call to
+                # a "mixed"-returning function — matched neither branch above
+                # and fell out of the `if` entirely, reaching the bridge
+                # fallback below, which yields 0 in native mode.  So
+                # `abs(v[0])` on `[1, -2.5]` printed `0 0`.  Dispatch on the
+                # tag at runtime instead.  BUG-ABS-OF-TAGGED-VALUE.
+                _tag_slot = self._create_entry_alloca(i32, "abs.tag")
+                _data_slot = self._create_entry_alloca(i64, "abs.data")
+                self.builder.call(
+                    self.runtime["abs_fv"],
+                    [self.builder.extract_value(val, 0),
+                     self.builder.extract_value(val, 1),
+                     _tag_slot, _data_slot])
+                return self._fv_build_from_slots(
+                    self.builder.load(_tag_slot),
+                    self.builder.load(_data_slot))
         return self._bridge_fallback_expr(node, "abs() with wrong args")
 
     def _emit_builtin_divmod(self, node):
@@ -35823,8 +42187,36 @@ class CodeGen:
     def _emit_builtin_chr(self, node):
         if len(node.args) == 1:
             val = self._emit_expr_value(node.args[0])
-            return self.builder.call(self.runtime["chr"], [val])
+            # fastpy_chr always allocates a fresh owned FpyString (Model 2).
+            return self._register_owned_str_ptr(
+                self.builder.call(self.runtime["chr"], [val]))
         raise CodeGenError("chr() takes exactly one argument", node)
+
+    def _emit_builtin_open(self, node):
+        """open(path, mode='r') → native C-stdio-backed file object.
+
+        Returns an i8* pointing to an FpyObj of the built-in "file" class
+        (tagged OBJ), so read()/write()/readline()/readlines()/close(),
+        `with open(...) as f:` (__enter__/__exit__), and `for line in f:`
+        (__iter__/__next__) all dispatch through the ordinary object
+        machinery.  Backed by fopen/fread/fwrite in the runtime, it needs no
+        CPython bridge and therefore works in pure mode on SlateOS.  Keyword
+        args (encoding=, newline=, ...) and 3+ positional args fall back to the
+        bridge for host-mode parity with CPython's full open() signature."""
+        # Only the simple path/mode positional form is handled natively; any
+        # kwargs (encoding=, buffering=, ...) route to the bridge.
+        if len(node.args) < 1 or len(node.args) > 2 or node.keywords:
+            return self._emit_unknown_builtin_call(node, "open")
+        # `open(Path(...))` is ordinary Python. fastpy_io_open takes the path as
+        # a C string, and in pure mode a Path pointer is a header, not text —
+        # passing it through unconverted made fopen() try to open a file named
+        # "PATH" (the header's magic word). See _emit_path_text_arg.
+        path = self._emit_path_text_arg(node.args[0], "open.path")
+        if len(node.args) >= 2:
+            mode = self._ensure_ptr(self._emit_expr_value(node.args[1]), "open.mode")
+        else:
+            mode = ir.Constant(i8_ptr, None)
+        return self.builder.call(self.runtime["io_open"], [path, mode])
 
     def _emit_builtin_ord(self, node):
         if len(node.args) == 1:
@@ -35835,19 +42227,25 @@ class CodeGen:
     def _emit_builtin_hex(self, node):
         if len(node.args) == 1:
             val = self._emit_expr_value(node.args[0])
-            return self.builder.call(self.runtime["hex"], [val])
+            # fastpy_hex always allocates a fresh owned FpyString (Model 2).
+            return self._register_owned_str_ptr(
+                self.builder.call(self.runtime["hex"], [val]))
         raise CodeGenError("hex() takes exactly one argument", node)
 
     def _emit_builtin_oct(self, node):
         if len(node.args) == 1:
             val = self._emit_expr_value(node.args[0])
-            return self.builder.call(self.runtime["oct"], [val])
+            # fastpy_oct always allocates a fresh owned FpyString (Model 2).
+            return self._register_owned_str_ptr(
+                self.builder.call(self.runtime["oct"], [val]))
         raise CodeGenError("oct() takes exactly one argument", node)
 
     def _emit_builtin_bin(self, node):
         if len(node.args) == 1:
             val = self._emit_expr_value(node.args[0])
-            return self.builder.call(self.runtime["bin"], [val])
+            # fastpy_bin always allocates a fresh owned FpyString (Model 2).
+            return self._register_owned_str_ptr(
+                self.builder.call(self.runtime["bin"], [val]))
         raise CodeGenError("bin() takes exactly one argument", node)
 
     def _emit_builtin_round(self, node):
@@ -35915,7 +42313,10 @@ class CodeGen:
                 return self._ensure_ptr(result)
             # Use FV dispatch so runtime tag drives the conversion.
             fv = self._load_or_wrap_fv(node.args[0])
-            return self._fv_call_repr(fv)
+            # Model-2: fastpy_fv_repr always allocates a fresh owned buffer
+            # (even for str input — it adds quotes), so its result is always
+            # owned. Register it for release at the statement boundary.
+            return self._register_owned_str_ptr(self._fv_call_repr(fv))
         raise CodeGenError("repr() takes exactly one argument", node)
 
     def _emit_builtin_sum(self, node):
@@ -35967,6 +42368,71 @@ class CodeGen:
                     and isinstance(node.args[1], ast.Constant)
                     and isinstance(node.args[1].value, float)):
                 _sum_float = True
+
+            # Heap-numeric elements need an FpyValue accumulator.  Both loops
+            # below read the element with `_list_get_as_bare(..., "int")`,
+            # which throws the runtime tag away and keeps the raw i64 — for a
+            # BigInt, Decimal or complex that i64 is the value's *address*, so
+            # `sum([2 ** 80, 2 ** 80])` added two pointers and printed
+            # `4413044692288`.  BUG-SUM-BARE-I64-OVER-HEAP-ELEMENTS.
+            #
+            # FVALUE/MIXED elements have the same problem for a different
+            # reason: nothing is statically known about them, so the bare read
+            # is a guess that is wrong for every float element too.
+            #
+            # The third accumulator keeps (tag, data) and folds with
+            # `fastpy_fv_binop`, which is the one place that knows how to add
+            # every tag combination — and, being the same helper the binop
+            # paths use, it also raises the right TypeError for `sum(["a"])`
+            # instead of silently adding two string pointers.
+            _sum_fv = False
+            if not _sum_float and len(node.args) >= 1:
+                _fv_kinds = (VKind.BIGINT, VKind.DECIMAL, VKind.COMPLEX,
+                             VKind.FVALUE, VKind.MIXED)
+                if self._get_list_elem_type(node.args[0]).kind in _fv_kinds:
+                    _sum_fv = True
+
+            if _sum_fv:
+                _acc_tag = self._create_entry_alloca(i32, "sumfv.tag")
+                _acc_data = self._create_entry_alloca(i64, "sumfv.data")
+                if len(node.args) >= 2:
+                    _st = self._emit_expr(node.args[1])
+                    _stag, _sdata = self._fv_unpack(_st.as_fv(self.builder))
+                    self.builder.store(_stag, _acc_tag)
+                    self.builder.store(_sdata, _acc_data)
+                else:
+                    self.builder.store(ir.Constant(i32, FPY_TAG_INT), _acc_tag)
+                    self.builder.store(ir.Constant(i64, 0), _acc_data)
+
+                idx_alloca = self._create_entry_alloca(i64, "sum.idx")
+                self.builder.store(ir.Constant(i64, 0), idx_alloca)
+                cond_block = self._new_block("sumfv.cond")
+                body_block = self._new_block("sumfv.body")
+                end_block = self._new_block("sumfv.end")
+                self.builder.branch(cond_block)
+                self.builder.position_at_end(cond_block)
+                idx = self.builder.load(idx_alloca)
+                self.builder.cbranch(
+                    self.builder.icmp_signed("<", idx, length),
+                    body_block, end_block)
+
+                self.builder.position_at_end(body_block)
+                idx = self.builder.load(idx_alloca)
+                _etag, _edata = self._fv_list_get(lst, idx, "sumfv.elem")
+                self._rt_call(
+                    "fv_binop",
+                    [self.builder.load(_acc_tag),
+                     self.builder.load(_acc_data), _etag, _edata,
+                     ir.Constant(i32, self._FV_BINOP_OPCODES[ast.Add]),
+                     _acc_tag, _acc_data])
+                self._emit_try_bail_if_exc()
+                self.builder.store(
+                    self.builder.add(idx, ir.Constant(i64, 1)), idx_alloca)
+                self.builder.branch(cond_block)
+
+                self.builder.position_at_end(end_block)
+                return self._fv_build_from_slots(self.builder.load(_acc_tag),
+                                                 self.builder.load(_acc_data))
 
             if _sum_float:
                 sum_alloca = self._create_entry_alloca(double, "sum.acc")
@@ -36052,12 +42518,29 @@ class CodeGen:
                 obj = self._ensure_ptr(obj)
                 lst = self._rt_call("list_from_obj_iter", [obj])
                 return self._rt_call("set_from_list", [lst])
+            # Everything else goes through the runtime on its tag.  This used
+            # to hand the argument's bare pointer to `set_from_list`, which
+            # reads it as an FpyList -- so `set({"k": 1})`, `set(b"AB")` and
+            # `set({7, 8})` each read one container type through another's
+            # field offsets and died, the constructor half of
+            # BUG-SET-UPDATE-NON-SET-ITERABLE-SEGFAULTS.  Only the FpyValue
+            # case was routed by tag, which is why the bug was invisible
+            # wherever the compiler had *failed* to pin the kind down and
+            # visible wherever it had succeeded.
             arg = self._emit_expr_value(arg_node)
-            if isinstance(arg.type, ir.LiteralStructType) and arg.type == fpy_val:
-                tag = self.builder.extract_value(arg, 0)
-                data = self.builder.extract_value(arg, 1)
-                arg = self.builder.call(self.runtime["fv_to_list"], [tag, data])
-            return self._rt_call("set_from_list", [arg])
+            tag, data = self._to_tag_data_ir(arg, arg_node)
+            # `_to_tag_data_ir` answers STR for a pointer whose kind it could
+            # not infer -- a default, not a fact.  This call site's default has
+            # always been LIST, and `set(<a list>)` is what an un-inferred
+            # pointer overwhelmingly is, so keep it: the point of this change
+            # is to stop guessing where the kind is *known*, not to give the
+            # unknown case a new way to be wrong.
+            if (isinstance(tag, ir.Constant)
+                    and int(tag.constant) == FPY_TAG_STR
+                    and self._infer_type_tag(arg_node, arg).kind != VKind.STR):
+                tag = ir.Constant(i32, FPY_TAG_LIST)
+            return self.builder.call(
+                self.runtime["set_from_iterable_fv"], [tag, data])
         if len(node.args) == 0:
             return self.builder.call(self.runtime["dict_new"], [])
         raise CodeGenError("set() takes 0 or 1 arguments", node)
@@ -36358,6 +42841,135 @@ class CodeGen:
         ret_data = self.builder.load(out_data)
         return self._fv_build_from_slots(ret_tag, ret_data)
 
+    def _emit_set_arg_tags(self, pairs):
+        """Publish the runtime tag of each positional argument.
+
+        A callee whose parameter is UNKNOWN receives only a bare i64 and
+        recovers the tag from the `fastpy_{set,get}_arg_tag` side-channel.
+        That channel is *global and sticky*: a call site that forgets to
+        write it leaves the previous call's tags in place, so the callee
+        reads a stale tag and misinterprets its own argument.  Every site
+        that reaches a Python-level function through a bare-i64 signature
+        must therefore call this, even when the tag looks statically
+        obvious — "obvious" only describes what the caller passes, not
+        what the callee will read if we stay silent.
+
+        `pairs` is a sequence of `(value, arg_node)`; `value` should be the
+        argument *before* any ptrtoint/zext coercion, so `_bare_to_tag_data`
+        still sees its real LLVM type.
+        """
+        for _ati, (_atv, _at_node) in enumerate(pairs):
+            _rt_tag_val = None
+            if (isinstance(_at_node, ast.Name)
+                    and _at_node.id in self.variables):
+                _v_alloca, _ = self.variables[_at_node.id]
+                if (isinstance(_v_alloca.type, ir.PointerType)
+                        and _v_alloca.type.pointee is fpy_val):
+                    _fv_load = self.builder.load(
+                        _v_alloca, name=f"fv.{_at_node.id}")
+                    _rt_tag_val = self.builder.extract_value(
+                        _fv_load, 0, name=f"fv.{_at_node.id}.tag")
+            if (_rt_tag_val is None
+                    and isinstance(_atv.type, ir.LiteralStructType)
+                    and _atv.type == fpy_val):
+                _rt_tag_val = self.builder.extract_value(_atv, 0)
+            if _rt_tag_val is not None:
+                self.builder.call(self.runtime["set_arg_tag"],
+                                  [ir.Constant(i32, _ati), _rt_tag_val])
+            else:
+                _at_tag, _ = self._bare_to_tag_data(_atv,
+                                                    value_node=_at_node)
+                self.builder.call(self.runtime["set_arg_tag"],
+                                  [ir.Constant(i32, _ati),
+                                   ir.Constant(i32, _at_tag)])
+
+    def _resolve_dunder_call_func(self, cls_name):
+        """Find the `__call__` LLVM function a class inherits, or None."""
+        cn = cls_name
+        while cn and cn in self._user_classes:
+            ci = self._user_classes[cn]
+            if "__call__" in ci.methods:
+                return ci.methods["__call__"]
+            cn = ci.parent_name
+        return None
+
+    def _emit_direct_dunder_call(self, obj_ptr, call_func, node: ast.Call):
+        """Call a statically-resolved `__call__` with `node`'s arguments.
+
+        Used by every `obj(...)` shape whose class is known at compile time,
+        whether the object comes from a variable (`f = F(); f(x)`) or straight
+        out of a constructor (`F()(x)`).  Going direct rather than through the
+        runtime's name-based `fastpy_obj_call_methodN` matters for three
+        reasons: the dispatcher only has 0-, 1- and 2-argument shapes, it
+        flattens every return type to a bare `i64`, and it forces the caller
+        to guess the result's tag.  Here the callee's real LLVM signature is
+        in hand, so arguments are coerced to it and the return tag is read
+        back from the side-channel the method itself published.
+        """
+        direct_args = [obj_ptr]
+        call_vals = []
+        for i, arg_node in enumerate(node.args):
+            val = self._emit_expr_value(arg_node)
+            call_vals.append((val, arg_node))
+            if 1 + i < len(call_func.args):
+                expected = call_func.args[1 + i].type
+                if val.type != expected:
+                    if (isinstance(expected, ir.IntType)
+                            and isinstance(val.type, ir.IntType)
+                            and expected.width != val.type.width):
+                        if expected.width > val.type.width:
+                            val = self.builder.zext(val, expected)
+                        else:
+                            val = self.builder.trunc(val, expected)
+                    elif (isinstance(expected, ir.IntType)
+                            and isinstance(val.type, ir.PointerType)):
+                        val = self.builder.ptrtoint(val, expected)
+                    elif (isinstance(expected, ir.PointerType)
+                            and isinstance(val.type, ir.IntType)):
+                        val = self.builder.inttoptr(val, expected)
+                    elif (isinstance(expected, ir.DoubleType)
+                            and isinstance(val.type, ir.IntType)):
+                        val = self.builder.bitcast(val, expected)
+                    elif (isinstance(expected, ir.IntType)
+                            and isinstance(val.type, ir.DoubleType)):
+                        val = self.builder.bitcast(val, expected)
+            direct_args.append(val)
+        # Set arg tags so the callee knows runtime types
+        self._emit_set_arg_tags(call_vals)
+        result = self.builder.call(call_func, direct_args)
+        ret_type = call_func.return_value.type
+        if isinstance(ret_type, ir.VoidType):
+            return ir.Constant(i64, 0)
+        return self._wrap_with_ret_tag(result)
+
+    def _wrap_with_ret_tag(self, result):
+        """Rebuild an FpyValue from a bare scalar return using `get_ret_tag`.
+
+        Only call this once the callee is known to *publish* a tag, since the
+        channel is sticky and otherwise hands back some earlier call's value —
+        the same trap `_recover_closure_ret_tag` documents.  Two lowerings
+        qualify: `fastpy.class.*` methods, whose every `return <expr>` path
+        calls `set_ret_tag` (see `_needs_ret_tag` in `_emit_return`), and
+        `fastpy.closure.*` bodies, which do the same.
+
+        Without it the caller assumes INT, so `Echo()("xyz")` prints the
+        string's address.  BUG-CALL-ON-CALL-IGNORES-RET-TAG.
+        """
+        if (isinstance(result.type, ir.LiteralStructType)
+                and result.type == fpy_val):
+            return result
+        ret_tag = self.builder.call(self.runtime["get_ret_tag"], [])
+        if isinstance(result.type, ir.PointerType):
+            data = self.builder.ptrtoint(result, i64)
+        elif isinstance(result.type, ir.DoubleType):
+            data = self.builder.bitcast(result, i64)
+        elif isinstance(result.type, ir.IntType):
+            data = (result if result.type.width == 64
+                    else self.builder.sext(result, i64))
+        else:
+            return result
+        return self._fv_build_from_slots(ret_tag, data)
+
     def _emit_call_on_call(self, node: ast.Call):
         """Handle Call-on-Call patterns: f(3)(5), C()(5), etc.
         The inner call might return a closure or an object with __call__.
@@ -36368,41 +42980,66 @@ class CodeGen:
             return None
         # Check if the inner call returns a closure
         inner_returns_closure = False
+        # The callee's LLVM body, when the inner call resolves to a nested
+        # def we generated.  Only then is `fpy_ret_tag` guaranteed fresh
+        # after the indirect call — see `_wrap_with_ret_tag`.
+        _closure_fn = None
         if isinstance(node.func.func, ast.Name):
             inner_name = node.func.func.id
             for full_name in self._closure_info:
                 if full_name.startswith(f"{inner_name}."):
                     inner_returns_closure = True
+                    _closure_fn = self.module.globals.get(
+                        f"fastpy.closure.{full_name}")
                     break
             if (inner_name in self.variables
                     and self._var_kind(inner_name) == VKind.CLOSURE):
                 inner_returns_closure = True
 
+        def _tagged(res):
+            return (self._wrap_with_ret_tag(res)
+                    if _closure_fn is not None else res)
+
         if inner_returns_closure:
             # Use call_ptr dispatch (handles closures and raw func ptrs)
             n_args = len(node.args)
             if n_args == 0:
-                return self.builder.call(
-                    self.runtime["call_ptr0"], [callee])
+                return _tagged(self.builder.call(
+                    self.runtime["call_ptr0"], [callee]))
             elif n_args == 1:
                 a = self._emit_expr_value(node.args[0])
+                self._emit_set_arg_tags([(a, node.args[0])])
                 if isinstance(a.type, ir.PointerType):
                     a = self.builder.ptrtoint(a, i64)
                 elif isinstance(a.type, ir.IntType) and a.type.width != 64:
                     a = self.builder.zext(a, i64)
-                return self.builder.call(
-                    self.runtime["call_ptr1"], [callee, a])
+                return _tagged(self.builder.call(
+                    self.runtime["call_ptr1"], [callee, a]))
             elif n_args == 2:
                 a1 = self._emit_expr_value(node.args[0])
                 a2 = self._emit_expr_value(node.args[1])
+                self._emit_set_arg_tags(
+                    [(a1, node.args[0]), (a2, node.args[1])])
                 if isinstance(a1.type, ir.PointerType):
                     a1 = self.builder.ptrtoint(a1, i64)
                 if isinstance(a2.type, ir.PointerType):
                     a2 = self.builder.ptrtoint(a2, i64)
-                return self.builder.call(
-                    self.runtime["call_ptr2"], [callee, a1, a2])
+                return _tagged(self.builder.call(
+                    self.runtime["call_ptr2"], [callee, a1, a2]))
         else:
-            # Object with __call__
+            # Object with __call__.  When the inner call is a constructor of
+            # a known user class the callee is statically resolvable, so go
+            # direct — the runtime dispatcher below only has 0/1/2-argument
+            # shapes and loses the return type.
+            _ctor_cls = None
+            if (isinstance(node.func, ast.Call)
+                    and isinstance(node.func.func, ast.Name)
+                    and node.func.func.id in self._user_classes):
+                _ctor_cls = node.func.func.id
+            if _ctor_cls is not None:
+                _cf = self._resolve_dunder_call_func(_ctor_cls)
+                if _cf is not None:
+                    return self._emit_direct_dunder_call(callee, _cf, node)
             name_ptr = self._make_string_constant("__call__")
             if len(node.args) == 0:
                 return self.builder.call(
@@ -36410,6 +43047,12 @@ class CodeGen:
                     [callee, name_ptr])
             elif len(node.args) == 1:
                 a = self._emit_expr_value(node.args[0])
+                # `C()(7)` reaches `__call__` through the runtime's
+                # name-based dispatcher, which passes a bare i64 — so the
+                # tag has to travel through the arg-tag channel or the
+                # callee reads whatever the *previous* call left there.
+                # BUG-CALL-ON-CALL-STALE-ARG-TAG.
+                self._emit_set_arg_tags([(a, node.args[0])])
                 if isinstance(a.type, ir.PointerType):
                     a = self.builder.ptrtoint(a, i64)
                 elif isinstance(a.type, ir.IntType) and a.type.width != 64:
@@ -36493,77 +43136,18 @@ class CodeGen:
             elif name in self.variables:
                 _vk = self._var_kind(name)
                 if _vk == VKind.CLOSURE:
-                    return self._emit_closure_call(node)
+                    result = self._emit_closure_call(node)
+                    return self._recover_closure_ret_tag(name, result)
                 # OBJ variable with __call__ → direct dispatch
                 if _vk == VKind.OBJ:
                     _call_cls = self._obj_var_class.get(name)
                     if _call_cls and self._class_has_method(_call_cls, "__call__"):
                         obj = self._load_variable(name, node)
                         obj = self._ensure_ptr(obj)
-                        call_func = None
-                        cn = _call_cls
-                        while cn and cn in self._user_classes:
-                            ci = self._user_classes[cn]
-                            if "__call__" in ci.methods:
-                                call_func = ci.methods["__call__"]
-                                break
-                            cn = ci.parent_name
+                        call_func = self._resolve_dunder_call_func(_call_cls)
                         if call_func is not None:
-                            direct_args = [obj]
-                            call_vals = []
-                            for i, arg_node in enumerate(node.args):
-                                val = self._emit_expr_value(arg_node)
-                                call_vals.append((val, arg_node))
-                                # Coerce arg types to match __call__ signature
-                                if 1 + i < len(call_func.args):
-                                    expected = call_func.args[1 + i].type
-                                    if val.type != expected:
-                                        if (isinstance(expected, ir.IntType)
-                                                and isinstance(val.type, ir.IntType)
-                                                and expected.width != val.type.width):
-                                            if expected.width > val.type.width:
-                                                val = self.builder.zext(val, expected)
-                                            else:
-                                                val = self.builder.trunc(val, expected)
-                                        elif (isinstance(expected, ir.IntType)
-                                                and isinstance(val.type, ir.PointerType)):
-                                            val = self.builder.ptrtoint(val, expected)
-                                        elif (isinstance(expected, ir.PointerType)
-                                                and isinstance(val.type, ir.IntType)):
-                                            val = self.builder.inttoptr(val, expected)
-                                        elif (isinstance(expected, ir.DoubleType)
-                                                and isinstance(val.type, ir.IntType)):
-                                            val = self.builder.bitcast(val, expected)
-                                        elif (isinstance(expected, ir.IntType)
-                                                and isinstance(val.type, ir.DoubleType)):
-                                            val = self.builder.bitcast(val, expected)
-                                direct_args.append(val)
-                            # Set arg tags so callee knows runtime types
-                            for _ati, (_atv, _at_node) in enumerate(call_vals):
-                                _rt_tag_val = None
-                                if (isinstance(_at_node, ast.Name)
-                                        and _at_node.id in self.variables):
-                                    _v_alloca, _v_vtag = self.variables[_at_node.id]
-                                    if (isinstance(_v_alloca.type, ir.PointerType)
-                                            and _v_alloca.type.pointee is fpy_val):
-                                        _fv_load = self.builder.load(
-                                            _v_alloca, name=f"fv.{_at_node.id}")
-                                        _rt_tag_val = self.builder.extract_value(
-                                            _fv_load, 0, name=f"fv.{_at_node.id}.tag")
-                                if _rt_tag_val is not None:
-                                    self.builder.call(self.runtime["set_arg_tag"],
-                                                      [ir.Constant(i32, _ati), _rt_tag_val])
-                                else:
-                                    _at_tag, _ = self._bare_to_tag_data(
-                                        _atv, value_node=_at_node)
-                                    self.builder.call(self.runtime["set_arg_tag"],
-                                                      [ir.Constant(i32, _ati),
-                                                       ir.Constant(i32, _at_tag)])
-                            result = self.builder.call(call_func, direct_args)
-                            ret_type = call_func.return_value.type
-                            if isinstance(ret_type, ir.VoidType):
-                                return ir.Constant(i64, 0)
-                            return result
+                            return self._emit_direct_dunder_call(
+                                obj, call_func, node)
                 # FVALUE/MIXED/OBJ variables that might hold a function pointer:
                 # dispatch through closure call path which uses call_ptr to
                 # auto-detect closures vs raw function pointers at runtime.
@@ -37101,8 +43685,12 @@ class CodeGen:
         if func_name == "dumps" and len(node.args) == 1 and not node.keywords:
             val = self._emit_expr_value(node.args[0])
             tag, data = self._bare_to_tag_data(val, node.args[0])
-            return self.builder.call(self.runtime["json_dumps"],
-                                     [ir.Constant(i32, tag), data])
+            # fastpy_json_dumps_fv always returns a fresh owned (+1) FpyString
+            # (fpy_str_copy) — register it for release at the statement
+            # boundary (Model 2).
+            return self._register_owned_str_ptr(
+                self.builder.call(self.runtime["json_dumps"],
+                                  [ir.Constant(i32, tag), data]))
         elif func_name == "loads" and len(node.args) == 1:
             arg = self._emit_expr_value(node.args[0])
             arg = self._ensure_ptr(arg)
@@ -37124,10 +43712,471 @@ class CodeGen:
         """os.getcwd / os.listdir / os.getenv + os.path functions"""
         if func_name == "getcwd" and len(node.args) == 0:
             return self.builder.call(self.runtime["os_getcwd"], [])
+        elif func_name == "getpid" and len(node.args) == 0:
+            # os.getpid() -> bare i64 PID (on SlateOS a real SYS_PROCESS_ID
+            # syscall via posix getpid()).
+            return self.builder.call(self.runtime["os_getpid"], [])
+        elif func_name == "getppid" and len(node.args) == 0:
+            # os.getppid() -> bare i64 parent PID (on SlateOS a real
+            # SYS_PROCESS_PARENT_ID syscall via posix getppid()).
+            return self.builder.call(self.runtime["os_getppid"], [])
+        elif func_name == "gettid" and len(node.args) == 0:
+            # os.gettid() -> bare i64 kernel task ID (on SlateOS a real
+            # SYS_TASK_ID syscall via posix gettid()).
+            return self.builder.call(self.runtime["os_gettid"], [])
+        elif func_name == "getuid" and len(node.args) == 0:
+            # os.getuid() -> bare i64 real uid (on SlateOS a real
+            # SYS_PROCESS_GET_CREDENTIALS syscall via posix getuid()).
+            return self.builder.call(self.runtime["os_getuid"], [])
+        elif func_name == "getgid" and len(node.args) == 0:
+            # os.getgid() -> bare i64 real gid (on SlateOS a real
+            # SYS_PROCESS_GET_CREDENTIALS syscall via posix getgid()).
+            return self.builder.call(self.runtime["os_getgid"], [])
+        elif func_name in ("setuid", "setgid") and len(node.args) == 1:
+            # os.setuid(uid)/os.setgid(gid) -> bare i64 status (0 ok, -1 EPERM).
+            # On SlateOS posix setuid()/setgid() run the userspace
+            # CAP_SETUID/CAP_SETGID + identity check and, if allowed, issue the
+            # real SYS_PROCESS_SET_CREDENTIALS syscall that mutates the kernel
+            # process credentials — a distinct kernel path (the
+            # process-credentials table) from the read-only getuid/getgid.
+            def _id_i64(v):
+                if (isinstance(v.type, ir.LiteralStructType)
+                        and v.type == fpy_val):
+                    return self.builder.extract_value(v, 1)
+                if isinstance(v.type, ir.PointerType):
+                    return self.builder.ptrtoint(v, i64)
+                if isinstance(v.type, ir.DoubleType):
+                    return self.builder.fptosi(v, i64)
+                if isinstance(v.type, ir.IntType) and v.type.width != 64:
+                    return self.builder.zext(v, i64)
+                return v
+            idv = _id_i64(self._emit_expr_value(node.args[0]))
+            rt_name = "os_setuid" if func_name == "setuid" else "os_setgid"
+            return self.builder.call(self.runtime[rt_name], [idv])
+        elif func_name in ("nice", "getpriority", "setpriority"):
+            # os.nice(inc)/os.getpriority(which, who)/os.setpriority(which, who,
+            # prio) -> bare i64.  On SlateOS these issue SYS_PROCESS_GET_NICE /
+            # SYS_PROCESS_SET_NICE via posix nice()/getpriority()/setpriority():
+            # the kernel records the nice value AND maps it to a scheduler
+            # priority level (nice is a real scheduling attribute) — a distinct
+            # kernel path (the scheduler's per-task priority) from every
+            # filesystem/credential syscall.
+            def _arg_i64(v):
+                if (isinstance(v.type, ir.LiteralStructType)
+                        and v.type == fpy_val):
+                    return self.builder.extract_value(v, 1)
+                if isinstance(v.type, ir.PointerType):
+                    return self.builder.ptrtoint(v, i64)
+                if isinstance(v.type, ir.DoubleType):
+                    return self.builder.fptosi(v, i64)
+                if isinstance(v.type, ir.IntType) and v.type.width != 64:
+                    return self.builder.zext(v, i64)
+                return v
+            if func_name == "nice" and len(node.args) == 1:
+                inc = _arg_i64(self._emit_expr_value(node.args[0]))
+                return self.builder.call(self.runtime["os_nice"], [inc])
+            if func_name == "getpriority" and len(node.args) == 2:
+                which = _arg_i64(self._emit_expr_value(node.args[0]))
+                who = _arg_i64(self._emit_expr_value(node.args[1]))
+                return self.builder.call(self.runtime["os_getpriority"], [which, who])
+            if func_name == "setpriority" and len(node.args) == 3:
+                which = _arg_i64(self._emit_expr_value(node.args[0]))
+                who = _arg_i64(self._emit_expr_value(node.args[1]))
+                prio = _arg_i64(self._emit_expr_value(node.args[2]))
+                return self.builder.call(self.runtime["os_setpriority"], [which, who, prio])
+            # Fall through for unsupported arities.
+        elif func_name == "pipe" and len(node.args) == 0:
+            # os.pipe() -> FpyList* [read_fd, write_fd] (as i8_ptr). On SlateOS a
+            # real SYS_PIPE_CREATE syscall via posix pipe(). Inference tags this
+            # LIST(INT), so `r, w = os.pipe()` unpacks the 2-element list.
+            return self.builder.call(self.runtime["os_pipe"], [])
+        elif func_name == "write" and len(node.args) == 2:
+            # os.write(fd, data) -> bare i64 bytes written. fd is a raw int fd,
+            # data a str; on SlateOS posix write() dispatches by fd kind — a
+            # pipe end routes to the pipe's kernel buffer via SYS_PIPE_WRITE
+            # (a regular file fd would use SYS_FS_WRITE).
+            def _fd_i64(v):
+                if (isinstance(v.type, ir.LiteralStructType)
+                        and v.type == fpy_val):
+                    return self.builder.extract_value(v, 1)
+                if isinstance(v.type, ir.PointerType):
+                    return self.builder.ptrtoint(v, i64)
+                if isinstance(v.type, ir.DoubleType):
+                    return self.builder.fptosi(v, i64)
+                if isinstance(v.type, ir.IntType) and v.type.width != 64:
+                    return self.builder.zext(v, i64)
+                return v
+            fd = _fd_i64(self._emit_expr_value(node.args[0]))
+            data = self._ensure_ptr(self._emit_expr_value(node.args[1]))
+            return self.builder.call(self.runtime["os_write"], [fd, data])
+        elif func_name == "read" and len(node.args) == 2:
+            # os.read(fd, n) -> str of up to n bytes (i8_ptr). On SlateOS posix
+            # read() dispatches by fd kind — a pipe end pulls from the pipe's
+            # kernel buffer via SYS_PIPE_READ (a file fd would use SYS_FS_READ).
+            def _fd_i64(v):
+                if (isinstance(v.type, ir.LiteralStructType)
+                        and v.type == fpy_val):
+                    return self.builder.extract_value(v, 1)
+                if isinstance(v.type, ir.PointerType):
+                    return self.builder.ptrtoint(v, i64)
+                if isinstance(v.type, ir.DoubleType):
+                    return self.builder.fptosi(v, i64)
+                if isinstance(v.type, ir.IntType) and v.type.width != 64:
+                    return self.builder.zext(v, i64)
+                return v
+            fd = _fd_i64(self._emit_expr_value(node.args[0]))
+            n = _fd_i64(self._emit_expr_value(node.args[1]))
+            return self.builder.call(self.runtime["os_read"], [fd, n])
+        elif func_name == "close" and len(node.args) == 1:
+            # os.close(fd) -> bare i64 status (0 ok, -1 error). Closes a raw int
+            # fd (e.g. a pipe end); on SlateOS posix close() dispatches by fd
+            # kind — a pipe end maps to SYS_PIPE_CLOSE.
+            def _fd_i64(v):
+                if (isinstance(v.type, ir.LiteralStructType)
+                        and v.type == fpy_val):
+                    return self.builder.extract_value(v, 1)
+                if isinstance(v.type, ir.PointerType):
+                    return self.builder.ptrtoint(v, i64)
+                if isinstance(v.type, ir.DoubleType):
+                    return self.builder.fptosi(v, i64)
+                if isinstance(v.type, ir.IntType) and v.type.width != 64:
+                    return self.builder.zext(v, i64)
+                return v
+            fd = _fd_i64(self._emit_expr_value(node.args[0]))
+            return self.builder.call(self.runtime["os_close"], [fd])
+        elif func_name == "dup" and len(node.args) == 1:
+            # os.dup(fd) -> bare i64 new fd aliasing the same kernel object.
+            # On SlateOS posix dup() shares the underlying handle (e.g. a pipe
+            # end): the new fd drives the *same* kernel pipe buffer.
+            def _fd_i64(v):
+                if (isinstance(v.type, ir.LiteralStructType)
+                        and v.type == fpy_val):
+                    return self.builder.extract_value(v, 1)
+                if isinstance(v.type, ir.PointerType):
+                    return self.builder.ptrtoint(v, i64)
+                if isinstance(v.type, ir.DoubleType):
+                    return self.builder.fptosi(v, i64)
+                if isinstance(v.type, ir.IntType) and v.type.width != 64:
+                    return self.builder.zext(v, i64)
+                return v
+            fd = _fd_i64(self._emit_expr_value(node.args[0]))
+            return self.builder.call(self.runtime["os_dup"], [fd])
+        elif func_name == "dup2" and len(node.args) == 2:
+            # os.dup2(oldfd, newfd) -> bare i64 newfd. Installs a copy of oldfd
+            # at the caller-chosen newfd (closing whatever was there), sharing
+            # the same kernel handle — a distinct path from dup()'s lowest-free.
+            def _fd_i64(v):
+                if (isinstance(v.type, ir.LiteralStructType)
+                        and v.type == fpy_val):
+                    return self.builder.extract_value(v, 1)
+                if isinstance(v.type, ir.PointerType):
+                    return self.builder.ptrtoint(v, i64)
+                if isinstance(v.type, ir.DoubleType):
+                    return self.builder.fptosi(v, i64)
+                if isinstance(v.type, ir.IntType) and v.type.width != 64:
+                    return self.builder.zext(v, i64)
+                return v
+            oldfd = _fd_i64(self._emit_expr_value(node.args[0]))
+            newfd = _fd_i64(self._emit_expr_value(node.args[1]))
+            return self.builder.call(self.runtime["os_dup2"], [oldfd, newfd])
+        elif func_name == "lseek" and len(node.args) == 3:
+            # os.lseek(fd, offset, whence) -> bare i64 new file offset. On
+            # SlateOS posix lseek() repositions a regular file fd's kernel
+            # offset via SYS_FS_SEEK — a distinct kernel path from read/write.
+            def _fd_i64(v):
+                if (isinstance(v.type, ir.LiteralStructType)
+                        and v.type == fpy_val):
+                    return self.builder.extract_value(v, 1)
+                if isinstance(v.type, ir.PointerType):
+                    return self.builder.ptrtoint(v, i64)
+                if isinstance(v.type, ir.DoubleType):
+                    return self.builder.fptosi(v, i64)
+                if isinstance(v.type, ir.IntType) and v.type.width != 64:
+                    return self.builder.zext(v, i64)
+                return v
+            fd = _fd_i64(self._emit_expr_value(node.args[0]))
+            offset = _fd_i64(self._emit_expr_value(node.args[1]))
+            whence = _fd_i64(self._emit_expr_value(node.args[2]))
+            return self.builder.call(self.runtime["os_lseek"], [fd, offset, whence])
+        elif func_name == "open" and len(node.args) in (2, 3):
+            # os.open(path, flags[, mode]) -> bare i64 raw file fd. On SlateOS
+            # posix open() -> SYS_FS_OPEN yields a raw fd that native
+            # os.read/os.write/os.lseek/os.close drive — the raw-fd counterpart
+            # to the high-level builtin open(). `flags`/`mode` are POSIX bits.
+            def _fd_i64(v):
+                if (isinstance(v.type, ir.LiteralStructType)
+                        and v.type == fpy_val):
+                    return self.builder.extract_value(v, 1)
+                if isinstance(v.type, ir.PointerType):
+                    return self.builder.ptrtoint(v, i64)
+                if isinstance(v.type, ir.DoubleType):
+                    return self.builder.fptosi(v, i64)
+                if isinstance(v.type, ir.IntType) and v.type.width != 64:
+                    return self.builder.zext(v, i64)
+                return v
+            path = self._emit_path_text_arg(node.args[0])
+            flags = _fd_i64(self._emit_expr_value(node.args[1]))
+            if len(node.args) == 3:
+                mode = _fd_i64(self._emit_expr_value(node.args[2]))
+            else:
+                # POSIX default creation mode 0o777 (masked by umask); only
+                # consulted when O_CREAT is set.
+                mode = ir.Constant(i64, 0o777)
+            return self.builder.call(self.runtime["os_open"], [path, flags, mode])
+        elif func_name == "umask" and len(node.args) == 1:
+            # os.umask(mask) -> bare i64 previous mask. On SlateOS posix umask()
+            # stores the process file-mode creation mask in the userspace POSIX
+            # layer; subsequent os.open(O_CREAT)/os.mkdir mask their mode with
+            # it before the kernel create syscall stamps the final permission
+            # bits. A genuine observable mutation (umask(022) then create 0777
+            # -> 0755 on disk), distinct from every other os.* path.
+            def _u_i64(v):
+                if (isinstance(v.type, ir.LiteralStructType)
+                        and v.type == fpy_val):
+                    return self.builder.extract_value(v, 1)
+                if isinstance(v.type, ir.PointerType):
+                    return self.builder.ptrtoint(v, i64)
+                if isinstance(v.type, ir.DoubleType):
+                    return self.builder.fptosi(v, i64)
+                if isinstance(v.type, ir.IntType) and v.type.width != 64:
+                    return self.builder.zext(v, i64)
+                return v
+            mask = _u_i64(self._emit_expr_value(node.args[0]))
+            return self.builder.call(self.runtime["os_umask"], [mask])
+        elif func_name == "ftruncate" and len(node.args) == 2:
+            # os.ftruncate(fd, length) -> bare i64 status (0 ok, -1 error). On
+            # SlateOS posix ftruncate() -> SYS_FS_FTRUNCATE resizes the file
+            # open on `fd` — a distinct kernel path from lseek/write and from
+            # the path-based os.truncate() (SYS_FS_TRUNCATE).
+            def _fd_i64(v):
+                if (isinstance(v.type, ir.LiteralStructType)
+                        and v.type == fpy_val):
+                    return self.builder.extract_value(v, 1)
+                if isinstance(v.type, ir.PointerType):
+                    return self.builder.ptrtoint(v, i64)
+                if isinstance(v.type, ir.DoubleType):
+                    return self.builder.fptosi(v, i64)
+                if isinstance(v.type, ir.IntType) and v.type.width != 64:
+                    return self.builder.zext(v, i64)
+                return v
+            fd = _fd_i64(self._emit_expr_value(node.args[0]))
+            length = _fd_i64(self._emit_expr_value(node.args[1]))
+            return self.builder.call(self.runtime["os_ftruncate"], [fd, length])
+        elif func_name == "pwrite" and len(node.args) == 3:
+            # os.pwrite(fd, data, offset) -> bare i64 bytes written. Positioned
+            # write: posix pwrite() places bytes at `offset` without moving the
+            # fd's file offset — distinct from write+lseek.
+            def _fd_i64(v):
+                if (isinstance(v.type, ir.LiteralStructType)
+                        and v.type == fpy_val):
+                    return self.builder.extract_value(v, 1)
+                if isinstance(v.type, ir.PointerType):
+                    return self.builder.ptrtoint(v, i64)
+                if isinstance(v.type, ir.DoubleType):
+                    return self.builder.fptosi(v, i64)
+                if isinstance(v.type, ir.IntType) and v.type.width != 64:
+                    return self.builder.zext(v, i64)
+                return v
+            fd = _fd_i64(self._emit_expr_value(node.args[0]))
+            data = self._ensure_ptr(self._emit_expr_value(node.args[1]))
+            offset = _fd_i64(self._emit_expr_value(node.args[2]))
+            return self.builder.call(self.runtime["os_pwrite"], [fd, data, offset])
+        elif func_name == "pread" and len(node.args) == 3:
+            # os.pread(fd, n, offset) -> str of up to n bytes read at absolute
+            # `offset` without moving the fd's file offset (posix pread()) —
+            # distinct from lseek+read.
+            def _fd_i64(v):
+                if (isinstance(v.type, ir.LiteralStructType)
+                        and v.type == fpy_val):
+                    return self.builder.extract_value(v, 1)
+                if isinstance(v.type, ir.PointerType):
+                    return self.builder.ptrtoint(v, i64)
+                if isinstance(v.type, ir.DoubleType):
+                    return self.builder.fptosi(v, i64)
+                if isinstance(v.type, ir.IntType) and v.type.width != 64:
+                    return self.builder.zext(v, i64)
+                return v
+            fd = _fd_i64(self._emit_expr_value(node.args[0]))
+            n = _fd_i64(self._emit_expr_value(node.args[1]))
+            offset = _fd_i64(self._emit_expr_value(node.args[2]))
+            return self.builder.call(self.runtime["os_pread"], [fd, n, offset])
         elif func_name == "listdir" and len(node.args) == 1:
-            v = self._emit_expr_value(node.args[0])
-            v = self._ensure_ptr(v)
+            v = self._emit_path_text_arg(node.args[0])
             return self.builder.call(self.runtime["os_listdir"], [v])
+        elif func_name == "stat" and len(node.args) == 1:
+            # os.stat(path) -> raw FpyList* (10 ints); inference (VKind.LIST,
+            # elem INT) makes downstream indexing st[i] treat it as a list,
+            # exactly like os.listdir. No FpyValue boxing needed.
+            v = self._emit_path_text_arg(node.args[0])
+            return self.builder.call(self.runtime["os_stat"], [v])
+        elif func_name == "statvfs" and len(node.args) == 1:
+            # os.statvfs(path) -> raw FpyList* (10 ints); returned like os.stat
+            # so downstream st[i] indexing treats it as a list. No boxing.
+            v = self._emit_path_text_arg(node.args[0])
+            return self.builder.call(self.runtime["os_statvfs"], [v])
+        elif func_name in ("remove", "unlink") and len(node.args) == 1:
+            # os.remove/os.unlink(path) -> bare i64 status (0 ok, -1 error).
+            # Inference (VKind.INT) makes downstream treat the result as a
+            # plain int, so no FpyValue boxing is needed.
+            v = self._emit_path_text_arg(node.args[0])
+            return self.builder.call(self.runtime["os_remove"], [v])
+        elif func_name == "mkdir" and len(node.args) == 1:
+            # os.mkdir(path) -> bare i64 status (0 ok, -1 error).
+            v = self._emit_path_text_arg(node.args[0])
+            return self.builder.call(self.runtime["os_mkdir"], [v])
+        elif func_name == "rmdir" and len(node.args) == 1:
+            # os.rmdir(path) -> bare i64 status (0 ok, -1 error).
+            v = self._emit_path_text_arg(node.args[0])
+            return self.builder.call(self.runtime["os_rmdir"], [v])
+        elif func_name == "rename" and len(node.args) == 2:
+            # os.rename(src, dst) -> bare i64 status (0 ok, -1 error).
+            src = self._emit_path_text_arg(node.args[0])
+            dst = self._emit_path_text_arg(node.args[1])
+            return self.builder.call(self.runtime["os_rename"], [src, dst])
+        elif func_name == "execv" and len(node.args) == 2:
+            # os.execv(path, argv) -> only returns on failure (-1); on success
+            # the process image is replaced by the new program. path is a str;
+            # argv is a list[str] whose elements become the C argv[]
+            # (NULL-terminated). Backed by posix execv() -> SYS_EXECVE.
+            path = self._emit_path_text_arg(node.args[0])
+            argv = self._ensure_ptr(self._emit_expr_value(node.args[1]))
+            return self.builder.call(self.runtime["os_execv"], [path, argv])
+        elif func_name == "fork" and len(node.args) == 0:
+            # os.fork() -> bare i64: child pid in the parent, 0 in the child, -1
+            # on error. Backed by posix fork() -> SYS_PROCESS_FORK on SlateOS.
+            return self.builder.call(self.runtime["os_fork"], [])
+        elif func_name == "waitpid" and len(node.args) == 2:
+            # os.waitpid(pid, options) -> FpyList* [pid, status] (as i8_ptr).
+            # Inference tags this LIST(INT), so `p, st = os.waitpid(c, 0)` works.
+            def _to_i64(v):
+                if isinstance(v.type, ir.LiteralStructType) and v.type == fpy_val:
+                    return self.builder.extract_value(v, 1)
+                if isinstance(v.type, ir.PointerType):
+                    return self.builder.ptrtoint(v, i64)
+                if isinstance(v.type, ir.DoubleType):
+                    return self.builder.fptosi(v, i64)
+                if isinstance(v.type, ir.IntType) and v.type.width != 64:
+                    return self.builder.zext(v, i64)
+                return v
+            pid = _to_i64(self._emit_expr_value(node.args[0]))
+            opts = _to_i64(self._emit_expr_value(node.args[1]))
+            return self.builder.call(self.runtime["os_waitpid"], [pid, opts])
+        elif func_name in ("WIFEXITED", "WEXITSTATUS") and len(node.args) == 1:
+            # os.WIFEXITED(status)/os.WEXITSTATUS(status) -> bare i64. Decode the
+            # raw wait status returned by os.waitpid.
+            def _to_i64(v):
+                if isinstance(v.type, ir.LiteralStructType) and v.type == fpy_val:
+                    return self.builder.extract_value(v, 1)
+                if isinstance(v.type, ir.PointerType):
+                    return self.builder.ptrtoint(v, i64)
+                if isinstance(v.type, ir.DoubleType):
+                    return self.builder.fptosi(v, i64)
+                if isinstance(v.type, ir.IntType) and v.type.width != 64:
+                    return self.builder.zext(v, i64)
+                return v
+            status = _to_i64(self._emit_expr_value(node.args[0]))
+            rt = "os_wifexited" if func_name == "WIFEXITED" else "os_wexitstatus"
+            return self.builder.call(self.runtime[rt], [status])
+        elif func_name == "symlink" and len(node.args) == 2:
+            # os.symlink(target, linkpath) -> bare i64 status (0 ok, -1 error).
+            target = self._emit_path_text_arg(node.args[0])
+            linkpath = self._emit_path_text_arg(node.args[1])
+            return self.builder.call(self.runtime["os_symlink"], [target, linkpath])
+        elif func_name == "link" and len(node.args) == 2:
+            # os.link(src, dst) -> bare i64 status (0 ok, -1 error) [hard link].
+            src = self._emit_path_text_arg(node.args[0])
+            dst = self._emit_path_text_arg(node.args[1])
+            return self.builder.call(self.runtime["os_link"], [src, dst])
+        elif func_name == "readlink" and len(node.args) == 1:
+            # os.readlink(path) -> str (the link's target); returns a valid
+            # FpyString pointer (empty string on error).
+            v = self._emit_path_text_arg(node.args[0])
+            return self.builder.call(self.runtime["os_readlink"], [v])
+        elif func_name == "chmod" and len(node.args) == 2:
+            # os.chmod(path, mode) -> bare i64 status (0 ok, -1 error).  mode
+            # is a plain integer (e.g. 0o644), so coerce it to bare i64.
+            path = self._emit_path_text_arg(node.args[0])
+            mode = self._emit_expr_value(node.args[1])
+            if (isinstance(mode.type, ir.LiteralStructType)
+                    and mode.type == fpy_val):
+                mode = self.builder.extract_value(mode, 1)
+            elif isinstance(mode.type, ir.PointerType):
+                mode = self.builder.ptrtoint(mode, i64)
+            elif isinstance(mode.type, ir.DoubleType):
+                mode = self.builder.fptosi(mode, i64)
+            elif isinstance(mode.type, ir.IntType) and mode.type.width != 64:
+                mode = self.builder.zext(mode, i64)
+            return self.builder.call(self.runtime["os_chmod"], [path, mode])
+        elif func_name == "access" and len(node.args) == 2:
+            # os.access(path, mode) -> bool. mode is F_OK/R_OK/W_OK/X_OK
+            # (0/4/2/1); posix access() rejects mode bits outside R|W|X with
+            # EINVAL, so the mode argument is genuinely honored (not ignored).
+            # Runtime returns a bare i64 (1/0); wrap as a BOOL FpyValue so the
+            # inferred VKind.BOOL matches downstream truthiness handling.
+            path = self._emit_path_text_arg(node.args[0])
+            mode = self._emit_expr_value(node.args[1])
+            if (isinstance(mode.type, ir.LiteralStructType)
+                    and mode.type == fpy_val):
+                mode = self.builder.extract_value(mode, 1)
+            elif isinstance(mode.type, ir.PointerType):
+                mode = self.builder.ptrtoint(mode, i64)
+            elif isinstance(mode.type, ir.DoubleType):
+                mode = self.builder.fptosi(mode, i64)
+            elif isinstance(mode.type, ir.IntType) and mode.type.width != 64:
+                mode = self.builder.zext(mode, i64)
+            result = self.builder.call(self.runtime["os_access"], [path, mode])
+            return self._fv_from_bool(result)
+        elif func_name == "truncate" and len(node.args) == 2:
+            # os.truncate(path, length) -> bare i64 status (0 ok, -1 error).
+            # length is a plain integer, so coerce it to bare i64.
+            path = self._emit_path_text_arg(node.args[0])
+            length = self._emit_expr_value(node.args[1])
+            if (isinstance(length.type, ir.LiteralStructType)
+                    and length.type == fpy_val):
+                length = self.builder.extract_value(length, 1)
+            elif isinstance(length.type, ir.PointerType):
+                length = self.builder.ptrtoint(length, i64)
+            elif isinstance(length.type, ir.DoubleType):
+                length = self.builder.fptosi(length, i64)
+            elif isinstance(length.type, ir.IntType) and length.type.width != 64:
+                length = self.builder.zext(length, i64)
+            return self.builder.call(self.runtime["os_truncate"], [path, length])
+        elif func_name == "utime" and len(node.args) == 3:
+            # os.utime(path, atime_ns, mtime_ns) -> bare i64 status (0 ok, -1).
+            # AOT-simplified 3-positional form; both times are bare i64 ns.
+            def _to_i64(v):
+                if (isinstance(v.type, ir.LiteralStructType)
+                        and v.type == fpy_val):
+                    return self.builder.extract_value(v, 1)
+                if isinstance(v.type, ir.PointerType):
+                    return self.builder.ptrtoint(v, i64)
+                if isinstance(v.type, ir.DoubleType):
+                    return self.builder.fptosi(v, i64)
+                if isinstance(v.type, ir.IntType) and v.type.width != 64:
+                    return self.builder.zext(v, i64)
+                return v
+            path = self._emit_path_text_arg(node.args[0])
+            atime = _to_i64(self._emit_expr_value(node.args[1]))
+            mtime = _to_i64(self._emit_expr_value(node.args[2]))
+            return self.builder.call(self.runtime["os_utime"], [path, atime, mtime])
+        elif func_name == "chown" and len(node.args) == 3:
+            # os.chown(path, uid, gid) -> bare i64 status (0 ok, -1).
+            # AOT-simplified 3-positional form; uid/gid are bare i64.
+            def _to_i64(v):
+                if (isinstance(v.type, ir.LiteralStructType)
+                        and v.type == fpy_val):
+                    return self.builder.extract_value(v, 1)
+                if isinstance(v.type, ir.PointerType):
+                    return self.builder.ptrtoint(v, i64)
+                if isinstance(v.type, ir.DoubleType):
+                    return self.builder.fptosi(v, i64)
+                if isinstance(v.type, ir.IntType) and v.type.width != 64:
+                    return self.builder.zext(v, i64)
+                return v
+            path = self._emit_path_text_arg(node.args[0])
+            uid = _to_i64(self._emit_expr_value(node.args[1]))
+            gid = _to_i64(self._emit_expr_value(node.args[2]))
+            return self.builder.call(self.runtime["os_chown"], [path, uid, gid])
         elif func_name == "getenv" and len(node.args) == 1:
             v = self._emit_expr_value(node.args[0])
             v = self._ensure_ptr(v)
@@ -37154,23 +44203,34 @@ class CodeGen:
             "join": ("os_path_join", 2),
             "basename": ("os_path_basename", 1),
             "dirname": ("os_path_dirname", 1),
+            "getsize": ("os_path_getsize", 1),
+            "getmtime": ("os_path_getmtime", 1),
+            "getatime": ("os_path_getatime", 1),
+            "getctime": ("os_path_getctime", 1),
+            "samefile": ("os_path_samefile", 2),
+            "islink": ("os_path_islink", 1),
         }
         if func_name in _os_path_fns:
             rt_key, n_args = _os_path_fns[func_name]
+            # Every parameter of every os.path.* function above is a path, and
+            # Python accepts a Path wherever it accepts a path string — so each
+            # goes through _emit_path_text_arg instead of being passed as a raw
+            # pointer, which for a headed pure-mode Path is the header (the
+            # callee then reads the magic word "PATH" as the filename).
             # os.path.join supports 2+ args: chain pairwise
             if func_name == "join" and len(node.args) >= 2:
-                result = self._ensure_ptr(self._emit_expr_value(node.args[0]))
+                result = self._emit_path_text_arg(node.args[0])
                 for i in range(1, len(node.args)):
-                    right = self._ensure_ptr(self._emit_expr_value(node.args[i]))
+                    right = self._emit_path_text_arg(node.args[i])
                     result = self.builder.call(self.runtime[rt_key], [result, right])
                 # os.path.join returns a string path — wrap as STR
                 return self._fv_from_str(result)
             if len(node.args) == n_args:
-                args = [self._ensure_ptr(self._emit_expr_value(node.args[i]))
+                args = [self._emit_path_text_arg(node.args[i])
                         for i in range(n_args)]
                 result = self.builder.call(self.runtime[rt_key], args)
                 # Boolean-returning functions: wrap as BOOL FpyValue
-                if func_name in ("exists", "isfile", "isdir"):
+                if func_name in ("exists", "isfile", "isdir", "samefile", "islink"):
                     return self._fv_from_bool(result)
                 return result
         return None
@@ -37522,7 +44582,19 @@ class CodeGen:
         "math.factorial": "int", "math.comb": "int", "math.perm": "int",
         "math.isnan": "bool", "math.isinf": "bool", "math.isfinite": "bool",
         # os / os.path
-        "os.getcwd": "str", "os.getenv": "pyobj",
+        "os.getcwd": "str", "os.getenv": "pyobj", "os.getpid": "int",
+        "os.getppid": "int", "os.gettid": "int",
+        "os.getuid": "int", "os.getgid": "int",
+        "os.setuid": "int", "os.setgid": "int",
+        "os.nice": "int", "os.getpriority": "int", "os.setpriority": "int",
+        "os.pipe": "list:int", "os.read": "str",
+        "os.fork": "int", "os.waitpid": "list:int",
+        "os.WIFEXITED": "int", "os.WEXITSTATUS": "int",
+        "os.write": "int", "os.close": "int", "os.dup": "int",
+        "os.dup2": "int",
+        "os.lseek": "int", "os.open": "int", "os.ftruncate": "int",
+        "os.umask": "int",
+        "os.pwrite": "int", "os.pread": "str",
         "os.path.join": "str", "os.path.dirname": "str",
         "os.path.basename": "str", "os.path.abspath": "str",
         "os.path.realpath": "str", "os.path.expanduser": "str",
@@ -37530,7 +44602,15 @@ class CodeGen:
         "os.path.exists": "bool", "os.path.isfile": "bool",
         "os.path.isdir": "bool", "os.path.isabs": "bool",
         "os.path.getsize": "int",
+        "os.path.getmtime": "float",
+        "os.path.getatime": "float",
+        "os.path.getctime": "float",
+        "os.path.samefile": "bool",
+        "os.path.islink": "bool",
         "os.listdir": "list:str",
+        "os.stat": "list:int",
+        "os.statvfs": "list:int",
+        "os.access": "bool",
         # json
         "json.dumps": "str", "json.loads": "pyobj",
         # textwrap — dedent/indent have native impls; fill does NOT
@@ -38442,6 +45522,35 @@ class CodeGen:
             return self.builder.call(self.runtime["logging_format_msg"],
                                       [fmt, args_list])
         return fmt
+
+    # Native-module attributes whose runtime value is a container, mapped to
+    # the ValueType that len()/iteration/subscript dispatch should see.
+    def _native_module_attr_vtype(self, node: ast.expr) -> "ValueType | None":
+        """Return the static ValueType for a native-module container attribute
+        (e.g. sys.argv → list[str]), or None if `node` isn't one.
+
+        Handles both `import sys; sys.argv` (ast.Attribute) and
+        `from sys import argv` (ast.Name registered in _native_imports)."""
+        mod_name: str | None = None
+        attr_name: str | None = None
+        if (isinstance(node, ast.Attribute)
+                and isinstance(node.value, ast.Name)):
+            nm = node.value.id
+            is_native = ((self._has_var(nm)
+                          and self._var_kind(nm) in (VKind.PYOBJ, VKind.NATIVE_MOD))
+                         or nm in getattr(self, '_native_modules', set()))
+            if is_native:
+                mod_name, attr_name = nm, node.attr
+        elif isinstance(node, ast.Name):
+            mod_name, attr_name = getattr(self, '_native_imports', {}).get(
+                node.id, (None, None))
+        if mod_name != "sys":
+            return None
+        if attr_name in ("argv", "path"):
+            return ValueType(VKind.LIST, elem_type=ValueType(VKind.STR))
+        if attr_name == "version_info":
+            return ValueType(VKind.TUPLE, elem_type=ValueType(VKind.INT))
+        return None
 
     def _emit_native_module_attr(self, mod_name: str, attr_name: str) -> ir.Value | None:
         """Emit a native module attribute access (e.g. math.pi).
@@ -39430,10 +46539,39 @@ class CodeGen:
                               [callable_ptr, t_ir, d_ir, out_tag, out_data])
         return
 
+    def _emit_path_text_arg(self, arg_node, name: str = "") -> ir.Value:
+        """Emit an argument for a runtime parameter that is *path text*.
+
+        Many runtime entry points take a filesystem path as a plain C string
+        (`fastpy_os_path_exists`, `fastpy_os_mkdir`, `fastpy_path_join`'s second
+        operand, ...), while Python accepts a `Path` anywhere a path string is
+        accepted. In pure mode a Path is a headed object whose text does NOT
+        start at the pointer (see FpyPurePath in runtime/pathlib_pure.c), so
+        passing the Path pointer straight through makes the callee read the
+        header — historically it read the magic word "PATH" and reported that
+        the file did not exist, a silently wrong answer rather than an error.
+        Route a Path through fastpy_path_str() to get the text.
+
+        Use this for every argument documented as a path string. Receivers of
+        Path *methods* need no conversion — those take a Path proper.
+        """
+        if self._is_path_expr(arg_node):
+            other = self._emit_expr_value(arg_node)
+            other = self._ensure_ptr(other, name)
+            return self.builder.call(self.runtime["path_str"], [other])
+        return self._ensure_ptr(self._emit_expr_value(arg_node), name)
+
     def _emit_method_call_path(self, node):
         """Emit pathlib.Path method calls. Always returns."""
         attr = node.func
         method = node.func.attr
+        # Classmethod constructors (Path.cwd()) take no receiver: the "object"
+        # is the Path class itself, so evaluating it would yield a non-object
+        # pointer. Emit the zero-argument runtime entry point directly.
+        if (method in self._PATH_CLASSMETHODS and not node.args
+                and self._is_path_class_ref(attr.value)):
+            return self.builder.call(
+                self.runtime[self._PATH_CLASSMETHODS[method]], [])
         obj = self._emit_expr_value(attr.value)
         obj = self._ensure_ptr(obj)
         # Attribute access (properties): .name, .parent, .suffix, .stem
@@ -39472,8 +46610,7 @@ class CodeGen:
         elif method == "joinpath" and len(node.args) >= 1:
             result = obj
             for arg_node in node.args:
-                other = self._emit_expr_value(arg_node)
-                other = self._ensure_ptr(other)
+                other = self._emit_path_text_arg(arg_node)
                 result = self.builder.call(self.runtime["path_join"],
                                            [result, other])
             return result
@@ -39925,81 +47062,78 @@ class CodeGen:
 
     # ---- Set method handlers (B3) ----
 
+    # All three of these carry the element's tag into (or match it against)
+    # the set's hash table, so the tag has to be the runtime one: a static
+    # guess of INT made `s.add(fl)` store a float's bit pattern, and then
+    # `fl in s` compared that pattern against a correctly-tagged probe and
+    # said False.  BUG-DICT-VALUE-STATIC-KIND.
+
     def _emit_set_method_add(self, node, obj):
         if len(node.args) != 1:
             return None
         val = self._emit_expr_value(node.args[0])
-        tag, data = self._bare_to_tag_data(val, node.args[0])
-        self.builder.call(self.runtime["set_add_fv"],
-                          [obj, ir.Constant(i32, tag), data])
+        tag, data = self._to_tag_data_ir(val, node.args[0])
+        self.builder.call(self.runtime["set_add_fv"], [obj, tag, data])
         return obj
 
     def _emit_set_method_discard(self, node, obj):
         if len(node.args) != 1:
             return None
         val = self._emit_expr_value(node.args[0])
-        tag, data = self._bare_to_tag_data(val, node.args[0])
-        self.builder.call(self.runtime["set_discard_fv"],
-                          [obj, ir.Constant(i32, tag), data])
+        tag, data = self._to_tag_data_ir(val, node.args[0])
+        self.builder.call(self.runtime["set_discard_fv"], [obj, tag, data])
         return obj
 
     def _emit_set_method_remove(self, node, obj):
         if len(node.args) != 1:
             return None
         val = self._emit_expr_value(node.args[0])
-        tag, data = self._bare_to_tag_data(val, node.args[0])
-        self.builder.call(self.runtime["set_discard_fv"],
-                          [obj, ir.Constant(i32, tag), data])
+        tag, data = self._to_tag_data_ir(val, node.args[0])
+        self.builder.call(self.runtime["set_discard_fv"], [obj, tag, data])
         return obj
 
-    def _emit_set_method_union(self, node, obj):
+    # The eleven methods that take an "other" all take *any* iterable, not
+    # just a set — `s.update([1, 2])`, `s.issubset("ab")`, and so on are all
+    # legal Python.  They used to pass the argument as a bare pointer to a
+    # runtime signature declared `FpyDict *`, so a list arrived as an FpyList
+    # whose items/length/capacity were read as a dict's keys/values/length and
+    # the resulting garbage FpyValue was dereferenced: no output, 0xC0000005.
+    # BUG-SET-UPDATE-NON-SET-ITERABLE-SEGFAULTS.
+    #
+    # A static kind cannot fix that — half these arguments are parameters —
+    # so the tag rides along to the runtime, which coerces once in
+    # fpy_iterable_as_set and raises TypeError for a non-iterable instead of
+    # walking off the object.  Passing (tag, data) is the same conclusion
+    # `.add()` reached for its element, one argument position over.
+
+    def _emit_set_iterable_method(self, node, obj, rt_name):
+        """Call `rt_name`(set, tag, data) with the argument's runtime tag."""
         if len(node.args) != 1:
             return None
         other = self._emit_expr_value(node.args[0])
-        other = self._ensure_ptr(other)
-        return self._rt_call("set_union", [obj, other])
+        tag, data = self._to_tag_data_ir(other, node.args[0])
+        return self.builder.call(self.runtime[rt_name], [obj, tag, data])
+
+    def _emit_set_method_union(self, node, obj):
+        return self._emit_set_iterable_method(node, obj, "set_union_fv")
 
     def _emit_set_method_intersection(self, node, obj):
-        if len(node.args) != 1:
-            return None
-        other = self._emit_expr_value(node.args[0])
-        other = self._ensure_ptr(other)
-        return self._rt_call("set_intersection", [obj, other])
+        return self._emit_set_iterable_method(node, obj, "set_intersection_fv")
 
     def _emit_set_method_difference(self, node, obj):
-        if len(node.args) != 1:
-            return None
-        other = self._emit_expr_value(node.args[0])
-        other = self._ensure_ptr(other)
-        return self._rt_call("set_difference", [obj, other])
+        return self._emit_set_iterable_method(node, obj, "set_difference_fv")
 
     def _emit_set_method_symmdiff(self, node, obj):
-        if len(node.args) != 1:
-            return None
-        other = self._emit_expr_value(node.args[0])
-        other = self._ensure_ptr(other)
-        return self._rt_call("set_symmetric_diff", [obj, other])
+        return self._emit_set_iterable_method(node, obj, "set_symmetric_diff_fv")
 
     def _emit_set_method_issubset(self, node, obj):
-        if len(node.args) != 1:
-            return None
-        other = self._emit_expr_value(node.args[0])
-        other = self._ensure_ptr(other)
-        return self._rt_call("set_issubset", [obj, other])
+        return self._emit_set_iterable_method(node, obj, "set_issubset_fv")
 
     def _emit_set_method_issuperset(self, node, obj):
-        if len(node.args) != 1:
-            return None
-        other = self._emit_expr_value(node.args[0])
-        other = self._ensure_ptr(other)
-        return self._rt_call("set_issuperset", [obj, other])
+        return self._emit_set_iterable_method(node, obj, "set_issuperset_fv")
 
     def _emit_set_method_isdisjoint(self, node, obj):
-        if len(node.args) != 1:
-            return None
-        other = self._emit_expr_value(node.args[0])
-        other = self._ensure_ptr(other)
-        return self._rt_call("set_isdisjoint", [obj, other])
+        return self._emit_set_iterable_method(node, obj, "set_isdisjoint_fv")
 
     def _emit_set_method_copy(self, node, obj):
         if len(node.args) != 0:
@@ -40022,36 +47156,29 @@ class CodeGen:
         return self._fv_build_from_slots(
             self.builder.load(tag_slot), self.builder.load(data_slot))
 
+    # The mutators return the set itself rather than the call's void result.
+
     def _emit_set_method_update(self, node, obj):
-        if len(node.args) != 1:
+        if self._emit_set_iterable_method(node, obj, "set_update_fv") is None:
             return None
-        other = self._emit_expr_value(node.args[0])
-        other = self._ensure_ptr(other)
-        self._rt_call("set_update", [obj, other])
         return obj
 
     def _emit_set_method_intersection_update(self, node, obj):
-        if len(node.args) != 1:
+        if self._emit_set_iterable_method(
+                node, obj, "set_intersection_update_fv") is None:
             return None
-        other = self._emit_expr_value(node.args[0])
-        other = self._ensure_ptr(other)
-        self._rt_call("set_intersection_update", [obj, other])
         return obj
 
     def _emit_set_method_difference_update(self, node, obj):
-        if len(node.args) != 1:
+        if self._emit_set_iterable_method(
+                node, obj, "set_difference_update_fv") is None:
             return None
-        other = self._emit_expr_value(node.args[0])
-        other = self._ensure_ptr(other)
-        self._rt_call("set_difference_update", [obj, other])
         return obj
 
     def _emit_set_method_symmetric_difference_update(self, node, obj):
-        if len(node.args) != 1:
+        if self._emit_set_iterable_method(
+                node, obj, "set_symmetric_difference_update_fv") is None:
             return None
-        other = self._emit_expr_value(node.args[0])
-        other = self._ensure_ptr(other)
-        self._rt_call("set_symmetric_difference_update", [obj, other])
         return obj
 
     # ---- Dict method dispatch table (B3) ----
@@ -41211,7 +48338,32 @@ class CodeGen:
         "format": "_emit_str_format",
     }
 
+    # String methods that ALWAYS return a freshly-allocated, owned (+1)
+    # FpyString in every branch (verified against the runtime: each returns
+    # via fpy_str_buf / fpy_str_from_cstr even in the no-op/no-match case).
+    # (Excludes bool/int returns — is*/startswith/endswith/find/rfind/index/
+    # rindex/count — and non-STR heap returns — split/rsplit/splitlines→list,
+    # partition/rpartition→tuple, encode→bytes.  Also excludes `format`, which
+    # can return a *borrowed* single interpolated argument or an immortal
+    # constant — see _emit_str_format, which registers its own concat result.)
+    # Model-2: their result is registered as an owned temp so it's released at
+    # the statement boundary.
+    _STR_METHODS_RETURN_STR = frozenset({
+        "lower", "upper", "capitalize", "title", "swapcase", "casefold",
+        "zfill", "removeprefix", "removesuffix", "translate",
+        "strip", "lstrip", "rstrip", "center", "ljust", "rjust",
+        "expandtabs", "replace", "join",
+    })
+
     def _emit_method_call_str(self, node, obj):
+        """Emit string method calls via dispatch table. Returns None if not
+        recognized. Registers owned-string results (Model 2)."""
+        result = self._emit_method_call_str_inner(node, obj)
+        if result is not None and node.func.attr in self._STR_METHODS_RETURN_STR:
+            self._register_owned_str_ptr(result)
+        return result
+
+    def _emit_method_call_str_inner(self, node, obj):
         """Emit string method calls via dispatch table. Returns None if not recognized."""
         method = node.func.attr
         # str.join(obj_iter): materialize generator/iterator to list first
@@ -41479,30 +48631,28 @@ class CodeGen:
             # bytes.decode() → str (same UTF-8 content)
             return self._rt_call("bytes_decode", [obj])
         elif method == "upper" and len(node.args) == 0:
-            return self._rt_call("str_upper", [obj])
+            return self._owned_bytes_result("bytes_upper", [obj])
         elif method == "lower" and len(node.args) == 0:
-            return self._rt_call("str_lower", [obj])
+            return self._owned_bytes_result("bytes_lower", [obj])
         elif method == "strip" and len(node.args) == 0:
-            return self._rt_call("str_strip", [obj])
+            return self._owned_bytes_result("bytes_strip", [obj])
         elif method == "lstrip" and len(node.args) == 0:
-            return self._rt_call("str_lstrip", [obj])
+            return self._owned_bytes_result("bytes_lstrip", [obj])
         elif method == "rstrip" and len(node.args) == 0:
-            return self._rt_call("str_rstrip", [obj])
+            return self._owned_bytes_result("bytes_rstrip", [obj])
         elif method == "replace" and len(node.args) >= 2:
+            # bytes.replace(old, new) — bytes-native (no maxcount variant yet;
+            # a count arg falls through to full replace, matching prior behavior).
             old = self._emit_expr_value(node.args[0])
             new = self._emit_expr_value(node.args[1])
-            if len(node.args) == 3:
-                cnt = self._emit_expr_value(node.args[2])
-                return self._rt_call("str_replace3", [obj, old, new, cnt])
-            return self._rt_call("str_replace", [obj, old, new])
+            return self._owned_bytes_result("bytes_replace", [obj, old, new])
         elif method == "split" and len(node.args) <= 2:
+            # bytes.split() / bytes.split(sep): both yield a list of bytes.
+            # (maxsplit not yet honored for the sep path — full split.)
             if len(node.args) == 0:
                 return self._rt_call("bytes_split", [obj])
             sep = self._emit_expr_value(node.args[0])
-            if len(node.args) == 2:
-                maxsplit = self._emit_expr_value(node.args[1])
-                return self._rt_call("str_split_max", [obj, sep, maxsplit])
-            return self._rt_call("str_split_max", [obj, sep, ir.Constant(i64, -1)])
+            return self._rt_call("bytes_split_sep", [obj, sep])
         elif method == "join" and len(node.args) == 1:
             if self._is_obj_expr(node.args[0]):
                 _jobj = self._emit_expr_value(node.args[0])
@@ -41510,7 +48660,7 @@ class CodeGen:
                 lst = self._rt_call("list_from_obj_iter", [_jobj])
             else:
                 lst = self._emit_expr_value(node.args[0])
-            return self._rt_call("str_join", [obj, lst])
+            return self._owned_bytes_result("bytes_join", [obj, lst])
         elif method == "find" and len(node.args) >= 1:
             sub = self._emit_expr_value(node.args[0])
             return self._rt_call("str_find", [obj, sub])
@@ -41895,6 +49045,14 @@ class CodeGen:
         # --- pathlib.Path method calls ---
         if self._is_path_expr(attr.value):
             return self._emit_method_call_path(node)
+        # Natively-supported Path CLASSmethods (Path.cwd()). The receiver is the
+        # class, not an instance, so the generic object-method path below would
+        # evaluate it to a non-object pointer and invoke UB; route it here
+        # instead. Unrecognized Path classmethods deliberately fall through to
+        # the existing behavior rather than being silently mistranslated.
+        if (attr.attr in self._PATH_CLASSMETHODS and not node.args
+                and self._is_path_class_ref(attr.value)):
+            return self._emit_method_call_path(node)
 
         # --- pyobj method calls ---
         if self._is_pyobj_receiver(attr.value):
@@ -41944,6 +49102,10 @@ class CodeGen:
             result = self._emit_method_call_dict(node)
             if result is not None:
                 return result
+
+        # --- Built-in file object method calls (open() result) ---
+        if self._is_file_expr(attr.value):
+            return self._emit_method_call_file(node)
 
         # --- User-class instance method calls ---
         if self._is_obj_expr(attr.value):
@@ -42360,6 +49522,43 @@ class CodeGen:
                     return True
         return False
 
+    def _call_is_void(self, node: ast.expr) -> bool:
+        """True when `node` calls a user function/method that never executes
+        `return <expr>`.
+
+        Such a callee compiles to a **void** LLVM function, so the call site has
+        no value to hand back and substitutes the placeholder `i64 0`.  The
+        placeholder's IR type says INT, which made `print(f())` say `0` and
+        `f() is None` say False — the Python answer is None in both cases.  Call
+        sites that need a *tag* rather than an LLVM type ask this and emit NONE.
+        See BUG-VOID-RETURNS-ZERO-NOT-NONE in known-issues.md.
+        """
+        if not isinstance(node, ast.Call):
+            return False
+        if isinstance(node.func, ast.Name):
+            # A local of the same name shadows the function (closure/callable
+            # variable), and its callee isn't statically known.
+            if node.func.id in self.variables:
+                return False
+            info = getattr(self, '_user_functions', {}).get(node.func.id)
+            return info is not None and getattr(info, 'ret_tag', None) == "void"
+        if isinstance(node.func, ast.Attribute):
+            # Resolve through the receiver's own class only.  Deliberately not
+            # _find_method_return_type: that falls back to scanning *every* user
+            # class when the receiver's class can't be inferred, which would let
+            # an unrelated class's void method answer for e.g. a str or pyobj
+            # receiver that happens to share a method name.  Answering "not
+            # void" for an unknown receiver is the safe direction — it only
+            # restores the old behaviour.
+            cls = self._infer_object_class(node.func.value)
+            while cls and cls in self._user_classes:
+                cls_info = self._user_classes[cls]
+                m = cls_info.methods.get(node.func.attr)
+                if m is not None:
+                    return isinstance(m.return_value.type, ir.VoidType)
+                cls = cls_info.parent_name
+        return False
+
     def _find_method_return_type(self, obj_node: ast.expr, method_name: str) -> ir.Type | None:
         """Try to determine the return type of a method on an object.
 
@@ -42521,6 +49720,250 @@ class CodeGen:
                 return True
             name = info.parent_name
         return False
+
+    def _is_open_call(self, node: ast.expr) -> bool:
+        """True if `node` is a direct builtin open(...) call (1-2 positional args)."""
+        return (isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "open"
+                and node.func.id not in self._user_functions
+                and node.func.id not in self._user_classes
+                and 1 <= len(node.args) <= 2
+                and not node.keywords)
+
+    def _is_file_expr(self, node: ast.expr) -> bool:
+        """True if `node` evaluates to a built-in file object (from open())."""
+        if isinstance(node, ast.Name):
+            return node.id in self._file_vars
+        return self._is_open_call(node)
+
+    # What each built-in file method hands back.  At emit time the runtime
+    # reports this through the ret-tag side channel, so codegen never had to
+    # know it statically; the same table written out is what lets the
+    # *pre-pass* answer, which has to happen before any of that code exists.
+    # Only the kinds that carry a pointer are listed — a method not named here
+    # falls through to the ordinary integer default, which is already right for
+    # `write`/`tell`/`seek` and harmless for `close`.
+    _FILE_METHOD_KINDS = {
+        "read": VKind.STR,
+        "readline": VKind.STR,
+        "readlines": VKind.LIST,
+    }
+
+    def _open_is_shadowed(self) -> bool:
+        """True if the program rebinds the name `open` anywhere.
+
+        `_is_open_call` decides this by asking `_user_functions`, which is only
+        complete once every top-level `def` has been declared.  The return-type
+        pre-pass runs *while* that set is being filled, so a `def open` further
+        down the file would be invisible to it and visible at emit time — the
+        two would disagree about the same call, which is worse than either
+        answer.  Reading the module AST gives one answer at any point in the
+        compile.
+        """
+        if self._open_shadowed is None:
+            tree = getattr(self, "_module_tree", None)
+            shadowed = False
+            for n in ast.walk(tree) if tree is not None else ():
+                if (isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                   ast.ClassDef))
+                        and n.name == "open"):
+                    shadowed = True
+                elif isinstance(n, ast.arg) and n.arg == "open":
+                    shadowed = True
+                elif isinstance(n, ast.Name) and n.id == "open" and isinstance(
+                        n.ctx, (ast.Store, ast.Del)):
+                    shadowed = True
+                elif isinstance(n, ast.alias) and (
+                        n.asname or n.name.split(".")[0]) == "open":
+                    shadowed = True
+                if shadowed:
+                    break
+            self._open_shadowed = shadowed
+        return self._open_shadowed
+
+    def _scope_file_names(self, node) -> set[str]:
+        """Names bound to a built-in file object within one function's scope.
+
+        `_file_vars` answers the same question during emission, but a
+        function's return type is inferred *before* its body is emitted, so at
+        that moment the set is empty and `f.read()` looks like a call on an
+        unknown object.  That is how a `str` read from a file came back tagged
+        as an int — BUG-FILEREAD-FN-RETTAG.
+
+        Deliberately flow-insensitive: a name assigned from `open(...)`
+        anywhere in the scope counts, *unless* it is also bound to something
+        else somewhere, in which case nothing is claimed.  A wrong answer here
+        misroutes a method call, so the ambiguous case declines.
+        """
+        if self._open_is_shadowed():
+            return set()
+        _nested = set()
+        for _item in ast.walk(node):
+            if _item is not node and isinstance(
+                    _item, (ast.FunctionDef, ast.AsyncFunctionDef,
+                            ast.ClassDef, ast.Lambda)):
+                for _sub in ast.walk(_item):
+                    _nested.add(id(_sub))
+        files: set[str] = set()
+        others: set[str] = set()
+        for n in ast.walk(node):
+            if id(n) in _nested:
+                continue
+            if isinstance(n, (ast.With, ast.AsyncWith)):
+                for item in n.items:
+                    if isinstance(item.optional_vars, ast.Name):
+                        (files if self._is_open_call(item.context_expr)
+                         else others).add(item.optional_vars.id)
+            elif isinstance(n, ast.Assign):
+                for tgt in n.targets:
+                    if isinstance(tgt, ast.Name):
+                        (files if self._is_open_call(n.value)
+                         else others).add(tgt.id)
+            elif isinstance(n, (ast.AugAssign, ast.AnnAssign, ast.NamedExpr)):
+                if isinstance(n.target, ast.Name):
+                    others.add(n.target.id)
+            elif isinstance(n, (ast.For, ast.AsyncFor)):
+                if isinstance(n.target, ast.Name):
+                    others.add(n.target.id)
+        return files - others
+
+    def _scope_global_tags(self, node) -> dict[str, str]:
+        """Module-level names a function only *reads*, with their tags.
+
+        A function's return type and return tag are inferred from sets —
+        `str_vars`, `list_vars`, `dict_vars`, `obj_vars` — built from the
+        function's own assignments and from its parameters.  A module-level
+        global that the function merely reads is in none of them, so
+
+            s = "hello"
+            def direct():
+                return s
+
+        fell through every arm to the `int` default and handed the caller a
+        live string pointer typed as an integer, which printed as
+        140697798825664.  BUG-RETURN-OF-GLOBAL-LOSES-ITS-KIND.
+
+        Nothing here has to be inferred: the CSA pre-pass already recorded
+        every module-level name's tag in `_csa_var_types`, and its own
+        `_func_ret_types` gets these functions right.  The only question is
+        which of those names still mean the module's binding once inside this
+        scope, and the honest answer is "the ones this scope never binds".
+        Any name bound here — a parameter (this function's or a nested one's),
+        an assignment including one under `global`, a loop, `with` or `except`
+        target, an import, a nested def or class — is dropped, because after
+        the rebinding the module's tag is no longer evidence about it.
+        Deliberately flow-insensitive: it declines rather than guesses.
+
+        A name the *module* binds more than once is dropped as well, since
+        `_csa_var_types` is last-writer-wins and cannot describe a name whose
+        kind changes over the module's lifetime; see
+        `_csa_global_single_bind`, built beside the tags themselves.
+        """
+        _tags = getattr(self, '_csa_var_types', None)
+        _single = getattr(self, '_csa_global_single_bind', None)
+        if not _tags or _single is None:
+            return {}
+        shadowed: set[str] = set()
+        for sub in ast.walk(node):
+            if isinstance(sub, ast.arg):
+                shadowed.add(sub.arg)
+            elif isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                  ast.ClassDef)):
+                if sub is not node:
+                    shadowed.add(sub.name)
+            elif isinstance(sub, ast.Assign):
+                for tgt in sub.targets:
+                    for nm in ast.walk(tgt):
+                        if isinstance(nm, ast.Name):
+                            shadowed.add(nm.id)
+            elif isinstance(sub, (ast.AugAssign, ast.AnnAssign, ast.NamedExpr)):
+                for nm in ast.walk(sub.target):
+                    if isinstance(nm, ast.Name):
+                        shadowed.add(nm.id)
+            elif isinstance(sub, (ast.For, ast.AsyncFor, ast.comprehension)):
+                for nm in ast.walk(sub.target):
+                    if isinstance(nm, ast.Name):
+                        shadowed.add(nm.id)
+            elif isinstance(sub, (ast.With, ast.AsyncWith)):
+                for item in sub.items:
+                    if item.optional_vars is not None:
+                        for nm in ast.walk(item.optional_vars):
+                            if isinstance(nm, ast.Name):
+                                shadowed.add(nm.id)
+            elif isinstance(sub, ast.ExceptHandler):
+                if sub.name:
+                    shadowed.add(sub.name)
+            elif isinstance(sub, (ast.Import, ast.ImportFrom)):
+                for alias in sub.names:
+                    shadowed.add((alias.asname or alias.name).split('.')[0])
+        return {k: v for k, v in _tags.items()
+                if v is not None and k in _single and k not in shadowed}
+
+    def _file_method_kind(self, node: ast.expr, file_names: set[str]):
+        """VKind of a `<file>.read()`-style call, or None if it is not one.
+
+        `file_names` comes from `_scope_file_names`; a direct
+        `open(p).read()` is recognised without it.
+        """
+        if not (isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)):
+            return None
+        recv = node.func.value
+        if not ((isinstance(recv, ast.Name) and recv.id in file_names)
+                or self._is_open_call(recv)):
+            return None
+        return self._FILE_METHOD_KINDS.get(node.func.attr)
+
+    def _emit_method_call_file(self, node: ast.Call) -> ir.Value:
+        """Emit a method call on a built-in file object (open() result).
+
+        The "file" class is registered only at runtime (objects.c), so codegen
+        cannot see its methods.  We dispatch dynamically via obj_call_methodN
+        and recover the return type from the runtime ret-tag side channel
+        (each native file method calls fastpy_set_ret_tag).  The result is
+        packed as an FpyValue so the caller preserves the correct dynamic type
+        (read/readline → str, readlines → list, write → int, close → None).
+        """
+        attr = node.func
+        method = attr.attr
+        obj = self._emit_expr_value(attr.value)
+        obj = self._ensure_ptr(obj, name="file.obj")
+        name_ptr = self._make_string_constant(method)
+
+        # Evaluate and coerce args to i64, forwarding runtime tags so string
+        # args (e.g. f.write(s)) reach the native method as valid pointers.
+        call_args: list[ir.Value] = []
+        for i, arg_node in enumerate(node.args):
+            v = self._emit_expr_value(arg_node)
+            _tag, _ = self._bare_to_tag_data(v, value_node=arg_node)
+            if (isinstance(v.type, ir.LiteralStructType) and v.type == fpy_val):
+                _tag_ir = self.builder.extract_value(v, 0)
+                self.builder.call(self.runtime["set_arg_tag"],
+                                  [ir.Constant(i32, i), _tag_ir])
+                v = self.builder.extract_value(v, 1)
+            else:
+                self.builder.call(self.runtime["set_arg_tag"],
+                                  [ir.Constant(i32, i), ir.Constant(i32, _tag)])
+                if isinstance(v.type, ir.PointerType):
+                    v = self.builder.ptrtoint(v, i64)
+                elif isinstance(v.type, ir.DoubleType):
+                    v = self.builder.bitcast(v, i64)
+                elif isinstance(v.type, ir.IntType) and v.type.width != 64:
+                    v = self.builder.zext(v, i64)
+            call_args.append(v)
+
+        n = len(call_args)
+        fn = self.runtime.get(f"obj_call_method{n}")
+        if fn is None:
+            return self._bridge_fallback_expr(node, "file method arity")
+        result = self.builder.call(fn, [obj, name_ptr] + call_args)
+        # Recover the dynamic return tag the native method set.
+        _rt = self.builder.call(self.runtime["get_ret_tag"], [])
+        fv = ir.Constant(fpy_val, ir.Undefined)
+        fv = self.builder.insert_value(fv, _rt, 0)
+        fv = self.builder.insert_value(fv, result, 1)
+        return fv
 
     def _is_obj_expr(self, node: ast.expr) -> bool:
         """Check if an expression evaluates to a user-class object."""
@@ -42902,6 +50345,41 @@ class CodeGen:
                         return None
         return None
 
+    def _literal_container_tag(self, node: ast.expr, head: str,
+                               parts: list, keys: list | None = None
+                               ) -> str:
+        """`head:<inner>` when a literal's parts agree on one kind, else `head`.
+
+        The same contract as `_csa_list_elem_tag` and `_dict_literal_value_type`
+        one layer up: a single tag has to describe *every* read out of the
+        container, so parts that disagree — or any part whose kind is not
+        statically known — mean the inner kind is declined rather than guessed
+        from the first one.  Declining is safe (the read falls back to the
+        runtime tag); naming the wrong kind is not.
+
+        Recursing through `_infer_constant_value_type` rather than
+        `_infer_type_tag` keeps this a pure AST classifier with no emit-time
+        state or side effects, and gives nesting for free:
+        `[["a", "bb"]]` answers `list:list:str`, which `from_old_tag` parses
+        back to the same depth.
+        """
+        if not parts:
+            return head
+        if keys is not None and any(k is None for k in keys):
+            return head  # `{**other}` — the values are not all visible here
+        tags = {self._infer_constant_value_type(p) for p in parts}
+        if None in tags:
+            return head  # some part's kind is not statically known
+        if len(tags) == 1:
+            return f"{head}:{tags.pop()}"
+        # Parts of differing known kinds.  "mixed" is a *complete* answer, not
+        # a half one — it tells the reader to dispatch on the runtime tag —
+        # so it belongs here rather than the bare head, which would be read as
+        # "elements of one unnamed kind" and completed with INT.
+        # `{"k": ["a", [1, 2, 3]]}` is this case, and `len(e[1])` on its value
+        # measured a list pointer as an integer and answered 0.
+        return f"{head}:mixed"
+
     def _infer_constant_value_type(self, node: ast.expr) -> str | None:
         """Infer the Python type tag of a simple expression at AST level.
         Used to build per-key type maps for dict literals. Returns one of
@@ -42926,12 +50404,28 @@ class CodeGen:
                 return "int"
         if isinstance(node, ast.JoinedStr):
             return "str"
-        if isinstance(node, (ast.Dict, ast.DictComp)):
+        # Container values name their element kind when the literal agrees on
+        # one.  A bare "dict"/"list" names the outer kind and nothing about
+        # what it holds, and that half-answer is worse here than no answer at
+        # all: the reader completes the missing element with VKind.INT and
+        # reads a str pointer as an integer, whereas declining entirely routes
+        # the read through the runtime tag and is correct.  `d = {"k": ["a",
+        # "bcd"]}; e = d["k"]` recorded "list" for key "k", which beat every
+        # other inference in `_infer_type_tag`, so `len(e[1])` answered 0
+        # while the direct `len(d["k"][1])` was right.
+        # BUG-DICT-VALUE-CONTAINER-ELEM-KIND-LOST-ON-BIND.
+        if isinstance(node, ast.Dict):
+            return self._literal_container_tag(node, "dict", node.values,
+                                               node.keys)
+        if isinstance(node, ast.DictComp):
             return "dict"
-        if isinstance(node, (ast.List, ast.ListComp)):
+        if isinstance(node, ast.List):
+            return self._literal_container_tag(node, "list", node.elts)
+        if isinstance(node, ast.ListComp):
             return "list"
         if isinstance(node, ast.Tuple):
-            return "list"  # tuples stored as lists in FpyValue
+            # tuples stored as lists in FpyValue
+            return self._literal_container_tag(node, "list", node.elts)
         if isinstance(node, (ast.Set, ast.SetComp)):
             return "set"
         # Constructor calls for known user classes → obj
@@ -43232,38 +50726,11 @@ class CodeGen:
                     self.runtime["dict_get_int_val"], [obj, key])
                 return data
 
-            tag_slot = self._create_entry_alloca(i32, "dget.tag")
-            data_slot = self._create_entry_alloca(i64, "dget.data")
-            # Tuple/list keys: use generic FpyValue-keyed getter
-            _key_is_tuple = (isinstance(node.slice, (ast.Tuple, ast.List))
-                             or (isinstance(node.slice, ast.Name)
-                                 and node.slice.id in self.variables
-                                 and self._var_kind(node.slice.id)
-                                 in (VKind.LIST, VKind.TUPLE)))
-            if _key_is_tuple:
-                kt, kd = self._bare_to_tag_data(key, node.slice)
-                if not isinstance(kd, ir.Constant) and isinstance(kd.type, ir.PointerType):
-                    kd = self.builder.ptrtoint(kd, i64)
-                self.builder.call(self.runtime["dict_get_kv_fv"],
-                                  [obj, ir.Constant(i32, kt), kd,
-                                   tag_slot, data_slot])
-            # Int keys use the int-keyed getter (native int keys in dict).
-            elif isinstance(key.type, ir.IntType):
-                self.builder.call(self.runtime["dict_get_int_fv"],
-                                  [obj, key, tag_slot, data_slot])
-            elif isinstance(key.type, ir.PointerType):
-                self.builder.call(self.runtime["dict_get_fv"],
-                                  [obj, key, tag_slot, data_slot])
-            elif key.type == fpy_val:
-                # Key is an FpyValue (e.g. from list.pop(), for-each, etc.)
-                kt = self.builder.extract_value(key, 0, "dkey.tag")
-                kd = self.builder.extract_value(key, 1, "dkey.data")
-                self.builder.call(self.runtime["dict_get_kv_fv"],
-                                  [obj, kt, kd, tag_slot, data_slot])
-            else:
-                return self._bridge_fallback_expr(node, "dict access with non-string key")
-            tag = self.builder.load(tag_slot)
-            data = self.builder.load(data_slot)
+            _loaded = self._emit_dict_load_by_key(obj, key, node.slice)
+            if _loaded is None:
+                return self._bridge_fallback_expr(
+                    node, "dict access with non-string key")
+            tag, data = _loaded
             # Find the base dict variable name, walking through nested
             # subscripts: d["a"]["b"] → base is "d".
             base_name = None
@@ -43355,14 +50822,19 @@ class CodeGen:
         # Returns a full FpyValue so downstream print/assignment preserves
         # the runtime tag.
         if (isinstance(node.value, ast.Name)
-                and node.value.id in self.variables
-                and not isinstance(node.slice, ast.Slice)):
+                and node.value.id in self.variables):
             _unk_alloca, _unk_tag = self.variables[node.value.id]
             if (self._tag_kind(_unk_tag) in (VKind.UNKNOWN, VKind.FVALUE, VKind.MIXED)
                     and isinstance(_unk_alloca.type, ir.PointerType)
                     and _unk_alloca.type.pointee is fpy_val):
-                # Load the container's runtime tag and data
                 _fv = self._load_fv_raw(node.value.id)
+                if isinstance(node.slice, ast.Slice):
+                    # Slicing preserves the container's kind, so it has to be
+                    # dispatched on the runtime tag too: the static paths below
+                    # pick str_slice or list_slice from the compiler's guess,
+                    # and a list arriving on the str path sliced to the empty
+                    # string.
+                    return self._emit_fv_slice(_fv, node.slice)
                 _c_tag = self._fv_tag(_fv)
                 _c_data = self._fv_data_i64(_fv)
                 # Load the key and convert to tag+data
@@ -43440,7 +50912,8 @@ class CodeGen:
             # Bytes slicing: b"hello"[1:3] → b'el' (same char* slice, but
             # stored with BYTES type tag so print shows b'...' prefix)
             if _vt_tag == VKind.BYTES and isinstance(node.slice, ast.Slice):
-                return self._emit_string_slice(obj, node.slice, node)
+                return self._emit_string_slice(obj, node.slice, node,
+                                               is_bytes=True)
             # Tuple/list pointer from chained subscript or expression:
             # route through list_get_fv to preserve runtime element tag.
             if _vt_tag in (VKind.LIST, VKind.TUPLE):
@@ -43470,10 +50943,14 @@ class CodeGen:
             stop = self._emit_expr_value(slc.upper) if slc.upper else ir.Constant(i64, -1)
             has_start = ir.Constant(i64, 1 if slc.lower else 0)
             has_stop = ir.Constant(i64, 1 if slc.upper else 0)
+            # A bytes receiver needs the byte-indexed pair — the str one
+            # returns an FpyString that a BYTES tag then reads as an FpyBytes.
+            # BUG-BYTES-SLICE-VIA-STR.
+            _pfx = "bytes" if self._is_bytes_expr(node.value) else "str"
             if slc.step:
                 step = self._emit_expr_value(slc.step)
-                return self._rt_call("str_slice_step", [obj, start, stop, step, has_start, has_stop])
-            return self._rt_call("str_slice", [obj, start, stop, has_start, has_stop])
+                return self._rt_call(_pfx + "_slice_step", [obj, start, stop, step, has_start, has_stop])
+            return self._rt_call(_pfx + "_slice", [obj, start, stop, has_start, has_stop])
 
         # Fallback: treat as pyobj __getitem__ via bridge
         obj = self._emit_expr_value(node.value)
@@ -43489,6 +50966,31 @@ class CodeGen:
                           [callable_ptr, ir.Constant(i32, tag), data,
                            out_tag, out_data])
         return self.builder.load(out_data)
+
+    def _emit_fv_slice(self, fv: ir.Value, sl: ast.Slice) -> ir.Value:
+        """Slice a container whose kind is only known at runtime.
+
+        `fastpy_fv_slice` picks str/bytes or list/tuple from the tag and echoes
+        that tag back, since a slice has the same kind as what it came from.
+        Without it a slice of an untyped parameter took whichever static path
+        the compiler guessed — `str_slice` on a list quietly produced the empty
+        string.  BUG-SUBSCRIPT-UNTYPED-PARAM-BRIDGE.
+        """
+        _zero = ir.Constant(i64, 0)
+        start = self._emit_expr_value(sl.lower) if sl.lower else _zero
+        stop = self._emit_expr_value(sl.upper) if sl.upper else _zero
+        step = self._emit_expr_value(sl.step) if sl.step else ir.Constant(i64, 1)
+        tag_slot = self._create_entry_alloca(i32, "fvsl.tag")
+        data_slot = self._create_entry_alloca(i64, "fvsl.data")
+        self.builder.call(
+            self.runtime["fv_slice"],
+            [self._fv_tag(fv), self._fv_data_i64(fv), start, stop, step,
+             ir.Constant(i64, 1 if sl.lower else 0),
+             ir.Constant(i64, 1 if sl.upper else 0),
+             ir.Constant(i64, 1 if sl.step else 0),
+             tag_slot, data_slot])
+        return self._fv_build_from_slots(self.builder.load(tag_slot),
+                                         self.builder.load(data_slot))
 
     def _emit_list_slice(self, lst: ir.Value, sl: ast.Slice, node: ast.AST) -> ir.Value:
         """Emit list slicing: lst[start:stop] or lst[start:stop:step]."""
@@ -43511,8 +51013,18 @@ class CodeGen:
             self.runtime["list_slice"], [lst, start, stop, has_start, has_stop]
         )
 
-    def _emit_string_slice(self, s: ir.Value, sl: ast.Slice, node: ast.AST) -> ir.Value:
-        """Emit string slicing: s[start:stop]."""
+    def _emit_string_slice(self, s: ir.Value, sl: ast.Slice, node: ast.AST,
+                           is_bytes: bool = False) -> ir.Value:
+        """Emit string slicing: s[start:stop].
+
+        `is_bytes` swaps in the byte-indexed pair.  A bytes slice used to be
+        produced by `fastpy_str_slice`, which indexes by code point and returns
+        an *FpyString* — and the result was then tagged BYTES, so every later
+        `fpy_bytes_len` probed for the bytes magic 16 bytes before a
+        smaller-header allocation.  BUG-BYTES-SLICE-VIA-STR.
+        """
+        _slice = "bytes_slice" if is_bytes else "str_slice"
+        _slice_step = "bytes_slice_step" if is_bytes else "str_slice_step"
         if sl.lower is not None:
             start = self._emit_expr_value(sl.lower)
             has_start = ir.Constant(i64, 1)
@@ -43530,12 +51042,12 @@ class CodeGen:
         if sl.step is not None:
             step = self._emit_expr_value(sl.step)
             return self.builder.call(
-                self.runtime["str_slice_step"],
+                self.runtime[_slice_step],
                 [s, start, stop, step, has_start, has_stop]
             )
 
         return self.builder.call(
-            self.runtime["str_slice"], [s, start, stop, has_start, has_stop]
+            self.runtime[_slice], [s, start, stop, has_start, has_stop]
         )
 
     def _emit_list_literal(self, node: ast.List) -> ir.Value:
@@ -43608,6 +51120,20 @@ class CodeGen:
                                  ast.Tuple)):
                 self.builder.call(self.runtime["rc_decref"], [tag_c, data])
             return
+        # Bytes elements: a bytes is a pointer like a str, and the fallback
+        # below tags every unrecognised pointer STR — so `[b"ab"]` printed
+        # `['ab']` and the element came back out of the list unable to
+        # concatenate with another bytes.  BUG-BYTES-IN-LIST-TAG-LOST.
+        # No decref here, deliberately: this mirrors the str pointer path,
+        # which also hands its creation reference to the list.
+        if self._is_bytes_expr(node):
+            value = self._emit_expr_value(node)
+            value = self._ensure_ptr(value)
+            self.builder.call(
+                self.runtime["list_append_fv"],
+                [list_ptr, ir.Constant(i32, FPY_TAG_BYTES),
+                 self.builder.ptrtoint(value, i64)])
+            return
         if self._is_dict_expr(node):
             value = self._emit_expr_value(node)
             data = self.builder.ptrtoint(value, i64)
@@ -43671,30 +51197,53 @@ class CodeGen:
                                   [list_ptr, tag, data])
                 return
 
-        # BigInt constants / expressions — tag as BIGINT, not INT
-        if self._is_bigint_expr(node):
+        # BigInt / Decimal / Complex elements.  All three are heap values
+        # reached through a pointer, and the generic fall-through below tags
+        # every i64 INT and every pointer STR — so `[2 ** 80]` printed the
+        # element's *address* and `[Decimal("1.5")]` printed an empty line.
+        # BUG-LIST-LITERAL-BIGINT-DECIMAL-ELEM.
+        #
+        # The narrow `_is_*_expr` predicates are not enough on their own.
+        # `_is_bigint_expr` knows only an integer literal too wide for an i64
+        # and a BIGINT-kinded name, so it answers False for `2 ** 80` — a
+        # BinOp of two small constants.  `_is_decimal_expr` was right about
+        # `Decimal("1.5")` and simply had no branch calling it.
+        #
+        # `_infer_type_tag` gets all three right, and it is the same analysis
+        # `_bare_to_tag_data` consults — which is precisely why a *dict* held
+        # these correctly all along while a list did not.  Asking it here is
+        # what makes the two container element-store paths agree.  The old
+        # predicates stay as extra evidence: they were already trusted, and
+        # OR-ing them can only widen what is tagged correctly.
+        _elem_kind = self._infer_type_tag(node, None).kind
+        _heap_num_tag = None
+        if _elem_kind == VKind.BIGINT or self._is_bigint_expr(node):
+            _heap_num_tag = FPY_TAG_BIGINT
+        elif _elem_kind == VKind.DECIMAL or self._is_decimal_expr(node):
+            _heap_num_tag = FPY_TAG_DECIMAL
+        elif _elem_kind == VKind.COMPLEX or self._is_complex_expr(node):
+            _heap_num_tag = FPY_TAG_COMPLEX
+        if _heap_num_tag is not None:
             value = self._emit_expr_value(node)
+            if (isinstance(value.type, ir.LiteralStructType)
+                    and value.type == fpy_val):
+                # Already carries its own runtime tag, which beats the static
+                # guess — a BIGINT-kinded expression may well be holding a
+                # value small enough to have stayed a plain int.
+                self.builder.call(
+                    self.runtime["list_append_fv"],
+                    [list_ptr, self.builder.extract_value(value, 0),
+                     self.builder.extract_value(value, 1)])
+                return
             if isinstance(value.type, ir.PointerType):
                 data = self.builder.ptrtoint(value, i64)
             elif isinstance(value.type, ir.IntType) and value.type.width == 64:
                 data = value
             else:
-                data = self.builder.zext(value, i64) if isinstance(value.type, ir.IntType) else value
+                data = (self.builder.zext(value, i64)
+                        if isinstance(value.type, ir.IntType) else value)
             self.builder.call(self.runtime["list_append_fv"],
-                              [list_ptr, ir.Constant(i32, FPY_TAG_BIGINT), data])
-            return
-
-        # Complex constants / expressions — tag as COMPLEX
-        if self._is_complex_expr(node):
-            value = self._emit_expr_value(node)
-            if isinstance(value.type, ir.PointerType):
-                data = self.builder.ptrtoint(value, i64)
-            elif isinstance(value.type, ir.IntType) and value.type.width == 64:
-                data = value
-            else:
-                data = self.builder.zext(value, i64) if isinstance(value.type, ir.IntType) else value
-            self.builder.call(self.runtime["list_append_fv"],
-                              [list_ptr, ir.Constant(i32, FPY_TAG_COMPLEX), data])
+                              [list_ptr, ir.Constant(i32, _heap_num_tag), data])
             return
 
         # For all other expressions, evaluate and dispatch by LLVM type
@@ -43927,17 +51476,31 @@ class CodeGen:
         return result_list
 
     def _emit_lc_body(self, gen, node, result_list, incr_block):
-        """Emit the body of a list comprehension (conditions + append)."""
+        """Emit the body of a list comprehension (conditions + append).
+
+        Owned temps created by the filter conditions or by the element
+        expression live in *this iteration's* blocks. They must be released
+        before the back-edge, not left pending for the enclosing statement's
+        flush: that flush runs after the loop, in a block the body does not
+        dominate ("Instruction does not dominate all uses"), and even if it
+        did it would release only the final iteration's value and leak the
+        rest. `fpy_list_append` increfs, so the list keeps its own reference
+        and the per-iteration release is correct. See
+        BUG-DECREF-DOES-NOT-DOMINATE.
+        """
+        _mark = len(self._rc_temps)
         for if_clause in gen.ifs:
             cond = self._emit_condition(if_clause)
             skip_block = self._new_block("lc.skip")
             append_block = self._new_block("lc.append")
             self.builder.cbranch(cond, append_block, skip_block)
             self.builder.position_at_end(skip_block)
+            self._release_rc_temps_since(_mark)
             self.builder.branch(incr_block)
             self.builder.position_at_end(append_block)
 
         self._emit_list_append_expr(result_list, node.elt)
+        self._flush_rc_temps_to(_mark)
         self.builder.branch(incr_block)
 
     def _emit_list_comp_tuple_unpack(self, node: ast.ListComp,
@@ -43945,7 +51508,10 @@ class CodeGen:
         """Emit [expr for a, b, ... in iterable] with tuple unpacking."""
         n_targets = len(gen.target.elts)
         pos_tags = self._infer_for_tuple_elem_types(gen.iter, n_targets)
-        pos_tags = [t if t != "unknown" else "int" for t in pos_tags]
+        # "unknown" stays unknown.  Rewriting it to "int" here is what made a
+        # tuple of mixed values unpack into int-kinded locals holding raw
+        # payloads; `_fv_store_from_list` keeps the element's runtime tag, and
+        # an honest "unknown" is what tells it to.  BUG-DICT-VALUE-STATIC-KIND.
 
         iter_val = self._emit_expr_value(gen.iter)
         if self._is_obj_expr(gen.iter):
@@ -43975,22 +51541,14 @@ class CodeGen:
         data_s = self._create_entry_alloca(i64, "lc_tu.data")
         self._rt_call("list_get_fv", [iter_val, idx, tag_s, data_s])
         elem_ptr = self._ensure_ptr(self.builder.load(data_s))
-        # Unpack tuple into individual variables
+        # Unpack tuple into individual variables.  Same helper the statement
+        # for-loop uses (`_unpack_targets_from_list`), so the element's runtime
+        # tag survives instead of being replaced by a positional guess.
         for ti, tgt in enumerate(gen.target.elts):
             if isinstance(tgt, ast.Name):
-                t2 = self._create_entry_alloca(i32, f"lc_tu.t{ti}")
-                d2 = self._create_entry_alloca(i64, f"lc_tu.d{ti}")
-                self._rt_call("list_get_fv", [elem_ptr, ir.Constant(i64, ti), t2, d2])
-                _var_tag = pos_tags[ti] if ti < len(pos_tags) else "int"
-                _vt_tag = (_var_tag if isinstance(_var_tag, ValueType)
-                           else ValueType.from_old_tag(_var_tag))
-                if _vt_tag.kind.is_ptr:
-                    self._store_variable(
-                        tgt.id,
-                        self._ensure_ptr(self.builder.load(d2)),
-                        _var_tag)
-                else:
-                    self._store_variable(tgt.id, self.builder.load(d2), _var_tag)
+                _var_tag = pos_tags[ti] if ti < len(pos_tags) else "unknown"
+                self._fv_store_from_list(tgt.id, elem_ptr,
+                                         ir.Constant(i64, ti), _var_tag)
 
         # Emit body (conditions + append)
         self._emit_lc_body(gen, node, result_list, incr_block)
@@ -44060,6 +51618,12 @@ class CodeGen:
                              else ValueType.from_old_tag("int"))
                 self._fv_store_from_list(var, iter_val, idx, _mlc_elem)
 
+            # Owned temps made by this iteration's conditions, inner iterable
+            # or element expression are released before the back-edge — a
+            # post-loop flush would neither dominate them nor cover more than
+            # the last iteration. See BUG-DECREF-DOES-NOT-DOMINATE.
+            _mark = len(self._rc_temps)
+
             # Apply 'if' conditions for this generator
             if gen.ifs:
                 for cond_node in gen.ifs:
@@ -44067,7 +51631,11 @@ class CodeGen:
                     if isinstance(cond_val.type, ir.IntType) and cond_val.type.width > 1:
                         cond_val = self.builder.icmp_signed("!=", cond_val, ir.Constant(cond_val.type, 0))
                     pass_b = self._new_block(f"{lbl}.pass")
-                    self.builder.cbranch(cond_val, pass_b, incr_b)
+                    skip_b = self._new_block(f"{lbl}.skip")
+                    self.builder.cbranch(cond_val, pass_b, skip_b)
+                    self.builder.position_at_end(skip_b)
+                    self._release_rc_temps_since(_mark)
+                    self.builder.branch(incr_b)
                     self.builder.position_at_end(pass_b)
 
             if gen_idx + 1 < len(node.generators):
@@ -44077,6 +51645,7 @@ class CodeGen:
                 # Innermost: append the element expression
                 self._emit_list_append_expr(result_list, node.elt)
 
+            self._flush_rc_temps_to(_mark)
             if not self.builder.block.is_terminated:
                 self.builder.branch(incr_b)
 
@@ -44142,6 +51711,12 @@ class CodeGen:
             self.builder.cbranch(self.builder.icmp_signed("<", idx0, outer_len), outer_body, outer_end)
 
         self.builder.position_at_end(outer_body)
+        # Temps created per outer iteration (notably the *inner* iterable, when
+        # it is a materialised generator) are released at inner_end, before the
+        # outer back-edge: outer_body does not dominate outer_end, so the
+        # enclosing statement's flush could not legally release them there.
+        # See BUG-DECREF-DOES-NOT-DOMINATE.
+        _outer_mark = len(self._rc_temps)
         if not is_range0:
             # Load element from outer list into var0
             idx0 = self._load_variable(idx0_name, node)
@@ -44209,6 +51784,7 @@ class CodeGen:
         self.builder.branch(inner_cond)
 
         self.builder.position_at_end(inner_end)
+        self._flush_rc_temps_to(_outer_mark)
         self.builder.branch(outer_incr)
 
         self.builder.position_at_end(outer_incr)
@@ -44232,9 +51808,13 @@ class CodeGen:
         set_ptr = self.builder.call(self.runtime["dict_new"], [])
         for elem_node in node.elts:
             val = self._emit_expr_value(elem_node)
-            tag, data = self._bare_to_tag_data(val, elem_node)
+            # A set element is stored tag-and-all, exactly like a dict value,
+            # so it needs the runtime tag for the same reason: `{fl}` for a
+            # tagged `fl = 4.5` otherwise holds the float's bit pattern as an
+            # int.  BUG-DICT-VALUE-STATIC-KIND.
+            tag, data = self._to_tag_data_ir(val, elem_node)
             self.builder.call(self.runtime["set_add_fv"],
-                              [set_ptr, ir.Constant(i32, tag), data])
+                              [set_ptr, tag, data])
         return set_ptr
 
     def _emit_dict_literal(self, node: ast.Dict) -> ir.Value:
@@ -44242,8 +51822,10 @@ class CodeGen:
 
         Routes through `dict_set_fv` so the value's exact runtime tag is
         preserved (including LIST/DICT/OBJ pointer values). The AST node
-        is passed to `_bare_to_tag_data` so pointer values are tagged
-        correctly rather than falling through to STR.
+        is passed to `_to_tag_data_ir` so pointer values are tagged
+        correctly rather than falling through to STR, and so a value whose
+        tag is only known at runtime contributes that tag instead of a
+        compile-time guess.  BUG-DICT-VALUE-STATIC-KIND.
         """
         dict_ptr = self.builder.call(self.runtime["dict_new"], [])
         for key_node, val_node in zip(node.keys, node.values):
@@ -44262,44 +51844,186 @@ class CodeGen:
                 continue
             key = self._emit_expr_value(key_node)
             val = self._emit_expr_value(val_node)
-            tag, data = self._bare_to_tag_data(val, val_node)
-            # Tuple/list keys: use generic FpyValue-keyed setter
-            _key_is_tuple = isinstance(key_node, (ast.Tuple, ast.List))
-            if not _key_is_tuple and isinstance(key_node, ast.Name):
-                if (key_node.id in self.variables
-                        and self._var_kind(key_node.id)
-                        in (VKind.LIST, VKind.TUPLE)):
-                    _key_is_tuple = True
-            if _key_is_tuple:
-                kt, kd = self._bare_to_tag_data(key, key_node)
-                if not isinstance(kd, ir.Constant) and isinstance(kd.type, ir.PointerType):
-                    kd = self.builder.ptrtoint(kd, i64)
-                self.builder.call(self.runtime["dict_set_kv_fv"],
-                                  [dict_ptr, ir.Constant(i32, kt), kd,
-                                   ir.Constant(i32, tag), data])
-            elif isinstance(key.type, ir.IntType):
-                # Int-keyed dict — native int-key storage
-                self.builder.call(self.runtime["dict_set_int_fv"],
-                                  [dict_ptr, key,
-                                   ir.Constant(i32, tag), data])
-            elif isinstance(key.type, ir.PointerType):
-                self.builder.call(self.runtime["dict_set_fv"],
-                                  [dict_ptr, key,
-                                   ir.Constant(i32, tag), data])
-            elif isinstance(key.type, ir.LiteralStructType):
-                # FpyValue key (e.g. a boxed variable used as dict key).
-                # Extract the i64 data field and use it as an int key.
-                # This is correct for int/bool/float keys whose identity
-                # is captured by the data word.
-                key_data = self.builder.extract_value(key, 1)
-                self.builder.call(self.runtime["dict_set_int_fv"],
-                                  [dict_ptr, key_data,
-                                   ir.Constant(i32, tag), data])
-            else:
+            tag, data = self._to_tag_data_ir(val, val_node)
+            if not self._emit_dict_store_by_key(dict_ptr, key, tag, data,
+                                                key_node):
                 # Truly unsupported key type — bridge fallback
                 return self._bridge_fallback_expr(
                     node, f"dict literal with {key.type} key type")
         return dict_ptr
+
+    def _emit_dict_store_by_key(self, dict_ptr: ir.Value, key: ir.Value,
+                                 tag: ir.Value, data: ir.Value,
+                                 key_node: 'ast.expr | None' = None) -> bool:
+        """Store (tag, data) under *key*, picking the setter from key's shape.
+
+        Returns False without emitting anything if the key shape has no
+        setter, so the caller can fall back before it has built a partial
+        store.
+
+        The `fpy_val` arm is the one worth naming: a key can become a tagged
+        struct for reasons that have nothing to do with the key itself — one
+        BigInt anywhere in the function is enough to promote a comprehension's
+        loop variable — and the emitters that dispatched on key shape inline
+        each had their own set of arms.  The one that missed `fpy_val` bailed
+        to the bridge from *inside* an already-emitted loop, stranding its
+        `.incr`/`.end` blocks unterminated and failing the build.  Having a
+        single helper is what stops the arms from drifting apart again.
+        BUG-DICTCOMP-FV-KEY-EMITS-BROKEN-IR.
+        """
+        # A tuple key is a pointer, and so is a str key, so the pointer arm
+        # below cannot tell them apart — this has to be settled from the AST
+        # before shape dispatch, or `{(1, 2): v}` would be strcmp'd.
+        if key_node is not None and self._key_node_is_tuple(key_node):
+            kt, kd = self._bare_to_tag_data(key, key_node)
+            if (not isinstance(kd, ir.Constant)
+                    and isinstance(kd.type, ir.PointerType)):
+                kd = self.builder.ptrtoint(kd, i64)
+            self.builder.call(self.runtime["dict_set_kv_fv"],
+                              [dict_ptr, ir.Constant(i32, kt), kd, tag, data])
+            return True
+        # A key carries a tag into the table exactly as a value does, and it is
+        # subject to the same trap: an FV-backed variable arrives here as a
+        # bare i64 payload, which would land in the *int*-keyed table under the
+        # string's address.  `{k: 1 for k in ["a", 7, 2.5]}` did that to all
+        # three keys.  BUG-DICT-VALUE-STATIC-KIND.
+        if key_node is not None:
+            _kt, _kd = self._to_tag_data_ir(key, key_node)
+            if not isinstance(_kt, ir.Constant):
+                self.builder.call(self.runtime["dict_set_kv_fv"],
+                                  [dict_ptr, _kt, _kd, tag, data])
+                return True
+        if isinstance(key.type, ir.IntType):
+            # A bool key is an int key as far as *identity* goes, but not as
+            # far as printing goes: Python keeps the key object that was
+            # inserted first, so `{True: 1}` prints `{True: 1}` and stays that
+            # way when `d[1] = 2` overwrites it.  Storing it untagged printed
+            # `{1: 1}` and made `sorted(d.keys())` yield ints.  This is only
+            # safe to store as BOOL because `fpy_key_equal` now unifies the
+            # numeric tags — otherwise it would split the key in two.
+            # BUG-BOOL-DICT-KEY-PRINTS-AS-INT.
+            if (key_node is not None
+                    and self._static_type_of(key_node) == "bool"):
+                bkey = key
+                if key.type.width != 64:
+                    bkey = self.builder.zext(key, i64)
+                self.builder.call(self.runtime["dict_set_kv_fv"],
+                                  [dict_ptr, ir.Constant(i32, FPY_TAG_BOOL),
+                                   bkey, tag, data])
+                return True
+            # Int-keyed dict — native int-key storage
+            self.builder.call(self.runtime["dict_set_int_fv"],
+                              [dict_ptr, key, tag, data])
+            return True
+        if isinstance(key.type, ir.DoubleType):
+            # A float key was simply a missing arm, not a missing capability:
+            # the table hashes a FLOAT-tagged value already (`fpy_hash_value`),
+            # and the read side reaches it through the same `_kv_` entry point
+            # every other tagged key uses.  Without this, `{2.5: "a"}` fell to
+            # the bridge and the PyObject that came back was then consumed as a
+            # native `FpyDict*` — `len(d)` on it segfaulted.
+            # BUG-FLOAT-KEY-DICT-LITERAL-SEGFAULTS.
+            self.builder.call(self.runtime["dict_set_kv_fv"],
+                              [dict_ptr, ir.Constant(i32, FPY_TAG_FLOAT),
+                               self.builder.bitcast(key, i64), tag, data])
+            return True
+        if isinstance(key.type, ir.PointerType):
+            self.builder.call(self.runtime["dict_set_fv"],
+                              [dict_ptr, key, tag, data])
+            return True
+        if isinstance(key.type, ir.LiteralStructType) and key.type == fpy_val:
+            # Hash the key tag-and-all rather than using the data word as an
+            # int: the word alone cannot tell a str's address from an int, so
+            # `{s: 1}` for a tagged `s = "a"` would collide with `{addr: 1}`
+            # and `"a" in d` would miss.
+            self.builder.call(self.runtime["dict_set_kv_fv"],
+                              [dict_ptr,
+                               self.builder.extract_value(key, 0),
+                               self.builder.extract_value(key, 1),
+                               tag, data])
+            return True
+        return False
+
+    def _key_node_is_tuple(self, key_node: 'ast.expr') -> bool:
+        """True when a subscript/dict key is a tuple or list, per the AST.
+
+        The LLVM type cannot answer this — a tuple key and a str key are both
+        pointers — so the decision has to come from the source shape.
+        """
+        if isinstance(key_node, (ast.Tuple, ast.List)):
+            return True
+        return (isinstance(key_node, ast.Name)
+                and key_node.id in self.variables
+                and self._var_kind(key_node.id) in (VKind.LIST, VKind.TUPLE))
+
+    def _emit_dict_load_by_key(self, dict_ptr: ir.Value, key: ir.Value,
+                                key_node: 'ast.expr | None' = None):
+        """Load the (tag, data) stored under *key*, dispatching on its shape.
+
+        Returns a `(tag_ir, data_ir)` pair, or None — without emitting
+        anything — when the key shape has no getter, so the caller can fall
+        back before it has built a partial load.
+
+        This is the read-side twin of `_emit_dict_store_by_key`, and exists
+        for the same reason: the two dict-subscript emitters (the FV-producing
+        one and the value-producing one) each grew their own copy of this
+        dispatch, and each was missing a different arm.  A store arm with no
+        matching load arm is worse than neither, because the value goes in and
+        cannot come out.  BUG-FLOAT-KEY-DICT-LITERAL-SEGFAULTS.
+        """
+        tag_slot = self._create_entry_alloca(i32, "dget.tag")
+        data_slot = self._create_entry_alloca(i64, "dget.data")
+
+        def _done():
+            return (self.builder.load(tag_slot), self.builder.load(data_slot))
+
+        if key_node is not None and self._key_node_is_tuple(key_node):
+            kt, kd = self._bare_to_tag_data(key, key_node)
+            if (not isinstance(kd, ir.Constant)
+                    and isinstance(kd.type, ir.PointerType)):
+                kd = self.builder.ptrtoint(kd, i64)
+            self.builder.call(self.runtime["dict_get_kv_fv"],
+                              [dict_ptr, ir.Constant(i32, kt), kd,
+                               tag_slot, data_slot])
+            return _done()
+        # An FV-backed variable used as a key arrives as a bare payload, so it
+        # has to be recovered from its slot before the shape arms below see an
+        # i64 and file it under the int-keyed table.  BUG-DICT-VALUE-STATIC-KIND.
+        if key_node is not None:
+            _kt, _kd = self._to_tag_data_ir(key, key_node)
+            if not isinstance(_kt, ir.Constant):
+                self.builder.call(self.runtime["dict_get_kv_fv"],
+                                  [dict_ptr, _kt, _kd, tag_slot, data_slot])
+                return _done()
+        if isinstance(key.type, ir.LiteralStructType) and key.type == fpy_val:
+            self.builder.call(self.runtime["dict_get_kv_fv"],
+                              [dict_ptr,
+                               self.builder.extract_value(key, 0, "dkey.tag"),
+                               self.builder.extract_value(key, 1, "dkey.data"),
+                               tag_slot, data_slot])
+            return _done()
+        if isinstance(key.type, ir.DoubleType):
+            # The float arm the store side was also missing.  `d[2.5]` used to
+            # fall to the bridge here even when the dict was built natively.
+            # BUG-FLOAT-KEY-DICT-LITERAL-SEGFAULTS.
+            self.builder.call(self.runtime["dict_get_kv_fv"],
+                              [dict_ptr, ir.Constant(i32, FPY_TAG_FLOAT),
+                               self.builder.bitcast(key, i64),
+                               tag_slot, data_slot])
+            return _done()
+        if isinstance(key.type, ir.IntType):
+            ikey = key
+            if key.type.width != 64:
+                ikey = (self.builder.zext(key, i64) if key.type.width == 1
+                        else self.builder.sext(key, i64))
+            self.builder.call(self.runtime["dict_get_int_fv"],
+                              [dict_ptr, ikey, tag_slot, data_slot])
+            return _done()
+        if isinstance(key.type, ir.PointerType):
+            self.builder.call(self.runtime["dict_get_fv"],
+                              [dict_ptr, key, tag_slot, data_slot])
+            return _done()
+        return None
 
     def _emit_dict_comprehension(self, node: ast.DictComp) -> ir.Value:
         """Emit {key: val for x in range(n)}."""
@@ -44328,8 +52052,8 @@ class CodeGen:
             # dict.items(), sorted(d.items()), and literal list of tuples).
             n_targets = len(gen.target.elts)
             pos_tags = self._infer_for_tuple_elem_types(gen.iter, n_targets)
-            # Replace "unknown" defaults with "int" for backward compat
-            pos_tags = [t if t != "unknown" else "int" for t in pos_tags]
+            # "unknown" stays unknown — see _emit_list_comp_tuple_unpack.
+            # BUG-DICT-VALUE-STATIC-KIND.
             # Get the tuple element and unpack
             tag_s = self._create_entry_alloca(i32, "dc.tag")
             data_s = self._create_entry_alloca(i64, "dc.data")
@@ -44337,45 +52061,33 @@ class CodeGen:
             elem_ptr = self._ensure_ptr(self.builder.load(data_s))
             for ti, tgt in enumerate(gen.target.elts):
                 if isinstance(tgt, ast.Name):
-                    t2 = self._create_entry_alloca(i32, f"dc.t{ti}")
-                    d2 = self._create_entry_alloca(i64, f"dc.d{ti}")
-                    self._rt_call("list_get_fv", [elem_ptr, ir.Constant(i64, ti), t2, d2])
-                    _var_tag = pos_tags[ti] if ti < len(pos_tags) else "int"
-                    _vt_tag = (_var_tag if isinstance(_var_tag, ValueType)
-                               else ValueType.from_old_tag(_var_tag))
-                    if _vt_tag.kind.is_ptr:
-                        # Pointer types: convert i64 data to pointer
-                        self._store_variable(
-                            tgt.id,
-                            self._ensure_ptr(self.builder.load(d2)),
-                            _var_tag)
-                    else:
-                        self._store_variable(tgt.id, self.builder.load(d2), _var_tag)
+                    _var_tag = pos_tags[ti] if ti < len(pos_tags) else "unknown"
+                    self._fv_store_from_list(tgt.id, elem_ptr,
+                                             ir.Constant(i64, ti), _var_tag)
             # Handle filter conditions (if clauses)
             incr_block = self._new_block("dc.incr")
+            # Per-iteration release: the dict retains both key and value
+            # (fastpy_dict_set_fv increfs), and a post-loop flush would be
+            # invalid IR. See BUG-DECREF-DOES-NOT-DOMINATE.
+            _mark = len(self._rc_temps)
             for if_clause in gen.ifs:
                 cond_val = self._emit_condition(if_clause)
                 skip_block = self._new_block("dc.skip")
                 add_block = self._new_block("dc.add")
                 self.builder.cbranch(cond_val, add_block, skip_block)
                 self.builder.position_at_end(skip_block)
+                self._release_rc_temps_since(_mark)
                 self.builder.branch(incr_block)
                 self.builder.position_at_end(add_block)
             # Evaluate key and value expressions
             key_val = self._emit_expr_value(node.key)
             val_val = self._emit_expr_value(node.value)
-            v_tag, v_data = self._bare_to_tag_data(val_val, node.value)
-            if isinstance(key_val.type, ir.IntType):
-                self.builder.call(self.runtime["dict_set_int_fv"],
-                                  [result_dict, key_val,
-                                   ir.Constant(i32, v_tag), v_data])
-            elif isinstance(key_val.type, ir.PointerType):
-                self.builder.call(self.runtime["dict_set_fv"],
-                                  [result_dict, key_val,
-                                   ir.Constant(i32, v_tag), v_data])
-            else:
+            v_tag, v_data = self._to_tag_data_ir(val_val, node.value)
+            if not self._emit_dict_store_by_key(result_dict, key_val,
+                                                v_tag, v_data, node.key):
                 return self._bridge_fallback_expr(
                     node, "dict comprehension key type")
+            self._flush_rc_temps_to(_mark)
             self.builder.branch(incr_block)
             self.builder.position_at_end(incr_block)
             next_idx = self.builder.add(idx, ir.Constant(i64, 1))
@@ -44454,30 +52166,28 @@ class CodeGen:
             else:
                 self._fv_store_from_list(var_name, list_ptr, idx, var_tag)
             # Handle filter conditions
+            # Per-iteration release — see BUG-DECREF-DOES-NOT-DOMINATE.
+            _mark = len(self._rc_temps)
             for if_clause in gen.ifs:
                 cond_val = self._emit_condition(if_clause)
                 skip_block = self._new_block("dcl.skip")
                 add_block = self._new_block("dcl.add")
                 self.builder.cbranch(cond_val, add_block, skip_block)
                 self.builder.position_at_end(skip_block)
+                self._release_rc_temps_since(_mark)
                 self.builder.branch(incr_block)
                 self.builder.position_at_end(add_block)
             key = self._emit_expr_value(node.key)
             val = self._emit_expr_value(node.value)
-            v_tag, v_data = self._bare_to_tag_data(val, node.value)
-            if isinstance(key.type, ir.PointerType):
+            v_tag, v_data = self._to_tag_data_ir(val, node.value)
+            if not self._emit_dict_store_by_key(dict_ptr, key, v_tag, v_data,
+                                                node.key):
+                # No arm matched: coerce to a pointer key, which is what this
+                # path did for every non-int key before the helper existed.
                 self.builder.call(self.runtime["dict_set_fv"],
-                                  [dict_ptr, key,
-                                   ir.Constant(i32, v_tag), v_data])
-            elif isinstance(key.type, ir.IntType):
-                self.builder.call(self.runtime["dict_set_int_fv"],
-                                  [dict_ptr, key,
-                                   ir.Constant(i32, v_tag), v_data])
-            else:
-                self.builder.call(self.runtime["dict_set_fv"],
-                                  [dict_ptr,
-                                   self._ensure_ptr(key),
-                                   ir.Constant(i32, v_tag), v_data])
+                                  [dict_ptr, self._ensure_ptr(key),
+                                   v_tag, v_data])
+            self._flush_rc_temps_to(_mark)
             self.builder.branch(incr_block)
             self.builder.position_at_end(incr_block)
             next_idx = self.builder.add(
@@ -44515,28 +52225,24 @@ class CodeGen:
         self.builder.position_at_end(body_block)
 
         # Handle filter conditions: {k: v for x in range(n) if cond}
+        # Per-iteration release — see BUG-DECREF-DOES-NOT-DOMINATE.
+        _mark = len(self._rc_temps)
         for if_clause in gen.ifs:
             cond_val = self._emit_condition(if_clause)
             skip_block = self._new_block("dc.skip")
             add_block = self._new_block("dc.add")
             self.builder.cbranch(cond_val, add_block, skip_block)
             self.builder.position_at_end(skip_block)
+            self._release_rc_temps_since(_mark)
             self.builder.branch(incr_block)
             self.builder.position_at_end(add_block)
 
         key = self._emit_expr_value(node.key)
         val = self._emit_expr_value(node.value)
-        tag, data = self._bare_to_tag_data(val, node.value)
-        if isinstance(key.type, ir.IntType):
-            self.builder.call(self.runtime["dict_set_int_fv"],
-                              [dict_ptr, key,
-                               ir.Constant(i32, tag), data])
-        elif isinstance(key.type, ir.PointerType):
-            self.builder.call(self.runtime["dict_set_fv"],
-                              [dict_ptr, key,
-                               ir.Constant(i32, tag), data])
-        else:
+        tag, data = self._to_tag_data_ir(val, node.value)
+        if not self._emit_dict_store_by_key(dict_ptr, key, tag, data, node.key):
             return self._bridge_fallback_expr(node, "dict comprehension key/value types")
+        self._flush_rc_temps_to(_mark)
         self.builder.branch(incr_block)
 
         self.builder.position_at_end(incr_block)
@@ -44614,6 +52320,9 @@ class CodeGen:
                              else ValueType.from_old_tag("int"))
                 self._fv_store_from_list(var, iter_val, idx, _elem_tag)
 
+            # Per-iteration release — see BUG-DECREF-DOES-NOT-DOMINATE.
+            _mark = len(self._rc_temps)
+
             # Apply 'if' conditions for this generator
             if gen.ifs:
                 for cond_node in gen.ifs:
@@ -44624,7 +52333,11 @@ class CodeGen:
                             "!=", cond_val,
                             ir.Constant(cond_val.type, 0))
                     pass_b = self._new_block(f"{lbl}.pass")
-                    self.builder.cbranch(cond_val, pass_b, incr_b)
+                    skip_b = self._new_block(f"{lbl}.skip")
+                    self.builder.cbranch(cond_val, pass_b, skip_b)
+                    self.builder.position_at_end(skip_b)
+                    self._release_rc_temps_since(_mark)
+                    self.builder.branch(incr_b)
                     self.builder.position_at_end(pass_b)
 
             if gen_idx + 1 < len(node.generators):
@@ -44633,18 +52346,11 @@ class CodeGen:
                 # Innermost: insert key/value into dict
                 key = self._emit_expr_value(node.key)
                 val = self._emit_expr_value(node.value)
-                tag, data = self._bare_to_tag_data(val, node.value)
-                if isinstance(key.type, ir.IntType):
-                    self.builder.call(
-                        self.runtime["dict_set_int_fv"],
-                        [result_dict, key,
-                         ir.Constant(i32, tag), data])
-                elif isinstance(key.type, ir.PointerType):
-                    self.builder.call(
-                        self.runtime["dict_set_fv"],
-                        [result_dict, key,
-                         ir.Constant(i32, tag), data])
+                tag, data = self._to_tag_data_ir(val, node.value)
+                self._emit_dict_store_by_key(result_dict, key, tag, data,
+                                             node.key)
 
+            self._flush_rc_temps_to(_mark)
             if not self.builder.block.is_terminated:
                 self.builder.branch(incr_b)
 
@@ -44672,6 +52378,14 @@ class CodeGen:
 
         Returns the VKind if the branch has a clearly determinable type,
         or None if the type is dynamic/unknown at compile time.
+
+        `VKind.MIXED` is a third answer, and it is a *determination*, not an
+        absence of one: the branch is known to evaluate to a runtime-tagged
+        `FpyValue`.  Folding that case into `None` cost the caller the one
+        thing it needed, because `None` on both sides reads as "the two arms
+        might yet agree" and skips the tagged phi — so `(1 if x else 2.5) if y
+        else (3 if x else 4.5)` merged two `FpyValue`s as naked i64 and
+        printed a float's bit pattern.  BUG-IFEXP-INT-FLOAT-PROMOTE.
         """
         if isinstance(node, ast.Constant):
             v = node.value
@@ -44690,14 +52404,18 @@ class CodeGen:
         elif isinstance(node, ast.Name):
             if node.id in self.variables:
                 k = self._var_kind(node.id)
-                if k in (VKind.MIXED, VKind.FVALUE, VKind.UNKNOWN):
+                if k in (VKind.MIXED, VKind.FVALUE):
+                    return VKind.MIXED
+                if k is VKind.UNKNOWN:
                     return None
                 return k
             if node.id in self._global_vars:
                 _, vt = self._global_vars[node.id]
                 if not isinstance(vt, ValueType):
                     vt = ValueType.from_old_tag(vt)
-                if vt.kind in (VKind.MIXED, VKind.FVALUE, VKind.UNKNOWN):
+                if vt.kind in (VKind.MIXED, VKind.FVALUE):
+                    return VKind.MIXED
+                if vt.kind is VKind.UNKNOWN:
                     return None
                 return vt.kind
         elif isinstance(node, (ast.List, ast.ListComp, ast.GeneratorExp)):
@@ -44711,12 +52429,24 @@ class CodeGen:
         elif isinstance(node, ast.JoinedStr):
             return VKind.STR
         elif isinstance(node, ast.IfExp):
-            # Nested ternary: check both sub-branches
+            # Nested ternary: the answer has to mirror exactly what
+            # `_emit_ifexp` will do with the same two sub-branches, because
+            # that is what decides whether this arm arrives tagged.
+            if ((isinstance(node.body, ast.Constant) and node.body.value is None)
+                    or (isinstance(node.orelse, ast.Constant)
+                        and node.orelse.value is None)):
+                return VKind.MIXED
             bk = self._ifexp_branch_kind(node.body)
             ek = self._ifexp_branch_kind(node.orelse)
-            if bk == ek:
-                return bk
-            return None
+            if bk is VKind.MIXED or ek is VKind.MIXED:
+                return VKind.MIXED
+            if bk is None and ek is None:
+                # Neither sub-branch is pinned down, so the inner ternary does
+                # not wrap either, and this arm is as unknown as they are.
+                return None
+            if bk != ek:
+                return VKind.MIXED
+            return bk
         return None
 
     def _emit_ifexp(self, node: ast.IfExp) -> ir.Value:
@@ -44738,11 +52468,22 @@ class CodeGen:
         if not needs_fv_output:
             _body_k = self._ifexp_branch_kind(node.body)
             _else_k = self._ifexp_branch_kind(node.orelse)
-            if _body_k is not None and _else_k is not None:
+            if _body_k is VKind.MIXED or _else_k is VKind.MIXED:
+                # An arm that already carries a runtime tag has to be merged
+                # as one.  Two such arms agree on being MIXED, which is not
+                # the kind of agreement that lets the tag be dropped.
+                needs_fv_output = True
+            elif _body_k is not None and _else_k is not None:
                 if _body_k != _else_k:
-                    # int/float can be promoted to double without fpy_val
-                    if not ({_body_k, _else_k} <= {VKind.INT, VKind.FLOAT}):
-                        needs_fv_output = True
+                    # An int arm beside a float arm used to be exempted here
+                    # and promoted to double, on the reasoning that no tag is
+                    # needed if both fit one LLVM type.  They do fit, but the
+                    # int-ness does not survive: `1 if c else 2.5` printed
+                    # `1.0` where CPython prints `1`, because a conditional
+                    # expression yields whichever arm ran, unconverted.  The
+                    # arms disagree, so the result carries a tag like any
+                    # other disagreeing pair.  BUG-IFEXP-INT-FLOAT-PROMOTE.
+                    needs_fv_output = True
             elif _body_k is not None or _else_k is not None:
                 # One known, one unknown/dynamic → could differ at runtime
                 needs_fv_output = True
@@ -44753,6 +52494,12 @@ class CodeGen:
         merge_block = self._new_block("ifexp.merge")
 
         self.builder.cbranch(cond, then_block, else_block)
+
+        # Owned temps created *inside* an arm live in that arm's block, but the
+        # enclosing statement flushes in the merge block, which the arm does not
+        # dominate. Capture them per-arm and re-register them as phis at the
+        # merge point. See BUG-DECREF-DOES-NOT-DOMINATE.
+        _arm_mark = len(self._rc_temps)
 
         if needs_fv_output:
             # Return a full FpyValue so the tag (NONE vs other) is preserved.
@@ -44772,6 +52519,7 @@ class CodeGen:
                 elif isinstance(then_data.type, ir.IntType) and then_data.type.width != 64:
                     then_data = self.builder.zext(then_data, i64)
             then_block_end = self.builder.block
+            then_temps = self._capture_arm_rc_temps(_arm_mark)
             self.builder.branch(merge_block)
 
             # Else branch
@@ -44790,9 +52538,12 @@ class CodeGen:
                 elif isinstance(else_data.type, ir.IntType) and else_data.type.width != 64:
                     else_data = self.builder.zext(else_data, i64)
             else_block_end = self.builder.block
+            else_temps = self._capture_arm_rc_temps(_arm_mark)
             self.builder.branch(merge_block)
 
             self.builder.position_at_end(merge_block)
+            self._rejoin_arm_rc_temps([(then_block_end, then_temps),
+                                       (else_block_end, else_temps)])
             phi_tag = self.builder.phi(i32, "ifexp.tag")
             phi_tag.add_incoming(then_tag_ir, then_block_end)
             phi_tag.add_incoming(else_tag_ir, else_block_end)
@@ -44807,6 +52558,7 @@ class CodeGen:
         if isinstance(then_val.type, ir.LiteralStructType) and then_val.type == fpy_val:
             then_val = self.builder.extract_value(then_val, 1)
         then_block_end = self.builder.block
+        then_temps = self._capture_arm_rc_temps(_arm_mark)
         self.builder.branch(merge_block)
 
         # Else branch
@@ -44860,9 +52612,12 @@ class CodeGen:
                 else_val = self.builder.zext(else_val, i64)
 
         else_block_end = self.builder.block
+        else_temps = self._capture_arm_rc_temps(_arm_mark)
         self.builder.branch(merge_block)
 
         self.builder.position_at_end(merge_block)
+        self._rejoin_arm_rc_temps([(then_block_end, then_temps),
+                                   (else_block_end, else_temps)])
         phi = self.builder.phi(then_val.type)
         phi.add_incoming(then_val, then_block_end)
         phi.add_incoming(else_val, else_block_end)
@@ -44983,6 +52738,15 @@ class CodeGen:
                         # conversion (handles mixed-type containers).
                         fv = self._load_or_wrap_fv(value.value)
                         str_val = self._fv_call_str(fv)
+                        # A statically-scalar interpolant routes through
+                        # fastpy_fv_str's fresh-buffer (owned +1) branch — the
+                        # concat that consumes it only copies bytes, so register
+                        # it for release at the statement boundary (Model 2).
+                        # STR/OBJ interpolants take the borrowed/conditional
+                        # paths and must NOT be registered (→ UAF), hence the
+                        # conservative static-scalar gate.
+                        if self._expr_is_static_scalar(value.value):
+                            self._register_owned_str_ptr(str_val)
 
                 # Apply conversion if requested
                 if conversion in (114, 97):  # !r or !a
@@ -45020,20 +52784,29 @@ class CodeGen:
         if not parts:
             return self._make_string_constant("")
 
-        # Concatenate all parts
+        # Concatenate all parts.  A single part is returned as-is (may be a
+        # borrowed interpolated value or an immortal literal) — do NOT register
+        # it.  Multi-part results come from str_concat (fresh +1) — register
+        # each so they're released at the statement boundary (Model 2).
         result = parts[0]
         for part in parts[1:]:
-            result = self._rt_call("str_concat", [result, part])
+            result = self._owned_str_concat([result, part])
         return result
 
     def _value_to_str(self, value: ir.Value, node: ast.AST) -> ir.Value:
         """Convert an LLVM value to a string pointer (for f-string formatting)."""
         if isinstance(value.type, ir.IntType) and value.type.width == 64:
-            return self.builder.call(self.runtime["int_to_str"], [value])
+            # int_to_str always allocates a fresh owned (+1) FpyString — register
+            # it so the interpolated piece is released at the statement boundary
+            # (Model 2).  The concat that consumes it only copies bytes.
+            return self._register_owned_str_ptr(
+                self.builder.call(self.runtime["int_to_str"], [value]))
         elif isinstance(value.type, ir.DoubleType):
-            return self.builder.call(self.runtime["float_to_str"], [value])
+            # float_to_str likewise always allocates fresh owned.
+            return self._register_owned_str_ptr(
+                self.builder.call(self.runtime["float_to_str"], [value]))
         elif isinstance(value.type, ir.PointerType):
-            return value  # already a string
+            return value  # already a string (borrowed) — do NOT register
         elif isinstance(value.type, ir.IntType) and value.type.width == 32:
             # Bool — format as "True" or "False"
             true_str = self._make_string_constant("True")
@@ -45041,6 +52814,39 @@ class CodeGen:
             is_true = self.builder.icmp_signed("!=", value, ir.Constant(i32, 0))
             return self.builder.select(is_true, true_str, false_str)
         return self._make_string_constant("")  # Phase 4: unconvertible type → empty string
+
+    def _exc_arg_to_message(self, value: ir.Value, arg_node: ast.expr,
+                            exc_name: str, node: ast.AST) -> ir.Value:
+        """Render an exception's first argument as its stored message.
+
+        For every built-in but one this is just str(arg).  KeyError is the
+        exception: its __str__ is `repr(args[0])`, so `raise KeyError("k")`
+        prints `KeyError: 'k'` — quotes included — while `KeyError(5)` prints
+        `KeyError: 5`.  fastpy keeps only the rendered message, never an args
+        tuple, so the repr has to be applied here at the raise, the last point
+        where the argument's type is still known.  The runtime's own dict-miss
+        paths apply the same rule through fpy_raise_key_error.
+        BUG-KEYERROR-STR-NOT-REPR.
+
+        Only arguments whose type is unambiguous get the repr treatment.  One
+        the front end cannot type falls through to str(), which is both what
+        every other exception does and what KeyError did before — so an
+        un-inferable case is no worse than it was, never wrong in a new way.
+        """
+        if exc_name == "KeyError":
+            # A tagged value carries its own type, so the runtime repr is exact.
+            if isinstance(value.type, ir.LiteralStructType):
+                return self._register_owned_str_ptr(self._fv_call_repr(value))
+            kind = self._infer_expr_kind(arg_node)
+            if kind is None and isinstance(arg_node, ast.Name):
+                kind = self._var_kind(arg_node.id)
+            if kind == VKind.STR and isinstance(value.type, ir.PointerType):
+                return self._register_owned_str_ptr(
+                    self._rt_call("str_repr", [value]))
+            # int/float/bool: repr and str agree, so the normal path is right.
+        if not isinstance(value.type, ir.PointerType):
+            return self._value_to_str(value, node)
+        return value
 
     def _emit_str_format(self, node: ast.Call, fmt_str_val: ir.Value) -> ir.Value:
         """Emit str.format() by parsing the format string at compile time."""
@@ -45136,10 +52942,24 @@ class CodeGen:
         if not parts:
             return self._make_string_constant("")
 
+        # Single part is returned as-is (may be a borrowed interpolated arg or
+        # an immortal literal constant) — do NOT register it as owned.
+        # Multi-part results come from str_concat (fresh +1) — register each so
+        # they're released at the statement boundary (Model 2).
         result = parts[0]
         for part in parts[1:]:
-            result = self._rt_call("str_concat", [result, part])
+            result = self._owned_str_concat([result, part])
         return result
+
+    def _fmt_spec_call(self, fn_name: str, args) -> ir.Value:
+        """Call a format_spec_* runtime fn (fastpy_format_spec_str/int/float —
+        each unconditionally returns a fresh, owned (+1) FpyString via
+        fpy_str_buf in every branch) and register the result as a Model-2 owned
+        temp so it is released at the statement boundary. The obj __format__
+        dispatch path is deliberately NOT routed through here (a user
+        __format__ may return a borrowed value)."""
+        return self._register_owned_str_ptr(
+            self.builder.call(self.runtime[fn_name], args))
 
     def _apply_format_spec(self, value: ir.Value, spec: str, arg_node: ast.expr, node: ast.AST) -> ir.Value:
         """Apply a format spec like .2f, 5d, <10 to a value, returning a string."""
@@ -45162,7 +52982,7 @@ class CodeGen:
             str_result = self.builder.call(
                 self.runtime["obj_call_method0"], [value, str_name])
             str_ptr = self._ensure_ptr(str_result)
-            return self.builder.call(self.runtime["format_spec_str"], [str_ptr, spec_ptr])
+            return self._fmt_spec_call("format_spec_str", [str_ptr, spec_ptr])
         # If the spec ends with f/e/g, treat as float
         if last in ("f", "e", "g", "F", "E", "G"):
             # Convert int to float if needed
@@ -45173,16 +52993,16 @@ class CodeGen:
                 as_i64 = self.builder.ptrtoint(value, i64)
                 value = self.builder.bitcast(as_i64, double)
             if isinstance(value.type, ir.DoubleType):
-                return self.builder.call(self.runtime["format_spec_float"], [value, spec_ptr])
+                return self._fmt_spec_call("format_spec_float", [value, spec_ptr])
         # If value is a float, use float spec
         if isinstance(value.type, ir.DoubleType):
-            return self.builder.call(self.runtime["format_spec_float"], [value, spec_ptr])
+            return self._fmt_spec_call("format_spec_float", [value, spec_ptr])
         # Integer format
         elif isinstance(value.type, ir.IntType) and value.type.width == 64:
-            return self.builder.call(self.runtime["format_spec_int"], [value, spec_ptr])
+            return self._fmt_spec_call("format_spec_int", [value, spec_ptr])
         # String format
         elif isinstance(value.type, ir.PointerType):
-            return self.builder.call(self.runtime["format_spec_str"], [value, spec_ptr])
+            return self._fmt_spec_call("format_spec_str", [value, spec_ptr])
         # FpyValue struct: dispatch by format spec type.
         # Float specs (f/e/g): extract data as double.
         # Int specs (d/b/o/x/X): extract data as i64.
@@ -45198,15 +53018,15 @@ class CodeGen:
                 int_as_f = self.builder.sitofp(data, double)
                 float_raw = self.builder.bitcast(data, double)
                 float_val = self.builder.select(is_int, int_as_f, float_raw)
-                return self.builder.call(
-                    self.runtime["format_spec_float"], [float_val, spec_ptr])
+                return self._fmt_spec_call(
+                    "format_spec_float", [float_val, spec_ptr])
             elif last in ("d", "b", "o", "x", "X", "c", "n"):
-                return self.builder.call(
-                    self.runtime["format_spec_int"], [data, spec_ptr])
+                return self._fmt_spec_call(
+                    "format_spec_int", [data, spec_ptr])
             else:
                 str_val = self._fv_call_str(value)
-                return self.builder.call(
-                    self.runtime["format_spec_str"], [str_val, spec_ptr])
+                return self._fmt_spec_call(
+                    "format_spec_str", [str_val, spec_ptr])
         return self._make_string_constant("")  # Phase 4: unsupported format spec → empty string
 
     def _apply_format_spec_dynamic(self, value: ir.Value, spec_ptr: ir.Value,
@@ -45214,11 +53034,11 @@ class CodeGen:
         """Like _apply_format_spec but spec_ptr is a runtime i8* string."""
         # Dispatch based on the value's LLVM type
         if isinstance(value.type, ir.DoubleType):
-            return self.builder.call(self.runtime["format_spec_float"],
-                                     [value, spec_ptr])
+            return self._fmt_spec_call("format_spec_float",
+                                       [value, spec_ptr])
         elif isinstance(value.type, ir.IntType) and value.type.width == 64:
-            return self.builder.call(self.runtime["format_spec_int"],
-                                     [value, spec_ptr])
+            return self._fmt_spec_call("format_spec_int",
+                                       [value, spec_ptr])
         elif isinstance(value.type, ir.PointerType):
             if self._is_obj_expr(arg_node):
                 # Convert object to string first, then apply str format
@@ -45226,16 +53046,16 @@ class CodeGen:
                 str_result = self.builder.call(
                     self.runtime["obj_call_method0"], [value, str_name])
                 str_ptr = self._ensure_ptr(str_result)
-                return self.builder.call(self.runtime["format_spec_str"],
-                                         [str_ptr, spec_ptr])
-            return self.builder.call(self.runtime["format_spec_str"],
-                                     [value, spec_ptr])
+                return self._fmt_spec_call("format_spec_str",
+                                           [str_ptr, spec_ptr])
+            return self._fmt_spec_call("format_spec_str",
+                                       [value, spec_ptr])
         # FpyValue: convert to string, then apply format
         elif (isinstance(value.type, ir.LiteralStructType)
                 and value.type == fpy_val):
             str_val = self._fv_call_str(value)
-            return self.builder.call(self.runtime["format_spec_str"],
-                                     [str_val, spec_ptr])
+            return self._fmt_spec_call("format_spec_str",
+                                       [str_val, spec_ptr])
         else:
             return self._make_string_constant("")
 
@@ -45278,8 +53098,9 @@ class CodeGen:
             # Ellipsis — represented as a sentinel value
             return ir.Constant(i64, 0)
         elif isinstance(value, bytes):
-            # bytes literal — store as string for now (limited support)
-            return self._make_string_constant(value.decode('latin-1', errors='replace'))
+            # bytes literal — real FpyBytes constant (immortal header at -16),
+            # so fpy_bytes_len/incref/decref work and embedded nulls survive.
+            return self._make_bytes_constant(value)
         elif isinstance(value, complex):
             # Complex literal — create FpyComplex at runtime
             real = ir.Constant(double, value.real)

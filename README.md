@@ -79,6 +79,12 @@ greet("world")
 | `--analyze` | Optimization analysis report |
 | `-v` / `--verbose` | Detailed compilation info |
 
+### Environment variables
+
+| Variable | Effect |
+|----------|--------|
+| `FASTPY_OPT` | LLVM backend optimization level for both the middle-end pass pipeline and codegen (`0`–`3`, default `2`). `3` raises the inliner threshold; it's not the default because it showed no reliable runtime win on the benchmark suite. |
+
 ### Multi-Python version targeting
 
 Compile against any installed Python version:

@@ -4,9 +4,12 @@
  */
 
 #include "bigint.h"
+#include "exceptions.h"
 #include <stdio.h>
 #include <string.h>
 #include <limits.h>
+#include <math.h>
+#include <float.h>
 
 #ifdef _MSC_VER
 #include <intrin.h>
@@ -302,6 +305,167 @@ FpyBigInt* fpy_bigint_abs(FpyBigInt *a) {
     return r;
 }
 
+/* ── Bitwise operations (Python two's-complement semantics) ─────────
+ * Python ints are conceptually infinite-width two's complement, so a
+ * negative operand's bits are all-1s above its magnitude.  We widen both
+ * operands to a common limb count (max length + 1 guard limb), materialize
+ * each in two's complement, apply the op limb-wise, derive the result's
+ * sign from the operands' sign bits, then convert back to sign+magnitude. */
+
+/* Write the two's-complement representation of (sign, mag[len]) into
+ * out[0..n) (n >= len). */
+static void bigint_to_twoscomp(int32_t sign, const uint64_t *mag,
+                               int32_t len, uint64_t *out, int32_t n) {
+    if (sign >= 0) {
+        for (int32_t i = 0; i < n; i++)
+            out[i] = (i < len) ? mag[i] : 0;
+    } else {
+        /* two's complement = ~mag + 1 across n limbs */
+        uint64_t carry = 1;
+        for (int32_t i = 0; i < n; i++) {
+            uint64_t v = (i < len) ? mag[i] : 0;
+            uint64_t inv = ~v;
+            uint64_t s = inv + carry;
+            carry = (s < inv) ? 1 : 0;
+            out[i] = s;
+        }
+    }
+}
+
+/* opcode: 0 = AND, 1 = OR, 2 = XOR */
+static FpyBigInt* bigint_bitwise(FpyBigInt *a, FpyBigInt *b, int opcode) {
+    int32_t sa = a->sign < 0 ? 1 : 0;
+    int32_t sb = b->sign < 0 ? 1 : 0;
+    int32_t n = (a->length > b->length ? a->length : b->length) + 1;
+    if (n < 2) n = 2;
+    uint64_t *ta = (uint64_t*)calloc((size_t)n, sizeof(uint64_t));
+    uint64_t *tb = (uint64_t*)calloc((size_t)n, sizeof(uint64_t));
+    bigint_to_twoscomp(a->sign, a->limbs, a->length, ta, n);
+    bigint_to_twoscomp(b->sign, b->limbs, b->length, tb, n);
+
+    FpyBigInt *r = bigint_alloc(n);
+    int32_t sr;
+    switch (opcode) {
+        case 0: sr = sa & sb; break;
+        case 1: sr = sa | sb; break;
+        default: sr = sa ^ sb; break;
+    }
+    for (int32_t i = 0; i < n; i++) {
+        uint64_t v;
+        switch (opcode) {
+            case 0: v = ta[i] & tb[i]; break;
+            case 1: v = ta[i] | tb[i]; break;
+            default: v = ta[i] ^ tb[i]; break;
+        }
+        r->limbs[i] = v;
+    }
+    r->length = n;
+    if (sr) {
+        /* negative result: magnitude = ~result + 1 (two's complement) */
+        uint64_t carry = 1;
+        for (int32_t i = 0; i < n; i++) {
+            uint64_t inv = ~r->limbs[i];
+            uint64_t s = inv + carry;
+            carry = (s < inv) ? 1 : 0;
+            r->limbs[i] = s;
+        }
+        r->sign = -1;
+    } else {
+        r->sign = 1;
+    }
+    bigint_normalize(r);
+    free(ta);
+    free(tb);
+    return r;
+}
+
+FpyBigInt* fpy_bigint_and(FpyBigInt *a, FpyBigInt *b) {
+    return bigint_bitwise(a, b, 0);
+}
+FpyBigInt* fpy_bigint_or(FpyBigInt *a, FpyBigInt *b) {
+    return bigint_bitwise(a, b, 1);
+}
+FpyBigInt* fpy_bigint_xor(FpyBigInt *a, FpyBigInt *b) {
+    return bigint_bitwise(a, b, 2);
+}
+
+/* Left shift by `shift` bits. Sign is preserved (Python: -5 << 2 == -20). */
+FpyBigInt* fpy_bigint_lshift(FpyBigInt *a, FpyBigInt *b) {
+    int overflow = 0;
+    int64_t shift = fpy_bigint_to_i64(b, &overflow);
+    if (overflow || shift < 0) {
+        /* Negative or absurd shift → treat as 0 (a << negative is a
+         * ValueError in Python; be lenient and return a copy). */
+        return fpy_bigint_copy(a);
+    }
+    if (a->length == 0 || shift == 0) return fpy_bigint_copy(a);
+    int32_t limb_shift = (int32_t)(shift / 64);
+    int32_t bit_shift = (int32_t)(shift % 64);
+    int32_t new_len = a->length + limb_shift + 1;
+    FpyBigInt *r = bigint_alloc(new_len);
+    for (int32_t i = 0; i < a->length; i++) {
+        uint64_t v = a->limbs[i];
+        int32_t lo = i + limb_shift;
+        if (bit_shift == 0) {
+            r->limbs[lo] |= v;
+        } else {
+            r->limbs[lo] |= (v << bit_shift);
+            r->limbs[lo + 1] |= (v >> (64 - bit_shift));
+        }
+    }
+    r->length = new_len;
+    r->sign = a->sign;
+    bigint_normalize(r);
+    return r;
+}
+
+/* Right shift by `shift` bits — arithmetic (floor) shift, matching
+ * Python: -5 >> 1 == -3 (floor(-2.5)). */
+FpyBigInt* fpy_bigint_rshift(FpyBigInt *a, FpyBigInt *b) {
+    int overflow = 0;
+    int64_t shift = fpy_bigint_to_i64(b, &overflow);
+    if (overflow || shift < 0) return fpy_bigint_copy(a);
+    if (a->length == 0 || shift == 0) return fpy_bigint_copy(a);
+    int32_t limb_shift = (int32_t)(shift / 64);
+    int32_t bit_shift = (int32_t)(shift % 64);
+    if (limb_shift >= a->length) {
+        /* Everything shifted out: 0 for positive, -1 for negative. */
+        return fpy_bigint_from_i64(a->sign < 0 ? -1 : 0);
+    }
+    int32_t new_len = a->length - limb_shift;
+    FpyBigInt *r = bigint_alloc(new_len);
+    /* Detect whether any 1-bits are shifted out (needed to floor negatives). */
+    int lost_bits = 0;
+    for (int32_t i = 0; i < limb_shift; i++)
+        if (a->limbs[i]) { lost_bits = 1; break; }
+    for (int32_t i = 0; i < new_len; i++) {
+        uint64_t lo = a->limbs[i + limb_shift];
+        uint64_t hi = (i + limb_shift + 1 < a->length)
+                      ? a->limbs[i + limb_shift + 1] : 0;
+        if (bit_shift == 0) {
+            r->limbs[i] = lo;
+        } else {
+            if ((lo & (((uint64_t)1 << bit_shift) - 1)) != 0) lost_bits = 1;
+            r->limbs[i] = (lo >> bit_shift) | (hi << (64 - bit_shift));
+        }
+    }
+    r->length = new_len;
+    r->sign = a->sign;
+    bigint_normalize(r);
+    /* For negatives, logical shift truncates toward zero; Python floors,
+     * so subtract 1 (add 1 to magnitude) when any bits were lost. */
+    if (a->sign < 0 && lost_bits) {
+        FpyBigInt *one = fpy_bigint_from_i64(1);
+        FpyBigInt *adj = mag_add(r, one);  /* |r| + 1 */
+        adj->sign = -1;
+        bigint_normalize(adj);
+        fpy_bigint_free(one);
+        fpy_bigint_free(r);
+        return adj;
+    }
+    return r;
+}
+
 /* Simple power by repeated squaring */
 FpyBigInt* fpy_bigint_pow(FpyBigInt *base, FpyBigInt *exp) {
     if (exp->sign < 0) {
@@ -535,8 +699,13 @@ static FpyBigInt* mag_divmod(FpyBigInt *a, FpyBigInt *b,
 /* Floor division and modulo — simple long division */
 FpyBigInt* fpy_bigint_floordiv(FpyBigInt *a, FpyBigInt *b) {
     if (fpy_bigint_is_zero(b)) {
-        fprintf(stderr, "ZeroDivisionError: integer division or modulo by zero\n");
-        exit(1);
+        /* This used to print and exit(1), which made `(2 ** 80) // 0` the one
+         * division by zero in the language that a `try` could not catch. Raise
+         * like every other arithmetic error and hand back a zero, matching
+         * fastpy_safe_div: callers here don't check for NULL, and the pending
+         * flag stops the program at the next check anyway. */
+        fastpy_raise(FPY_EXC_ZERODIVISION, "division by zero");
+        return fpy_bigint_from_i64(0);
     }
     /* Simple case: single limb each */
     if (a->length <= 1 && b->length <= 1) {
@@ -576,6 +745,102 @@ FpyBigInt* fpy_bigint_floordiv(FpyBigInt *a, FpyBigInt *b) {
     bigint_normalize(q);
     if (q->length == 0) q->sign = 1;
     return q;
+}
+
+/* Number of bits in |a| (0 for zero), i.e. Python's int.bit_length(). */
+int64_t fpy_bigint_bit_length(FpyBigInt *a) {
+    if (a->length == 0) return 0;
+    uint64_t top = a->limbs[a->length - 1];
+    int bits = 0;
+    while (top) { bits++; top >>= 1; }
+    return (int64_t)(a->length - 1) * 64 + bits;
+}
+
+/* True division: a / b as a double.  BUG-BIGINT-TRUEDIV-UNIMPLEMENTED.
+ *
+ * Returns 0 on success, 1 for a zero divisor, 2 when the result is too large
+ * for a double.  The caller raises; this file has no opinion about which
+ * exception object that is.
+ *
+ * Converting each side to a double first and dividing would be wrong, not just
+ * imprecise: (10 ** 400) / (10 ** 399) is exactly 10.0 in Python even though
+ * neither operand is representable.  So the quotient is computed from the
+ * magnitudes at 55 bits of precision and then scaled, which is CPython's
+ * long_true_divide (Objects/longobject.c) with the same shift choice.
+ *
+ * The 55 bits matter: a double keeps 53, so 55 leaves a round bit and a place
+ * to park stickiness.  Any nonzero remainder is folded into the low bit of the
+ * quotient, which cannot disturb the top 53 but does turn an exact-looking tie
+ * into a value above the tie — that is what makes the single round-to-nearest
+ * -even performed by the (double) conversion come out the same as rounding the
+ * infinitely precise quotient. */
+int fpy_bigint_truediv(FpyBigInt *a, FpyBigInt *b, double *out) {
+    *out = 0.0;
+    if (fpy_bigint_is_zero(b)) return 1;
+    /* Zero keeps the sign of the quotient: 0 / -5 is -0.0, not 0.0. */
+    int negative = (a->sign != b->sign);
+    if (fpy_bigint_is_zero(a)) { *out = negative ? -0.0 : 0.0; return 0; }
+
+    int64_t a_bits = fpy_bigint_bit_length(a);
+    int64_t b_bits = fpy_bigint_bit_length(b);
+    int64_t diff = a_bits - b_bits;
+    /* |a/b| is in [2^(diff-1), 2^(diff+1)), so these bounds are decided
+     * before any work: past DBL_MAX_EXP nothing is representable, and below
+     * the smallest subnormal everything rounds to zero. */
+    if (diff > DBL_MAX_EXP) return 2;
+    if (diff < DBL_MIN_EXP - DBL_MANT_DIG - 1) { *out = negative ? -0.0 : 0.0; return 0; }
+
+    /* shift = the power of two the 55-bit quotient will be scaled by.  Clamping
+     * at DBL_MIN_EXP is what keeps subnormal results correctly rounded: there
+     * the quotient is computed with *fewer* than 55 bits so that the single
+     * rounding happens in ldexp rather than twice. */
+    int64_t shift = (diff > DBL_MIN_EXP ? diff : DBL_MIN_EXP) - DBL_MANT_DIG - 2;
+
+    FpyBigInt *num, *den;
+    FpyBigInt *sh = fpy_bigint_from_i64(shift < 0 ? -shift : shift);
+    if (shift <= 0) {
+        num = fpy_bigint_lshift(a, sh);
+        den = fpy_bigint_copy(b);
+    } else {
+        num = fpy_bigint_copy(a);
+        den = fpy_bigint_lshift(b, sh);
+    }
+    fpy_bigint_free(sh);
+    num->sign = 1;
+    den->sign = 1;
+
+    FpyBigInt *rem = NULL;
+    FpyBigInt *q = mag_divmod(num, den, &rem);
+    /* Sticky bit: a nonzero remainder means the true quotient sits above the
+     * integer one, and setting the low bit records that without changing which
+     * side of the halfway point the top bits fall on. */
+    if (!fpy_bigint_is_zero(rem)) {
+        if (q->length == 0) { bigint_ensure_capacity(q, 1); q->limbs[0] = 0; q->length = 1; }
+        q->limbs[0] |= 1u;
+    }
+    fpy_bigint_free(rem);
+    fpy_bigint_free(num);
+    fpy_bigint_free(den);
+
+    /* q has at most 56 bits by construction, so it always fits a uint64. */
+    double dq = 0.0;
+    for (int32_t i = q->length - 1; i >= 0; i--)
+        dq = dq * 18446744073709551616.0 + (double)q->limbs[i];
+    fpy_bigint_free(q);
+
+    double result = ldexp(dq, (int)shift);
+    if (isinf(result)) return 2;
+    *out = negative ? -result : result;
+    return 0;
+}
+
+/* |a| as a double, correctly rounded; 0 on success, 2 if out of range.
+ * Dividing by one reuses the rounding above rather than repeating it. */
+int fpy_bigint_to_double(FpyBigInt *a, double *out) {
+    FpyBigInt *one = fpy_bigint_from_i64(1);
+    int rc = fpy_bigint_truediv(a, one, out);
+    fpy_bigint_free(one);
+    return rc;
 }
 
 FpyBigInt* fpy_bigint_mod(FpyBigInt *a, FpyBigInt *b) {
@@ -752,4 +1017,32 @@ int64_t fpy_checked_pow(int64_t base, int64_t exp, FpyBigInt **big) {
         }
     }
     return result;
+}
+
+/* Overflow-checked left shift: `a << b`.  If the result fits in a signed
+ * i64 it is returned and *big is left NULL; otherwise *big receives the
+ * BigInt result.  Python requires b >= 0 (a negative shift count is a
+ * ValueError); b <= 0 here returns a unchanged (b==0 is identity, and the
+ * negative case is a caller-level error we don't crash on). */
+int64_t fpy_checked_lshift(int64_t a, int64_t b, FpyBigInt **big) {
+    *big = NULL;
+    if (b <= 0) return a;
+    if (a == 0) return 0;
+    if (b < 64) {
+        /* `a << b` fits in i64 iff the bits shifted past bit 63 are all
+         * copies of the sign bit — i.e. (a >> (63 - b)) is 0 (non-neg) or
+         * -1 (negative).  Compute the shift on the unsigned value to avoid
+         * signed-left-shift UB; the bit pattern is exact once we know it
+         * fits. */
+        int64_t probe = a >> (63 - b);
+        if (probe == 0 || probe == -1) {
+            return (int64_t)((uint64_t)a << b);
+        }
+    }
+    FpyBigInt *ba = fpy_bigint_from_i64(a);
+    FpyBigInt *bb = fpy_bigint_from_i64(b);
+    *big = fpy_bigint_lshift(ba, bb);
+    fpy_bigint_free(ba);
+    fpy_bigint_free(bb);
+    return 0;
 }

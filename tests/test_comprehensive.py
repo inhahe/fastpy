@@ -4,7 +4,10 @@ Comprehensive test suite: unifies all existing tests and adds new tiers.
 Tiers (in order of increasing scope):
 
 1. **Regression tests** — existing tests/regressions/ and tests/programs/
-   (auto-collected by conftest.py, not repeated here)
+   (auto-collected by conftest.py, not repeated here — so naming *this file*
+   on the command line does NOT run them; only directory discovery does.
+   Use `python -m pytest tests`. conftest prints a "partial run" warning when
+   they are missed. DEBT-NAMED-SUITES-SKIP-THE-REGRESSION-CORPUS.)
 
 2. **Differential tests** — existing test_differential.py inline tests
    (not repeated here)
@@ -49,7 +52,8 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 from compiler.pipeline import compile_source, compile_file, CompileResult
-from tests.harness import diff_test, run_cpython, run_executable, DiffResult, RunResult
+from tests.harness import (diff_test, run_cpython, run_executable, DiffResult,
+                           RunResult, _is_verifier_error)
 
 
 # ---------------------------------------------------------------------------
@@ -1559,8 +1563,17 @@ def test_self_compile_real_module(compiler_file: Path):
     source = compiler_file.read_text(encoding="utf-8")
     result = compile_source(source, source_filename=str(compiler_file))
     if not result.success:
-        # Expected — track what's blocking
         blockers = [str(e) for e in result.errors[:3]]
+        # An LLVM verifier rejection is invalid IR, not a missing feature — it
+        # will never become a PASS by implementing more of Python, so it must
+        # not be absorbed into the self-hosting-progress SKIP bucket.
+        # BUG-DECREF-DOES-NOT-DOMINATE hid here for exactly that reason.
+        if _is_verifier_error(result):
+            pytest.fail(
+                "Codegen emitted invalid IR (LLVM verifier rejected it):\n  "
+                + "\n  ".join(blockers)
+            )
+        # Expected — track what's blocking
         pytest.skip(f"Can't compile yet: {'; '.join(blockers)}")
 
     # If compilation succeeds, try running it (it won't do much without

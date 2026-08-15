@@ -88,3 +88,41 @@ or compile-time escape analysis to bypass GC tracking for non-escaping objects.
 | 3–20x     | Methods, containers, strings, objects |
 
 **Geometric mean across all 16 benchmarks: ~13x faster than CPython.**
+
+## Compiler Speed (compile-time / developer iteration)
+
+These measure how fast fastpy *compiles* a program (not how fast the output
+runs). Wall-clock is best-of-5 with warm caches (runtime `.obj` cache and MSVC
+env cache both populated). Measured on x64 Windows / MSVC.
+
+### End-to-end compile wall time (small program, `fib(30)`)
+
+| Config                        | compile wall (best-of-5) | vs baseline |
+|-------------------------------|--------------------------|-------------|
+| Baseline (`ae2da03`)          | 2400 ms                  | —           |
+| + MSVC env cache + codegen    | ~200 ms                  | **−92%**    |
+
+The dominant cost in the baseline was re-invoking `vcvars64.bat` on **every**
+link to discover `link.exe` and the MSVC environment (~2.1 s per link). The
+MSVC environment is now captured once, cached in-process and on disk
+(`runtime/_msvc_env_cache.json`, keyed on the vcvars path + mtime), and
+`link.exe` is invoked directly with that environment. `_link_windows` dropped
+from ~2148 ms to ~141 ms.
+
+### Codegen hotspot (`_detect_class_container_attrs`, class-heavy program: Richards)
+
+| Config                | cumulative (per-call) | vs baseline |
+|-----------------------|-----------------------|-------------|
+| Baseline (`ae2da03`)  | 7.51 s (179 ms/call)  | —           |
+| + hoisted tree walks  | 1.08 s (26 ms/call)   | **−86%**    |
+
+Two nested full-AST walks that were re-run for every candidate receiver were
+loop-invariant; they are now precomputed once into `_ctor_first` /
+`_ctor_fixpoint` maps before the per-receiver loop. Semantics are identical
+(verified against the full differential test suite — 593 tests, no regressions).
+
+### Tunable backend optimization level
+
+The LLVM backend opt level is now controlled by the `FASTPY_OPT` environment
+variable (default `2`). `-O3` was A/B-tested and showed no reliable win on
+these benchmarks (regressions amid noise), so `-O2` remains the default.

@@ -192,6 +192,19 @@ void* fpy_cpython_getattr(void *obj, const char *attr_name) {
     return (void*)result;
 }
 
+/* Native-module import/getattr.  On a host (CPython-embedded) build these are
+ * exactly the real import/getattr — the native module's real object is
+ * available for non-native attribute fallback.  The pure-mode build supplies
+ * non-raising sentinel stubs (see bridge_stub.c) so `import sys` never
+ * requires the bridge; keeping the entry points symmetric lets codegen emit
+ * one call sequence for both link targets. */
+void* fpy_cpython_import_native(const char *module_name) {
+    return fpy_cpython_import(module_name);
+}
+void* fpy_cpython_getattr_native(void *obj, const char *attr_name) {
+    return fpy_cpython_getattr(obj, attr_name);
+}
+
 /* Set an attribute on a PyObject*. Takes a tag+data FpyValue. */
 void fpy_cpython_setattr(void *obj, const char *attr_name,
                          int32_t val_tag, int64_t val_data) {
@@ -1465,17 +1478,39 @@ void fastpy_path_write_text(void *self, const char *content) {
 
 const char* fastpy_path_str(void *self) { return _path_as_cstr(self); }
 
-/* iterdir: returns a Python iterator as PyObject* (the codegen
- * handles list conversion at a higher level). */
+/* iterdir: returns an FpyList* of OBJ-tagged Path objects.
+ *
+ * The codegen types `p.iterdir()` as list[Path] (_infer_type_tag in
+ * compiler/codegen.py) and codegen is deliberately mode-agnostic, so this must
+ * hand back the same shape as the pure runtime's fastpy_path_iterdir. It used
+ * to return the raw PyObject* list, which made the for-loop go through the
+ * CPython iterator protocol — fine here, but a link error in pure builds.
+ *
+ * CPython's iterdir() is a generator; materializing it is a real (if minor)
+ * semantic difference, but this call site has always been eager. */
 void* fastpy_path_iterdir(void *self) {
     fpy_cpython_init();
-    /* Return a Python list of Path objects for compatibility */
     PyObject *iter = PyObject_CallMethod((PyObject*)self, "iterdir", NULL);
-    if (!iter) { PyErr_Print(); Py_RETURN_NONE; }
+    if (!iter) { PyErr_Print(); return (void*)fpy_list_new(0); }
     PyObject *lst = PySequence_List(iter);
     Py_DECREF(iter);
-    if (!lst) { PyErr_Print(); Py_RETURN_NONE; }
-    return (void*)lst;
+    if (!lst) { PyErr_Print(); return (void*)fpy_list_new(0); }
+
+    Py_ssize_t n = PyList_GET_SIZE(lst);
+    FpyList *out = fpy_list_new(n);
+    for (Py_ssize_t i = 0; i < n; i++) {
+        PyObject *item = PyList_GET_ITEM(lst, i);   /* borrowed */
+        /* The codegen treats a Path as a borrowed pointer with no destructor,
+         * so hand the list a strong reference that is intentionally never
+         * released — same allocate-and-leak convention as fastpy_path_new. */
+        Py_INCREF(item);
+        FpyValue v;
+        v.tag = FPY_TAG_OBJ;
+        v.data.obj = (FpyObj*)item;
+        fpy_list_append(out, v);
+    }
+    Py_DECREF(lst);
+    return (void*)out;
 }
 
 /* ── Flush Python's stdout (important for subprocess capture) ──── */

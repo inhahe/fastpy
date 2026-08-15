@@ -23,6 +23,7 @@
 #endif
 #include "threading.h"
 #include "objects.h"
+#include "exceptions.h"
 
 /* Forward declaration: the compiled Python module provides this */
 extern void fastpy_main(void);
@@ -213,6 +214,151 @@ int64_t fastpy_bytes_get(const char *b, int64_t index) {
     return (int64_t)(unsigned char)b[index];
 }
 
+/* bytes + bytes → concat.  FpyBytes-aware (uses stored length, so embedded
+ * null bytes are preserved) and header-backed via fpy_bytes_alloc so the
+ * result carries a valid FpyBytes header (refcount=1) — incref/decref and
+ * fpy_bytes_len work correctly and it is freed exactly once. */
+const char* fastpy_bytes_concat(const char *a, const char *b) {
+    int64_t la = fpy_bytes_len(a);
+    int64_t lb = fpy_bytes_len(b);
+    char *out = fpy_bytes_alloc(la + lb);
+    if (la > 0) memcpy(out, a, (size_t)la);
+    if (lb > 0) memcpy(out + la, b, (size_t)lb);
+    return out;
+}
+
+/* bytes * int → repetition.  Same header-backed, embedded-null-safe rules. */
+const char* fastpy_bytes_repeat(const char *b, int64_t n) {
+    int64_t lb = fpy_bytes_len(b);
+    if (n < 0) n = 0;
+    int64_t total = lb * n;
+    char *out = fpy_bytes_alloc(total);
+    for (int64_t i = 0; i < n; i++)
+        if (lb > 0) memcpy(out + i * lb, b, (size_t)lb);
+    return out;
+}
+
+/* ── bytes methods (FpyBytes-native: length-aware, embedded-null safe,
+ *    header-backed results, ASCII-only case/whitespace per CPython). ───── */
+
+static inline int fpy_bytes_is_ws(unsigned char c) {
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r'
+        || c == '\v' || c == '\f';
+}
+
+const char* fastpy_bytes_upper(const char *b) {
+    int64_t n = fpy_bytes_len(b);
+    char *out = fpy_bytes_alloc(n);
+    for (int64_t i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)b[i];
+        out[i] = (c >= 'a' && c <= 'z') ? (char)(c - 32) : (char)c;
+    }
+    return out;
+}
+
+const char* fastpy_bytes_lower(const char *b) {
+    int64_t n = fpy_bytes_len(b);
+    char *out = fpy_bytes_alloc(n);
+    for (int64_t i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)b[i];
+        out[i] = (c >= 'A' && c <= 'Z') ? (char)(c + 32) : (char)c;
+    }
+    return out;
+}
+
+/* mode: 0=strip both, 1=lstrip, 2=rstrip.  ASCII whitespace only. */
+static const char* fpy_bytes_strip_impl(const char *b, int mode) {
+    int64_t n = fpy_bytes_len(b);
+    int64_t start = 0, end = n;
+    if (mode != 2)  /* strip left */
+        while (start < end && fpy_bytes_is_ws((unsigned char)b[start])) start++;
+    if (mode != 1)  /* strip right */
+        while (end > start && fpy_bytes_is_ws((unsigned char)b[end - 1])) end--;
+    int64_t len = end - start;
+    char *out = fpy_bytes_alloc(len);
+    if (len > 0) memcpy(out, b + start, (size_t)len);
+    return out;
+}
+const char* fastpy_bytes_strip(const char *b)  { return fpy_bytes_strip_impl(b, 0); }
+const char* fastpy_bytes_lstrip(const char *b) { return fpy_bytes_strip_impl(b, 1); }
+const char* fastpy_bytes_rstrip(const char *b) { return fpy_bytes_strip_impl(b, 2); }
+
+/* Find sub (length ls) within b (length lb) starting at `from`; -1 if absent. */
+static int64_t fpy_bytes_find(const char *b, int64_t lb,
+                              const char *sub, int64_t ls, int64_t from) {
+    if (ls == 0) return from <= lb ? from : -1;
+    for (int64_t i = from; i + ls <= lb; i++)
+        if (memcmp(b + i, sub, (size_t)ls) == 0) return i;
+    return -1;
+}
+
+const char* fastpy_bytes_replace(const char *b, const char *old, const char *neu) {
+    int64_t lb = fpy_bytes_len(b), lo = fpy_bytes_len(old), ln = fpy_bytes_len(neu);
+    /* Count non-overlapping occurrences first to size the result. */
+    int64_t count = 0;
+    if (lo > 0) {
+        int64_t i = 0;
+        while ((i = fpy_bytes_find(b, lb, old, lo, i)) != -1) { count++; i += lo; }
+    }
+    int64_t out_len = lb + count * (ln - lo);
+    char *out = fpy_bytes_alloc(out_len);
+    int64_t si = 0, oi = 0;
+    if (lo > 0) {
+        int64_t pos;
+        while ((pos = fpy_bytes_find(b, lb, old, lo, si)) != -1) {
+            int64_t chunk = pos - si;
+            if (chunk > 0) { memcpy(out + oi, b + si, (size_t)chunk); oi += chunk; }
+            if (ln > 0) { memcpy(out + oi, neu, (size_t)ln); oi += ln; }
+            si = pos + lo;
+        }
+    }
+    if (lb - si > 0) { memcpy(out + oi, b + si, (size_t)(lb - si)); oi += lb - si; }
+    return out;
+}
+
+/* Append a fresh header-backed bytes slice [start,start+len) to `list`. */
+static void fpy_bytes_list_append_slice(FpyList *list, const char *b,
+                                        int64_t start, int64_t len) {
+    char *piece = fpy_bytes_alloc(len);
+    if (len > 0) memcpy(piece, b + start, (size_t)len);
+    fpy_list_append(list, fpy_bytes_val(piece));
+}
+
+/* bytes.split(sep): split on exact `sep`, keeping empty fields (CPython). */
+FpyList* fastpy_bytes_split_sep(const char *b, const char *sep) {
+    FpyList *result = fpy_list_new(8);
+    int64_t lb = fpy_bytes_len(b), ls = fpy_bytes_len(sep);
+    if (ls == 0) {  /* empty separator → ValueError in CPython; be lenient */
+        fpy_bytes_list_append_slice(result, b, 0, lb);
+        return result;
+    }
+    int64_t si = 0, pos;
+    while ((pos = fpy_bytes_find(b, lb, sep, ls, si)) != -1) {
+        fpy_bytes_list_append_slice(result, b, si, pos - si);
+        si = pos + ls;
+    }
+    fpy_bytes_list_append_slice(result, b, si, lb - si);
+    return result;
+}
+
+/* bytes.join(list): concatenate the bytes elements of `list` with `sep`. */
+const char* fastpy_bytes_join(const char *sep, FpyList *list) {
+    int64_t ls = fpy_bytes_len(sep);
+    int64_t total = 0;
+    for (int64_t i = 0; i < list->length; i++) {
+        total += fpy_bytes_len(list->items[i].data.s);
+        if (i > 0) total += ls;
+    }
+    char *out = fpy_bytes_alloc(total);
+    int64_t pos = 0;
+    for (int64_t i = 0; i < list->length; i++) {
+        if (i > 0 && ls > 0) { memcpy(out + pos, sep, (size_t)ls); pos += ls; }
+        int64_t el = fpy_bytes_len(list->items[i].data.s);
+        if (el > 0) { memcpy(out + pos, list->items[i].data.s, (size_t)el); pos += el; }
+    }
+    return out;
+}
+
 const char* fastpy_str_slice(const char *s, int64_t start, int64_t stop, int64_t has_start, int64_t has_stop) {
     int64_t len = fastpy_str_len(s);  /* code point count */
     if (!has_start) start = 0;
@@ -299,15 +445,73 @@ const char* fastpy_str_slice_step(const char *s, int64_t start, int64_t stop,
     return r->data;
 }
 
+/* Slicing a bytes used to go through fastpy_str_slice, which is code-point
+ * indexed and returns an *FpyString*.  The result was then tagged BYTES, so
+ * every later fpy_bytes_len probed for an FpyBytes magic 16 bytes before an
+ * FpyString allocation — a heap-buffer-overflow read that only happened to
+ * land somewhere harmless.  These are byte-indexed and header-backed.
+ * BUG-BYTES-SLICE-VIA-STR. */
+const char* fastpy_bytes_slice(const char *b, int64_t start, int64_t stop,
+                                int64_t has_start, int64_t has_stop) {
+    int64_t len = fpy_bytes_len(b);
+    if (!has_start) start = 0;
+    if (!has_stop) stop = len;
+    if (start < 0) start += len;
+    if (stop < 0) stop += len;
+    if (start < 0) start = 0;
+    if (stop > len) stop = len;
+    if (start >= stop) return fpy_bytes_alloc(0);
+    int64_t n = stop - start;
+    char *out = fpy_bytes_alloc(n);
+    memcpy(out, b + start, (size_t)n);
+    return out;
+}
+
+const char* fastpy_bytes_slice_step(const char *b, int64_t start, int64_t stop,
+                                     int64_t step, int64_t has_start,
+                                     int64_t has_stop) {
+    int64_t len = fpy_bytes_len(b);
+    if (step == 0) step = 1;
+    if (step > 0) {
+        if (!has_start) start = 0;
+        if (!has_stop) stop = len;
+        if (start < 0) start += len;
+        if (stop < 0) stop += len;
+        if (start < 0) start = 0;
+        if (stop > len) stop = len;
+    } else {
+        if (!has_start) start = len - 1;
+        if (has_stop && stop < 0) stop += len;
+        if (!has_stop) stop = -1;  /* sentinel past the beginning */
+        if (start < 0) start += len;
+        if (start >= len) start = len - 1;
+    }
+    int64_t n = 0;
+    if (step > 0) {
+        for (int64_t i = start; i < stop; i += step) n++;
+    } else {
+        for (int64_t i = start; i > stop && i >= 0; i += step) n++;
+    }
+    if (n < 0) n = 0;
+    char *out = fpy_bytes_alloc(n);
+    int64_t o = 0;
+    if (step > 0) {
+        for (int64_t i = start; i < stop; i += step) out[o++] = b[i];
+    } else {
+        for (int64_t i = start; i > stop && i >= 0; i += step) out[o++] = b[i];
+    }
+    return out;
+}
+
 const char* fastpy_str_repeat(const char *s, int64_t n) {
+    /* Header-backed buffers so the returned STR value has a valid FpyString
+       header (no OOB header read / leak). See BUG-RUNTIME-STR-PRODUCERS-BARE-MALLOC. */
     if (n <= 0) {
-        char *result = (char*)malloc(1);
-        result[0] = '\0';
-        return result;
+        return fpy_str_buf(0);
     }
     size_t slen = strlen(s);
     size_t rlen = slen * n;
-    char *result = (char*)malloc(rlen + 1);
+    char *result = fpy_str_buf((int64_t)rlen);
     for (int64_t i = 0; i < n; i++) {
         memcpy(result + i * slen, s, slen);
     }
@@ -317,7 +521,7 @@ const char* fastpy_str_repeat(const char *s, int64_t n) {
 
 const char* fastpy_str_lower(const char *s) {
     size_t len = strlen(s);
-    char *result = (char*)malloc(len + 1);
+    char *result = fpy_str_buf((int64_t)len);
     for (size_t i = 0; i <= len; i++) {
         result[i] = (s[i] >= 'A' && s[i] <= 'Z') ? s[i] + 32 : s[i];
     }
@@ -456,21 +660,9 @@ double fastpy_pow_float(double base, double exp) {
     return pow(base, exp);
 }
 
-/* --- Exception system (flag-based) --- */
-
-#define FPY_EXC_NONE           0
-#define FPY_EXC_ZERODIVISION   1
-#define FPY_EXC_VALUEERROR     2
-#define FPY_EXC_TYPEERROR      3
-#define FPY_EXC_INDEXERROR     4
-#define FPY_EXC_KEYERROR       5
-#define FPY_EXC_RUNTIMEERROR   6
-#define FPY_EXC_STOPITERATION  7
-#define FPY_EXC_EXCEPTIONGROUP 8
-#define FPY_EXC_NAMEERROR      9
-#define FPY_EXC_OVERFLOWERROR  10
-#define FPY_EXC_ATTRIBUTEERROR 11
-#define FPY_EXC_GENERIC        99
+/* --- Exception system (flag-based) ---
+ * The type codes live in exceptions.h so every runtime .c raises with the
+ * same numbering; see the header for why they aren't per-file #defines. */
 
 /* Per-thread exception state. Each thread has its own exception,
  * so raising in one thread doesn't corrupt another's state. */
@@ -482,6 +674,101 @@ FPY_THREAD_LOCAL int fpy_exc_group_inner_types[FPY_MAX_GROUP_INNERS];
 FPY_THREAD_LOCAL int fpy_exc_group_inner_count = 0;
 FPY_THREAD_LOCAL void *fpy_exc_obj = NULL;  /* exception object for user-defined exceptions */
 FPY_THREAD_LOCAL const char *fpy_exc_class_name = "";  /* actual class name for type(e).__name__ */
+
+/* --- Header-backed storage for the pending exception message ---------------
+ *
+ * Binding an exception with `as e` makes the message an ordinary STR value,
+ * and increfing a STR probes for an FpyString header 8 bytes below the char
+ * data (see `fpy_str_header`). Only strings that actually carry that header
+ * may be probed: compiler-emitted literals do, because codegen lays them out
+ * as {magic, refcount, chars}, but the message producers inside the runtime
+ * do not — plain C string literals and the static `char[256]` scratch buffers
+ * (`_cmp_err`, `_cx_err`, ...) have whatever happens to precede them in
+ * .rodata/.bss. The probe therefore read out of bounds on every runtime-raised
+ * exception that a program actually caught by name.
+ *
+ * Copying the message here, once, at the single point where it is published
+ * makes the probe well-defined for every producer at the same time. Fixing the
+ * producers instead does not scale: of the ~89 `fastpy_raise` call sites only
+ * three use a static buffer and the rest pass bare C literals, which are just
+ * as headerless. Weakening `fpy_str_header` is not an option either — the
+ * probe is load-bearing, and a laxer test would misclassify real strings.
+ *
+ * The copy is an ordinary refcounted string, not an immortal one. It used to
+ * be immortal — a single buffer rewritten by every raise — which made incref a
+ * no-op and so made `str(e)` a *borrowed* pointer into storage the next raise
+ * overwrote: collecting messages in a list gave N copies of the last one.
+ *
+ *     seen = []
+ *     for d in [0, 1, 2]:
+ *         try: raise ValueError("v%d" % d)
+ *         except ValueError as e: seen.append(str(e))
+ *     # ['v2', 'v2', 'v2'] instead of ['v0', 'v1', 'v2']
+ *
+ * Now each publish owns one reference and releases the previous one, so a
+ * holder that increfs — which is every holder codegen emits: an `as e` binding
+ * and the `saved.exc.msg` slot behind a bare `raise` — really does extend the
+ * message's life. The buffer is reused in place only while the exception slot
+ * is its *sole* owner (refcount 1), which is the common case of one raise
+ * after another with nobody holding on, and costs no allocation there.
+ *
+ * This half cannot stand alone: a mortal buffer with no incref at the holders
+ * would trade a wrong value for a use-after-free. See the matching
+ * `_retain_exc_msg_slot` in compiler/codegen.py.
+ * BUG-STR-HEADER-PROBES-BEFORE-RUNTIME-STATIC-BUFFERS,
+ * BUG-EXC-MSG-BUFFER-ALIASES-ACROSS-RAISES. */
+#define FPY_EXC_MSG_MIN_CAP 256
+static FPY_THREAD_LOCAL FpyString *fpy_exc_msg_cur = NULL;
+static FPY_THREAD_LOCAL size_t fpy_exc_msg_cur_cap = 0;  /* chars incl. NUL */
+
+/* Drop this thread's reference to the published message. */
+static void fpy_exc_msg_drop(void) {
+    FpyString *s = fpy_exc_msg_cur;
+    fpy_exc_msg_cur = NULL;
+    fpy_exc_msg_cur_cap = 0;
+    if (s && fpy_str_decref(s->data)) free(s);
+}
+
+/* Copy `msg` into header-backed storage and return a pointer to the chars. */
+static const char *fpy_exc_msg_store(const char *msg) {
+    /* A NULL message still gets a header-backed empty string: a handler that
+     * binds it will incref, and increfing a bare "" literal probes 8 bytes of
+     * whatever precedes it in .rodata. */
+    if (!msg) msg = "";
+    /* Re-publishing the current message must not memcpy a buffer onto itself. */
+    if (fpy_exc_msg_cur && msg == fpy_exc_msg_cur->data) return msg;
+    size_t n = strlen(msg);
+    if (fpy_exc_msg_cur && fpy_exc_msg_cur->refcount == 1
+            && n + 1 <= fpy_exc_msg_cur_cap) {
+        memcpy(fpy_exc_msg_cur->data, msg, n + 1);
+        return fpy_exc_msg_cur->data;
+    }
+    size_t cap = (n + 1 < FPY_EXC_MSG_MIN_CAP) ? FPY_EXC_MSG_MIN_CAP : n + 1;
+    /* malloc directly rather than fpy_str_alloc: that one does not check for
+     * OOM, and losing a raise to a failed allocation is worse than truncating
+     * the message into whatever buffer is already here. */
+    FpyString *s = (FpyString *)malloc(sizeof(FpyString) + cap);
+    if (!s) {
+        if (fpy_exc_msg_cur && fpy_exc_msg_cur->refcount == 1
+                && fpy_exc_msg_cur_cap > 1) {
+            size_t k = fpy_exc_msg_cur_cap - 1;
+            if (k > n) k = n;
+            memcpy(fpy_exc_msg_cur->data, msg, k);
+            fpy_exc_msg_cur->data[k] = '\0';
+            return fpy_exc_msg_cur->data;
+        }
+        return "";
+    }
+    s->magic = FPY_STR_MAGIC;
+    s->refcount = 1;
+    memcpy(s->data, msg, n + 1);
+    /* Copy first, release after: `msg` may point into the buffer being dropped
+     * (a raise whose message was built from the pending one). */
+    fpy_exc_msg_drop();
+    fpy_exc_msg_cur = s;
+    fpy_exc_msg_cur_cap = cap;
+    return s->data;
+}
 
 /* Per-thread return tag for closure calls. The closure body stores
  * the value's runtime tag here before returning the i64 data. The
@@ -672,7 +959,7 @@ static void fpy_shadow_print_traceback(void) {
  * Also snapshots the shadow call stack for traceback display. */
 void fastpy_raise(int exc_type, const char *msg) {
     fpy_exc_type = exc_type;
-    fpy_exc_msg = msg;
+    fpy_exc_msg = fpy_exc_msg_store(msg);
     /* Auto-set the class name for builtin exception types so that
      * type(e).__name__ works even for runtime-raised exceptions (1/0,
      * d["missing"], lst[999], etc.) where the compiler doesn't emit
@@ -690,9 +977,10 @@ void fastpy_raise(int exc_type, const char *msg) {
             "ExceptionGroup",   /* 8 */
             "NameError",        /* 9 */
             "OverflowError",    /* 10 */
-            "AttributeError"    /* 11 */
+            "AttributeError",   /* 11 */
+            "UnboundLocalError" /* 12 */
         };
-        if (exc_type >= 1 && exc_type <= 11)
+        if (exc_type >= 1 && exc_type <= FPY_EXC_MAX_BUILTIN)
             fpy_exc_class_name = builtin_names[exc_type];
         /* For FPY_EXC_GENERIC (99), the compiler sets the name explicitly
          * via fastpy_exc_set_class_name — don't overwrite it here. */
@@ -713,13 +1001,17 @@ void fastpy_raise(int exc_type, const char *msg) {
 extern void fastpy_obj_set_fv(void*, const char*, int32_t, int64_t);
 void fastpy_raise_with_obj(int exc_type, const char *msg, void *obj) {
     fpy_exc_type = exc_type;
-    fpy_exc_msg = msg;
+    fpy_exc_msg = fpy_exc_msg_store(msg);
     fpy_exc_obj = obj;
     /* Store the message on the object so str(e) works after exc_clear().
-     * Uses a dynamic attribute "__exc_msg__" that obj_to_str checks. */
+     * The published *copy* goes on the object, not the caller's pointer: the
+     * copy is refcounted and fastpy_obj_set_fv increfs, so the attribute keeps
+     * it alive on its own for as long as the object lives. The caller's
+     * pointer has no such guarantee — a message built at the raise site is a
+     * temporary the statement boundary releases. */
     if (obj) {
         fastpy_obj_set_fv(obj, "__exc_msg__", 2 /*FPY_TAG_STR*/,
-                          (int64_t)(intptr_t)msg);
+                          (int64_t)(intptr_t)fpy_exc_msg);
     }
     if (fpy_shadow_depth > 0)
         fpy_shadow_stack[fpy_shadow_depth - 1].lineno = fpy_current_line;
@@ -752,12 +1044,156 @@ const char* fastpy_exc_get_msg(void) {
 /* Clear current exception. */
 void fastpy_exc_clear(void) {
     fpy_exc_type = FPY_EXC_NONE;
+    /* Hand back the exception slot's reference. Whoever caught the exception
+     * has already taken one of their own — codegen increfs at the `as e`
+     * binding and at the saved-message slot — so this frees the message only
+     * when nothing is holding it. */
+    fpy_exc_msg_drop();
     fpy_exc_msg = "";
     fpy_exc_group_inner = FPY_EXC_NONE;
     fpy_exc_group_inner_count = 0;
     fpy_exc_obj = NULL;
     fpy_exc_class_name = "";
     fpy_traceback_depth = 0;
+}
+
+/* --- Moving the pending exception aside while cleanup code runs ------------
+ *
+ * A `finally` body, and the `__exit__` call a `with` block ends in, run *while*
+ * an exception is propagating — and they run ordinary code: calls, divisions,
+ * subscripts. Every one of those is followed by a pending-exception check that
+ * unwinds the frame it is in, so with the exception still flagged the first
+ * statement of the cleanup bails before doing anything and a `__exit__` that
+ * prints, or that returns True to suppress, never runs at all.
+ *
+ * So the exception is moved aside for the duration and put back after. This
+ * only became load-bearing when a function outside any `try` gained an
+ * unwind path of its own (BUG-PENDING-EXC-CLOBBERED-IN-FUNCTION); before that
+ * a callee simply ignored the pending flag, which is why `__exit__` used to
+ * work by accident.
+ *
+ * `fastpy_exc_restore` deliberately keeps whatever the cleanup body raised in
+ * preference to the saved exception: in Python a raise inside `finally`
+ * replaces the exception it interrupted.
+ *
+ * The message needs more than a pointer copy. It is a refcounted FpyString
+ * that `fpy_exc_msg_store` reuses in place while the exception slot is its
+ * sole owner, so a raise during the cleanup would otherwise memcpy over the
+ * saved text. Saving therefore *transfers* the slot's reference into the
+ * saved frame and leaves `fpy_exc_msg_cur` empty, which forces the next raise
+ * to allocate.
+ *
+ * The traceback is deliberately not saved: it is only rewritten by a raise,
+ * and a raise during the cleanup is a raise whose exception wins anyway. */
+#define FPY_EXC_SAVE_DEPTH 64
+typedef struct {
+    int type;
+    const char *msg;
+    FpyString *msg_str;      /* owns one reference while saved */
+    size_t msg_cap;
+    void *obj;
+    const char *class_name;
+    int group_inner;
+    int group_inner_count;
+    int group_inner_types[FPY_MAX_GROUP_INNERS];
+} FpyExcSaved;
+static FPY_THREAD_LOCAL FpyExcSaved fpy_exc_saved[FPY_EXC_SAVE_DEPTH];
+/* Counts every save, including ones past the array. Overflowing levels save
+ * nothing *and clear nothing*, so the exception stays pending and the cleanup
+ * behaves the way it did before this existed — degraded, never lost. */
+static FPY_THREAD_LOCAL int fpy_exc_saved_depth = 0;
+
+/* Release a saved frame's reference to its message. */
+static void fpy_exc_saved_release(FpyExcSaved *f) {
+    FpyString *s = f->msg_str;
+    f->msg_str = NULL;
+    f->msg = "";
+    f->msg_cap = 0;
+    if (s && fpy_str_decref(s->data)) free(s);
+}
+
+/* Stash the pending exception (if any) and clear it. */
+void fastpy_exc_save(void) {
+    int d = fpy_exc_saved_depth++;
+    if (d >= FPY_EXC_SAVE_DEPTH) return;
+    FpyExcSaved *f = &fpy_exc_saved[d];
+    f->type = fpy_exc_type;
+    f->msg = fpy_exc_msg;
+    f->msg_str = fpy_exc_msg_cur;
+    f->msg_cap = fpy_exc_msg_cur_cap;
+    f->obj = fpy_exc_obj;
+    f->class_name = fpy_exc_class_name;
+    f->group_inner = fpy_exc_group_inner;
+    f->group_inner_count = fpy_exc_group_inner_count;
+    if (f->group_inner_count > 0) {
+        int n = f->group_inner_count;
+        if (n > FPY_MAX_GROUP_INNERS) n = FPY_MAX_GROUP_INNERS;
+        memcpy(f->group_inner_types, fpy_exc_group_inner_types,
+               sizeof(int) * (size_t)n);
+    }
+    /* The reference moved into the frame; leave the slot owning nothing. */
+    fpy_exc_msg_cur = NULL;
+    fpy_exc_msg_cur_cap = 0;
+    fpy_exc_type = FPY_EXC_NONE;
+    fpy_exc_msg = "";
+    fpy_exc_obj = NULL;
+    fpy_exc_class_name = "";
+    fpy_exc_group_inner = FPY_EXC_NONE;
+    fpy_exc_group_inner_count = 0;
+}
+
+/* Put the stashed exception back, unless the cleanup raised its own. */
+void fastpy_exc_restore(void) {
+    if (fpy_exc_saved_depth <= 0) return;
+    int d = --fpy_exc_saved_depth;
+    if (d >= FPY_EXC_SAVE_DEPTH) return;
+    FpyExcSaved *f = &fpy_exc_saved[d];
+    if (fpy_exc_type != FPY_EXC_NONE) {
+        /* A raise inside the cleanup replaces the one it interrupted. */
+        fpy_exc_saved_release(f);
+        return;
+    }
+    fpy_exc_msg_drop();          /* nothing pending, but the slot may hold "" */
+    fpy_exc_type = f->type;
+    fpy_exc_msg = f->msg;
+    fpy_exc_msg_cur = f->msg_str;   /* reference moves back out of the frame */
+    fpy_exc_msg_cur_cap = f->msg_cap;
+    fpy_exc_obj = f->obj;
+    fpy_exc_class_name = f->class_name;
+    fpy_exc_group_inner = f->group_inner;
+    fpy_exc_group_inner_count = f->group_inner_count;
+    if (f->group_inner_count > 0) {
+        int n = f->group_inner_count;
+        if (n > FPY_MAX_GROUP_INNERS) n = FPY_MAX_GROUP_INNERS;
+        memcpy(fpy_exc_group_inner_types, f->group_inner_types,
+               sizeof(int) * (size_t)n);
+    }
+    f->msg_str = NULL;
+    f->msg = "";
+    f->msg_cap = 0;
+}
+
+/* Discard the stashed exception — `__exit__` returned truthy and suppressed
+ * it. Whatever the cleanup itself raised is left alone. */
+void fastpy_exc_drop(void) {
+    if (fpy_exc_saved_depth <= 0) return;
+    int d = --fpy_exc_saved_depth;
+    if (d >= FPY_EXC_SAVE_DEPTH) {
+        /* This level never saved, so the exception is still pending and
+         * "discard it" means clearing it for real. */
+        fastpy_exc_clear();
+        return;
+    }
+    fpy_exc_saved_release(&fpy_exc_saved[d]);
+}
+
+/* Was an exception stashed by the innermost fastpy_exc_save? `__exit__`
+ * needs to know whether it is being called for an exception or a normal
+ * exit, and by then the flag it would have read has been moved aside. */
+int fastpy_exc_saved_pending(void) {
+    int d = fpy_exc_saved_depth - 1;
+    if (d < 0 || d >= FPY_EXC_SAVE_DEPTH) return 0;
+    return fpy_exc_saved[d].type != FPY_EXC_NONE;
 }
 
 /* Set the actual exception class name (for type(e).__name__) */
@@ -812,7 +1248,79 @@ int fastpy_exc_name_to_id(const char *name) {
     if (strcmp(name, "NameError") == 0) return FPY_EXC_NAMEERROR;
     if (strcmp(name, "OverflowError") == 0) return FPY_EXC_OVERFLOWERROR;
     if (strcmp(name, "AttributeError") == 0) return FPY_EXC_ATTRIBUTEERROR;
+    if (strcmp(name, "UnboundLocalError") == 0) return FPY_EXC_UNBOUNDLOCAL;
     return FPY_EXC_GENERIC;
+}
+
+/* ---- The builtin exception hierarchy ----
+ *
+ * `except` matching used to be an equality test on the type code, which is
+ * only the right answer when the handler names the exact class that was
+ * raised.  Python's builtin exceptions form a tree, and the abstract nodes of
+ * that tree — ArithmeticError, LookupError — are the whole reason it exists:
+ * `except ArithmeticError:` did not catch `1 / 0`, and `except LookupError:`
+ * did not catch a missing dict key, because neither name has a code of its
+ * own and the equality test had nothing to compare.
+ *
+ * The tree lives here rather than in codegen because the same walk answers
+ * for user-defined classes: fastpy_exc_class_matches checks the registered
+ * classes first, so `class MyError(ValueError)` walks up through its own
+ * entry and then continues into this table.
+ */
+static const char *fpy_builtin_exc_parent(const char *name) {
+    static const struct { const char *child; const char *parent; } tree[] = {
+        {"ZeroDivisionError",   "ArithmeticError"},
+        {"OverflowError",       "ArithmeticError"},
+        {"FloatingPointError",  "ArithmeticError"},
+        {"ArithmeticError",     "Exception"},
+        {"IndexError",          "LookupError"},
+        {"KeyError",            "LookupError"},
+        {"LookupError",         "Exception"},
+        {"UnboundLocalError",   "NameError"},
+        {"NameError",           "Exception"},
+        {"NotImplementedError", "RuntimeError"},
+        {"RecursionError",      "RuntimeError"},
+        {"RuntimeError",        "Exception"},
+        {"FileNotFoundError",   "OSError"},
+        {"FileExistsError",     "OSError"},
+        {"PermissionError",     "OSError"},
+        {"IsADirectoryError",   "OSError"},
+        {"NotADirectoryError",  "OSError"},
+        {"BrokenPipeError",     "OSError"},
+        {"OSError",             "Exception"},
+        {"ModuleNotFoundError", "ImportError"},
+        {"ImportError",         "Exception"},
+        {"UnicodeDecodeError",  "UnicodeError"},
+        {"UnicodeEncodeError",  "UnicodeError"},
+        {"UnicodeError",        "ValueError"},
+        {"ValueError",          "Exception"},
+        {"IndentationError",    "SyntaxError"},
+        {"SyntaxError",         "Exception"},
+        {"TypeError",           "Exception"},
+        {"AttributeError",      "Exception"},
+        {"StopIteration",       "Exception"},
+        {"StopAsyncIteration",  "Exception"},
+        {"AssertionError",      "Exception"},
+        {"BufferError",         "Exception"},
+        {"EOFError",            "Exception"},
+        {"MemoryError",         "Exception"},
+        {"ReferenceError",      "Exception"},
+        {"ExceptionGroup",      "Exception"},
+        {"SystemExit",          "BaseException"},
+        {"KeyboardInterrupt",   "BaseException"},
+        {"GeneratorExit",       "BaseException"},
+        {"Exception",           "BaseException"},
+    };
+    /* OSError absorbed IOError and EnvironmentError in Python 3; they are
+     * the same class, not subclasses of it, so normalize rather than
+     * making `except IOError:` miss an OSError. */
+    if (strcmp(name, "IOError") == 0
+        || strcmp(name, "EnvironmentError") == 0)
+        name = "OSError";
+    for (size_t i = 0; i < sizeof(tree) / sizeof(tree[0]); i++)
+        if (strcmp(tree[i].child, name) == 0)
+            return tree[i].parent;
+    return NULL;
 }
 
 /* ---- Exception class hierarchy registry ---- */
@@ -837,9 +1345,17 @@ void fastpy_exc_register_class(const char *name, const char *parent) {
  * Returns 1 if raised_name IS handler_name, or if raised_name inherits
  * from handler_name through the registered class hierarchy. */
 int fastpy_exc_class_matches(const char *raised_name, const char *handler_name) {
+    if (!raised_name || !handler_name || !raised_name[0]) return 0;
     /* Direct match */
     if (strcmp(raised_name, handler_name) == 0) return 1;
-    /* Walk up the inheritance chain */
+    /* IOError and EnvironmentError name the same class as OSError. */
+    if ((strcmp(handler_name, "IOError") == 0
+         || strcmp(handler_name, "EnvironmentError") == 0)
+        && strcmp(raised_name, "OSError") == 0) return 1;
+    /* Walk up the inheritance chain.  A registered (user-defined) class wins
+     * over the builtin table, so a `class ValueError(...)` of the program's
+     * own does not inherit the builtin one's parent; when neither knows the
+     * name the walk is over. */
     const char *current = raised_name;
     for (int depth = 0; depth < FPY_MAX_EXC_CLASSES; depth++) {
         /* Find the parent of current */
@@ -850,6 +1366,7 @@ int fastpy_exc_class_matches(const char *raised_name, const char *handler_name) 
                 break;
             }
         }
+        if (!parent) parent = fpy_builtin_exc_parent(current);
         if (!parent) break;
         if (strcmp(parent, handler_name) == 0) return 1;
         current = parent;
@@ -863,13 +1380,14 @@ void fastpy_exc_unhandled(void) {
     const char *names[] = {
         "Exception", "ZeroDivisionError", "ValueError", "TypeError",
         "IndexError", "KeyError", "RuntimeError", "StopIteration",
-        "ExceptionGroup", "NameError", "OverflowError", "AttributeError"
+        "ExceptionGroup", "NameError", "OverflowError", "AttributeError",
+        "UnboundLocalError"
     };
     const char *name;
     if (fpy_exc_class_name[0] != '\0') {
         name = fpy_exc_class_name;
     } else {
-        name = (fpy_exc_type >= 1 && fpy_exc_type <= 11)
+        name = (fpy_exc_type >= 1 && fpy_exc_type <= FPY_EXC_MAX_BUILTIN)
             ? names[fpy_exc_type] : "Exception";
     }
     fpy_shadow_print_traceback();
@@ -893,7 +1411,7 @@ int64_t fastpy_safe_div(int64_t a, int64_t b) {
 int64_t fastpy_safe_mod(int64_t a, int64_t b) {
     if (b == 0) {
         if (!fastpy_exc_pending())
-            fastpy_raise(FPY_EXC_ZERODIVISION, "integer modulo by zero");
+            fastpy_raise(FPY_EXC_ZERODIVISION, "division by zero");
         return 0;
     }
     return a % b;
@@ -905,6 +1423,19 @@ double fastpy_safe_fdiv(double a, double b) {
         return 0.0;
     }
     return a / b;
+}
+
+/* Python's float %, which raises on a zero divisor and takes the sign of the
+ * divisor.  Codegen used to inline a bare `frem` with neither property, so
+ * `1.0 % 0.0` answered nan instead of raising. */
+double fastpy_safe_fmod(double a, double b) {
+    if (b == 0.0) {
+        fastpy_raise(FPY_EXC_ZERODIVISION, "division by zero");
+        return 0.0;
+    }
+    double m = fmod(a, b);
+    if (m != 0.0 && ((m < 0.0) != (b < 0.0))) m += b;
+    return m;
 }
 
 /* int/int "true division" that returns float.  CPython 3.14+ uses
@@ -952,6 +1483,10 @@ extern FpyList* fastpy_list_new(void);
 extern void fastpy_list_append_fv(FpyList*, int32_t, int64_t);
 extern void fastpy_list_get_fv(FpyList*, int64_t, int32_t*, int64_t*);
 extern void fastpy_list_set_fv(FpyList*, int64_t, int32_t, int64_t);
+extern void fastpy_abs_fv(int32_t, int64_t, int32_t*, int64_t*);
+extern void fastpy_neg_fv(int32_t, int64_t, int32_t*, int64_t*);
+extern void fastpy_int_fv(int32_t, int64_t, int32_t*, int64_t*);
+extern void fastpy_float_fv(int32_t, int64_t, int32_t*, int64_t*);
 extern int64_t fastpy_list_length(FpyList*);
 extern FpyList* fastpy_list_sorted(FpyList*);
 extern FpyList* fastpy_list_from_obj_iter(void*);
@@ -1047,6 +1582,19 @@ extern void fastpy_set_update(FpyDict*, FpyDict*);
 extern void fastpy_set_intersection_update(FpyDict*, FpyDict*);
 extern void fastpy_set_difference_update(FpyDict*, FpyDict*);
 extern void fastpy_set_symmetric_difference_update(FpyDict*, FpyDict*);
+/* The (tag, data) forms codegen calls for the set *methods* — any iterable. */
+extern void fastpy_set_update_fv(FpyDict*, int32_t, int64_t);
+extern void fastpy_set_intersection_update_fv(FpyDict*, int32_t, int64_t);
+extern void fastpy_set_difference_update_fv(FpyDict*, int32_t, int64_t);
+extern void fastpy_set_symmetric_difference_update_fv(FpyDict*, int32_t, int64_t);
+extern FpyDict* fastpy_set_union_fv(FpyDict*, int32_t, int64_t);
+extern FpyDict* fastpy_set_intersection_fv(FpyDict*, int32_t, int64_t);
+extern FpyDict* fastpy_set_difference_fv(FpyDict*, int32_t, int64_t);
+extern FpyDict* fastpy_set_symmetric_diff_fv(FpyDict*, int32_t, int64_t);
+extern int32_t fastpy_set_issubset_fv(FpyDict*, int32_t, int64_t);
+extern int32_t fastpy_set_issuperset_fv(FpyDict*, int32_t, int64_t);
+extern int32_t fastpy_set_isdisjoint_fv(FpyDict*, int32_t, int64_t);
+extern FpyDict* fastpy_set_from_iterable_fv(int32_t, int64_t);
 extern FpyList* fastpy_zip1(FpyList*);
 extern void fastpy_dict_popitem(FpyDict*, int32_t*, int64_t*, int32_t*, int64_t*);
 extern FpyDict* fastpy_dict_copy(FpyDict*);
@@ -1131,6 +1679,11 @@ extern void fpy_cpython_rbinop(int32_t, int64_t, void*, int32_t, int32_t*, int64
 extern int32_t fpy_cpython_compare(void*, void*, int32_t);
 extern void fpy_cpython_concat(void*, void*, int32_t*, int64_t*);
 
+/* The JIT symbol table is used only by the Python-side JIT to resolve runtime
+ * symbols via ctypes. Pure-mode AOT builds (SlateOS / no-CPython) neither run
+ * the JIT nor link the CPython bridge, so the table is excluded there — it
+ * would otherwise force-reference bridge functions that pure mode omits. */
+#ifndef FPY_PURE_MODE
 static FpySymEntry fpy_jit_symbols[] = {
     SYM(fastpy_print_newline),
     SYM(fastpy_fv_print), SYM(fastpy_fv_write),
@@ -1138,11 +1691,14 @@ static FpySymEntry fpy_jit_symbols[] = {
     SYM(fastpy_fv_len), SYM(fastpy_fv_iter_get), SYM(fastpy_fv_subscript), SYM(fastpy_fv_contains), SYM(fastpy_fv_binop),
     SYM(fastpy_raise), SYM(fastpy_raise_with_obj),
     SYM(fastpy_exc_pending), SYM(fastpy_exc_clear),
+    SYM(fastpy_exc_save), SYM(fastpy_exc_restore), SYM(fastpy_exc_drop),
+    SYM(fastpy_exc_saved_pending),
     SYM(fastpy_exc_get_type), SYM(fastpy_exc_get_msg), SYM(fastpy_exc_get_obj),
     SYM(fastpy_exc_name_to_id), SYM(fastpy_exc_set_class_name), SYM(fastpy_exc_get_class_name),
     SYM(fastpy_exc_register_class), SYM(fastpy_exc_class_matches),
     SYM(fastpy_list_new), SYM(fastpy_list_append_fv),
-    SYM(fastpy_list_get_fv), SYM(fastpy_list_set_fv),
+    SYM(fastpy_list_get_fv), SYM(fastpy_list_set_fv), SYM(fastpy_abs_fv),
+    SYM(fastpy_neg_fv), SYM(fastpy_int_fv), SYM(fastpy_float_fv),
     SYM(fastpy_list_length), SYM(fastpy_list_sorted), SYM(fastpy_list_from_obj_iter), SYM(fastpy_list_reversed),
     SYM(fastpy_list_reverse_prefix), SYM(fastpy_list_reverse),
     SYM(fastpy_list_copy), SYM(fastpy_list_clear),
@@ -1151,7 +1707,7 @@ static FpySymEntry fpy_jit_symbols[] = {
     SYM(fastpy_dict_length), SYM(fastpy_dict_keys), SYM(fastpy_dict_values),
     SYM(fastpy_dict_items), SYM(fastpy_dict_has_key), SYM(fastpy_dict_update),
     SYM(fastpy_dict_equal), SYM(fastpy_set_equal),
-    SYM(fastpy_tuple_new), SYM(fastpy_obj_new),
+    SYM(fastpy_tuple_new), SYM(fastpy_obj_new), SYM(fastpy_io_open),
     SYM(fastpy_register_class), SYM(fastpy_set_class_var),
     SYM(fastpy_register_method),
     SYM(fastpy_set_method_ret_tag), SYM(fastpy_obj_call_method1_fv),
@@ -1179,6 +1735,13 @@ static FpySymEntry fpy_jit_symbols[] = {
     SYM(fastpy_set_clear), SYM(fastpy_set_pop_fv),
     SYM(fastpy_set_update), SYM(fastpy_set_intersection_update),
     SYM(fastpy_set_difference_update), SYM(fastpy_set_symmetric_difference_update),
+    SYM(fastpy_set_update_fv), SYM(fastpy_set_intersection_update_fv),
+    SYM(fastpy_set_difference_update_fv),
+    SYM(fastpy_set_symmetric_difference_update_fv),
+    SYM(fastpy_set_union_fv), SYM(fastpy_set_intersection_fv),
+    SYM(fastpy_set_difference_fv), SYM(fastpy_set_symmetric_diff_fv),
+    SYM(fastpy_set_issubset_fv), SYM(fastpy_set_issuperset_fv),
+    SYM(fastpy_set_isdisjoint_fv), SYM(fastpy_set_from_iterable_fv),
     SYM(fastpy_zip1), SYM(fastpy_dict_popitem),
     SYM(fastpy_dict_copy), SYM(fastpy_str_index_sub), SYM(fastpy_str_rindex_sub),
     SYM(fastpy_str_replace_count),
@@ -1249,6 +1812,10 @@ int fastpy_get_jit_symbol_count(void) {
     while (fpy_jit_symbols[n].name) n++;
     return n;
 }
+#else  /* FPY_PURE_MODE: no JIT symbol table in pure AOT builds */
+FpySymEntry *fastpy_get_jit_symbols(void) { return (FpySymEntry *)0; }
+int fastpy_get_jit_symbol_count(void) { return 0; }
+#endif /* FPY_PURE_MODE */
 
 /* Command-line argument storage (populated by main).
  * Non-static so cpython_bridge.c can extern-reference them. */
@@ -1307,8 +1874,13 @@ int main(int argc, char *argv[]) {
             case FPY_EXC_NAMEERROR:    name = "NameError"; break;
             case FPY_EXC_OVERFLOWERROR: name = "OverflowError"; break;
             case FPY_EXC_ATTRIBUTEERROR: name = "AttributeError"; break;
+            case FPY_EXC_UNBOUNDLOCAL: name = "UnboundLocalError"; break;
             default: break;
         }
+        /* A user-defined class supplies its own name, and so does any raise
+         * that set one explicitly; the switch above is only the fallback. */
+        if (fpy_exc_class_name[0] != '\0')
+            name = fpy_exc_class_name;
         fpy_shadow_print_traceback();
         fprintf(stderr, "%s: %s\n", name, fpy_exc_msg ? fpy_exc_msg : "");
         return 1;
@@ -1325,13 +1897,23 @@ void fastpy_sys_exit(int64_t code) {
     exit((int)code);
 }
 
-/* sys.argv — returns the real command-line arguments. */
+/* sys.argv — returns the real command-line arguments.
+ *
+ * Each element must be a heap FpyString (a length header precedes the char
+ * data), not a raw C string: FPY_TAG_STR values are dereferenced as
+ * FpyString.data by list iteration / print / string ops, so a bare
+ * `fpy_argv[i]` would fault when the runtime reads the missing length
+ * header. Copy each argv entry into a fresh fpy_str_alloc buffer. */
 FpyList* fastpy_sys_argv(void) {
     FpyList *lst = fpy_list_new(fpy_argc > 4 ? fpy_argc : 4);
     for (int i = 0; i < fpy_argc; i++) {
+        const char *src = fpy_argv[i] ? fpy_argv[i] : "";
+        size_t len = strlen(src);
+        FpyString *s = fpy_str_alloc(len);
+        memcpy(s->data, src, len + 1);
         FpyValue v;
         v.tag = FPY_TAG_STR;
-        v.data.s = fpy_argv[i];
+        v.data.s = s->data;
         fpy_list_append(lst, v);
     }
     return lst;
@@ -1361,7 +1943,10 @@ FpyList* fastpy_sys_version_info(void) {
     v.tag = FPY_TAG_INT; v.data.i = 3; fpy_list_append(t, v);  /* major */
     v.tag = FPY_TAG_INT; v.data.i = 14; fpy_list_append(t, v); /* minor */
     v.tag = FPY_TAG_INT; v.data.i = 0; fpy_list_append(t, v);  /* micro */
-    v.tag = FPY_TAG_STR; v.data.s = "final"; fpy_list_append(t, v);
+    /* Header-backed STR: a bare string literal has no FpyString header, so
+     * fpy_str_header/decref on version_info[3] would read out of bounds.
+     * See BUG-RUNTIME-STR-PRODUCERS-BARE-MALLOC. */
+    v.tag = FPY_TAG_STR; v.data.s = fpy_str_from_cstr("final"); fpy_list_append(t, v);
     v.tag = FPY_TAG_INT; v.data.i = 0; fpy_list_append(t, v);
     return t;
 }
@@ -1651,7 +2236,7 @@ const char* fastpy_base64_b64decode(const char *data) {
 /* uuid.uuid4() → random UUID string "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx" */
 const char* fastpy_uuid_uuid4(void) {
     fpy_rng_ensure_init();
-    char *buf = (char*)malloc(37);
+    char *buf = fpy_str_buf(36);
     uint64_t r1 = fpy_rng_next();
     uint64_t r2 = fpy_rng_next();
     /* Set version (4) and variant (10xx) bits */
@@ -1848,7 +2433,54 @@ extern const char* fastpy_os_path_join(const char *a, const char *b);
 extern const char* fastpy_os_path_basename(const char *path);
 extern const char* fastpy_os_path_dirname(const char *path);
 extern const char* fastpy_os_getcwd(void);
+extern int64_t fastpy_os_getpid(void);
+extern int64_t fastpy_os_getppid(void);
+extern int64_t fastpy_os_gettid(void);
+extern int64_t fastpy_os_getuid(void);
+extern int64_t fastpy_os_getgid(void);
+extern int64_t fastpy_os_setuid(int64_t uid);
+extern int64_t fastpy_os_setgid(int64_t gid);
+extern int64_t fastpy_os_nice(int64_t inc);
+extern int64_t fastpy_os_getpriority(int64_t which, int64_t who);
+extern int64_t fastpy_os_setpriority(int64_t which, int64_t who, int64_t prio);
+extern FpyList* fastpy_os_pipe(void);
+extern int64_t fastpy_os_write(int64_t fd, const char *data);
+extern const char* fastpy_os_read(int64_t fd, int64_t n);
+extern int64_t fastpy_os_close(int64_t fd);
+extern int64_t fastpy_os_dup(int64_t fd);
+extern int64_t fastpy_os_dup2(int64_t oldfd, int64_t newfd);
+extern int64_t fastpy_os_lseek(int64_t fd, int64_t offset, int64_t whence);
+extern int64_t fastpy_os_open(const char *path, int64_t flags, int64_t mode);
+extern int64_t fastpy_os_umask(int64_t mask);
+extern int64_t fastpy_os_ftruncate(int64_t fd, int64_t length);
+extern int64_t fastpy_os_pwrite(int64_t fd, const char *data, int64_t offset);
+extern const char* fastpy_os_pread(int64_t fd, int64_t n, int64_t offset);
 extern FpyList* fastpy_os_listdir(const char *path);
+extern int64_t fastpy_os_remove(const char *path);
+extern int64_t fastpy_os_mkdir(const char *path);
+extern int64_t fastpy_os_rmdir(const char *path);
+extern int64_t fastpy_os_rename(const char *src, const char *dst);
+extern int64_t fastpy_os_execv(const char *path, FpyList *argv);
+extern int64_t fastpy_os_fork(void);
+extern FpyList* fastpy_os_waitpid(int64_t pid, int64_t options);
+extern int64_t fastpy_os_wifexited(int64_t status);
+extern int64_t fastpy_os_wexitstatus(int64_t status);
+extern int64_t fastpy_os_path_getsize(const char *path);
+extern double fastpy_os_path_getmtime(const char *path);
+extern double fastpy_os_path_getatime(const char *path);
+extern double fastpy_os_path_getctime(const char *path);
+extern int64_t fastpy_os_symlink(const char *target, const char *linkpath);
+extern const char* fastpy_os_readlink(const char *path);
+extern int64_t fastpy_os_link(const char *src, const char *dst);
+extern int64_t fastpy_os_chmod(const char *path, int64_t mode);
+extern int64_t fastpy_os_truncate(const char *path, int64_t length);
+extern int64_t fastpy_os_utime(const char *path, int64_t atime_ns, int64_t mtime_ns);
+extern int64_t fastpy_os_chown(const char *path, int64_t uid, int64_t gid);
+extern int64_t fastpy_os_access(const char *path, int64_t mode);
+extern int64_t fastpy_os_path_samefile(const char *a, const char *b);
+extern int64_t fastpy_os_path_islink(const char *path);
+extern FpyList* fastpy_os_stat(const char *path);
+extern FpyList* fastpy_os_statvfs(const char *path);
 
 /* Path(str) → just returns the string (Path IS a string internally) */
 /* Path() — implemented in cpython_bridge.c */
@@ -1858,7 +2490,14 @@ extern FpyList* fastpy_os_listdir(const char *path);
  * Declarations are extern — implementations live in cpython_bridge.c
  * where Python.h is available. */
 
-/* path.with_suffix(suffix) → new path with different extension */
+/* path.with_suffix(suffix) → new path with different extension.
+ *
+ * Pure mode supplies its own implementation in pathlib_pure.c: there a Path
+ * carries a real header (see FpyPurePath) so that the OBJ refcount dispatcher's
+ * magic probes at offsets 0/32 can never alias path text, which means both the
+ * incoming pointer and the PATH-tagged result must be headed objects rather
+ * than bare strings. */
+#ifndef FPY_PURE_MODE
 const char* fastpy_path_with_suffix(const char *self, const char *suffix) {
     /* Find the last dot in basename */
     const char *base_start = self;
@@ -1871,11 +2510,12 @@ const char* fastpy_path_with_suffix(const char *self, const char *suffix) {
     }
     int prefix_len = dot ? (int)(dot - self) : (int)strlen(self);
     int suffix_len = (int)strlen(suffix);
-    char *buf = (char*)malloc(prefix_len + suffix_len + 1);
+    char *buf = fpy_str_buf(prefix_len + suffix_len);
     memcpy(buf, self, prefix_len);
     memcpy(buf + prefix_len, suffix, suffix_len + 1);
     return buf;
 }
+#endif  /* !FPY_PURE_MODE */
 
 /* ============================================================
  * textwrap module
@@ -1895,11 +2535,11 @@ const char* fastpy_textwrap_dedent(const char *text) {
         while (*p && *p != '\n') p++;
         if (*p == '\n') p++;
     }
-    if (min_indent == 9999 || min_indent == 0) return fpy_strdup(text);
+    if (min_indent == 9999 || min_indent == 0) return fpy_str_from_cstr(text);
 
     /* Build dedented result */
     int64_t len = (int64_t)strlen(text);
-    char *out = (char*)malloc(len + 1);
+    char *out = fpy_str_buf(len);
     char *o = out;
     p = text;
     while (*p) {
@@ -1921,7 +2561,7 @@ const char* fastpy_textwrap_indent(const char *text, const char *prefix) {
     /* Count lines */
     int64_t lines = 1;
     for (const char *p = text; *p; p++) if (*p == '\n') lines++;
-    char *out = (char*)malloc(tlen + lines * plen + 1);
+    char *out = fpy_str_buf(tlen + lines * plen);
     char *o = out;
     const char *p = text;
     int at_line_start = 1;
@@ -2007,7 +2647,11 @@ FpyList* fastpy_glob_glob(const char *pattern) {
                 snprintf(full, sizeof(full), "%s\\%s", dir, fd.cFileName);
             else
                 snprintf(full, sizeof(full), "%s", fd.cFileName);
-            FpyValue v; v.tag = FPY_TAG_STR; v.data.s = fpy_strdup(full);
+            /* Header-backed STR so the list element has a valid FpyString
+             * header for fpy_str_header/decref. Matches the str.split idiom
+             * (refcount 1, append increfs). See
+             * BUG-RUNTIME-STR-PRODUCERS-BARE-MALLOC. */
+            FpyValue v; v.tag = FPY_TAG_STR; v.data.s = fpy_str_from_cstr(full);
             fpy_list_append(result, v);
         } while (FindNextFileA(h, &fd));
         FindClose(h);
@@ -2030,7 +2674,11 @@ FpyList* fastpy_glob_glob(const char *pattern) {
                 snprintf(full, sizeof(full), "%s/%s", dir, ent->d_name);
             else
                 snprintf(full, sizeof(full), "%s", ent->d_name);
-            FpyValue v; v.tag = FPY_TAG_STR; v.data.s = fpy_strdup(full);
+            /* Header-backed STR so the list element has a valid FpyString
+             * header for fpy_str_header/decref. Matches the str.split idiom
+             * (refcount 1, append increfs). See
+             * BUG-RUNTIME-STR-PRODUCERS-BARE-MALLOC. */
+            FpyValue v; v.tag = FPY_TAG_STR; v.data.s = fpy_str_from_cstr(full);
             fpy_list_append(result, v);
         }
         closedir(d);
@@ -2051,13 +2699,13 @@ const char* fastpy_tempfile_gettempdir(void) {
     if (n > 0) {
         /* Remove trailing backslash */
         if (n > 0 && buf[n-1] == '\\') buf[n-1] = '\0';
-        return fpy_strdup(buf);
+        return fpy_str_from_cstr(buf);
     }
-    return fpy_strdup("C:\\Temp");
+    return fpy_str_from_cstr("C:\\Temp");
 #else
     const char *tmp = getenv("TMPDIR");
-    if (tmp) return fpy_strdup(tmp);
-    return fpy_strdup("/tmp");
+    if (tmp) return fpy_str_from_cstr(tmp);
+    return fpy_str_from_cstr("/tmp");
 #endif
 }
 
@@ -2068,11 +2716,11 @@ const char* fastpy_tempfile_mkdtemp(void) {
     GetTempPathA(sizeof(tmp), tmp);
     snprintf(path, sizeof(path), "%sfpy_%08x", tmp, (uint32_t)fpy_rng_next());
     CreateDirectoryA(path, NULL);
-    return fpy_strdup(path);
+    return fpy_str_from_cstr(path);
 #else
     char tmpl[] = "/tmp/fpy_XXXXXX";
     char *result = mkdtemp(tmpl);
-    return result ? fpy_strdup(result) : fpy_strdup("/tmp/fpy_fallback");
+    return result ? fpy_str_from_cstr(result) : fpy_str_from_cstr("/tmp/fpy_fallback");
 #endif
 }
 

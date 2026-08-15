@@ -32,6 +32,17 @@ IS_WINDOWS = sys.platform == "win32"
 IS_MACOS = sys.platform == "darwin"
 IS_LINUX = sys.platform.startswith("linux")
 
+# LLVM optimization level for host codegen (both the IR pass pipeline and
+# backend instruction selection). Defaults to -O2, which measures fastest for
+# fastpy's generated code — -O3 regressed tight loops and cross-FV-boundary
+# inlining in A/B testing. Override with FASTPY_OPT=0..3 for experimentation.
+try:
+    _BACKEND_OPT_LEVEL = int(os.environ.get("FASTPY_OPT", "2"))
+    if _BACKEND_OPT_LEVEL not in (0, 1, 2, 3):
+        _BACKEND_OPT_LEVEL = 2
+except ValueError:
+    _BACKEND_OPT_LEVEL = 2
+
 # --- Object file extension ---
 OBJ_EXT = ".obj" if IS_WINDOWS else ".o"
 EXE_EXT = ".exe" if IS_WINDOWS else ""
@@ -47,6 +58,182 @@ SHARED_RUNTIME_OBJS = [RUNTIME_DIR / (name + OBJ_EXT) for name in _SHARED_RUNTIM
 # Legacy flat layout for backward compatibility
 _LEGACY_RUNTIME_NAMES = ["runtime", "objects", "cpython_bridge", "threading", "gc", "bigint"]
 _LEGACY_RUNTIME_OBJS = [RUNTIME_DIR / (name + OBJ_EXT) for name in _LEGACY_RUNTIME_NAMES]
+
+
+# --- Cross-compilation targets ---
+# Passing target=None to the codegen entry points keeps the existing behavior:
+# emit for the host triple (COFF on Windows, ELF/Mach-O on Linux/macOS), linked
+# against the host CPython. A named cross-target instead emits an object for a
+# foreign platform. The first supported one is SlateOS userspace.
+SLATEOS_TARGET = "x86_64-slateos"
+
+# LLVM parameters for the SlateOS x86_64 userspace target. These MUST stay in
+# lockstep with the OS repo's Rust target spec (toolchain/x86_64-slateos.json)
+# so fastpy-emitted objects are ABI-compatible with that sysroot's libc.a (the
+# `posix` crate compiled as a staticlib) and can be linked by the same
+# gnu-lld/rust-lld linker. Both host and target are x86_64, so the already
+# initialized native X86 backend can emit for this triple with no extra target
+# initialization — we only need the foreign triple, data layout, and codegen
+# knobs (static relocation + large code model + SSE2, matching the JSON).
+_SLATEOS_TRIPLE = "x86_64-unknown-linux-musl"
+_SLATEOS_DATA_LAYOUT = (
+    "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128"
+)
+_SLATEOS_CPU = "x86-64"
+_SLATEOS_FEATURES = "+sse,+sse2"
+
+# Link step for the SlateOS target. Unlike the host link paths (MSVC link.exe /
+# cc), a SlateOS executable is an ELF for a foreign platform, so we drive the
+# LLVM linker (`rust-lld` in GNU/ELF flavor) directly. rust-lld ships inside the
+# installed Rust toolchain that the OS repo already uses to build its userspace
+# (the same lld/rust-lld referenced by toolchain/x86_64-slateos.json), so no new
+# tool is required. The SlateOS loader maps userspace binaries at a fixed base,
+# and the sysroot is static-only, hence: static link, no dynamic linker, non-PIE.
+_SLATEOS_LLD_FLAVOR = "gnu"
+
+# Directory where the cross-compiled pure-mode SlateOS runtime objects are
+# cached (out-of-tree from the host .obj/.o so the two never collide).
+SLATEOS_RUNTIME_DIR = RUNTIME_DIR / "slateos"
+
+# Pure-mode runtime translation units for the SlateOS target. Unlike the host
+# build (which links cpython_bridge.c against libpython), a SlateOS pure-mode
+# build omits the CPython bridge entirely and substitutes bridge_stub.c — its
+# operational entry points raise a catchable RuntimeError and the refcount
+# hooks are no-ops (no bridge objects can exist). The JIT symbol table in
+# runtime.c is compiled out via -DFPY_PURE_MODE (it would otherwise
+# force-reference bridge functions pure mode omits).
+_SLATEOS_RUNTIME_NAMES = [
+    "runtime", "objects", "threading", "gc", "bigint", "bridge_stub",
+    # pathlib_pure.c: native (CPython-free) pathlib.Path surface for pure mode.
+    # The bridge's PyObject*-backed path functions live in cpython_bridge.c,
+    # which pure mode omits; this TU supplies them treating a Path as a heap C
+    # string. Pure-only — never compiled into the host build (see
+    # _SHARED_RUNTIME_NAMES), so no symbol collision with the bridge.
+    "pathlib_pure",
+]
+
+# The C cross-compiler target passed to `zig cc`. `zig cc --target=<t>` is a
+# self-contained clang plus bundled musl headers and libc, so no system-wide
+# toolchain or separately vendored musl sysroot is required. The flags below
+# mirror the codegen ABI in `_make_target_machine`: static relocation
+# (-fno-pic/-fno-pie), large code model, and -O2 to match the IR opt level.
+_SLATEOS_ZIG_TARGET = "x86_64-linux-musl"
+
+
+def _find_zig_cc() -> Path | None:
+    """
+    Locate the `zig` executable used as the SlateOS C cross-compiler.
+
+    `zig cc --target=x86_64-linux-musl` bundles clang + musl headers + musl
+    libc in one portable download, so it needs neither a system-wide install
+    nor a separately vendored musl sysroot. Resolution order:
+
+    1. ``$FASTPY_ZIG`` — explicit override (path to ``zig[.exe]``).
+    2. A bare ``zig`` on PATH.
+    3. A portable unpack under ``D:\\utils\\zig-*`` / ``C:\\utils\\zig-*``
+       (dev-machine fallback).
+
+    Returns the path to zig, or None if not found.
+    """
+    import shutil
+    import glob
+
+    override = os.environ.get("FASTPY_ZIG")
+    if override:
+        p = Path(override)
+        if p.exists():
+            return p
+
+    found = shutil.which("zig")
+    if found:
+        return Path(found)
+
+    # Dev-machine portable-install fallback.
+    for base in (r"D:\utils", r"C:\utils"):
+        for m in sorted(glob.glob(os.path.join(base, "zig-*", "zig.exe")),
+                        reverse=True):
+            return Path(m)
+    return None
+
+
+def _find_slateos_sysroot_lib() -> Path | None:
+    """
+    Locate the SlateOS sysroot ``lib`` directory that holds ``libc.a``.
+
+    A pure-mode SlateOS executable links the fastpy program + runtime objects
+    against the OS repo's static ``libc.a`` (the ``posix`` crate built as a
+    libc-shaped staticlib). Resolution order:
+
+    1. ``$FASTPY_SLATEOS_SYSROOT`` — either the sysroot root (its ``lib``
+       subdir is tried) or the ``lib`` dir itself.
+    2. A sibling ``os`` checkout at ``<fastpy>/../os/toolchain/sysroot/lib``.
+
+    Returns the directory containing ``libc.a``, or None if not found.
+    """
+    candidates: list[Path] = []
+    env = os.environ.get("FASTPY_SLATEOS_SYSROOT")
+    if env:
+        p = Path(env)
+        candidates.append(p / "lib")
+        candidates.append(p)
+    candidates.append(
+        _PROJECT_ROOT.parent / "os" / "toolchain" / "sysroot" / "lib"
+    )
+    for c in candidates:
+        if (c / "libc.a").exists():
+            return c
+    return None
+
+
+def _find_rust_lld() -> Path | None:
+    """
+    Locate `rust-lld` (the LLVM linker bundled with the Rust toolchain).
+
+    The SlateOS link step reuses the very linker the OS repo builds its
+    userspace with, so a fastpy SlateOS binary is produced by the same
+    gnu-lld/rust-lld path as the rest of the OS. Resolution order:
+
+    1. `$FASTPY_RUST_LLD` — explicit override.
+    2. The active Rust sysroot (`rustc --print sysroot`), under
+       `lib/rustlib/<host>/bin/rust-lld[.exe]`.
+    3. A bare `rust-lld` / `ld.lld` on PATH.
+
+    Returns the path, or None if no linker was found.
+    """
+    import shutil
+
+    override = os.environ.get("FASTPY_RUST_LLD")
+    if override:
+        p = Path(override)
+        if p.exists():
+            return p
+
+    # Query the Rust sysroot and scan its rustlib bin dirs for rust-lld.
+    rustc = shutil.which("rustc")
+    if rustc:
+        try:
+            sysroot = subprocess.run(
+                [rustc, "--print", "sysroot"],
+                capture_output=True, text=True, timeout=15,
+            )
+            if sysroot.returncode == 0:
+                root = Path(sysroot.stdout.strip())
+                rustlib = root / "lib" / "rustlib"
+                if rustlib.is_dir():
+                    exe = "rust-lld.exe" if IS_WINDOWS else "rust-lld"
+                    for host_dir in rustlib.iterdir():
+                        cand = host_dir / "bin" / exe
+                        if cand.exists():
+                            return cand
+        except (subprocess.SubprocessError, OSError):
+            pass
+
+    # Fall back to a linker on PATH.
+    for name in ("rust-lld", "ld.lld"):
+        found = shutil.which(name)
+        if found:
+            return Path(found)
+    return None
 
 
 # --- Python installation descriptor ---
@@ -449,13 +636,12 @@ RUNTIME_BUILD_BAT = RUNTIME_DIR / "build_runtime.bat"
 RUNTIME_BUILD_SH = RUNTIME_DIR / "build_runtime.sh"
 
 
-def _find_msvc_cl() -> str | None:
-    """Find cl.exe by setting up MSVC environment via vcvars64.bat.
+def _find_vcvars_bat() -> Path | None:
+    """Locate vcvars64.bat by enumerating VS installations.
 
-    Returns a bat preamble string that sets up the environment, or None
-    if MSVC cannot be found. Enumerates all VS installations under both
-    Program Files directories (handles year-named and version-named
-    folders like '2022', '18', etc.) and falls back to vswhere.exe.
+    Enumerates all VS installations under both Program Files directories
+    (handles year-named and version-named folders like '2022', '18', etc.)
+    and falls back to vswhere.exe. Returns the Path, or None if not found.
     """
     editions = ["Community", "Enterprise", "Professional", "BuildTools"]
     bases = [
@@ -475,7 +661,7 @@ def _find_msvc_cl() -> str | None:
             for edition in editions:
                 vcvars = subdir / edition / "VC" / "Auxiliary" / "Build" / "vcvars64.bat"
                 if vcvars.exists():
-                    return f'call "{vcvars}" >NUL'
+                    return vcvars
     # Last resort: use vswhere.exe (handles any edition/year/path)
     vswhere = Path(
         r"C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe"
@@ -492,15 +678,151 @@ def _find_msvc_cl() -> str | None:
                 / "VC" / "Auxiliary" / "Build" / "vcvars64.bat"
             )
             if vcvars.exists():
-                return f'call "{vcvars}" >NUL'
+                return vcvars
     return None
 
 
+def _find_msvc_cl() -> str | None:
+    """Find cl.exe by setting up MSVC environment via vcvars64.bat.
+
+    Returns a bat preamble string that sets up the environment, or None
+    if MSVC cannot be found.
+    """
+    vcvars = _find_vcvars_bat()
+    if vcvars is not None:
+        return f'call "{vcvars}" >NUL'
+    return None
+
+
+# Cached MSVC environment (in-process). Running vcvars64.bat is slow (~1-2s of
+# environment setup); we do it once, capture the resulting environment, and
+# reuse it to invoke link.exe/cl.exe directly on subsequent calls. This is the
+# single biggest compile-time win — a bare link previously re-ran vcvars every
+# time. A disk cache (keyed on the vcvars path + mtime) extends the win across
+# separate one-shot CLI compiles.
+_MSVC_ENV_CACHE: dict[str, str] | None = None
+_MSVC_ENV_TRIED = False
+
+
+def _msvc_env_cache_file() -> Path:
+    return RUNTIME_DIR / "_msvc_env_cache.json"
+
+
+def _get_msvc_env() -> dict[str, str] | None:
+    """Return a cached environment dict (for subprocess `env=`) that has the
+    MSVC toolchain (link.exe/cl.exe, INCLUDE, LIB, PATH) set up, or None if
+    MSVC can't be found. Runs vcvars64.bat at most once per process.
+    """
+    global _MSVC_ENV_CACHE, _MSVC_ENV_TRIED
+    if _MSVC_ENV_CACHE is not None:
+        return _MSVC_ENV_CACHE
+    if _MSVC_ENV_TRIED:
+        return None
+    _MSVC_ENV_TRIED = True
+
+    vcvars = _find_vcvars_bat()
+    if vcvars is None:
+        return None
+    vcvars_key = str(vcvars.resolve())
+    try:
+        vcvars_mtime = vcvars.stat().st_mtime
+    except OSError:
+        vcvars_mtime = 0.0
+
+    # Try the disk cache first.
+    cache_file = _msvc_env_cache_file()
+    if cache_file.exists():
+        try:
+            import json
+            data = json.loads(cache_file.read_text(encoding="utf-8"))
+            if (data.get("vcvars") == vcvars_key
+                    and data.get("mtime") == vcvars_mtime
+                    and isinstance(data.get("env"), dict)
+                    and data["env"]):
+                _MSVC_ENV_CACHE = {str(k): str(v) for k, v in data["env"].items()}
+                return _MSVC_ENV_CACHE
+        except (ValueError, OSError):
+            pass
+
+    # Run vcvars once and capture the resulting environment via `set`.
+    # Pass a single command *string* (not an argv list) with `cmd /s /c` so
+    # cmd strips exactly the outer quote pair — this is the robust way to run
+    # a quoted batch path followed by `&& set` without cmd mangling quotes.
+    cmd_str = f'cmd.exe /s /c ""{vcvars}" >NUL && set"'
+    try:
+        result = subprocess.run(
+            cmd_str, capture_output=True, text=True, timeout=120,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+
+    env: dict[str, str] = {}
+    for line in result.stdout.splitlines():
+        if "=" in line:
+            key, _, val = line.partition("=")
+            if key:
+                env[key] = val
+    # Sanity check: a valid MSVC env must expose PATH and LIB.
+    keys_upper = {k.upper() for k in env}
+    if "PATH" not in keys_upper or "LIB" not in keys_upper:
+        return None
+
+    _MSVC_ENV_CACHE = env
+    try:
+        import json
+        cache_file.write_text(
+            json.dumps({"vcvars": vcvars_key, "mtime": vcvars_mtime, "env": env}),
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
+    return env
+
+
+def _env_path_value(env: dict[str, str]) -> str:
+    """Extract the PATH value from an env dict, case-insensitively."""
+    for k, v in env.items():
+        if k.upper() == "PATH":
+            return v
+    return ""
+
+
+def _newest_runtime_header_mtime() -> float:
+    """Newest mtime among the runtime's headers.
+
+    Every runtime .c includes some of these, and several of them carry
+    layout-critical declarations (`FpyValue`, `FpyString`, the FPY_EXC_*
+    constants) that the .obj bakes in. Comparing a .c against its .obj alone
+    therefore silently keeps a stale .obj whenever only a header changed — the
+    edit appears to have no effect, which is a miserable thing to debug. Using
+    the newest header in the directory over-rebuilds a little (any header
+    change rebuilds every .obj) and that is the right trade: a runtime build is
+    seconds, and the alternative is trusting a hand-maintained per-file
+    dependency list to stay correct.
+    """
+    newest = 0.0
+    try:
+        for h in RUNTIME_DIR.glob("*.h"):
+            m = h.stat().st_mtime
+            if m > newest:
+                newest = m
+    except OSError:
+        # An unreadable runtime dir is the build's problem, not the cache's;
+        # returning 0 just means "no header constraint".
+        return 0.0
+    return newest
+
+
 def _obj_is_current(src: Path, obj: Path) -> bool:
-    """Check if an object file exists and is newer than its source."""
+    """Check if an object file exists and is newer than its source *and headers*."""
     if not obj.exists():
         return False
-    return obj.stat().st_mtime >= src.stat().st_mtime
+    obj_mtime = obj.stat().st_mtime
+    if obj_mtime < src.stat().st_mtime:
+        return False
+    return obj_mtime >= _newest_runtime_header_mtime()
 
 
 def _compile_shared_runtime_windows(vcvars_cmd: str) -> None:
@@ -685,6 +1007,65 @@ def _compile_bridge_posix(install: PythonInstall) -> Path:
     return out_obj
 
 
+def _compile_shared_runtime_slateos(force: bool = False) -> list[Path]:
+    """Cross-compile the pure-mode C runtime to SlateOS (musl) ELF objects.
+
+    Drives ``zig cc --target=x86_64-linux-musl`` over the pure-mode runtime
+    translation units (``_SLATEOS_RUNTIME_NAMES``), emitting one ``.o`` per
+    source into ``SLATEOS_RUNTIME_DIR``. The compile flags mirror the codegen
+    ABI (static relocation, large code model) and define ``FPY_PURE_MODE`` so
+    the CPython-bridge fallbacks resolve to ``bridge_stub.c`` and the JIT
+    symbol table is compiled out. Objects that are already newer than their
+    source are skipped unless ``force`` is set.
+
+    Returns the list of object paths (in ``_SLATEOS_RUNTIME_NAMES`` order).
+    """
+    zig = _find_zig_cc()
+    if zig is None:
+        raise RuntimeError(
+            "Cannot find `zig` for the SlateOS runtime cross-compile. Install "
+            "zig (it bundles clang + musl), put it on PATH, or set FASTPY_ZIG "
+            "to the zig executable path.")
+
+    SLATEOS_RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+    objs: list[Path] = []
+    for name in _SLATEOS_RUNTIME_NAMES:
+        src = RUNTIME_DIR / f"{name}.c"
+        obj = SLATEOS_RUNTIME_DIR / f"{name}.o"
+        objs.append(obj)
+        if not force and _obj_is_current(src, obj):
+            continue
+        cmd = [
+            str(zig), "cc",
+            f"--target={_SLATEOS_ZIG_TARGET}",
+            "-c", "-O2",
+            "-mcmodel=large",     # match codegen code-model=large
+            "-fno-pic", "-fno-pie",  # match relocation-model=static
+            "-DFPY_PURE_MODE",    # no CPython bridge / no JIT symbol table
+            str(src),
+            "-o", str(obj),
+        ]
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=300,
+            cwd=str(RUNTIME_DIR),
+        )
+        if result.returncode != 0 or not obj.exists():
+            raise RuntimeError(
+                f"Failed to cross-compile {src.name} for SlateOS:\n"
+                f"{result.stdout}\n{result.stderr}")
+    return objs
+
+
+def ensure_slateos_runtime_built(force: bool = False) -> list[Path]:
+    """Ensure the pure-mode SlateOS C runtime objects are built; return paths.
+
+    Public entry point mirroring :func:`ensure_runtime_built` for the SlateOS
+    cross-target. Pure mode has no per-Python-version bridge, so there is a
+    single shared set of objects independent of any ``PythonInstall``.
+    """
+    return _compile_shared_runtime_slateos(force=force)
+
+
 def ensure_runtime_built(python_exe: str | Path | None = None,
                          python_version: str | None = None) -> list[Path]:
     """Ensure the C runtime is compiled for the target Python. Returns list of
@@ -749,7 +1130,44 @@ def ensure_runtime_built(python_exe: str | Path | None = None,
         f"Missing: {', '.join(missing)}")
 
 
-def compile_ir_to_obj(ir_string: str, output_path: Path) -> Path:
+def _make_target_machine(target: str | None):
+    """
+    Build the LLVM `TargetMachine` for a codegen target.
+
+    `target=None` -> host machine (the historical behavior: PIC on POSIX,
+    default relocation on Windows). `target=SLATEOS_TARGET` -> a foreign
+    x86_64 SlateOS-userspace machine using the triple/data-layout/codegen
+    knobs from `toolchain/x86_64-slateos.json` (static relocation, large code
+    model, SSE2), so the emitted object matches the OS's Rust sysroot ABI.
+    """
+    if target is None:
+        # Host codegen. Use PIC relocation on POSIX (required for ASLR and
+        # shared objects); leave Windows at its default.
+        tm = llvm.Target.from_default_triple()
+        return tm.create_target_machine(
+            opt=_BACKEND_OPT_LEVEL,  # -O3 backend codegen (override w/ FASTPY_OPT)
+            reloc="pic" if not IS_WINDOWS else "default",
+            codemodel="default",
+        )
+    if target == SLATEOS_TARGET:
+        tm = llvm.Target.from_triple(_SLATEOS_TRIPLE)
+        return tm.create_target_machine(
+            cpu=_SLATEOS_CPU,
+            features=_SLATEOS_FEATURES,
+            opt=2,
+            # Match x86_64-slateos.json: relocation-model=static,
+            # code-model=large, non-PIE. The SlateOS loader maps userspace
+            # binaries at a fixed base, so static relocation is correct and
+            # avoids needing a PLT/GOT the minimal sysroot doesn't set up.
+            reloc="static",
+            codemodel="large",
+        )
+    raise ValueError(f"Unknown codegen target {target!r}")
+
+
+def compile_ir_to_obj(
+    ir_string: str, output_path: Path, target: str | None = None
+) -> Path:
     """
     Compile LLVM IR text to a native object file.
 
@@ -759,6 +1177,9 @@ def compile_ir_to_obj(ir_string: str, output_path: Path) -> Path:
     Args:
         ir_string: LLVM IR as a string.
         output_path: Path for the output object file.
+        target: Codegen target. `None` (default) emits for the host; pass
+            `SLATEOS_TARGET` to cross-compile an x86_64 SlateOS-userspace
+            object (ELF, ABI-matched to the Rust `x86_64-slateos` sysroot).
 
     Returns:
         Path to the generated object file.
@@ -767,19 +1188,22 @@ def compile_ir_to_obj(ir_string: str, output_path: Path) -> Path:
     mod = llvm.parse_assembly(ir_string)
     mod.verify()
 
-    # Create target machine (backend-level opts)
-    # Use PIC relocation on POSIX (required for ASLR and shared objects)
-    target = llvm.Target.from_default_triple()
-    target_machine = target.create_target_machine(
-        opt=2,  # -O2 backend codegen
-        reloc="pic" if not IS_WINDOWS else "default",
-        codemodel="default",
-    )
+    # For a cross-target, override the module's triple and data layout so the
+    # emitted object is tagged for the foreign platform (the IR text carries
+    # the host's triple/layout from codegen). Both host and target are x86_64
+    # with the standard layout, so this is a re-tag, not an ABI change.
+    if target == SLATEOS_TARGET:
+        mod.triple = _SLATEOS_TRIPLE
+        mod.data_layout = _SLATEOS_DATA_LAYOUT
+
+    # Create target machine (backend-level opts).
+    target_machine = _make_target_machine(target)
 
     # Run IR-level optimization passes (-O2 pipeline).
     # Uses the new LLVM pass manager API (PassBuilder + PipelineTuningOptions).
-    pto = llvm.PipelineTuningOptions(speed_level=2, size_level=0)
-    pto.inlining_threshold = 225  # standard -O2 inlining
+    pto = llvm.PipelineTuningOptions(speed_level=_BACKEND_OPT_LEVEL, size_level=0)
+    # -O3 uses a larger inline threshold (275) than -O2 (225).
+    pto.inlining_threshold = 275 if _BACKEND_OPT_LEVEL >= 3 else 225
     pb = llvm.create_pass_builder(target_machine, pto)
     mpm = pb.getModulePassManager()
     mpm.run(mod, pb)
@@ -793,13 +1217,53 @@ def compile_ir_to_obj(ir_string: str, output_path: Path) -> Path:
 
 
 def _link_windows(obj_files: list[Path], output_path: Path,
-                   install: PythonInstall | None = None) -> Path:
-    """Link object files using MSVC's link.exe (Windows)."""
-    obj_list = " ".join(f'"{p}"' for p in obj_files)
-    out_str = str(output_path)
+                  install: PythonInstall | None = None) -> Path:
+    """Link object files using MSVC's link.exe (Windows).
 
+    Fast path: use the cached MSVC environment (captured once via vcvars) and
+    invoke link.exe directly — this avoids re-running vcvars64.bat (~1-2s) on
+    every link, which dominates compile time. Falls back to the vcvars-batch
+    method if the cached-env path is unavailable or fails.
+    """
     py_lib_dir = _find_python_lib_dir(install)
     py_lib = _find_python_lib_name(install)
+
+    env = _get_msvc_env()
+    if env is not None:
+        import shutil
+        link_exe = shutil.which("link.exe", path=_env_path_value(env))
+        if link_exe:
+            args = [
+                link_exe, "/NOLOGO", f"/OUT:{output_path}",
+                *[str(p) for p in obj_files],
+                f"/LIBPATH:{py_lib_dir}", py_lib,
+                "/DEFAULTLIB:ucrt", "/DEFAULTLIB:msvcrt",
+                "/DEFAULTLIB:legacy_stdio_definitions",
+                "/SUBSYSTEM:CONSOLE", "/STACK:8388608",
+                "/EXPORT:fastpy_get_jit_symbols",
+                "/EXPORT:fastpy_get_jit_symbol_count",
+            ]
+            try:
+                result = subprocess.run(
+                    args, capture_output=True, text=True,
+                    timeout=300, env=env,
+                )
+            except (OSError, subprocess.SubprocessError):
+                result = None
+            if result is not None and result.returncode == 0 \
+                    and output_path.exists():
+                return output_path
+            # Otherwise fall through to the batch fallback below, which
+            # produces a full diagnostic if linking genuinely fails.
+
+    return _link_windows_batch(obj_files, output_path, py_lib_dir, py_lib)
+
+
+def _link_windows_batch(obj_files: list[Path], output_path: Path,
+                        py_lib_dir: Path, py_lib: str) -> Path:
+    """Fallback linker path: set up MSVC via a vcvars batch, then link."""
+    obj_list = " ".join(f'"{p}"' for p in obj_files)
+    out_str = str(output_path)
 
     vcvars_cmd = _find_msvc_cl()
     if vcvars_cmd is None:
@@ -882,25 +1346,122 @@ def _link_posix(obj_files: list[Path], output_path: Path,
     return output_path
 
 
+def _link_slateos(
+    obj_files: list[Path],
+    output_path: Path,
+    entry: str = "_start",
+    sysroot_lib_dir: Path | None = None,
+    libs: list[str] | None = None,
+) -> Path:
+    """
+    Link object files into a SlateOS-userspace ELF executable via rust-lld.
+
+    This is the foreign-target counterpart of `_link_windows`/`_link_posix`.
+    Instead of the host's MSVC/cc driver it invokes `rust-lld` in GNU/ELF
+    flavor — the same LLVM linker the OS repo uses for its `x86_64-slateos`
+    userspace — so the resulting binary matches that sysroot's ABI.
+
+    The link is static and non-PIE with no dynamic linker, matching
+    `toolchain/x86_64-slateos.json` (relocation-model=static, crt-static,
+    the loader maps userspace at a fixed base). Pure-mode fastpy programs
+    (no CPython bridge) link their own objects plus the fastpy C runtime
+    objects and the sysroot `libc.a`.
+
+    Args:
+        obj_files: Object files to link (fastpy program + runtime objects).
+        output_path: Path for the output ELF executable.
+        entry: Entry symbol. Defaults to ``_start`` — the real ELF entry, which
+            the sysroot ``libc.a`` provides (crt0: ``_start`` →
+            ``__libc_start_main`` retrieves argv/envp from the kernel, inits
+            environ/signals, runs ELF constructors, calls ``main``, then
+            ``exit``s with its return value). Setting the entry to ``_start``
+            pulls that crt member out of the archive. Pass ``"main"`` only to
+            link a bare object with no crt (e.g. the low-level plumbing test).
+        sysroot_lib_dir: Optional directory added to the linker search path
+            (e.g. the OS repo's ``toolchain/sysroot/lib`` holding ``libc.a``).
+        libs: Optional archive names to link (e.g. ``["c"]`` for ``libc.a``).
+
+    Returns:
+        Path to the generated executable.
+    """
+    lld = _find_rust_lld()
+    if lld is None:
+        raise RuntimeError(
+            "Cannot find rust-lld for the SlateOS link step. Install a Rust "
+            "toolchain (it bundles rust-lld) or set FASTPY_RUST_LLD to the "
+            "linker path.")
+
+    cmd: list[str] = [
+        str(lld),
+        "-flavor", _SLATEOS_LLD_FLAVOR,
+        "-static",            # crt-static: no dynamic loader on SlateOS
+        "--no-dynamic-linker",
+        "-e", entry,          # SlateOS loader jumps to this entry symbol
+        "-o", str(output_path),
+    ]
+    cmd += [str(p) for p in obj_files]
+    if sysroot_lib_dir is not None:
+        cmd.append(f"-L{sysroot_lib_dir}")
+    for lib in libs or []:
+        cmd.append(f"-l{lib}")
+
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"SlateOS link failed:\n{result.stdout}\n{result.stderr}")
+    if not output_path.exists():
+        raise RuntimeError(
+            f"SlateOS link appeared to succeed but {output_path} not found.\n"
+            f"stdout: {result.stdout}\nstderr: {result.stderr}")
+    return output_path
+
+
 def link_executable(
     obj_files: list[Path],
     output_path: Path,
     install: PythonInstall | None = None,
+    target: str | None = None,
 ) -> Path:
     """
     Link object files into a native executable.
 
     On Windows, uses MSVC link.exe. On Linux/macOS, uses cc (gcc/clang).
+    With ``target=SLATEOS_TARGET``, cross-links a SlateOS-userspace ELF via
+    rust-lld instead (see `_link_slateos`); the host CPython is not linked.
 
     Args:
         obj_files: List of object files to link.
         output_path: Path for the output executable.
         install: PythonInstall to link against. If None, uses current Python.
+            Ignored for the SlateOS target (pure-mode, no CPython bridge).
+        target: Link target. ``None`` (default) links a host executable; pass
+            ``SLATEOS_TARGET`` to cross-link a SlateOS ELF.
 
     Returns:
         Path to the generated executable.
     """
     output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if target == SLATEOS_TARGET:
+        # Pure-mode SlateOS link: program objects + cross-compiled fastpy
+        # runtime objects, resolved against the OS repo's static libc.a. The
+        # runtime is built on demand (cached under SLATEOS_RUNTIME_DIR).
+        runtime_objs = ensure_slateos_runtime_built()
+        sysroot_lib = _find_slateos_sysroot_lib()
+        if sysroot_lib is None:
+            raise RuntimeError(
+                "Cannot find the SlateOS sysroot libc.a. Set "
+                "FASTPY_SLATEOS_SYSROOT to the sysroot directory (holding "
+                "lib/libc.a), or check out the OS repo as a sibling of fastpy "
+                "(../os/toolchain/sysroot/lib).")
+        return _link_slateos(
+            list(obj_files) + runtime_objs,
+            output_path,
+            sysroot_lib_dir=sysroot_lib,
+            libs=["c"],
+        )
+    if target is not None:
+        raise ValueError(f"Unknown link target {target!r}")
 
     if IS_WINDOWS:
         return _link_windows(obj_files, output_path, install)

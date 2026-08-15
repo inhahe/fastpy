@@ -12,6 +12,13 @@ Three possible outcomes for each test:
 
 A SKIP is expected while the compiler is under development. A FAIL is
 always a bug — either in the compiler or in the test.
+
+One important exception to "a compile failure is a SKIP": an **LLVM verifier**
+error is not an unsupported feature, it is invalid IR that codegen should never
+have emitted, and no amount of feature work will turn it into a PASS. Those are
+classified as FAIL — see `_VERIFIER_ERROR_SIGNS` / `_is_verifier_error`. This
+matters: BUG-DECREF-DOES-NOT-DOMINATE sat green in the suite as a SKIP for a
+long time precisely because it was indistinguishable from "not implemented yet".
 """
 
 from __future__ import annotations
@@ -20,6 +27,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -31,6 +39,46 @@ if str(_PROJECT_ROOT) not in sys.path:
 from compiler.pipeline import compile_source, CompileResult
 
 
+# Wall-clock budget for one differential test: the CPython reference run and
+# the compiled binary each get this long. It bounds a genuine hang (an
+# infinite loop in generated code) without being tight enough to fire on a
+# busy machine — the slowest legitimate file in the suite runs in ~2 s, so
+# this is a 15x margin, and on a green run the headroom costs nothing because
+# nothing waits on it. It used to be 10 s, which was enough for a full run
+# under load to fail a test that passed standalone seconds later.
+# BUG-SUITE-DEFAULT-TIMEOUT-FLAKES-UNDER-LOAD.
+DEFAULT_TIMEOUT = 30.0
+
+
+# Substrings that identify an LLVM *verifier* rejection rather than a fastpy
+# "feature not supported" message. Invalid IR is always a codegen bug, so these
+# are reported as FAIL instead of being absorbed into the SKIP bucket.
+_VERIFIER_ERROR_SIGNS = (
+    "does not dominate all uses",
+    "Broken module found",
+    "Instruction referencing instruction not embedded in a basic block",
+    "PHI node entries do not match predecessors",
+    "Invalid operand types",
+    "Basic Block does not have terminator",
+    "Terminator found in the middle of a basic block",
+    "Instruction does not dominate",
+)
+
+
+def _is_verifier_error(compile_result: CompileResult) -> bool:
+    """True when a failed compile was rejected by the LLVM verifier.
+
+    A verifier error means codegen emitted structurally invalid IR — a
+    different category from "this Python feature isn't implemented yet" — so
+    the caller must surface it as a failure, never as a skip.
+    """
+    for err in getattr(compile_result, "errors", None) or ():
+        msg = getattr(err, "message", None) or str(err)
+        if any(sign in msg for sign in _VERIFIER_ERROR_SIGNS):
+            return True
+    return False
+
+
 @dataclass
 class RunResult:
     """Output captured from running a program."""
@@ -38,6 +86,11 @@ class RunResult:
     stderr: str
     exit_code: int
     timed_out: bool = False
+    # Wall-clock seconds the process ran for. Reported on a timeout so the
+    # next occurrence separates "this hung" from "this was merely slow":
+    # a program that normally finishes in 0.1 s and burned the whole budget
+    # is an infinite loop, one that took 29.9 s of a 30 s budget is load.
+    duration: float = 0.0
 
 
 @dataclass
@@ -74,6 +127,16 @@ class DiffResult:
         """Multi-line detail for failure diagnosis."""
         lines = [self.summary()]
         if self.failed:
+            # A killed process has no output to diff, so dumping "(empty)"
+            # against CPython's stdout would bury the one fact that matters
+            # — which the summary line already states.
+            if self.compiled is not None and self.compiled.timed_out:
+                return "\n".join(lines)
+            # A failure with no compiled run is an invalid-IR rejection: the
+            # compiler errors are the whole story.
+            if self.compiled is None and self.compile_result:
+                for err in self.compile_result.errors:
+                    lines.append(f"  {err}")
             if self.cpython and self.compiled:
                 if self.cpython.stdout != self.compiled.stdout:
                     lines.append("--- CPython stdout ---")
@@ -96,12 +159,13 @@ class DiffResult:
         return "\n".join(lines)
 
 
-def run_cpython(source: str, timeout: float = 10.0) -> RunResult:
+def run_cpython(source: str, timeout: float = DEFAULT_TIMEOUT) -> RunResult:
     """
     Run a Python source string under CPython and capture output.
 
     Uses the same Python interpreter that's running the test suite.
     """
+    started = time.monotonic()
     try:
         proc = subprocess.run(
             [sys.executable, "-c", source],
@@ -116,6 +180,7 @@ def run_cpython(source: str, timeout: float = 10.0) -> RunResult:
             stdout=proc.stdout,
             stderr=proc.stderr,
             exit_code=proc.returncode,
+            duration=time.monotonic() - started,
         )
     except subprocess.TimeoutExpired:
         return RunResult(
@@ -123,11 +188,13 @@ def run_cpython(source: str, timeout: float = 10.0) -> RunResult:
             stderr="Timed out",
             exit_code=-1,
             timed_out=True,
+            duration=time.monotonic() - started,
         )
 
 
-def run_executable(exe_path: Path, timeout: float = 10.0) -> RunResult:
+def run_executable(exe_path: Path, timeout: float = DEFAULT_TIMEOUT) -> RunResult:
     """Run a compiled executable and capture output."""
+    started = time.monotonic()
     try:
         # Ensure Python DLLs (python3XX.dll) are on PATH for the compiled
         # executable, which links against the CPython bridge.
@@ -147,6 +214,7 @@ def run_executable(exe_path: Path, timeout: float = 10.0) -> RunResult:
             stdout=proc.stdout,
             stderr=proc.stderr,
             exit_code=proc.returncode,
+            duration=time.monotonic() - started,
         )
     except subprocess.TimeoutExpired:
         return RunResult(
@@ -154,7 +222,37 @@ def run_executable(exe_path: Path, timeout: float = 10.0) -> RunResult:
             stderr="Timed out",
             exit_code=-1,
             timed_out=True,
+            duration=time.monotonic() - started,
         )
+
+
+def _runtime_stderr(stderr: str) -> str:
+    """Drop CPython's *compile-time* warnings from a stderr capture.
+
+    The reference interpreter emits SyntaxWarning while compiling the source
+    — `'return' in a 'finally' block`, an invalid escape sequence, `is` with
+    a literal.  Those say something about the source text under one
+    particular CPython version, not about what the program does, and fastpy
+    is a different compiler with its own diagnostics.  A test that exercises
+    a warned-about-but-legal construct would otherwise be permanently
+    unrunnable, so the warning and the source line it echoes are removed
+    before the presence check.  Anything the program itself writes to stderr
+    — including warnings raised at *run* time — is left alone.
+    """
+    out: list[str] = []
+    skip_echo = False
+    for line in stderr.splitlines(True):
+        if "SyntaxWarning:" in line:
+            # `file:line: SyntaxWarning: msg` is followed by the offending
+            # source line, indented.
+            skip_echo = True
+            continue
+        if skip_echo:
+            skip_echo = False
+            if line[:1].isspace():
+                continue
+        out.append(line)
+    return "".join(out)
 
 
 def _parse_compile_flags(source: str) -> dict:
@@ -188,7 +286,7 @@ def _parse_compile_flags(source: str) -> dict:
 
 def diff_test(
     source: str,
-    timeout: float = 10.0,
+    timeout: float = DEFAULT_TIMEOUT,
 ) -> DiffResult:
     """
     Run the full differential test for a Python source string.
@@ -213,6 +311,14 @@ def diff_test(
     compile_result = compile_source(source, **extra_kwargs)
 
     if not compile_result.success:
+        # Invalid IR is a codegen bug, not a missing feature — never a skip.
+        if _is_verifier_error(compile_result):
+            return DiffResult(
+                status="fail",
+                reason="Codegen emitted invalid IR (LLVM verifier rejected it)",
+                cpython=cpython_result,
+                compile_result=compile_result,
+            )
         # Compiler can't handle this yet — that's a skip, not a failure
         return DiffResult(
             status="skip",
@@ -233,7 +339,28 @@ def diff_test(
     except OSError:
         pass
 
-    # Step 4: Compare outputs
+    # Step 4: Compare outputs.
+    #
+    # A timed-out binary is reported as a timeout, before the generic diff
+    # gets to describe it as "stdout differs; exit code: ..." — which is what
+    # a killed process looks like (no output, exit code -1) and is why the
+    # last occurrence cost a bisect to identify. CPython finished, so the
+    # program itself terminates; either codegen produced a loop that does
+    # not, or the machine was too busy to finish it inside the budget.
+    # BUG-SUITE-DEFAULT-TIMEOUT-FLAKES-UNDER-LOAD.
+    if compiled_result.timed_out:
+        return DiffResult(
+            status="fail",
+            reason=(
+                f"compiled program timed out after {timeout:g}s "
+                f"(CPython finished the same program in "
+                f"{cpython_result.duration:.2f}s)"
+            ),
+            cpython=cpython_result,
+            compiled=compiled_result,
+            compile_result=compile_result,
+        )
+
     differences: list[str] = []
 
     if cpython_result.stdout != compiled_result.stdout:
@@ -247,8 +374,8 @@ def diff_test(
 
     # We compare stderr loosely — only flag it if one has stderr and the
     # other doesn't, because exact error messages may differ
-    cpython_has_err = bool(cpython_result.stderr.strip())
-    compiled_has_err = bool(compiled_result.stderr.strip())
+    cpython_has_err = bool(_runtime_stderr(cpython_result.stderr).strip())
+    compiled_has_err = bool(_runtime_stderr(compiled_result.stderr).strip())
     if cpython_has_err != compiled_has_err:
         differences.append("stderr presence differs")
 
@@ -270,7 +397,7 @@ def diff_test(
     )
 
 
-def diff_test_file(path: Path, timeout: float = 10.0) -> DiffResult:
+def diff_test_file(path: Path, timeout: float = DEFAULT_TIMEOUT) -> DiffResult:
     """Run the differential test on a Python source file."""
     source = path.read_text(encoding="utf-8")
     return diff_test(source, timeout)

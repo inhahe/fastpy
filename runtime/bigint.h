@@ -38,9 +38,23 @@ FpyBigInt* fpy_bigint_sub(FpyBigInt *a, FpyBigInt *b);
 FpyBigInt* fpy_bigint_mul(FpyBigInt *a, FpyBigInt *b);
 FpyBigInt* fpy_bigint_floordiv(FpyBigInt *a, FpyBigInt *b);
 FpyBigInt* fpy_bigint_mod(FpyBigInt *a, FpyBigInt *b);
+/* a / b as a double, correctly rounded.  Returns 0 on success, 1 for a zero
+ * divisor, 2 when the quotient is out of double range; the caller raises. */
+int fpy_bigint_truediv(FpyBigInt *a, FpyBigInt *b, double *out);
+/* a as a double, correctly rounded.  Returns 0, or 2 if out of double range. */
+int fpy_bigint_to_double(FpyBigInt *a, double *out);
+int64_t fpy_bigint_bit_length(FpyBigInt *a);
 FpyBigInt* fpy_bigint_pow(FpyBigInt *base, FpyBigInt *exp);
 FpyBigInt* fpy_bigint_neg(FpyBigInt *a);
 FpyBigInt* fpy_bigint_abs(FpyBigInt *a);
+
+/* Bitwise / shift (Python two's-complement / floor semantics).
+ * For shifts, `b` is the shift count (as a BigInt). */
+FpyBigInt* fpy_bigint_and(FpyBigInt *a, FpyBigInt *b);
+FpyBigInt* fpy_bigint_or(FpyBigInt *a, FpyBigInt *b);
+FpyBigInt* fpy_bigint_xor(FpyBigInt *a, FpyBigInt *b);
+FpyBigInt* fpy_bigint_lshift(FpyBigInt *a, FpyBigInt *b);
+FpyBigInt* fpy_bigint_rshift(FpyBigInt *a, FpyBigInt *b);
 
 /* Comparison: returns -1, 0, or 1 */
 int fpy_bigint_cmp(FpyBigInt *a, FpyBigInt *b);
@@ -60,5 +74,6 @@ int64_t fpy_checked_add(int64_t a, int64_t b, FpyBigInt **big);
 int64_t fpy_checked_sub(int64_t a, int64_t b, FpyBigInt **big);
 int64_t fpy_checked_mul(int64_t a, int64_t b, FpyBigInt **big);
 int64_t fpy_checked_pow(int64_t base, int64_t exp, FpyBigInt **big);
+int64_t fpy_checked_lshift(int64_t a, int64_t b, FpyBigInt **big);
 
 #endif /* FASTPY_BIGINT_H */

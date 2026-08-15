@@ -11,3 +11,35 @@ __pycache__/
 .build/
 web/venv*/
 *.egg-info/
+# Cross-compiled SlateOS runtime objects (build artifacts, regenerated on demand)
+runtime/slateos/
+
+# Cached MSVC environment (machine-specific absolute paths; regenerated on demand)
+runtime/_msvc_env_cache.json
+
+# Benchmark snapshots written by benchmarks/bench_fastpy_only.py
+benchmarks/_bench_*.json
+
+# Idle-probe artifacts (machine-local benchmark runs)
+benchmarks/_probe.log
+benchmarks/_probe_status.json
+benchmarks/_probe_report.md
+benchmarks/_probe_stdout.log
+benchmarks/_probe_pid.txt
+
+# stable_bench.py / ab_bench.py results and the exes they build to compare
+benchmarks/_stable_*.json
+benchmarks/_ab_*.json
+benchmarks/_ab_exes/
+
+# _tls_experiment.py scratch: built variants and dumped IR
+benchmarks/_tls_exes/
+benchmarks/_dict_ir.ll
+benchmarks/_dist_ir.ll
+
+# Compile-and-run probes: a throwaway .py is compiled here and its stdout
+# diffed against CPython's.  The probe itself is scratch -- the ones worth
+# keeping graduate to tests/regressions/ -- but its dumped IR and captured
+# output are pure artifacts and never belong in a commit.
+benchmarks/_probe*.ll
+benchmarks/*.out

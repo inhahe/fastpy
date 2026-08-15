@@ -166,6 +166,137 @@ int main() {
 }
 """)
 
+# Iterating a dict or a set is a different code path from looking one up:
+# `_emit_for_dict` has to decide, at compile time, what kind of value the loop
+# variable holds, and that decision is what these three measure.  The suite had
+# no coverage of it at all until an A/B run needed to answer "did making the
+# unprovable cases dynamic cost anything?" and found nothing to measure.
+# int keys and str keys are separate benchmarks because they reach the loop
+# body through different tag paths, and a set is separate again.
+
+bench("dict iterate 100K x 20", "common", """
+d = {}
+i = 0
+while i < 100000:
+    d[i] = i
+    i = i + 1
+total = 0
+r = 0
+while r < 20:
+    for k in d:
+        total = total + k
+    r = r + 1
+print(total)
+""", """
+#include <stdio.h>
+#include <stdint.h>
+#include <unordered_map>
+int main() {
+    std::unordered_map<int64_t, int64_t> d;
+    for (int64_t i = 0; i < 100000; i++) d[i] = i;
+    int64_t total = 0;
+    for (int r = 0; r < 20; r++)
+        for (const auto &kv : d) total += kv.first;
+    printf("%lld\\n", (long long)total);
+    return 0;
+}
+""")
+
+bench("set iterate 100K x 20", "common", """
+s = set()
+i = 0
+while i < 100000:
+    s.add(i)
+    i = i + 1
+total = 0
+r = 0
+while r < 20:
+    for e in s:
+        total = total + e
+    r = r + 1
+print(total)
+""", """
+#include <stdio.h>
+#include <stdint.h>
+#include <unordered_set>
+int main() {
+    std::unordered_set<int64_t> s;
+    for (int64_t i = 0; i < 100000; i++) s.insert(i);
+    int64_t total = 0;
+    for (int r = 0; r < 20; r++)
+        for (int64_t e : s) total += e;
+    printf("%lld\\n", (long long)total);
+    return 0;
+}
+""")
+
+# Building a set *from* something is a third path again, and one that had no
+# coverage until BUG-SET-UPDATE-NON-SET-ITERABLE-SEGFAULTS moved it onto a
+# runtime tag dispatch.  It is the shape where a coercion that copies its
+# argument first would cost real time and no test would notice, since a copy is
+# only slower, never wrong.  `set(xs)` and `s.update(xs)` share that coercion,
+# so measuring one measures both.
+
+bench("set from list 100K x 20", "common", """
+xs = []
+i = 0
+while i < 100000:
+    xs.append(i)
+    i = i + 1
+total = 0
+r = 0
+while r < 20:
+    s = set(xs)
+    total = total + len(s)
+    r = r + 1
+print(total)
+""", """
+#include <stdio.h>
+#include <stdint.h>
+#include <vector>
+#include <unordered_set>
+int main() {
+    std::vector<int64_t> xs;
+    for (int64_t i = 0; i < 100000; i++) xs.push_back(i);
+    int64_t total = 0;
+    for (int r = 0; r < 20; r++) {
+        std::unordered_set<int64_t> s(xs.begin(), xs.end());
+        total += (int64_t)s.size();
+    }
+    printf("%lld\\n", (long long)total);
+    return 0;
+}
+""")
+
+bench("str-key dict iterate 20K x 20", "common", """
+d = {}
+i = 0
+while i < 20000:
+    d["k" + str(i)] = i
+    i = i + 1
+n = 0
+r = 0
+while r < 20:
+    for k in d:
+        n = n + len(k)
+    r = r + 1
+print(n)
+""", """
+#include <stdio.h>
+#include <stdint.h>
+#include <string>
+#include <unordered_map>
+int main() {
+    std::unordered_map<std::string, int64_t> d;
+    for (int i = 0; i < 20000; i++) d["k" + std::to_string(i)] = i;
+    int64_t n = 0;
+    for (int r = 0; r < 20; r++)
+        for (const auto &kv : d) n += (int64_t)kv.first.size();
+    printf("%lld\\n", (long long)n);
+    return 0;
+}
+""")
+
 bench("string concat 100K", "common", """
 parts = []
 i = 0

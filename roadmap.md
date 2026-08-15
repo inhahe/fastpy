@@ -222,7 +222,14 @@ coefficient + exponent. Supports Decimal(str), Decimal(int), arithmetic
 ~~Object-oriented filesystem paths.~~ Implemented: Path construction, `/` operator,
 `.name`, `.parent`, `.suffix`, `.stem`, `.exists()`, `.is_file()`, `.is_dir()`,
 `.resolve()`, `.read_text()`, `.write_text()`, `.iterdir()`, `.with_suffix()`,
-`.joinpath()`. Path is stored as a string pointer with "path" type tag.
+`.joinpath()`, `Path.cwd()`. `.iterdir()` is typed `list[Path]` — both runtimes
+materialize the listing into an `FpyList*` of OBJ-tagged Paths.
+
+Representation: a Path is an opaque pointer carrying the "path" type tag. In
+host/bridge builds that is a `PyObject*`; in pure mode (`runtime/pathlib_pure.c`,
+no CPython) it is an `FpyPurePath` header block whose text lives at offset 40 —
+past the offsets the OBJ refcount dispatcher blind-probes for object magics.
+Path text is therefore never at offset 0; reach it via `fastpy_path_as_cstr()`.
 
 ### 17. ~~Linux/macOS support~~ ✅ DONE
 ~~Clang/GCC build scripts for the runtime.~~ Implemented:
