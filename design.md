@@ -1075,6 +1075,35 @@ tag. Only the statically-dispatched operations — `==`, arithmetic, `len` — w
 wrong, which is why it hid: nothing crashed and nothing printed oddly, the
 answers were just false.
 
+**An attribute records a type, not which of two buckets it fell into.**
+`_class_container_attrs` held, per class, two *sets of attribute names* —
+`list_attrs` and `dict_attrs` — which can answer only "is this attribute
+list-ish?" and "is it dict-ish?". Two name-sets cannot spell "tuple" and cannot
+carry an element kind, so both halves of the same wound followed:
+`self.t = ("a", [1, 2, 3])` was in neither bucket and `a.t[1]` fell through to
+the loaded i64 (INT), which made `for v in a.t[1]` take the native list loop
+over an FpyValue and segfault; and `self.items = items` in `__init__` reached
+the list bucket but arrived with no element kind, so `len(b.items[1])` measured
+a pointer. `_class_attr_vtypes` (class -> attr -> `ValueType`) is now the
+truth, and the two sets survive as the coarse views their older call sites ask
+for. **An attr absent from the map means "no information", not "not a
+container"** — every consumer must fall back rather than conclude, which is
+what lets the map be added without auditing all of them.
+
+Widening `list_attrs` to include tuples is the one-token version of this fix
+and is wrong: `list()` asks `_is_list_expr` in order to *skip* a conversion, so
+a tuple attribute answering "yes" makes `list(p.pos)` hand the tuple straight
+back. Recording a type is what lets `_is_tuple_expr` say yes while
+`_is_list_expr` says no. Two further hazards of the general kind described just
+above came out with it — an *allowlist* of believed kinds in `_infer_type_tag`'s
+subscript arm (`LIST, STR, DICT, OBJ, TUPLE, FLOAT`, silently dropping MIXED
+and every kind added after it was written, inverted to "believe it unless it is
+the INT/UNKNOWN default"), and three consumers that asked only about lists
+where a tuple behaves identically. The last of those had been quietly wrong all
+along and only started answering out loud once tuple attributes became visible:
+indexing a tuple *of dicts* fell to the str path and read the dict's own
+pointer as characters.
+
 **One classifier for a list literal, wherever it appears.** Three CSA scans
 independently answered "what is the tag of this list literal?" — `_build_local_vt`
 for function locals, `_csa_build_var_types` for module globals, and the

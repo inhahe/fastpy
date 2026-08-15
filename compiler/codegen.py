@@ -1384,6 +1384,17 @@ class CodeGen:
         # Maps class name -> (list_attrs, dict_attrs)
         self._class_container_attrs: dict[str, tuple[set[str], set[str]]] = {}
 
+        # Per-class attribute *types*: class name -> attr -> ValueType.
+        # `_class_container_attrs` above can answer only "is this attr a list?"
+        # and "is this attr a dict?", which cannot distinguish a tuple from a
+        # list (so `for v in c.t[1]` crashed while the list spelling worked)
+        # and cannot carry an element kind (so `self.data = data` in __init__
+        # left `c.data[1]` at the INT default).  This map is the truth; the two
+        # sets remain as the coarse yes/no views the older call sites ask for.
+        # An attr absent from here means "no information", not "not a
+        # container" — consumers must fall back rather than conclude.
+        self._class_attr_vtypes: dict[str, dict[str, 'ValueType']] = {}
+
         # Per-class float/string/bool/int attribute detection (including inherited attrs)
         self._per_class_float_attrs: dict[str, set[str]] = {}
         self._per_class_string_attrs: dict[str, set[str]] = {}
@@ -8500,9 +8511,17 @@ class CodeGen:
                         arg_types.append(None)
                 elif isinstance(arg, ast.JoinedStr):
                     arg_types.append("str")
-                elif isinstance(arg, ast.List):
+                elif isinstance(arg, (ast.List, ast.Tuple)):
                     # One classifier for every element kind, rather than a
                     # first-element guess that named three of them.
+                    # `ast.Tuple` belongs here for the same reason it belongs
+                    # in the other five copies of this classifier: without it
+                    # `C(("a", [1, 2, 3]))` passed no type at all, so
+                    # `self.t = t` in `__init__` recorded nothing and
+                    # `for v in c.t[1]:` segfaulted — while the list spelling
+                    # of the same call was correct.  `_csa_list_literal_tag`
+                    # has answered for tuples since BUG-TUPLE-RETURN-SEGFAULTS;
+                    # this call site was simply still asking only about lists.
                     arg_types.append(self._csa_list_literal_tag(
                         arg, {**var_types, **_local_vt}))
                 elif isinstance(arg, ast.Dict):
@@ -11536,7 +11555,13 @@ class CodeGen:
             for i, pname in enumerate(param_names):
                 if i < len(call_types) and call_types[i] is not None:
                     _ct_kind = self._tag_kind(call_types[i])
-                    if _ct_kind == VKind.LIST:
+                    if _ct_kind in _LIST_LIKE:
+                        # `_LIST_LIKE`, not `VKind.LIST`.  `list_vars` here
+                        # already means "container-like" — the DICT and SET
+                        # arms below both add to it — so a tuple parameter
+                        # belongs and its omission was an oversight, not a
+                        # policy.  It became reachable the moment the call
+                        # argument classifier learned to tag tuple literals.
                         list_vars.add(pname)
                     elif _ct_kind == VKind.DICT:
                         list_vars.add(pname)
@@ -11841,7 +11866,8 @@ class CodeGen:
                         pidx = param_names.index(n.value.value.id)
                         if (pidx < len(call_types)
                                 and call_types[pidx] is not None
-                                and self._tag_kind(call_types[pidx]) == VKind.LIST):
+                                and self._tag_kind(call_types[pidx])
+                                    in _LIST_LIKE):
                             ret_type = i8_ptr
                             break
                     # str + str, str * int, list + list, etc. → ptr return
@@ -16192,6 +16218,10 @@ class CodeGen:
                 list_attrs |= s_list
                 dict_attrs |= s_dict
                 self._class_container_attrs[class_name] = (list_attrs, dict_attrs)
+            if sec_base in self._class_attr_vtypes:
+                _sec = dict(self._class_attr_vtypes[sec_base])
+                _sec.update(self._class_attr_vtypes.get(class_name, {}))
+                self._class_attr_vtypes[class_name] = _sec
             self._per_class_float_attrs[class_name] |= self._per_class_float_attrs.get(sec_base, set())
             self._per_class_string_attrs[class_name] |= self._per_class_string_attrs.get(sec_base, set())
             self._per_class_bool_attrs[class_name] |= self._per_class_bool_attrs.get(sec_base, set())
@@ -16522,6 +16552,13 @@ class CodeGen:
             p_list, p_dict = self._class_container_attrs[parent_name]
             list_attrs |= p_list
             dict_attrs |= p_dict
+        if parent_name and parent_name in self._class_attr_vtypes:
+            # Inherit the parent's attr types, but never overwrite the child's
+            # own — a subclass that reassigns `self.items` in its `__init__`
+            # has the more specific answer.
+            _inherited = dict(self._class_attr_vtypes[parent_name])
+            _inherited.update(self._class_attr_vtypes.get(class_name, {}))
+            self._class_attr_vtypes[class_name] = _inherited
         self._class_container_attrs[class_name] = (list_attrs, dict_attrs)
 
         self._dcl_emit_class_var_globals(node, class_name)
@@ -16908,6 +16945,7 @@ class CodeGen:
         dict_attrs: set[str] = set()
         obj_attrs: set[str] = set()
         obj_attr_types: dict[str, str] = {}
+        attr_vtypes: dict[str, ValueType] = {}
         lookup_name = cname if cname is not None else node.name
 
         # Find __init__ to analyze param → attr relationships
@@ -17031,6 +17069,17 @@ class CodeGen:
                         if (isinstance(tgt, ast.Attribute)
                                 and isinstance(tgt.value, ast.Name)
                                 and tgt.value.id == "self"):
+                            # Record the attribute's *type* alongside the
+                            # coarse list/dict buckets below.  The buckets
+                            # cannot spell "tuple" and cannot carry an element
+                            # kind; this map can, and consumers that need
+                            # either consult it first.  Only container
+                            # literals are recorded — anything else stays
+                            # absent, i.e. "no information".
+                            _av = self._attr_vtype_of(n.value, method,
+                                                      lookup_name)
+                            if _av is not None:
+                                attr_vtypes[tgt.attr] = _av
                             if isinstance(n.value, (ast.List, ast.ListComp, ast.Set)):
                                 list_attrs.add(tgt.attr)
                             # [x] * N or [x, y] * N → list attribute
@@ -17275,7 +17324,51 @@ class CodeGen:
             self._class_obj_attrs[lookup_name] = obj_attrs
         if obj_attr_types:
             self._class_obj_attr_types[lookup_name] = obj_attr_types
+        if attr_vtypes:
+            self._class_attr_vtypes.setdefault(
+                lookup_name, {}).update(attr_vtypes)
         return list_attrs, dict_attrs
+
+    def _attr_vtype_of(self, value: ast.expr, method: ast.FunctionDef,
+                       cls_name: str) -> 'ValueType | None':
+        """The full type of a container assigned to `self.attr`, or None.
+
+        `_class_container_attrs` records a *bucket* (list-ish / dict-ish) per
+        attribute.  A bucket cannot say "tuple, whose elements are lists", so
+        an attribute holding a tuple was invisible to `_is_tuple_expr` and an
+        attribute holding any container had its element kind defaulted to INT.
+        This answers with a `ValueType` instead, and declines (None) rather
+        than guessing, so an absent entry means "ask the old sets".
+        """
+        if isinstance(value, (ast.List, ast.ListComp)):
+            return ValueType(VKind.LIST,
+                             elem_type=self._infer_list_elem_type(value))
+        if isinstance(value, ast.Tuple):
+            return ValueType(VKind.TUPLE,
+                             elem_type=self._infer_list_elem_type(value))
+        if isinstance(value, (ast.Set, ast.SetComp)):
+            return ValueType(VKind.SET)
+        if isinstance(value, (ast.Dict, ast.DictComp)):
+            return ValueType(VKind.DICT)
+        # `self.attr = param` — the parameter's type is only known from the
+        # call sites, and it is the shape that loses the element kind today
+        # (BUG-CTOR-PARAM-CONTAINER-ATTR-ELEM-KIND-LOST).  `_call_site_param_types`
+        # holds a tag string, which `from_old_tag` parses into exactly the
+        # ValueType wanted here, element kind included.
+        if isinstance(value, ast.Name):
+            _params = [a.arg for a in method.args.args]
+            if value.id in _params:
+                _pidx = _params.index(value.id) - 1  # skip self
+                _csa = self._call_site_param_types
+                _ct = (_csa.get(cls_name, [])
+                       or _csa.get(f"{cls_name}.__init__", []))
+                if 0 <= _pidx < len(_ct) and _ct[_pidx]:
+                    _vt = _ct[_pidx]
+                    if not isinstance(_vt, ValueType):
+                        _vt = ValueType.from_old_tag(str(_vt))
+                    if _vt.kind in _LIST_LIKE or _vt.kind in _DICT_LIKE:
+                        return _vt
+        return None
 
     def _detect_class_string_attrs(self, node: ast.ClassDef,
                                     cname: str | None = None) -> set[str]:
@@ -22365,6 +22458,13 @@ class CodeGen:
                 if node.attr in _path_path_attrs:
                     return ValueType(VKind.PATH)
             obj_cls = self._infer_object_class(node.value)
+            # The recorded type first: it distinguishes a tuple from a list and
+            # carries the element kind, both of which the two buckets below
+            # discard — `list_attrs` answers `elem_type=INT` for every list
+            # attribute whatever it holds.
+            _avt = self._lookup_attr_vtype(obj_cls, node.attr)
+            if _avt is not None:
+                return _avt
             if obj_cls and obj_cls in self._class_container_attrs:
                 list_attrs, dict_attrs = self._class_container_attrs[obj_cls]
                 if node.attr in list_attrs:
@@ -22558,11 +22658,18 @@ class CodeGen:
             elem = self._get_list_elem_type(node.value)
             if not isinstance(elem, ValueType):
                 elem = ValueType.from_old_tag(elem)
-            if elem.kind == VKind.LIST:
+            # An enumeration of "kinds we believe" is the shape that keeps
+            # losing a kind here — it listed LIST, STR, DICT, OBJ, TUPLE and
+            # FLOAT, and so silently dropped MIXED, BYTES, BIGINT, SET, DEQUE
+            # and every kind added after it was written.  MIXED is the one
+            # that crashed: `self.t = ("a", [1, 2, 3])` gives a `tuple:mixed`
+            # attribute, `c.t[1]` fell through to the loaded i64 (INT), and
+            # `for v in c.t[1]:` chose the native list loop over an FpyValue.
+            # Inverted: believe the recorded element kind unless it is the one
+            # that *is* the default, so "no information" still falls through
+            # to `_llvm_type_tag` exactly as before.
+            if elem.kind not in (VKind.INT, VKind.UNKNOWN):
                 return elem  # compound: list:float stays as ValueType
-            if elem.kind in (VKind.STR, VKind.DICT, VKind.OBJ, VKind.TUPLE, VKind.FLOAT):
-                return elem
-            # "int" / unknown → fall through to _llvm_type_tag
         # BinOp: object operator overloading OR list concat/repeat
         if isinstance(node, ast.BinOp):
             if self._is_obj_expr(node.left):
@@ -35809,8 +35916,39 @@ class CodeGen:
             return at
         return None
 
+    def _lookup_attr_vtype(self, cls_name: 'str | None',
+                           attr: str) -> 'ValueType | None':
+        """The recorded `ValueType` of `cls_name.attr`, or None if unknown.
+
+        Returning None rather than a default is the whole point: every caller
+        has a pre-existing fallback that is right often enough, and a guess
+        here would silently replace it.  When the class is unknown, the attr
+        name is claimed only if exactly one class defines it — the same
+        "decline rather than guess" rule `_scope_file_names` uses.
+        """
+        if cls_name:
+            return self._class_attr_vtypes.get(cls_name, {}).get(attr)
+        _found: 'ValueType | None' = None
+        for _c, _attrs in self._class_attr_vtypes.items():
+            _vt = _attrs.get(attr)
+            if _vt is None:
+                continue
+            if _found is not None and _found != _vt:
+                return None  # two classes disagree — no answer is safe
+            _found = _vt
+        return _found
+
     def _get_list_elem_type(self, node: ast.expr) -> 'ValueType':
         """Get the element type of a list expression."""
+        # Object attribute holding a container: the recorded type carries the
+        # element kind, where the `self.attr` walk below only fires inside the
+        # class and the `list_attrs` bucket carries nothing at all.
+        if isinstance(node, ast.Attribute) and not (
+                isinstance(node.value, ast.Name) and node.value.id == "self"):
+            _avt = self._lookup_attr_vtype(
+                self._infer_object_class(node.value), node.attr)
+            if _avt is not None and _avt.elem_type is not None:
+                return _avt.elem_type
         # p.iterdir() yields Paths — checked first so the loop variable keeps
         # its PATH tag and .name/str()/read_text() on it hit the native Path
         # entry points instead of the generic FpyValue/bridge dispatch.
@@ -36550,11 +36688,16 @@ class CodeGen:
                 return True
         # List slicing returns a list
         if isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Slice):
-            if self._is_list_expr(node.value):
+            # `or _is_tuple_expr`: slicing a tuple yields a sequence exactly
+            # the same way, and asking only about lists is the same omission
+            # `_infer_type_tag`'s matching arm already corrects one screen up.
+            if (self._is_list_expr(node.value)
+                    or self._is_tuple_expr(node.value)):
                 return True
         # Indexing a list-of-lists returns a list
         if isinstance(node, ast.Subscript) and not isinstance(node.slice, ast.Slice):
-            if self._is_list_expr(node.value):
+            if (self._is_list_expr(node.value)
+                    or self._is_tuple_expr(node.value)):
                 elem_type = self._get_list_elem_type(node.value)
                 if elem_type.kind == VKind.LIST:
                     return True
@@ -36576,6 +36719,17 @@ class CodeGen:
         # Object attribute access: obj.attr where attr is a list
         if isinstance(node, ast.Attribute):
             obj_cls = self._infer_object_class(node.value)
+            # The recorded type overrules the bucket.  `list_attrs` is
+            # deliberately coarse — a tuple *parameter* is put in it so that
+            # iteration, `len` and indexing all work — but "list-ish" is the
+            # wrong answer for the one caller that asks in order to *skip* a
+            # conversion: `list(q.pos)` on a tuple attribute handed the tuple
+            # straight back.  Where `_class_attr_vtypes` knows the real kind,
+            # believe it; where it does not, the bucket is still the best
+            # available answer.
+            _avt = self._lookup_attr_vtype(obj_cls, node.attr)
+            if _avt is not None and _avt.kind == VKind.TUPLE:
+                return False
             if obj_cls and obj_cls in self._class_container_attrs:
                 list_attrs, _ = self._class_container_attrs[obj_cls]
                 if node.attr in list_attrs:
@@ -36693,6 +36847,22 @@ class CodeGen:
     def _is_tuple_expr(self, node: ast.expr) -> bool:
         if isinstance(node, ast.Tuple):
             return True
+        # Object attribute holding a tuple.  `_is_list_expr` has had the
+        # matching arm all along, via `_class_container_attrs`' list bucket —
+        # but a bucket cannot spell "tuple", so `self.t = ("a", [1, 2, 3])`
+        # was neither a list expression nor a tuple one, and `c.t[1]` fell
+        # past every element-type arm to the loaded i64, i.e. INT.  `for v in
+        # c.t[1]:` then took the native list loop over an FpyValue and
+        # segfaulted while the list spelling was correct.
+        # Answering through `_class_attr_vtypes` rather than widening the list
+        # bucket keeps `list(c.t)` a real conversion: were the attr simply
+        # added to `list_attrs`, `list()` would see "already a list" and hand
+        # back the tuple unchanged.
+        if isinstance(node, ast.Attribute):
+            _avt = self._lookup_attr_vtype(
+                self._infer_object_class(node.value), node.attr)
+            if _avt is not None and _avt.kind == VKind.TUPLE:
+                return True
         # Native-module container attributes: sys.version_info → tuple
         _nm = self._native_module_attr_vtype(node)
         if _nm is not None and _nm.kind == VKind.TUPLE:
@@ -37108,7 +37278,17 @@ class CodeGen:
                         return True
         # Indexing a list of dicts or dict-of-dicts returns a dict
         if isinstance(node, ast.Subscript) and not isinstance(node.slice, ast.Slice):
-            if self._is_list_expr(node.value):
+            # A *tuple* of dicts indexes to a dict for exactly the same
+            # reason, and this arm asking only about lists is what made
+            # `self.dicts = ({"a": 1}, {"b": 2})` then `h.dicts[1]["c"]`
+            # raise "string index out of range": with no dict arm the outer
+            # subscript fell through to the str path and indexed the dict's
+            # own pointer as characters.  It stayed invisible only while
+            # tuple attributes were invisible too — the moment
+            # `_class_attr_vtypes` let `h.dicts` be recognised as a tuple,
+            # this consumer started answering "not a dict" out loud.
+            if (self._is_list_expr(node.value)
+                    or self._is_tuple_expr(node.value)):
                 elem_type = self._get_list_elem_type(node.value)
                 if elem_type.kind == VKind.DICT:
                     return True

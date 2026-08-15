@@ -4833,7 +4833,7 @@ again (`_dict_var_int_values`, `_dict_var_list_values`, `_dict_var_dict_values`,
 
 **Pre-existing:** reproduced identically at `5441451^`.
 
-### BUG-CTOR-PARAM-CONTAINER-ATTR-ELEM-KIND-LOST. `self.t = t` in `__init__` loses the container's element kind, and iterating it segfaults — 2026-07-27
+### BUG-CTOR-PARAM-CONTAINER-ATTR-ELEM-KIND-LOST. FIXED 2026-08-15 — `self.t = t` in `__init__` lost the container's element kind, and iterating it segfaulted
 
 **What** (CPython prints `3` / `1` / `2` / `3`; compiled prints `0` then
 segfaults):
@@ -4852,30 +4852,60 @@ for v in c.t[1]:
 Writing the literal *inside* `__init__` instead — `self.t = ["a", [1, 2, 3]]` —
 is correct. The tuple spelling fails the same way, so this is not a tuple bug.
 
-**Root cause (suspected, not yet confirmed):** `_detect_class_container_attrs`
-(codegen.py ~16756) records `self.attr` as a list attr from the *shape of the
-assigned expression*, with one arm (~16906) for "assigned a parameter whose
-call-site type is LIST or TUPLE". That arm records **membership in a name-set**
-— `list_attrs` — and a name-set cannot carry an element kind, so the attribute
-is a list of unknown, i.e. `VKind.INT`. `len(c.t[1])` therefore measures a
-pointer and `for` picks the native list loop over an FpyValue.
+**Root cause (confirmed):** `_detect_class_container_attrs` records `self.attr`
+as a list attr from the *shape of the assigned expression*, with one arm for
+"assigned a parameter whose call-site type is LIST or TUPLE". That arm records
+**membership in a name-set** — `list_attrs` — and a name-set cannot carry an
+element kind, so the attribute is a list of unknown, i.e. `VKind.INT`.
+`len(c.t[1])` therefore measures a pointer and `for` picks the native list loop
+over an FpyValue.
 
 Note the `len()` answers `0` here where the literal-inside-`__init__` case
 answers correctly, so the attribute is being seen as a list at all — it is only
 the *element* kind that is missing. This is the class-attribute instance of the
 same `elem_type=VKind.INT` conflation catalogued elsewhere in this file.
 
-**Proper fix:** replace `_class_container_attrs`' `(set[str], set[str])` with a
-`dict[str, ValueType]` per class, so an attribute records its full type rather
-than which of two buckets it fell into. That is the same refactor
-BUG-RETURN-OF-BYTES-OR-BIGINT-VAR-PRINTS-POINTER wants for `str_vars`/
-`list_vars`/`dict_vars`/`obj_vars`, applied to attributes: **the recurring
-mistake in this compiler is a set of names where a map to a type belongs.**
-
 **Severity:** high — it segfaults, and `self.x = param` in `__init__` is one of
 the most ordinary things a Python program does.
 
 **Pre-existing:** reproduced identically at `5441451^`.
+
+**The fix**, as predicted above: `_class_attr_vtypes` (class -> attr ->
+`ValueType`) records the attribute's full type, kind *and* element kind. The
+two name-sets survive as the coarse yes/no views their older call sites still
+ask for, and an attr absent from the map means "no information", not "not a
+container", so every consumer keeps its existing fallback. **The recurring
+mistake this fixes is a set of names standing in for a map to a type** — the
+same refactor BUG-RETURN-OF-BYTES-OR-BIGINT-VAR-PRINTS-POINTER still wants for
+`str_vars`/`list_vars`/`dict_vars`/`obj_vars`.
+
+Four things came out with it, none of them optional:
+
+- **The tuple half.** `self.t = ("a", [1, 2, 3])` was in *neither* bucket, so
+  `a.t[1]` fell through to the loaded i64 — INT — and `for` chose the native
+  list loop over an FpyValue. A bucket cannot spell "tuple".
+- **Widening `list_attrs` to include tuples is the wrong one-token fix**, and
+  the `list()` cases in the regression test rule it out: `list()` asks
+  `_is_list_expr`, and a tuple attribute answering "yes" makes `list(p.pos)`
+  hand the tuple back instead of converting it. Recording a *type* is what
+  lets `_is_tuple_expr` say yes while `_is_list_expr` says no.
+- **An allowlist of kinds inverted to a denylist.** `_infer_type_tag`'s
+  subscript arm believed `LIST, STR, DICT, OBJ, TUPLE, FLOAT` and so silently
+  dropped MIXED, BYTES, BIGINT, SET, DEQUE and every kind added after it was
+  written. MIXED is the one that crashed. It now believes the recorded element
+  kind unless it is the default (INT/UNKNOWN), so "no information" still falls
+  through exactly as before.
+- **Consumers that asked only about lists.** Slicing and indexing a tuple, and
+  indexing a tuple *of dicts*, all needed the tuple arm — the last one made
+  `h.dicts[1]["c"]` raise "string index out of range" by indexing the dict's
+  own pointer as characters. These were invisible only while tuple attributes
+  were invisible; fixing the map made them start answering out loud.
+
+**Verified:** `tests/regressions/a_container_attribute_keeps_its_kind_and_element_kind.py`
+(the segfault, the element kind through a ctor param, both `list()` cases, five
+element kinds, two classes sharing an attribute name, and inheritance where the
+child's own assignment wins). Full suite 1055 passed, 0 failed. Codegen time
+unchanged (min 3.80s vs 3.99s over 40 regression programs).
 
 ### BUG-NESTED-LIST-ARG-INNER-ELEM-LOST. A nested list literal argument keeps the outer element kind but not the inner — 2026-07-27
 
