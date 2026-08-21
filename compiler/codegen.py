@@ -23432,6 +23432,76 @@ class CodeGen:
                         self._list_append_types[var_name] = ValueType(
                             VKind.MIXED)
 
+    @staticmethod
+    def _comp_int_targets(node: ast.expr) -> frozenset:
+        """The names `node`'s comprehension generators bind that can only
+        ever hold an int.
+
+        Only `range(...)` qualifies: it is the one iterable whose element kind
+        is a property of the *call* rather than of some value that has to be
+        tracked to its definition.
+        """
+        names = set()
+        for gen in getattr(node, "generators", ()):
+            if (isinstance(gen.target, ast.Name)
+                    and isinstance(gen.iter, ast.Call)
+                    and isinstance(gen.iter.func, ast.Name)
+                    and gen.iter.func.id == "range"):
+                names.add(gen.target.id)
+        return frozenset(names)
+
+    def _provably_int(self, node: ast.expr, int_names: frozenset) -> bool:
+        """Can `node` evaluate to nothing but an int?
+
+        Conservative by construction: every shape not named below answers
+        False, and False only ever costs a runtime tag check.
+
+        This exists because `ELEM_KIND_UNKNOWN` made "I could not tell"
+        honest, and honesty is only half the job — the *provable* cases have
+        to keep answering positively or the honesty costs a call per element.
+        `[i * i for i in range(n)]` is the commonest list comprehension there
+        is; before the sentinel it reached the reader as INT by accident, and
+        it must now reach it as INT on purpose.
+
+        `int_names` holds names that can only be ints — see
+        `_comp_int_targets`.
+        """
+        if isinstance(node, ast.Constant):
+            # `bool` is a subclass of `int` but has its own kind and its own
+            # tag, so it is not the answer being claimed here.
+            return isinstance(node.value, int) and not isinstance(node.value, bool)
+        if isinstance(node, ast.Name):
+            return node.id in int_names
+        if isinstance(node, ast.UnaryOp):
+            # `not x` is a bool; the other three are int-in, int-out.
+            if isinstance(node.op, (ast.USub, ast.UAdd, ast.Invert)):
+                return self._provably_int(node.operand, int_names)
+            return False
+        if isinstance(node, ast.BinOp):
+            # `/` is true division and yields a float even for two ints, so it
+            # is deliberately absent.
+            if isinstance(node.op, (ast.Add, ast.Sub, ast.Mult, ast.FloorDiv,
+                                    ast.Mod, ast.LShift, ast.RShift,
+                                    ast.BitOr, ast.BitXor, ast.BitAnd)):
+                return (self._provably_int(node.left, int_names)
+                        and self._provably_int(node.right, int_names))
+            if isinstance(node.op, ast.Pow):
+                # `2 ** -1` is 0.5, so the exponent has to be a literal that
+                # can be checked for sign rather than merely provably an int.
+                return (self._provably_int(node.left, int_names)
+                        and isinstance(node.right, ast.Constant)
+                        and isinstance(node.right.value, int)
+                        and not isinstance(node.right.value, bool)
+                        and node.right.value >= 0)
+            return False
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id == "len" and len(node.args) == 1
+                and not node.keywords
+                and node.func.id not in self._user_functions):
+            # `len` is only the builtin if the program has not defined its own.
+            return True
+        return False
+
     def _infer_list_elem_type(self, node: ast.expr) -> 'ValueType':
         """Infer the element type of a list expression.
 
@@ -23613,6 +23683,12 @@ class CodeGen:
                             return ValueType(VKind.STR)
                     elif first.attr in getattr(self, '_class_string_attrs', set()):
                         return ValueType(VKind.STR)
+            # An arithmetic first element that can only be an int — `[1 + 2,
+            # 3 * 4]`.  The int-literal arm above catches the bare literals;
+            # this catches the expressions over them, which reached the INT
+            # default by accident before the sentinel existed.
+            if self._provably_int(first, frozenset()):
+                return ValueType(VKind.INT)
             return ELEM_KIND_UNKNOWN
         if isinstance(node, ast.ListComp):
             # Infer from the element expression
@@ -23652,6 +23728,14 @@ class CodeGen:
             # An int literal element is a positive answer, as in the list arm.
             if (isinstance(elt, ast.Constant) and isinstance(elt.value, int)
                     and not isinstance(elt.value, bool)):
+                return ValueType(VKind.INT)
+            # An element expression that can only be an int — above all
+            # `[i * i for i in range(n)]`, where `i` is a `range` target and
+            # the arithmetic over it is int-in, int-out.  Without this the
+            # commonest comprehension in Python answers "I could not tell" and
+            # pays a runtime tag check for every element of a list whose
+            # elements cannot be anything but ints.
+            if self._provably_int(elt, self._comp_int_targets(node)):
                 return ValueType(VKind.INT)
             return ELEM_KIND_UNKNOWN
         return ELEM_KIND_UNKNOWN
