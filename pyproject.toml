@@ -1,6 +1,6 @@
 [project]
 name = "fastpy"
-version = "0.1.0"
+version = "0.1.2"
 description = "A fast AOT Python compiler targeting LLVM"
 requires-python = ">=3.12"
 dependencies = []

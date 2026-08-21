@@ -238,6 +238,13 @@ _LIST_LIKE = (VKind.LIST, VKind.TUPLE, VKind.DEQUE)
 _DICT_LIKE = (VKind.DICT, VKind.COUNTER, VKind.DEFAULTDICT)
 
 
+# Forward declaration: `ValueType.__init__` normalises this sentinel away, and
+# the sentinel is itself a `ValueType`, so the name has to exist before the
+# class body runs.  It is bound to the real instance immediately after the
+# class.  See ELEM_KIND_UNKNOWN's own comment below.
+ELEM_KIND_UNKNOWN: 'ValueType | None' = None
+
+
 class ValueType:
     """Static type information for a compiled value.
 
@@ -251,6 +258,27 @@ class ValueType:
     def __init__(self, kind: VKind, elem_type: 'ValueType | None' = None,
                  class_name: str | None = None,
                  value_type: 'ValueType | None' = None):
+        # `ELEM_KIND_UNKNOWN` is an *answer* — "nothing in the program says what
+        # this holds" — not a storable component.  Storing it inside a composite
+        # loses the distinction, because identity does not survive the round
+        # trip: a `ValueType(LIST, elem_type=<sentinel>)` recorded as a
+        # variable's tag comes back out of `_get_list_elem_type`'s Phase 3 as an
+        # ordinary `ValueType(int)`, so every reader that asks
+        # `is ELEM_KIND_UNKNOWN` sees evidence where there is none.  That is how
+        # `deps = list(graph[node])` followed by `for dep in deps:` regained the
+        # F1 inline fast path and read each str key back as a native integer
+        # (`KeyError: 140695993972576`).
+        #
+        # `elem_type=None` is already this class's spelling of "element kind
+        # unknown", and `_is_confident_elem_type` already declines on it, so
+        # normalising here keeps the invariant in one place — the sentinel is a
+        # return-value protocol only, and can never be reached through a field.
+        # (During the sentinel's own construction the global below is still
+        # `None` and both arguments are `None`, so this is a no-op then.)
+        if elem_type is not None and elem_type is ELEM_KIND_UNKNOWN:
+            elem_type = None
+        if value_type is not None and value_type is ELEM_KIND_UNKNOWN:
+            value_type = None
         self.kind = kind
         self.elem_type = elem_type
         self.class_name = class_name
@@ -397,6 +425,39 @@ class ValueType:
         # so we can distinguish bytes from str at the FV wrapping level.
         vt._tag_cache = tag
         return vt
+
+
+# The INT that means "I have no idea".
+#
+# `_get_list_elem_type` and `_infer_list_elem_type` must hand every caller
+# *some* element kind, and answer INT when nothing in the program says what a
+# list holds.  So an INT answer is two different statements at once — "the
+# elements are ints" and "I could not tell" — and for most callers that is
+# fine: they need a kind to lay out a load, and INT is the safe shape.
+#
+# It is not fine for the three readers that are about to *skip the runtime
+# tag* on the strength of the answer (the inline-GEP paths in
+# `_can_inline_list_access` and `_emit_for_list`, and the loop variable's
+# static tag).  Reading a str pointer as an i64 because the compiler had to
+# say something is how BUG-EMPTY-LIST-DEFAULT-READ-AS-EVIDENCE and
+# BUG-UNEVIDENCED-LIST-ELEM-KIND-READ-AS-INT both worked.
+#
+# This singleton separates the two statements without changing a single
+# caller: it *is* `ValueType(VKind.INT)` — equal to it, laid out like it, and
+# indistinguishable to anything that just wants a kind — but the fallback
+# return sites hand back this exact object, so a reader that may not guess can
+# ask `elem_type is ELEM_KIND_UNKNOWN` and decline.  `ValueType` is immutable
+# after construction (nothing outside `__init__` assigns to its slots), so
+# sharing one instance is safe.
+#
+# **It is a return value, never a field.**  `ValueType.__init__` normalises it
+# back to `None` in `elem_type`/`value_type`, because identity does not survive
+# being stored inside a composite: a `ValueType(LIST, elem_type=<sentinel>)`
+# written into a variable's tag is rebuilt on the way back out, and the reader
+# then sees a plain `ValueType(int)` — "I could not tell" laundered into
+# evidence one level up.  `elem_type=None` is the storable spelling of the same
+# thing, and every reader already declines on it.
+ELEM_KIND_UNKNOWN = ValueType(VKind.INT)
 
 
 @dataclass
@@ -4683,12 +4744,177 @@ class CodeGen:
             taken.add(new)
             _rewrite(scope, old, new, node)
 
+    # The four comprehension forms. All of them have `.generators`; only
+    # `DictComp` lacks `.elt`, carrying `.key`/`.value` instead.
+    _COMP_NODES = (ast.ListComp, ast.SetComp, ast.GeneratorExp, ast.DictComp)
+
+    @staticmethod
+    def _comp_bound_names(target: ast.expr) -> set:
+        """Every name a generator's target binds.
+
+        `ast.walk` rather than a type switch because a target is an arbitrary
+        assignment pattern: `for (a, (b, *c)) in ...` binds three names.
+        """
+        return {n.id for n in ast.walk(target) if isinstance(n, ast.Name)}
+
+    @classmethod
+    def _comp_inner_parts(cls, comp: ast.expr) -> list:
+        """The sub-expressions of `comp` evaluated in its *own* scope.
+
+        Everything except the first generator's iterable. Python evaluates
+        that one eagerly, in the enclosing scope, before the comprehension's
+        scope exists — which is why `[n for n in range(n)]` reads the outer
+        `n` for the bound and is not a `NameError`. Every other part (the
+        element/key/value, all targets, the second and later iterables, and
+        all the `if` clauses) sees the comprehension's own names.
+        """
+        parts = []
+        if isinstance(comp, ast.DictComp):
+            parts.append(comp.key)
+            parts.append(comp.value)
+        else:
+            parts.append(comp.elt)
+        for idx, gen in enumerate(comp.generators):
+            parts.append(gen.target)
+            if idx:
+                parts.append(gen.iter)
+            parts.extend(gen.ifs)
+        return parts
+
+    @classmethod
+    def _comp_subst(cls, node, mapping: dict) -> None:
+        """Rewrite free occurrences of `mapping`'s keys in `node`, in place.
+
+        "Free" is the whole difficulty: the walk has to stop renaming where
+        an inner binder shadows the name, or a rename meant for the outer
+        comprehension corrupts the inner one.
+        """
+        if node is None or not mapping:
+            return
+        if isinstance(node, ast.Name):
+            if node.id in mapping:
+                node.id = mapping[node.id]
+            return
+        if isinstance(node, cls._COMP_NODES):
+            # An inner comprehension. Its own targets shadow ours inside it,
+            # but *not* inside its first iterable, which belongs to our scope.
+            shadow = set()
+            for gen in node.generators:
+                shadow |= cls._comp_bound_names(gen.target)
+            cls._comp_subst(node.generators[0].iter, mapping)
+            inner = {k: v for k, v in mapping.items() if k not in shadow}
+            for part in cls._comp_inner_parts(node):
+                cls._comp_subst(part, inner)
+            return
+        if isinstance(node, ast.Lambda):
+            # A lambda's parameters shadow the comprehension's target in its
+            # body -- `[lambda x: x for x in r]` returns the identity, not a
+            # closure over the target. Its *defaults*, though, are evaluated
+            # where the lambda is written, so they do see the target.
+            for default in node.args.defaults:
+                cls._comp_subst(default, mapping)
+            for default in node.args.kw_defaults:
+                cls._comp_subst(default, mapping)
+            params = set()
+            for group in (node.args.posonlyargs, node.args.args,
+                          node.args.kwonlyargs):
+                params.update(a.arg for a in group)
+            for slot in (node.args.vararg, node.args.kwarg):
+                if slot is not None:
+                    params.add(slot.arg)
+            body_map = {k: v for k, v in mapping.items() if k not in params}
+            cls._comp_subst(node.body, body_map)
+            return
+        # A `:=` target is never one of `mapping`'s keys: Python rejects
+        # `[(x := 1) for x in r]` outright ("assignment expression cannot
+        # rebind comprehension iteration variable"), and rejects it for
+        # *enclosing* comprehensions' variables too. So the generic walk
+        # below cannot rename one by accident, and a walrus keeps binding in
+        # the enclosing scope exactly as it should.
+        for child in ast.iter_child_nodes(node):
+            cls._comp_subst(child, mapping)
+
+    def _scope_comprehension_targets(self, tree: ast.Module) -> None:
+        """Alpha-rename every comprehension's targets to private names.
+
+        A comprehension has its own scope in Python 3: the `i` in
+        `[i * i for i in range(4)]` is a distinct variable from any `i`
+        around it, and running the comprehension leaves the outer one
+        untouched. We emit comprehensions inline in the enclosing scope, so
+        the target's name *was* the enclosing name — the store went straight
+        into the enclosing scope's variable table, and because it stores with
+        `force_type=True` it replaced the name's kind as well as its value.
+        An outer `s` holding a string silently became an int. Exit code 0, no
+        diagnostic, wrong answers downstream
+        (BUG-COMPREHENSION-LEAKS-ITS-LOOP-VARIABLE).
+
+        Renaming is the right instrument rather than saving and restoring the
+        enclosing slot around the loop, because the scoping rule is not
+        "restore it afterwards" — it is that the two names were never the
+        same name. Save/restore would still let the *body* of the
+        comprehension read the target through the enclosing name, and would
+        still have to special-case the first iterable, which genuinely does
+        read the enclosing one. A rename gets both for free.
+
+        Renaming happens unconditionally, not only when the target collides
+        with an enclosing name. Always renaming is what Python actually does,
+        it removes an entire class of "did the collision analysis get this
+        right?" bugs, and it fixes the lesser half of the same defect:
+        `[p for p in range(3)]` used to leave `p` *defined* afterwards where
+        CPython raises `NameError`.
+
+        Runs before `_gen_prescan` so that inference and codegen see one
+        consistent set of names.
+        """
+        comps = [n for n in ast.walk(tree) if isinstance(n, self._COMP_NODES)]
+        if not comps:
+            return
+
+        # Anything already spoken for. Parameters and function/class names are
+        # not `ast.Name` nodes, so each needs collecting in its own right; a
+        # fresh name that collided with one would trade this bug for a worse
+        # one.
+        taken: set = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Name):
+                taken.add(node.id)
+            elif isinstance(node, ast.arg):
+                taken.add(node.arg)
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                   ast.ClassDef)):
+                taken.add(node.name)
+            elif isinstance(node, ast.alias):
+                taken.add(node.asname or node.name.split(".")[0])
+            elif isinstance(node, (ast.Global, ast.Nonlocal)):
+                taken.update(node.names)
+
+        for idx, comp in enumerate(comps):
+            bound = set()
+            for gen in comp.generators:
+                bound |= self._comp_bound_names(gen.target)
+            if not bound:
+                continue
+            mapping = {}
+            for name in sorted(bound):
+                fresh = f"{name}__c{idx}"
+                while fresh in taken:
+                    fresh = f"_{fresh}"
+                taken.add(fresh)
+                mapping[name] = fresh
+            # Only the comprehension's own scope is rewritten. The outer
+            # occurrences of the same name -- including the first iterable
+            # right here in the same expression -- keep the original, which
+            # is precisely the separation the bug was missing.
+            for part in self._comp_inner_parts(comp):
+                self._comp_subst(part, mapping)
+
     def generate(self, tree: ast.Module) -> str:
         """Generate LLVM IR from a Python AST. Returns IR as string."""
         import os as _os
         if _os.environ.get("FASTPY_COERCION_DEBUG"):
             _SafeIRBuilder.enable_coercion_debug()
         self._uniquify_nested_def_names(tree)
+        self._scope_comprehension_targets(tree)
         self._gen_prescan(tree)
 
         # Pass 1: forward-declare all user functions and class methods
@@ -21518,14 +21744,21 @@ class CodeGen:
             return None
         elem_type = self._get_list_elem_type(node)
         if elem_type.kind in (VKind.INT, VKind.FLOAT):
-            # Dict-derived lists (data["x"] where data has list values)
-            # may contain any type, not just ints.  The default elem_type
-            # is INT but is unreliable, so disable inline access to ensure
-            # list_get_fv preserves the runtime tag.
-            if (not elem_type.elem_type
-                    and isinstance(node, ast.Subscript)
-                    and not isinstance(node.slice, ast.Slice)
-                    and self._is_dict_expr(node.value)):
+            # Inline access reads the element's data half and *invents* its
+            # tag, so it may only run on an element kind the program actually
+            # stated.  `ELEM_KIND_UNKNOWN` is the INT that means "nothing said"
+            # — taking it at face value is how `dst[0]` on a list built by
+            # `dst.append(s)` for an unclassifiable `s` became an i64 load of a
+            # string pointer, and `dst[0] + "/"` raised `unsupported operand
+            # type(s) for +: 'int' and 'str'`.
+            # BUG-UNEVIDENCED-LIST-ELEM-KIND-READ-AS-INT.
+            #
+            # This subsumes the dict-derived special case that used to sit
+            # here (`data["x"]` where `data` has list values): a dict subscript
+            # is simply one of the many expressions nothing has said an element
+            # kind for, and enumerating its sources was always going to miss
+            # the others.
+            if elem_type is ELEM_KIND_UNKNOWN:
                 return None
             return str(elem_type)
         # Analysis: list IS a list but elements aren't scalar → generic access
@@ -22064,8 +22297,29 @@ class CodeGen:
                             and isinstance(arg.func, ast.Attribute)
                             and arg.func.attr == "values"
                             and self._is_dict_expr(arg.func.value)):
-                        return ValueType(VKind.LIST, elem_type=ValueType(VKind.INT))
-                return ValueType(VKind.LIST, elem_type=ValueType(VKind.INT))
+                        # A dict's values are whatever was put in them; the
+                        # recorded `value_type` is the only evidence, and there
+                        # usually isn't any.  BUG-UNEVIDENCED-LIST-ELEM-KIND-
+                        # READ-AS-INT.
+                        _vt = None
+                        if isinstance(arg.func.value, ast.Name):
+                            _dt = self.variables.get(arg.func.value.id)
+                            if _dt is not None and isinstance(_dt[1], ValueType):
+                                _vt = _dt[1].value_type
+                        return ValueType(VKind.LIST,
+                                         elem_type=_vt or ELEM_KIND_UNKNOWN)
+                # `range` genuinely yields ints, so its INT is evidence.  For
+                # `list`/`sorted`/`reversed` over an argument none of the arms
+                # above recognised, it is not: nothing in the program said what
+                # the result holds, and saying INT anyway hands the inline-GEP
+                # readers a licence to skip the runtime tag and read a str
+                # pointer back as a native i64.  `deps = list(graph[node])`
+                # followed by `for dep in deps:` did exactly that and raised
+                # `KeyError: 140695993972576`.
+                # BUG-UNEVIDENCED-LIST-ELEM-KIND-READ-AS-INT.
+                if node.func.id == "range":
+                    return ValueType(VKind.LIST, elem_type=ValueType(VKind.INT))
+                return ValueType(VKind.LIST, elem_type=ELEM_KIND_UNKNOWN)
             # A user function whose body never executes `return <expr>` compiles
             # to a *void* LLVM function, and the call site substitutes the
             # placeholder `i64 0`.  Nothing populates _func_ret_types for it, so
@@ -22679,6 +22933,32 @@ class CodeGen:
                     # like UNKNOWN (no specific-type match), which is safe.
                     return var_tag
         if isinstance(node, (ast.List, ast.ListComp, ast.GeneratorExp)):
+            # An *empty* literal is evidence of nothing, and recording the
+            # fallback kind as though it were evidence is what
+            # BUG-EMPTY-LIST-DEFAULT-READ-AS-EVIDENCE was.
+            # `_infer_list_elem_type([])` answers INT because its callers must
+            # be handed *some* kind; writing that answer into the variable's
+            # tag turns "I had to say something" into "I know it holds ints".
+            # `_is_confident_elem_type` then reads the tag back, sees an
+            # element kind is present, and reports the list confidently INT —
+            # which is precisely the claim the F1 inline-GEP fast path needs
+            # before it may skip `list_get_fv` and hardcode the tag.  So
+            # `toks = []` followed by `toks.append(t)` for a `t` the append
+            # pre-scan cannot classify (a for-loop variable over a list of
+            # strs) read every element back as an int: `t == '|'` compared a
+            # string pointer against a string and answered False forever, and
+            # a shell built on that loop silently ran no commands.
+            #
+            # A bare `ValueType(VKind.LIST)` says "element kind unknown",
+            # which is both true and already understood everywhere: the
+            # empty-list override in `_emit_assign` tests `not
+            # type_tag.elem_type` first, so an append pre-scan that *does*
+            # have evidence still supplies it and still gets the fast path.
+            # Only the case with no evidence changes, and it changes to
+            # routing the read through the runtime tag — correct, and the
+            # behaviour every non-empty literal already had.
+            if isinstance(node, ast.List) and not node.elts:
+                return ValueType(VKind.LIST)
             elem_type = self._infer_list_elem_type(node)
             return ValueType(VKind.LIST, elem_type=elem_type)
         elif isinstance(node, (ast.Dict, ast.DictComp)):
@@ -23317,15 +23597,91 @@ class CodeGen:
                         self._list_append_types[var_name] = ValueType(
                             VKind.MIXED)
 
+    @staticmethod
+    def _comp_int_targets(node: ast.expr) -> frozenset:
+        """The names `node`'s comprehension generators bind that can only
+        ever hold an int.
+
+        Only `range(...)` qualifies: it is the one iterable whose element kind
+        is a property of the *call* rather than of some value that has to be
+        tracked to its definition.
+        """
+        names = set()
+        for gen in getattr(node, "generators", ()):
+            if (isinstance(gen.target, ast.Name)
+                    and isinstance(gen.iter, ast.Call)
+                    and isinstance(gen.iter.func, ast.Name)
+                    and gen.iter.func.id == "range"):
+                names.add(gen.target.id)
+        return frozenset(names)
+
+    def _provably_int(self, node: ast.expr, int_names: frozenset) -> bool:
+        """Can `node` evaluate to nothing but an int?
+
+        Conservative by construction: every shape not named below answers
+        False, and False only ever costs a runtime tag check.
+
+        This exists because `ELEM_KIND_UNKNOWN` made "I could not tell"
+        honest, and honesty is only half the job — the *provable* cases have
+        to keep answering positively or the honesty costs a call per element.
+        `[i * i for i in range(n)]` is the commonest list comprehension there
+        is; before the sentinel it reached the reader as INT by accident, and
+        it must now reach it as INT on purpose.
+
+        `int_names` holds names that can only be ints — see
+        `_comp_int_targets`.
+        """
+        if isinstance(node, ast.Constant):
+            # `bool` is a subclass of `int` but has its own kind and its own
+            # tag, so it is not the answer being claimed here.
+            return isinstance(node.value, int) and not isinstance(node.value, bool)
+        if isinstance(node, ast.Name):
+            return node.id in int_names
+        if isinstance(node, ast.UnaryOp):
+            # `not x` is a bool; the other three are int-in, int-out.
+            if isinstance(node.op, (ast.USub, ast.UAdd, ast.Invert)):
+                return self._provably_int(node.operand, int_names)
+            return False
+        if isinstance(node, ast.BinOp):
+            # `/` is true division and yields a float even for two ints, so it
+            # is deliberately absent.
+            if isinstance(node.op, (ast.Add, ast.Sub, ast.Mult, ast.FloorDiv,
+                                    ast.Mod, ast.LShift, ast.RShift,
+                                    ast.BitOr, ast.BitXor, ast.BitAnd)):
+                return (self._provably_int(node.left, int_names)
+                        and self._provably_int(node.right, int_names))
+            if isinstance(node.op, ast.Pow):
+                # `2 ** -1` is 0.5, so the exponent has to be a literal that
+                # can be checked for sign rather than merely provably an int.
+                return (self._provably_int(node.left, int_names)
+                        and isinstance(node.right, ast.Constant)
+                        and isinstance(node.right.value, int)
+                        and not isinstance(node.right.value, bool)
+                        and node.right.value >= 0)
+            return False
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id == "len" and len(node.args) == 1
+                and not node.keywords
+                and node.func.id not in self._user_functions):
+            # `len` is only the builtin if the program has not defined its own.
+            return True
+        return False
+
     def _infer_list_elem_type(self, node: ast.expr) -> 'ValueType':
         """Infer the element type of a list expression.
 
         Returns a ValueType representing the element kind. Callers that
         need a string tag can use ``result._to_tag()`` or str(result).
+
+        Every fall-through here returns `ELEM_KIND_UNKNOWN` rather than a
+        fresh `ValueType(VKind.INT)`.  The two are equal and interchangeable
+        for callers that just want a kind; the difference is that a reader
+        about to skip the runtime tag can tell "the elements are ints" from
+        "I had to say something".  See ELEM_KIND_UNKNOWN's own comment.
         """
         if isinstance(node, (ast.List, ast.Tuple)):
             if not node.elts:
-                return ValueType(VKind.INT)
+                return ELEM_KIND_UNKNOWN
             # --- Mixed-type detection (must run BEFORE first-element fast
             # paths, which would early-return before reaching this check) ---
             if len(node.elts) > 1:
@@ -23423,6 +23779,22 @@ class CodeGen:
                     and isinstance(first.operand, ast.Constant)):
                 if isinstance(first.operand.value, float):
                     return ValueType(VKind.FLOAT)
+            # An int literal really is the *positive* int answer, not the
+            # fallback the bottom of this function returns.  Both spellings
+            # used to reach that fallback, which was harmless while INT meant
+            # one thing — now that the readers distinguish evidence from
+            # guesswork, saying so here is what keeps `[1, 2, 3]` on the
+            # inline-GEP fast path.  The complex/decimal/BigInt check above
+            # has already claimed the literals that only look like ints, and
+            # the float and bool arms have claimed theirs, so anything still
+            # an `int` here is one.
+            if isinstance(first, ast.Constant) and isinstance(first.value, int):
+                return ValueType(VKind.INT)
+            if (isinstance(first, ast.UnaryOp)
+                    and isinstance(first.op, ast.USub)
+                    and isinstance(first.operand, ast.Constant)
+                    and isinstance(first.operand.value, int)):
+                return ValueType(VKind.INT)
             # Check if elements are nested lists or tuples (both stored as list pointers)
             if isinstance(first, (ast.List, ast.ListComp, ast.Tuple)):
                 # Recurse so the *inner* element kind survives too.  This
@@ -23476,7 +23848,13 @@ class CodeGen:
                             return ValueType(VKind.STR)
                     elif first.attr in getattr(self, '_class_string_attrs', set()):
                         return ValueType(VKind.STR)
-            return ValueType(VKind.INT)
+            # An arithmetic first element that can only be an int — `[1 + 2,
+            # 3 * 4]`.  The int-literal arm above catches the bare literals;
+            # this catches the expressions over them, which reached the INT
+            # default by accident before the sentinel existed.
+            if self._provably_int(first, frozenset()):
+                return ValueType(VKind.INT)
+            return ELEM_KIND_UNKNOWN
         if isinstance(node, ast.ListComp):
             # Infer from the element expression
             elt = node.elt
@@ -23512,8 +23890,20 @@ class CodeGen:
                     and isinstance(node.generators[0].target, ast.Name)
                     and node.generators[0].target.id == elt.id):
                 return self._get_list_elem_type(node.generators[0].iter)
-            return ValueType(VKind.INT)
-        return ValueType(VKind.INT)
+            # An int literal element is a positive answer, as in the list arm.
+            if (isinstance(elt, ast.Constant) and isinstance(elt.value, int)
+                    and not isinstance(elt.value, bool)):
+                return ValueType(VKind.INT)
+            # An element expression that can only be an int — above all
+            # `[i * i for i in range(n)]`, where `i` is a `range` target and
+            # the arithmetic over it is int-in, int-out.  Without this the
+            # commonest comprehension in Python answers "I could not tell" and
+            # pays a runtime tag check for every element of a list whose
+            # elements cannot be anything but ints.
+            if self._provably_int(elt, self._comp_int_targets(node)):
+                return ValueType(VKind.INT)
+            return ELEM_KIND_UNKNOWN
+        return ELEM_KIND_UNKNOWN
 
     def _emit_tuple_unpack(self, target: ast.Tuple, value_node: ast.expr, node: ast.AST) -> None:
         """Emit tuple unpacking: a, b, c = 1, 2, 3 or a, b, c = some_tuple."""
@@ -30748,85 +31138,24 @@ class CodeGen:
         idx = self._load_variable(idx_name, node)
         elem_type = self._get_list_elem_type(node.iter)
         elem_kind = elem_type.kind
-        # Dict-value lists (e.g. data["users"] where values are lists of
-        # dicts/mixed types): the default elem_type is INT but the actual
-        # elements may be dicts/strings/objects.  Upgrade to MIXED so the
-        # loop variable supports runtime-dispatched subscript, method
-        # calls, etc.
-        if elem_kind == VKind.INT and not elem_type.elem_type:
-            _from_dict = False
-            # Case 1: `for x in var:` where var was assigned from dict[key]
-            # or from list(dict[key]) / sorted(dict[key]) etc.
-            if (isinstance(node.iter, ast.Name)
-                    and node.iter.id in self.variables):
-                _iter_vt = self.variables[node.iter.id][1]
-                _iter_vt = (_iter_vt if isinstance(_iter_vt, ValueType)
-                            else ValueType.from_old_tag(_iter_vt))
-                if _iter_vt.kind == VKind.LIST:
-                    _iter_name = node.iter.id
-                    tree = getattr(self, '_csa_root_tree', None)
-                    if tree:
-                        for n in ast.walk(tree):
-                            if not (isinstance(n, ast.Assign)
-                                    and len(n.targets) == 1
-                                    and isinstance(n.targets[0], ast.Name)
-                                    and n.targets[0].id == _iter_name):
-                                continue
-                            # Direct subscript: var = d[key]
-                            _rhs = n.value
-                            # Unwrap list()/sorted()/reversed()/tuple():
-                            # var = list(d[key]) → look at d[key]
-                            if (isinstance(_rhs, ast.Call)
-                                    and isinstance(_rhs.func, ast.Name)
-                                    and _rhs.func.id in (
-                                        "list", "sorted", "reversed", "tuple")
-                                    and _rhs.args):
-                                _rhs = _rhs.args[0]
-                            if (isinstance(_rhs, ast.Subscript)
-                                    and isinstance(_rhs.value, ast.Name)
-                                    and _rhs.value.id in self.variables
-                                    and self._var_kind(_rhs.value.id)
-                                        in (VKind.DICT, VKind.DEFAULTDICT)):
-                                _from_dict = True
-                                break
-            # Case 2: `for x in d["key"]:` — direct subscript on a dict
-            # variable that has list values
-            elif (isinstance(node.iter, ast.Subscript)
-                      and isinstance(node.iter.value, ast.Name)):
-                _base = node.iter.value.id
-                if (_base in self.variables
-                        and self._var_kind(_base)
-                            in (VKind.DICT, VKind.DEFAULTDICT)):
-                    _from_dict = True
-                elif _base in self._dict_var_list_values:
-                    _from_dict = True
-            # Case 3: `for x in var:` where var was assigned from
-            # d.get(key, []) or d.setdefault(key, []).  The returned
-            # list's element type is unknown at compile time — the
-            # default [] tells us nothing about the dict's actual values.
-            if (not _from_dict
-                    and isinstance(node.iter, ast.Name)
-                    and node.iter.id in self.variables):
-                _iter_vt = self.variables[node.iter.id][1]
-                _iter_vt = (_iter_vt if isinstance(_iter_vt, ValueType)
-                            else ValueType.from_old_tag(_iter_vt))
-                if _iter_vt.kind == VKind.LIST:
-                    _iter_name = node.iter.id
-                    tree = getattr(self, '_csa_root_tree', None)
-                    if tree:
-                        for n in ast.walk(tree):
-                            if (isinstance(n, ast.Assign)
-                                    and len(n.targets) == 1
-                                    and isinstance(n.targets[0], ast.Name)
-                                    and n.targets[0].id == _iter_name
-                                    and isinstance(n.value, ast.Call)
-                                    and isinstance(n.value.func, ast.Attribute)
-                                    and n.value.func.attr in ("get", "setdefault")
-                                    and self._is_dict_expr(n.value.func.value)):
-                                _from_dict = True
-                                break
-            if _from_dict:
-                elem_kind = VKind.MIXED
+        # The element kind the readers below are about to act on may be the
+        # `ELEM_KIND_UNKNOWN` fallback — the INT that `_get_list_elem_type`
+        # returns when nothing in the program says what this list holds.  The
+        # loop variable's static tag is a claim about every element, so making
+        # that claim out of the fallback is how `for v in dst:` over a list
+        # built by `dst.append(v)` from a list of floats emitted a native
+        # `sitofp` of each element's *bit pattern* and summed to 9.22e18.
+        # MIXED is the honest tag: dispatch on the runtime tag instead.
+        # BUG-UNEVIDENCED-LIST-ELEM-KIND-READ-AS-INT.
+        #
+        # This replaces a three-case AST walk that asked the same question of
+        # dict-derived lists only — `var = d[key]`, `for x in d["key"]`,
+        # `var = d.get(key, [])` — and so upgraded those to MIXED while every
+        # other unevidenced source kept the INT claim.  Enumerating the
+        # sources that have no evidence was always going to miss some; asking
+        # whether there *is* evidence cannot.
+        if elem_type is ELEM_KIND_UNKNOWN:
+            elem_kind = VKind.MIXED
         # Determine the variable's tag from the list's element type
         if elem_kind == VKind.LIST:
             var_tag = elem_type if elem_type.elem_type else ValueType(VKind.LIST, elem_type=ValueType(VKind.INT))
@@ -30841,6 +31170,14 @@ class CodeGen:
         # Confidence check: elem_type was explicitly set from a variable's
         # tag with element info, a literal with typed elements, or a
         # known-typed expression.
+        #
+        # The `elem_kind` test now already implies evidence — an unevidenced
+        # answer became MIXED above — so `_is_confident_elem_type` is the
+        # narrower of two overlapping guards rather than the only one.  It
+        # stays because narrower is the safe direction here: it declines for
+        # evidenced element kinds reached through an attribute or a call,
+        # which costs an inline load and cannot cost correctness.  Widening
+        # the fast path to those is a separate, measurable change.
         _f1_safe = (
             elem_kind in (VKind.INT, VKind.FLOAT)
             and self._USE_FV_LOCALS
@@ -36152,7 +36489,19 @@ class CodeGen:
         return None
 
     def _get_list_elem_type(self, node: ast.expr) -> 'ValueType':
-        """Get the element type of a list expression."""
+        """Get the element type of a list expression.
+
+        Answers `ELEM_KIND_UNKNOWN` — an INT equal to and interchangeable with
+        `ValueType(VKind.INT)` — when nothing in the program says what the
+        elements are, so that a reader about to skip the runtime tag can tell
+        the guess from the answer.  See ELEM_KIND_UNKNOWN's own comment.
+        """
+        # `range(...)` yields ints, and saying so positively is what keeps the
+        # commonest int loop of all on the inline fast path now that a bare
+        # INT means "no idea".
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id == "range"):
+            return ValueType(VKind.INT)
         # Object attribute holding a container: the recorded type carries the
         # element kind, where the `self.attr` walk below only fires inside the
         # class and the `list_attrs` bucket carries nothing at all.
@@ -36280,7 +36629,7 @@ class CodeGen:
             # For tuples, check the literal definition for element type
             if self._tag_kind(type_tag) == VKind.TUPLE and node.id in self._tuple_elem_types:
                 _tet = self._tuple_elem_types[node.id]
-                return _tet if isinstance(_tet, ValueType) else ValueType(VKind.INT)
+                return _tet if isinstance(_tet, ValueType) else ELEM_KIND_UNKNOWN
         # .values(), .items(), .keys() return lists of tagged values / strings.
         # items() returns tuples (list with is_tuple=1).
         # keys() returns strings (or ints for int-keyed dicts).
@@ -36384,7 +36733,11 @@ class CodeGen:
                             and isinstance(_stmt.targets[0], ast.Name)
                             and _stmt.targets[0].id == node.id):
                         _et = self._infer_list_elem_type(_stmt.value)
-                        if _et.kind != VKind.INT:  # non-default → trust it
+                        # "non-default → trust it" used to be spelled `.kind !=
+                        # VKind.INT`, which threw away a *positive* int answer
+                        # along with the fallback; the sentinel says which is
+                        # which, so `xs = [1, 2, 3]` is now trusted here too.
+                        if _et is not ELEM_KIND_UNKNOWN:
                             return _et
         # list(arg) / sorted(arg) / tuple(arg) — propagate element type
         # from the argument so `for x in list(val)` has correct tags.
@@ -50800,14 +51153,21 @@ class CodeGen:
             if elem_type.kind == VKind.MIXED:
                 tag = self.builder.load(tag_slot)
                 return self._fv_build_from_slots(tag, data)
-            # Default INT elem_type on a list from a dict value:
-            # the list could contain any type (dict, str, list, etc.)
-            # since there's no specific element tracking.  Return full
-            # FpyValue so chained subscripts (data["x"][0]["y"]) work.
-            if (elem_type.kind == VKind.INT
-                    and not elem_type.elem_type
-                    and isinstance(node.value, ast.Subscript)
-                    and self._is_dict_expr(node.value.value)):
+            # No evidence for the element kind: `list_get_fv` just handed us
+            # both halves, so keep them.  Returning the data half alone here
+            # would throw the runtime tag away and re-type a str pointer as a
+            # native i64 purely because the fallback had to say *some* kind —
+            # `dst[0] + "/"` on a list built by `dst.append(s)` from strings
+            # then failed with "unsupported operand type(s) for +: 'int' and
+            # 'str'" while the same elements iterated correctly.
+            # BUG-UNEVIDENCED-LIST-ELEM-KIND-READ-AS-INT.
+            #
+            # This subsumes the narrower case that used to sit here, which
+            # asked the same question of dict-derived lists only
+            # (`isinstance(node.value, ast.Subscript)` over a dict, so that
+            # `data["x"][0]["y"]` chained).  A dict value is one source of an
+            # unevidenced list; it was never the only one.
+            if elem_type is ELEM_KIND_UNKNOWN:
                 tag = self.builder.load(tag_slot)
                 return self._fv_build_from_slots(tag, data)
             if elem_type.kind.is_ptr:
