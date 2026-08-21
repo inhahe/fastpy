@@ -8,6 +8,206 @@ how to reproduce it, and what the proper fix looks like.
 
 ## Active Bugs
 
+### BUG-EMPTY-LIST-DEFAULT-READ-AS-EVIDENCE. `x = []` claimed to hold ints, and the for-loop reader believed it — 2026-08-21 — **FIXED 2026-08-21**
+
+**Reproduce (pre-fix):**
+
+```python
+def count_bars():
+    toks = ["a", "b"]
+    toks2 = []
+    for t in toks:
+        toks2.append(t)
+    toks2.append("|")
+    n = 0
+    for t in toks2:
+        if t == "|":
+            n = n + 1
+    return n
+
+print(count_bars())     # CPython: 1     fastpy: 0
+```
+
+`_infer_list_elem_type` has to hand every caller *some* element kind, and
+answers `INT` when it knows nothing — `[]` has no elements to look at, so it
+answered `INT` for the empty literal too. `_infer_type_tag` then wrote that
+answer straight into the variable's tag as `list:int`, which turned "I had to
+say something" into "I know it holds ints".
+
+`_emit_for_list`'s F1 inline-GEP fast path is gated on
+`_is_confident_elem_type`, whose docstring says it must return True only on
+"explicit evidence the elements are the claimed type (not just the 'int'
+default)" — but its `ast.Name` arm asked only whether an element kind was
+*present*:
+
+```python
+if isinstance(iter_node, ast.Name) and iter_node.id in self.variables:
+    _, type_tag = self.variables[iter_node.id]
+    if isinstance(type_tag, ValueType) and type_tag.elem_type is not None:
+        return True
+```
+
+The fabricated `list:int` satisfies that, so the loop was allowed to skip
+`fastpy_list_get_fv`, GEP straight to the data half and **hardcode the tag**:
+
+```llvm
+%".146" = getelementptr inbounds {i32, i64}, {i32, i64}* %".145", i32 0, i32 1
+%".147" = load i64, i64* %".146"
+%".148" = insertvalue {i32, i64} undef, i32 0, 0     ; tag := 0 (INT)
+%".149" = insertvalue {i32, i64} %".148", i64 %".147", 1
+...
+call i32 @"fastpy_fv_compare"(i32 %".156", i64 %".157", i32 2, i64 %".158", i32 0)
+```
+
+The appends had stored tag `2` (STR), so `fv_compare` was handed an int on the
+left and a string on the right and answered False for every element, forever.
+The same fast path also skips the element's `fpy_rc_incref` while the loop
+variable is still decref'd on the next iteration, so a wrongly-confident list
+of pointers was a refcount underflow as well as a mistyped read.
+
+It only bit when the append pre-scan could *not* classify the appended
+expression: a classifiable append overrides the empty-list default with real
+evidence (`_emit_assign`'s "Override empty-list element type from pre-scan",
+codegen.py:20254), which is why `x.append("a")` was always correct and
+`for t in toks: x.append(t)` was not. `_csa_elem_tag_of` declines correctly for
+a for-loop variable (it returns None, and both append-vote loops then record
+*no* element kind) — the pre-scan was right; the assignment site overwrote its
+"I don't know" with a guess.
+
+**Impact.** This is what broke SlateOS's `fastpy-minishell` boot self-test: the
+tokeniser counts pipeline stages with exactly the loop above, counted zero,
+forked nothing, and exited 0 with `$?` never set. Introduced by 40535b5, whose
+own commit message states the rule it broke — *"a half-answer is worse than no
+answer… the reader of that half-answer filled the missing element in with
+VKind.INT and read a pointer as an integer"* — one producer over, in the
+for-loop reader.
+
+**FIXED 2026-08-21.** `_infer_type_tag` no longer records a fabricated element
+kind for an empty list literal; `x = []` gets a bare `ValueType(VKind.LIST)`,
+which is both true and already understood everywhere — the empty-list override
+at codegen.py:20254 tests `not type_tag.elem_type` first, so an append pre-scan
+that *does* have evidence still supplies it and still gets the fast path. Only
+the no-evidence case changes, and it changes to routing the read through the
+runtime tag. Regression test:
+`tests/regressions/empty_list_default_read_as_evidence.py`.
+
+---
+
+### BUG-UNEVIDENCED-LIST-ELEM-KIND-READ-AS-INT. The *readers* still treat "I don't know" as "int", so a list with no evidenced element kind is read as integers — 2026-08-21 — **FIXED 2026-08-21**
+
+**Reproduce:**
+
+```python
+def sum_floats():                    # CPython: 3.75
+    src = [1.5, 2.25]                # fastpy:  9.221683186994512e+18
+    dst = []                         #          (the two doubles' *bit
+    for v in src:                    #           patterns*, added as ints
+        dst.append(v)                #           and printed as a float)
+    total = 0.0
+    for v in dst:
+        total = total + v
+    return total
+
+def by_index():                      # CPython: one/three
+    src = ["one", "two", "three"]    # fastpy:  TypeError: unsupported operand
+    dst = []                         #          type(s) for +: 'int' and 'str'
+    for s in src:
+        dst.append(s)
+    return dst[0] + "/" + dst[2]
+```
+
+Both are the sibling of BUG-EMPTY-LIST-DEFAULT-READ-AS-EVIDENCE above, on the
+*read* side, and both predate it — they fail identically before and after that
+fix. `_get_list_elem_type` uses `VKind.INT` as two different statements — "the
+elements are ints" and "I have no idea" — and the readers below cannot tell
+them apart, so they pick the first reading:
+
+- **`_emit_for_list`, codegen.py:30856-30860.** The loop variable's static tag
+  is `ValueType(elem_kind)`, i.e. `INT` for the unevidenced default. `total + v`
+  then emits a native `sitofp` of the element's i64 *bits*, which is the
+  `9.22e18` above. There is already a special case for one known source of the
+  problem — the `_from_dict` walk at 30782-30855 upgrades dict-derived lists to
+  `MIXED` — but it enumerates dict sources instead of asking the general
+  question.
+- **`_can_inline_list_access`, codegen.py:21519-21530.** Returns the element
+  type for any `INT`/`FLOAT` answer, so `dst[0]` becomes an inline i64 load of
+  a string pointer. It carries the *same* narrow special case, declining only
+  when the receiver is a dict subscript (21525-21529).
+
+There is a third reader with the same defect, found while fixing the first two:
+
+- **`_emit_subscript`'s `list_get_fv` fallback, codegen.py:50850-50864.** Even
+  once `_can_inline_list_access` declines and the read is routed through the
+  runtime call — which loads *both* halves into slots — this code throws the
+  tag slot away and returns the data half typed by `elem_type.kind`. So
+  declining the inline path was not by itself enough to fix `by_index()`: the
+  slow path re-made the same guess one step later. It too carried the narrow
+  dict-subscript special case (returning the full `FpyValue` only when the
+  receiver was a dict subscript, so that `data["x"][0]["y"]` chained).
+
+**The fix.** The evidenced/unevidenced distinction is now carried by the answer
+itself rather than re-derived per reader: `ELEM_KIND_UNKNOWN` is a single
+module-level `ValueType(VKind.INT)` instance that every *fallback* return site
+in `_get_list_elem_type` and `_infer_list_elem_type` hands back. It is `==` to
+`ValueType(VKind.INT)`, laid out identically, and invisible to all 46 existing
+callers — but the readers that are about to skip the runtime tag can ask
+`elem_type is ELEM_KIND_UNKNOWN` and decline. Two positive-INT arms were added
+alongside (an int literal element, and `range(...)`) so that the genuinely
+int-typed cases keep saying so positively and keep their fast path; the
+local-assignment scan in `_get_list_elem_type` was sharpened from
+`_et.kind != VKind.INT` to `_et is not ELEM_KIND_UNKNOWN`, which now trusts
+`xs = [1, 2, 3]` where it previously discarded it along with the fallback.
+
+All three readers were then changed to the one predicate, and both narrow
+special cases deleted rather than left alongside: `_emit_for_list` sets
+`elem_kind = VKind.MIXED` (the honest tag — dispatch on the runtime tag),
+`_can_inline_list_access` returns `None`, and `_emit_subscript` returns the
+full `FpyValue` built from the tag slot it already loaded. Declining is always
+safe — it costs a call, never correctness — so every over-decline this
+introduces is a perf question, not a bug.
+
+**A sentinel is a return value, never a field.** The first cut of the above
+regressed `test_stdlib_compiled[graphlib_topo]` with `KeyError:
+140695993972576` — a pointer used as an integer dict key. Minimised:
+
+```python
+deps = list(graph[node])         # graph == {"A": ["B"], "B": []}
+for dep in deps:
+    in_degree[dep] = in_degree[dep] - 1
+```
+
+The sentinel's *identity does not survive being stored inside a composite*.
+`_infer_type_tag` recorded `ValueType(LIST, elem_type=<sentinel>)` as `deps`'
+tag; the tag round-trips, and `_get_list_elem_type`'s Phase 3 rebuilt the
+element kind, handing back a non-identical `ValueType(INT)`. Every reader that
+asks `is ELEM_KIND_UNKNOWN` therefore missed, `_is_confident_elem_type` saw a
+non-`None` `elem_type` and said yes, and the F1 inline-GEP fast path came back
+— *more* aggressively than before, because the deleted `_from_dict` walk had
+been catching exactly this `var = list(d[key])` shape. "I could not tell" was
+laundered into evidence one level up.
+
+Two changes close it:
+
+- **`ValueType.__init__` normalises `ELEM_KIND_UNKNOWN` to `None`** in both
+  `elem_type` and `value_type`. `elem_type=None` is already this class's
+  spelling of "element kind unknown" and every reader already declines on it,
+  so the invariant lives in one place instead of at each recording site. The
+  sentinel now cannot be reached through a field at all.
+- **A fourth guessing site**, found by the same trace:
+  `_infer_type_tag`'s `list`/`sorted`/`reversed`/`range` arm ended in a
+  hardcoded `elem_type=ValueType(VKind.INT)` for *any* argument its arms did
+  not recognise — which is what typed `list(graph[node])` as `list:int` in the
+  first place. `range` genuinely yields ints and keeps its INT; the rest now
+  answer `ELEM_KIND_UNKNOWN`. `list(d.values())` likewise stopped claiming INT
+  and now consults the dict's recorded `value_type`, falling back to unknown.
+
+Regression tests: `tests/regressions/empty_list_default_read_as_evidence.py`,
+cases 3 (float) and 7 (`dst[0] + "/" + dst[2]`); and
+`tests/test_comprehensive.py::test_stdlib_compiled[graphlib_topo]` for the
+composite-identity half.
+
+---
+
 ### DEBT-NAMED-SUITES-SKIP-THE-REGRESSION-CORPUS. FIXED 2026-08-15 — invoking pytest with explicit test-file names silently ran 57% of the suite
 
 **Reproduce:**
