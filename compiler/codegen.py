@@ -4744,12 +4744,177 @@ class CodeGen:
             taken.add(new)
             _rewrite(scope, old, new, node)
 
+    # The four comprehension forms. All of them have `.generators`; only
+    # `DictComp` lacks `.elt`, carrying `.key`/`.value` instead.
+    _COMP_NODES = (ast.ListComp, ast.SetComp, ast.GeneratorExp, ast.DictComp)
+
+    @staticmethod
+    def _comp_bound_names(target: ast.expr) -> set:
+        """Every name a generator's target binds.
+
+        `ast.walk` rather than a type switch because a target is an arbitrary
+        assignment pattern: `for (a, (b, *c)) in ...` binds three names.
+        """
+        return {n.id for n in ast.walk(target) if isinstance(n, ast.Name)}
+
+    @classmethod
+    def _comp_inner_parts(cls, comp: ast.expr) -> list:
+        """The sub-expressions of `comp` evaluated in its *own* scope.
+
+        Everything except the first generator's iterable. Python evaluates
+        that one eagerly, in the enclosing scope, before the comprehension's
+        scope exists — which is why `[n for n in range(n)]` reads the outer
+        `n` for the bound and is not a `NameError`. Every other part (the
+        element/key/value, all targets, the second and later iterables, and
+        all the `if` clauses) sees the comprehension's own names.
+        """
+        parts = []
+        if isinstance(comp, ast.DictComp):
+            parts.append(comp.key)
+            parts.append(comp.value)
+        else:
+            parts.append(comp.elt)
+        for idx, gen in enumerate(comp.generators):
+            parts.append(gen.target)
+            if idx:
+                parts.append(gen.iter)
+            parts.extend(gen.ifs)
+        return parts
+
+    @classmethod
+    def _comp_subst(cls, node, mapping: dict) -> None:
+        """Rewrite free occurrences of `mapping`'s keys in `node`, in place.
+
+        "Free" is the whole difficulty: the walk has to stop renaming where
+        an inner binder shadows the name, or a rename meant for the outer
+        comprehension corrupts the inner one.
+        """
+        if node is None or not mapping:
+            return
+        if isinstance(node, ast.Name):
+            if node.id in mapping:
+                node.id = mapping[node.id]
+            return
+        if isinstance(node, cls._COMP_NODES):
+            # An inner comprehension. Its own targets shadow ours inside it,
+            # but *not* inside its first iterable, which belongs to our scope.
+            shadow = set()
+            for gen in node.generators:
+                shadow |= cls._comp_bound_names(gen.target)
+            cls._comp_subst(node.generators[0].iter, mapping)
+            inner = {k: v for k, v in mapping.items() if k not in shadow}
+            for part in cls._comp_inner_parts(node):
+                cls._comp_subst(part, inner)
+            return
+        if isinstance(node, ast.Lambda):
+            # A lambda's parameters shadow the comprehension's target in its
+            # body -- `[lambda x: x for x in r]` returns the identity, not a
+            # closure over the target. Its *defaults*, though, are evaluated
+            # where the lambda is written, so they do see the target.
+            for default in node.args.defaults:
+                cls._comp_subst(default, mapping)
+            for default in node.args.kw_defaults:
+                cls._comp_subst(default, mapping)
+            params = set()
+            for group in (node.args.posonlyargs, node.args.args,
+                          node.args.kwonlyargs):
+                params.update(a.arg for a in group)
+            for slot in (node.args.vararg, node.args.kwarg):
+                if slot is not None:
+                    params.add(slot.arg)
+            body_map = {k: v for k, v in mapping.items() if k not in params}
+            cls._comp_subst(node.body, body_map)
+            return
+        # A `:=` target is never one of `mapping`'s keys: Python rejects
+        # `[(x := 1) for x in r]` outright ("assignment expression cannot
+        # rebind comprehension iteration variable"), and rejects it for
+        # *enclosing* comprehensions' variables too. So the generic walk
+        # below cannot rename one by accident, and a walrus keeps binding in
+        # the enclosing scope exactly as it should.
+        for child in ast.iter_child_nodes(node):
+            cls._comp_subst(child, mapping)
+
+    def _scope_comprehension_targets(self, tree: ast.Module) -> None:
+        """Alpha-rename every comprehension's targets to private names.
+
+        A comprehension has its own scope in Python 3: the `i` in
+        `[i * i for i in range(4)]` is a distinct variable from any `i`
+        around it, and running the comprehension leaves the outer one
+        untouched. We emit comprehensions inline in the enclosing scope, so
+        the target's name *was* the enclosing name — the store went straight
+        into the enclosing scope's variable table, and because it stores with
+        `force_type=True` it replaced the name's kind as well as its value.
+        An outer `s` holding a string silently became an int. Exit code 0, no
+        diagnostic, wrong answers downstream
+        (BUG-COMPREHENSION-LEAKS-ITS-LOOP-VARIABLE).
+
+        Renaming is the right instrument rather than saving and restoring the
+        enclosing slot around the loop, because the scoping rule is not
+        "restore it afterwards" — it is that the two names were never the
+        same name. Save/restore would still let the *body* of the
+        comprehension read the target through the enclosing name, and would
+        still have to special-case the first iterable, which genuinely does
+        read the enclosing one. A rename gets both for free.
+
+        Renaming happens unconditionally, not only when the target collides
+        with an enclosing name. Always renaming is what Python actually does,
+        it removes an entire class of "did the collision analysis get this
+        right?" bugs, and it fixes the lesser half of the same defect:
+        `[p for p in range(3)]` used to leave `p` *defined* afterwards where
+        CPython raises `NameError`.
+
+        Runs before `_gen_prescan` so that inference and codegen see one
+        consistent set of names.
+        """
+        comps = [n for n in ast.walk(tree) if isinstance(n, self._COMP_NODES)]
+        if not comps:
+            return
+
+        # Anything already spoken for. Parameters and function/class names are
+        # not `ast.Name` nodes, so each needs collecting in its own right; a
+        # fresh name that collided with one would trade this bug for a worse
+        # one.
+        taken: set = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Name):
+                taken.add(node.id)
+            elif isinstance(node, ast.arg):
+                taken.add(node.arg)
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                   ast.ClassDef)):
+                taken.add(node.name)
+            elif isinstance(node, ast.alias):
+                taken.add(node.asname or node.name.split(".")[0])
+            elif isinstance(node, (ast.Global, ast.Nonlocal)):
+                taken.update(node.names)
+
+        for idx, comp in enumerate(comps):
+            bound = set()
+            for gen in comp.generators:
+                bound |= self._comp_bound_names(gen.target)
+            if not bound:
+                continue
+            mapping = {}
+            for name in sorted(bound):
+                fresh = f"{name}__c{idx}"
+                while fresh in taken:
+                    fresh = f"_{fresh}"
+                taken.add(fresh)
+                mapping[name] = fresh
+            # Only the comprehension's own scope is rewritten. The outer
+            # occurrences of the same name -- including the first iterable
+            # right here in the same expression -- keep the original, which
+            # is precisely the separation the bug was missing.
+            for part in self._comp_inner_parts(comp):
+                self._comp_subst(part, mapping)
+
     def generate(self, tree: ast.Module) -> str:
         """Generate LLVM IR from a Python AST. Returns IR as string."""
         import os as _os
         if _os.environ.get("FASTPY_COERCION_DEBUG"):
             _SafeIRBuilder.enable_coercion_debug()
         self._uniquify_nested_def_names(tree)
+        self._scope_comprehension_targets(tree)
         self._gen_prescan(tree)
 
         # Pass 1: forward-declare all user functions and class methods

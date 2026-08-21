@@ -8,6 +8,243 @@ how to reproduce it, and what the proper fix looks like.
 
 ## Active Bugs
 
+### BUG-COMPREHENSION-INSIDE-A-LAMBDA-YIELDS-AN-EMPTY-LIST — 2026-08-21
+
+**In short:** a `lambda` whose body is a list comprehension returns an empty
+list, always. The comprehension runs zero times instead of once per element.
+Exit code 0, no diagnostic — the caller just gets `[]` and computes with it.
+
+**Reproduce:**
+
+```python
+g = lambda: [j for j in range(2)]
+print(len(g()))
+```
+
+CPython prints `2`; fastpy prints `0`. It does not need a closure, a captured
+name, or an argument — the bare shape is enough. A `def` with the same body is
+fine, so this is specific to `Lambda`.
+
+**Predates the comprehension-scope fix.** Verified by compiling the two-line
+case with `_scope_comprehension_targets` stashed out: the baseline prints `0`
+too. Found while checking that the scope fix did not regress lambdas.
+
+**Where:** unknown as yet — the lambda emitter and the comprehension emitters
+both work in isolation, so the fault is in how the comprehension's loop is
+emitted into a lambda's body block rather than in either alone. Start by
+dumping the IR for the reproducer and checking whether the loop's trip count
+is computed against the right block, or whether the result list is built into a
+`alloca` in the wrong function.
+
+**Proper fix:** whatever the IR shows; do not paper over it by special-casing
+`Lambda` in the comprehension emitters. Worth checking the sibling shapes at
+the same time — a set/dict comprehension and a generator expression in a lambda
+body, and a comprehension in a lambda body inside a `def`.
+
+### BUG-LAMBDA-DEFAULT-CAPTURING-A-COMPREHENSION-TARGET-READS-GARBAGE — 2026-08-21
+
+**In short:** a `lambda` written inside a comprehension, with a default
+argument that reads the comprehension's loop variable, gets a garbage number
+instead of the value. Not a wrong-but-plausible value — a raw pointer printed
+as an integer, e.g. `2317994435504`.
+
+**Reproduce:**
+
+```python
+gs = [lambda a, b=y: (a, b) for y in range(3)]
+print(gs[2](9))
+```
+
+CPython prints `(9, 2)`; fastpy prints a tuple whose second element is a large
+meaningless integer.
+
+**Not lambda defaults in general** — `y = 7; f = lambda a, b=y: a + b; f(1)`
+compiles and prints `8` correctly, as does the equivalent `def`. It is
+specifically a default evaluated inside a comprehension's loop body. Nor is it
+lambdas-in-comprehensions in general: `[lambda x: x * 2 for x in range(3)]`
+works, and `fs[0](5)` correctly gives `10`.
+
+**Predates the comprehension-scope fix**, verified the same way (stash the
+pass out, recompile, same garbage).
+
+**Where:** the default's value has to be captured at the point the lambda is
+*created*, i.e. once per iteration, into storage owned by that closure. The
+symptom — a pointer-shaped integer — suggests the default is being stored as a
+reference to the loop's slot and read back after the loop has ended, or that
+the tag is being lost so a pointer is read as an unboxed int.
+
+**Proper fix:** capture defaults by value into the closure at creation time.
+Check the tag handling on the way in and out; a pointer read as an int is the
+signature of a lost tag, and that half of the bug may be shared with other
+closure-capture paths.
+
+### BUG-NESTED-TUPLE-UNPACKING-COMPREHENSION-TARGET-IS-A-NAMEERROR — 2026-08-21
+
+**In short:** a comprehension that unpacks a *nested* tuple in its `for` clause
+— `for (m, (n, o)) in ...` — fails at runtime with `NameError` on the inner
+names. One level of unpacking works; two levels do not.
+
+**Reproduce:**
+
+```python
+res = [m + n + o for (m, (n, o)) in [(1, (2, 3)), (4, (5, 6))]]
+print(res[0], res[1])
+```
+
+CPython prints `6 15`; fastpy raises `NameError: name 'n' is not defined`.
+Flat unpacking on the same shape is fine: `[lo + hi for lo, hi in [(1, 2),
+(3, 4)]]` gives `3 7` correctly.
+
+**Predates the comprehension-scope fix.** With the pass in place the message
+reads `NameError: name 'n__c3' is not defined` — the same bug wearing the new
+private name, which incidentally confirms the rename itself reaches nested
+targets correctly (`_comp_bound_names` walks the whole target pattern). It is
+the *emitter* that only binds the top level.
+
+**Where:** `_emit_list_comp_tuple_unpack` (`compiler/codegen.py:51866`). It
+binds one flat level of names from the element and does not recurse into a
+nested `ast.Tuple`/`ast.List` target.
+
+**Proper fix — reuse the recursive unpacker that already exists.** This is not
+a missing capability, it is a path that does not call the working code.
+`_unpack_targets_from_list` (`codegen.py:30519`) already does exactly the right
+thing: `ast.Name` stores, `ast.Tuple`/`ast.List` recurses into the inner list,
+anything else falls back to the bridge. It is what `_emit_for_tuple_unpack`
+uses, which is why the statement forms are correct — verified, both of these
+compile and print correctly:
+
+```python
+for (m, (n, o)) in [(1, (2, 3)), (4, (5, 6))]:   # prints 6 then 15
+    print(m + n + o)
+a, (b, c) = 1, (2, 3)                            # prints 1 2 3
+print(a, b, c)
+```
+
+So the fix is to have the comprehension unpacker delegate to
+`_unpack_targets_from_list` rather than grow a second recursive implementation.
+Test `*starred` targets in the same change — the shared helper sends them to
+the bridge fallback rather than handling them, so the comprehension side will
+inherit whatever that does, and it should at least be consistent with the
+statement form.
+
+### BUG-COMPREHENSION-LEAKS-ITS-LOOP-VARIABLE. A comprehension's target overwrites an enclosing name of the same name, silently corrupting both its value and its type — 2026-08-21 — **FIXED 2026-08-21**
+
+**In short:** in Python, `[i * i for i in range(4)]` has its own scope — the `i`
+inside it is a different variable from any `i` outside it, and running the
+comprehension leaves the outer `i` untouched. fastpy emits the comprehension
+inline in the enclosing scope, so its target writes straight over whatever the
+enclosing name held. The old value is gone, and so is its *kind*: an outer `s`
+holding a string becomes an int, or becomes a different string, with no error
+and exit code 0. This is silent data corruption, not a crash.
+
+**Reproduce — all four comprehension forms leak, at module and function scope:**
+
+```python
+p = "outer"
+xs = [p for p in range(3)]          # list comp
+q = "outer"
+ys = {q for q in range(3)}          # set comp
+r = "outer"
+zs = {r: r for r in range(3)}       # dict comp
+t = "outer"
+gs = list(t for t in range(3))      # generator expression
+u = "outer"
+for u in range(3):                  # a plain for-loop, for contrast
+    pass
+print(p, q, r, t, u)
+```
+
+CPython prints `outer outer outer outer 2` — the four comprehensions leave their
+names alone, and the plain `for` correctly leaves the last iterate. fastpy
+prints `3 3 3 3 2`. Note the leaked value is **`3`**, not even the last iterate
+`2`: it is the raw loop counter read *after* its final increment, so the value
+is wrong in its own right as well as being in the wrong scope. The plain `for`
+on the same line is right, which rules out "fastpy implements Python 2
+semantics" — this is simply incorrect.
+
+**Reproduce — the type is corrupted too, which is the dangerous half:**
+
+```python
+s = "hello world"
+xs = ["a", "b"]
+ys = [s for s in xs]
+print(len(s))
+print(s.upper())
+```
+
+CPython prints `11` then `HELLO WORLD`. fastpy prints `1` then `B` — the outer
+`s` now *is* the comprehension's last iterate. Exit code 0 either way. A program
+that computes with `s` afterwards gets plausible-looking wrong answers rather
+than a diagnostic.
+
+**Predates the element-kind work.** Confirmed by compiling the four-line case
+with the `fastpy-ab-base` baseline worktree, which is pinned before commit
+`8e8b529` (the `ELEM_KIND_UNKNOWN` sentinel): the baseline prints `4` for
+`i = "not an int"; squares = [i * i for i in range(4)]; print(i)` as well. This
+bug is orthogonal to element-kind inference and was only *found* by it, when
+`tests/regressions/provably_int_elements_keep_the_fast_path.py` tripped over it.
+
+**Where:** `compiler/codegen.py`, `_emit_list_comprehension` (~line 51494). It
+takes the target's name directly —
+
+```python
+        var_name = gen.target.id                       # ~51517
+        ...
+            # force_type=True: the loop variable is genuinely an integer
+            # from range(), even if it previously held an OBJ value.
+            self._store_variable(var_name, start, ValueType(VKind.INT),
+                                 force_type=True)      # ~51539
+```
+
+— and `_store_variable` writes into the *enclosing* function/module scope's
+variable table. `force_type=True` is what destroys the kind as well as the
+value: it is there so a `range` target can be an int even if the name previously
+held an object, which is correct reasoning for a name that genuinely belongs to
+the comprehension and wrong for one that does not. The sibling emitters
+`_emit_list_comprehension_multi` (~51759), `_emit_list_comprehension_nested`
+(~51862) and `_emit_list_comp_tuple_unpack` do the same, as do the set/dict/
+generator emitters, which is why all four forms leak.
+
+**Fixed** by `CodeGen._scope_comprehension_targets`, an AST alpha-rename
+pre-pass run from `generate()` between `_uniquify_nested_def_names` and
+`_gen_prescan`, so inference and codegen see one consistent set of names. It
+rewrites every generator target to `<name>__c<N>` and substitutes it through
+the comprehension's own scope only. None of the five emitters was touched:
+by the time they run, the target simply *is* a private name, so a partial fix
+that left one form leaking was not possible.
+
+Note the correct Python semantics are subtler than "don't write the outer name":
+the *first* generator's iterable is evaluated in the enclosing scope, so a
+comprehension may still *read* an outer name of the same name there — that is
+why `[n for n in range(n)]` reads the outer `n` for its bound instead of raising
+`NameError`. Renaming the target rather than snapshot/restoring the slot gets
+that right for free, which is the reason renaming was chosen over save/restore.
+
+Three details the pass has to get right, each pinned by the regression test:
+
+- **The rename is unconditional**, not collision-triggered. That is what Python
+  does, it removes a whole class of "did the collision analysis get this right?"
+  bugs, and it fixes the lesser half of the same defect: `[p for p in range(3)]`
+  used to leave `p` *defined* afterwards where CPython raises `NameError`.
+- **Inner binders shadow.** A nested comprehension's targets shadow the outer
+  one's inside it, but *not* inside its first iterable, which belongs to the
+  outer scope. A lambda's parameters shadow in its body but not in its
+  defaults. `_comp_subst` stops at both.
+- **A walrus is left alone**, because `:=` genuinely does bind in the enclosing
+  scope. This needs no special case: Python rejects `[(x := 1) for x in r]`
+  outright, and rejects rebinding an *enclosing* comprehension's variable too,
+  so a walrus target can never be one of the names being renamed.
+
+**Regression test:**
+`tests/regressions/a_comprehension_does_not_leak_its_loop_variable.py` — all
+four forms, at module and function scope, plus a plain `for` loop as the
+control (it genuinely does bind in the enclosing scope and must keep doing so),
+kind preservation, the first-iterable rule, nested and shadowing comprehensions,
+tuple-unpacking targets, the walrus, and multiple generators with conditions.
+`tests/regressions/provably_int_elements_keep_the_fast_path.py` still
+deliberately does *not* assert any of this (see the comment in its section 6),
+so an element-kind regression cannot fail for this unrelated reason.
+
 ### BUG-EMPTY-LIST-DEFAULT-READ-AS-EVIDENCE. `x = []` claimed to hold ints, and the for-loop reader believed it — 2026-08-21 — **FIXED 2026-08-21**
 
 **Reproduce (pre-fix):**
