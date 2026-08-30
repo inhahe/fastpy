@@ -12,6 +12,7 @@ while the Python-independent runtime files are shared.
 
 from __future__ import annotations
 
+import inspect
 import os
 import sys
 import subprocess
@@ -1201,7 +1202,18 @@ def compile_ir_to_obj(
 
     # Run IR-level optimization passes (-O2 pipeline).
     # Uses the new LLVM pass manager API (PassBuilder + PipelineTuningOptions).
-    pto = llvm.PipelineTuningOptions(speed_level=_BACKEND_OPT_LEVEL, size_level=0)
+    # `size_level` was dropped from PipelineTuningOptions in llvmlite 0.49
+    # (its __init__ is now `(self, speed_level=2)`), so passing it raises
+    # TypeError on new llvmlite and omitting it raises nothing on old — the
+    # value we passed, 0, is what both versions default to, meaning "tune for
+    # speed, not size". So this is purely an API-shape difference and the
+    # compiled output is identical either way. Detected by signature rather
+    # than by version number: the check then describes the thing it actually
+    # depends on, and keeps working if the keyword ever returns.
+    if "size_level" in inspect.signature(llvm.PipelineTuningOptions.__init__).parameters:
+        pto = llvm.PipelineTuningOptions(speed_level=_BACKEND_OPT_LEVEL, size_level=0)
+    else:
+        pto = llvm.PipelineTuningOptions(speed_level=_BACKEND_OPT_LEVEL)
     # -O3 uses a larger inline threshold (275) than -O2 (225).
     pto.inlining_threshold = 275 if _BACKEND_OPT_LEVEL >= 3 else 225
     pb = llvm.create_pass_builder(target_machine, pto)
