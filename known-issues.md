@@ -8,6 +8,121 @@ how to reproduce it, and what the proper fix looks like.
 
 ## Active Bugs
 
+### BUG-JIT-SYMBOL-TABLE-ALWAYS-EMPTY-ON-WIN64. With the JIT importable, `exec()` of anything that calls the runtime kills the program — 2026-09-26
+
+**In short:** when `compiler.jit` is importable at run time — the condition
+under which `exec()` and dynamic imports use the native JIT (roadmap item 2) —
+a fastpy program on 64-bit Windows dies with an access violation the first
+time JIT-compiled code calls any runtime function. `exec("print(42)")` is
+enough. No exception and no fallback to CPython: the process is gone. Without
+`compiler` on the path the same programs work, because the CPython fallback
+runs instead. Broken since the in-process JIT landed (9d162bc, 2026-04-20).
+
+**Reproduce** (the source is assembled at run time, so the compiler cannot
+see it and compile it ahead of time):
+
+```python
+src = "".join(["print(", "42)", "\n"])
+print("before exec")
+exec(src)
+print("after exec")
+```
+
+`python -m compiler t.py -o t.exe`, then run `t.exe` with `PYTHONPATH` set to
+the fastpy checkout: it prints `before exec` and exits `0xC0000005`. cdb shows
+`rip=0`, `rcx=0`, `rdx=0x2a` — the JIT'd `fastpy_main` calling
+`fastpy_fv_print(0, 42)` through a null address.
+
+**Cause.** `_load_symbol_table()` in `compiler/jit.py` calls
+`kernel32.GetModuleHandleW(None)` without setting `restype`, so ctypes returns
+a C `int` and truncates the 64-bit module handle (`0x00007ff68de20000` comes
+back as `0xffffffff8de20000`). `GetProcAddress` on that finds nothing, the
+function returns an empty table, and `_register_runtime_symbols` maps no
+runtime function at all. MCJIT does not fail on the unresolved calls —
+`finalize_object()` succeeds and binds them to address 0 — so `jit_compile`
+returns a valid pointer and `jit_exec`'s fallback to `exec()` never triggers.
+
+**The fix, verified:** `GetModuleHandleW.restype = ctypes.c_void_p` and
+`.argtypes = [ctypes.c_wchar_p]`. With that in a patched copy of `compiler/`
+(run via `PYTHONPATH`), the program above prints `42` through the JIT and
+exits 0. It is necessary, not sufficient — the next entry is what still
+breaks. Two more changes belong with it:
+- **`jit_compile` must refuse a module that references anything it could not
+  map** — any declared function or global the module *uses*, called or not
+  (see the next entry for why "not" matters) — and return 0, so the CPython
+  fallback runs. An unresolved symbol must never reach machine code.
+- **A regression test that runs a compiled program's `exec()` with the JIT
+  importable.** None exists, which is how this went unnoticed: the JIT path
+  runs only when `compiler` happens to be on `sys.path`, and when
+  `compiler.jit` fails to import, the bridge falls back to CPython without a
+  word — which also makes a broken JIT look like a working one.
+
+**Linux: probably the same, untested.** The POSIX branch finds the table with
+`dlsym(RTLD_DEFAULT, ...)`, which sees an executable's own symbols only if it
+was linked with `-rdynamic`/`--export-dynamic`, and `compiler/toolchain.py`
+passes neither.
+
+### BUG-JIT-RESOLVES-230-OF-656-RUNTIME-FUNCTIONS-AND-NO-GLOBALS. Even with the table found, `exec()` of a two-argument `print`, `str.split` or a class kills the program — and so can code that never calls a missing function — 2026-09-26
+
+**In short:** JIT-compiled code can reach only the runtime functions listed by
+hand in `fpy_jit_symbols` (`runtime/runtime.c`) — 230 of them — while codegen
+declares 656 in every module, and `_register_runtime_symbols` maps functions
+only: the runtime *variables* every module declares (`fpy_current_line`,
+`fpy_classes`) are never mapped at all. Worse, **one unresolved reference
+breaks the whole module**: `print(sorted([3, 1, 2]))` crashes although the
+only missing function it references, `fastpy_exc_unhandled`, sits on an error
+path it never takes — the call that actually faults (`rip=0`) is to a
+function that *is* in the table.
+
+**What was run** (each a compiled program `exec()`ing source assembled at run
+time, against a scratch copy of `compiler/` with the previous entry's handle
+fixed):
+
+| exec'd source | handle fixed | + globals mapped, and a stub that names itself for every unmapped function |
+|---|---|---|
+| `print(42)` | works | works |
+| `print(sorted([3, 1, 2]))` | crash, `rip=0` | **works** — no stub is ever called |
+| `s = 'a,b'; print(s.split(','))` | crash | calls unmapped `fastpy_str_split_max` |
+| a class with an `__init__`, then `print(P(21).a)` | crash | calls unmapped `fastpy_set_class_slot_count` (the IR references eight more) |
+| `print('exec: sum =', 20 + 22)` | crash | prints `exec: sum =`, then calls unmapped `fastpy_write_space` |
+
+The `sorted` row is the one that matters: with every reference resolved it
+runs, and no unmapped function is called, so the crash without the stubs came
+from the unresolved references themselves. Presumably MCJIT stops applying
+relocations at the first symbol it cannot resolve and llvmlite's
+`finalize_object()` swallows the error, leaving later calls — to functions
+the table *does* map — pointing at 0; the mechanism was not traced further.
+(Whether the unmapped globals alone would also crash was not isolated; they
+were mapped to dummy cells here only to take them out of the question.)
+
+**The proper fix** is to stop keeping the list by hand, and to cover
+variables as well as functions:
+- generate the table from the declarations codegen emits — functions *and*
+  globals, with `&fpy_current_line`-style entries for the variables — so that
+  anything codegen can reference is by construction something the JIT can
+  resolve; or export the runtime's symbols from the executable (a generated
+  `/EXPORT` list on Windows, `--export-dynamic` on POSIX) and let MCJIT's
+  in-process search find them;
+- map `mod.global_variables` declarations in `_register_runtime_symbols`, not
+  only `mod.functions`;
+- and the refusal from the previous entry, so that any gap that remains falls
+  back to CPython instead of crashing.
+
+### BUG-CPYTHON-OUTPUT-GETS-A-DOUBLED-CR-WHEN-REDIRECTED. Lines the embedded CPython prints end in `\r\r\n` in a file or pipe on Windows — 2026-09-26
+
+**In short:** in the first entry's reproducer *without* the JIT, the CPython
+fallback runs the `exec`, and stdout redirected to a file holds
+`42\r\r\n` where CPython writes `42\r\n`. fastpy's own `print` lines around it
+are right. On a console the extra `\r` is invisible; in a file, a pipe, or a
+diff against CPython it is a wrong byte, and PowerShell shows it as a blank
+line.
+
+**Likely cause, not traced:** the text is newline-translated twice — once by
+CPython's text-mode `sys.stdout` and again by a text-mode C stream on the
+runtime side. Find where the bridge routes CPython's output
+(`fpy_cpython_flush` is the first place to look) and make one of the two
+binary.
+
 ### BUG-COMPREHENSION-INSIDE-A-LAMBDA-YIELDS-AN-EMPTY-LIST — 2026-08-21
 
 **In short:** a `lambda` whose body is a list comprehension returns an empty
