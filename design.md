@@ -2074,6 +2074,27 @@ the CPython bridge for SlateOS later as a superset once CPython is ported.
   "Pipeline" above). The prerequisite for running fastpy *on* SlateOS, where
   the binding cannot load; the OS repo's lane D builds `opt`, `llc` and
   `ld.lld` for SlateOS (LLVM 20.1).
+- [-] **fastpy running on SlateOS** (0.3.0; host side done, the on-target run
+  waits for the OS image to carry LLVM's tools). `IS_SLATEOS` is decided by
+  the kernel's release string -- SlateOS answers `uname` as Linux, with the
+  release `6.6.0-slateos` -- and on SlateOS `compile_and_link` builds a
+  SlateOS program the way other hosts cross-build one
+  (`_compile_and_link_slateos`): pure mode, `target=SLATEOS_TARGET`, the
+  tools backend (chosen by `auto` because the binding cannot load), and a
+  link against two installed archives in `SLATEOS_SYSTEM_LIB_DIR`
+  (`/usr/lib/x86_64-slateos`): the OS's `libc.a`, and `libfastpy_rt.a`, the
+  pure-mode runtime packed on a build machine by
+  `build_slateos_runtime_archive` (`zig ar`, deterministic), since SlateOS has
+  no C compiler. Off SlateOS an archive found in the sysroot is never used --
+  it could be older than `runtime/*.c` -- so the cross route still builds the
+  runtime objects. An archive links only the members a program references,
+  which is safe because no runtime file works through a constructor. The
+  linker search adds `ld.lld` in `FASTPY_LLVM_BIN` ahead of rust-lld. The OS
+  repo's `scripts/fastpy-slateos-bundle.py` assembles the image's share:
+  `/usr/lib/fastpy/{compiler,llvmlite}` (llvmlite's `ir` only; the binding
+  would never load), `/bin/fastpy`, and the archive.
+  `tests/test_slateos_native.py` links a program from exactly those two
+  archives with every other source of a runtime or a CPython forbidden.
 - [ ] **CPython bridge on SlateOS (B)** — later, once CPython is ported, so
   unsupported-stdlib programs also run on-target.
 

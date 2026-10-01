@@ -85,7 +85,30 @@ greet("world")
 |----------|--------|
 | `FASTPY_OPT` | LLVM backend optimization level for both the middle-end pass pipeline and codegen (`0`–`3`, default `2`). `3` raises the inliner threshold; it's not the default because it showed no reliable runtime win on the benchmark suite. |
 | `FASTPY_LLVM_BACKEND` | How LLVM is reached: `llvmlite` (in-process, through `llvmlite.binding`), `tools` (LLVM's own `opt` and `llc` run as programs on the IR text), or `auto` (the default: llvmlite when it loads, the tools when it does not). The tools route is for systems with no dynamic linker, where `llvmlite.binding` cannot load -- SlateOS -- and compiles the same IR through the same `default<O*>` pipeline and codegen settings. |
-| `FASTPY_LLVM_BIN` | The directory holding `opt` and `llc` for the tools route. Unset, they are looked for on `PATH`, then as versioned names (`opt-18`, newest first). |
+| `FASTPY_LLVM_BIN` | The directory holding `opt` and `llc` for the tools route, and `ld.lld` for the SlateOS link if it is there too. Unset, they are looked for on `PATH`, then as versioned names (`opt-18`, newest first). |
+| `FASTPY_SLATEOS_SYSROOT` | Where the SlateOS `libc.a` is, for a SlateOS link: the sysroot (its `lib/` is tried) or the directory itself. Unset: a sibling `../os/toolchain/sysroot/lib` checkout, or on SlateOS, `/usr/lib/x86_64-slateos`. |
+| `FASTPY_ZIG` | The `zig` executable that cross-compiles the C runtime for SlateOS (`zig cc`) and packs it (`zig ar`). Unset: `zig` on `PATH`, then `D:\utils\zig-*`. |
+| `FASTPY_RUST_LLD` | The linker for a SlateOS link. Unset: `ld.lld` in `FASTPY_LLVM_BIN`, then the active Rust toolchain's `rust-lld`, then `rust-lld` or `ld.lld` on `PATH`. |
+
+### Building for SlateOS, and on it
+
+`compile_ir_to_obj(..., target=SLATEOS_TARGET)` and `link_executable(...,
+target=SLATEOS_TARGET)` cross-build a static SlateOS program from any host: the
+C runtime in pure mode (no CPython bridge), cross-compiled with `zig cc`, linked
+with `rust-lld` or `ld.lld` against SlateOS's `libc.a`.
+
+On SlateOS itself the same route is simply the default, recognised by the
+kernel's release string (`6.6.0-slateos`): `python3 -m compiler prog.py -o
+prog` builds a SlateOS program. Three things differ there, because SlateOS has
+no dynamic linker and no C compiler:
+
+- LLVM is reached through `opt` and `llc` (`FASTPY_LLVM_BACKEND`), since
+  `llvmlite.binding` cannot load; only the pure-Python `llvmlite.ir` is needed.
+- The runtime is installed, as `/usr/lib/x86_64-slateos/libfastpy_rt.a`
+  beside `libc.a`. `toolchain.build_slateos_runtime_archive(dest)` makes it on
+  a build machine; the SlateOS repository's `scripts/fastpy-slateos-bundle.py`
+  packs it with the compiler for the image.
+- The link is `ld.lld`, LLVM's linker under its own name.
 
 ### Multi-Python version targeting
 

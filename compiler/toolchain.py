@@ -91,6 +91,29 @@ IS_WINDOWS = sys.platform == "win32"
 IS_MACOS = sys.platform == "darwin"
 IS_LINUX = sys.platform.startswith("linux")
 
+
+def _host_is_slateos() -> bool:
+    """Whether this machine is SlateOS.
+
+    SlateOS answers `uname` as Linux -- its C library presents the Linux ABI,
+    and a CPython built for Linux is what runs this compiler there -- but with
+    a kernel release of its own, `6.6.0-slateos`. That suffix is the one part
+    of the answer that is SlateOS's, so it is what is tested, as WSL is told
+    apart by its `-microsoft-standard-WSL2`.
+    """
+    if not IS_LINUX:
+        return False
+    try:
+        release = os.uname().release
+    except (AttributeError, OSError):
+        return False
+    return release.endswith("-slateos")
+
+
+# On SlateOS the host *is* the SlateOS target: a program compiled there is
+# built the way other hosts cross-build for it (see `compile_and_link`).
+IS_SLATEOS = _host_is_slateos()
+
 # LLVM optimization level for host codegen (both the IR pass pipeline and
 # backend instruction selection). Defaults to -O2, which measures fastest for
 # fastpy's generated code — -O3 regressed tight loops and cross-FV-boundary
@@ -153,6 +176,16 @@ _SLATEOS_LLD_FLAVOR = "gnu"
 # Directory where the cross-compiled pure-mode SlateOS runtime objects are
 # cached (out-of-tree from the host .obj/.o so the two never collide).
 SLATEOS_RUNTIME_DIR = RUNTIME_DIR / "slateos"
+
+# On SlateOS itself, what a program links against is installed, not built: two
+# archives in the system's library directory for the target, where a cross
+# toolchain's sysroot would keep them. `libc.a` is the OS's C library (the
+# `posix` crate); `libfastpy_rt.a` is this runtime in pure mode, made on a
+# build machine by `build_slateos_runtime_archive` -- SlateOS has no C
+# compiler to build it from `runtime/*.c` -- and staged beside it by the OS
+# repository's image recipe.
+SLATEOS_SYSTEM_LIB_DIR = Path("/usr/lib/x86_64-slateos")
+SLATEOS_RUNTIME_ARCHIVE = "libfastpy_rt.a"
 
 # Pure-mode runtime translation units for the SlateOS target. Unlike the host
 # build (which links cpython_bridge.c against libpython), a SlateOS pure-mode
@@ -225,7 +258,9 @@ def _find_slateos_sysroot_lib() -> Path | None:
 
     1. ``$FASTPY_SLATEOS_SYSROOT`` — either the sysroot root (its ``lib``
        subdir is tried) or the ``lib`` dir itself.
-    2. A sibling ``os`` checkout at ``<fastpy>/../os/toolchain/sysroot/lib``.
+    2. On SlateOS, the system's own: ``SLATEOS_SYSTEM_LIB_DIR``. Anywhere
+       else, a sibling ``os`` checkout at
+       ``<fastpy>/../os/toolchain/sysroot/lib``.
 
     Returns the directory containing ``libc.a``, or None if not found.
     """
@@ -235,9 +270,12 @@ def _find_slateos_sysroot_lib() -> Path | None:
         p = Path(env)
         candidates.append(p / "lib")
         candidates.append(p)
-    candidates.append(
-        _PROJECT_ROOT.parent / "os" / "toolchain" / "sysroot" / "lib"
-    )
+    if IS_SLATEOS:
+        candidates.append(SLATEOS_SYSTEM_LIB_DIR)
+    else:
+        candidates.append(
+            _PROJECT_ROOT.parent / "os" / "toolchain" / "sysroot" / "lib"
+        )
     for c in candidates:
         if (c / "libc.a").exists():
             return c
@@ -250,12 +288,16 @@ def _find_rust_lld() -> Path | None:
 
     The SlateOS link step reuses the very linker the OS repo builds its
     userspace with, so a fastpy SlateOS binary is produced by the same
-    gnu-lld/rust-lld path as the rest of the OS. Resolution order:
+    gnu-lld/rust-lld path as the rest of the OS. On SlateOS itself there is
+    no Rust toolchain, and the linker is LLVM's `ld.lld`, the same program
+    under its own name. Resolution order:
 
     1. `$FASTPY_RUST_LLD` — explicit override.
-    2. The active Rust sysroot (`rustc --print sysroot`), under
+    2. `ld.lld` in `$FASTPY_LLVM_BIN`, the directory the tools route takes
+       `opt` and `llc` from, when it has one there.
+    3. The active Rust sysroot (`rustc --print sysroot`), under
        `lib/rustlib/<host>/bin/rust-lld[.exe]`.
-    3. A bare `rust-lld` / `ld.lld` on PATH.
+    4. A bare `rust-lld` / `ld.lld` on PATH.
 
     Returns the path, or None if no linker was found.
     """
@@ -265,6 +307,15 @@ def _find_rust_lld() -> Path | None:
     if override:
         p = Path(override)
         if p.exists():
+            return p
+
+    # Unlike opt and llc, a FASTPY_LLVM_BIN without ld.lld is not an error:
+    # an LLVM installation used for its optimizer may well link with
+    # rust-lld, so the search goes on.
+    llvm_bin = os.environ.get("FASTPY_LLVM_BIN")
+    if llvm_bin:
+        p = Path(llvm_bin) / ("ld.lld" + EXE_EXT)
+        if p.is_file():
             return p
 
     # Query the Rust sysroot and scan its rustlib bin dirs for rust-lld.
@@ -1125,6 +1176,43 @@ def ensure_slateos_runtime_built(force: bool = False) -> list[Path]:
     return _compile_shared_runtime_slateos(force=force)
 
 
+def build_slateos_runtime_archive(dest: Path, force: bool = False) -> Path:
+    """Build the pure-mode SlateOS runtime and pack it as one archive, `dest`.
+
+    This is the form SlateOS installs the runtime in (`SLATEOS_RUNTIME_ARCHIVE`
+    in `SLATEOS_SYSTEM_LIB_DIR`): it has no C compiler to build `runtime/*.c`
+    itself, so the objects are made here, by `ensure_slateos_runtime_built`,
+    and carried there in one file. `zig ar` -- LLVM's archiver, which zig
+    already brings for the compile -- packs them deterministically, so the same
+    objects always give the same bytes.
+
+    Linking an archive takes only the members a program references, where a
+    list of objects takes all of them. Nothing in the runtime depends on the
+    difference: no file of it does its work from a constructor or from a
+    section the linker would have to keep while nothing refers to it.
+
+    Returns `dest`.
+    """
+    dest = Path(dest)
+    objs = ensure_slateos_runtime_built(force=force)
+    zig = _find_zig_cc()
+    if zig is None:
+        raise RuntimeError(
+            "Cannot find `zig` to pack the SlateOS runtime archive; set "
+            "FASTPY_ZIG to the zig executable path.")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    # `ar r` adds to an archive that exists, so a member dropped from the
+    # runtime since the last build would live on in it: start from nothing.
+    dest.unlink(missing_ok=True)
+    cmd = [str(zig), "ar", "rcsD", str(dest)] + [str(o) for o in objs]
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    if result.returncode != 0 or not dest.is_file():
+        raise RuntimeError(
+            f"Failed to pack the SlateOS runtime archive {dest}:\n"
+            f"{result.stdout}\n{result.stderr}")
+    return dest
+
+
 def ensure_runtime_built(python_exe: str | Path | None = None,
                          python_version: str | None = None) -> list[Path]:
     """Ensure the C runtime is compiled for the target Python. Returns list of
@@ -1621,9 +1709,9 @@ def _link_slateos(
     lld = _find_rust_lld()
     if lld is None:
         raise RuntimeError(
-            "Cannot find rust-lld for the SlateOS link step. Install a Rust "
-            "toolchain (it bundles rust-lld) or set FASTPY_RUST_LLD to the "
-            "linker path.")
+            "Cannot find a linker for the SlateOS link step: rust-lld (which "
+            "a Rust toolchain bundles) or LLVM's ld.lld (on PATH, or in "
+            "FASTPY_LLVM_BIN). Set FASTPY_RUST_LLD to name one directly.")
 
     cmd: list[str] = [
         str(lld),
@@ -1660,8 +1748,11 @@ def link_executable(
     Link object files into a native executable.
 
     On Windows, uses MSVC link.exe. On Linux/macOS, uses cc (gcc/clang).
-    With ``target=SLATEOS_TARGET``, cross-links a SlateOS-userspace ELF via
-    rust-lld instead (see `_link_slateos`); the host CPython is not linked.
+    With ``target=SLATEOS_TARGET``, links a SlateOS-userspace ELF via
+    rust-lld or ld.lld instead (see `_link_slateos`); the host CPython is not
+    linked. That works the same on SlateOS itself, except that the runtime is
+    the installed archive rather than objects built from `runtime/*.c` (see
+    `_slateos_runtime_inputs`).
 
     Args:
         obj_files: List of object files to link.
@@ -1677,19 +1768,23 @@ def link_executable(
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     if target == SLATEOS_TARGET:
-        # Pure-mode SlateOS link: program objects + cross-compiled fastpy
-        # runtime objects, resolved against the OS repo's static libc.a. The
-        # runtime is built on demand (cached under SLATEOS_RUNTIME_DIR).
-        runtime_objs = ensure_slateos_runtime_built()
+        # Pure-mode SlateOS link: program objects + fastpy's runtime, resolved
+        # against the static libc.a. Off SlateOS the runtime is built on
+        # demand (cached under SLATEOS_RUNTIME_DIR); on it, it is installed.
         sysroot_lib = _find_slateos_sysroot_lib()
         if sysroot_lib is None:
+            if IS_SLATEOS:
+                raise RuntimeError(
+                    f"Cannot find the C library: no libc.a in "
+                    f"{SLATEOS_SYSTEM_LIB_DIR}. Set FASTPY_SLATEOS_SYSROOT to "
+                    "the directory that holds it.")
             raise RuntimeError(
                 "Cannot find the SlateOS sysroot libc.a. Set "
                 "FASTPY_SLATEOS_SYSROOT to the sysroot directory (holding "
                 "lib/libc.a), or check out the OS repo as a sibling of fastpy "
                 "(../os/toolchain/sysroot/lib).")
         return _link_slateos(
-            list(obj_files) + runtime_objs,
+            list(obj_files) + _slateos_runtime_inputs(sysroot_lib),
             output_path,
             sysroot_lib_dir=sysroot_lib,
             libs=["c"],
@@ -1703,11 +1798,50 @@ def link_executable(
         return _link_posix(obj_files, output_path, install)
 
 
+def _slateos_runtime_inputs(sysroot_lib: Path) -> list[Path]:
+    """What a SlateOS program links for fastpy's runtime.
+
+    On SlateOS, the installed archive beside `libc.a` -- there is no C
+    compiler there to build the runtime from source. Anywhere else, the
+    objects built from this checkout's `runtime/*.c`, even if an archive
+    happens to sit in the sysroot: it could be older than the sources, and
+    nothing here could tell.
+    """
+    if IS_SLATEOS:
+        archive = sysroot_lib / SLATEOS_RUNTIME_ARCHIVE
+        if not archive.is_file():
+            raise RuntimeError(
+                f"fastpy's runtime is not installed: no {archive}. It is "
+                "built on another machine by build_slateos_runtime_archive "
+                "and installed beside libc.a.")
+        return [archive]
+    return ensure_slateos_runtime_built()
+
+
+def _compile_and_link_slateos(ir_string: str, output_path: Path) -> Path:
+    """`compile_and_link` on SlateOS, which builds for itself the way other
+    hosts build for it: pure mode -- the CPython running this compiler is a
+    static program and exports nothing a fastpy program could link against
+    -- with the installed runtime archive and the system's `libc.a`.
+
+    The object goes in a temporary directory rather than beside the output,
+    so an output named like an object (`prog.o`) is not deleted as one.
+    """
+    with tempfile.TemporaryDirectory(prefix="fastpy-") as tmp:
+        obj = compile_ir_to_obj(ir_string, Path(tmp) / "program.o",
+                                target=SLATEOS_TARGET)
+        return link_executable([obj], output_path, target=SLATEOS_TARGET)
+
+
 def compile_and_link(ir_string: str, output_path: Path,
                      python_version: str | None = None,
                      python_exe: str | Path | None = None) -> Path:
     """
     Full pipeline: LLVM IR string -> object file -> linked executable.
+
+    On SlateOS this builds a SlateOS program in pure mode
+    (`_compile_and_link_slateos`), and the two Python arguments, which name
+    a CPython to link against, have nothing to choose between.
 
     Args:
         ir_string: LLVM IR as a string.
@@ -1720,6 +1854,8 @@ def compile_and_link(ir_string: str, output_path: Path,
     Returns:
         Path to the generated executable.
     """
+    if IS_SLATEOS:
+        return _compile_and_link_slateos(ir_string, output_path)
     install = resolve_python(python_version=python_version, python_exe=python_exe)
     runtime_objs = ensure_runtime_built(
         python_exe=install.executable,

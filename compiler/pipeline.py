@@ -144,8 +144,14 @@ def compile_source(source: str, output: Path | None = None,
         # Use a local .build directory (easy to exclude from antivirus)
         # instead of system temp (which accumulates stale dirs).
         build_root = Path(__file__).resolve().parent.parent / ".build"
-        build_root.mkdir(exist_ok=True)
-        tmp_dir = tempfile.mkdtemp(prefix="fastpy_", dir=str(build_root))
+        try:
+            build_root.mkdir(exist_ok=True)
+            tmp_dir = tempfile.mkdtemp(prefix="fastpy_", dir=str(build_root))
+        except OSError:
+            # An installed compiler's directory is not the user's to write
+            # (SlateOS installs fastpy in /usr/lib/fastpy): use the system's
+            # temporary directory, which is.
+            tmp_dir = tempfile.mkdtemp(prefix="fastpy_")
         import sys as _sys
         exe_name = "output.exe" if _sys.platform == "win32" else "output"
         output = Path(tmp_dir) / exe_name
