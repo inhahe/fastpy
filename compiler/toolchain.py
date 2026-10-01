@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import inspect
 import os
+import re
+import shutil
 import sys
 import subprocess
 import sysconfig
@@ -22,11 +24,67 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional  # used in _probe_python_install return type
 
-import llvmlite.binding as llvm
+# --- Reaching LLVM ---
+# LLVM turns the IR into an object one of two ways. In-process, through
+# `llvmlite.binding` -- which loads LLVM as a shared library with ctypes, and is
+# what every platform with a dynamic linker uses. Or through LLVM's own
+# programs, `opt` and `llc`, given the IR as text -- which is how a system
+# without a dynamic linker gets there at all: SlateOS links every program
+# statically, so `llvmlite.binding` can never load there, while `opt` and
+# `llc` built for it are ordinary programs. The binding is therefore imported
+# on first use rather than with this module, so that loading the compiler does
+# not require it.
+_llvm_binding = None
+_llvm_binding_error: BaseException | None = None
 
-# Initialize LLVM targets (required before any target operations)
-llvm.initialize_native_target()
-llvm.initialize_native_asmprinter()
+
+def _binding():
+    """`llvmlite.binding`, imported and initialized on first use, or `None`
+    when it cannot be loaded (the reason is kept for the message that needs
+    it)."""
+    global _llvm_binding, _llvm_binding_error
+    if _llvm_binding is None and _llvm_binding_error is None:
+        try:
+            import llvmlite.binding as binding
+
+            # Required before any target operation.
+            binding.initialize_native_target()
+            binding.initialize_native_asmprinter()
+            _llvm_binding = binding
+        except (ImportError, OSError) as e:
+            _llvm_binding_error = e
+    return _llvm_binding
+
+
+def llvm_backend() -> str:
+    """Which way LLVM is reached: `"llvmlite"` (in-process) or `"tools"`
+    (`opt` and `llc` run as programs).
+
+    `FASTPY_LLVM_BACKEND` chooses. Unset, or `auto`, means llvmlite when it
+    loads and the tools when it does not; any other value is an error rather
+    than a silent default, since a misspelt choice would otherwise compile with
+    the backend its author meant to avoid.
+    """
+    choice = os.environ.get("FASTPY_LLVM_BACKEND", "auto").strip().lower()
+    if choice in ("llvmlite", "tools"):
+        return choice
+    if choice != "auto":
+        raise ValueError(
+            f"FASTPY_LLVM_BACKEND={choice!r}: expected 'auto', 'llvmlite' or 'tools'"
+        )
+    return "llvmlite" if _binding() is not None else "tools"
+
+
+def _require_binding():
+    """`llvmlite.binding`, or an error saying why it is missing and what to
+    use instead."""
+    binding = _binding()
+    if binding is None:
+        raise RuntimeError(
+            f"llvmlite.binding cannot be loaded ({_llvm_binding_error}); "
+            "set FASTPY_LLVM_BACKEND=tools to compile with LLVM's opt and llc"
+        )
+    return binding
 
 # --- Platform detection ---
 IS_WINDOWS = sys.platform == "win32"
@@ -1141,6 +1199,7 @@ def _make_target_machine(target: str | None):
     knobs from `toolchain/x86_64-slateos.json` (static relocation, large code
     model, SSE2), so the emitted object matches the OS's Rust sysroot ABI.
     """
+    llvm = _require_binding()
     if target is None:
         # Host codegen. Use PIC relocation on POSIX (required for ASLR and
         # shared objects); leave Windows at its default.
@@ -1185,6 +1244,10 @@ def compile_ir_to_obj(
     Returns:
         Path to the generated object file.
     """
+    if llvm_backend() == "tools":
+        return _compile_ir_to_obj_tools(ir_string, output_path, target)
+    llvm = _require_binding()
+
     # Parse the IR
     mod = llvm.parse_assembly(ir_string)
     mod.verify()
@@ -1226,6 +1289,165 @@ def compile_ir_to_obj(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_bytes(obj_data)
     return output_path
+
+
+def _find_llvm_tool(name: str) -> str:
+    """The path of LLVM's `name` program (`opt`, `llc`).
+
+    `FASTPY_LLVM_BIN`, a directory, is looked in first; then `PATH` for the
+    plain name; then `PATH` for a versioned one (`opt-18`), newest version
+    first, as distributions install them.
+    """
+    exe = name + EXE_EXT
+    bin_dir = os.environ.get("FASTPY_LLVM_BIN")
+    if bin_dir:
+        candidate = Path(bin_dir) / exe
+        if candidate.is_file():
+            return str(candidate)
+        raise FileNotFoundError(f"FASTPY_LLVM_BIN={bin_dir}: no {exe} there")
+    found = shutil.which(name)
+    if found:
+        return found
+    versioned: list[tuple[int, str]] = []
+    pattern = re.compile(rf"^{re.escape(name)}-(\d+){re.escape(EXE_EXT)}$")
+    for directory in os.environ.get("PATH", "").split(os.pathsep):
+        try:
+            entries = os.listdir(directory)
+        except OSError:
+            continue
+        for entry in entries:
+            m = pattern.match(entry)
+            if m and os.access(os.path.join(directory, entry), os.X_OK):
+                versioned.append((int(m.group(1)), os.path.join(directory, entry)))
+    if versioned:
+        return max(versioned)[1]
+    raise FileNotFoundError(
+        f"LLVM's {name} was not found on PATH (nor {name}-N); install LLVM or "
+        f"set FASTPY_LLVM_BIN to the directory holding {exe}"
+    )
+
+
+def _retarget_ir(ir_string: str, triple: str, data_layout: str) -> str:
+    """`ir_string` with its `target triple` and `target datalayout` lines
+    replaced -- what `mod.triple`/`mod.data_layout` do in-process."""
+    lines = ir_string.split("\n")
+    out = [
+        line for line in lines
+        if not line.startswith(("target triple = ", "target datalayout = "))
+    ]
+    header = [f'target triple = "{triple}"', f'target datalayout = "{data_layout}"']
+    # After the ModuleID comment, where llvmlite writes them.
+    at = 1 if out and out[0].startswith("; ModuleID") else 0
+    return "\n".join(out[:at] + header + out[at:])
+
+
+def _ir_triple(ir_string: str) -> str | None:
+    """The `target triple` an IR module names, or `None`."""
+    m = re.search(r'^target triple = "([^"]*)"', ir_string, re.M)
+    return m.group(1) if m else None
+
+
+def _compile_ir_to_obj_tools(
+    ir_string: str, output_path: Path, target: str | None
+) -> Path:
+    """`compile_ir_to_obj` through LLVM's own programs: `opt` runs the same
+    `default<O*>` pipeline with the same inline threshold the in-process path
+    uses, then `llc` emits the object with the same triple, CPU, features,
+    relocation model and code model. This is how a system with no dynamic
+    linker (SlateOS) compiles at all, since `llvmlite.binding` cannot load
+    there; `FASTPY_LLVM_BACKEND=tools` uses it anywhere else, which is how it
+    is tested.
+    """
+    opt = _find_llvm_tool("opt")
+    llc = _find_llvm_tool("llc")
+    if target == SLATEOS_TARGET:
+        ir_string = _retarget_ir(ir_string, _SLATEOS_TRIPLE, _SLATEOS_DATA_LAYOUT)
+        triple = _SLATEOS_TRIPLE
+        codegen = [
+            f"-mcpu={_SLATEOS_CPU}",
+            f"-mattr={_SLATEOS_FEATURES}",
+            "-relocation-model=static",
+            "-code-model=large",
+            "-O2",
+        ]
+    elif target is None:
+        triple = _ir_triple(ir_string) or host_triple()
+        codegen = [f"-O{_BACKEND_OPT_LEVEL}"]
+        if not IS_WINDOWS:
+            codegen.append("-relocation-model=pic")
+    else:
+        raise ValueError(f"Unknown codegen target {target!r}")
+
+    inline = 275 if _BACKEND_OPT_LEVEL >= 3 else 225
+    with tempfile.TemporaryDirectory(prefix="fastpy-llvm-") as tmp:
+        ll = Path(tmp) / "module.ll"
+        bc = Path(tmp) / "module.bc"
+        ll.write_text(ir_string, encoding="utf-8")
+        steps = [
+            [opt, f"-passes=default<O{_BACKEND_OPT_LEVEL}>",
+             f"-inline-threshold={inline}", f"-mtriple={triple}",
+             str(ll), "-o", str(bc)],
+            [llc, "-filetype=obj", f"-mtriple={triple}", *codegen,
+             str(bc), "-o", str(output_path)],
+        ]
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        for cmd in steps:
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, encoding="utf-8",
+                errors="replace", timeout=600,
+            )
+            if result.returncode != 0:
+                raise RuntimeError(
+                    f"{Path(cmd[0]).name} failed (exit {result.returncode}):\n"
+                    f"{result.stderr.strip()}"
+                )
+    return output_path
+
+
+# x86-64's ELF data layout -- what llvmlite's target machine answers for an
+# x86-64 Linux triple, `x86_64-unknown-linux-gnu` or `-musl` alike -- so IR
+# built without llvmlite is laid out as the in-process path lays it out. (Mach-O
+# and COFF mangle differently; neither is a platform that lacks llvmlite.)
+_X86_64_DATA_LAYOUT = (
+    "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128"
+)
+
+
+def host_triple() -> str:
+    """The LLVM triple for this machine: llvmlite's answer when it loads.
+
+    Without it -- a system with no dynamic linker, which in practice is
+    SlateOS -- it is worked out for the one shape such a system has: x86-64,
+    Linux-like, glibc or not. Anything else needs llvmlite, and says so.
+    """
+    binding = _binding()
+    if binding is not None:
+        return binding.get_default_triple()
+    import platform
+    machine = platform.machine().lower()
+    if machine not in ("x86_64", "amd64") or not IS_LINUX:
+        raise RuntimeError(
+            f"no LLVM triple known for {sys.platform}/{machine} without "
+            f"llvmlite.binding ({_llvm_binding_error})"
+        )
+    # glibc says so through confstr; musl -- and SlateOS's C library, which
+    # takes musl's shape -- does not.
+    try:
+        libc = os.confstr("CS_GNU_LIBC_VERSION") or ""
+    except (ValueError, OSError):
+        libc = ""
+    return "x86_64-unknown-linux-gnu" if libc.startswith("glibc") else "x86_64-unknown-linux-musl"
+
+
+def host_data_layout(triple: str) -> str:
+    """The data layout for `triple`: llvmlite's answer when it loads,
+    otherwise x86-64 ELF's, the only shape `host_triple` produces without
+    it."""
+    binding = _binding()
+    if binding is not None:
+        tm = binding.Target.from_triple(triple).create_target_machine()
+        return str(tm.target_data)
+    return _X86_64_DATA_LAYOUT
 
 
 def _link_windows(obj_files: list[Path], output_path: Path,

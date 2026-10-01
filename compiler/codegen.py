@@ -1254,14 +1254,12 @@ class CodeGen:
         self._current_scope_stmts = []  # Phase 4: initialize early
         self.module = ir.Module(name="fastpy_module")
         # Use the host platform's LLVM triple and data layout for correct
-        # struct layout (padding/alignment) and object file format.
-        import llvmlite.binding as _llvm
-        _llvm.initialize_native_target()
-        _llvm.initialize_native_asmprinter()
-        self.module.triple = _llvm.get_default_triple()
-        _target = _llvm.Target.from_triple(self.module.triple)
-        _tm = _target.create_target_machine()
-        self.module.data_layout = str(_tm.target_data)
+        # struct layout (padding/alignment) and object file format. Asked of
+        # the toolchain, which answers from llvmlite.binding when it loads and
+        # without it where it cannot (SlateOS has no dynamic linker).
+        from compiler.toolchain import host_data_layout, host_triple
+        self.module.triple = host_triple()
+        self.module.data_layout = host_data_layout(self.module.triple)
         self._threading_mode = threading_mode
         # Integer mode: False = BigInt fallback on overflow (default, Python-compatible)
         # True = i64-only with OverflowError on overflow (faster, not Python-compatible)

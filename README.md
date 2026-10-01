@@ -84,6 +84,8 @@ greet("world")
 | Variable | Effect |
 |----------|--------|
 | `FASTPY_OPT` | LLVM backend optimization level for both the middle-end pass pipeline and codegen (`0`–`3`, default `2`). `3` raises the inliner threshold; it's not the default because it showed no reliable runtime win on the benchmark suite. |
+| `FASTPY_LLVM_BACKEND` | How LLVM is reached: `llvmlite` (in-process, through `llvmlite.binding`), `tools` (LLVM's own `opt` and `llc` run as programs on the IR text), or `auto` (the default: llvmlite when it loads, the tools when it does not). The tools route is for systems with no dynamic linker, where `llvmlite.binding` cannot load -- SlateOS -- and compiles the same IR through the same `default<O*>` pipeline and codegen settings. |
+| `FASTPY_LLVM_BIN` | The directory holding `opt` and `llc` for the tools route. Unset, they are looked for on `PATH`, then as versioned names (`opt-18`, newest first). |
 
 ### Multi-Python version targeting
 

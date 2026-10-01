@@ -28,6 +28,25 @@ The two codegen/link entry points live in `compiler/toolchain.py`:
 - **`compile_ir_to_obj(ir_string, output_path, target=None)`** — parses IR, runs
   the `-O2` new-pass-manager pipeline, and emits an object file via an LLVM
   `TargetMachine`.
+
+  LLVM is reached one of two ways, chosen by `llvm_backend()`
+  (`FASTPY_LLVM_BACKEND`: `auto`, the default, `llvmlite` or `tools`).
+  **In-process** through `llvmlite.binding`, which loads LLVM as a shared
+  library with ctypes — every platform with a dynamic linker. Or through
+  **LLVM's own programs**, `opt` then `llc`, given the IR as text
+  (`_compile_ir_to_obj_tools`): the same `default<O*>` pipeline, inline
+  threshold, triple, CPU, features, relocation and code model, so the two
+  produce equivalent objects. The tools route exists for a system with no
+  dynamic linker — SlateOS links every program statically, so the binding can
+  never load there — and `auto` falls back to it whenever the binding fails to
+  import. The binding is therefore imported lazily (`_binding()`), never at
+  module import, and IR is built by `llvmlite.ir`, which is pure Python and
+  needs no LLVM at all. Without the binding, `host_triple()`/
+  `host_data_layout()` answer for the one shape such a system has (x86-64,
+  Linux-like, glibc or musl decided by `confstr`). The tools are found through
+  `FASTPY_LLVM_BIN`, then `PATH`, then versioned names (`opt-18`), newest
+  first. `tests/test_llvm_tools_backend.py` compiles one program both ways and
+  compares what the two executables print.
 - **`link_executable(obj_files, output_path, install)`** — links objects into an
   executable. Windows uses MSVC `link.exe` (via vcvars); POSIX uses `cc`.
 - **`compile_and_link(...)`** — the full IR→exe convenience wrapper.
@@ -2050,6 +2069,11 @@ the CPython bridge for SlateOS later as a superset once CPython is ported.
   deliberately mode-agnostic, so the bridge was changed to match rather than
   returning a raw PyObject* list. CPython's laziness is the one semantic
   difference; the bridge was always eager too.
+- [x] **LLVM through its own tools** (0.2.0) — `FASTPY_LLVM_BACKEND=tools`
+  compiles through `opt` and `llc` instead of `llvmlite.binding` (see
+  "Pipeline" above). The prerequisite for running fastpy *on* SlateOS, where
+  the binding cannot load; the OS repo's lane D builds `opt`, `llc` and
+  `ld.lld` for SlateOS (LLVM 20.1).
 - [ ] **CPython bridge on SlateOS (B)** — later, once CPython is ported, so
   unsupported-stdlib programs also run on-target.
 
