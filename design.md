@@ -2197,5 +2197,6 @@ correct: it is the workload, not the compiler.
 
 ## Git workflow (project rule)
 
-Never `git push` from this working directory. The user pushes by copying files to
-`D:\github\fastpy` and pushing there. Committing locally is fine.
+Push only when the user says to, and then straight from this repository; the
+`D:\github\fastpy` mirror it used to publish through is gone. Committing locally
+is fine.

@@ -6232,6 +6232,37 @@ alone. Add both arms together, or add an explicit comment at each
 **Proper fix:** give FpyComplex and FpyDecimal a leading `int32_t refcount`
 like FpyBigInt and add matching arms to both functions.
 
+### DEBT-REPO-NOT-PUSHABLE. This repository cannot be pushed to GitHub as it stands — 2026-10-18
+
+**What:** publishing changed on 2026-10-18 from a mirror copy
+(`D:\github\fastpy`, now gone) to pushing this repository directly. Three
+things stop that push:
+
+1. **No remote.** The repository had none on purpose while the mirror existed.
+2. **Unrelated history.** `inhahe/fastpy` on GitHub holds the mirror's own
+   history: snapshot commits, `Add a license` (e2fd882), and the tags `v0.1.0`
+   (7f56b4a) and `v0.1-pre-refactor` (4bfcd4e). None of it is shared with this
+   repository's 421 commits, so a plain push is rejected, and a force push
+   would throw GitHub's history away.
+3. **It tracks files that were never meant to be public.** The mirror copied a
+   whitelist: the sources under `compiler/`, `runtime/`, `fastpy/`, `tests/`
+   and `benchmarks/`, plus named top-level docs. Here about 1,100 paths have
+   been committed over time, among them top-level scratch scripts and IR
+   dumps, debug executables (`bm_float_debug*`), `python313.dll`, the runtime
+   archives, compiled `runtime/*.o`, `orchestrator2.log`,
+   `.orchestrator_history` (a session's prompt history), `topost.txt`,
+   `todo.txt`, `graphify-out/`, and files named by mangled Windows paths
+   (`D\uF03Atemp...`). Untracking them now leaves them in every older commit.
+
+**Proper fix:** decide what is public; untrack and gitignore the rest; strip
+it from all history with `git filter-repo`. That rewrites every hash: the
+hashes cited in this file and in `design.md` must be remapped through
+filter-repo's `commit-map`, and the `_fastpy_before` worktree recreated. Then
+add `origin`, fetch GitHub's `main`, merge it with
+`--allow-unrelated-histories` keeping this tree plus `LICENSE`, and push as a
+fast-forward. The merge keeps GitHub's old commits, and the released tags on
+them, in `main`'s history.
+
 ---
 
 ## Recently Fixed
