@@ -43,3 +43,6 @@ benchmarks/_dist_ir.ll
 # output are pure artifacts and never belong in a commit.
 benchmarks/_probe*.ll
 benchmarks/*.out
+
+# Release scripts are local tooling and stay out of the repository.
+*release.bat
