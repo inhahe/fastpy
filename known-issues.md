@@ -6232,40 +6232,31 @@ alone. Add both arms together, or add an explicit comment at each
 **Proper fix:** give FpyComplex and FpyDecimal a leading `int32_t refcount`
 like FpyBigInt and add matching arms to both functions.
 
-### DEBT-REPO-NOT-PUSHABLE. This repository cannot be pushed to GitHub as it stands — 2026-10-18
-
-**What:** publishing changed on 2026-10-18 from a mirror copy
-(`D:\github\fastpy`, now gone) to pushing this repository directly. Three
-things stop that push:
-
-1. **No remote.** The repository had none on purpose while the mirror existed.
-2. **Unrelated history.** `inhahe/fastpy` on GitHub holds the mirror's own
-   history: snapshot commits, `Add a license` (e2fd882), and the tags `v0.1.0`
-   (7f56b4a) and `v0.1-pre-refactor` (4bfcd4e). None of it is shared with this
-   repository's 421 commits, so a plain push is rejected, and a force push
-   would throw GitHub's history away.
-3. **It tracks files that were never meant to be public.** The mirror copied a
-   whitelist: the sources under `compiler/`, `runtime/`, `fastpy/`, `tests/`
-   and `benchmarks/`, plus named top-level docs. Here about 1,100 paths have
-   been committed over time, among them top-level scratch scripts and IR
-   dumps, debug executables (`bm_float_debug*`), `python313.dll`, the runtime
-   archives, compiled `runtime/*.o`, `orchestrator2.log`,
-   `.orchestrator_history` (a session's prompt history), `topost.txt`,
-   `todo.txt`, `graphify-out/`, and files named by mangled Windows paths
-   (`D\uF03Atemp...`). Untracking them now leaves them in every older commit.
-
-**Proper fix:** decide what is public; untrack and gitignore the rest; strip
-it from all history with `git filter-repo`. That rewrites every hash: the
-hashes cited in this file and in `design.md` must be remapped through
-filter-repo's `commit-map`, and the `_fastpy_before` worktree recreated. Then
-add `origin`, fetch GitHub's `main`, merge it with
-`--allow-unrelated-histories` keeping this tree plus `LICENSE`, and push as a
-fast-forward. The merge keeps GitHub's old commits, and the released tags on
-them, in `main`'s history.
-
 ---
 
 ## Recently Fixed
+
+### DEBT-REPO-NOT-PUSHABLE (fixed 2026-10-18) — the repository could not be pushed to GitHub
+
+**What it was:** publishing moved on 2026-10-18 from a mirror copy
+(`D:\github\fastpy`, gone) to pushing this repository. But the repository
+had no remote, its history had parted from GitHub's at 407025e (2026-04-22;
+after that GitHub received only the mirror's snapshot commits), and the
+commits since then had tracked some 370 files that were never meant to be
+public: scratch scripts and IR dumps, debug executables, `python313.dll`,
+the runtime archives, compiled `runtime/*.o`, logs, a session's prompt
+history, personal notes.
+
+**Fix:** `git filter-repo --refs 407025e..main` kept only the public set: the
+top-level files `.gitignore` now lists, and the sources under `compiler/`,
+`runtime/`, `fastpy/`, `tests/`, `benchmarks/`, `tools/` and `web/`. Commits
+up to 407025e kept their hashes; the docs' citations of later ones were
+remapped. GitHub's `main` was merged in with `-s ours`, keeping this tree and
+recording the snapshots, so the push was a fast-forward. `.gitignore` now
+ignores whatever it does not list at the top level, and anything in `tests/`
+that is not Python. The history as it was before the rewrite is in
+`.git/pre-publish-history.bundle`; it still holds the dropped files, so it
+stays local.
 
 ### BUG-BIGINT-INCREF-MISSING (fixed 2026-07-27) — *this was the "regression suite flake"*
 

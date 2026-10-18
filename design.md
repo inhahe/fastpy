@@ -2200,3 +2200,8 @@ correct: it is the workload, not the compiler.
 Push only when the user says to, and then straight from this repository; the
 `D:\github\fastpy` mirror it used to publish through is gone. Committing locally
 is fine.
+
+`.gitignore` ignores everything at the top level that it does not list, and
+everything in `tests/` that is not a `.py` file, so scratch files left there are
+never committed. A new top-level file that belongs in the repository needs its
+own `!/name` line there.
