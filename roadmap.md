@@ -255,7 +255,7 @@ Path text is therefore never at offset 0; reach it via `fastpy_path_as_cstr()`.
 
 ### 18. ~~REPL mode~~ ✅ DONE as a statement-replay REPL (2026-04-28) — to be replaced by 19
 The "SKIPPED — doesn't apply to an AOT compiler" note that stood here was
-overtaken: `python -m compiler --repl` (`compiler/repl.py`, commit 7e931b2,
+overtaken: `python -m compiler --repl` (`compiler/repl.py`, commit f3a55fd,
 with the web playground) has existed since 2026-04-28. Each input is compiled
 with the whole session so far replayed in front of it — every earlier
 statement, with function and class redefinitions deduplicated — then linked

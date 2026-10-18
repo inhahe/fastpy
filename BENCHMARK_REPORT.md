@@ -99,7 +99,7 @@ env cache both populated). Measured on x64 Windows / MSVC.
 
 | Config                        | compile wall (best-of-5) | vs baseline |
 |-------------------------------|--------------------------|-------------|
-| Baseline (`ae2da03`)          | 2400 ms                  | —           |
+| Baseline (`5e42cdc`)          | 2400 ms                  | —           |
 | + MSVC env cache + codegen    | ~200 ms                  | **−92%**    |
 
 The dominant cost in the baseline was re-invoking `vcvars64.bat` on **every**
@@ -113,7 +113,7 @@ from ~2148 ms to ~141 ms.
 
 | Config                | cumulative (per-call) | vs baseline |
 |-----------------------|-----------------------|-------------|
-| Baseline (`ae2da03`)  | 7.51 s (179 ms/call)  | —           |
+| Baseline (`5e42cdc`)  | 7.51 s (179 ms/call)  | —           |
 | + hoisted tree walks  | 1.08 s (26 ms/call)   | **−86%**    |
 
 Two nested full-AST walks that were re-run for every candidate receiver were

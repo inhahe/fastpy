@@ -294,7 +294,7 @@ than a diagnostic.
 
 **Predates the element-kind work.** Confirmed by compiling the four-line case
 with the `fastpy-ab-base` baseline worktree, which is pinned before commit
-`8e8b529` (the `ELEM_KIND_UNKNOWN` sentinel): the baseline prints `4` for
+`33cb9a9` (the `ELEM_KIND_UNKNOWN` sentinel): the baseline prints `4` for
 `i = "not an int"; squares = [i * i for i in range(4)]; print(i)` as well. This
 bug is orthogonal to element-kind inference and was only *found* by it, when
 `tests/regressions/provably_int_elements_keep_the_fast_path.py` tripped over it.
@@ -428,7 +428,7 @@ a for-loop variable (it returns None, and both append-vote loops then record
 
 **Impact.** This is what broke SlateOS's `fastpy-minishell` boot self-test: the
 tokeniser counts pipeline stages with exactly the loop above, counted zero,
-forked nothing, and exited 0 with `$?` never set. Introduced by 40535b5, whose
+forked nothing, and exited 0 with `$?` never set. Introduced by bc8d7dd, whose
 own commit message states the rule it broke — *"a half-answer is worse than no
 answer… the reader of that half-answer filled the missing element in with
 VKind.INT and read a pointer as an integer"* — one producer over, in the
@@ -630,7 +630,7 @@ print(sorted(s))
 ```
 
 `s.update({2, 3})` — a *set* argument — works. Every other iterable crashes:
-list, tuple, str, bytes. Present on `20a5304` too, so it predates the
+list, tuple, str, bytes. Present on `92e7a7f` too, so it predates the
 key-kind work; found while writing `tests/regressions/set_elem_kind_proof.py`.
 
 **Why.** The runtime entry point is
@@ -722,7 +722,7 @@ alone — an aliasing coercion would show up nowhere else.
 ### BUG-FROZENSET-CALL-RETURNS-A-PYOBJECT-TAGGED-SET. `sorted(frozenset([2, 1]))` segfaults — 2026-08-15 — **FIXED 2026-08-15**
 
 Found while testing the constructor half of the entry above; it predates that
-work (reproduced on `6268414`).
+work (reproduced on `fe92279`).
 
 `frozenset` was absent from `_BUILTIN_DISPATCH`, so a `frozenset(...)` call
 fell through to `_route_unknown_builtin` and came back as a `PyObject *` from
@@ -766,7 +766,7 @@ for k in d:            # <- key kind wanted here
 print(total)
 ```
 
-`_is_int_keyed_dict(d)` returns False, on this checkout and on `20a5304`.
+`_is_int_keyed_dict(d)` returns False, on this checkout and on `92e7a7f`.
 
 **Why.** The `ast.Name` arm (codegen.py ~37218) proves int-keyed from three
 kinds of evidence: an int-keyed literal binding, an int-keyed *mutation*
@@ -816,7 +816,7 @@ workload at all before this — only `dict lookup 1K keys x 1K`, which never
 enters `_emit_for_dict` — so an A/B run over the old 16 could not have seen a
 regression in this code path either way.
 
-**Measured** (`ab_bench.py` vs `20a5304`, 41 interleaved reps, ratios only —
+**Measured** (`ab_bench.py` vs `92e7a7f`, 41 interleaved reps, ratios only —
 the box was at 54% load from an unrelated process):
 
 | benchmark | B/A | |
@@ -855,7 +855,7 @@ while j < 1000:
 print(total)
 ```
 
-`096babe` vs `ab4e4a5` measured **2.9x slower** on this benchmark. Most of
+`aa276a6` vs `5210002` measured **2.9x slower** on this benchmark. Most of
 that turned out not to be this issue at all — see the history below, which is
 kept because two plausible diagnoses were wrong and the way they were
 falsified is the useful part. After PERF-DICT-KEY-HOT-PATH-MSVC was fixed the
@@ -912,11 +912,11 @@ would read the wrong thread's flag. This is why `_ExternalTLSGlobal`
 The sibling of PERF-EXC-CHECK-IN-HOT-LOOP, and the larger of the two.
 `_emit_try_bail_if_exc` (`compiler/codegen.py:38848`) is called from 31 sites
 and always emits the check. On `dist_sq method 1M` that is 15 checks, and they
-are **the entire regression against `096babe` — and then some**:
+are **the entire regression against `aa276a6` — and then some**:
 
 | build (1M calls) | min | net of 12.4ms floor |
 |---|---|---|
-| `096babe` | 14.5ms | 2.12ms |
+| `aa276a6` | 14.5ms | 2.12ms |
 | HEAD | 16.1ms | 3.74ms |
 | HEAD, checks replaced by constant 0 | 13.8ms | **1.44ms** |
 
@@ -954,7 +954,7 @@ the count of checks in the generated IR is unchanged. What changes is that the
 reuses the first load across pure code, and simplifycfg folds a branch on a
 condition it has already proven false on that path. Measured on
 `_dist_src.py`, checks surviving `-O2` went **21 → 12**, and the benchmark's
-A/B ratio against `096babe` went **1.40x → 1.14x** (net work 4.9ms → 3.6ms
+A/B ratio against `aa276a6` went **1.40x → 1.14x** (net work 4.9ms → 3.6ms
 against a 3.2ms baseline; 1.34ms with every check removed by hand).
 
 This is route 2 from the original plan, but delegated: LLVM has the finished
@@ -1052,7 +1052,7 @@ bound the defect: `*rest, = "ab", 2` (no plain target at all) and
 `r, q = "ab", 2` (no star) both print correctly — so the plain-unpack path
 propagates kinds fine and only the starred path drops them.
 
-Confirmed pre-existing at `096babe`.
+Confirmed pre-existing at `aa276a6`.
 
 **Proper fix:** the starred-unpack lowering needs to carry each fixed
 position's element kind the way the plain-tuple path already does, instead
@@ -1094,7 +1094,7 @@ define internal double @"fastpy.user.sink"(double %"v") alwaysinline
 ```
 
 The loop's `i64` counter is then widened at the call and comes back as a
-float. Confirmed pre-existing at `096babe`, so it long predates the ABI /
+float. Confirmed pre-existing at `aa276a6`, so it long predates the ABI /
 call-site-analysis work of 2026-08-14.
 
 This is the mirror image of BUG-GLOBAL-KIND-CHANGING-REBIND-USES-STALE-TAG
@@ -1582,7 +1582,7 @@ are the several `self.variables[pname] = ...` parameter-binding sites
 `_func_*` map that stores per-parameter facts without a scope prefix.
 
 **Pre-existing, not a regression:** reproduces identically on the compiler as
-of commit `3000210`, before any of the element-kind work. It was found while
+of commit `753af5b`, before any of the element-kind work. It was found while
 minimising an unrelated crash and the minimisation walked into it.
 
 **Proper fix:** key every per-parameter fact by `(function, parameter)`, the
@@ -2986,7 +2986,7 @@ because the subscript path has no runtime-tag dispatch arm — but the tag now
 survives the call, which is the prerequisite.
 
 **Test:** `tests/regressions/untyped_param_fv_abi.py`. Verified badly wrong at
-`b1a665d` (pointers printed as integers, lengths 0). Clean under
+`633b979` (pointers printed as integers, lengths 0). Clean under
 ASan/UBSan/LSan.
 
 ### ~~BUG-RETURNS-UNTYPED-PARAM-RET-TAG~~ **FIXED**. A function that returns its own untyped parameter was typed `int`, so `len(f(x))` answered 0 — 2026-07-26
@@ -3040,7 +3040,7 @@ the bare `"int"` default, skips bare-ABI ones, and is confined to a direct
 `return <user call>`.
 
 **Test:** `tests/regressions/returns_untyped_param_ret_tag.py`. Verified wrong
-at `24bfaa4`. Clean under ASan/UBSan/LSan.
+at `8af77f5`. Clean under ASan/UBSan/LSan.
 
 ### ~~BUG-BYTES-RETURN-TAG-LOST. A `bytes`-returning function loses its tag, so `len()` answers 0 and `print()` shows a pointer~~ — FIXED 2026-07-26
 
@@ -3109,7 +3109,7 @@ and `_duf_determine_ret_tag` both have direct arms for a str literal, and the
 forward-referenced case resolves through `_func_ret_types` for the tags it does
 record. `tests/regressions/bytes_return_tag.py` pins the str behaviour anyway.
 
-**Test:** `tests/regressions/bytes_return_tag.py`. Verified wrong at `e781cfb`.
+**Test:** `tests/regressions/bytes_return_tag.py`. Verified wrong at `1527842`.
 Clean under ASan/UBSan/LSan.
 
 ### ~~BUG-BYTES-CONTAINS-NO-ARM. `x in b"..."` has no arm in the emitter and faults through the CPython bridge~~ — FIXED 2026-07-26
@@ -3179,7 +3179,7 @@ header — so tagging that allocation BYTES made every later `fpy_bytes_len` rea
 the magic field 16 bytes before the buffer. ASan caught it as a
 heap-buffer-overflow read on `b = b"abcd"; print(b[1:3])`; without a sanitizer
 it silently read whatever the allocator left there, so the length was garbage
-or, more often, accidentally plausible. Verified wrong at `e781cfb`.
+or, more often, accidentally plausible. Verified wrong at `1527842`.
 
 **Fix:** real byte-indexed `fastpy_bytes_slice` / `fastpy_bytes_slice_step`
 backed by `fpy_bytes_alloc`, selected at all three lowering sites — the static
@@ -3200,7 +3200,7 @@ it.
 ### ~~BUG-BYTES-IN-LIST-TAG-LOST. A `bytes` stored in a list came back out as a `str` (or as a raw pointer)~~ — FIXED 2026-07-26
 
 **What:** found while writing the test above, and independent of it —
-`z = b"abcd"; print([z])` printed `['abcd']` at `e781cfb`. Three separate gaps,
+`z = b"abcd"; print([z])` printed `['abcd']` at `1527842`. Three separate gaps,
 all the same shape:
 
 - `_emit_list_append_expr` has arms that tag the element LIST, DICT, OBJ,
@@ -3231,7 +3231,7 @@ BUG-CODEGEN-OWNED-TEMP-OVER-INCREF.
 
 **What:** fastpy has no mutable bytes type. `bytearray([65, 66])` prints
 `[65, 66]` where CPython prints `bytearray(b'AB')`. Verified the same at
-`e781cfb`, so this is long-standing rather than a regression; it is recorded
+`1527842`, so this is long-standing rather than a regression; it is recorded
 here because the neighbouring `bytes()` work (BUG-BYTES-CTOR-BRIDGE-ONLY above)
 deliberately left `bytearray` alone and it would otherwise look like an
 oversight.
@@ -3312,7 +3312,7 @@ required-slot fast path is untouched, so `f(*seq)` into an all-required
 signature is as cheap as before.
 
 **Test:** `tests/regressions/splat_defaulted_slot_type.py`. Verified wrong at
-`157c863`.
+`aa629a6`.
 
 ### ~~BUG-SPLAT-HETEROGENEOUS-ELEM. A required slot filled by `f(*seq)` is unwrapped by the sequence's static element type, which a heterogeneous sequence does not have~~ — FIXED 2026-07-26
 
@@ -3346,7 +3346,7 @@ an FV-ABI callee and converts it via the runtime tag for a bare-ABI one. The
 the FV path costs nothing extra; the bare path adds one tag compare.
 
 **Test:** `tests/regressions/splat_defaulted_slot_type.py`. Verified wrong at
-`157c863`.
+`aa629a6`.
 
 ### ~~BUG-SPLAT-CALL-PICKS-FIRST-SPECIALIZATION. `f(*seq)` against a monomorphized function always calls the first specialization~~ — FIXED 2026-07-26
 
@@ -3386,7 +3386,7 @@ never in a position to reproduce it, since it has neither the callee's
 parameter list nor the sequence-binding map.
 
 **Test:** `tests/regressions/splat_defaulted_slot_type.py`. Verified wrong at
-`157c863`.
+`aa629a6`.
 
 ### ~~BUG-STARARG-SPLAT-DEFAULT-PARAM. `f(*xs)` raises IndexError when `f` has a default parameter~~ — FIXED 2026-07-26
 
@@ -3442,7 +3442,7 @@ poisoned rather than guessed at. The defaulted slots are left alone — see
 BUG-SPLAT-DEFAULTED-SLOT-TYPE above.
 
 **Test:** `tests/regressions/stararg_splat_default_param.py`. Verified to
-IndexError at `2482ae6`. Clean under ASan/UBSan/LSan.
+IndexError at `29b156e`. Clean under ASan/UBSan/LSan.
 
 **Follow-up done:** `tests/regressions/param_type_from_call_arg.py` says a
 star-args call site cannot be exercised because of this bug; that note is now
@@ -3657,10 +3657,10 @@ earlier:
   purpose; CPython's own behaviour is the tie-breaker.
 
 Regression test: `tests/regressions/mixed_scalar_return_tag.py`. Verified wrong
-at `cfc34df`.
+at `7580793`.
 
 **Two adjacent bugs surfaced while testing this** — both verified pre-existing
-at `cfc34df`, both since fixed together (they had to be: the first is
+at `7580793`, both since fixed together (they had to be: the first is
 unobservable without the second):
 ~~BUG-IFEXP-INT-FLOAT-PROMOTE~~ and ~~BUG-VAR-RETYPED-MIDSCOPE-STALE-SLOT~~,
 below.
@@ -3761,7 +3761,7 @@ showed it plainly:
 ```
 
 Unrolling the loop worked (each read follows its own store in emission order);
-so did moving the whole thing inside a `def`. Pre-existing at `cfc34df`, where
+so did moving the whole thing inside a `def`. Pre-existing at `7580793`, where
 the same program printed a different wrong answer (`2.0 / 4.598e+18 / …`) for
 the same reason.
 
@@ -4885,7 +4885,7 @@ lit=['abcd','efgh'];    print(len(lit[0]))  # fastpy 4, CPython 4 (constants OK)
 ```
 CPython: `4 4 4 4`; fastpy: `0 0 0 4`. Not covered by the differential suite
 (the failing patterns aren't exercised there). Verified pre-existing (reproduces
-on parent commit `ac1fb3b`, before the Model-2 work) — this is a type-inference
+on parent commit `4c2759e`, before the Model-2 work) — this is a type-inference
 bug, **not** a refcount/UAF bug (the string isn't freed, just mis-tagged; no ASan
 report).
 
@@ -5209,7 +5209,7 @@ c = 65
 h = (h ^ c) & mask                 # `&` with a bigint operand → crash (was 0xC0000005)
 ```
 
-**Fix (static path, committed 7e126c8):** implemented
+**Fix (static path, committed 851dde3):** implemented
 `fpy_bigint_and/or/xor/lshift/rshift` in `runtime/bigint.c` (two's-complement
 widening to honor Python's infinite-width negative semantics; floor/arithmetic
 right shift), declared them in `runtime/bigint.h` and codegen, and added
@@ -5417,7 +5417,7 @@ index a str, list, dict, tuple or bytes from the tag. Four parts:
    store, so a slot is never widened.
 
 **Test:** tests/regressions/subscript_untyped_param.py. Verified wrong at
-1f23c9f. Clean under ASan/UBSan/LSan.
+cf7c7dc. Clean under ASan/UBSan/LSan.
 
 ### BUG-FILEREAD-FN-RETTAG. A user function that returns a file-read result is typed `int`, losing the `str` tag — 2026-07-21 — **FIXED 2026-07-27**
 
@@ -5781,7 +5781,7 @@ element default and `len()` measures a pointer.
 **Severity:** medium. Silently wrong; no crash in the shapes probed, but the
 same wrong answer routes `for` to the native list loop, so a crash is reachable.
 
-**Pre-existing:** reproduced identically at `5441451^`, before any of the tuple
+**Pre-existing:** reproduced identically at `3f34d82^`, before any of the tuple
 work.
 
 **The fix**, as predicted above: methods get the same element-carrying return
@@ -5827,7 +5827,7 @@ different producer. Tuples behave the same; not a tuple bug.
 
 **Severity:** medium. Silently wrong.
 
-**Pre-existing:** reproduced identically at `5441451^`.
+**Pre-existing:** reproduced identically at `3f34d82^`.
 
 **Root cause (confirmed — and it was two layers, only one of them the
 suspected one).** The suspected layer was real: `_dict_var_list_values` and its
@@ -5901,7 +5901,7 @@ had never been tested — and it was wrong the whole time. Giving methods a real
 return record (BUG-METHOD-RETURN-ELEM-KIND-LOST, above) routed the method
 through the same analysis as the function, and the test went red. The fix
 exposed the bug rather than causing it; `git stash` on the working tree shows
-the function form printing `(null)` at `41cf0ea` with everything reverted.
+the function form printing `(null)` at `4f5b4cf` with everything reverted.
 
 **Root cause.** *Three* scans answer "what does this list hold?" by walking
 its `.append()` calls: `_prescan_list_append_types` (codegen), and two inside
@@ -5977,7 +5977,7 @@ same `elem_type=VKind.INT` conflation catalogued elsewhere in this file.
 **Severity:** high — it segfaults, and `self.x = param` in `__init__` is one of
 the most ordinary things a Python program does.
 
-**Pre-existing:** reproduced identically at `5441451^`.
+**Pre-existing:** reproduced identically at `3f34d82^`.
 
 **The fix**, as predicted above: `_class_attr_vtypes` (class -> attr ->
 `ValueType`) records the attribute's full type, kind *and* element kind. The
@@ -6170,7 +6170,7 @@ is the wrong shape for this — it discards the suffix by construction.
 **NOT REPRODUCIBLE as written — 2026-08-15.** Four shapes were probed (`str`
 elements and nested-list elements, each called inline and via a binding) and
 all four already agree with CPython; `git log -S` confirms `_RET_TAG_TO_ARG`
-is unchanged since `bde6cd1`, so this is not something that was fixed in
+is unchanged since `a158c96`, so this is not something that was fixed in
 passing. The map really does discard the suffix by construction, so the
 analysis above is correct about the *code* — some later reader evidently
 recovers the element kind before it matters, which means the entry needs a
@@ -6432,8 +6432,8 @@ treated as non-owned), but a genuine UB read that ASan flags and a real leak.
 ASan (`clang -DFPY_PURE_MODE -fsanitize=address`, WSL) confirmed a real
 heap-buffer-overflow in `fpy_str_header` for JSON parse and a global-buffer-overflow
 for the `sys.version_info` "final" literal *before* the fix, and EXIT=0 /
-LeakSanitizer-clean *after* for json/glob/version_info paths. Commits: `902912e`,
-`bf01314`, `190114e`, `99f6f8d`, `56831be`, `004bcbd`.
+LeakSanitizer-clean *after* for json/glob/version_info paths. Commits: `6db42ea`,
+`8f75bbe`, `a8ae3e7`, `df564d0`, `708dfcc`, `1855816`.
 
 Two orthogonal bugs surfaced during this work and were logged separately:
 BUG-CODEGEN-OWNED-TEMP-OVER-INCREF (codegen leak, Model-2 Stage 1 done) and
@@ -6676,8 +6676,8 @@ variable's slot is created by the loop emitter rather than by a first plain
 store. So the bug needs a `while` *inside a function*, with a counter
 introduced by an ordinary assignment.
 
-**Not a regression.** Verified failing identically at HEAD, `622b214` and
-`cfc34df`. It predates the whole IfExp/tagged-value line of work.
+**Not a regression.** Verified failing identically at HEAD, `b5aa7db` and
+`7580793`. It predates the whole IfExp/tagged-value line of work.
 
 **Severity: high — an infinite hang with no output, on entirely ordinary code.**
 Worse than a wrong answer: no assertion, no message, no exit. The harness does
