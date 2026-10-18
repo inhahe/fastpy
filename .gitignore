@@ -1,11 +1,51 @@
+# The top level holds only the entries listed here. Anything else created
+# there -- scratch scripts, IR dumps, captured output, debug executables,
+# local notes -- stays out of the repository without a pattern of its own.
+# A new top-level file that belongs in the repository needs a "!/name" line.
+/*
+!/.gitignore
+!/LICENSE
+!/README.md
+!/roadmap.md
+!/design.md
+!/known-issues.md
+!/open-questions.md
+!/MODULE_SUPPORT.md
+!/BENCHMARK_REPORT.md
+!/BRIDGE_FALLBACKS.md
+!/FUTURE_OPTIMIZATIONS.md
+!/LINUX_PORT_BUGS.md
+!/REFACTOR_DESIGN.md
+!/audit_features.py
+!/pyproject.toml
+!/setup.py
+!/compiler/
+!/runtime/
+!/fastpy/
+!/tests/
+!/benchmarks/
+!/tools/
+!/web/
+
+# tests/ holds only Python sources: the executables and IR a test run leaves
+# beside them are output. Test data in any other format needs its own "!" line.
+/tests/**
+!/tests/**/
+!/tests/**/*.py
+
+# Build output. The rules from here on come after the whitelists above so
+# that they win over them.
 __pycache__/
 *.pyc
+*.o
 *.obj
+*.pyd
 *.exe
 *.pdb
 *.ilk
 *.exp
 *.lib
+*.ll
 .pytest_cache/
 .hypothesis/
 .build/
@@ -32,16 +72,13 @@ benchmarks/_stable_*.json
 benchmarks/_ab_*.json
 benchmarks/_ab_exes/
 
-# _tls_experiment.py scratch: built variants and dumped IR
+# _tls_experiment.py scratch: built variants
 benchmarks/_tls_exes/
-benchmarks/_dict_ir.ll
-benchmarks/_dist_ir.ll
 
 # Compile-and-run probes: a throwaway .py is compiled here and its stdout
 # diffed against CPython's.  The probe itself is scratch -- the ones worth
-# keeping graduate to tests/regressions/ -- but its dumped IR and captured
-# output are pure artifacts and never belong in a commit.
-benchmarks/_probe*.ll
+# keeping graduate to tests/regressions/ -- but its captured output is a pure
+# artifact and never belongs in a commit.
 benchmarks/*.out
 
 # Release scripts are local tooling and stay out of the repository.
