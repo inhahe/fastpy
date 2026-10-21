@@ -1839,7 +1839,7 @@ fastpy can cross-compile for a foreign platform:
 - **`target=None`** (default) — host codegen. PIC relocation on POSIX, default on
   Windows; links against host CPython. Unchanged historical behavior.
 - **`target=SLATEOS_TARGET`** (`"x86_64-slateos"`) — cross-compile for **SlateOS
-  userspace** (the microkernel OS in `D:\visual studio projects\os`). Emits an
+  userspace** (the microkernel OS in `C:\visual studio projects\os`). Emits an
   x86-64 **ELF** object using the triple `x86_64-unknown-linux-musl`, the
   data-layout, `static` relocation, `large` code model, and `+sse,+sse2` taken
   verbatim from the OS repo's Rust target spec `toolchain/x86_64-slateos.json`.
