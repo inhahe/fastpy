@@ -7,7 +7,7 @@ from compiler.pipeline import compile_source
 import subprocess
 
 src_file = sys.argv[1] if len(sys.argv) > 1 else str(HERE / "_scratch_irbuilder2.py")
-source = open(src_file).read()
+source = open(src_file, encoding="utf-8").read()
 
 result = compile_source(source)
 if not result.success:
