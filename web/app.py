@@ -13,6 +13,7 @@ WSL (via gunicorn, run from the checkout):
 from __future__ import annotations
 
 import os
+import sys
 import time
 import uuid
 import threading
@@ -25,9 +26,15 @@ from flask import Flask, request, jsonify, render_template
 # starts, naming the package, rather than on its first request.
 import llvmlite  # noqa: F401
 
-from compiler.repl import ReplSession
-
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+# `compiler` is a top-level package of the checkout, which is not installed.
+# gunicorn, run from the checkout, has it on sys.path already; running this
+# file directly puts web/ there instead.
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from compiler.repl import ReplSession  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Flask app
