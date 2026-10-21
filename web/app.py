@@ -11,6 +11,7 @@ WSL (via gunicorn, compiles through Windows Python):
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 import time
 import uuid
@@ -37,9 +38,12 @@ try:
 except ImportError:
     if sys.platform == "win32":
         raise  # llvmlite should always be present on Windows
-    # WSL without llvmlite: fall back to Windows Python.
-    _PYTHON_EXE = "/mnt/d/python314/python.exe"
-    _HELPER_SCRIPT = r"D:\visual studio projects\fastpy\web\compile_helper.py"
+    # WSL without llvmlite: fall back to Windows Python. It is handed the
+    # helper as an argument, so the helper's path must be a Windows one.
+    _PYTHON_EXE = "/mnt/c/python314/python.exe"
+    _HELPER_SCRIPT = subprocess.run(
+        ["wslpath", "-w", str(PROJECT_ROOT / "web" / "compile_helper.py")],
+        capture_output=True, text=True, check=True).stdout.strip()
 
 # ---------------------------------------------------------------------------
 # Flask app

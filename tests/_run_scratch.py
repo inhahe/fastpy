@@ -1,10 +1,12 @@
 """Run a scratch test through the proper compilation pipeline."""
 import sys
-sys.path.insert(0, r"D:\visual studio projects\fastpy")
+from pathlib import Path
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE.parent))
 from compiler.pipeline import compile_source
 import subprocess
 
-src_file = sys.argv[1] if len(sys.argv) > 1 else r"D:\visual studio projects\fastpy\tests\_scratch_irbuilder2.py"
+src_file = sys.argv[1] if len(sys.argv) > 1 else str(HERE / "_scratch_irbuilder2.py")
 source = open(src_file).read()
 
 result = compile_source(source)
