@@ -123,7 +123,16 @@ def test_the_sysroot_variable_still_wins_on_slateos(monkeypatch, tmp_path):
     assert toolchain._find_slateos_sysroot_lib() == chosen / "lib"
 
 
+def _checkout_at(directory):
+    """An OS checkout as the walk recognises one: its sysroot build script."""
+    (directory / "toolchain").mkdir(parents=True, exist_ok=True)
+    (directory / "toolchain" / "build-sysroot.ps1").write_bytes(b"# build\n")
+    return directory
+
+
 def _sysroot_at(checkout):
+    """A built sysroot in an OS checkout at `checkout`; its lib directory."""
+    _checkout_at(checkout)
     lib = checkout / "toolchain" / "sysroot" / "lib"
     lib.mkdir(parents=True)
     (lib / "libc.a").write_bytes(b"!<arch>\n")
@@ -164,6 +173,91 @@ def test_the_sysroot_variable_wins_over_the_checkout_the_build_runs_in(
     monkeypatch.setenv("FASTPY_SLATEOS_SYSROOT", str(chosen))
     monkeypatch.chdir(tmp_path / "os-lane-d")
     assert toolchain._find_slateos_sysroot_lib() == chosen
+
+
+def test_a_sysroot_variable_holding_no_libc_is_an_error(monkeypatch, tmp_path):
+    # It pins the libc exactly; quietly using another one is what it prevents.
+    _sysroot_at(tmp_path / "os-lane-d")
+    monkeypatch.setattr(toolchain, "IS_SLATEOS", False)
+    monkeypatch.setenv("FASTPY_SLATEOS_SYSROOT", str(tmp_path / "typo"))
+    monkeypatch.chdir(tmp_path / "os-lane-d")
+    with pytest.raises(RuntimeError, match="holds no libc.a"):
+        toolchain._find_slateos_sysroot_lib()
+
+
+def test_the_nearest_checkout_wins(monkeypatch, tmp_path):
+    # A worktree nested inside another checkout has both on its walk.
+    _sysroot_at(tmp_path / "os")
+    nested = _sysroot_at(tmp_path / "os" / "worktrees" / "lane-d")
+    monkeypatch.delenv("FASTPY_SLATEOS_SYSROOT", raising=False)
+    monkeypatch.setattr(toolchain, "IS_SLATEOS", False)
+    monkeypatch.chdir(tmp_path / "os" / "worktrees" / "lane-d")
+    assert toolchain._find_slateos_sysroot_lib() == nested
+
+
+def test_a_checkout_whose_sysroot_is_not_built_is_an_error(monkeypatch, tmp_path):
+    # Not a reason to go on to an ancestor, or to the sibling's libc.a.
+    _sysroot_at(tmp_path / "os")
+    lane = _checkout_at(tmp_path / "os-lane-d")
+    monkeypatch.delenv("FASTPY_SLATEOS_SYSROOT", raising=False)
+    monkeypatch.setattr(toolchain, "IS_SLATEOS", False)
+    monkeypatch.setattr(toolchain, "_PROJECT_ROOT", tmp_path / "fastpy")
+    monkeypatch.chdir(lane)
+    with pytest.raises(RuntimeError, match="sysroot is not built"):
+        toolchain._find_slateos_sysroot_lib()
+
+
+def test_a_libc_outside_any_checkout_is_not_taken_for_one(monkeypatch, tmp_path):
+    # A toolchain/sysroot/lib/libc.a with no OS build script beside it is
+    # some other tree's.
+    stray = tmp_path / "toolchain" / "sysroot" / "lib"
+    stray.mkdir(parents=True)
+    (stray / "libc.a").write_bytes(b"!<arch>\n")
+    sibling = _sysroot_at(tmp_path / "os")
+    (tmp_path / "work").mkdir()
+    monkeypatch.delenv("FASTPY_SLATEOS_SYSROOT", raising=False)
+    monkeypatch.setattr(toolchain, "IS_SLATEOS", False)
+    monkeypatch.setattr(toolchain, "_PROJECT_ROOT", tmp_path / "fastpy")
+    monkeypatch.chdir(tmp_path / "work")
+    assert toolchain._find_slateos_sysroot_lib() == sibling
+
+
+def test_a_submodule_fastpy_finds_the_checkout_it_sits_in(monkeypatch, tmp_path):
+    # As <os>/toolchain/fastpy it belongs to that checkout, wherever the build
+    # is run from.
+    lane = _sysroot_at(tmp_path / "os-lane-d")
+    _sysroot_at(tmp_path / "os")
+    (tmp_path / "work").mkdir()
+    monkeypatch.delenv("FASTPY_SLATEOS_SYSROOT", raising=False)
+    monkeypatch.setattr(toolchain, "IS_SLATEOS", False)
+    monkeypatch.setattr(toolchain, "_PROJECT_ROOT",
+                        tmp_path / "os-lane-d" / "toolchain" / "fastpy")
+    monkeypatch.chdir(tmp_path / "work")
+    assert toolchain._find_slateos_sysroot_lib() == lane
+
+
+def test_the_checkout_the_build_runs_in_comes_before_fastpys_own(monkeypatch, tmp_path):
+    _sysroot_at(tmp_path / "os-lane-d")
+    here = _sysroot_at(tmp_path / "os-lane-a")
+    monkeypatch.delenv("FASTPY_SLATEOS_SYSROOT", raising=False)
+    monkeypatch.setattr(toolchain, "IS_SLATEOS", False)
+    monkeypatch.setattr(toolchain, "_PROJECT_ROOT",
+                        tmp_path / "os-lane-d" / "toolchain" / "fastpy")
+    monkeypatch.chdir(tmp_path / "os-lane-a")
+    assert toolchain._find_slateos_sysroot_lib() == here
+
+
+def test_with_no_working_directory_the_sibling_is_used(monkeypatch, tmp_path):
+    sibling = _sysroot_at(tmp_path / "os")
+
+    def gone():
+        raise FileNotFoundError("the working directory was deleted")
+
+    monkeypatch.delenv("FASTPY_SLATEOS_SYSROOT", raising=False)
+    monkeypatch.setattr(toolchain, "IS_SLATEOS", False)
+    monkeypatch.setattr(toolchain, "_PROJECT_ROOT", tmp_path / "fastpy")
+    monkeypatch.setattr(toolchain, "_working_dir", gone)
+    assert toolchain._find_slateos_sysroot_lib() == sibling
 
 
 def test_on_slateos_the_runtime_is_the_installed_archive(monkeypatch, tmp_path):

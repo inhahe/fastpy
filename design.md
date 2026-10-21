@@ -1888,8 +1888,9 @@ the CPython bridge for SlateOS later as a superset once CPython is ported.
 - [x] **Full program link + crt startup** — `link_executable(target=SLATEOS_TARGET)`
   builds the runtime on demand, resolves the OS repo's static `libc.a`
   (`_find_slateos_sysroot_lib()`: `$FASTPY_SLATEOS_SYSROOT`, the OS checkout
-  the build runs in -- found by walking up from the working directory -- or
-  the sibling `../os/toolchain/sysroot/lib`), and links program object + runtime objects +
+  the build runs in -- the nearest directory above the working directory with
+  `toolchain/build-sysroot.ps1` -- the one fastpy sits in as a submodule,
+  or the sibling `../os/toolchain/sysroot/lib`), and links program object + runtime objects +
   `-lc` via `_link_slateos`. The link entry is **`_start`** (the real ELF
   entry), so rust-lld pulls the crt0 out of `libc.a` — the OS `posix` crate
   (built for `x86_64-unknown-none`, so its `#[cfg(target_os = "none")]` crt is

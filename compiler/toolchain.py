@@ -257,44 +257,79 @@ def _find_slateos_sysroot_lib() -> Path | None:
     libc-shaped staticlib). Resolution order:
 
     1. ``$FASTPY_SLATEOS_SYSROOT`` — either the sysroot root (its ``lib``
-       subdir is tried) or the ``lib`` dir itself.
-    2. On SlateOS, the system's own: ``SLATEOS_SYSTEM_LIB_DIR``. Anywhere
-       else, the OS checkout the build runs in -- the nearest directory at
-       or above the working directory with ``toolchain/sysroot/lib/libc.a``
-       -- and then a sibling ``os`` checkout at
-       ``<fastpy>/../os/toolchain/sysroot/lib``.
+       subdir is tried) or the ``lib`` dir itself. Set, it is the answer: one
+       holding no ``libc.a`` is an error, not a reason to look elsewhere.
+    2. On SlateOS, the system's own: ``SLATEOS_SYSTEM_LIB_DIR``.
+    3. Anywhere else, the OS checkout the build runs in: the nearest
+       directory at or above the working directory that is one (it has
+       ``toolchain/build-sysroot.ps1``). Its sysroot not built is an error,
+       not a reason to look further up.
+    4. The OS checkout fastpy itself sits in, as that checkout's submodule
+       (``<os>/toolchain/fastpy``) -- the compiler it was pinned with --
+       found the same way from fastpy's own directory, wherever the build
+       is run from.
+    5. A sibling ``os`` checkout at ``<fastpy>/../os/toolchain/sysroot/lib``.
 
     The checkout the build runs in comes before the sibling because the OS
     repo is worked in several checkouts beside one named ``os``: from any of
     the others the sibling is a different tree, whose ``libc.a`` is not the
-    one being built and tested (the OS repo's design decision 915).
+    one being built and tested (the OS repo's design decision 915). For the
+    same reason a checkout is recognised by its build script rather than by
+    a ``libc.a``, which a stray directory can hold and an unbuilt checkout
+    does not.
 
-    Returns the directory containing ``libc.a``, or None if not found.
+    Returns the directory containing ``libc.a``, or None if none of these
+    applies. Raises RuntimeError for the two errors above.
     """
-    candidates: list[Path] = []
     env = os.environ.get("FASTPY_SLATEOS_SYSROOT")
     if env:
-        p = Path(env)
-        candidates.append(p / "lib")
-        candidates.append(p)
+        for c in (Path(env) / "lib", Path(env)):
+            if os.path.isfile(c / "libc.a"):
+                return c
+        raise RuntimeError(
+            f"FASTPY_SLATEOS_SYSROOT is {env}, which holds no libc.a "
+            "(nor does its lib/).")
     if IS_SLATEOS:
-        candidates.append(SLATEOS_SYSTEM_LIB_DIR)
+        return (SLATEOS_SYSTEM_LIB_DIR
+                if os.path.isfile(SLATEOS_SYSTEM_LIB_DIR / "libc.a") else None)
+    try:
+        here = _working_dir()
+    except OSError:
+        # No working directory to start from (deleted, or not readable).
+        pass
     else:
-        try:
-            here = Path.cwd()
-        except OSError:
-            # The working directory was deleted: there is nothing to walk.
-            here = None
-        if here is not None:
-            candidates.extend(
-                d / "toolchain" / "sysroot" / "lib" for d in (here, *here.parents)
-            )
-        candidates.append(
-            _PROJECT_ROOT.parent / "os" / "toolchain" / "sysroot" / "lib"
-        )
-    for c in candidates:
-        if (c / "libc.a").exists():
-            return c
+        found = _os_checkout_sysroot(here)
+        if found is not None:
+            return found
+    found = _os_checkout_sysroot(_PROJECT_ROOT)
+    if found is not None:
+        return found
+    sibling = _PROJECT_ROOT.parent / "os" / "toolchain" / "sysroot" / "lib"
+    return sibling if os.path.isfile(sibling / "libc.a") else None
+
+
+def _working_dir() -> Path:
+    """The process's working directory (a seam the tests replace)."""
+    return Path.cwd()
+
+
+def _os_checkout_sysroot(start: Path) -> Path | None:
+    """The sysroot ``lib`` directory of the nearest SlateOS checkout at or
+    above `start`, or None if `start` is in none. Raises RuntimeError if that
+    checkout's ``libc.a`` is not built.
+
+    Probed with ``os.path.isfile``, which answers False for a path it cannot
+    read, so an unreadable ancestor is passed over rather than failing the
+    link."""
+    for d in (start, *start.parents):
+        if os.path.isfile(d / "toolchain" / "build-sysroot.ps1"):
+            lib = d / "toolchain" / "sysroot" / "lib"
+            if os.path.isfile(lib / "libc.a"):
+                return lib
+            raise RuntimeError(
+                f"{d} is a SlateOS checkout whose sysroot is not built: no "
+                f"{lib / 'libc.a'}. Build it (toolchain/build-sysroot.ps1), or "
+                "set FASTPY_SLATEOS_SYSROOT.")
     return None
 
 
