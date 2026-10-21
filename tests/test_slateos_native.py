@@ -123,6 +123,49 @@ def test_the_sysroot_variable_still_wins_on_slateos(monkeypatch, tmp_path):
     assert toolchain._find_slateos_sysroot_lib() == chosen / "lib"
 
 
+def _sysroot_at(checkout):
+    lib = checkout / "toolchain" / "sysroot" / "lib"
+    lib.mkdir(parents=True)
+    (lib / "libc.a").write_bytes(b"!<arch>\n")
+    return lib
+
+
+def test_elsewhere_the_checkout_the_build_runs_in_comes_before_the_sibling(
+        monkeypatch, tmp_path):
+    # The OS repo is worked in several checkouts beside one named `os`; from
+    # any other, the sibling is a different tree's libc.a.
+    lane = _sysroot_at(tmp_path / "os-lane-d")
+    _sysroot_at(tmp_path / "os")
+    inside = tmp_path / "os-lane-d" / "services" / "fastpy-hello"
+    inside.mkdir(parents=True)
+    monkeypatch.delenv("FASTPY_SLATEOS_SYSROOT", raising=False)
+    monkeypatch.setattr(toolchain, "IS_SLATEOS", False)
+    monkeypatch.setattr(toolchain, "_PROJECT_ROOT", tmp_path / "fastpy")
+    monkeypatch.chdir(inside)
+    assert toolchain._find_slateos_sysroot_lib() == lane
+
+
+def test_elsewhere_outside_any_checkout_the_sibling_os_is_used(monkeypatch, tmp_path):
+    sibling = _sysroot_at(tmp_path / "os")
+    elsewhere = tmp_path / "work"
+    elsewhere.mkdir()
+    monkeypatch.delenv("FASTPY_SLATEOS_SYSROOT", raising=False)
+    monkeypatch.setattr(toolchain, "IS_SLATEOS", False)
+    monkeypatch.setattr(toolchain, "_PROJECT_ROOT", tmp_path / "fastpy")
+    monkeypatch.chdir(elsewhere)
+    assert toolchain._find_slateos_sysroot_lib() == sibling
+
+
+def test_the_sysroot_variable_wins_over_the_checkout_the_build_runs_in(
+        monkeypatch, tmp_path):
+    _sysroot_at(tmp_path / "os-lane-d")
+    chosen = _sysroot_at(tmp_path / "chosen")
+    monkeypatch.setattr(toolchain, "IS_SLATEOS", False)
+    monkeypatch.setenv("FASTPY_SLATEOS_SYSROOT", str(chosen))
+    monkeypatch.chdir(tmp_path / "os-lane-d")
+    assert toolchain._find_slateos_sysroot_lib() == chosen
+
+
 def test_on_slateos_the_runtime_is_the_installed_archive(monkeypatch, tmp_path):
     monkeypatch.setattr(toolchain, "IS_SLATEOS", True)
     with pytest.raises(RuntimeError, match="libfastpy_rt.a"):

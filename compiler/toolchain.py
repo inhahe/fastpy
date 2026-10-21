@@ -259,8 +259,15 @@ def _find_slateos_sysroot_lib() -> Path | None:
     1. ``$FASTPY_SLATEOS_SYSROOT`` — either the sysroot root (its ``lib``
        subdir is tried) or the ``lib`` dir itself.
     2. On SlateOS, the system's own: ``SLATEOS_SYSTEM_LIB_DIR``. Anywhere
-       else, a sibling ``os`` checkout at
+       else, the OS checkout the build runs in -- the nearest directory at
+       or above the working directory with ``toolchain/sysroot/lib/libc.a``
+       -- and then a sibling ``os`` checkout at
        ``<fastpy>/../os/toolchain/sysroot/lib``.
+
+    The checkout the build runs in comes before the sibling because the OS
+    repo is worked in several checkouts beside one named ``os``: from any of
+    the others the sibling is a different tree, whose ``libc.a`` is not the
+    one being built and tested (the OS repo's design decision 915).
 
     Returns the directory containing ``libc.a``, or None if not found.
     """
@@ -273,6 +280,15 @@ def _find_slateos_sysroot_lib() -> Path | None:
     if IS_SLATEOS:
         candidates.append(SLATEOS_SYSTEM_LIB_DIR)
     else:
+        try:
+            here = Path.cwd()
+        except OSError:
+            # The working directory was deleted: there is nothing to walk.
+            here = None
+        if here is not None:
+            candidates.extend(
+                d / "toolchain" / "sysroot" / "lib" for d in (here, *here.parents)
+            )
         candidates.append(
             _PROJECT_ROOT.parent / "os" / "toolchain" / "sysroot" / "lib"
         )
@@ -1781,8 +1797,9 @@ def link_executable(
             raise RuntimeError(
                 "Cannot find the SlateOS sysroot libc.a. Set "
                 "FASTPY_SLATEOS_SYSROOT to the sysroot directory (holding "
-                "lib/libc.a), or check out the OS repo as a sibling of fastpy "
-                "(../os/toolchain/sysroot/lib).")
+                "lib/libc.a), run from inside an OS checkout whose "
+                "toolchain/sysroot/lib holds one, or check out the OS repo as "
+                "a sibling of fastpy (../os/toolchain/sysroot/lib).")
         return _link_slateos(
             list(obj_files) + _slateos_runtime_inputs(sysroot_lib),
             output_path,
