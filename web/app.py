@@ -1,18 +1,18 @@
 """
 fastpy playground — web interface for the fastpy compiler REPL.
 
+It compiles in this process, so it needs llvmlite (web/requirements.txt).
+
 Windows (direct):
     python web/app.py
 
-WSL (via gunicorn, compiles through Windows Python):
+WSL (via gunicorn, run from the checkout):
     gunicorn -w 1 --bind 127.0.0.1:5001 --timeout 60 web.app:app
 """
 
 from __future__ import annotations
 
 import os
-import subprocess
-import sys
 import time
 import uuid
 import threading
@@ -20,30 +20,14 @@ from pathlib import Path
 
 from flask import Flask, request, jsonify, render_template
 
+# The REPL imports the compiler, and with it llvmlite, only when it first
+# compiles: importing llvmlite here makes a server without it fail as it
+# starts, naming the package, rather than on its first request.
+import llvmlite  # noqa: F401
+
 from compiler.repl import ReplSession
 
-# ---------------------------------------------------------------------------
-# Detect environment: Windows (local compile) vs WSL (remote compile)
-# ---------------------------------------------------------------------------
-
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-
-# When running from WSL, the compiler isn't importable directly — we
-# shell out to Windows Python via the compile_helper script.
-try:
-    import llvmlite  # noqa: F401 — just checking availability
-    # Compiler available locally (Windows, or WSL with llvmlite installed).
-    _PYTHON_EXE = None
-    _HELPER_SCRIPT = None
-except ImportError:
-    if sys.platform == "win32":
-        raise  # llvmlite should always be present on Windows
-    # WSL without llvmlite: fall back to Windows Python. It is handed the
-    # helper as an argument, so the helper's path must be a Windows one.
-    _PYTHON_EXE = "/mnt/c/python314/python.exe"
-    _HELPER_SCRIPT = subprocess.run(
-        ["wslpath", "-w", str(PROJECT_ROOT / "web" / "compile_helper.py")],
-        capture_output=True, text=True, check=True).stdout.strip()
 
 # ---------------------------------------------------------------------------
 # Flask app
@@ -68,11 +52,6 @@ MAX_OUTPUT_LEN = 100_000    # 100 KB output cap
 MAX_LOG_STATEMENTS = 200
 
 
-def _make_repl() -> ReplSession:
-    return ReplSession(python_exe=_PYTHON_EXE,
-                       helper_script=_HELPER_SCRIPT)
-
-
 def _get_or_create_session(sid: str | None, ip: str) -> tuple[str, ReplSession]:
     now = time.time()
     with _sessions_lock:
@@ -91,7 +70,7 @@ def _get_or_create_session(sid: str | None, ip: str) -> tuple[str, ReplSession]:
             del _sessions[oldest]
 
         new_id = uuid.uuid4().hex[:16]
-        repl = _make_repl()
+        repl = ReplSession()
         _sessions[new_id] = {"repl": repl, "last_access": now, "ip": ip}
         return new_id, repl
 

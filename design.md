@@ -2212,9 +2212,9 @@ nginx's `inhahe.com` site, in WSL, proxies https://inhahe.com/fastpy/ to it:
   into its scripts, so moving the checkout means recreating it:
   `python3 -m venv --clear web/venv-linux`, then
   `web/venv-linux/bin/pip install -r web/requirements.txt`.
-- **Where it compiles:** with llvmlite in that venv, in WSL. Without it,
-  `app.py` hands each compile to Windows Python (`C:\python314`) running
-  `web/compile_helper.py`.
+- **Where it compiles:** in the server's own process, in WSL, so the venv
+  needs llvmlite. Without it the server stops as it starts, naming the
+  package.
 
 ## Git workflow (project rule)
 

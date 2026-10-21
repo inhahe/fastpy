@@ -12,9 +12,7 @@ Usage:
 from __future__ import annotations
 
 import ast
-import os
 import subprocess
-import sys
 import tempfile
 import traceback
 from pathlib import Path
@@ -38,22 +36,9 @@ class ReplSession:
     Function and class definitions are deduplicated (latest wins).
     """
 
-    def __init__(self, python_exe: str | None = None,
-                 helper_script: str | None = None):
-        """Create a REPL session.
-
-        Args:
-            python_exe: Path to the Python interpreter that has the
-                fastpy compiler installed.  When running from WSL this
-                should be the Windows Python, e.g.
-                ``/mnt/d/python314/python.exe``.
-                If None, uses the current interpreter (in-process).
-            helper_script: Path to ``web/compile_helper.py``.  Required
-                when *python_exe* is set.
-        """
+    def __init__(self):
+        """Create a REPL session, which compiles in this process."""
         self._line_count = 0
-        self._python_exe = python_exe
-        self._helper_script = helper_script
 
         # Ordered log of all successfully executed statements.
         # Each entry is a source string for one statement.
@@ -68,16 +53,7 @@ class ReplSession:
         self._known_vars: set[str] = set()
 
         # Temporary directory for compiled executables.
-        # When using a remote compiler (WSL→Windows), create the temp dir
-        # on the Windows filesystem so both sides can access it.
-        if python_exe and sys.platform != "win32":
-            # Use a Windows-accessible path under /mnt/d or /mnt/c.
-            wsl_tmp = Path("/mnt/d/tmp/fastpy_repl")
-            wsl_tmp.mkdir(parents=True, exist_ok=True)
-            self._tmp_dir = Path(tempfile.mkdtemp(
-                prefix="repl_", dir=str(wsl_tmp)))
-        else:
-            self._tmp_dir = Path(tempfile.mkdtemp(prefix="fastpy_repl_"))
+        self._tmp_dir = Path(tempfile.mkdtemp(prefix="fastpy_repl_"))
 
     def eval_line(self, source: str) -> str | None:
         """Compile and execute one REPL input.  Returns display string or None."""
@@ -220,17 +196,10 @@ class ReplSession:
 
     def _compile_and_run(self, source: str) -> tuple[str, str, int]:
         """Compile source to an exe and run it.  Returns (stdout, stderr, rc)."""
+        from compiler.pipeline import compile_source
+
         exe_name = f"repl_{self._line_count}.exe"
         exe_path = self._tmp_dir / exe_name
-
-        if self._python_exe and self._helper_script:
-            return self._compile_and_run_remote(source, exe_path)
-        return self._compile_and_run_local(source, exe_path)
-
-    def _compile_and_run_local(self, source: str, exe_path: Path
-                               ) -> tuple[str, str, int]:
-        """Compile in-process (when running on the same machine as the compiler)."""
-        from compiler.pipeline import compile_source
 
         result = compile_source(source, exe_path,
                                 source_filename="<repl>")
@@ -245,38 +214,6 @@ class ReplSession:
             timeout=30,
             cwd=str(self._tmp_dir),
         )
-        return proc.stdout, proc.stderr, proc.returncode
-
-    def _compile_and_run_remote(self, source: str, exe_path: Path
-                                ) -> tuple[str, str, int]:
-        """Compile via a remote Python (e.g. Windows Python called from WSL)."""
-        # Convert WSL path to Windows path for the Windows Python process.
-        exe_path_str = str(exe_path)
-        if exe_path_str.startswith("/mnt/"):
-            # /mnt/d/foo -> D:\foo
-            parts = exe_path_str.split("/")  # ['', 'mnt', 'd', ...]
-            drive = parts[2].upper()
-            rest = "\\".join(parts[3:])
-            exe_path_str = f"{drive}:\\{rest}"
-        elif exe_path_str.startswith("/tmp/"):
-            # /tmp/... -> use Windows %TEMP% via subprocess
-            import subprocess as sp
-            win_tmp = sp.run(
-                [self._python_exe, "-c", "import tempfile; print(tempfile.gettempdir())"],
-                capture_output=True, text=True, timeout=10
-            ).stdout.strip()
-            exe_path_str = win_tmp + "\\" + exe_path.name
-
-        proc = subprocess.run(
-            [self._python_exe, self._helper_script, exe_path_str],
-            input=source,
-            capture_output=True,
-            text=True,
-            timeout=60,
-        )
-        if proc.returncode == 2:
-            # Compilation error (not runtime error).
-            raise RuntimeError(proc.stderr.strip())
         return proc.stdout, proc.stderr, proc.returncode
 
 
