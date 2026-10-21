@@ -12,9 +12,11 @@ Usage:
 from __future__ import annotations
 
 import ast
+import shutil
 import subprocess
 import tempfile
 import traceback
+import weakref
 from pathlib import Path
 
 
@@ -52,8 +54,12 @@ class ReplSession:
         # Track which variable names are live (for expression display).
         self._known_vars: set[str] = set()
 
-        # Temporary directory for compiled executables.
+        # Temporary directory for compiled executables. It goes with the
+        # session: the web playground drops a session by deleting its last
+        # reference, and keeps running. A failure to remove it is printed
+        # to stderr by the finalizer machinery, which cannot raise it.
         self._tmp_dir = Path(tempfile.mkdtemp(prefix="fastpy_repl_"))
+        weakref.finalize(self, shutil.rmtree, self._tmp_dir)
 
     def eval_line(self, source: str) -> str | None:
         """Compile and execute one REPL input.  Returns display string or None."""
