@@ -2195,6 +2195,27 @@ intersects the two name sets and drops the rest — so a new benchmark must be
 copied into the baseline too. Copying `run_comparison.py` across is safe and
 correct: it is the workload, not the compiler.
 
+## Web playground (`web/`)
+
+`web/app.py` is a Flask front end to `compiler/repl.py`: each `/api/run`
+compiles the session's statements so far plus the new one, and runs the result.
+nginx's `inhahe.com` site, in WSL, proxies https://inhahe.com/fastpy/ to it:
+
+- **The service** is WSL's `/etc/systemd/system/fastpy-playground.service`:
+  gunicorn on `127.0.0.1:5001`, run from this checkout
+  (`/mnt/c/visual studio projects/fastpy`). It is disabled, as it already was
+  when the WSL distribution came over from the old PC, so the public route
+  answers 502 until it is started (`sudo systemctl enable --now
+  fastpy-playground`).
+- **Its environment** is `web/venv-linux`, a venv of Ubuntu's Python 3.12 with
+  the packages in `web/requirements.txt`. A venv writes its own absolute path
+  into its scripts, so moving the checkout means recreating it:
+  `python3 -m venv --clear web/venv-linux`, then
+  `web/venv-linux/bin/pip install -r web/requirements.txt`.
+- **Where it compiles:** with llvmlite in that venv, in WSL. Without it,
+  `app.py` hands each compile to Windows Python (`C:\python314`) running
+  `web/compile_helper.py`.
+
 ## Git workflow (project rule)
 
 Push only when the user says to, and then straight from this repository; the
